@@ -7623,11 +7623,15 @@ fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
 	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
-	let mut table = data.samples[..rows * data.features].to_vec();
+	let features = data.features;
+	let mut table = data.samples[..rows * features].to_vec();
 	table.extend_from_slice(&data.targets[..rows]);
 	let mut program = PredictorBuilder::new();
 	program.nearest(count, exclude, table);
-	Ok(Predictor::new(program.finish()?))
+	let program = program.finish()?;
+	if !exclude { return Ok(Predictor::new(program)) }
+	let predictions = predict_rows(&Predictor::new(program.clone()), &data.samples[..rows * features], features)?;
+	Ok(Predictor { program, predict: Box::new(move |row, _| Ok(predictions[row])) })
 }
 impl Estimator {
 	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
