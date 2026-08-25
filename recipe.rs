@@ -6335,7 +6335,7 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		let shared_budget = shared_values / waves_per_workgroup;
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
