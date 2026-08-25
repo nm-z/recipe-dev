@@ -660,7 +660,19 @@ fn main() -> BuildResult<()> {
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
+	runtime_configuration(&manifest)?;
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
+	let profile = out.ancestors().nth(3).ok_or_else(|| io::Error::other("OUT_DIR must live under the profile directory"))?;
+	println!("cargo:rustc-env=RECIPE_BIN={}", profile.join("recipe").display());
+	// FNV-1a over the sources: the same tree fingerprints identically on every
+	// host, so one topology never mixes builds.
+	let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+	for source in ["Cargo.toml", "build.rs", "cli.rs", "recipe.rs", "amd-nv-cpu.ll"] {
+		for byte in fs::read(source)? {
+			fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+		}
+	}
+	println!("cargo:rustc-env=RECIPE_BUILD_ID={fingerprint}");
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
 	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
@@ -679,5 +691,37 @@ fn main() -> BuildResult<()> {
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
+	println!("cargo:rerun-if-changed=build.rs");
+	println!("cargo:rerun-if-changed=cli.rs");
+	println!("cargo:rerun-if-changed=recipe.rs");
+	Ok(())
+}
+
+/// The authoritative runtime configuration: one typed TOML definition names the
+/// runtime socket, the reachable hosts, and the reservable host-memory limit.
+fn runtime_configuration(manifest: &str) -> BuildResult<()> {
+	let runtime = text(manifest, "runtime")?;
+	let (address, port) = runtime.rsplit_once(':').ok_or_else(|| io::Error::other("runtime must be an address:port"))?;
+	if address.is_empty() || port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+		return Err(io::Error::other("runtime must name a host and a nonzero port").into());
+	}
+	let hosts = text(manifest, "hosts")?;
+	for entry in hosts.split(';').filter(|entry| !entry.is_empty()) {
+		let mut fields = entry.splitn(3, '=');
+		let (name, command, binary) = (fields.next().unwrap_or_default(), fields.next().unwrap_or_default(), fields.next().unwrap_or_default());
+		if name.is_empty() || name.contains([':', ' ', '=']) || command.is_empty() || !binary.starts_with('/') {
+			return Err(io::Error::other(format!("hosts entry {entry:?} must be name=command=/absolute/recipe-binary")).into());
+		}
+	}
+	if !hosts.is_empty() && ["127.0.0.1", "localhost", "::1"].contains(&address) {
+		return Err(io::Error::other("a multi-host topology requires a runtime address reachable from every host").into());
+	}
+	let limit = number(manifest, "host-memory-limit")?;
+	if limit.parse::<f64>().ok().filter(|value| *value > 0.0 && *value <= 1.0).is_none() {
+		return Err(io::Error::other("host-memory-limit must be a fraction above zero and at most one").into());
+	}
+	println!("cargo:rustc-env=RECIPE_RUNTIME={runtime}");
+	println!("cargo:rustc-env=RECIPE_HOSTS={hosts}");
+	println!("cargo:rustc-env=RECIPE_HOST_MEMORY_LIMIT={limit}");
 	Ok(())
 }

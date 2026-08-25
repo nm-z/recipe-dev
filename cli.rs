@@ -1,6 +1,22 @@
-use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
+use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command, sync::atomic::AtomicI32, sync::atomic::Ordering};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export] | recipe --runtime | recipe --probe";
+
+static CHILD: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" {
+	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+	fn kill(pid: i32, number: i32) -> i32;
+}
+
+extern "C" fn forward_interrupt(number: i32) {
+	let pid = CHILD.load(Ordering::Acquire);
+	if pid > 0 {
+		unsafe {
+			kill(pid, number);
+		}
+	}
+}
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -46,6 +62,12 @@ fn library_path(directory: &Path) -> PathBuf {
 }
 
 fn run(source: &Path, device: Option<&str>) {
+	// The public boundary submits every run to the authoritative runtime; only a
+	// dispatched executor, marked by its granted RECIPE_JOB, compiles and runs
+	// its declaration here.
+	if std::env::var_os("RECIPE_JOB").is_none() {
+		recipe::submit(source, device)
+	}
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -61,9 +83,11 @@ fn run(source: &Path, device: Option<&str>) {
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
+	// The dispatched child receives this process's interrupt so it can checkpoint.
+	unsafe { signal(2, forward_interrupt) };
 	// The running child holds the inode, so unlinking now leaves nothing behind
 	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| { fs::remove_file(&output).ok(); child.wait() });
+	let status = command.spawn().and_then(|mut child| { CHILD.store(child.id() as i32, Ordering::Release); fs::remove_file(&output).ok(); child.wait() });
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
 }
@@ -72,6 +96,12 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--runtime" {
+			recipe::runtime()
+		}
+		if argument == "--probe" {
+			recipe::probe()
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if device.is_some() {

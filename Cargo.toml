@@ -14,6 +14,9 @@ path = "cli.rs"
 [dependencies]
 
 [package.metadata.recipe]
+runtime = "127.0.0.1:9462"
+hosts = ""
+host-memory-limit = 0.8
 dependency-allowlist = []
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
