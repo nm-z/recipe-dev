@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>[,<name>]] <source.rs> [export] | recipe --worker";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -72,6 +72,9 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--worker" {
+			recipe::worker()
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if device.is_some() {
