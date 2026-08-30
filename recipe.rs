@@ -480,7 +480,7 @@ mod program_ir {
 		pub row: &'a str,
 		pub features: usize,
 		pub weights: &'a str,
-		pub offset: usize,
+		pub context: &'a str,
 		pub parameters: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
@@ -500,6 +500,7 @@ mod program_ir {
 
 	/// Emit a predictor without a runtime stack, local array, or opcode switch.
 	/// Stores and loads are resolved at compile time into SSA values.
+	#[rustfmt::skip]
 	pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorContext<'_>) -> Result<PredictorForward, EmitError> {
 		let instructions = parse_predictor(code)?;
 		let mut output = String::new();
@@ -614,75 +615,44 @@ mod program_ir {
 					let p = format!("{}.nearest.{sequence}", context.prefix);
 					sequence += 1;
 					let (zero, maximum) = ((context.literal)(0.0, ty), (context.literal)(f64::MAX, ty));
-					// Row loop head: induction variable plus the k best (distance, target) pairs as phis.
-					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
-					let _ = writeln!(output, "%{p}.i = phi i32 [ 0, %{p}.entry ], [ %{p}.i.next, %{p}.latch ]");
-					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}.new, %{p}.latch ]");
-						let _ = writeln!(output, "%{p}.t{slot} = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.t{slot}.new, %{p}.latch ]");
+					if maximum == zero {
+						let result = format!("%{p}.result");
+						let _ = writeln!(output, "{result} = call {ty} @recipe.div({ty} {zero}, {ty} {count})", count = (context.literal)(count as f64, ty));
+						stack.push(result);
+						continue;
 					}
-					let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.i, {rows}\nbr i1 %{p}.more, label %{p}.distance, label %{p}.done");
-					// Squared distance between the query row and stored row i, accumulated per feature.
-					let _ = writeln!(output, "{p}.distance:\nbr label %{p}.d.head\n{p}.d.head:");
-					let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.distance ], [ %{p}.j.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.distance ], [ %{p}.acc.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.d.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.d.more, label %{p}.d.body, label %{p}.d.done", features = context.features);
-					let _ = writeln!(output, "{p}.d.body:");
-					let _ = writeln!(
-						output,
-						"%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}",
-						row = context.row,
-						features = context.features,
-						input = context.input
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.w.base = mul i32 %{p}.i, {features}\n%{p}.w.relative = add i32 %{p}.w.base, %{p}.j\n%{p}.w.index = add i32 %{p}.w.relative, {offset}\n%{p}.w.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.w.index\n%{p}.w = load {ty}, {ptr} %{p}.w.ptr, align {align}",
-						features = context.features,
-						offset = context.offset,
-						weights = context.weights
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.diff = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.w)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.diff, {ty} %{p}.diff)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.square)"
-					);
-					let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.d.head\n{p}.d.done:");
-					let candidate_distance = if exclude {
-						let _ = writeln!(output, "%{p}.self = icmp eq i32 %{p}.i, {row}\n%{p}.candidate = select i1 %{p}.self, {ty} {maximum}, {ty} %{p}.acc", row = context.row);
-						format!("%{p}.candidate")
-					} else {
-						format!("%{p}.acc")
-					};
-					let _ = writeln!(
-						output,
-						"%{p}.target.relative = add i32 {base}, %{p}.i\n%{p}.target.index = add i32 %{p}.target.relative, {offset}\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}",
-						base = rows * context.features,
-						offset = context.offset,
-						weights = context.weights
-					);
-					// Bubble the candidate through the k slots. A displaced entry precedes every later
-					// equal-distance slot because rows are visited in ascending index order.
-					let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
-					let mut carry_precedes = "false".to_owned();
+					let leaves = rows.div_ceil(super::NEAREST_LEAF_ROWS).next_power_of_two();
+					let node_slots = 2 * leaves - 1;
+					let permutation = node_slots * super::NEAREST_NODE_FIELDS;
+					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.tree\n{p}.tree:");
+					let _ = writeln!(output, "%{p}.node = phi i32 [ 0, %{p}.entry ], [ %{p}.internal.next, %{p}.internal ], [ %{p}.leaf.parent, %{p}.leaf.done ]\n%{p}.previous = phi i32 [ -1, %{p}.entry ], [ %{p}.node, %{p}.internal ], [ %{p}.node, %{p}.leaf.done ]");
 					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.tie{slot} = and i1 %{p}.equal{slot}, {carry_precedes}");
-						let _ = writeln!(output, "%{p}.swap{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}");
-						let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
-						let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
-						let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
-						let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
-						let _ = writeln!(output, "%{p}.carry.precedes{slot} = or i1 {carry_precedes}, %{p}.swap{slot}");
+						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}, %{p}.internal ], [ %{p}.leaf.d{slot}, %{p}.leaf.done ]");
+						let _ = writeln!(output, "%{p}.r{slot} = phi i32 [ -1, %{p}.entry ], [ %{p}.r{slot}, %{p}.internal ], [ %{p}.leaf.r{slot}, %{p}.leaf.done ]");
+					}
+					let _ = writeln!(output, "%{p}.active = icmp ne i32 %{p}.node, -1\nbr i1 %{p}.active, label %{p}.load, label %{p}.done\n{p}.load:\n%{p}.node.base = mul i32 %{p}.node, {fields}", fields = super::NEAREST_NODE_FIELDS);
+					for (field, name) in ["minimum", "first", "second", "dimension", "parent"].into_iter().enumerate() {
+						let _ = writeln!(output, "%{p}.{name}.index = add i32 %{p}.node.base, {field}\n%{p}.{name}.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.{name}.index\n%{p}.{name} = load i32, {ptr} %{p}.{name}.ptr, align 4", context = context.context);
+					}
+					let _ = writeln!(output, "%{p}.is.leaf = icmp eq i32 %{p}.dimension, -1\nbr i1 %{p}.is.leaf, label %{p}.leaf.entry, label %{p}.internal\n{p}.internal:\n%{p}.left = add i32 %{p}.node, 1\n%{p}.query.base = mul i32 {row}, {features}\n%{p}.query.index = add i32 %{p}.query.base, %{p}.dimension\n%{p}.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.query.index\n%{p}.query = load {ty}, {ptr} %{p}.query.ptr, align {align}\n%{p}.threshold.base = mul i32 %{p}.first, {features}\n%{p}.threshold.index = add i32 %{p}.threshold.base, %{p}.dimension\n%{p}.threshold.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.threshold.index\n%{p}.threshold = load {ty}, {ptr} %{p}.threshold.ptr, align {align}\n%{p}.right.first = call i1 @recipe.ogt({ty} %{p}.query, {ty} %{p}.threshold)\n%{p}.near = select i1 %{p}.right.first, i32 %{p}.second, i32 %{p}.left\n%{p}.far = select i1 %{p}.right.first, i32 %{p}.left, i32 %{p}.second\n%{p}.far.base = mul i32 %{p}.far, {fields}\n%{p}.far.minimum.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.far.base\n%{p}.far.minimum = load i32, {ptr} %{p}.far.minimum.ptr, align 4\n%{p}.gap.raw = call {ty} @recipe.sub({ty} %{p}.query, {ty} %{p}.threshold)\n%{p}.gap = call {ty} @recipe.mul({ty} %{p}.gap.raw, {ty} %{p}.gap.raw)\n%{p}.farther = call i1 @recipe.ogt({ty} %{p}.gap, {ty} %{p}.d{last})\n%{p}.same.gap = call i1 @recipe.oeq({ty} %{p}.gap, {ty} %{p}.d{last})\n%{p}.later.row = icmp ugt i32 %{p}.far.minimum, %{p}.r{last}\n%{p}.tie.prune = and i1 %{p}.same.gap, %{p}.later.row\n%{p}.bounded = or i1 %{p}.farther, %{p}.tie.prune\n%{p}.full = icmp ne i32 %{p}.r{last}, -1\n%{p}.prune = and i1 %{p}.full, %{p}.bounded\n%{p}.entering = icmp eq i32 %{p}.previous, %{p}.parent\n%{p}.from.near = icmp eq i32 %{p}.previous, %{p}.near\n%{p}.visit.far.raw = xor i1 %{p}.prune, true\n%{p}.visit.far = and i1 %{p}.from.near, %{p}.visit.far.raw\n%{p}.returned.next = select i1 %{p}.visit.far, i32 %{p}.far, i32 %{p}.parent\n%{p}.internal.next = select i1 %{p}.entering, i32 %{p}.near, i32 %{p}.returned.next\nbr label %{p}.tree", row = context.row, features = context.features, input = context.input, weights = context.weights, context = context.context, fields = super::NEAREST_NODE_FIELDS, last = count - 1);
+					let _ = writeln!(output, "{p}.leaf.entry:\nbr label %{p}.leaf.head\n{p}.leaf.head:\n%{p}.leaf.i = phi i32 [ %{p}.first, %{p}.leaf.entry ], [ %{p}.leaf.i.next, %{p}.leaf.latch ]");
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.leaf.d{slot} = phi {ty} [ %{p}.d{slot}, %{p}.leaf.entry ], [ %{p}.leaf.d{slot}.new, %{p}.leaf.latch ]\n%{p}.leaf.r{slot} = phi i32 [ %{p}.r{slot}, %{p}.leaf.entry ], [ %{p}.leaf.r{slot}.new, %{p}.leaf.latch ]");
+					}
+					let allowed = if exclude { format!("xor i1 %{p}.self, true") } else { "icmp eq i1 false, false".to_owned() };
+					let _ = writeln!(output, "%{p}.leaf.more = icmp ult i32 %{p}.leaf.i, %{p}.second\nbr i1 %{p}.leaf.more, label %{p}.leaf.distance, label %{p}.leaf.done\n{p}.leaf.distance:\n%{p}.candidate.position = add i32 %{p}.leaf.i, {permutation}\n%{p}.candidate.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.candidate.position\n%{p}.candidate = load i32, {ptr} %{p}.candidate.ptr, align 4\nbr label %{p}.distance.head\n{p}.distance.head:\n%{p}.feature = phi i32 [ 0, %{p}.leaf.distance ], [ %{p}.feature.next, %{p}.distance.body ]\n%{p}.distance = phi {ty} [ {zero}, %{p}.leaf.distance ], [ %{p}.distance.next, %{p}.distance.body ]\n%{p}.feature.more = icmp ult i32 %{p}.feature, {features}\nbr i1 %{p}.feature.more, label %{p}.distance.body, label %{p}.distance.done\n{p}.distance.body:\n%{p}.leaf.query.base = mul i32 {row}, {features}\n%{p}.leaf.query.index = add i32 %{p}.leaf.query.base, %{p}.feature\n%{p}.leaf.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.leaf.query.index\n%{p}.leaf.query = load {ty}, {ptr} %{p}.leaf.query.ptr, align {align}\n%{p}.candidate.base = mul i32 %{p}.candidate, {features}\n%{p}.candidate.index = add i32 %{p}.candidate.base, %{p}.feature\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.candidate.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}\n%{p}.difference = call {ty} @recipe.sub({ty} %{p}.leaf.query, {ty} %{p}.weight)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.difference, {ty} %{p}.difference)\n%{p}.distance.next = call {ty} @recipe.add({ty} %{p}.distance, {ty} %{p}.square)\n%{p}.feature.next = add i32 %{p}.feature, 1\nbr label %{p}.distance.head\n{p}.distance.done:\n%{p}.finite = call i1 @recipe.olt({ty} %{p}.distance, {ty} {maximum})\n%{p}.self = icmp eq i32 %{p}.candidate, {row}\n%{p}.not.self = {allowed}\n%{p}.candidate.valid = and i1 %{p}.finite, %{p}.not.self", permutation = permutation, context = context.context, features = context.features, row = context.row, input = context.input, weights = context.weights);
+					let (mut carry_distance, mut carry_row) = (format!("%{p}.distance"), format!("%{p}.candidate"));
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.row.before{slot} = icmp ult i32 {carry_row}, %{p}.leaf.r{slot}\n%{p}.tie{slot} = and i1 %{p}.equal{slot}, %{p}.row.before{slot}\n%{p}.ordered{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}\n%{p}.swap{slot} = and i1 %{p}.candidate.valid, %{p}.ordered{slot}\n%{p}.leaf.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.leaf.d{slot}\n%{p}.leaf.r{slot}.new = select i1 %{p}.swap{slot}, i32 {carry_row}, i32 %{p}.leaf.r{slot}\n%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.leaf.d{slot}, {ty} {carry_distance}\n%{p}.carry.r{slot} = select i1 %{p}.swap{slot}, i32 %{p}.leaf.r{slot}, i32 {carry_row}");
 						carry_distance = format!("%{p}.carry.d{slot}");
-						carry_target = format!("%{p}.carry.t{slot}");
-						carry_precedes = format!("%{p}.carry.precedes{slot}");
+						carry_row = format!("%{p}.carry.r{slot}");
 					}
-					let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
-					let mut sum = zero;
+					let _ = writeln!(output, "br label %{p}.leaf.latch\n{p}.leaf.latch:\n%{p}.leaf.i.next = add i32 %{p}.leaf.i, 1\nbr label %{p}.leaf.head\n{p}.leaf.done:\n%{p}.leaf.parent = add i32 %{p}.parent, 0\nbr label %{p}.tree\n{p}.done:");
+					let mut sum = zero.clone();
 					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.present{slot} = icmp ne i32 %{p}.r{slot}, -1\n%{p}.safe{slot} = select i1 %{p}.present{slot}, i32 %{p}.r{slot}, i32 0\n%{p}.target.index{slot} = add i32 {base}, %{p}.safe{slot}\n%{p}.target.ptr{slot} = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index{slot}\n%{p}.target.raw{slot} = load {ty}, {ptr} %{p}.target.ptr{slot}, align {align}\n%{p}.target{slot} = select i1 %{p}.present{slot}, {ty} %{p}.target.raw{slot}, {ty} {zero}", base = rows * context.features, weights = context.weights);
 						let name = format!("%{p}.sum{slot}");
-						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.t{slot})");
+						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.target{slot})");
 						sum = name;
 					}
 					let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
@@ -1257,7 +1227,7 @@ impl NativeLayout {
 			contexts.push(context_offset);
 			adjoints.push(adjoint_offset);
 			value_offset = checked_add(value_offset, graph_rows_buffer(node.output, rows, element)?, "model value arena")?;
-			context_offset = checked_add(context_offset, node_context(node, rows, element)?, "model context arena")?;
+			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision)?, "model context arena")?;
 			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
 		}
 		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
@@ -2400,7 +2370,7 @@ impl NativeModelIr {
 							row: &row,
 							features: node.input.elements(),
 							weights: &pointers.weights,
-							offset: node.offset,
+							context: &pointers.context,
 							parameters: node.parameters,
 							prefix: &prefix,
 							literal: &literal,
@@ -6964,7 +6934,19 @@ impl EpochOperation {
 		matches!(self, Self::Full | Self::Optimizer)
 	}
 }
-
+fn native_context_values(graph: &Graph, layout: &NativeLayout, weights: &Buffer, precision: Compute) -> Result<Vec<u8>> {
+	let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+	let nearest = graph.nodes.iter().map(|node| nearest_layout(node, &graph.programs)).collect::<Result<Vec<_>>>()?;
+	if precision.pack(f64::MAX) == precision.pack(0.0) || nearest.iter().all(Option::is_none) {
+		return Ok(contexts);
+	}
+	let effective = weights.download_float(graph.parameters.len(), precision)?;
+	for (index, (node, nearest)) in graph.nodes.iter().zip(nearest).enumerate() {
+		let Some((features, rows, bytes)) = nearest else { continue };
+		NearestIndex::build(&effective[node.offset..node.offset + rows * features], features, rows).write(&mut contexts[layout.contexts[index]..layout.contexts[index] + bytes]);
+	}
+	Ok(contexts)
+}
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
@@ -7009,7 +6991,7 @@ impl NativeTape {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
@@ -7584,7 +7566,31 @@ fn structural(value: f64) -> Result<i32> {
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
 }
-fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
+const NEAREST_LEAF_ROWS: usize = 16;
+const NEAREST_NODE_FIELDS: usize = 5;
+fn nearest_rows(parameters: usize, features: usize) -> Option<usize> {
+	let width = features.checked_add(1)?;
+	parameters.checked_div(width).filter(|rows| *rows != 0 && *rows * width == parameters)
+}
+fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize, usize)>> {
+	if node.op != Primitive::Predictor {
+		return Ok(None);
+	}
+	let end = node.program_offset.checked_add(checked_mul(node.program_count, 2, "predictor program")?).ok_or_else(|| RecipeError::new("predictor program range overflows"))?;
+	let program = programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("predictor program range is invalid"))?;
+	if !program.chunks_exact(2).any(|instruction| instruction[0] == PredictorOpcode::Nearest as i32 as f64) {
+		return Ok(None);
+	}
+	let table_rows = nearest_rows(node.parameters, node.input.elements()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+	let leaves = table_rows.div_ceil(NEAREST_LEAF_ROWS).checked_next_power_of_two().ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
+	let nodes = checked_mul(leaves, 2, "nearest index nodes")?.checked_sub(1).ok_or_else(|| RecipeError::new("nearest index nodes are empty"))?;
+	let bytes = checked_mul(checked_add(checked_mul(nodes, NEAREST_NODE_FIELDS, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?;
+	Ok(Some((node.input.elements(), table_rows, bytes)))
+}
+fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
+	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
+		return Ok(bytes);
+	}
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -7607,7 +7613,7 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		}
 		_ => 1,
 	};
-	checked_mul(elements.max(1), element, "context bytes")
+	checked_mul(elements.max(1), precision.bytes(), "context bytes")
 }
 fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
@@ -9508,77 +9514,79 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	graph.frozen.fill(1);
 	Ok(graph)
 }
-#[derive(Clone)]
-struct NearestNode {
-	minimum: u32,
-	start: u32,
-	end: u32,
-	split: Option<(usize, f64, Box<NearestNode>, Box<NearestNode>)>,
-}
+type NearestNode = [u32; NEAREST_NODE_FIELDS];
 #[derive(Clone)]
 struct NearestIndex {
 	features: usize,
 	permutation: Vec<u32>,
-	root: NearestNode,
+	nodes: Vec<NearestNode>,
 }
 impl NearestIndex {
 	fn build(samples: &[f64], features: usize, rows: usize) -> Self {
-		let mut permutation = (0..rows as u32).collect::<Vec<_>>();
-		let root = Self::partition(samples, features, &mut permutation, 0);
-		Self { features, permutation, root }
+		let (mut permutation, mut nodes) = ((0..rows as u32).collect::<Vec<_>>(), Vec::new());
+		Self::partition(samples, features, &mut permutation, 0, u32::MAX, &mut nodes);
+		Self { features, permutation, nodes }
 	}
-	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32) -> NearestNode {
+	fn write(&self, target: &mut [u8]) {
+		let slots = (target.len() / size_of::<u32>() - self.permutation.len()) / NEAREST_NODE_FIELDS;
+		let nodes = self.nodes.iter().flatten().copied().enumerate();
+		for (position, value) in nodes.chain(self.permutation.iter().copied().enumerate().map(|(position, row)| (slots * NEAREST_NODE_FIELDS + position, row))) {
+			target[position * size_of::<u32>()..(position + 1) * size_of::<u32>()].copy_from_slice(&value.to_le_bytes())
+		}
+	}
+	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32, parent: u32, nodes: &mut Vec<NearestNode>) -> u32 {
+		let index = nodes.len() as u32;
 		let minimum = permutation.iter().copied().min().unwrap_or(0);
-		let end = start + permutation.len() as u32;
-		if permutation.len() <= 16 {
-			return NearestNode { minimum, start, end, split: None };
+		nodes.push([minimum, start, start + permutation.len() as u32, u32::MAX, parent]);
+		if permutation.len() <= NEAREST_LEAF_ROWS {
+			return index;
 		}
-		let mut widest = (f64::NEG_INFINITY, 0);
-		for feature in 0..features {
-			let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-			for &row in permutation.iter() {
-				let value = samples[row as usize * features + feature];
-				(low, high) = (low.min(value), high.max(value));
-			}
-			widest = if high - low > widest.0 { (high - low, feature) } else { widest };
-		}
-		let (dimension, middle) = (widest.1, permutation.len() / 2);
+		let dimension = (0..features)
+			.fold((f64::NEG_INFINITY, 0), |widest, feature| {
+				let (low, high) = permutation
+					.iter()
+					.map(|&row| samples[row as usize * features + feature])
+					.fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
+				if high - low > widest.0 { (high - low, feature) } else { widest }
+			})
+			.1;
+		let middle = permutation.len() / 2;
 		permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
-		let threshold = samples[permutation[middle] as usize * features + dimension];
+		let pivot = permutation[middle];
 		let (left, right) = permutation.split_at_mut(middle);
-		let left = Box::new(Self::partition(samples, features, left, start));
-		let right = Box::new(Self::partition(samples, features, right, start + middle as u32));
-		NearestNode { minimum, start, end, split: Some((dimension, threshold, left, right)) }
+		Self::partition(samples, features, left, start, index, nodes);
+		let right = Self::partition(samples, features, right, start + middle as u32, index, nodes);
+		nodes[index as usize] = [minimum, pivot, right, dimension as u32, parent];
+		index
 	}
-	fn nearest(&self, node: &NearestNode, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
-		let Some((dimension, threshold, left, right)) = &node.split else {
-			for &candidate in &self.permutation[node.start as usize..node.end as usize] {
+	fn nearest(&self, index: usize, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
+		let [_, first, second, dimension, _] = self.nodes[index];
+		if dimension == u32::MAX {
+			for &candidate in &self.permutation[first as usize..second as usize] {
 				if exclude && candidate as usize == row {
 					continue;
 				}
-				let base = candidate as usize * self.features;
-				let measured = distance(query, &samples[base..base + self.features]);
-				let keeps = best.len() < count || best.last().is_some_and(|&(kept, index)| measured < kept || (measured == kept && candidate < index));
-				if measured < f64::MAX && keeps {
-					let position = best.iter().position(|&(kept, index)| kept > measured || (kept == measured && index > candidate)).unwrap_or(best.len());
+				let base = candidate as usize * query.len();
+				let measured = distance(query, &samples[base..base + query.len()]);
+				let position = best.partition_point(|&(kept, index)| kept < measured || (kept == measured && index < candidate));
+				if measured < f64::MAX && position < count {
 					best.insert(position, (measured, candidate));
 					best.truncate(count);
 				}
 			}
 			return;
-		};
-		// On an equal coordinate the left child holds the lower row indices, so it is
-		// searched first to settle tie-breaks before the far bound is consulted.
-		let (near, far) = if query[*dimension] <= *threshold { (left, right) } else { (right, left) };
+		}
+		let (dimension, threshold) = (dimension as usize, samples[first as usize * query.len() + dimension as usize]);
+		let (left, right) = (index + 1, second as usize);
+		// Equal coordinates search lower rows first, and the bound preserves distance-row ties.
+		let (near, far) = if query[dimension] <= threshold { (left, right) } else { (right, left) };
 		self.nearest(near, samples, query, row, count, exclude, best);
-		// The squared split coordinate gap lower-bounds every far-side distance, so the
-		// far subtree is skipped only when no far row can displace or tie a kept one.
-		if best.len() == count {
-			if let Some(&(kept, index)) = best.last() {
-				let gap = (query[*dimension] - threshold).powi(2);
-				if gap > kept || (gap == kept && far.minimum > index) {
-					return;
-				}
+		if best.len() == count
+			&& let Some(&(kept, index)) = best.last()
+		{
+			let gap = (query[dimension] - threshold).powi(2);
+			if gap > kept || (gap == kept && self.nodes[far][0] > index) {
+				return;
 			}
 		}
 		self.nearest(far, samples, query, row, count, exclude, best);
@@ -9645,21 +9653,13 @@ impl PredictorProgram {
 					let count = instruction[1].abs() as usize;
 					let exclude = instruction[1] < 0.0;
 					let features = query.len();
-					let rows = self
-						.table
-						.len()
-						.checked_div(features + 1)
-						.filter(|rows| rows * (features + 1) == self.table.len())
-						.ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+					let rows = nearest_rows(self.table.len(), features).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 					let (samples, targets) = self.table.split_at(rows * features);
-					// An index is built beside the table it searches and neither is replaced afterwards, so a
-					// program that carries an absent or differently shaped index rebuilds from the table it holds
-					// now rather than answering from one that never saw these values.
 					let rebuilt =
 						self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
 					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
 					let mut best = Vec::with_capacity(count);
-					index.nearest(&index.root, samples, query, row, count, exclude, &mut best);
+					index.nearest(0, samples, query, row, count, exclude, &mut best);
 					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
 				}
 				value if value == PredictorOpcode::Affine as i32 => {
