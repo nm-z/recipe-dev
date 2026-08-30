@@ -6187,8 +6187,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
-	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
+	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
+	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..)) || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
@@ -6231,7 +6232,7 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 		source_rows: 1,
 		features: saved.input.elements(),
 		schema: DataSchema::default(),
-		sequence: (saved.input.length > 1).then_some(saved.input),
+		sequence: (saved.input.length > 1).then_some((saved.input, saved.input)),
 		target_categorical: false,
 		norm_mean: saved.norm_mean.clone(),
 		norm_scale: saved.norm_scale.clone(),
@@ -10738,7 +10739,7 @@ struct Prepared {
 	source_rows: usize,
 	features: usize,
 	schema: DataSchema,
-	sequence: Option<Shape>,
+	sequence: Option<(Shape, Shape)>,
 	target_categorical: bool,
 	norm_mean: Vec<f64>,
 	norm_scale: Vec<f64>,
@@ -10749,6 +10750,8 @@ struct Table {
 	name: String,
 	headers: Vec<String>,
 	rows: Vec<Vec<String>>,
+	/// Row-major image values are channel-major when each image row is one channel.
+	attention: Option<Shape>,
 }
 enum FeatureType {
 	Numeric,
@@ -10891,54 +10894,43 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
 	let sample_target = stems[0].contains(target);
 	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
-	// Per-sample subdirectories: identical file stems per directory, one stem naming the
-	// target. Each directory is one sample and each file stem one column.
-	if aligned && sample_target {
-		let columns = stems[0].iter().cloned().collect::<Vec<_>>();
-		let mut headers = Vec::new();
-		let mut rows: Vec<Vec<String>> = vec![Vec::new(); directories.len()];
-		for column in &columns {
-			let mut width = None;
-			for (row, entries) in directories.values().enumerate() {
-				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
-				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
-					image_values(path, bytes)?
-				} else {
-					vec![sample_text(path, bytes)?]
-				};
-				require(*width.get_or_insert(values.len()) == values.len(), format!("sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
-				rows[row].extend(values);
-			}
-			match width.unwrap_or(0) {
-				1 => headers.push(column.clone()),
-				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
-			}
-		}
-		return Ok(Some(Table { name, headers, rows }));
-	}
-	if aligned && paired_target {
+	// Per-sample layouts use directories as rows; paired layouts use directories as columns.
+	if aligned && (sample_target || paired_target) {
 		let mut columns = Vec::new();
-		for (directory, entries) in &directories {
-			let mut ordered = entries.clone();
-			ordered.sort_by_key(|(path, _)| stem(path));
-			columns.push((singular(directory), ordered));
+		if sample_target {
+			for column in &stems[0] {
+				columns.push((column.clone(), directories.values().map(|entries| entries.iter().copied().find(|(path, _)| stem(path) == *column).unwrap()).collect()));
+			}
+		} else {
+			for (directory, entries) in &directories {
+				let mut entries = entries.clone();
+				entries.sort_by_key(|(path, _)| stem(path));
+				columns.push((singular(directory), entries));
+			}
 		}
 		let mut headers = Vec::new();
-		let mut rows: Vec<Vec<String>> = vec![Vec::new(); stems[0].len()];
-		for (column, ordered) in &columns {
-			let mut width = None;
-			for (row, (path, bytes)) in ordered.iter().enumerate() {
-				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
-				require(*width.get_or_insert(values.len()) == values.len(), format!("paired sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+		let mut attention = Some(Shape { channels: 0, length: 0 });
+		let mut rows = vec![Vec::new(); columns[0].1.len()];
+		for (column, entries) in &columns {
+			let mut kind = None;
+			for (row, (path, bytes)) in entries.iter().enumerate() {
+				let (shape, values) = sample_values(path, bytes)?;
+				require(!sample_target || column != target || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
+				let current = (shape, values.len());
+				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
 			}
-			match width.unwrap_or(0) {
-				1 => headers.push(column.clone()),
-				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
+			let (shape, width) = kind.unwrap_or((None, 0));
+			if column != target
+				&& let Some(previous) = attention
+			{
+				attention = shape
+					.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+					.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels })
 			}
+			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, rows }));
+		return Ok(Some(Table { name, headers, rows, attention: attention.filter(|shape| shape.channels != 0) }));
 	}
 	if aligned {
 		return Ok(None);
@@ -10955,40 +10947,44 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 /// Rows of one sample table: each sample contributes its content columns plus the target.
 struct SampleTableBuilder {
 	target: String,
+	shape: Option<Shape>,
 	headers: Vec<String>,
 	rows: Vec<Vec<String>>,
 }
 impl SampleTableBuilder {
 	fn new(target: String) -> Self {
-		Self { target, headers: Vec::new(), rows: Vec::new() }
+		Self { target, shape: None, headers: Vec::new(), rows: Vec::new() }
 	}
 	fn push(&mut self, path: &Path, bytes: &[u8], target: String) -> Result<()> {
-		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) { image_values(path, bytes)? } else { vec![sample_text(path, bytes)?] };
+		let (shape, values) = sample_values(path, bytes)?;
 		if self.headers.is_empty() {
-			self.headers = match values.len() {
-				1 => vec!["content".to_owned()],
-				width => (1..=width).map(|index| format!("pixel.{index}")).collect(),
-			};
+			self.shape = shape;
+			let name = if shape.is_some() { "pixel" } else { "content" };
+			self.headers = (1..=values.len()).map(|index| if values.len() == 1 { name.to_owned() } else { format!("{name}.{index}") }).collect();
 			self.headers.push(self.target.clone());
 		}
-		require(values.len() + 1 == self.headers.len(), format!("sample {} expected {} values, received {}", path.display(), self.headers.len() - 1, values.len()))?;
+		let (expected, received) = ((self.shape, self.headers.len() - 1), (shape, values.len()));
+		require(expected == received, format!("sample {} expected {expected:?}, received {received:?}", path.display()))?;
 		let mut row = values;
 		row.push(target);
 		self.rows.push(row);
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, rows: self.rows })
+		Ok(Table { name, headers: self.headers, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
 	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
 }
-fn image_values(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String>)> {
+	if !path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+		return Ok((None, vec![sample_text(path, bytes)?]));
+	}
 	let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
 	let decoded = if jpeg { jpeg_pixels(bytes) } else { png_pixels(bytes) };
-	let (_, _, _, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
-	Ok(pixels.iter().map(|value| value.to_string()).collect())
+	let (width, height, channels, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+	Ok((Some(Shape { channels: checked_mul(width, channels, "image row width")?, length: height }), pixels.iter().map(|value| value.to_string()).collect()))
 }
 fn is_image(extension: &str) -> bool {
 	matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
@@ -11340,7 +11336,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
 		for (table, test) in tables.iter_mut().zip(tests) {
-			require(table.headers == test.headers, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
+			require(table.headers == test.headers && table.attention == test.attention, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
 			table.rows.extend(test.rows);
 		}
 	}
@@ -11388,6 +11384,8 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	});
 	let sequence = (repeated && sequence_widths.len() > 1 && sequence_widths.keys().copied().eq(1..=sequence_widths.len()) && sequence_widths.values().all(|width| *width == sequence_widths[&1]))
 		.then(|| Shape { channels: sequence_widths[&1], length: sequence_widths.len() });
+	let attention = tables.iter().filter_map(|table| table.attention).find(|shape| shape.elements() == features);
+	let shapes = sequence.map(|sequence| (sequence, attention.unwrap_or(sequence)));
 	require(features != 0, "dataset has no training features")?;
 	let target_categories = selected.iter().map(|target| categories(&tables[target.0], target.1, source_table_rows)).collect::<Vec<_>>();
 	let target_categorical =
@@ -11455,7 +11453,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		.map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1])))
 		.chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target)))
 		.collect();
-	finish_prepared(data, samples, targets, target_width, source_rows, features, sequence, target_categorical, schema)
+	finish_prepared(data, samples, targets, target_width, source_rows, features, shapes, target_categorical, schema)
 }
 fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	let mut sequences = Vec::new();
@@ -11493,10 +11491,12 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, 1, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	let sequence = Shape { channels: CHAR_IDS.len(), length };
+	finish_prepared(data, samples, targets, 1, source_rows, features, Some((sequence, sequence)), true, schema)
 }
 fn finish_prepared(
-	data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema,
+	data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<(Shape, Shape)>, target_categorical: bool,
+	schema: DataSchema,
 ) -> Result<Prepared> {
 	require(target_width != 0 && targets.len() % target_width == 0, "target vector width does not divide the target buffer")?;
 	let rows = targets.len() / target_width;
@@ -11668,7 +11668,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows }])
+	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[String]) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -11686,7 +11686,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new() };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().chain(exclusions).any(|name| column_match(name, &union, header, column));
@@ -11705,7 +11705,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 		}
 	}
 	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows }])
+	Ok(vec![Table { name, headers, rows, attention: None }])
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -11778,7 +11778,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, rows });
+		tables.push(Table { name: name.clone(), headers, rows, attention: None });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -12311,7 +12311,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, rows: table_rows })
+	Ok(Table { name, headers, rows: table_rows, attention: None })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -12534,7 +12534,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, rows })
+	Ok(Table { name, headers, rows, attention: None })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -12559,7 +12559,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, rows }, blank))
+	Ok((Table { name, headers, rows, attention: None }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
