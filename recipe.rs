@@ -10855,9 +10855,6 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
 	let [target] = data.target.as_slice() else { return Ok(None) };
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
-		return Ok(None);
-	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
@@ -10966,6 +10963,9 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
+	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+		return Ok(None);
+	}
 	let mut builder = SampleTableBuilder::new(target.clone());
 	for (directory, entries) in &directories {
 		for (path, bytes) in entries {
