@@ -9849,33 +9849,37 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	let workers = std::thread::available_parallelism().map_or(1, |value| value.get()).min(rows);
 	for _ in 0..config.svm_iterations {
-		// Each prediction is independent. `parallel_map` preserves the row order of
-		// its results, so the later reductions use the same order as the serial fit.
-		let directions = parallel_map(rows, |row| {
-			let sample = &data.samples[row * data.features..(row + 1) * data.features];
-			let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
-			let error = prediction - data.targets[row];
-			if error > config.svm_epsilon {
-				1.0
-			} else if error < -config.svm_epsilon {
-				-1.0
-			} else {
-				0.0
+		let partials = parallel_map(workers, |worker| {
+			let (start, end) = (worker * rows / workers, (worker + 1) * rows / workers);
+			let (mut bias_gradient, mut gradient) = (0.0, vec![0.0; data.features]);
+			for row in start..end {
+				let sample = &data.samples[row * data.features..(row + 1) * data.features];
+				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let error = prediction - data.targets[row];
+				let direction = if error > config.svm_epsilon {
+					1.0
+				} else if error < -config.svm_epsilon {
+					-1.0
+				} else {
+					0.0
+				};
+				bias_gradient += direction / rows as f64;
+				for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut gradient) {
+					*value_gradient += direction * (value - mean) * scale / rows as f64
+				}
 			}
+			(bias_gradient, gradient)
 		});
+		let mut gradient = weights.iter().map(|weight| config.svm_regularization * weight).collect::<Vec<_>>();
 		let mut bias_gradient = 0.0;
-		for &direction in &directions {
-			bias_gradient += direction / rows as f64;
-		}
-		let gradient = parallel_map(data.features, |feature| {
-			let mut value_gradient = config.svm_regularization * weights[feature];
-			for (row, &direction) in directions.iter().enumerate() {
-				let value = data.samples[row * data.features + feature];
-				value_gradient += direction * (value - means[feature]) * inverse[feature] / rows as f64
+		for (partial_bias, partial_gradient) in partials {
+			bias_gradient += partial_bias;
+			for (value_gradient, partial) in gradient.iter_mut().zip(partial_gradient) {
+				*value_gradient += partial
 			}
-			value_gradient
-		});
+		}
 		bias -= config.svm_rate * bias_gradient;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
 			*weight -= config.svm_rate * gradient
