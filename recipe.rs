@@ -9932,35 +9932,50 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: boo
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::new(program.finish()?))
 }
-fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Result<Vec<f64>> {
-	let width = values.len();
-	require(matrix.len() == width * width && width != 0, "linear system shape is invalid")?;
-	for column in 0..width {
-		let pivot = (column..width)
-			.max_by(|left, right| matrix[*left * width + column].abs().total_cmp(&matrix[*right * width + column].abs()))
-			.ok_or_else(|| RecipeError::new("linear system has no pivot"))?;
-		require(matrix[pivot * width + column].abs() > epsilon, "linear system is singular")?;
-		for entry in 0..width {
-			matrix.swap(column * width + entry, pivot * width + entry)
+fn solve_bayes(samples: &[f64], targets: &[f64], means: &[f64], target_mean: f64, config: Config) -> Result<Vec<f64>> {
+	let (rows, features) = (targets.len(), means.len());
+	require(rows != 0 && features != 0 && samples.len() == checked_mul(rows, features, "Bayes sample matrix")?, "Bayes system shape is invalid")?;
+	// Solve the smaller equivalent ridge system: feature space when features fit, or row space otherwise.
+	let dual = rows < features;
+	let (width, terms) = if dual { (rows, features) } else { (features, rows) };
+	let centered = |axis: usize, term: usize| {
+		if dual { samples[axis * features + term] - means[term] } else { samples[term * features + axis] - means[axis] }
+	};
+	let mut matrix = vec![0.0; checked_mul(width, width, "Bayes system matrix")?];
+	for row in 0..width {
+		for column in 0..=row {
+			matrix[row * width + column] = (0..terms).map(|term| centered(row, term) * centered(column, term) / config.bayes_noise_variance).sum()
 		}
-		values.swap(column, pivot);
-		let scale = matrix[column * width + column];
-		for entry in column..width {
-			matrix[column * width + entry] /= scale
-		}
-		values[column] /= scale;
-		for row in 0..width {
+		matrix[row * width + row] += config.bayes_prior_precision
+	}
+	let mut values = if dual {
+		targets.iter().map(|target| (target - target_mean) / config.bayes_noise_variance).collect::<Vec<_>>()
+	} else {
+		(0..features)
+			.map(|feature| samples.chunks_exact(features).zip(targets).map(|(sample, target)| (sample[feature] - means[feature]) * (target - target_mean) / config.bayes_noise_variance).sum())
+			.collect()
+	};
+	// Ridge regularization makes the system positive definite, so factor only its lower triangle.
+	for row in 0..width {
+		for column in 0..=row {
+			let value = matrix[row * width + column] - (0..column).map(|inner| matrix[row * width + inner] * matrix[column * width + inner]).sum::<f64>();
 			if row == column {
-				continue;
+				require(value > config.bayes_variance_epsilon, "Bayes system is not positive definite")?;
+				matrix[row * width + column] = value.sqrt()
+			} else {
+				matrix[row * width + column] = value / matrix[column * width + column]
 			}
-			let factor = matrix[row * width + column];
-			for entry in column..width {
-				matrix[row * width + entry] -= factor * matrix[column * width + entry]
-			}
-			values[row] -= factor * values[column];
 		}
 	}
-	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
+	for row in 0..width {
+		values[row] = (values[row] - (0..row).map(|column| matrix[row * width + column] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	for row in (0..width).rev() {
+		values[row] = (values[row] - (row + 1..width).map(|column| matrix[column * width + row] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	let weights =
+		if dual { (0..features).map(|feature| samples.chunks_exact(features).zip(&values).map(|(sample, value)| (sample[feature] - means[feature]) * value).sum()).collect() } else { values };
+	require(weights.iter().all(|value| value.is_finite()), "Bayes system produced a nonfinite solution").map(|_| weights)
 }
 fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse: &[f64]) {
 	program.constant(base);
@@ -9978,28 +9993,10 @@ fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse
 fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
-		let mut means = vec![0.0; data.features];
+		let samples = &data.samples[..rows * data.features];
 		let target_mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-		for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
-			for (mean, value) in means.iter_mut().zip(sample) {
-				*mean += value / rows as f64
-			}
-		}
-		let mut matrix = vec![0.0; data.features * data.features];
-		let mut values = vec![0.0; data.features];
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			for left in 0..data.features {
-				let centered = sample[left] - means[left];
-				values[left] += centered * (target - target_mean) / config.bayes_noise_variance;
-				for right in 0..data.features {
-					matrix[left * data.features + right] += centered * (sample[right] - means[right]) / config.bayes_noise_variance
-				}
-			}
-		}
-		for feature in 0..data.features {
-			matrix[feature * data.features + feature] += config.bayes_prior_precision
-		}
-		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
+		let means = (0..data.features).map(|feature| samples.chunks_exact(data.features).map(|sample| sample[feature]).sum::<f64>() / rows as f64).collect::<Vec<_>>();
+		let weights = solve_bayes(samples, &data.targets[..rows], &means, target_mean, config)?;
 		let bias = target_mean - weights.iter().zip(&means).map(|(weight, mean)| weight * mean).sum::<f64>();
 		let mut program = PredictorBuilder::new();
 		program.constant(bias);
