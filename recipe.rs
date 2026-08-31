@@ -6208,7 +6208,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		output_profile = StorageFormat(model.quantization).selection().map(|_| StorageFormat(model.quantization));
 	}
 	if let Some(format) = output_profile
-		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.parameters != 0 && node.block_index + 1 == model.blocks.len())
+		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.parameters != 0 && node.block_index + 1 == model.blocks.len())
 	{
 		node.argument[8] = f64::from(format.tensor(0, false, true))
 	}
@@ -6312,7 +6312,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
-			if node.parameters != 0 {
+			if node.op != Primitive::Predictor && node.parameters != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
