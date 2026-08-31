@@ -560,20 +560,29 @@ fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into())
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
-	("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"),
+	(
+		"@contraction_tile = external addrspace(3) global [0 x double], align 16",
+		"@contraction_tile = internal thread_local global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16",
+	),
 	(" addrspace(3)", ""),
-	("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"),
+	("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @recipe.cpu.thread.id()"),
 	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
-	("call i32 @recipe.group.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.group.id.x()", "call i32 @recipe.cpu.thread.id()"),
 	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
 	("call void @llvm.amdgcn.s.barrier()", ""),
 	("call void @recipe.local.barrier()", ""),
-	("call void @grid_barrier(i32 %threads)", ""),
+	("call void @grid_barrier(i32 %threads)", "call void @recipe.cpu.barrier()"),
 	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
 	("declare void @llvm.amdgcn.s.barrier()", ""),
 	("declare i64 @__ockl_steadyctr_u64()", ""),
 	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }"),
 ];
+const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
+@recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
+@recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
+define void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
+define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
 /// Compile-time contraction shape. A reverse K extent is cut into one contiguous
 /// partition per `split_span` elements, capped at `partitions`, so the summation
 /// order is a property of the program rather than of the device it runs on.
@@ -701,6 +710,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
+	ir.push_str(CPU_PARALLEL);
 	let clang = text(manifest, "cpu-compiler")?;
 	if !Path::new(clang).exists() {
 		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
@@ -792,6 +802,7 @@ fn main() -> BuildResult<()> {
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
