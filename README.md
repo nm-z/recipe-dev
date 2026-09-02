@@ -49,6 +49,17 @@ model.values(model.tensor("blk.0.attn_q.weight").unwrap());
 
 Every shard of a split is opened by name, the tensor data stays mapped, and quantized tensors decode through the same block decoders that read saved `.ogdl` models.
 
+## tokenizer
+
+```rust
+let tokenizer = recipe.gguf("model.gguf").tokenizer();
+let ids = tokenizer.encode("Hello, world");
+let text = tokenizer.decode(&ids);
+tokenizer.bos(); tokenizer.eos(); tokenizer.pad();
+```
+
+A byte-level BPE tokenizer built from the GGUF metadata alone: `tokenizer.ggml.tokens`, `merges`, `token_type`, the special ids, and the pre-tokenizer family named by `tokenizer.ggml.pre` (the GPT-2, Llama 3, and Qwen 2 regex families). Special tokens written in the text are matched whole, `encode` leads with the beginning-of-sequence id when the model asks for it, and `decode` rejoins bytes split across tokens.
+
 ## files
 
 ```bash

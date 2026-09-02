@@ -4218,6 +4218,10 @@ mod gguf {
 		}
 		/// The tensor's elements decoded to f64, dequantizing block formats through
 		/// the same decoders the saved-model path uses.
+		/// The byte-level BPE tokenizer the metadata describes.
+		pub fn tokenizer(&self) -> super::Tokenizer {
+			super::Tokenizer::from_gguf(self).unwrap_or_else(|error| panic!("{error}"))
+		}
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
 			let data = self.data(tensor);
 			match tensor.kind {
@@ -4253,6 +4257,288 @@ mod gguf {
 	}
 }
 pub use gguf::{Gguf, GgufTensor, GgufValue};
+mod tokenizer {
+	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
+	//! table, the merge ranks, the pre-tokenizer family, and the special ids.
+	use super::{Gguf, GgufValue, RecipeError, Result, require};
+	use std::collections::HashMap;
+
+	/// The pre-tokenizer alternation that cuts text into words before merging.
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum Family {
+		Gpt2,
+		Llama3,
+		Qwen2,
+	}
+
+	fn letter(value: char) -> bool {
+		value.is_alphabetic()
+	}
+	fn number(value: char) -> bool {
+		value.is_numeric()
+	}
+	fn space(value: char) -> bool {
+		value.is_whitespace()
+	}
+	fn newline(value: char) -> bool {
+		value == '\r' || value == '\n'
+	}
+	fn other(value: char) -> bool {
+		!space(value) && !letter(value) && !number(value)
+	}
+	fn run(chars: &[char], at: usize, class: fn(char) -> bool) -> usize {
+		chars[at.min(chars.len())..].iter().take_while(|value| class(**value)).count()
+	}
+	/// `'s|'t|'re|'ve|'m|'ll|'d`, case-insensitive for the newer families.
+	fn contraction(chars: &[char], at: usize, insensitive: bool) -> usize {
+		if chars.get(at) != Some(&'\'') {
+			return 0;
+		}
+		let same = |index: usize, expected: char| chars.get(at + index).is_some_and(|value| if insensitive { value.to_ascii_lowercase() == expected } else { *value == expected });
+		["s", "t", "re", "ve", "m", "ll", "d"].iter().find(|suffix| suffix.chars().enumerate().all(|(index, expected)| same(1 + index, expected))).map_or(0, |suffix| 1 + suffix.len())
+	}
+	/// `\s+(?!\S)`: a whitespace run that leaves its last character to the
+	/// following word unless it ends the text.
+	fn trailing_space(chars: &[char], at: usize) -> usize {
+		let count = run(chars, at, space);
+		if count == 0 {
+			0
+		} else if at + count == chars.len() {
+			count
+		} else {
+			count - 1
+		}
+	}
+
+	impl Family {
+		fn named(pre: &str) -> Result<Self> {
+			Ok(match pre {
+				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
+				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
+				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
+				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
+			})
+		}
+		/// The length in characters of the word that starts at `at`.
+		fn word(self, chars: &[char], at: usize) -> usize {
+			let space_prefix = usize::from(chars[at] == ' ');
+			let prefixed = |class: fn(char) -> bool| {
+				let count = run(chars, at + space_prefix, class);
+				if count == 0 { 0 } else { space_prefix + count }
+			};
+			if self == Self::Gpt2 {
+				let count = contraction(chars, at, false);
+				if count != 0 {
+					return count;
+				}
+				for class in [letter, number, other] {
+					let count = prefixed(class);
+					if count != 0 {
+						return count;
+					}
+				}
+			} else {
+				let count = contraction(chars, at, true);
+				if count != 0 {
+					return count;
+				}
+				// [^\r\n\p{L}\p{N}]?\p{L}+
+				let prefix = usize::from(!newline(chars[at]) && !letter(chars[at]) && !number(chars[at]));
+				let count = run(chars, at + prefix, letter);
+				if count != 0 {
+					return prefix + count;
+				}
+				// \p{N}{1,3} for llama3, \p{N} for qwen2
+				let count = run(chars, at, number).min(if self == Self::Llama3 { 3 } else { 1 });
+				if count != 0 {
+					return count;
+				}
+				// ?[^\s\p{L}\p{N}]+[\r\n]*
+				let count = prefixed(other);
+				if count != 0 {
+					return count + run(chars, at + count, newline);
+				}
+				// \s*[\r\n]+
+				let spaces = run(chars, at, space);
+				if let Some(last) = (0..spaces).rev().find(|index| newline(chars[at + index])) {
+					return last + 1;
+				}
+			}
+			let count = trailing_space(chars, at);
+			if count != 0 {
+				return count;
+			}
+			run(chars, at, space).max(1)
+		}
+		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+			let (offsets, chars): (Vec<usize>, Vec<char>) = text.char_indices().unzip();
+			let (mut at, mut words) = (0, Vec::new());
+			while at < chars.len() {
+				let next = at + self.word(&chars, at);
+				words.push(&text[offsets[at]..offsets.get(next).copied().unwrap_or(text.len())]);
+				at = next;
+			}
+			words
+		}
+	}
+
+	/// The GPT-2 byte map: printable Latin-1 bytes stay themselves, the rest
+	/// take the code points from U+0100 upward in byte order.
+	fn byte_map() -> [char; 256] {
+		let mut map = ['\0'; 256];
+		let mut next = 0x100;
+		for byte in 0..=255_u8 {
+			let printable = (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174;
+			map[usize::from(byte)] = if printable {
+				char::from(byte)
+			} else {
+				next += 1;
+				char::from_u32(next - 1).unwrap()
+			};
+		}
+		map
+	}
+
+	pub struct Tokenizer {
+		tokens: Vec<String>,
+		ids: HashMap<String, u32>,
+		merges: HashMap<(u32, u32), (u32, u32)>,
+		specials: Vec<(String, u32)>,
+		bytes: [u32; 256],
+		byte_of: HashMap<char, u8>,
+		family: Family,
+		add_bos: bool,
+		bos: Option<u32>,
+		eos: Option<u32>,
+		pad: Option<u32>,
+	}
+
+	impl Tokenizer {
+		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
+			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
+			let kind = text("tokenizer.ggml.model")?;
+			require(kind == "gpt2", format!("tokenizer model {kind:?} is not byte-level BPE"))?;
+			let family = Family::named(text("tokenizer.ggml.pre")?)?;
+			let array = |key: &str| match model.value(key) {
+				Some(GgufValue::Array(items)) => Ok(items.as_slice()),
+				_ => Err(RecipeError::new(format!("{key} is absent"))),
+			};
+			let tokens = array("tokenizer.ggml.tokens")?
+				.iter()
+				.map(|item| item.text().map(str::to_owned).ok_or_else(|| RecipeError::new("tokenizer.ggml.tokens holds a non-string")))
+				.collect::<Result<Vec<_>>>()?;
+			let ids = tokens.iter().enumerate().map(|(id, token)| (token.clone(), id as u32)).collect::<HashMap<_, _>>();
+			let id = |token: &str| ids.get(token).copied().ok_or_else(|| RecipeError::new(format!("token {token:?} is absent from the vocabulary")));
+			let mut merges = HashMap::new();
+			for (rank, merge) in array("tokenizer.ggml.merges")?.iter().enumerate() {
+				let merge = merge.text().ok_or_else(|| RecipeError::new("tokenizer.ggml.merges holds a non-string"))?;
+				let (left, right) = merge.split_once(' ').ok_or_else(|| RecipeError::new(format!("merge {merge:?} has no pair")))?;
+				merges.insert((id(left)?, id(right)?), (rank as u32, id(&format!("{left}{right}"))?));
+			}
+			let map = byte_map();
+			let mut bytes = [0; 256];
+			for (byte, symbol) in map.iter().enumerate() {
+				bytes[byte] = id(&symbol.to_string())?;
+			}
+			let types = array("tokenizer.ggml.token_type").ok();
+			let mut specials = tokens
+				.iter()
+				.enumerate()
+				.filter(|(index, _)| types.and_then(|types| types.get(*index)).is_some_and(|kind| matches!(kind, GgufValue::I32(3 | 4))))
+				.map(|(index, token)| (token.clone(), index as u32))
+				.collect::<Vec<_>>();
+			specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+			let special_id = |key: &str| model.value(key).and_then(GgufValue::integer).map(|value| value as u32);
+			Ok(Self {
+				byte_of: map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect(),
+				ids,
+				merges,
+				specials,
+				bytes,
+				family,
+				add_bos: matches!(model.value("tokenizer.ggml.add_bos_token"), Some(GgufValue::Bool(true))),
+				bos: special_id("tokenizer.ggml.bos_token_id"),
+				eos: special_id("tokenizer.ggml.eos_token_id"),
+				pad: special_id("tokenizer.ggml.padding_token_id"),
+				tokens,
+			})
+		}
+		pub fn bos(&self) -> Option<u32> {
+			self.bos
+		}
+		pub fn eos(&self) -> Option<u32> {
+			self.eos
+		}
+		pub fn pad(&self) -> Option<u32> {
+			self.pad
+		}
+		pub fn vocabulary(&self) -> usize {
+			self.tokens.len()
+		}
+		/// The token's text in the byte-map alphabet, as the vocabulary spells it.
+		pub fn token(&self, id: u32) -> &str {
+			&self.tokens[id as usize]
+		}
+		/// Token ids for `text`, with the beginning-of-sequence id first when the
+		/// model asks for it. Special tokens written out in the text are matched
+		/// whole, longest first, before the pre-tokenizer sees the rest.
+		pub fn encode(&self, text: &str) -> Vec<u32> {
+			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			let (mut start, mut at) = (0, 0);
+			while at < text.len() {
+				if let Some((special, id)) = self.specials.iter().find(|(special, _)| text[at..].starts_with(special.as_str())) {
+					self.encode_plain(&text[start..at], &mut output);
+					output.push(*id);
+					at += special.len();
+					start = at;
+				} else {
+					at += text[at..].chars().next().map_or(1, char::len_utf8);
+				}
+			}
+			self.encode_plain(&text[start..], &mut output);
+			output
+		}
+		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+			for word in self.family.split(text) {
+				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>();
+				// Llama 3 vocabularies take a whole word that is already a token as is.
+				if self.family == Family::Llama3
+					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>())
+				{
+					output.push(*id);
+					continue;
+				}
+				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
+					.filter_map(|index| self.merges.get(&(symbols[index], symbols[index + 1])).map(|(rank, merged)| (rank, index, merged)))
+					.min()
+					.map(|(_, index, merged)| (index, *merged))
+				{
+					symbols[index] = merged;
+					symbols.remove(index + 1);
+				}
+				output.extend(symbols);
+			}
+		}
+		fn byte_of_token(&self, byte: u8) -> char {
+			self.tokens[self.bytes[usize::from(byte)] as usize].chars().next().unwrap()
+		}
+		/// The text the ids spell. Bytes split across tokens rejoin before the
+		/// UTF-8 decode, and a token outside the byte alphabet keeps its own text.
+		pub fn decode(&self, ids: &[u32]) -> String {
+			let mut bytes = Vec::new();
+			for id in ids {
+				for symbol in self.tokens[*id as usize].chars() {
+					match self.byte_of.get(&symbol) {
+						Some(byte) => bytes.push(*byte),
+						None => bytes.extend(symbol.to_string().as_bytes()),
+					}
+				}
+			}
+			String::from_utf8_lossy(&bytes).into_owned()
+		}
+	}
+}
+pub use tokenizer::Tokenizer;
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};

@@ -1,0 +1,14 @@
+The quick brown fox jumps over the lazy dog. It's 2024, and IT'S 03:45pm; we've got 1234567 reasons (or 3.14159) to say "hello, world!"
+
+fn main() {
+	let values: Vec<u32> = (0..10).map(|index| index * 2).collect();
+    println!("{values:?}");  // trailing comment
+}
+
+你好，世界！今天天气很好。日本語のテキストもあります。한국어 문장도 포함됩니다.
+Emoji: 😀🚀 café naïve résumé — “quotes” … ellipsis
+<|im_start|>user
+What is    the   answer?<|im_end|>
+Tabs		and   spaces     
+   indented line
+END
