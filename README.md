@@ -87,6 +87,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	hyper(lanes, rank, [...])
 
 feature reduction:
 	pool(size)
@@ -109,6 +110,7 @@ Feature generation is banned.
 
 `embed` must be the first block. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The table is stored in any quantization and only the addressed rows are read per token.
 `dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into its parts through a gate, writes their output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
 
 ## 15 activations
 

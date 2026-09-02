@@ -1472,6 +1472,87 @@ define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr ad
 %delta.ptr = getelementptr inbounds i8, ptr addrspace(1) %delta, i32 %delta.index %incoming = load i8, ptr addrspace(1) %delta.ptr, align 1
 %product = call i8 @recipe.mul(i8 %value, i8 %incoming) %sum.next = call i8 @recipe.add(i8 %sum, i8 %product) %step.next = add i32 %step.index, 1 br label %loop
 done: %gradient.index = add i32 %offset, %p %gradient.ptr = getelementptr inbounds i8, ptr addrspace(1) %gradient, i32 %gradient.index store i8 %sum, ptr addrspace(1) %gradient.ptr, align 1 ret void }
+; Hyper-connection stream bodies. A stream row holds %lanes copies of
+; %channels channels, lane l at channels [l * channels, (l + 1) * channels).
+; Reverse bodies add into their adjoints; every element belongs to one thread.
+; Output element %p of the widened batch copies the input channel of its lane.
+define internal void @expand_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %lanes ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %per.row %within = urem i32 %p, %per.row
+%lane.channel = udiv i32 %within, %length %position = urem i32 %within, %length %channel = urem i32 %lane.channel, %channels
+%row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %index.row = add i32 %row.base, %channel.base %index = add i32 %index.row, %position
+%input.ptr = getelementptr inbounds i8, ptr addrspace(1) %input, i32 %index %value = load i8, ptr addrspace(1) %input.ptr, align 1
+%output.ptr = getelementptr inbounds i8, ptr addrspace(1) %output, i32 %p store i8 %value, ptr addrspace(1) %output.ptr, align 1 ret void }
+; Source element %p of the narrow batch sums the adjoints of its lanes in lane order.
+define internal void @expand_reverse_body( ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %lanes ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow
+%row.base = mul i32 %row, %per.row %base = add i32 %row.base, %within br label %loop loop:
+%lane = phi i32 [ 0, %entry ], [ %lane.next, %step ] %sum = phi i8 [ 0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %lane, %lanes
+br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narrow %index = add i32 %base, %lane.offset
+%delta.ptr = getelementptr inbounds i8, ptr addrspace(1) %delta, i32 %index %value = load i8, ptr addrspace(1) %delta.ptr, align 1
+%sum.next = call i8 @recipe.add(i8 %sum, i8 %value) %lane.next = add i32 %lane, 1 br label %loop done:
+%adjoint.ptr = getelementptr inbounds i8, ptr addrspace(1) %adjoint, i32 %p %prior = load i8, ptr addrspace(1) %adjoint.ptr, align 1
+%total = call i8 @recipe.add(i8 %prior, i8 %sum) store i8 %total, ptr addrspace(1) %adjoint.ptr, align 1 ret void }
+; Output element %p of the narrow batch is the gate-weighted sum of its lanes; without a gate every lane weighs one.
+define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow
+%row.base = mul i32 %row, %per.row %base = add i32 %row.base, %within br label %loop loop:
+%lane = phi i32 [ 0, %entry ], [ %lane.next, %step ] %sum = phi i8 [ 0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %lane, %lanes
+br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narrow %index = add i32 %base, %lane.offset
+%stream.ptr = getelementptr inbounds i8, ptr addrspace(1) %stream, i32 %index %value = load i8, ptr addrspace(1) %stream.ptr, align 1
+%gate.ptr = getelementptr inbounds i8, ptr addrspace(1) %gate, i32 %index %gate.loaded = load i8, ptr addrspace(1) %gate.ptr, align 1
+%weight = select i1 %gated, i8 %gate.loaded, i8 0 %product = call i8 @recipe.mul(i8 %weight, i8 %value)
+%sum.next = call i8 @recipe.add(i8 %sum, i8 %product) %lane.next = add i32 %lane, 1 br label %loop done:
+%output.ptr = getelementptr inbounds i8, ptr addrspace(1) %output, i32 %p store i8 %sum, ptr addrspace(1) %output.ptr, align 1 ret void }
+; Stream element %p receives gate * dh, and its gate receives stream * dh.
+define internal void @read_reverse_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %stream.adjoint, ptr addrspace(1) %gate.adjoint, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %per.row %within = urem i32 %p, %per.row
+%lane.channel = udiv i32 %within, %length %position = urem i32 %within, %length %channel = urem i32 %lane.channel, %channels
+%row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %h.row = add i32 %row.base, %channel.base %h = add i32 %h.row, %position
+%delta.ptr = getelementptr inbounds i8, ptr addrspace(1) %delta, i32 %h %dh = load i8, ptr addrspace(1) %delta.ptr, align 1
+%gate.ptr = getelementptr inbounds i8, ptr addrspace(1) %gate, i32 %p %gate.loaded = load i8, ptr addrspace(1) %gate.ptr, align 1
+%weight = select i1 %gated, i8 %gate.loaded, i8 0 %stream.term = call i8 @recipe.mul(i8 %weight, i8 %dh)
+%stream.adjoint.ptr = getelementptr inbounds i8, ptr addrspace(1) %stream.adjoint, i32 %p %stream.prior = load i8, ptr addrspace(1) %stream.adjoint.ptr, align 1
+%stream.sum = call i8 @recipe.add(i8 %stream.prior, i8 %stream.term) store i8 %stream.sum, ptr addrspace(1) %stream.adjoint.ptr, align 1
+br i1 %gated, label %gate.pass, label %exit gate.pass:
+%stream.ptr = getelementptr inbounds i8, ptr addrspace(1) %stream, i32 %p %value = load i8, ptr addrspace(1) %stream.ptr, align 1
+%gate.term = call i8 @recipe.mul(i8 %value, i8 %dh)
+%gate.adjoint.ptr = getelementptr inbounds i8, ptr addrspace(1) %gate.adjoint, i32 %p %gate.prior = load i8, ptr addrspace(1) %gate.adjoint.ptr, align 1
+%gate.sum = call i8 @recipe.add(i8 %gate.prior, i8 %gate.term) store i8 %gate.sum, ptr addrspace(1) %gate.adjoint.ptr, align 1 br label %exit exit: ret void }
+; Output element %p of the widened batch is its lane's write gate times the branch output channel.
+define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %gate, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %per.row %within = urem i32 %p, %per.row
+%lane.channel = udiv i32 %within, %length %position = urem i32 %within, %length %channel = urem i32 %lane.channel, %channels %lane = udiv i32 %lane.channel, %channels
+%row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %y.row = add i32 %row.base, %channel.base %y = add i32 %y.row, %position
+%gate.row = mul i32 %row, %lanes %gate.lane = add i32 %gate.row, %lane %gate.lane.base = mul i32 %gate.lane, %length %g = add i32 %gate.lane.base, %position
+%branch.ptr = getelementptr inbounds i8, ptr addrspace(1) %branch, i32 %y %value = load i8, ptr addrspace(1) %branch.ptr, align 1
+%gate.ptr = getelementptr inbounds i8, ptr addrspace(1) %gate, i32 %g %gate.loaded = load i8, ptr addrspace(1) %gate.ptr, align 1
+%weight = select i1 %gated, i8 %gate.loaded, i8 0 %product = call i8 @recipe.mul(i8 %weight, i8 %value)
+%output.ptr = getelementptr inbounds i8, ptr addrspace(1) %output, i32 %p store i8 %product, ptr addrspace(1) %output.ptr, align 1 ret void }
+; Branch element %p sums gate * adjoint over its lanes in lane order.
+define internal void @outer_reverse_branch_body( ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %position = urem i32 %within, %length
+%row.base = mul i32 %row, %per.row %base = add i32 %row.base, %within %gate.row = mul i32 %row, %lanes br label %loop loop:
+%lane = phi i32 [ 0, %entry ], [ %lane.next, %step ] %sum = phi i8 [ 0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %lane, %lanes
+br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narrow %index = add i32 %base, %lane.offset
+%delta.ptr = getelementptr inbounds i8, ptr addrspace(1) %delta, i32 %index %value = load i8, ptr addrspace(1) %delta.ptr, align 1
+%gate.lane = add i32 %gate.row, %lane %gate.lane.base = mul i32 %gate.lane, %length %g = add i32 %gate.lane.base, %position
+%gate.ptr = getelementptr inbounds i8, ptr addrspace(1) %gate, i32 %g %gate.loaded = load i8, ptr addrspace(1) %gate.ptr, align 1
+%weight = select i1 %gated, i8 %gate.loaded, i8 0 %product = call i8 @recipe.mul(i8 %weight, i8 %value)
+%sum.next = call i8 @recipe.add(i8 %sum, i8 %product) %lane.next = add i32 %lane, 1 br label %loop done:
+%adjoint.ptr = getelementptr inbounds i8, ptr addrspace(1) %adjoint, i32 %p %prior = load i8, ptr addrspace(1) %adjoint.ptr, align 1
+%total = call i8 @recipe.add(i8 %prior, i8 %sum) store i8 %total, ptr addrspace(1) %adjoint.ptr, align 1 ret void }
+; Gate element %p (one per row, lane, and position) sums branch * adjoint over its channels in channel order.
+define internal void @outer_reverse_gate_body( ptr addrspace(1) %branch, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %lanes ) #1 { entry:
+%narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %gates.row = mul i32 %lanes, %length %row = udiv i32 %p, %gates.row %within = urem i32 %p, %gates.row
+%lane = udiv i32 %within, %length %position = urem i32 %within, %length %row.base = mul i32 %row, %per.row %lane.base = mul i32 %lane, %narrow
+%delta.base.row = add i32 %row.base, %lane.base %delta.base = add i32 %delta.base.row, %position %branch.row = mul i32 %row, %narrow %branch.base = add i32 %branch.row, %position
+br label %loop loop: %channel = phi i32 [ 0, %entry ], [ %channel.next, %step ] %sum = phi i8 [ 0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %channel, %channels
+br i1 %more, label %step, label %done step: %channel.offset = mul i32 %channel, %length %delta.index = add i32 %delta.base, %channel.offset %branch.index = add i32 %branch.base, %channel.offset
+%delta.ptr = getelementptr inbounds i8, ptr addrspace(1) %delta, i32 %delta.index %value = load i8, ptr addrspace(1) %delta.ptr, align 1
+%branch.ptr = getelementptr inbounds i8, ptr addrspace(1) %branch, i32 %branch.index %y = load i8, ptr addrspace(1) %branch.ptr, align 1
+%product = call i8 @recipe.mul(i8 %y, i8 %value) %sum.next = call i8 @recipe.add(i8 %sum, i8 %product) %channel.next = add i32 %channel, 1 br label %loop done:
+%adjoint.ptr = getelementptr inbounds i8, ptr addrspace(1) %adjoint, i32 %p %prior = load i8, ptr addrspace(1) %adjoint.ptr, align 1
+%total = call i8 @recipe.add(i8 %prior, i8 %sum) store i8 %total, ptr addrspace(1) %adjoint.ptr, align 1 ret void }
 define internal i8 @sigmoid(i8 %x) #1 { entry: %negative = call i8 @recipe.neg(i8 %x)
 %exponential = call i8 @recipe.exp(i8 %negative) %denominator = call i8 @recipe.add(i8 0, i8 %exponential)
 %value = call i8 @recipe.div(i8 0, i8 %denominator) ret i8 %value }
