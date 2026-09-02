@@ -134,3 +134,96 @@ fn q8_0_decodes_like_the_scalar_format() {
 	let _ = writeln!(summary, "gguf: {} tensors, {} metadata pairs", model.tensors().len(), model.metadata().len());
 	assert!(!summary.is_empty());
 }
+
+/// One f16 as f64.
+fn half(bits: u16) -> f64 {
+	let (sign, exponent, mantissa) = (bits >> 15, i32::from((bits >> 10) & 0x1f), f64::from(bits & 0x3ff));
+	let magnitude = if exponent == 0 { mantissa * 2_f64.powi(-24) } else { (1.0 + mantissa / 1024.0) * 2_f64.powi(exponent - 15) };
+	if sign == 1 { -magnitude } else { magnitude }
+}
+
+/// The IQ4 non-linear level table.
+const IQ4: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// Random blocks of IQ4_NL, IQ4_XS, and Q6_K with normal f16 scales, and the
+/// values a scalar reading of each format specification gives them.
+fn random_blocks(kind: u32, blocks: usize) -> (Vec<u8>, Vec<f64>) {
+	let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(kind);
+	let mut byte = move || {
+		state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+		(state >> 56) as u8
+	};
+	let (mut bytes, mut expected) = (Vec::new(), Vec::new());
+	for _ in 0..blocks {
+		match kind {
+			20 => {
+				let d = u16::from_le_bytes([byte(), byte() & 0x3f | 0x04]);
+				let qs = (0..16).map(|_| byte()).collect::<Vec<_>>();
+				bytes.extend(d.to_le_bytes());
+				bytes.extend(&qs);
+				expected.extend((0..32).map(|i| half(d) * f64::from(IQ4[usize::from((qs[i % 16] >> (4 * (i / 16))) & 0xf)])));
+			}
+			23 => {
+				let d = u16::from_le_bytes([byte(), byte() & 0x3f | 0x04]);
+				let scales_h = u16::from_le_bytes([byte(), byte()]);
+				let scales_l = (0..4).map(|_| byte()).collect::<Vec<_>>();
+				let qs = (0..128).map(|_| byte()).collect::<Vec<_>>();
+				bytes.extend(d.to_le_bytes());
+				bytes.extend(scales_h.to_le_bytes());
+				bytes.extend(&scales_l);
+				bytes.extend(&qs);
+				for e in 0..256 {
+					let (ib, j) = (e / 32, e % 32);
+					let ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | ((((scales_h >> (2 * ib)) & 3) as u8) << 4);
+					let q = (qs[ib * 16 + j % 16] >> (4 * (j / 16))) & 0xf;
+					expected.push(half(d) * f64::from(i32::from(ls) - 32) * f64::from(IQ4[usize::from(q)]));
+				}
+			}
+			14 => {
+				let ql = (0..128).map(|_| byte()).collect::<Vec<_>>();
+				let qh = (0..64).map(|_| byte()).collect::<Vec<_>>();
+				let scales = (0..16).map(|_| byte()).collect::<Vec<_>>();
+				let d = u16::from_le_bytes([byte(), byte() & 0x3f | 0x04]);
+				bytes.extend(&ql);
+				bytes.extend(&qh);
+				bytes.extend(&scales);
+				bytes.extend(d.to_le_bytes());
+				for e in 0..256 {
+					let (h, group, l) = (e / 128, (e % 128) / 32, e % 32);
+					let low = (ql[h * 64 + l + 32 * (group % 2)] >> (4 * (group / 2))) & 0xf;
+					let high = (qh[h * 32 + l] >> (2 * group)) & 3;
+					let q = i32::from(low | (high << 4)) - 32;
+					expected.push(half(d) * f64::from(scales[e / 16] as i8) * f64::from(q));
+				}
+			}
+			other => panic!("no generator for GGML type {other}"),
+		}
+	}
+	(bytes, expected)
+}
+
+#[test]
+fn iq4_nl_iq4_xs_and_q6_k_decode_like_the_scalar_format() {
+	let cases = [("iq4_nl", 20, 32, 18), ("iq4_xs", 23, 256, 136), ("q6_k", 14, 256, 210)];
+	let generated = cases.iter().map(|(_, kind, _, _)| random_blocks(*kind, 3)).collect::<Vec<_>>();
+	let tensors = cases.iter().zip(&generated).map(|((name, kind, block, _), (bytes, _))| (*name, *kind, vec![*block as u64, 3], bytes.clone())).collect::<Vec<_>>();
+	let path = std::env::temp_dir().join(format!("recipe-gguf-layouts-{}.gguf", std::process::id()));
+	write_gguf(&path, &[("general.architecture", "recipe")], &tensors);
+	let model = recipe.gguf(&path);
+	let _ = std::fs::remove_file(&path);
+	for ((name, kind, block, stride), (bytes, expected)) in cases.iter().zip(&generated) {
+		let tensor = model.tensor(name).unwrap();
+		assert_eq!((tensor.kind, tensor.bytes), (*kind, 3 * stride), "{name} descriptor differs");
+		assert_eq!(model.data(tensor), &bytes[..], "{name} maps the wrong bytes");
+		let values = model.values(tensor).unwrap();
+		assert_eq!(values.len(), 3 * block, "{name} decodes the wrong count");
+		let differing = values
+			.iter()
+			.zip(expected)
+			.enumerate()
+			.filter(|(_, (value, expected))| value.to_bits() != expected.to_bits())
+			.map(|(index, (value, expected))| format!("[{index}] {value} != {expected}"))
+			.collect::<Vec<_>>();
+		assert!(differing.is_empty(), "{name} differs from the scalar decode at {} of {} values: {}", differing.len(), values.len(), differing[..differing.len().min(4)].join(", "));
+	}
+}
