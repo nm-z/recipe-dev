@@ -68,6 +68,20 @@ let values = ngram.lookup(&ids);
 ```
 
 N-gram embeddings from a host-resident table: `ngram.heads` heads each hash the bigram, and as many the trigram, of every token into their own row range of the `[width, rows]` tensor named by `ngram.table` (seeds from `ngram.seeds`, the context reset at the end-of-sequence id). The table stays mapped; only the addressed rows decode, in any quantization.
+## placement
+
+```text
+recipe --device amd0 --device cpu model.rs
+```
+
+```rust
+let placed = recipe.place("model.ogdl", &[5, 3]);
+let prediction = placed.infer(&input);
+placed.resident_bytes();
+placed.moved_bytes();
+```
+
+Inference layers across the selected devices: the split gives every device, in `--device` order, the blocks it takes. Each range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run. The CPU is always selectable after the accelerators.
 
 ## files
 

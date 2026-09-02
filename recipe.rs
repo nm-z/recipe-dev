@@ -5541,6 +5541,9 @@ mod bundle {
 	}
 	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let (_, graphs) = load_semantic(path)?;
+		infer_graphs(&graphs, input, forward)
+	}
+	pub(super) fn infer_graphs(graphs: &[SemanticGraph], input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
 		require(input.len() == first.inputs.len(), format!("model input expected {} values, received {}", first.inputs.len(), input.len()))?;
 		let mut values = first.inputs.iter().cloned().zip(input.iter().copied()).collect::<BTreeMap<_, _>>();
@@ -7350,6 +7353,114 @@ impl Recipe {
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
 }
+/// A saved model placed across the selected devices: contiguous block ranges,
+/// each on its own device, run in sequence with the stream moved at every hop.
+pub struct Placed {
+	graphs: Vec<bundle::SemanticGraph>,
+	split: Vec<usize>,
+	devices: &'static [&'static Gpu],
+	resident: Vec<usize>,
+	moved: usize,
+}
+/// The nodes of the blocks each device takes, rebased so every part is a graph
+/// of its own whose input is the previous part's output.
+fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
+	let (mut parts, mut start, mut first_block) = (Vec::new(), 0, 0);
+	for (device, blocks) in split.iter().enumerate() {
+		first_block += blocks;
+		let end = if device + 1 == split.len() { graph.nodes.len() } else { graph.nodes.iter().position(|node| node.block_index >= first_block).unwrap_or(graph.nodes.len()) };
+		require(end > start, format!("device {device} takes no blocks"))?;
+		let base = graph.nodes[start].offset;
+		let rebase = |node: &Node, index: i32, role: &str| match usize::try_from(index) {
+			Ok(from) if from >= start => Ok(index - start as i32),
+			Ok(from) if from + 1 == start && role == "source" => Ok(-1),
+			Err(_) if index == -1 && start == 0 => Ok(-1),
+			Err(_) if index != -1 => Ok(index),
+			_ => Err(RecipeError::new(format!("the split cuts a {role} connection into block {} from before block {}", node.block_index, graph.nodes[start].block_index))),
+		};
+		let nodes = graph.nodes[start..end]
+			.iter()
+			.map(|node| {
+				require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
+				Ok(Node { source: rebase(node, node.source, "source")?, second: rebase(node, node.second, "second")?, offset: node.offset - base, ..node.clone() })
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let last = &graph.nodes[end - 1];
+		let parameters = last.offset + last.parameters;
+		parts.push(Graph {
+			nodes,
+			parameters: graph.parameters[base..parameters].to_vec(),
+			frozen: graph.frozen[base..parameters].to_vec(),
+			programs: graph.programs.clone(),
+			stored: graph.stored[start..end].to_vec(),
+			input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
+			output: last.output,
+			source: (end - start) as i32 - 1,
+			state: TrainingState::default(),
+			block_index: last.block_index,
+			block_kind: last.block_kind,
+			lanes: graph.lanes,
+			rank: graph.rank,
+		});
+		start = end;
+	}
+	Ok(parts)
+}
+impl Recipe {
+	/// Place a saved model across the selected devices: `split` gives every
+	/// device, in `--device` order, the number of blocks it takes.
+	pub fn place(&self, path: impl AsRef<Path>, split: &[usize]) -> Placed {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		let devices = selected_gpus().unwrap_or_else(|error| panic!("{error}"));
+		let (_, graphs) = bundle::load_semantic(&path).unwrap_or_else(|error| panic!("{error}"));
+		assert!(split.len() == devices.len(), "the split names {} devices but {} are selected", split.len(), devices.len());
+		let (mut resident, mut moved) = (vec![0; devices.len()], 0);
+		for stored in &graphs {
+			let blocks = stored.model.blocks.len();
+			assert!(split.iter().sum::<usize>() == blocks, "the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>());
+			let mut placed = || -> Result<()> {
+				let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
+				let bytes = stored.precision.bytes();
+				for (index, part) in split_graph(&graph, split)?.iter().enumerate() {
+					resident[index] += part.parameters.len() * bytes;
+					if index + 1 < split.len() {
+						moved += part.output.elements() * bytes;
+					}
+				}
+				Ok(())
+			};
+			placed().unwrap_or_else(|error| panic!("{error}"));
+		}
+		Placed { graphs, split: split.to_vec(), devices, resident, moved }
+	}
+}
+impl Placed {
+	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
+		bundle::infer_graphs(&self.graphs, input, |stored, samples| self.forward(stored, samples)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn forward(&self, stored: &bundle::SemanticGraph, samples: &[f64]) -> Result<Vec<f64>> {
+		let graph = materialize_saved_graph(stored, samples, self.devices[0], Config::load()?)?;
+		let (mut stream, mut statistics) = (samples.to_vec(), 0);
+		for (part, device) in split_graph(&graph, &self.split)?.iter().zip(self.devices) {
+			let mut tape = NativeTape::new(part, &stream, &[], device, stored.precision, None)?;
+			let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+			tape.inject_bn_stats(stored.bn_stats.get(statistics..statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+			statistics += count;
+			tape.forward()?;
+			stream = tape.predictions()?;
+		}
+		Ok(stream)
+	}
+	/// Parameter bytes each device holds, in the model precision.
+	pub fn resident_bytes(&self) -> &[usize] {
+		&self.resident
+	}
+	/// Bytes one row moves across all hops.
+	pub fn moved_bytes(&self) -> usize {
+		self.moved
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {
 	channels: usize,
@@ -9812,12 +9923,12 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() {
-				if cfg!(any(amd, nvidia)) {
-					return Err(RecipeError::new(errors.join("; ")));
-				}
-				found.push(cpu_device()?);
+			if found.is_empty() && cfg!(any(amd, nvidia)) {
+				return Err(RecipeError::new(errors.join("; ")));
 			}
+			// The CPU is always selectable, after the accelerators, so a placement
+			// can end on the host.
+			found.push(cpu_device()?);
 			Ok(found)
 		})
 		.as_ref()
@@ -9829,7 +9940,7 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
+	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
 fn local_host() -> Result<String> {
