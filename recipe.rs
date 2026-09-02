@@ -2537,6 +2537,22 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Dconv) => {
+					let count = checked_mul(self.rows, node.output.elements(), "depthwise count")?;
+					emit_fixed_loop(&mut ir, index, "dconv", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							weights = pointers.weights,
+							value = pointers.value,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(reverse, Primitive::Rope) => {
 					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
@@ -2751,6 +2767,35 @@ impl NativeModelIr {
 							delta = pointers.delta,
 							length = node.output.length,
 							width = node.output.channels,
+							offset = node.offset
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Dconv) => {
+					let count = checked_mul(self.rows, node.output.elements(), "depthwise reverse count")?;
+					emit_fixed_loop(&mut ir, index, "dconv.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							pointer = pointer_type(backend),
+							weights = pointers.weights,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", node.parameters, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							delta = pointers.delta,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0],
 							offset = node.offset
 						));
 					})?;
@@ -4751,6 +4796,7 @@ mod bundle {
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
+			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4793,6 +4839,7 @@ mod bundle {
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
+			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -5444,6 +5491,7 @@ enum Operation {
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
 	Embed(usize, usize),
+	Dconv(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -5577,7 +5625,8 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
-	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width); }
+	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
+	fn dconv(kernel: usize) = Operation::Dconv(kernel); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -6910,6 +6959,7 @@ impl Operation {
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
+			Self::Dconv(_) => "dconv",
 		}
 	}
 }
@@ -7115,6 +7165,7 @@ enum Primitive {
 	Rope = 11,
 	TopK = 15,
 	Scale = 16,
+	Dconv = 17,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -7156,6 +7207,7 @@ impl Node {
 			Primitive::Rope => "Rope",
 			Primitive::TopK => "TopK",
 			Primitive::Scale => "Scale",
+			Primitive::Dconv => "Dconv",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -7248,7 +7300,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
+	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Dconv(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
@@ -7352,6 +7404,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
+		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
 		Operation::Attention(heads, rope) => lower_attention(graph, *heads, *rope)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -7570,6 +7623,12 @@ fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()>
 	require(graph.nodes.is_empty(), "embedding must be the first block: it reads token ids from the model input")?;
 	let output = Shape { channels: width, length: graph.output.elements() };
 	push_node(graph, Primitive::Gather, output, checked_mul(vocabulary, width, "embedding table")?, arguments(vocabulary as f64, width as f64), -2)
+}
+/// A causal depthwise convolution keeps the shape: every channel mixes its own
+/// last `kernel` positions with one tap each, left-padded with zeros.
+fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
+	require(kernel != 0, "depthwise convolution kernel must be positive")?;
+	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
 }
 fn lower_attention(graph: &mut Graph, heads: usize, rope: Option<(usize, u64)>) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
