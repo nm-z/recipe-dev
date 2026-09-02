@@ -29,7 +29,23 @@ struct Packet {
 	run: fn(&str) -> TrainingReport,
 }
 
-const PACKETS: &[Packet] = &[Packet { issue: 511, device: "cpu", run: packet_511 }, Packet { issue: 512, device: "cpu", run: packet_512 }, Packet { issue: 519, device: "cpu", run: packet_519 }];
+const PACKETS: &[Packet] = &[
+	Packet { issue: 511, device: "cpu", run: packet_511 },
+	Packet { issue: 512, device: "cpu", run: packet_512 },
+	Packet { issue: 515, device: "cpu", run: packet_515 },
+	Packet { issue: 519, device: "cpu", run: packet_519 },
+];
+
+/// Quantized nearest-neighbor and forest estimators on the z-scored text sample
+/// subfolders with int(1) arithmetic.
+fn packet_515(bundle: &str) -> TrainingReport {
+	let data = recipe.data("data/text/sample_subfolders").target("target").norm(z_score);
+	let model = recipe.model().knn(3).huber().iq(2).xxs.forest(2).leak().iq(2).xs.loss(rmse);
+	let report = recipe.train().optimizer(adamw).lr(0.001).seed(75147662717921).epochs(1).log(all).stop(0.0).int(1).save(bundle).run(&model, &data);
+	let output = recipe.infer(bundle, &[0.0; 87]);
+	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	report
+}
 
 /// Quantized residual convolution block feeding a random forest on the z-scored
 /// temporal chronological splits.
