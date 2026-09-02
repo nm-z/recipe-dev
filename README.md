@@ -38,6 +38,17 @@ Recipe measures each selected link and each device's gradient throughput before 
 
 `recipe --worker <device>` serves one local GPU over stdin and stdout. Recipe starts this transport entrypoint through SSH for a host-qualified selector. It is a protocol endpoint, not a model script invocation.
 
+## gguf
+
+```rust
+let model = recipe.gguf("model-00001-of-00004.gguf");
+model.value("general.architecture");
+model.tensors();
+model.values(model.tensor("blk.0.attn_q.weight").unwrap());
+```
+
+Every shard of a split is opened by name, the tensor data stays mapped, and quantized tensors decode through the same block decoders that read saved `.ogdl` models.
+
 ## files
 
 ```bash

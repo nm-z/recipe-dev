@@ -1,0 +1,102 @@
+gguf_ex_read_0: version:      3
+gguf_ex_read_0: alignment:   32
+gguf_ex_read_0: data offset: 1216
+gguf_ex_read_0: n_kv: 15
+gguf_ex_read_0: kv[0]: key = some.parameter.uint8
+gguf_ex_read_0: kv[1]: key = some.parameter.int8
+gguf_ex_read_0: kv[2]: key = some.parameter.uint16
+gguf_ex_read_0: kv[3]: key = some.parameter.int16
+gguf_ex_read_0: kv[4]: key = some.parameter.uint32
+gguf_ex_read_0: kv[5]: key = some.parameter.int32
+gguf_ex_read_0: kv[6]: key = some.parameter.float32
+gguf_ex_read_0: kv[7]: key = some.parameter.uint64
+gguf_ex_read_0: kv[8]: key = some.parameter.int64
+gguf_ex_read_0: kv[9]: key = some.parameter.float64
+gguf_ex_read_0: kv[10]: key = some.parameter.bool
+gguf_ex_read_0: kv[11]: key = some.parameter.string
+gguf_ex_read_0: kv[12]: key = some.parameter.arr.i16
+gguf_ex_read_0: kv[13]: key = some.parameter.arr.f32
+gguf_ex_read_0: kv[14]: key = some.parameter.arr.str
+gguf_ex_read_0: find key: some.parameter.string found, kv[11] value = hello world
+gguf_ex_read_0: n_tensors: 10
+gguf_ex_read_0: tensor[0]: name = tensor_0, size = 3024, offset = 0
+gguf_ex_read_0: tensor[1]: name = tensor_1, size = 20, offset = 3040
+gguf_ex_read_0: tensor[2]: name = tensor_2, size = 6720, offset = 3072
+gguf_ex_read_0: tensor[3]: name = tensor_3, size = 24, offset = 9792
+gguf_ex_read_0: tensor[4]: name = tensor_4, size = 360, offset = 9824
+gguf_ex_read_0: tensor[5]: name = tensor_5, size = 48, offset = 10208
+gguf_ex_read_0: tensor[6]: name = tensor_6, size = 12, offset = 10272
+gguf_ex_read_0: tensor[7]: name = tensor_7, size = 200, offset = 10304
+gguf_ex_read_0: tensor[8]: name = tensor_8, size = 4, offset = 10528
+gguf_ex_read_0: tensor[9]: name = tensor_9, size = 1792, offset = 10560
+gguf_ex_read_1: version:      3
+gguf_ex_read_1: alignment:   32
+gguf_ex_read_1: data offset: 1216
+gguf_ex_read_1: n_kv: 15
+gguf_ex_read_1: kv[0]: key = some.parameter.uint8
+gguf_ex_read_1: kv[1]: key = some.parameter.int8
+gguf_ex_read_1: kv[2]: key = some.parameter.uint16
+gguf_ex_read_1: kv[3]: key = some.parameter.int16
+gguf_ex_read_1: kv[4]: key = some.parameter.uint32
+gguf_ex_read_1: kv[5]: key = some.parameter.int32
+gguf_ex_read_1: kv[6]: key = some.parameter.float32
+gguf_ex_read_1: kv[7]: key = some.parameter.uint64
+gguf_ex_read_1: kv[8]: key = some.parameter.int64
+gguf_ex_read_1: kv[9]: key = some.parameter.float64
+gguf_ex_read_1: kv[10]: key = some.parameter.bool
+gguf_ex_read_1: kv[11]: key = some.parameter.string
+gguf_ex_read_1: kv[12]: key = some.parameter.arr.i16
+gguf_ex_read_1: kv[13]: key = some.parameter.arr.f32
+gguf_ex_read_1: kv[14]: key = some.parameter.arr.str
+gguf_ex_read_1: n_tensors: 10
+gguf_ex_read_1: tensor[0]: name = tensor_0, size = 3024, offset = 0, type = f32, n_elts = 756
+gguf_ex_read_1: tensor[1]: name = tensor_1, size = 20, offset = 3040, type = f32, n_elts = 5
+gguf_ex_read_1: tensor[2]: name = tensor_2, size = 6720, offset = 3072, type = f32, n_elts = 1680
+gguf_ex_read_1: tensor[3]: name = tensor_3, size = 24, offset = 9792, type = f32, n_elts = 6
+gguf_ex_read_1: tensor[4]: name = tensor_4, size = 360, offset = 9824, type = f32, n_elts = 90
+gguf_ex_read_1: tensor[5]: name = tensor_5, size = 48, offset = 10208, type = f32, n_elts = 12
+gguf_ex_read_1: tensor[6]: name = tensor_6, size = 12, offset = 10272, type = f32, n_elts = 3
+gguf_ex_read_1: tensor[7]: name = tensor_7, size = 200, offset = 10304, type = f32, n_elts = 50
+gguf_ex_read_1: tensor[8]: name = tensor_8, size = 4, offset = 10528, type = f32, n_elts = 1
+gguf_ex_read_1: tensor[9]: name = tensor_9, size = 1792, offset = 10560, type = f32, n_elts = 448
+gguf_ex_read_1: reading tensor 0 data
+gguf_ex_read_1: tensor[0]: n_dims = 4, ne = (4, 7, 9, 3), name = tensor_0, data = 0x55d58d4f4830
+tensor_0 data[:10] : 100.000000 100.000000 100.000000 100.000000 100.000000 100.000000 100.000000 100.000000 100.000000 100.000000 
+
+gguf_ex_read_1: reading tensor 1 data
+gguf_ex_read_1: tensor[1]: n_dims = 1, ne = (5, 1, 1, 1), name = tensor_1, data = 0x55d58d4f5410
+tensor_1 data[:10] : 101.000000 101.000000 101.000000 101.000000 101.000000 
+
+gguf_ex_read_1: reading tensor 2 data
+gguf_ex_read_1: tensor[2]: n_dims = 4, ne = (6, 4, 10, 7), name = tensor_2, data = 0x55d58d4f5430
+tensor_2 data[:10] : 102.000000 102.000000 102.000000 102.000000 102.000000 102.000000 102.000000 102.000000 102.000000 102.000000 
+
+gguf_ex_read_1: reading tensor 3 data
+gguf_ex_read_1: tensor[3]: n_dims = 2, ne = (3, 2, 1, 1), name = tensor_3, data = 0x55d58d4f6e70
+tensor_3 data[:10] : 103.000000 103.000000 103.000000 103.000000 103.000000 103.000000 
+
+gguf_ex_read_1: reading tensor 4 data
+gguf_ex_read_1: tensor[4]: n_dims = 2, ne = (9, 10, 1, 1), name = tensor_4, data = 0x55d58d4f6e90
+tensor_4 data[:10] : 104.000000 104.000000 104.000000 104.000000 104.000000 104.000000 104.000000 104.000000 104.000000 104.000000 
+
+gguf_ex_read_1: reading tensor 5 data
+gguf_ex_read_1: tensor[5]: n_dims = 3, ne = (1, 6, 2, 1), name = tensor_5, data = 0x55d58d4f7010
+tensor_5 data[:10] : 105.000000 105.000000 105.000000 105.000000 105.000000 105.000000 105.000000 105.000000 105.000000 105.000000 
+
+gguf_ex_read_1: reading tensor 6 data
+gguf_ex_read_1: tensor[6]: n_dims = 1, ne = (3, 1, 1, 1), name = tensor_6, data = 0x55d58d4f7050
+tensor_6 data[:10] : 106.000000 106.000000 106.000000 
+
+gguf_ex_read_1: reading tensor 7 data
+gguf_ex_read_1: tensor[7]: n_dims = 4, ne = (1, 10, 1, 5), name = tensor_7, data = 0x55d58d4f7070
+tensor_7 data[:10] : 107.000000 107.000000 107.000000 107.000000 107.000000 107.000000 107.000000 107.000000 107.000000 107.000000 
+
+gguf_ex_read_1: reading tensor 8 data
+gguf_ex_read_1: tensor[8]: n_dims = 1, ne = (1, 1, 1, 1), name = tensor_8, data = 0x55d58d4f7150
+tensor_8 data[:10] : 108.000000 
+
+gguf_ex_read_1: reading tensor 9 data
+gguf_ex_read_1: tensor[9]: n_dims = 4, ne = (2, 8, 7, 4), name = tensor_9, data = 0x55d58d4f7170
+tensor_9 data[:10] : 109.000000 109.000000 109.000000 109.000000 109.000000 109.000000 109.000000 109.000000 109.000000 109.000000 
+
+gguf_ex_read_1: ctx_data size: 16400
