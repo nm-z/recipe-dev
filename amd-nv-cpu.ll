@@ -986,6 +986,43 @@ br i1 %more, label %step, label %done step: %channel.offset = mul i32 %channel, 
 done: %per.row = mul i32 %experts, %length %weights.row = mul i32 %row, %per.row %expert.base = mul i32 %expert, %length %weight.row = add i32 %weights.row, %expert.base %weight.index = add i32 %weight.row, %position
 %adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %weight.index %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
 %total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
+; Output element %p of a [rows][width][length] batch is table row %id at one
+; channel, where %id is the i32 token at that row and position.
+define internal void @gather_forward_body( ptr addrspace(1) %ids, ptr addrspace(1) %table, ptr addrspace(1) %output,
+i32 %p, i32 %length, i32 %width ) #1 { entry: %per.row = mul i32 %width, %length %row = udiv i32 %p, %per.row
+%within = urem i32 %p, %per.row %channel = udiv i32 %within, %length %position = urem i32 %within, %length
+%row.tokens = mul i32 %row, %length %token = add i32 %row.tokens, %position
+%id.ptr = getelementptr inbounds i32, ptr addrspace(1) %ids, i32 %token %id = load i32, ptr addrspace(1) %id.ptr, align 4
+%table.row = mul i32 %id, %width %table.index = add i32 %table.row, %channel
+%table.ptr = getelementptr inbounds double, ptr addrspace(1) %table, i32 %table.index
+%value = load double, ptr addrspace(1) %table.ptr, align 8
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+store double %value, ptr addrspace(1) %output.ptr, align 8 ret void }
+; One thread owns table row %v: it scans the tokens in order and adds the
+; adjoint of every token that read the row, so the sum is deterministic and
+; only the rows that were read touch their adjoints.
+define internal void @gather_reverse_body( ptr addrspace(1) %ids, ptr addrspace(1) %delta, ptr addrspace(1) %gradient,
+i32 %v, i32 %tokens, i32 %length, i32 %width, i32 %offset ) #1 { entry: %per.row = mul i32 %width, %length
+%row.base = mul i32 %v, %width %gradient.base = add i32 %offset, %row.base br label %zero.loop zero.loop:
+%zero.channel = phi i32 [ 0, %entry ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.channel, %width
+br i1 %zero.more, label %zero.step, label %token.loop zero.step: %zero.index = add i32 %gradient.base, %zero.channel
+%zero.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %zero.index
+store double 0.0, ptr addrspace(1) %zero.ptr, align 8 %zero.next = add i32 %zero.channel, 1 br label %zero.loop token.loop:
+%token = phi i32 [ 0, %zero.loop ], [ %token.next, %token.done ] %token.more = icmp ult i32 %token, %tokens
+br i1 %token.more, label %token.check, label %exit token.check:
+%id.ptr = getelementptr inbounds i32, ptr addrspace(1) %ids, i32 %token %id = load i32, ptr addrspace(1) %id.ptr, align 4
+%hit = icmp eq i32 %id, %v br i1 %hit, label %hit.entry, label %token.done hit.entry: %row = udiv i32 %token, %length
+%position = urem i32 %token, %length %row.offset = mul i32 %row, %per.row %delta.base = add i32 %row.offset, %position
+br label %channel.loop channel.loop: %channel = phi i32 [ 0, %hit.entry ], [ %channel.next, %channel.step ]
+%channel.more = icmp ult i32 %channel, %width br i1 %channel.more, label %channel.step, label %token.done channel.step:
+%channel.offset = mul i32 %channel, %length %delta.index = add i32 %delta.base, %channel.offset
+%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index
+%delta.value = load double, ptr addrspace(1) %delta.ptr, align 8 %gradient.index = add i32 %gradient.base, %channel
+%gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index
+%current = load double, ptr addrspace(1) %gradient.ptr, align 8
+%updated = call double @recipe.add(double %current, double %delta.value)
+store double %updated, ptr addrspace(1) %gradient.ptr, align 8 %channel.next = add i32 %channel, 1 br label %channel.loop
+token.done: %token.next = add i32 %token, 1 br label %token.loop exit: ret void }
 define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
 %exponential = call double @recipe.exp(double %negative) %denominator = call double @recipe.add(double 1.0, double %exponential)
 %value = call double @recipe.div(double 1.0, double %denominator) ret double %value }

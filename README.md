@@ -70,13 +70,14 @@ cli.rs          cli options
 test.rs         combo testing
 ```
 
-## 18 thingys:
+## 19 thingys:
 ```rust
 weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)
 	perc(width)
+	embed(vocab, width)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
@@ -103,6 +104,8 @@ estimators:
 Feature generation is banned.
 
 `moe` scores every position with one `[width, experts]` router, keeps the `topk` experts under a softmax over the kept scores, and sums the expert outputs under those weights.
+
+`embed` must be the first block. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The table is stored in any quantization and only the addressed rows are read per token.
 
 ## 15 activations
 

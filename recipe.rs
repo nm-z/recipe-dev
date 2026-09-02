@@ -2522,6 +2522,21 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Gather) => {
+					let count = checked_mul(self.rows, node.output.elements(), "gather output count")?;
+					emit_fixed_loop(&mut ir, index, "gather", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @gather_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {length}, i32 {width} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							weights = pointers.weights,
+							value = pointers.value,
+							length = node.output.length,
+							width = node.output.channels
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -2703,6 +2718,22 @@ impl NativeModelIr {
 							length = node.output.length,
 							experts = node.argument[1],
 							expert = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Gather) => {
+					let vocabulary = integer_argument(node.argument[0], "gather vocabulary")? as usize;
+					let tokens = checked_mul(self.rows, node.output.length, "gather tokens")?;
+					emit_fixed_loop(&mut ir, index, "gather.reverse", vocabulary, |ir, p| {
+						ir.push_str(&format!(
+							"call void @gather_reverse_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 {tokens}, i32 {length}, i32 {width}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							delta = pointers.delta,
+							length = node.output.length,
+							width = node.output.channels,
+							offset = node.offset
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -4700,6 +4731,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
+			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4734,6 +4766,7 @@ mod bundle {
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
+			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -5384,6 +5417,7 @@ enum Operation {
 	Residual(Vec<Residual>),
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
+	Embed(usize, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -5516,7 +5550,8 @@ impl Model {
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
-	fn perc(width: usize) = Operation::Perceptron(width); }
+	fn perc(width: usize) = Operation::Perceptron(width);
+	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -6836,6 +6871,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
+			Self::Embed(..) => "embed",
 		}
 	}
 }
@@ -7037,6 +7073,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Gather = 10,
 	TopK = 15,
 	Scale = 16,
 }
@@ -7076,6 +7113,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Gather => "Gather",
 			Primitive::TopK => "TopK",
 			Primitive::Scale => "Scale",
 		};
@@ -7273,6 +7311,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
+		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Attention(heads) => lower_attention(graph, *heads)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -7486,6 +7525,12 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
+fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()> {
+	require(vocabulary != 0 && width != 0, "embedding dimensions must be positive")?;
+	require(graph.nodes.is_empty(), "embedding must be the first block: it reads token ids from the model input")?;
+	let output = Shape { channels: width, length: graph.output.elements() };
+	push_node(graph, Primitive::Gather, output, checked_mul(vocabulary, width, "embedding table")?, arguments(vocabulary as f64, width as f64), -2)
+}
 fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
 	let input = graph.output;
@@ -7632,7 +7677,8 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		if matches!(node.op, Primitive::Elementwise | Primitive::Normalize) {
 			continue;
 		}
-		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
+		// An embedding row feeds the next block with its width, not with the vocabulary.
+		let fan_in = if node.op == Primitive::Gather { node.output.channels } else { (node.parameters / node.output.channels.max(1)).max(1) } as f64;
 		let scale = config.initial / fan_in.sqrt();
 		for index in node.offset..node.offset + node.parameters {
 			if graph.frozen[index] == 0 {
@@ -7912,6 +7958,18 @@ impl NativeTape {
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
+		// A graph that starts with a gather reads its input as i32 token ids.
+		let samples = match graph.nodes.first().filter(|node| node.op == Primitive::Gather) {
+			Some(node) => {
+				let vocabulary = node.argument[0];
+				let ids = samples
+					.iter()
+					.map(|id: &f64| require(id.fract() == 0.0 && *id >= 0.0 && *id < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32))
+					.collect::<Result<Vec<_>>>()?;
+				Buffer::upload(gpu, &ids)?
+			}
+			None => Buffer::upload_float(gpu, samples, precision.model)?,
+		};
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
@@ -7930,7 +7988,7 @@ impl NativeTape {
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision.model)?,
+			samples,
 			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,

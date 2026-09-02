@@ -27,8 +27,9 @@ fn report(text: String) {
 /// Rows and columns are prime-adjacent on purpose: they force partial M, N, and
 /// K tiles, a partial register block, and a partition count that does not divide
 /// the element count evenly.
-fn dataset(rows: usize, columns: usize) -> std::path::PathBuf {
-	let path = std::env::temp_dir().join(format!("recipe-determinism-{rows}x{columns}.csv"));
+/// With `ids` the columns are token ids below 4099 rather than reals.
+fn dataset(rows: usize, columns: usize, ids: bool) -> std::path::PathBuf {
+	let path = std::env::temp_dir().join(format!("recipe-determinism-{rows}x{columns}{}.csv", if ids { "-ids" } else { "" }));
 	if path.exists() {
 		return path;
 	}
@@ -44,7 +45,11 @@ fn dataset(rows: usize, columns: usize) -> std::path::PathBuf {
 	text.push_str("y\n");
 	for _ in 0..rows {
 		for _ in 0..columns {
-			let _ = write!(text, "{:.6},", random());
+			if ids {
+				let _ = write!(text, "{},", ((random() + 1.0) * 2049.5) as usize);
+			} else {
+				let _ = write!(text, "{:.6},", random());
+			}
 		}
 		let _ = writeln!(text, "{:.6}", random());
 	}
@@ -76,6 +81,9 @@ const CASES: &[Case] = &[
 	Case { name: "deep-iq4nl", shape: "deep-iq4nl", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "deep-iq4xs", shape: "deep-iq4xs", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "deep-q6k", shape: "deep-q6k", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "embed", shape: "embed", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "embed-fp16", shape: "embed", precision: "fp16", rows: 131, columns: 17 },
+	Case { name: "embed-iq4xs", shape: "embed-iq4xs", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter", shape: "prelu", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter-bf16", shape: "prelu", precision: "bf16", rows: 131, columns: 17 },
 	Case { name: "transcendental-tanh", shape: "tanh", precision: "fp32", rows: 131, columns: 17 },
@@ -108,6 +116,8 @@ fn build(case: &Case) -> Model {
 		"deep-iq4nl" => recipe.model().layer(9).relu().iq(4).nl.layer(5).relu().iq(4).nl.layer(1).iq(4).nl.loss(mse),
 		"deep-iq4xs" => recipe.model().layer(9).relu().iq(4).xs.layer(5).relu().iq(4).xs.layer(1).iq(4).xs.loss(mse),
 		"deep-q6k" => recipe.model().layer(9).relu().qi(6).k.layer(5).relu().qi(6).k.layer(1).qi(6).k.loss(mse),
+		"embed" => recipe.model().embed(4099, 6).layer(5).relu().layer(1).loss(mse),
+		"embed-iq4xs" => recipe.model().embed(4099, 6).iq(4).xs.layer(5).relu().layer(1).loss(mse),
 		"prelu" => recipe.model().layer(9).prelu().layer(5).prelu().layer(1).loss(mse),
 		"tanh" => recipe.model().layer(9).tanh().layer(5).tanh().layer(1).loss(mse),
 		"gelu" => recipe.model().layer(9).gelu().layer(5).gelu().layer(1).loss(mse),
@@ -204,7 +214,7 @@ fn stable_bundle(path: &std::path::Path) -> Vec<u8> {
 
 fn run(case: &Case) -> Evidence {
 	let bundle = std::env::temp_dir().join(format!("recipe-determinism-{}-{}.ogdl", case.name, std::process::id()));
-	let data = recipe.data(dataset(case.rows, case.columns).to_string_lossy().as_ref()).target("y");
+	let data = recipe.data(dataset(case.rows, case.columns, case.shape.starts_with("embed")).to_string_lossy().as_ref()).target("y");
 	// The persistence case trains, saves, reloads the bundle, trains again, and
 	// saves again, so the evidence covers the save, reload, resume, and rerun
 	// path rather than one uninterrupted run.
