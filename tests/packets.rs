@@ -29,7 +29,18 @@ struct Packet {
 	run: fn(&str) -> TrainingReport,
 }
 
-const PACKETS: &[Packet] = &[Packet { issue: 519, device: "cpu", run: packet_519 }];
+const PACKETS: &[Packet] = &[Packet { issue: 511, device: "cpu", run: packet_511 }, Packet { issue: 519, device: "cpu", run: packet_519 }];
+
+/// Quantized residual layer and convolution blocks with batch normalization on
+/// the z-scored temporal chronological splits.
+fn packet_511(bundle: &str) -> TrainingReport {
+	let data = recipe.data("data/temporal/chronological_splits").target("target").norm(z_score);
+	let model = recipe.model().layer(8).res([layer(8), layer(8)]).cos().norm(batch).qi(5).0.layer(8).res([conv(8, 1), conv(8, 1)]).norm(batch).iq(2).xxs.loss(huber);
+	let report = recipe.train().optimizer(adamw).lr(0.0001).seed(39864877594399).epochs(1).log(all).f(6, 9).save(bundle).run(&model, &data);
+	let output = recipe.infer(bundle, &[0.0; 20]);
+	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	report
+}
 
 /// Quantized layer and pool model on the temporal chronological splits.
 fn packet_519(bundle: &str) -> TrainingReport {
