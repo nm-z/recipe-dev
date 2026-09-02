@@ -7460,6 +7460,134 @@ impl Placed {
 		self.moved
 	}
 }
+/// One id at a time from a model's logits: a repetition penalty over the
+/// recent ids, then top-k, top-p, min-p, temperature, and a seeded draw.
+/// Temperature zero is greedy.
+pub struct Sampler {
+	temperature: f64,
+	top_k: usize,
+	top_p: f64,
+	min_p: f64,
+	penalty: f64,
+	window: usize,
+	state: u64,
+}
+impl Sampler {
+	pub fn temperature(mut self, value: f64) -> Self {
+		self.temperature = value;
+		self
+	}
+	/// Keep the `count` highest logits; zero keeps every id.
+	pub fn top_k(mut self, count: usize) -> Self {
+		self.top_k = count;
+		self
+	}
+	/// Keep the smallest set of ids whose probability sums to at least `mass`.
+	pub fn top_p(mut self, mass: f64) -> Self {
+		self.top_p = mass;
+		self
+	}
+	/// Drop ids whose probability is below `ratio` times the highest.
+	pub fn min_p(mut self, ratio: f64) -> Self {
+		self.min_p = ratio;
+		self
+	}
+	/// Divide positive logits of the last `window` ids by `penalty`, and
+	/// multiply negative ones.
+	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
+		(self.penalty, self.window) = (penalty, window);
+		self
+	}
+	pub fn seed(mut self, seed: u64) -> Self {
+		self.state = seed;
+		self
+	}
+	pub fn sample(&mut self, logits: &[f64], history: &[u32]) -> u32 {
+		assert!(!logits.is_empty(), "sampler received no logits");
+		let mut candidates = logits.iter().copied().enumerate().map(|(id, logit)| (id as u32, logit)).collect::<Vec<_>>();
+		for id in history.iter().rev().take(self.window) {
+			let logit = &mut candidates[*id as usize].1;
+			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
+		}
+		candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+		if self.temperature <= 0.0 {
+			return candidates[0].0;
+		}
+		if self.top_k != 0 {
+			candidates.truncate(self.top_k);
+		}
+		let probabilities = |candidates: &[(u32, f64)], temperature: f64| {
+			let weights = candidates.iter().map(|(_, logit)| ((logit - candidates[0].1) / temperature).exp()).collect::<Vec<_>>();
+			let total = weights.iter().sum::<f64>();
+			weights.into_iter().map(|weight| weight / total).collect::<Vec<_>>()
+		};
+		let mass = probabilities(&candidates, 1.0);
+		let mut kept = 1;
+		let mut cumulative = mass[0];
+		while kept < candidates.len() && cumulative < self.top_p && mass[kept] >= self.min_p * mass[0] {
+			cumulative += mass[kept];
+			kept += 1;
+		}
+		candidates.truncate(kept);
+		let mass = probabilities(&candidates, self.temperature);
+		self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		let mut draw = (self.state >> 11) as f64 / (1_u64 << 53) as f64;
+		for (candidate, probability) in candidates.iter().zip(&mass) {
+			if draw < *probability {
+				return candidate.0;
+			}
+			draw -= probability;
+		}
+		candidates.last().unwrap().0
+	}
+}
+/// What `decode` produced: the prompt followed by the generated ids, the
+/// seconds of the first forward, and the seconds of each later step.
+pub struct Generation {
+	pub ids: Vec<u32>,
+	pub prefill_seconds: f64,
+	pub step_seconds: Vec<f64>,
+}
+impl Recipe {
+	pub fn sampler(&self) -> Sampler {
+		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15 }
+	}
+	/// Autoregressive decode over a saved model whose inputs are a window of ids
+	/// and whose outputs are one logit per id. Every step feeds the last window
+	/// of ids, samples one id, and stops at a `stop` id or after `budget` ids.
+	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		let (_, graphs) = bundle::load_semantic(&path).unwrap_or_else(|error| panic!("{error}"));
+		let window = graphs.first().map_or(0, |graph| graph.inputs.len());
+		assert!(window != 0 && prompt.len() >= window, "decode prompt holds {} ids but the model window is {window}", prompt.len());
+		let forward = |stored: &bundle::SemanticGraph, samples: &[f64]| {
+			let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			tape.inject_bn_stats(&stored.bn_stats)?;
+			tape.forward()?;
+			tape.predictions()
+		};
+		let mut generation = Generation { ids: prompt.to_vec(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+		for step in 0..budget {
+			let started = std::time::Instant::now();
+			let input = generation.ids[generation.ids.len() - window..].iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+			let logits = bundle::infer_graphs(&graphs, &input, forward).unwrap_or_else(|error| panic!("{error}"));
+			let id = sampler.sample(&logits, &generation.ids);
+			let seconds = started.elapsed().as_secs_f64();
+			if step == 0 {
+				generation.prefill_seconds = seconds;
+			} else {
+				generation.step_seconds.push(seconds);
+			}
+			generation.ids.push(id);
+			if stop.contains(&id) {
+				break;
+			}
+		}
+		generation
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {

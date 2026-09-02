@@ -82,6 +82,17 @@ placed.moved_bytes();
 ```
 
 Inference layers across the selected devices: the split gives every device, in `--device` order, the blocks it takes. Each range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run. The CPU is always selectable after the accelerators.
+## decode
+
+```rust
+let mut sampler = recipe.sampler().temperature(0.8).top_k(40).top_p(0.95).repeat(1.1, 64).seed(7);
+let generation = recipe.decode("model.ogdl", &prompt_ids, &mut sampler, &[eos], 64);
+generation.ids;
+generation.prefill_seconds;
+generation.step_seconds;
+```
+
+The model takes a window of ids and returns one logit per id. Every step feeds the last window, samples one id (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy), and stops at a stop id or the budget.
 
 ## files
 
