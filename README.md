@@ -49,6 +49,20 @@ Every shard of a split is opened by name and the tensor data stays mapped. A
 quantized tensor binds to the tape in its own GGML layout, so the contraction
 reads the mapped bytes through the block decoders that read saved `.ogdl` models.
 
+## tokenizer
+
+```rust
+let tokenizer = recipe.gguf("model.gguf").tokenizer();
+let ids = tokenizer.encode("Hello, world");
+let text = tokenizer.decode(&ids);
+tokenizer.bos(); tokenizer.eos(); tokenizer.pad();
+tokenizer.chat(&[("system", "Be brief."), ("user", "Hi")], true);
+```
+
+A byte-level BPE tokenizer built from the GGUF metadata alone: `tokenizer.ggml.tokens`, `token_type`, the special ids, and the pre-tokenizer family named by `tokenizer.ggml.pre` (the GPT-2, Llama 3, and Qwen 2 regex families). Pieces rank by `tokenizer.ggml.merges` when the file lists merges and by `tokenizer.ggml.scores` when it ranks each piece on its own, so both spellings of a vocabulary run the same merge loop. Control and user-defined tokens are matched whole, longest first, and no merge ever spells one out of ordinary pieces. `encode` frames the ids with the sequence tokens `add_bos_token` and `add_eos_token` ask for, and `decode` rejoins bytes split across tokens.
+
+`chat` renders `tokenizer.chat_template` for a conversation of role and content pairs, in the Jinja subset the common templates use: `{% for %}` over `messages`, `{% if %}`/`{% elif %}`/`{% else %}` with `==`, `!=` and `not`, `{{ }}` substitution of `bos_token`, `eos_token`, `add_generation_prompt` and the message fields, and the `-` whitespace controls. Anything outside that subset is named in an error rather than ignored.
+
 ## files
 
 ```bash

@@ -4017,6 +4017,10 @@ mod gguf {
 			let shard = &self.shards[tensor.shard];
 			&shard.mapping.bytes()[shard.data + tensor.offset..shard.data + tensor.offset + tensor.bytes]
 		}
+		/// The byte-level BPE tokenizer the metadata describes.
+		pub fn tokenizer(&self) -> super::Tokenizer {
+			super::Tokenizer::from_gguf(self).unwrap_or_else(|error| panic!("{error}"))
+		}
 		/// The tensor's elements decoded to f64, dequantizing block formats through
 		/// the same decoders the saved-model path uses.
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
@@ -4056,6 +4060,547 @@ mod gguf {
 	}
 }
 pub use gguf::{Gguf, GgufTensor, GgufValue};
+mod tokenizer {
+	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
+	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
+	//! special ids, and the chat template.
+	use super::{Gguf, GgufValue, RecipeError, Result, require};
+	use std::collections::HashMap;
+
+	/// The pre-tokenizer alternation that cuts text into words before merging.
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum Family {
+		Gpt2,
+		Llama3,
+		Qwen2,
+	}
+
+	fn letter(value: char) -> bool {
+		value.is_alphabetic()
+	}
+	fn number(value: char) -> bool {
+		value.is_numeric()
+	}
+	fn space(value: char) -> bool {
+		value.is_whitespace()
+	}
+	fn newline(value: char) -> bool {
+		value == '\r' || value == '\n'
+	}
+	fn other(value: char) -> bool {
+		!space(value) && !letter(value) && !number(value)
+	}
+	fn run(chars: &[char], at: usize, class: fn(char) -> bool) -> usize {
+		chars[at.min(chars.len())..].iter().take_while(|value| class(**value)).count()
+	}
+	/// `'s|'t|'re|'ve|'m|'ll|'d`, case-insensitive for the newer families.
+	fn contraction(chars: &[char], at: usize, insensitive: bool) -> usize {
+		if chars.get(at) != Some(&'\'') {
+			return 0;
+		}
+		let same = |index: usize, expected: char| chars.get(at + index).is_some_and(|value| if insensitive { value.to_ascii_lowercase() == expected } else { *value == expected });
+		["s", "t", "re", "ve", "m", "ll", "d"].iter().find(|suffix| suffix.chars().enumerate().all(|(index, expected)| same(1 + index, expected))).map_or(0, |suffix| 1 + suffix.len())
+	}
+	/// `\s+(?!\S)`: a whitespace run that leaves its last character to the
+	/// following word unless it ends the text.
+	fn trailing_space(chars: &[char], at: usize) -> usize {
+		let count = run(chars, at, space);
+		if count == 0 {
+			0
+		} else if at + count == chars.len() {
+			count
+		} else {
+			count - 1
+		}
+	}
+
+	impl Family {
+		fn named(pre: &str) -> Result<Self> {
+			Ok(match pre {
+				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
+				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
+				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
+				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
+			})
+		}
+		/// The length in characters of the word that starts at `at`.
+		fn word(self, chars: &[char], at: usize) -> usize {
+			let space_prefix = usize::from(chars[at] == ' ');
+			let prefixed = |class: fn(char) -> bool| {
+				let count = run(chars, at + space_prefix, class);
+				if count == 0 { 0 } else { space_prefix + count }
+			};
+			if self == Self::Gpt2 {
+				let count = contraction(chars, at, false);
+				if count != 0 {
+					return count;
+				}
+				for class in [letter, number, other] {
+					let count = prefixed(class);
+					if count != 0 {
+						return count;
+					}
+				}
+			} else {
+				let count = contraction(chars, at, true);
+				if count != 0 {
+					return count;
+				}
+				// [^\r\n\p{L}\p{N}]?\p{L}+
+				let prefix = usize::from(!newline(chars[at]) && !letter(chars[at]) && !number(chars[at]));
+				let count = run(chars, at + prefix, letter);
+				if count != 0 {
+					return prefix + count;
+				}
+				// \p{N}{1,3} for llama3, \p{N} for qwen2
+				let count = run(chars, at, number).min(if self == Self::Llama3 { 3 } else { 1 });
+				if count != 0 {
+					return count;
+				}
+				// ?[^\s\p{L}\p{N}]+[\r\n]*
+				let count = prefixed(other);
+				if count != 0 {
+					return count + run(chars, at + count, newline);
+				}
+				// \s*[\r\n]+
+				let spaces = run(chars, at, space);
+				if let Some(last) = (0..spaces).rev().find(|index| newline(chars[at + index])) {
+					return last + 1;
+				}
+			}
+			let count = trailing_space(chars, at);
+			if count != 0 {
+				return count;
+			}
+			run(chars, at, space).max(1)
+		}
+		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+			let (offsets, chars): (Vec<usize>, Vec<char>) = text.char_indices().unzip();
+			let (mut at, mut words) = (0, Vec::new());
+			while at < chars.len() {
+				let next = at + self.word(&chars, at);
+				words.push(&text[offsets[at]..offsets.get(next).copied().unwrap_or(text.len())]);
+				at = next;
+			}
+			words
+		}
+	}
+
+	/// The GPT-2 byte map: printable Latin-1 bytes stay themselves, the rest
+	/// take the code points from U+0100 upward in byte order.
+	fn byte_map() -> [char; 256] {
+		let mut map = ['\0'; 256];
+		let mut next = 0x100;
+		for byte in 0..=255_u8 {
+			let printable = (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174;
+			map[usize::from(byte)] = if printable {
+				char::from(byte)
+			} else {
+				next += 1;
+				char::from_u32(next - 1).unwrap()
+			};
+		}
+		map
+	}
+
+	/// Where the vocabulary ranks its pieces: the merge list names each pair and
+	/// its rank, while scores rank every piece on their own, best first.
+	enum Ranks {
+		Merges(HashMap<(u32, u32), (u32, u32)>),
+		Scores(Vec<u32>),
+	}
+
+	/// Piece ranks from `tokenizer.ggml.scores`, the highest score merging first.
+	fn ranked(scores: &[GgufValue], vocabulary: usize) -> Result<Vec<u32>> {
+		require(scores.len() == vocabulary, format!("tokenizer.ggml.scores holds {} scores for {vocabulary} tokens", scores.len()))?;
+		let scores = scores
+			.iter()
+			.map(|item| match *item {
+				GgufValue::F32(score) => Ok(score),
+				GgufValue::F64(score) => Ok(score as f32),
+				_ => Err(RecipeError::new("tokenizer.ggml.scores holds a non-float")),
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let mut order = (0..scores.len()).collect::<Vec<_>>();
+		order.sort_by(|left, right| scores[*right].total_cmp(&scores[*left]).then(left.cmp(right)));
+		let mut ranks = vec![0; scores.len()];
+		for (rank, id) in order.into_iter().enumerate() {
+			ranks[id] = rank as u32;
+		}
+		Ok(ranks)
+	}
+
+	pub struct Tokenizer {
+		tokens: Vec<String>,
+		ids: HashMap<String, u32>,
+		ranks: Ranks,
+		added: Vec<(String, u32)>,
+		is_added: Vec<bool>,
+		bytes: [u32; 256],
+		byte_of: HashMap<char, u8>,
+		family: Family,
+		template: Option<String>,
+		add_bos: bool,
+		add_eos: bool,
+		bos: Option<u32>,
+		eos: Option<u32>,
+		pad: Option<u32>,
+	}
+
+	impl Tokenizer {
+		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
+			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
+			let kind = text("tokenizer.ggml.model")?;
+			require(kind == "gpt2", format!("tokenizer model {kind:?} is not byte-level BPE"))?;
+			let family = Family::named(text("tokenizer.ggml.pre")?)?;
+			let array = |key: &str| match model.value(key) {
+				Some(GgufValue::Array(items)) => Ok(items.as_slice()),
+				_ => Err(RecipeError::new(format!("{key} is absent"))),
+			};
+			let tokens = array("tokenizer.ggml.tokens")?
+				.iter()
+				.map(|item| item.text().map(str::to_owned).ok_or_else(|| RecipeError::new("tokenizer.ggml.tokens holds a non-string")))
+				.collect::<Result<Vec<_>>>()?;
+			let ids = tokens.iter().enumerate().map(|(id, token)| (token.clone(), id as u32)).collect::<HashMap<_, _>>();
+			let id = |token: &str| ids.get(token).copied().ok_or_else(|| RecipeError::new(format!("token {token:?} is absent from the vocabulary")));
+			let ranks = match (array("tokenizer.ggml.merges"), array("tokenizer.ggml.scores")) {
+				(Ok(list), _) => {
+					let mut merges = HashMap::new();
+					for (rank, merge) in list.iter().enumerate() {
+						let merge = merge.text().ok_or_else(|| RecipeError::new("tokenizer.ggml.merges holds a non-string"))?;
+						let (left, right) = merge.split_once(' ').ok_or_else(|| RecipeError::new(format!("merge {merge:?} has no pair")))?;
+						merges.insert((id(left)?, id(right)?), (rank as u32, id(&format!("{left}{right}"))?));
+					}
+					Ranks::Merges(merges)
+				}
+				(_, Ok(scores)) => Ranks::Scores(ranked(scores, tokens.len())?),
+				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
+			};
+			let map = byte_map();
+			let mut bytes = [0; 256];
+			for (byte, symbol) in map.iter().enumerate() {
+				bytes[byte] = id(&symbol.to_string())?;
+			}
+			// Control and user-defined tokens are the added tokens: `encode` matches
+			// them whole and no merge ever spells one out of ordinary pieces.
+			let types = array("tokenizer.ggml.token_type").ok();
+			let kind = |index: usize| types.and_then(|types| types.get(index)).and_then(GgufValue::integer);
+			let mut added = tokens.iter().enumerate().filter(|(index, _)| matches!(kind(*index), Some(3 | 4))).map(|(index, token)| (token.clone(), index as u32)).collect::<Vec<_>>();
+			added.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+			let mut is_added = vec![false; tokens.len()];
+			for (_, id) in &added {
+				is_added[*id as usize] = true;
+			}
+			let special_id = |key: &str| model.value(key).and_then(GgufValue::integer).map(|value| value as u32);
+			let flag = |key: &str| matches!(model.value(key), Some(GgufValue::Bool(true)));
+			Ok(Self {
+				byte_of: map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect(),
+				ids,
+				ranks,
+				added,
+				is_added,
+				bytes,
+				family,
+				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
+				add_bos: flag("tokenizer.ggml.add_bos_token"),
+				add_eos: flag("tokenizer.ggml.add_eos_token"),
+				bos: special_id("tokenizer.ggml.bos_token_id"),
+				eos: special_id("tokenizer.ggml.eos_token_id"),
+				pad: special_id("tokenizer.ggml.padding_token_id"),
+				tokens,
+			})
+		}
+		pub fn bos(&self) -> Option<u32> {
+			self.bos
+		}
+		pub fn eos(&self) -> Option<u32> {
+			self.eos
+		}
+		pub fn pad(&self) -> Option<u32> {
+			self.pad
+		}
+		pub fn vocabulary(&self) -> usize {
+			self.tokens.len()
+		}
+		/// The token's text in the byte-map alphabet, as the vocabulary spells it.
+		pub fn token(&self, id: u32) -> &str {
+			&self.tokens[id as usize]
+		}
+		/// Token ids for `text`, framed by the beginning- and end-of-sequence ids
+		/// when the model asks for them. Added tokens written out in the text are
+		/// matched whole, longest first, before the pre-tokenizer sees the rest.
+		pub fn encode(&self, text: &str) -> Vec<u32> {
+			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			let (mut start, mut at) = (0, 0);
+			while at < text.len() {
+				if let Some((added, id)) = self.added.iter().find(|(added, _)| text[at..].starts_with(added.as_str())) {
+					self.encode_plain(&text[start..at], &mut output);
+					output.push(*id);
+					at += added.len();
+					start = at;
+				} else {
+					at += text[at..].chars().next().map_or(1, char::len_utf8);
+				}
+			}
+			self.encode_plain(&text[start..], &mut output);
+			output.extend(self.eos.filter(|_| self.add_eos));
+			output
+		}
+		/// The rank and id of the piece that joins `left` to `right`, the lowest
+		/// rank merging first. A merge never spells an added token.
+		fn merge(&self, left: u32, right: u32) -> Option<(u32, u32)> {
+			let (rank, merged) = match &self.ranks {
+				Ranks::Merges(merges) => *merges.get(&(left, right))?,
+				Ranks::Scores(ranks) => {
+					let merged = *self.ids.get(&format!("{}{}", self.tokens[left as usize], self.tokens[right as usize]))?;
+					(ranks[merged as usize], merged)
+				}
+			};
+			(!self.is_added[merged as usize]).then_some((rank, merged))
+		}
+		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+			for word in self.family.split(text) {
+				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>();
+				// Llama 3 vocabularies take a whole word that is already a token as is.
+				if self.family == Family::Llama3
+					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
+				{
+					output.push(*id);
+					continue;
+				}
+				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
+					.filter_map(|index| self.merge(symbols[index], symbols[index + 1]).map(|(rank, merged)| (rank, index, merged)))
+					.min()
+					.map(|(_, index, merged)| (index, merged))
+				{
+					symbols[index] = merged;
+					symbols.remove(index + 1);
+				}
+				output.extend(symbols);
+			}
+		}
+		fn byte_of_token(&self, byte: u8) -> char {
+			self.tokens[self.bytes[usize::from(byte)] as usize].chars().next().unwrap()
+		}
+		/// The text the ids spell. Bytes split across tokens rejoin before the
+		/// UTF-8 decode, and a token outside the byte alphabet keeps its own text.
+		pub fn decode(&self, ids: &[u32]) -> String {
+			let mut bytes = Vec::new();
+			for id in ids {
+				for symbol in self.tokens[*id as usize].chars() {
+					match self.byte_of.get(&symbol) {
+						Some(byte) => bytes.push(*byte),
+						None => bytes.extend(symbol.to_string().as_bytes()),
+					}
+				}
+			}
+			String::from_utf8_lossy(&bytes).into_owned()
+		}
+		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
+		/// content. `generation` sets `add_generation_prompt`, which the template
+		/// reads to open the reply. Unsupported template syntax is an error.
+		pub fn chat(&self, messages: &[(&str, &str)], generation: bool) -> String {
+			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
+		}
+		fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
+			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
+			let scope = Scope { messages, generation, bos: token(self.bos), eos: token(self.eos), bound: None };
+			let (pieces, mut out, mut at) = (parse(template)?, String::new(), 0);
+			render(&pieces, &mut at, &mut out, &scope, true, &[])?;
+			Ok(out)
+		}
+	}
+
+	/// One piece of a chat template: literal text, a `{{ ... }}` substitution, or
+	/// a `{% ... %}` statement.
+	enum Piece {
+		Text(String),
+		Write(String),
+		Tag(String),
+	}
+
+	fn push_text(pieces: &mut Vec<Piece>, text: &str, start: bool, end: bool) {
+		let text = if start { text.trim_start() } else { text };
+		let text = if end { text.trim_end() } else { text };
+		if !text.is_empty() {
+			pieces.push(Piece::Text(text.to_owned()));
+		}
+	}
+
+	/// Splits a chat template into its pieces, applying the `-` controls that trim
+	/// the whitespace around a tag.
+	fn parse(template: &str) -> Result<Vec<Piece>> {
+		let (mut pieces, mut rest, mut start) = (Vec::new(), template, false);
+		while let Some(open) = rest.as_bytes().windows(2).position(|pair| pair == b"{{" || pair == b"{%") {
+			let write = rest.as_bytes()[open + 1] == b'{';
+			let close = if write { "}}" } else { "%}" };
+			let body = &rest[open + 2..];
+			let end = body.find(close).ok_or_else(|| RecipeError::new(format!("chat template leaves a {} tag unclosed", if write { "{{" } else { "{%" })))?;
+			push_text(&mut pieces, &rest[..open], start, body.starts_with('-'));
+			let source = body[..end].trim_matches('-').trim().to_owned();
+			pieces.push(if write { Piece::Write(source) } else { Piece::Tag(source) });
+			start = body[..end].ends_with('-');
+			rest = &body[end + close.len()..];
+		}
+		push_text(&mut pieces, rest, start, false);
+		Ok(pieces)
+	}
+
+	/// A value a chat template can name.
+	enum Value<'a> {
+		Text(String),
+		Flag(bool),
+		Messages(&'a [(&'a str, &'a str)]),
+		Message(&'a (&'a str, &'a str)),
+	}
+	impl Value<'_> {
+		fn truth(&self) -> bool {
+			match self {
+				Self::Text(text) => !text.is_empty(),
+				Self::Flag(flag) => *flag,
+				Self::Messages(messages) => !messages.is_empty(),
+				Self::Message(_) => true,
+			}
+		}
+		fn text(&self) -> Result<&str> {
+			match self {
+				Self::Text(text) => Ok(text),
+				_ => Err(RecipeError::new("a chat template compares or writes a value that is not text")),
+			}
+		}
+	}
+
+	/// The names a chat template resolves: the conversation, the generation flag,
+	/// the sequence tokens, and the message a `for` statement binds.
+	#[derive(Clone)]
+	struct Scope<'a> {
+		messages: &'a [(&'a str, &'a str)],
+		generation: bool,
+		bos: String,
+		eos: String,
+		bound: Option<(String, &'a (&'a str, &'a str))>,
+	}
+
+	/// A literal, a name, or a name read through `['key']` and `.key` accessors.
+	fn value<'a>(source: &str, scope: &Scope<'a>) -> Result<Value<'a>> {
+		let source = source.trim();
+		let quoted = |mark: char| source.strip_prefix(mark).and_then(|rest| rest.strip_suffix(mark));
+		if let Some(text) = quoted('\'').or_else(|| quoted('"')) {
+			return Ok(Value::Text(text.to_owned()));
+		}
+		let head = source.find(['[', '.']).unwrap_or(source.len());
+		let name = source[..head].trim();
+		let mut value = match name {
+			"messages" => Value::Messages(scope.messages),
+			"add_generation_prompt" => Value::Flag(scope.generation),
+			"bos_token" => Value::Text(scope.bos.clone()),
+			"eos_token" => Value::Text(scope.eos.clone()),
+			_ => match &scope.bound {
+				Some((bound, message)) if bound.as_str() == name => Value::Message(message),
+				_ => return Err(RecipeError::new(format!("chat template names {name:?}, which this tokenizer does not define"))),
+			},
+		};
+		let mut rest = &source[head..];
+		while !rest.is_empty() {
+			let (key, next) = match rest.strip_prefix('[') {
+				Some(body) => {
+					let end = body.find(']').ok_or_else(|| RecipeError::new("chat template leaves a [ accessor unclosed"))?;
+					(body[..end].trim().trim_matches(['\'', '"']), &body[end + 1..])
+				}
+				None => {
+					let body = &rest[1..];
+					let end = body.find(['[', '.']).unwrap_or(body.len());
+					(&body[..end], &body[end..])
+				}
+			};
+			value = match (&value, key) {
+				(Value::Message(message), "role") => Value::Text(message.0.to_owned()),
+				(Value::Message(message), "content") => Value::Text(message.1.to_owned()),
+				_ => return Err(RecipeError::new(format!("chat template reads {key:?} from a value that has no such field"))),
+			};
+			rest = next;
+		}
+		Ok(value)
+	}
+
+	/// `not a`, `a == b`, `a != b`, or the truth of one value.
+	fn condition(source: &str, scope: &Scope) -> Result<bool> {
+		if let Some(rest) = source.trim().strip_prefix("not ") {
+			return Ok(!condition(rest, scope)?);
+		}
+		for (operator, equal) in [("==", true), ("!=", false)] {
+			if let Some((left, right)) = source.split_once(operator) {
+				return Ok((value(left, scope)?.text()? == value(right, scope)?.text()?) == equal);
+			}
+		}
+		Ok(value(source, scope)?.truth())
+	}
+
+	/// Renders the pieces from `at` until one of `stop`, returning the tag that
+	/// ended the block. A branch that is not taken still parses, with `emit` off,
+	/// so the walk lands past its `endif` or `endfor`.
+	fn render(pieces: &[Piece], at: &mut usize, out: &mut String, scope: &Scope, emit: bool, stop: &[&str]) -> Result<String> {
+		while *at < pieces.len() {
+			let piece = &pieces[*at];
+			*at += 1;
+			match piece {
+				Piece::Text(text) if emit => out.push_str(text),
+				Piece::Write(source) if emit => out.push_str(value(source, scope)?.text()?),
+				Piece::Text(_) | Piece::Write(_) => {}
+				Piece::Tag(source) => {
+					let (head, rest) = source.split_once(' ').unwrap_or((source.as_str(), ""));
+					if stop.contains(&head) {
+						return Ok(source.clone());
+					}
+					match head {
+						"if" => {
+							// Each branch renders in turn; only the first whose condition
+							// holds writes, and the others parse with `emit` off.
+							let (mut branch, mut test, mut taken) = (head.to_owned(), rest.to_owned(), false);
+							loop {
+								let live = emit && !taken && (branch == "else" || condition(&test, scope)?);
+								taken |= live;
+								let ended = render(pieces, at, out, scope, live, &["elif", "else", "endif"])?;
+								let (next, tail) = ended.split_once(' ').unwrap_or((ended.as_str(), ""));
+								if next == "endif" {
+									break;
+								}
+								(branch, test) = (next.to_owned(), tail.to_owned());
+							}
+						}
+						"for" => {
+							let (name, iterable) = rest.split_once(" in ").ok_or_else(|| RecipeError::new(format!("chat template for statement {rest:?} has no \"in\"")))?;
+							let (name, body) = (name.trim().to_owned(), *at);
+							let items = match emit {
+								true => match value(iterable, scope)? {
+									Value::Messages(messages) => messages,
+									_ => return Err(RecipeError::new(format!("chat template iterates {:?}, which is not a list", iterable.trim()))),
+								},
+								false => &[][..],
+							};
+							for message in items {
+								*at = body;
+								let inner = Scope { bound: Some((name.clone(), message)), ..scope.clone() };
+								render(pieces, at, out, &inner, true, &["endfor"])?;
+							}
+							if items.is_empty() {
+								*at = body;
+								render(pieces, at, out, scope, false, &["endfor"])?;
+							}
+						}
+						_ => return Err(RecipeError::new(format!("chat template statement {head:?} is not supported"))),
+					}
+				}
+			}
+		}
+		match stop.is_empty() {
+			true => Ok(String::new()),
+			false => Err(RecipeError::new(format!("chat template ends before its {}", stop.join(" or ")))),
+		}
+	}
+}
+pub use tokenizer::Tokenizer;
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
