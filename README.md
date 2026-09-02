@@ -75,7 +75,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)
+	attn(heads)[.rope(dims, base)]
 	perc(width)
 	embed(vocab, width)
 	rnn(hidden)

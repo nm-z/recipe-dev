@@ -2537,6 +2537,24 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(reverse, Primitive::Rope) => {
+					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
+					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
+					let ty = self.precision.model_type;
+					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
+							pointer = pointer_type(backend),
+							channels = node.output.channels,
+							length = node.output.length,
+							head_width = node.argument[2],
+							dims = node.argument[0],
+							rotated = 2.0 * node.argument[3]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -4724,7 +4742,8 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Attention(heads, None) => format!("attn,{heads}"),
+			Operation::Attention(heads, Some((dims, base))) => format!("attn,{heads},{dims},{}", f64::from_bits(*base)),
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
@@ -4756,7 +4775,14 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
-			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"attn" => {
+				let heads = value_at(fields.next(), "attention heads")?;
+				let rope = match (fields.next(), fields.next()) {
+					(None, _) => None,
+					(dims, base) => Some((value_at(dims, "rotary dimensions")?, value_at::<f64>(base, "rotary base")?.to_bits())),
+				};
+				Ok(Operation::Attention(heads, rope))
+			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
@@ -5410,7 +5436,7 @@ enum Operation {
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Attention(usize),
+	Attention(usize, Option<(usize, u64)>),
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
@@ -5546,7 +5572,7 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(heads);
+	fn attn(heads: usize) = Operation::Attention(heads, None);
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -5557,6 +5583,18 @@ impl Model {
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	/// Rotary position embedding on the preceding `attn` block: the first `dims`
+	/// channels of every query and key head rotate by their position at
+	/// frequencies `base^(-2i/dims)`.
+	pub fn rope(&self, dims: usize, base: f64) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("rope requires a preceding attn block"));
+		match &mut block.operation {
+			Operation::Attention(_, rope) => *rope = Some((dims, base.to_bits())),
+			_ => panic!("rope requires a preceding attn block"),
+		}
+		model
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -6864,7 +6902,7 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Attention(_) => "attn",
+			Self::Attention(..) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
@@ -7074,6 +7112,7 @@ enum Primitive {
 	Normalize = 8,
 	Predictor = 9,
 	Gather = 10,
+	Rope = 11,
 	TopK = 15,
 	Scale = 16,
 }
@@ -7114,6 +7153,7 @@ impl Node {
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
 			Primitive::Gather => "Gather",
+			Primitive::Rope => "Rope",
 			Primitive::TopK => "TopK",
 			Primitive::Scale => "Scale",
 		};
@@ -7312,7 +7352,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads)?,
+		Operation::Attention(heads, rope) => lower_attention(graph, *heads, *rope)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -7531,11 +7571,16 @@ fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()>
 	let output = Shape { channels: width, length: graph.output.elements() };
 	push_node(graph, Primitive::Gather, output, checked_mul(vocabulary, width, "embedding table")?, arguments(vocabulary as f64, width as f64), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
+fn lower_attention(graph: &mut Graph, heads: usize, rope: Option<(usize, u64)>) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
 	let input = graph.output;
 	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
 	let width = input.channels / heads;
+	if let Some((dims, base)) = rope {
+		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
+		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, input.channels as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	}
 	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
 	lower_project(graph, input.channels)
 }

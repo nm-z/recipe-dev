@@ -1023,6 +1023,38 @@ br label %channel.loop channel.loop: %channel = phi i32 [ 0, %hit.entry ], [ %ch
 %updated = call double @recipe.add(double %current, double %delta.value)
 store double %updated, ptr addrspace(1) %gradient.ptr, align 8 %channel.next = add i32 %channel, 1 br label %channel.loop
 token.done: %token.next = add i32 %token, 1 br label %token.loop exit: ret void }
+; Rotary embedding over the first %rotated channels of a fused QKV row: inside
+; each head the channel pairs (i, i + dims/2) below %dims rotate by
+; position * base^(-2i/dims). With %reverse the transpose rotation is added
+; into %output, which makes the same body the adjoint pass.
+define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length,
+i32 %head.width, i32 %dims, i32 %rotated, double %base, i1 %reverse ) #1 { entry: %per.row = mul i32 %channels, %length
+%within = urem i32 %p, %per.row %channel = udiv i32 %within, %length %position = urem i32 %within, %length
+%local = urem i32 %channel, %head.width %half = udiv i32 %dims, 2
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %p
+%value = load double, ptr addrspace(1) %input.ptr, align 8
+%rotates = icmp ult i32 %channel, %rotated %inside = icmp ult i32 %local, %dims %active = and i1 %rotates, %inside
+br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local, %half
+%local.upper = sub i32 %local, %half %index = select i1 %upper, i32 %local.upper, i32 %local
+%half.stride = mul i32 %half, %length %partner.up = add i32 %p, %half.stride %partner.down = sub i32 %p, %half.stride
+%partner = select i1 %upper, i32 %partner.down, i32 %partner.up
+%partner.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %partner
+%other = load double, ptr addrspace(1) %partner.ptr, align 8
+%two.index = mul i32 %index, 2 %two.index.value = call double @recipe.from.u32(i32 %two.index)
+%dims.value = call double @recipe.from.u32(i32 %dims) %ratio = call double @recipe.div(double %two.index.value, double %dims.value)
+%log.base = call double @recipe.log(double %base) %exponent.positive = call double @recipe.mul(double %ratio, double %log.base)
+%exponent = call double @recipe.neg(double %exponent.positive) %frequency = call double @recipe.exp(double %exponent)
+%position.value = call double @recipe.from.u32(i32 %position) %angle = call double @recipe.mul(double %position.value, double %frequency)
+%cos = call double @recipe.cos(double %angle) %sin = call double @recipe.sin(double %angle) %sin.negative = call double @recipe.neg(double %sin)
+%sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)
+%sin.term = select i1 %upper, double %sin.signed, double %sin.signed.negative
+%cos.part = call double @recipe.mul(double %value, double %cos) %sin.part = call double @recipe.mul(double %other, double %sin.term)
+%rotated.value = call double @recipe.add(double %cos.part, double %sin.part) br label %finish finish:
+%result = phi double [ %value, %entry ], [ %rotated.value, %rotate ]
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+br i1 %reverse, label %accumulate, label %assign accumulate: %prior = load double, ptr addrspace(1) %output.ptr, align 8
+%sum = call double @recipe.add(double %prior, double %result) store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void
+assign: store double %result, ptr addrspace(1) %output.ptr, align 8 ret void }
 define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
 %exponential = call double @recipe.exp(double %negative) %denominator = call double @recipe.add(double 1.0, double %exponential)
 %value = call double @recipe.div(double 1.0, double %denominator) ret double %value }
