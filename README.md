@@ -59,6 +59,15 @@ tokenizer.bos(); tokenizer.eos(); tokenizer.pad();
 ```
 
 A byte-level BPE tokenizer built from the GGUF metadata alone: `tokenizer.ggml.tokens`, `merges`, `token_type`, the special ids, and the pre-tokenizer family named by `tokenizer.ggml.pre` (the GPT-2, Llama 3, and Qwen 2 regex families). Special tokens written in the text are matched whole, `encode` leads with the beginning-of-sequence id when the model asks for it, and `decode` rejoins bytes split across tokens.
+## ngram
+
+```rust
+let ngram = recipe.gguf("model.gguf").ngram();
+let rows = ngram.rows(&ids, position);
+let values = ngram.lookup(&ids);
+```
+
+N-gram embeddings from a host-resident table: `ngram.heads` heads each hash the bigram, and as many the trigram, of every token into their own row range of the `[width, rows]` tensor named by `ngram.table` (seeds from `ngram.seeds`, the context reset at the end-of-sequence id). The table stays mapped; only the addressed rows decode, in any quantization.
 
 ## files
 

@@ -4223,7 +4223,7 @@ impl IntFormat {
 /// key-value metadata and tensor descriptors, then an aligned data section
 /// whose tensors use the same GGML block layouts as Recipe's storage formats.
 mod gguf {
-	use super::{Integer, RecipeError, Result, StorageFormat, StoredWeight, require, unfp16};
+	use super::{Integer, RecipeError, Result, StorageFormat, require, unfp16};
 	use std::path::{Path, PathBuf};
 
 	const MAGIC: u32 = 0x4655_4747;
@@ -4500,7 +4500,19 @@ mod gguf {
 			super::Tokenizer::from_gguf(self).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
-			let data = self.data(tensor);
+			self.decode(tensor, self.data(tensor), tensor.shape.iter().product::<u64>() as usize)
+		}
+		/// One row of a tensor: `shape[0]` values, decoded from that row's bytes alone.
+		pub fn row(&self, tensor: &GgufTensor, index: usize) -> Result<Vec<f64>> {
+			let (block, stride, _) = layout(tensor.kind)?;
+			let width = tensor.shape.first().copied().unwrap_or(0) as usize;
+			let rows = tensor.shape.iter().skip(1).product::<u64>() as usize;
+			require(width != 0 && width % block == 0, format!("tensor {} rows of {width} are not whole blocks of {block}", tensor.name))?;
+			require(index < rows, format!("tensor {} has {rows} rows, row {index} requested", tensor.name))?;
+			let bytes = width / block * stride;
+			self.decode(tensor, &self.data(tensor)[index * bytes..(index + 1) * bytes], width)
+		}
+		fn decode(&self, tensor: &GgufTensor, data: &[u8], count: usize) -> Result<Vec<f64>> {
 			match tensor.kind {
 				0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
 				1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
@@ -4510,18 +4522,12 @@ mod gguf {
 				25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
 				26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
 				27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
-				_ => self.stored(tensor).map(|stored| stored.arithmetic),
+				_ => {
+					let (_, _, format) = layout(tensor.kind)?;
+					let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is not block quantized", tensor.name)))?;
+					format.decompress(data, &[], count)
+				}
 			}
-		}
-		/// The tensor as the stored weight the tape binds: its block bytes in Recipe's
-		/// matching storage format, decoded once for the arithmetic copy.
-		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
-			let (_, _, format) = layout(tensor.kind)?;
-			let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is not block quantized", tensor.name)))?;
-			let count = tensor.shape.iter().product::<u64>() as usize;
-			let bytes = self.data(tensor).to_vec();
-			let arithmetic = format.decompress(&bytes, &[], count)?;
-			Ok(StoredWeight { format, count, bytes, codebook: Vec::new(), arithmetic })
 		}
 	}
 
@@ -4816,6 +4822,87 @@ mod tokenizer {
 	}
 }
 pub use tokenizer::Tokenizer;
+mod ngram {
+	//! N-gram embeddings gathered on the host from a mapped GGUF table: the
+	//! current token with its previous one and two tokens hash into per-head
+	//! row ranges, and only the addressed rows are decoded.
+	use super::{Gguf, GgufTensor, GgufValue, RecipeError, Result, require};
+
+	/// A token outside the context, before the sequence start or an end id.
+	const ABSENT: u32 = u32::MAX;
+
+	pub struct Ngram<'a> {
+		model: &'a Gguf,
+		table: GgufTensor,
+		heads: usize,
+		width: usize,
+		rows: usize,
+		seeds: Vec<u64>,
+		ends: Vec<u32>,
+	}
+
+	impl<'a> Ngram<'a> {
+		pub(super) fn new(model: &'a Gguf) -> Result<Self> {
+			let integer = |key: &str| model.value(key).and_then(GgufValue::integer);
+			let heads = integer("ngram.heads").ok_or_else(|| RecipeError::new("ngram.heads is absent"))? as usize;
+			let name = model.value("ngram.table").and_then(GgufValue::text).unwrap_or("ngram.table");
+			let table = model.tensor(name).ok_or_else(|| RecipeError::new(format!("n-gram table {name:?} is absent")))?.clone();
+			require(table.shape.len() == 2 && heads != 0, format!("n-gram table {name:?} must be [width, rows] with at least one head"))?;
+			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
+			require(rows % (2 * heads) == 0, format!("n-gram table rows {rows} do not split into {} head ranges", 2 * heads))?;
+			let seeds = match model.value("ngram.seeds") {
+				Some(GgufValue::Array(items)) => items.iter().map(|item| item.integer().ok_or_else(|| RecipeError::new("ngram.seeds holds a non-integer"))).collect::<Result<Vec<_>>>()?,
+				_ => (1..=2 * heads as u64).collect(),
+			};
+			require(seeds.len() == 2 * heads, format!("ngram.seeds holds {} seeds for {} heads", seeds.len(), 2 * heads))?;
+			Ok(Self { model, table, heads, width, rows, seeds, ends: integer("tokenizer.ggml.eos_token_id").map(|id| id as u32).into_iter().collect() })
+		}
+		pub fn heads(&self) -> usize {
+			self.heads
+		}
+		/// Values per token: `2 * heads` rows of the table width.
+		pub fn width(&self) -> usize {
+			2 * self.heads * self.width
+		}
+		/// The row each head addresses for the token at `position`: the first
+		/// `heads` rows hash the bigram, the rest the trigram. A token before the
+		/// sequence start or behind an end id is absent from the context.
+		pub fn rows(&self, ids: &[u32], position: usize) -> Vec<usize> {
+			let previous = |back: usize| if back <= position && !ids[position - back..position].iter().any(|id| self.ends.contains(id)) { ids[position - back] } else { ABSENT };
+			let context = [ids[position], previous(1), previous(2)];
+			let range = self.rows / (2 * self.heads);
+			(0..2 * self.heads)
+				.map(|head| {
+					let order = if head < self.heads { 2 } else { 3 };
+					let hash = context[..order].iter().fold(self.seeds[head], |hash, id| {
+						let mixed = (hash ^ u64::from(*id)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+						mixed ^ (mixed >> 32)
+					});
+					head * range + (hash % range as u64) as usize
+				})
+				.collect()
+		}
+		/// The addressed rows of every token, concatenated: `ids.len() * width()`
+		/// values, decoded from those rows' bytes alone.
+		pub fn lookup(&self, ids: &[u32]) -> Result<Vec<f64>> {
+			let mut values = Vec::with_capacity(ids.len() * self.width());
+			for position in 0..ids.len() {
+				for row in self.rows(ids, position) {
+					values.extend(self.model.row(&self.table, row)?);
+				}
+			}
+			Ok(values)
+		}
+	}
+
+	impl Gguf {
+		/// The n-gram table the metadata describes, gathered on the host.
+		pub fn ngram(&self) -> Ngram<'_> {
+			Ngram::new(self).unwrap_or_else(|error| panic!("{error}"))
+		}
+	}
+}
+pub use ngram::Ngram;
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
