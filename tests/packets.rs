@@ -36,8 +36,20 @@ const PACKETS: &[Packet] = &[
 	Packet { issue: 512, device: "cpu", run: packet_512 },
 	Packet { issue: 513, device: "nv0", run: packet_513 },
 	Packet { issue: 515, device: "cpu", run: packet_515 },
+	Packet { issue: 518, device: "nv0", run: packet_518 },
 	Packet { issue: 519, device: "cpu", run: packet_519 },
 ];
+
+/// Quantized residual convolution block and two-expert mixture on the z-scored
+/// temporal chronological splits in int(8) arithmetic.
+fn packet_518(bundle: &str) -> TrainingReport {
+	let data = recipe.data("data/temporal/chronological_splits").target("target").norm(z_score);
+	let model = recipe.model().layer(8).res([conv(8, 1), relu(), layer(8)]).sigmoid().iq(3).xxs.layer(8).moe(1, [layer(8), layer(8)]).sigmoid().qi(3).k.loss(focal);
+	let report = recipe.train().optimizer(adamw).lr(0.0001).seed(98076090604027).epochs(1).log(all).int(8).save(bundle).run(&model, &data);
+	let output = recipe.infer(bundle, &[0.0; 20]);
+	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	report
+}
 
 /// Quantized LightGBM and layer with batch normalization on the split temporal
 /// chronological splits in f(6, 9) arithmetic.
