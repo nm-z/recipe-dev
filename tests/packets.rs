@@ -33,9 +33,21 @@ const PACKETS: &[Packet] = &[
 	Packet { issue: 509, device: "nv0", run: packet_509 },
 	Packet { issue: 511, device: "cpu", run: packet_511 },
 	Packet { issue: 512, device: "cpu", run: packet_512 },
+	Packet { issue: 513, device: "nv0", run: packet_513 },
 	Packet { issue: 515, device: "cpu", run: packet_515 },
 	Packet { issue: 519, device: "cpu", run: packet_519 },
 ];
+
+/// Quantized LSTM and GRU with batch normalization on the image class
+/// subfolders in int(1) arithmetic.
+fn packet_513(bundle: &str) -> TrainingReport {
+	let data = recipe.data("data/image/class_subfolders").target("target");
+	let model = recipe.model().lstm(8).cos().norm(batch).iq(2).m.gru(8).qi(8).0.loss(mae);
+	let report = recipe.train().optimizer(adamw).lr(0.001).seed(14625434013680).epochs(1).log(all).stop(0.0).int(1).save(bundle).run(&model, &data);
+	let output = recipe.infer(bundle, &[0.0; 3072]);
+	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	report
+}
 
 /// Quantized perceptron and layer with batch normalization on the temporal
 /// chronological splits in fp8 arithmetic.
