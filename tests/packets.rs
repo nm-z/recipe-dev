@@ -31,12 +31,24 @@ struct Packet {
 
 const PACKETS: &[Packet] = &[
 	Packet { issue: 509, device: "nv0", run: packet_509 },
+	Packet { issue: 510, device: "nv0", run: packet_510 },
 	Packet { issue: 511, device: "cpu", run: packet_511 },
 	Packet { issue: 512, device: "cpu", run: packet_512 },
 	Packet { issue: 513, device: "nv0", run: packet_513 },
 	Packet { issue: 515, device: "cpu", run: packet_515 },
 	Packet { issue: 519, device: "cpu", run: packet_519 },
 ];
+
+/// Quantized LightGBM and layer with batch normalization on the split temporal
+/// chronological splits in f(6, 9) arithmetic.
+fn packet_510(bundle: &str) -> TrainingReport {
+	let data = recipe.data("data/temporal/chronological_splits").target("target").split(0.8);
+	let model = recipe.model().lgbm().prelu().norm(batch).qi(3).k.m.layer(4).log().norm(batch).qi(3).k.l.loss(rmse);
+	let report = recipe.train().optimizer(adamw).lr(0.0001).seed(39676778323334).epochs(1).log(all).f(6, 9).save(bundle).run(&model, &data);
+	let output = recipe.infer(bundle, &[0.0; 20]);
+	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	report
+}
 
 /// Quantized LSTM and GRU with batch normalization on the image class
 /// subfolders in int(1) arithmetic.
