@@ -102,6 +102,8 @@ estimators:
 ```
 Feature generation is banned.
 
+`moe` scores every position with one `[width, experts]` router, keeps the `topk` experts under a softmax over the kept scores, and sums the expert outputs under those weights.
+
 ## 15 activations
 
 ```

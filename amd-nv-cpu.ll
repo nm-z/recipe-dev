@@ -903,6 +903,89 @@ br i1 %more, label %step, label %done step: %index = add i32 %input.base, %i
 %maximum.index.wide = zext i32 %maximum.index to i64
 store double %maximum, ptr addrspace(1) %output.ptr, align 8
 store i64 %maximum.index.wide, ptr addrspace(1) %context.ptr, align 8 ret void }
+; Mixture routing bodies. Scores and weights hold %experts values per position,
+; expert e of position t at [e * length + t] within the row.
+; Position %p keeps its %top highest scores, ties to the lower expert, under a
+; softmax over the kept scores, and zero elsewhere. The weights buffer holds
+; the selection marks until the last pass overwrites them.
+define internal void @topk_forward_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, i32 %p, i32 %experts, i32 %length, i32 %top ) #1 { entry:
+%row = udiv i32 %p, %length %position = urem i32 %p, %length %per.row = mul i32 %experts, %length %row.base = mul i32 %row, %per.row %base = add i32 %row.base, %position
+br label %clear.loop clear.loop: %clear = phi i32 [ 0, %entry ], [ %clear.next, %clear.step ] %clear.more = icmp ult i32 %clear, %experts
+br i1 %clear.more, label %clear.step, label %select.loop clear.step: %clear.offset = mul i32 %clear, %length %clear.index = add i32 %base, %clear.offset
+%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %clear.index store double 0.0, ptr addrspace(1) %clear.ptr, align 8 %clear.next = add i32 %clear, 1 br label %clear.loop
+select.loop: %pick = phi i32 [ 0, %clear.loop ], [ %pick.next, %select.mark ] %pick.more = icmp ult i32 %pick, %top br i1 %pick.more, label %scan.entry, label %normalize.entry
+scan.entry: br label %scan.loop
+scan.loop: %candidate = phi i32 [ 0, %scan.entry ], [ %candidate.next, %scan.step ] %best = phi i32 [ -1, %scan.entry ], [ %best.next, %scan.step ]
+%best.score = phi double [ 0.0, %scan.entry ], [ %best.score.next, %scan.step ] %scan.more = icmp ult i32 %candidate, %experts br i1 %scan.more, label %scan.step, label %select.mark
+scan.step: %candidate.offset = mul i32 %candidate, %length %candidate.index = add i32 %base, %candidate.offset
+%mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %candidate.index %mark = load double, ptr addrspace(1) %mark.ptr, align 8 %unmarked = call i1 @recipe.oeq(double %mark, double 0.0)
+%score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i32 %candidate.index %score = load double, ptr addrspace(1) %score.ptr, align 8
+%none = icmp eq i32 %best, -1 %higher = call i1 @recipe.ogt(double %score, double %best.score) %better = or i1 %none, %higher %take = and i1 %unmarked, %better
+%best.next = select i1 %take, i32 %candidate, i32 %best %best.score.next = select i1 %take, double %score, double %best.score %candidate.next = add i32 %candidate, 1 br label %scan.loop
+select.mark: %best.offset = mul i32 %best, %length %best.index = add i32 %base, %best.offset %best.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %best.index
+store double 1.0, ptr addrspace(1) %best.ptr, align 8 %pick.next = add i32 %pick, 1 br label %select.loop
+normalize.entry: br label %max.loop
+max.loop: %m = phi i32 [ 0, %normalize.entry ], [ %m.next, %max.step ] %maximum = phi double [ 0.0, %normalize.entry ], [ %maximum.next, %max.step ] %m.first = phi i1 [ true, %normalize.entry ], [ %m.first.next, %max.step ]
+%max.more = icmp ult i32 %m, %experts br i1 %max.more, label %max.step, label %sum.entry
+max.step: %m.offset = mul i32 %m, %length %m.index = add i32 %base, %m.offset %m.mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %m.index %m.mark = load double, ptr addrspace(1) %m.mark.ptr, align 8
+%m.marked = call i1 @recipe.oeq(double %m.mark, double 1.0) %m.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i32 %m.index %m.score = load double, ptr addrspace(1) %m.score.ptr, align 8
+%m.higher = call i1 @recipe.ogt(double %m.score, double %maximum) %m.better = or i1 %m.first, %m.higher %m.take = and i1 %m.marked, %m.better
+%maximum.next = select i1 %m.take, double %m.score, double %maximum %m.first.next = select i1 %m.take, i1 false, i1 %m.first %m.next = add i32 %m, 1 br label %max.loop
+sum.entry: br label %sum.loop
+sum.loop: %s = phi i32 [ 0, %sum.entry ], [ %s.next, %sum.step ] %total = phi double [ 0.0, %sum.entry ], [ %total.next, %sum.step ] %sum.more = icmp ult i32 %s, %experts br i1 %sum.more, label %sum.step, label %write.entry
+sum.step: %s.offset = mul i32 %s, %length %s.index = add i32 %base, %s.offset %s.mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %s.index %s.mark = load double, ptr addrspace(1) %s.mark.ptr, align 8
+%s.marked = call i1 @recipe.oeq(double %s.mark, double 1.0) %s.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i32 %s.index %s.score = load double, ptr addrspace(1) %s.score.ptr, align 8
+%s.shifted = call double @recipe.sub(double %s.score, double %maximum) %s.exponential = call double @recipe.exp(double %s.shifted) %s.term = select i1 %s.marked, double %s.exponential, double 0.0
+%total.next = call double @recipe.add(double %total, double %s.term) %s.next = add i32 %s, 1 br label %sum.loop
+write.entry: br label %write.loop
+write.loop: %w = phi i32 [ 0, %write.entry ], [ %w.next, %write.step ] %write.more = icmp ult i32 %w, %experts br i1 %write.more, label %write.step, label %exit
+write.step: %w.offset = mul i32 %w, %length %w.index = add i32 %base, %w.offset %w.mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %w.index %w.mark = load double, ptr addrspace(1) %w.mark.ptr, align 8
+%w.marked = call i1 @recipe.oeq(double %w.mark, double 1.0) %w.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i32 %w.index %w.score = load double, ptr addrspace(1) %w.score.ptr, align 8
+%w.shifted = call double @recipe.sub(double %w.score, double %maximum) %w.exponential = call double @recipe.exp(double %w.shifted) %w.probability = call double @recipe.div(double %w.exponential, double %total)
+%w.value = select i1 %w.marked, double %w.probability, double 0.0 store double %w.value, ptr addrspace(1) %w.mark.ptr, align 8 %w.next = add i32 %w, 1 br label %write.loop
+exit: ret void }
+; The softmax adjoint over the kept experts of one position: each score
+; receives w * (dw - sum_j w_j dw_j), which is zero for unkept experts.
+define internal void @topk_reverse_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %experts, i32 %length ) #1 { entry:
+%row = udiv i32 %p, %length %position = urem i32 %p, %length %per.row = mul i32 %experts, %length %row.base = mul i32 %row, %per.row %base = add i32 %row.base, %position
+br label %sum.loop sum.loop: %s = phi i32 [ 0, %entry ], [ %s.next, %sum.step ] %inner = phi double [ 0.0, %entry ], [ %inner.next, %sum.step ] %sum.more = icmp ult i32 %s, %experts
+br i1 %sum.more, label %sum.step, label %write.entry sum.step: %s.offset = mul i32 %s, %length %s.index = add i32 %base, %s.offset
+%s.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %s.index %s.weight = load double, ptr addrspace(1) %s.weight.ptr, align 8
+%s.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %s.index %s.delta = load double, ptr addrspace(1) %s.delta.ptr, align 8
+%s.product = call double @recipe.mul(double %s.weight, double %s.delta) %inner.next = call double @recipe.add(double %inner, double %s.product) %s.next = add i32 %s, 1 br label %sum.loop
+write.entry: br label %write.loop
+write.loop: %w = phi i32 [ 0, %write.entry ], [ %w.next, %write.step ] %write.more = icmp ult i32 %w, %experts br i1 %write.more, label %write.step, label %exit
+write.step: %w.offset = mul i32 %w, %length %w.index = add i32 %base, %w.offset %w.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %w.index %w.weight = load double, ptr addrspace(1) %w.weight.ptr, align 8
+%w.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %w.index %w.delta = load double, ptr addrspace(1) %w.delta.ptr, align 8
+%w.centered = call double @recipe.sub(double %w.delta, double %inner) %w.term = call double @recipe.mul(double %w.weight, double %w.centered)
+%w.adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %w.index %w.prior = load double, ptr addrspace(1) %w.adjoint.ptr, align 8
+%w.sum = call double @recipe.add(double %w.prior, double %w.term) store double %w.sum, ptr addrspace(1) %w.adjoint.ptr, align 8 %w.next = add i32 %w, 1 br label %write.loop
+exit: ret void }
+; Output element %p of a branch is the branch value times its position's weight for %expert.
+define internal void @scale_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %experts, i32 %expert ) #1 { entry:
+%narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %position = urem i32 %p, %length %per.row = mul i32 %experts, %length %row.base = mul i32 %row, %per.row
+%expert.base = mul i32 %expert, %length %weight.row = add i32 %row.base, %expert.base %weight.index = add i32 %weight.row, %position
+%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index %weight = load double, ptr addrspace(1) %weight.ptr, align 8
+%branch.ptr = getelementptr inbounds double, ptr addrspace(1) %branch, i32 %p %value = load double, ptr addrspace(1) %branch.ptr, align 8 %product = call double @recipe.mul(double %weight, double %value)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %product, ptr addrspace(1) %output.ptr, align 8 ret void }
+define internal void @scale_reverse_branch_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %experts, i32 %expert ) #1 { entry:
+%narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %position = urem i32 %p, %length %per.row = mul i32 %experts, %length %row.base = mul i32 %row, %per.row
+%expert.base = mul i32 %expert, %length %weight.row = add i32 %row.base, %expert.base %weight.index = add i32 %weight.row, %position
+%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index %weight = load double, ptr addrspace(1) %weight.ptr, align 8
+%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %p %value = load double, ptr addrspace(1) %delta.ptr, align 8 %term = call double @recipe.mul(double %weight, double %value)
+%adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
+%sum = call double @recipe.add(double %prior, double %term) store double %sum, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
+; Weight %p (one per row and position) sums branch * adjoint over the channels in channel order.
+define internal void @scale_reverse_weight_body( ptr addrspace(1) %branch, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %experts, i32 %expert ) #1 { entry:
+%narrow = mul i32 %channels, %length %row = udiv i32 %p, %length %position = urem i32 %p, %length %row.base = mul i32 %row, %narrow %base = add i32 %row.base, %position
+br label %loop loop: %channel = phi i32 [ 0, %entry ], [ %channel.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %channel, %channels
+br i1 %more, label %step, label %done step: %channel.offset = mul i32 %channel, %length %index = add i32 %base, %channel.offset
+%branch.ptr = getelementptr inbounds double, ptr addrspace(1) %branch, i32 %index %value = load double, ptr addrspace(1) %branch.ptr, align 8
+%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index %incoming = load double, ptr addrspace(1) %delta.ptr, align 8
+%product = call double @recipe.mul(double %value, double %incoming) %sum.next = call double @recipe.add(double %sum, double %product) %channel.next = add i32 %channel, 1 br label %loop
+done: %per.row = mul i32 %experts, %length %weights.row = mul i32 %row, %per.row %expert.base = mul i32 %expert, %length %weight.row = add i32 %weights.row, %expert.base %weight.index = add i32 %weight.row, %position
+%adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %weight.index %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
+%total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
 define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
 %exponential = call double @recipe.exp(double %negative) %denominator = call double @recipe.add(double 1.0, double %exponential)
 %value = call double @recipe.div(double 1.0, double %denominator) ret double %value }
