@@ -94,6 +94,17 @@ generation.step_seconds;
 
 The model takes a window of ids and returns one logit per id. Every step feeds the last window, samples one id (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy), and stops at a stop id or the budget.
 
+```rust
+let speculation = recipe.speculate("main.ogdl", "draft.ogdl", &prompt_ids, 4, &[eos], 64);
+speculation.ids;
+speculation.accepted;
+speculation.rejected;
+speculation.forwards;
+speculation.seconds;
+```
+
+`speculate` is a greedy decode where the draft bundle proposes `lookahead` ids and the main bundle verifies them in one batched forward: matching proposals are kept, the first mismatch is replaced by the main id and ends the batch, and a fully accepted batch keeps the main id after it. The ids equal a plain greedy decode whatever the draft proposes.
+
 ## files
 
 ```bash

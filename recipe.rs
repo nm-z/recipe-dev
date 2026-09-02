@@ -5545,26 +5545,36 @@ mod bundle {
 	}
 	pub(super) fn infer_graphs(graphs: &[SemanticGraph], input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
-		require(input.len() == first.inputs.len(), format!("model input expected {} values, received {}", first.inputs.len(), input.len()))?;
-		let mut values = first.inputs.iter().cloned().zip(input.iter().copied()).collect::<BTreeMap<_, _>>();
+		let width = first.inputs.len();
+		require(width != 0 && !input.is_empty() && input.len() % width == 0, format!("model input expected {width} values per row, received {}", input.len()))?;
+		let rows = input.len() / width;
+		let mut values = input.chunks(width).map(|row| first.inputs.iter().cloned().zip(row.iter().copied()).collect::<BTreeMap<_, _>>()).collect::<Vec<_>>();
 		let mut result = Vec::new();
 		for stored in graphs {
-			let mut samples = stored.inputs.iter().map(|name| values.get(name).copied().ok_or_else(|| RecipeError::new(format!("input {name:?} is absent")))).collect::<Result<Vec<_>>>()?;
-			if !stored.norm_mean.is_empty() {
-				require(stored.norm_mean.len() == samples.len(), format!("model normalization expected {} values, received {}", stored.norm_mean.len(), samples.len()))?;
-				for (value, (mean, scale)) in samples.iter_mut().zip(stored.norm_mean.iter().zip(&stored.norm_scale)) {
-					*value = (*value - mean) / scale;
+			let mut samples = Vec::with_capacity(rows * stored.inputs.len());
+			for row in &values {
+				for name in &stored.inputs {
+					samples.push(row.get(name).copied().ok_or_else(|| RecipeError::new(format!("input {name:?} is absent")))?);
 				}
 			}
-			result = forward(&stored, &samples)?;
+			if !stored.norm_mean.is_empty() {
+				require(stored.norm_mean.len() == stored.inputs.len(), format!("model normalization expected {} values, received {}", stored.norm_mean.len(), stored.inputs.len()))?;
+				for (index, value) in samples.iter_mut().enumerate() {
+					let column = index % stored.inputs.len();
+					*value = (*value - stored.norm_mean[column]) / stored.norm_scale[column];
+				}
+			}
+			result = forward(stored, &samples)?;
 			if stored.target_span > 0.0 {
 				for value in &mut result {
 					*value = stored.target_min + stored.target_span * logistic(*value);
 				}
 			}
-			require(result.len() == stored.outputs.len(), format!("model output expected {} values, received {}", stored.outputs.len(), result.len()))?;
-			for (name, value) in stored.outputs.iter().cloned().zip(result.iter().copied()) {
-				values.insert(name, value);
+			require(result.len() == rows * stored.outputs.len(), format!("model output expected {} values, received {}", rows * stored.outputs.len(), result.len()))?;
+			for (row, outputs) in values.iter_mut().zip(result.chunks(stored.outputs.len())) {
+				for (name, value) in stored.outputs.iter().cloned().zip(outputs.iter().copied()) {
+					row.insert(name, value);
+				}
 			}
 		}
 		Ok(result)
@@ -7586,6 +7596,82 @@ impl Recipe {
 			}
 		}
 		generation
+	}
+}
+
+/// What `speculate` produced: the ids, how many draft proposals the main
+/// model accepted and rejected, how many main forwards it took, and the seconds.
+pub struct Speculation {
+	pub ids: Vec<u32>,
+	pub accepted: usize,
+	pub rejected: usize,
+	pub forwards: usize,
+	pub seconds: f64,
+}
+/// The last `width` ids as model input.
+fn window(ids: &[u32], width: usize) -> Vec<f64> {
+	ids[ids.len() - width..].iter().map(|id| f64::from(*id)).collect()
+}
+fn greedy(logits: &[f64]) -> u32 {
+	(0..logits.len()).max_by(|left, right| logits[*left].total_cmp(&logits[*right]).then(right.cmp(left))).expect("logits are empty") as u32
+}
+impl Recipe {
+	/// Greedy decode with a draft model running `lookahead` ids ahead of the
+	/// main model. The main model verifies every proposal in one batched
+	/// forward: a proposal that matches its own greedy choice is kept, the
+	/// first mismatch is replaced by the main model's id and ends the batch,
+	/// and a fully accepted batch also keeps the main model's extra id. The
+	/// ids equal a plain greedy decode whatever the draft proposes.
+	pub fn speculate(&self, path: impl AsRef<Path>, draft: impl AsRef<Path>, prompt: &[u32], lookahead: usize, stop: &[u32], budget: usize) -> Speculation {
+		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		let load = |path: &Path| {
+			let (_, graphs) = bundle::load_semantic(&resolve_path(path).unwrap_or_else(|error| panic!("{error}"))).unwrap_or_else(|error| panic!("{error}"));
+			let width = graphs.first().map_or(0, |graph| graph.inputs.len());
+			assert!(width != 0 && prompt.len() >= width, "speculate prompt holds {} ids but {} has a window of {width}", prompt.len(), path.display());
+			(graphs, width)
+		};
+		let (main, main_width) = load(path.as_ref());
+		let (draft, draft_width) = load(draft.as_ref());
+		assert!(lookahead != 0, "speculate needs a lookahead of at least one id");
+		let forward = |stored: &bundle::SemanticGraph, samples: &[f64]| {
+			let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			tape.inject_bn_stats(&stored.bn_stats)?;
+			tape.forward()?;
+			tape.predictions()
+		};
+		let infer = |graphs: &[bundle::SemanticGraph], input: &[f64]| bundle::infer_graphs(graphs, input, forward).unwrap_or_else(|error| panic!("{error}"));
+		let started = std::time::Instant::now();
+		let mut speculation = Speculation { ids: prompt.to_vec(), accepted: 0, rejected: 0, forwards: 0, seconds: 0.0 };
+		'decode: while speculation.ids.len() - prompt.len() < budget {
+			let mut extended = speculation.ids.clone();
+			for _ in 0..lookahead {
+				let id = greedy(&infer(&draft, &window(&extended, draft_width)));
+				extended.push(id);
+			}
+			let rows = (0..=lookahead).flat_map(|ahead| window(&extended[..speculation.ids.len() + ahead], main_width)).collect::<Vec<_>>();
+			let logits = infer(&main, &rows);
+			speculation.forwards += 1;
+			let vocabulary = logits.len() / (lookahead + 1);
+			for ahead in 0..=lookahead {
+				let choice = greedy(&logits[ahead * vocabulary..(ahead + 1) * vocabulary]);
+				let verdict = (ahead < lookahead).then(|| extended[speculation.ids.len()] == choice);
+				match verdict {
+					Some(true) => speculation.accepted += 1,
+					Some(false) => speculation.rejected += 1,
+					None => {}
+				}
+				speculation.ids.push(choice);
+				if stop.contains(&choice) || speculation.ids.len() - prompt.len() >= budget {
+					break 'decode;
+				}
+				if verdict == Some(false) {
+					break;
+				}
+			}
+		}
+		speculation.seconds = started.elapsed().as_secs_f64();
+		speculation
 	}
 }
 
