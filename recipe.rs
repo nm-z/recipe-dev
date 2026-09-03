@@ -2585,6 +2585,30 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				// Training through the recurrence is not implemented: fail loudly rather
+				// than emit a silently wrong gradient.
+				(true, Primitive::Delta) => return Err(RecipeError::new("delta-net is inference-only: it has no reverse pass")),
+				(false, Primitive::Delta) => {
+					// The recurrence walks positions in order, so the kernel owns the whole
+					// sequence and parallelises over rows and heads rather than elements.
+					ir.push_str(&format!(
+						"call void @delta_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {heads}, i32 {groups}, i32 {state}, i32 {kernel}, i32 {width}, i32 {qkv_width}, i32 {v_width}, i32 {length}, i32 %threads )\n",
+						pointer = pointer_type(backend),
+						source = pointers.source,
+						weights = pointers.weights,
+						value = pointers.value,
+						context = pointers.context,
+						heads = node.argument[0],
+						groups = node.argument[1],
+						state = node.argument[2],
+						kernel = node.argument[3],
+						width = node.argument[4],
+						qkv_width = node.argument[5],
+						v_width = node.argument[6],
+						length = node.output.length
+					));
+					ir.push_str(barrier(backend));
+				}
 				(reverse, Primitive::Rope) => {
 					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
@@ -3806,6 +3830,8 @@ fn accumulate_owned(target: &str, value: &str, ty: &str, pointer: &str, prefix: 
 /// into. The count is `min(elements, this)`, so it follows the shape of the work
 /// and never the width of the launch.
 const NATIVE_SCALAR_PARTITIONS: usize = 4096;
+/// Delta-net mixes each channel's last four positions before the recurrence.
+const DELTA_CONV: usize = 4;
 
 struct PartitionedLoop<'a> {
 	count: usize,
@@ -4989,6 +5015,7 @@ mod bundle {
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
+			Operation::Delta(heads, groups, state) => format!("delta,{heads},{groups},{state}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -5032,6 +5059,7 @@ mod bundle {
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
+			"delta" => Ok(Operation::Delta(value_at(fields.next(), "delta-net heads")?, value_at(fields.next(), "delta-net groups")?, value_at(fields.next(), "delta-net state")?)),
 			"hyper" => {
 				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
 				let (rank, parts) = rest.split_once(',').unwrap_or((rest, ""));
@@ -5706,6 +5734,7 @@ enum Operation {
 	Perceptron(usize),
 	Embed(usize, usize),
 	Dconv(usize),
+	Delta(usize, usize, usize),
 	Hyper(usize, usize, Vec<Residual>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5841,7 +5870,8 @@ impl Model {
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
-	fn dconv(kernel: usize) = Operation::Dconv(kernel); }
+	fn dconv(kernel: usize) = Operation::Dconv(kernel);
+	fn delta(heads: usize, groups: usize, state: usize) = Operation::Delta(heads, groups, state); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -7181,6 +7211,7 @@ impl Operation {
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Dconv(_) => "dconv",
+			Self::Delta(..) => "delta",
 			Self::Hyper(..) => "hyper",
 		}
 	}
@@ -7700,6 +7731,7 @@ enum Primitive {
 	TopK = 15,
 	Scale = 16,
 	Dconv = 17,
+	Delta = 18,
 	Expand = 12,
 	Read = 13,
 	Outer = 14,
@@ -7745,6 +7777,7 @@ impl Node {
 			Primitive::TopK => "TopK",
 			Primitive::Scale => "Scale",
 			Primitive::Dconv => "Dconv",
+			Primitive::Delta => "Delta",
 			Primitive::Expand => "Expand",
 			Primitive::Read => "Read",
 			Primitive::Outer => "Outer",
@@ -7955,6 +7988,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
+		Operation::Delta(heads, groups, state) => lower_delta(graph, *heads, *groups, *state)?,
 		Operation::Attention(heads, rope) => lower_attention(graph, *heads, *rope)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -8180,6 +8214,41 @@ fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()>
 fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
 	require(kernel != 0, "depthwise convolution kernel must be positive")?;
 	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
+}
+/// Gated delta-net: a linear-attention block whose state is a `[state, state]`
+/// matrix per head, carried across positions and updated by the delta rule
+///
+///     s *= exp(g)                      gate, one scalar per head per position
+///     d[j] = (v[j] - dot(s[j], k)) * b  beta-weighted prediction error
+///     s[j] += d[j] * k                  rank-one correction
+///     o[j] = dot(s[j], q) / sqrt(state)
+///
+/// The block owns every weight it needs, like `attn` owns its projections: the
+/// fused q|k|v projection and the z gate, the causal depthwise convolution over
+/// q|k|v, the beta and alpha gate projections with their bias and decay, the
+/// output norm, and the output projection. `groups` is the query/key head count,
+/// which is `heads` for a plain block and smaller when keys are shared.
+/// The state rows are held transposed (`s[j*state + i]` is `S[i][j]`) so every
+/// dot product walks contiguous memory.
+fn lower_delta(graph: &mut Graph, heads: usize, groups: usize, state: usize) -> Result<()> {
+	require(heads != 0 && groups != 0 && state != 0, "delta-net dimensions must be positive")?;
+	require(heads % groups == 0, "delta-net head count must be a multiple of the group count")?;
+	let input = graph.output;
+	let width = input.channels;
+	let v_width = checked_mul(heads, state, "delta-net value width")?;
+	let qk_width = checked_mul(groups, state, "delta-net key width")?;
+	let qkv_width = checked_add(checked_mul(qk_width, 2, "delta-net key pair")?, v_width, "delta-net qkv width")?;
+	// weights, in this order: qkv projection, z gate projection, conv taps, beta, alpha, dt bias, decay, norm, out
+	let mut parameters = checked_mul(width, qkv_width, "delta-net qkv projection")?;
+	parameters = checked_add(parameters, checked_mul(width, v_width, "delta-net gate projection")?, "delta-net weights")?;
+	parameters = checked_add(parameters, checked_mul(qkv_width, DELTA_CONV, "delta-net conv taps")?, "delta-net weights")?;
+	parameters = checked_add(parameters, checked_mul(width, heads, "delta-net beta")?, "delta-net weights")?;
+	parameters = checked_add(parameters, checked_mul(width, heads, "delta-net alpha")?, "delta-net weights")?;
+	parameters = checked_add(parameters, checked_mul(heads, 2, "delta-net bias and decay")?, "delta-net weights")?;
+	parameters = checked_add(parameters, state, "delta-net weights")?;
+	parameters = checked_add(parameters, checked_mul(v_width, width, "delta-net out projection")?, "delta-net weights")?;
+	push_node(graph, Primitive::Delta, input, parameters,
+		[heads as f64, groups as f64, state as f64, DELTA_CONV as f64, width as f64, qkv_width as f64, v_width as f64, 0.0, 0.0], -2)
 }
 fn lower_attention(graph: &mut Graph, heads: usize, rope: Option<(usize, u64)>) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
@@ -9297,6 +9366,17 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
+		}
+		// One [state, state] matrix per head per row carries the recurrence, and the
+		// convolved q|k|v and the z gate are held for the position walk.
+		Primitive::Delta => {
+			let (heads, state, qkv_width, v_width) = (node.argument[0] as usize, node.argument[2] as usize, node.argument[5] as usize, node.argument[6] as usize);
+			let matrices = checked_mul(checked_mul(rows, heads, "delta-net state heads")?, checked_mul(state, state, "delta-net state matrix")?, "delta-net states")?;
+			// the projected q|k|v, the convolved copy of it, and the z gate
+			let stream_width = checked_add(checked_mul(qkv_width, 2, "delta-net qkv pair")?, v_width, "delta-net stream width")?;
+			let streams = checked_mul(checked_mul(rows, node.output.length, "delta-net stream rows")?, stream_width, "delta-net streams")?;
+			let gates = checked_mul(checked_mul(rows, node.output.length, "delta-net gate rows")?, checked_mul(heads, 2, "delta-net gate pair")?, "delta-net gates")?;
+			checked_add(matrices, checked_add(streams, gates, "delta-net scratch")?, "delta-net")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
 		Primitive::Normalize => {

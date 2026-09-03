@@ -1,0 +1,1 @@
+/home/nate/Developer/recipe-flashnext/target/release/librecipe.rlib: /home/nate/Developer/recipe-flashnext/Cargo.toml /home/nate/Developer/recipe-flashnext/amd-nv-cpu.ll /home/nate/Developer/recipe-flashnext/build.rs /home/nate/Developer/recipe-flashnext/recipe.rs

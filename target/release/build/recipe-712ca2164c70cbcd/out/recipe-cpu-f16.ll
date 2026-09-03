@@ -3627,7 +3627,498 @@ ptr %projection.delta, ptr %previous, ptr %gradient, i1 %write.input, i1 false, 
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
 i32 %projection.gradient.offset, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k,
 i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads )  %projection.next = add i32 %projection.gate, 1 br label %projection.loop
-invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = { nounwind } attributes #1 = { alwaysinline nounwind } attributes #3 = { noinline nounwind }@recipe.cpu.thread = internal thread_local global i32 0, align 4
+invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = { nounwind } attributes #1 = { alwaysinline nounwind } attributes #3 = { noinline nounwind }
+
+; Gated delta-net. One block owns its q|k|v projection, the z gate projection, the
+; causal depthwise convolution, the beta and alpha gates, the recurrence, the gated
+; output norm, and the output projection.
+;
+; Activations are [row][channel][position] with position contiguous.
+; Weights follow the block order: qkv, gate, conv, beta, alpha, dt, decay, norm, out.
+; Context is laid out as: state matrices | projected qkv | convolved qkv | z | beta | gate.
+; The state for head h holds S transposed, s[j*state + i] = S[i][j], so each dot walks
+; contiguous memory.
+define internal void @delta_forward_body( ptr %input, ptr %weights, ptr %output,
+ptr %context, i32 %rows, i32 %heads, i32 %groups, i32 %state, i32 %kernel,
+i32 %width, i32 %qkv.width, i32 %v.width, i32 %length, i32 %threads ) #3 { entry:
+%tid = call i32 @recipe.cpu.thread.id()
+%qk.width = mul i32 %groups, %state
+%state.square = mul i32 %state, %state
+%matrices = mul i32 %rows, %heads
+%matrix.span = mul i32 %matrices, %state.square
+%stream.qkv = mul i32 %qkv.width, %length
+%stream.v = mul i32 %v.width, %length
+%row.in = mul i32 %width, %length
+%projected.base = add i32 %matrix.span, 0
+%projected.span = mul i32 %rows, %stream.qkv
+%convolved.base = add i32 %projected.base, %projected.span
+%gate.base = add i32 %convolved.base, %projected.span
+%gate.span = mul i32 %rows, %stream.v
+%beta.base = add i32 %gate.base, %gate.span
+%head.span = mul i32 %heads, %length
+%head.qk = mul i32 %groups, %length
+%beta.span = mul i32 %rows, %head.span
+%decay.base = add i32 %beta.base, %beta.span
+
+; weight block offsets
+%w.qkv = mul i32 %width, %qkv.width
+%w.gate.off = add i32 %w.qkv, 0
+%w.gate = mul i32 %width, %v.width
+%w.conv.off = add i32 %w.gate.off, %w.gate
+%w.conv = mul i32 %qkv.width, %kernel
+%w.beta.off = add i32 %w.conv.off, %w.conv
+%w.beta = mul i32 %width, %heads
+%w.alpha.off = add i32 %w.beta.off, %w.beta
+%w.dt.off = add i32 %w.alpha.off, %w.beta
+%w.decay.off = add i32 %w.dt.off, %heads
+%w.norm.off = add i32 %w.decay.off, %heads
+%w.out.off = add i32 %w.norm.off, %state
+
+; ---- phase A: project x into q|k|v and into the z gate ----
+%projA.count = mul i32 %rows, %stream.qkv
+br label %projA.loop
+projA.loop:
+%projA.i = phi i32 [ %tid, %entry ], [ %projA.next, %projA.step ]
+%projA.more = icmp ult i32 %projA.i, %projA.count
+br i1 %projA.more, label %projA.step, label %projA.done
+projA.step:
+%projA.row = udiv i32 %projA.i, %stream.qkv
+%projA.rem = urem i32 %projA.i, %stream.qkv
+%projA.out = udiv i32 %projA.rem, %length
+%projA.pos = urem i32 %projA.rem, %length
+%projA.xbase = mul i32 %projA.row, %row.in
+%projA.wbase = mul i32 %projA.out, %width
+br label %projA.inner
+projA.inner:
+%projA.k = phi i32 [ 0, %projA.step ], [ %projA.k.next, %projA.acc ]
+%projA.sum = phi half [ 0xH0000, %projA.step ], [ %projA.sum.next, %projA.acc ]
+%projA.kmore = icmp ult i32 %projA.k, %width
+br i1 %projA.kmore, label %projA.acc, label %projA.store
+projA.acc:
+%projA.xoff = mul i32 %projA.k, %length
+%projA.xi = add i32 %projA.xbase, %projA.xoff
+%projA.xi2 = add i32 %projA.xi, %projA.pos
+%projA.xp = getelementptr inbounds half, ptr %input, i32 %projA.xi2
+%projA.x = load half, ptr %projA.xp, align 2
+%projA.wi = add i32 %projA.wbase, %projA.k
+%projA.wp = getelementptr inbounds half, ptr %weights, i32 %projA.wi
+%projA.w = load half, ptr %projA.wp, align 2
+%projA.prod = call half @recipe.mul(half %projA.w, half %projA.x)
+%projA.sum.next = call half @recipe.add(half %projA.sum, half %projA.prod)
+%projA.k.next = add i32 %projA.k, 1
+br label %projA.inner
+projA.store:
+%projA.dst = add i32 %projected.base, %projA.i
+%projA.dp = getelementptr inbounds half, ptr %context, i32 %projA.dst
+store half %projA.sum, ptr %projA.dp, align 2
+%projA.next = add i32 %projA.i, %threads
+br label %projA.loop
+projA.done:
+
+
+; ---- phase B: causal depthwise convolution over q|k|v, then silu ----
+br label %conv.loop
+conv.loop:
+%conv.i = phi i32 [ %tid, %projA.done ], [ %conv.next, %conv.store ]
+%conv.more = icmp ult i32 %conv.i, %projA.count
+br i1 %conv.more, label %conv.step, label %conv.done
+conv.step:
+%conv.row = udiv i32 %conv.i, %stream.qkv
+%conv.rem = urem i32 %conv.i, %stream.qkv
+%conv.ch = udiv i32 %conv.rem, %length
+%conv.pos = urem i32 %conv.rem, %length
+%conv.rowbase = mul i32 %conv.row, %stream.qkv
+%conv.chbase = mul i32 %conv.ch, %length
+%conv.base = add i32 %conv.rowbase, %conv.chbase
+%conv.tapbase = mul i32 %conv.ch, %kernel
+%conv.reach = sub i32 %kernel, 1
+br label %conv.inner
+conv.inner:
+%conv.t = phi i32 [ 0, %conv.step ], [ %conv.t.next, %conv.acc ]
+%conv.sum = phi half [ 0xH0000, %conv.step ], [ %conv.sum.next, %conv.acc ]
+%conv.tmore = icmp ult i32 %conv.t, %kernel
+br i1 %conv.tmore, label %conv.acc, label %conv.act
+conv.acc:
+%conv.ahead = add i32 %conv.pos, %conv.t
+%conv.src = sub i32 %conv.ahead, %conv.reach
+%conv.valid = icmp sge i32 %conv.src, 0
+%conv.clamped = select i1 %conv.valid, i32 %conv.src, i32 0
+%conv.idx0 = add i32 %conv.base, %conv.clamped
+%conv.idx = add i32 %projected.base, %conv.idx0
+%conv.sp = getelementptr inbounds half, ptr %context, i32 %conv.idx
+%conv.loaded = load half, ptr %conv.sp, align 2
+%conv.val = select i1 %conv.valid, half %conv.loaded, half 0xH0000
+%conv.ti = add i32 %conv.tapbase, %conv.t
+%conv.wi = add i32 %w.conv.off, %conv.ti
+%conv.wp = getelementptr inbounds half, ptr %weights, i32 %conv.wi
+%conv.w = load half, ptr %conv.wp, align 2
+%conv.prod = call half @recipe.mul(half %conv.w, half %conv.val)
+%conv.sum.next = call half @recipe.add(half %conv.sum, half %conv.prod)
+%conv.t.next = add i32 %conv.t, 1
+br label %conv.inner
+conv.act:
+%conv.sig = call half @sigmoid(half %conv.sum)
+%conv.silu = call half @recipe.mul(half %conv.sum, half %conv.sig)
+br label %conv.store
+conv.store:
+%conv.dst = add i32 %convolved.base, %conv.i
+%conv.dp = getelementptr inbounds half, ptr %context, i32 %conv.dst
+store half %conv.silu, ptr %conv.dp, align 2
+%conv.next = add i32 %conv.i, %threads
+br label %conv.loop
+conv.done:
+
+
+; ---- phase C: l2-normalise each q and k head, and build the beta and decay gates ----
+%norm.count = mul i32 %rows, %length
+%norm.heads = mul i32 %norm.count, %groups
+%normq.total = mul i32 %norm.heads, 2
+br label %norm.loop
+norm.loop:
+%norm.i = phi i32 [ %tid, %conv.done ], [ %norm.next, %norm.write ]
+%norm.more = icmp ult i32 %norm.i, %normq.total
+br i1 %norm.more, label %norm.step, label %norm.done
+norm.step:
+%norm.half = udiv i32 %norm.i, %norm.heads
+%norm.rem = urem i32 %norm.i, %norm.heads
+%norm.row = udiv i32 %norm.rem, %head.qk
+%norm.rem2 = urem i32 %norm.rem, %head.qk
+%norm.g = udiv i32 %norm.rem2, %length
+%norm.pos = urem i32 %norm.rem2, %length
+%norm.offset = mul i32 %norm.half, %qk.width
+%norm.chan0 = mul i32 %norm.g, %state
+%norm.chan = add i32 %norm.chan0, %norm.offset
+%norm.rowbase = mul i32 %norm.row, %stream.qkv
+%norm.chbase = mul i32 %norm.chan, %length
+%norm.b0 = add i32 %norm.rowbase, %norm.chbase
+%norm.b1 = add i32 %norm.b0, %norm.pos
+%norm.base = add i32 %convolved.base, %norm.b1
+br label %norm.sum
+norm.sum:
+%norm.j = phi i32 [ 0, %norm.step ], [ %norm.j.next, %norm.acc ]
+%norm.acc2 = phi half [ 0xH0000, %norm.step ], [ %norm.acc2.next, %norm.acc ]
+%norm.jmore = icmp ult i32 %norm.j, %state
+br i1 %norm.jmore, label %norm.acc, label %norm.scale
+norm.acc:
+%norm.joff = mul i32 %norm.j, %length
+%norm.ji = add i32 %norm.base, %norm.joff
+%norm.jp = getelementptr inbounds half, ptr %context, i32 %norm.ji
+%norm.v = load half, ptr %norm.jp, align 2
+%norm.sq = call half @recipe.mul(half %norm.v, half %norm.v)
+%norm.acc2.next = call half @recipe.add(half %norm.acc2, half %norm.sq)
+%norm.j.next = add i32 %norm.j, 1
+br label %norm.sum
+norm.scale:
+%norm.eps = call half @recipe.add(half %norm.acc2, half 0x3EB0C6F7A0B5ED8D)
+%norm.root = call half @recipe.sqrt(half %norm.eps)
+%norm.inv = call half @recipe.div(half 0xH3C00, half %norm.root)
+br label %norm.write.loop
+norm.write.loop:
+%normw.j = phi i32 [ 0, %norm.scale ], [ %normw.j.next, %normw.step ]
+%normw.more = icmp ult i32 %normw.j, %state
+br i1 %normw.more, label %normw.step, label %norm.write
+normw.step:
+%normw.joff = mul i32 %normw.j, %length
+%normw.ji = add i32 %norm.base, %normw.joff
+%normw.jp = getelementptr inbounds half, ptr %context, i32 %normw.ji
+%normw.v = load half, ptr %normw.jp, align 2
+%normw.scaled = call half @recipe.mul(half %normw.v, half %norm.inv)
+store half %normw.scaled, ptr %normw.jp, align 2
+%normw.j.next = add i32 %normw.j, 1
+br label %norm.write.loop
+norm.write:
+%norm.next = add i32 %norm.i, %threads
+br label %norm.loop
+norm.done:
+
+
+; ---- phase D: beta = sigmoid(Wb x); decay = exp(a * softplus(Wa x + dt)) ----
+%gates.count = mul i32 %rows, %head.span
+br label %gates.loop
+gates.loop:
+%gates.i = phi i32 [ %tid, %norm.done ], [ %gates.next, %gates.store ]
+%gates.more = icmp ult i32 %gates.i, %gates.count
+br i1 %gates.more, label %gates.step, label %gates.done
+gates.step:
+%gates.row = udiv i32 %gates.i, %head.span
+%gates.rem = urem i32 %gates.i, %head.span
+%gates.h = udiv i32 %gates.rem, %length
+%gates.pos = urem i32 %gates.rem, %length
+%gates.xbase = mul i32 %gates.row, %row.in
+%gates.wbase = mul i32 %gates.h, %width
+br label %gates.inner
+gates.inner:
+%gates.k = phi i32 [ 0, %gates.step ], [ %gates.k.next, %gates.acc ]
+%gates.b = phi half [ 0xH0000, %gates.step ], [ %gates.b.next, %gates.acc ]
+%gates.a = phi half [ 0xH0000, %gates.step ], [ %gates.a.next, %gates.acc ]
+%gates.kmore = icmp ult i32 %gates.k, %width
+br i1 %gates.kmore, label %gates.acc, label %gates.finish
+gates.acc:
+%gates.xoff = mul i32 %gates.k, %length
+%gates.xi = add i32 %gates.xbase, %gates.xoff
+%gates.xi2 = add i32 %gates.xi, %gates.pos
+%gates.xp = getelementptr inbounds half, ptr %input, i32 %gates.xi2
+%gates.x = load half, ptr %gates.xp, align 2
+%gates.bi0 = add i32 %gates.wbase, %gates.k
+%gates.bi = add i32 %w.beta.off, %gates.bi0
+%gates.bp = getelementptr inbounds half, ptr %weights, i32 %gates.bi
+%gates.bw = load half, ptr %gates.bp, align 2
+%gates.bprod = call half @recipe.mul(half %gates.bw, half %gates.x)
+%gates.b.next = call half @recipe.add(half %gates.b, half %gates.bprod)
+%gates.ai = add i32 %w.alpha.off, %gates.bi0
+%gates.ap = getelementptr inbounds half, ptr %weights, i32 %gates.ai
+%gates.aw = load half, ptr %gates.ap, align 2
+%gates.aprod = call half @recipe.mul(half %gates.aw, half %gates.x)
+%gates.a.next = call half @recipe.add(half %gates.a, half %gates.aprod)
+%gates.k.next = add i32 %gates.k, 1
+br label %gates.inner
+gates.finish:
+%gates.beta = call half @sigmoid(half %gates.b)
+%gates.dti = add i32 %w.dt.off, %gates.h
+%gates.dtp = getelementptr inbounds half, ptr %weights, i32 %gates.dti
+%gates.dt = load half, ptr %gates.dtp, align 2
+%gates.biased = call half @recipe.add(half %gates.a, half %gates.dt)
+%gates.ex = call half @recipe.exp(half %gates.biased)
+%gates.one = call half @recipe.add(half %gates.ex, half 0xH3C00)
+%gates.soft = call half @recipe.log(half %gates.one)
+%gates.di = add i32 %w.decay.off, %gates.h
+%gates.dp = getelementptr inbounds half, ptr %weights, i32 %gates.di
+%gates.decay = load half, ptr %gates.dp, align 2
+%gates.scaled = call half @recipe.mul(half %gates.soft, half %gates.decay)
+%gates.gate = call half @recipe.exp(half %gates.scaled)
+br label %gates.store
+gates.store:
+%gates.bdst = add i32 %beta.base, %gates.i
+%gates.bdp = getelementptr inbounds half, ptr %context, i32 %gates.bdst
+store half %gates.beta, ptr %gates.bdp, align 2
+%gates.gdst = add i32 %decay.base, %gates.i
+%gates.gdp = getelementptr inbounds half, ptr %context, i32 %gates.gdst
+store half %gates.gate, ptr %gates.gdp, align 2
+%gates.next = add i32 %gates.i, %threads
+br label %gates.loop
+gates.done:
+
+
+; ---- phase E: the delta rule, one (row, head) per worker, sequential in position ----
+; s starts at zero. Per position: s *= decay; d[j] = (v[j] - dot(s[j], k)) * beta;
+; s[j] += d[j] * k; out[j] = dot(s[j], q) * rsqrt(state).
+%rule.count = mul i32 %rows, %heads
+%rule.scale.d = call half @recipe.from.u32(i32 %state)
+%rule.root = call half @recipe.sqrt(half %rule.scale.d)
+%rule.scale = call half @recipe.div(half 0xH3C00, half %rule.root)
+%rule.share = udiv i32 %heads, %groups
+br label %rule.loop
+rule.loop:
+%rule.i = phi i32 [ %tid, %gates.done ], [ %rule.next, %rule.tokens.done ]
+%rule.more = icmp ult i32 %rule.i, %rule.count
+br i1 %rule.more, label %rule.step, label %rule.done
+rule.step:
+%rule.row = udiv i32 %rule.i, %heads
+%rule.h = urem i32 %rule.i, %heads
+%rule.g = udiv i32 %rule.h, %rule.share
+%rule.sbase0 = mul i32 %rule.i, %state.square
+%rule.rowbase = mul i32 %rule.row, %stream.qkv
+%rule.vchan0 = mul i32 %rule.h, %state
+%rule.vchan = add i32 %rule.vchan0, %qk.width
+%rule.vchan2 = add i32 %rule.vchan, %qk.width
+%rule.qchan = mul i32 %rule.g, %state
+%rule.kchan0 = mul i32 %rule.g, %state
+%rule.kchan = add i32 %rule.kchan0, %qk.width
+%rule.gatebase0 = mul i32 %rule.row, %head.span
+%rule.gatebase1 = mul i32 %rule.h, %length
+%rule.gatebase = add i32 %rule.gatebase0, %rule.gatebase1
+; zero the state matrix
+br label %rule.zero
+rule.zero:
+%rule.z = phi i32 [ 0, %rule.step ], [ %rule.z.next, %rule.zero.step ]
+%rule.zmore = icmp ult i32 %rule.z, %state.square
+br i1 %rule.zmore, label %rule.zero.step, label %rule.tokens
+rule.zero.step:
+%rule.zi = add i32 %rule.sbase0, %rule.z
+%rule.zp = getelementptr inbounds half, ptr %context, i32 %rule.zi
+store half 0xH0000, ptr %rule.zp, align 2
+%rule.z.next = add i32 %rule.z, 1
+br label %rule.zero
+rule.tokens:
+%rule.t = phi i32 [ 0, %rule.zero ], [ %rule.t.next, %rule.out.done ]
+%rule.tmore = icmp ult i32 %rule.t, %length
+br i1 %rule.tmore, label %rule.token, label %rule.tokens.done
+rule.token:
+%rule.gi = add i32 %rule.gatebase, %rule.t
+%rule.gp = getelementptr inbounds half, ptr %context, i32 %rule.gi
+%rule.decay.i = add i32 %decay.base, %rule.gi
+%rule.decay.p = getelementptr inbounds half, ptr %context, i32 %rule.decay.i
+%rule.decay = load half, ptr %rule.decay.p, align 2
+%rule.beta.i = add i32 %beta.base, %rule.gi
+%rule.beta.p = getelementptr inbounds half, ptr %context, i32 %rule.beta.i
+%rule.beta = load half, ptr %rule.beta.p, align 2
+; scale the whole state by the decay gate
+br label %rule.decay.loop
+rule.decay.loop:
+%rule.d = phi i32 [ 0, %rule.token ], [ %rule.d.next, %rule.decay.step ]
+%rule.dmore = icmp ult i32 %rule.d, %state.square
+br i1 %rule.dmore, label %rule.decay.step, label %rule.rows
+rule.decay.step:
+%rule.di = add i32 %rule.sbase0, %rule.d
+%rule.dp = getelementptr inbounds half, ptr %context, i32 %rule.di
+%rule.dv = load half, ptr %rule.dp, align 2
+%rule.dscaled = call half @recipe.mul(half %rule.dv, half %rule.decay)
+store half %rule.dscaled, ptr %rule.dp, align 2
+%rule.d.next = add i32 %rule.d, 1
+br label %rule.decay.loop
+; per row j of the transposed state: delta, correction, and the output projection
+rule.rows:
+%rule.j = phi i32 [ 0, %rule.decay.loop ], [ %rule.j.next, %rule.row.done ]
+%rule.jmore = icmp ult i32 %rule.j, %state
+br i1 %rule.jmore, label %rule.row.step, label %rule.out.done
+rule.row.step:
+%rule.jbase0 = mul i32 %rule.j, %state
+%rule.jbase = add i32 %rule.sbase0, %rule.jbase0
+br label %rule.dot
+rule.dot:
+%rule.c = phi i32 [ 0, %rule.row.step ], [ %rule.c.next, %rule.dot.step ]
+%rule.dotk = phi half [ 0xH0000, %rule.row.step ], [ %rule.dotk.next, %rule.dot.step ]
+%rule.dotq = phi half [ 0xH0000, %rule.row.step ], [ %rule.dotq.next, %rule.dot.step ]
+%rule.cmore = icmp ult i32 %rule.c, %state
+br i1 %rule.cmore, label %rule.dot.step, label %rule.update
+rule.dot.step:
+%rule.si = add i32 %rule.jbase, %rule.c
+%rule.sp = getelementptr inbounds half, ptr %context, i32 %rule.si
+%rule.sv = load half, ptr %rule.sp, align 2
+%rule.kc0 = add i32 %rule.kchan, %rule.c
+%rule.kc1 = mul i32 %rule.kc0, %length
+%rule.kc2 = add i32 %rule.rowbase, %rule.kc1
+%rule.kc3 = add i32 %rule.kc2, %rule.t
+%rule.kc = add i32 %convolved.base, %rule.kc3
+%rule.kp = getelementptr inbounds half, ptr %context, i32 %rule.kc
+%rule.kv = load half, ptr %rule.kp, align 2
+%rule.kprod = call half @recipe.mul(half %rule.sv, half %rule.kv)
+%rule.dotk.next = call half @recipe.add(half %rule.dotk, half %rule.kprod)
+%rule.qc0 = add i32 %rule.qchan, %rule.c
+%rule.qc1 = mul i32 %rule.qc0, %length
+%rule.qc2 = add i32 %rule.rowbase, %rule.qc1
+%rule.qc3 = add i32 %rule.qc2, %rule.t
+%rule.qc = add i32 %convolved.base, %rule.qc3
+%rule.qp = getelementptr inbounds half, ptr %context, i32 %rule.qc
+%rule.qv = load half, ptr %rule.qp, align 2
+%rule.qprod = call half @recipe.mul(half %rule.sv, half %rule.qv)
+%rule.dotq.next = call half @recipe.add(half %rule.dotq, half %rule.qprod)
+%rule.c.next = add i32 %rule.c, 1
+br label %rule.dot
+rule.update:
+%rule.vc0 = add i32 %rule.vchan2, %rule.j
+%rule.vc1 = mul i32 %rule.vc0, %length
+%rule.vc2 = add i32 %rule.rowbase, %rule.vc1
+%rule.vc3 = add i32 %rule.vc2, %rule.t
+%rule.vc = add i32 %convolved.base, %rule.vc3
+%rule.vp = getelementptr inbounds half, ptr %context, i32 %rule.vc
+%rule.vv = load half, ptr %rule.vp, align 2
+%rule.err = call half @recipe.sub(half %rule.vv, half %rule.dotk)
+%rule.delta = call half @recipe.mul(half %rule.err, half %rule.beta)
+br label %rule.correct
+rule.correct:
+%rule.m = phi i32 [ 0, %rule.update ], [ %rule.m.next, %rule.correct.step ]
+%rule.newq = phi half [ %rule.dotq, %rule.update ], [ %rule.newq.next, %rule.correct.step ]
+%rule.mmore = icmp ult i32 %rule.m, %state
+br i1 %rule.mmore, label %rule.correct.step, label %rule.emit
+rule.correct.step:
+%rule.mi = add i32 %rule.jbase, %rule.m
+%rule.mp = getelementptr inbounds half, ptr %context, i32 %rule.mi
+%rule.mv = load half, ptr %rule.mp, align 2
+%rule.mk0 = add i32 %rule.kchan, %rule.m
+%rule.mk1 = mul i32 %rule.mk0, %length
+%rule.mk2 = add i32 %rule.rowbase, %rule.mk1
+%rule.mk3 = add i32 %rule.mk2, %rule.t
+%rule.mk = add i32 %convolved.base, %rule.mk3
+%rule.mkp = getelementptr inbounds half, ptr %context, i32 %rule.mk
+%rule.mkv = load half, ptr %rule.mkp, align 2
+%rule.add = call half @recipe.mul(half %rule.delta, half %rule.mkv)
+%rule.mnew = call half @recipe.add(half %rule.mv, half %rule.add)
+store half %rule.mnew, ptr %rule.mp, align 2
+%rule.mq0 = add i32 %rule.qchan, %rule.m
+%rule.mq1 = mul i32 %rule.mq0, %length
+%rule.mq2 = add i32 %rule.rowbase, %rule.mq1
+%rule.mq3 = add i32 %rule.mq2, %rule.t
+%rule.mq = add i32 %convolved.base, %rule.mq3
+%rule.mqp = getelementptr inbounds half, ptr %context, i32 %rule.mq
+%rule.mqv = load half, ptr %rule.mqp, align 2
+%rule.qadd = call half @recipe.mul(half %rule.add, half %rule.mqv)
+%rule.newq.next = call half @recipe.add(half %rule.newq, half %rule.qadd)
+%rule.m.next = add i32 %rule.m, 1
+br label %rule.correct
+rule.emit:
+%rule.scaled = call half @recipe.mul(half %rule.newq, half %rule.scale)
+%rule.oc0 = add i32 %rule.vchan0, %rule.j
+%rule.oc1 = mul i32 %rule.oc0, %length
+%rule.oc2 = mul i32 %rule.row, %stream.v
+%rule.oc3 = add i32 %rule.oc2, %rule.oc1
+%rule.oc4 = add i32 %rule.oc3, %rule.t
+%rule.oc = add i32 %gate.base, %rule.oc4
+%rule.op = getelementptr inbounds half, ptr %context, i32 %rule.oc
+%rule.zv = load half, ptr %rule.op, align 2
+%rule.zsig = call half @sigmoid(half %rule.zv)
+%rule.zgated = call half @recipe.mul(half %rule.zsig, half %rule.zv)
+%rule.ni = add i32 %w.norm.off, %rule.j
+%rule.np = getelementptr inbounds half, ptr %weights, i32 %rule.ni
+%rule.nw = load half, ptr %rule.np, align 2
+%rule.normed = call half @recipe.mul(half %rule.scaled, half %rule.nw)
+%rule.final = call half @recipe.mul(half %rule.normed, half %rule.zgated)
+store half %rule.final, ptr %rule.op, align 2
+br label %rule.row.done
+rule.row.done:
+%rule.j.next = add i32 %rule.j, 1
+br label %rule.rows
+rule.out.done:
+%rule.t.next = add i32 %rule.t, 1
+br label %rule.tokens
+rule.tokens.done:
+%rule.next = add i32 %rule.i, %threads
+br label %rule.loop
+rule.done:
+
+
+; ---- phase F: project the gated stream back to the block width ----
+%out.count = mul i32 %rows, %row.in
+br label %out.loop
+out.loop:
+%out.i = phi i32 [ %tid, %rule.done ], [ %out.next, %out.store ]
+%out.more = icmp ult i32 %out.i, %out.count
+br i1 %out.more, label %out.step, label %out.done
+out.step:
+%out.row = udiv i32 %out.i, %row.in
+%out.rem = urem i32 %out.i, %row.in
+%out.ch = udiv i32 %out.rem, %length
+%out.pos = urem i32 %out.rem, %length
+%out.sbase = mul i32 %out.row, %stream.v
+%out.wbase = mul i32 %out.ch, %v.width
+br label %out.inner
+out.inner:
+%out.k = phi i32 [ 0, %out.step ], [ %out.k.next, %out.acc ]
+%out.sum = phi half [ 0xH0000, %out.step ], [ %out.sum.next, %out.acc ]
+%out.kmore = icmp ult i32 %out.k, %v.width
+br i1 %out.kmore, label %out.acc, label %out.store
+out.acc:
+%out.soff = mul i32 %out.k, %length
+%out.si = add i32 %out.sbase, %out.soff
+%out.si2 = add i32 %out.si, %out.pos
+%out.si3 = add i32 %gate.base, %out.si2
+%out.sp = getelementptr inbounds half, ptr %context, i32 %out.si3
+%out.sv = load half, ptr %out.sp, align 2
+%out.wi0 = add i32 %out.wbase, %out.k
+%out.wi = add i32 %w.out.off, %out.wi0
+%out.wp = getelementptr inbounds half, ptr %weights, i32 %out.wi
+%out.wv = load half, ptr %out.wp, align 2
+%out.prod = call half @recipe.mul(half %out.wv, half %out.sv)
+%out.sum.next = call half @recipe.add(half %out.sum, half %out.prod)
+%out.k.next = add i32 %out.k, 1
+br label %out.inner
+out.store:
+%out.dp = getelementptr inbounds half, ptr %output, i32 %out.i
+store half %out.sum, ptr %out.dp, align 2
+%out.next = add i32 %out.i, %threads
+br label %out.loop
+out.done:
+ret void }@recipe.cpu.thread = internal thread_local global i32 0, align 4
 @recipe.cpu.barrier.context = internal thread_local global ptr null, align 2
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 2
 define void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 2 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 2 ret void }
