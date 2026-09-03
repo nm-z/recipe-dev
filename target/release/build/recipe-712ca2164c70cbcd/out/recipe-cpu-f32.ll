@@ -3809,9 +3809,12 @@ norm.acc:
 %norm.j.next = add i32 %norm.j, 1
 br label %norm.sum
 norm.scale:
-%norm.eps = call float @recipe.add(float %norm.acc2, float 0x3EB0C6F7A0B5ED8D)
-%norm.root = call float @recipe.sqrt(float %norm.eps)
-%norm.inv = call float @recipe.div(float 1.0, float %norm.root)
+; per-row L2: x / max(norm, eps), so a zero row leaves the epsilon in the divisor
+; rather than folding the epsilon under the root
+%norm.root = call float @recipe.sqrt(float %norm.acc2)
+%norm.small = fcmp olt float %norm.root, 0x3EB0C6F7A0B5ED8D
+%norm.floor = select i1 %norm.small, float 0x3EB0C6F7A0B5ED8D, float %norm.root
+%norm.inv = call float @recipe.div(float 1.0, float %norm.floor)
 br label %norm.write.loop
 norm.write.loop:
 %normw.j = phi i32 [ 0, %norm.scale ], [ %normw.j.next, %normw.step ]

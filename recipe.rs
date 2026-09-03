@@ -2585,9 +2585,11 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
-				// Training through the recurrence is not implemented: fail loudly rather
-				// than emit a silently wrong gradient.
-				(true, Primitive::Delta) => return Err(RecipeError::new("delta-net is inference-only: it has no reverse pass")),
+				// Issue #566 wants this block trainable. The adjoint has to run backwards
+				// through the rank-one state update, both l2 norms, the causal convolution
+				// and both gate projections, and none of that is written yet. Refuse rather
+				// than emit a gradient that would train the block to nothing.
+				(true, Primitive::Delta) => return Err(RecipeError::new("delta-net has no reverse pass yet: the block runs inference only")),
 				(false, Primitive::Delta) => {
 					// The recurrence walks positions in order, so the kernel owns the whole
 					// sequence and parallelises over rows and heads rather than elements.
