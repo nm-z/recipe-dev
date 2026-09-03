@@ -3992,7 +3992,7 @@ br label %rule.decay.loop
 rule.rows:
 %rule.j = phi i32 [ 0, %rule.decay.loop ], [ %rule.j.next, %rule.row.done ]
 %rule.jmore = icmp ult i32 %rule.j, %state
-br i1 %rule.jmore, label %rule.row.step, label %rule.out.done
+br i1 %rule.jmore, label %rule.row.step, label %rule.norm.sum
 rule.row.step:
 %rule.jbase0 = mul i32 %rule.j, %state
 %rule.jbase = add i32 %rule.sbase0, %rule.jbase0
@@ -4069,27 +4069,78 @@ store half %rule.mnew, ptr addrspace(1) %rule.mp, align 2
 %rule.m.next = add i32 %rule.m, 1
 br label %rule.correct
 rule.emit:
+; hold the raw head output; the per-head RMS is only known once every j is done,
+; so park it in the pre-convolution buffer, which is dead after phase B
 %rule.scaled = call half @recipe.mul(half %rule.newq, half %rule.scale)
-%rule.oc0 = add i32 %rule.vchan0, %rule.j
-%rule.oc1 = mul i32 %rule.oc0, %length
-%rule.oc2 = mul i32 %rule.row, %stream.v
-%rule.oc3 = add i32 %rule.oc2, %rule.oc1
-%rule.oc4 = add i32 %rule.oc3, %rule.t
-%rule.oc = add i32 %gate.base, %rule.oc4
-%rule.op = getelementptr inbounds half, ptr addrspace(1) %context, i32 %rule.oc
-%rule.zv = load half, ptr addrspace(1) %rule.op, align 2
-%rule.zsig = call half @sigmoid(half %rule.zv)
-%rule.zgated = call half @recipe.mul(half %rule.zsig, half %rule.zv)
-%rule.ni = add i32 %w.norm.off, %rule.j
-%rule.np = getelementptr inbounds half, ptr addrspace(1) %weights, i32 %rule.ni
-%rule.nw = load half, ptr addrspace(1) %rule.np, align 2
-%rule.normed = call half @recipe.mul(half %rule.scaled, half %rule.nw)
-%rule.final = call half @recipe.mul(half %rule.normed, half %rule.zgated)
-store half %rule.final, ptr addrspace(1) %rule.op, align 2
+%rule.sc0 = add i32 %rule.vchan0, %rule.j
+%rule.sc1 = mul i32 %rule.sc0, %length
+%rule.sc2 = mul i32 %rule.row, %stream.qkv
+%rule.sc3 = add i32 %rule.sc2, %rule.sc1
+%rule.sc4 = add i32 %rule.sc3, %rule.t
+%rule.sc = add i32 %projected.base, %rule.sc4
+%rule.scp = getelementptr inbounds half, ptr addrspace(1) %context, i32 %rule.sc
+store half %rule.scaled, ptr addrspace(1) %rule.scp, align 2
 br label %rule.row.done
 rule.row.done:
 %rule.j.next = add i32 %rule.j, 1
 br label %rule.rows
+; ---- per-head RMSNorm of the output, then the z gate ----
+rule.norm.sum:
+%rn.j = phi i32 [ 0, %rule.rows ], [ %rn.j.next, %rn.acc ]
+%rn.acc2 = phi half [ 0xH0000, %rule.rows ], [ %rn.acc2.next, %rn.acc ]
+%rn.more = icmp ult i32 %rn.j, %state
+br i1 %rn.more, label %rn.acc, label %rn.scale
+rn.acc:
+%rn.c0 = add i32 %rule.vchan0, %rn.j
+%rn.c1 = mul i32 %rn.c0, %length
+%rn.c2 = mul i32 %rule.row, %stream.qkv
+%rn.c3 = add i32 %rn.c2, %rn.c1
+%rn.c4 = add i32 %rn.c3, %rule.t
+%rn.c = add i32 %projected.base, %rn.c4
+%rn.p = getelementptr inbounds half, ptr addrspace(1) %context, i32 %rn.c
+%rn.v = load half, ptr addrspace(1) %rn.p, align 2
+%rn.sq = call half @recipe.mul(half %rn.v, half %rn.v)
+%rn.acc2.next = call half @recipe.add(half %rn.acc2, half %rn.sq)
+%rn.j.next = add i32 %rn.j, 1
+br label %rule.norm.sum
+rn.scale:
+%rn.count = call half @recipe.from.u32(i32 %state)
+%rn.mean = call half @recipe.div(half %rn.acc2, half %rn.count)
+%rn.eps = call half @recipe.add(half %rn.mean, half 0x3EB0C6F7A0B5ED8D)
+%rn.root = call half @recipe.sqrt(half %rn.eps)
+%rn.inv = call half @recipe.div(half 0xH3C00, half %rn.root)
+br label %rule.norm.apply
+rule.norm.apply:
+%ra.j = phi i32 [ 0, %rn.scale ], [ %ra.j.next, %ra.step ]
+%ra.more = icmp ult i32 %ra.j, %state
+br i1 %ra.more, label %ra.step, label %rule.out.done
+ra.step:
+%ra.c0 = add i32 %rule.vchan0, %ra.j
+%ra.c1 = mul i32 %ra.c0, %length
+%ra.c2 = mul i32 %rule.row, %stream.qkv
+%ra.c3 = add i32 %ra.c2, %ra.c1
+%ra.c4 = add i32 %ra.c3, %rule.t
+%ra.c = add i32 %projected.base, %ra.c4
+%ra.p = getelementptr inbounds half, ptr addrspace(1) %context, i32 %ra.c
+%ra.raw = load half, ptr addrspace(1) %ra.p, align 2
+%ra.normed = call half @recipe.mul(half %ra.raw, half %rn.inv)
+%ra.ni = add i32 %w.norm.off, %ra.j
+%ra.np = getelementptr inbounds half, ptr addrspace(1) %weights, i32 %ra.ni
+%ra.nw = load half, ptr addrspace(1) %ra.np, align 2
+%ra.weighted = call half @recipe.mul(half %ra.normed, half %ra.nw)
+%ra.o1 = mul i32 %ra.c0, %length
+%ra.o2 = mul i32 %rule.row, %stream.v
+%ra.o3 = add i32 %ra.o2, %ra.o1
+%ra.o4 = add i32 %ra.o3, %rule.t
+%ra.o = add i32 %gate.base, %ra.o4
+%ra.op = getelementptr inbounds half, ptr addrspace(1) %context, i32 %ra.o
+%ra.zv = load half, ptr addrspace(1) %ra.op, align 2
+%ra.zsig = call half @sigmoid(half %ra.zv)
+%ra.zgated = call half @recipe.mul(half %ra.zsig, half %ra.zv)
+%ra.final = call half @recipe.mul(half %ra.weighted, half %ra.zgated)
+store half %ra.final, ptr addrspace(1) %ra.op, align 2
+%ra.j.next = add i32 %ra.j, 1
+br label %rule.norm.apply
 rule.out.done:
 %rule.t.next = add i32 %rule.t, 1
 br label %rule.tokens
