@@ -4252,6 +4252,26 @@ mod gguf {
 	use super::{Integer, RecipeError, Result, StorageFormat, require, unfp16};
 	use std::path::{Path, PathBuf};
 
+	/// A tensor prepared as a parameter buffer. It holds the block-quantized bytes
+	/// as the file stores them, so binding one costs a copy of the mapped region
+	/// rather than a decode and a re-encode.
+	pub struct Stored(pub(in crate) super::StoredWeight);
+
+	impl Stored {
+		/// Values the buffer holds.
+		pub fn count(&self) -> usize {
+			self.0.count
+		}
+		/// Whether the buffer keeps the file's own block encoding.
+		pub fn quantized(&self) -> bool {
+			!self.0.bytes.is_empty()
+		}
+		/// Stored bytes, for a quantized buffer.
+		pub fn bytes(&self) -> &[u8] {
+			&self.0.bytes
+		}
+	}
+
 	const MAGIC: u32 = 0x4655_4747;
 	const VERSION: u32 = 3;
 	const DEFAULT_ALIGNMENT: u64 = 32;
@@ -4528,6 +4548,21 @@ mod gguf {
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
 			self.decode(tensor, self.data(tensor), tensor.shape.iter().product::<u64>() as usize)
 		}
+		/// The tensor as a parameter buffer the tape can bind: a block-quantized
+		/// tensor keeps its mapped bytes and its own format, so nothing is decoded
+		/// and re-encoded on the way in. An unquantized tensor decodes once into
+		/// the arithmetic slot, which is what a full-precision parameter is.
+		pub fn bind(&self, tensor: &GgufTensor) -> Result<Stored> {
+			let count = tensor.shape.iter().product::<u64>() as usize;
+			let (block, _, format) = layout(tensor.kind)?;
+			match format {
+				Some(format) => {
+					require(count % block == 0, format!("tensor {} of {count} values is not whole blocks of {block}", tensor.name))?;
+					Ok(Stored(super::StoredWeight { format, count, bytes: self.data(tensor).to_vec(), codebook: Vec::new(), arithmetic: Vec::new() }))
+				}
+				None => Ok(Stored(super::StoredWeight { format: super::StorageFormat(0), count, bytes: Vec::new(), codebook: Vec::new(), arithmetic: self.values(tensor)? })),
+			}
+		}
 		/// One row of a tensor: `shape[0]` values, decoded from that row's bytes alone.
 		pub fn row(&self, tensor: &GgufTensor, index: usize) -> Result<Vec<f64>> {
 			let (block, stride, _) = layout(tensor.kind)?;
@@ -4565,7 +4600,7 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue};
+pub use gguf::{Gguf, GgufTensor, GgufValue, Stored};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the merge ranks, the pre-tokenizer family, and the special ids.
