@@ -5483,6 +5483,22 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 	}
 	Ok(weights)
 }
+/// Encodes each `block`-wide slice of the weights on the configured CPU workers and
+/// concatenates the encoded blocks in index order. A trailing partial slice pads with
+/// zeros. Block formats carry no codebook.
+fn encode_blocks(weights: &[f64], block: usize, encode: impl Fn(usize, &[f32], &mut Vec<u8>) + Sync) -> Result<(Vec<u8>, Vec<f64>)> {
+	let blocks = parallel_map(weights.len().div_ceil(block), |chunk| {
+		let values = block_values(weights, chunk, block);
+		let mut data = Vec::new();
+		encode(chunk, &values, &mut data);
+		data
+	})?;
+	Ok((blocks.concat(), Vec::new()))
+}
+/// Reads the `chunk`-th `block`-wide slice as single precision, padding past the end with zeros.
+fn block_values(values: &[f64], chunk: usize, block: usize) -> Vec<f32> {
+	(0..block).map(|index| values.get(chunk * block + index).copied().unwrap_or(0.0) as f32).collect()
+}
 impl Integer for StorageFormat {
 	fn bits(self) -> u8 {
 		self.0 as u8
@@ -5491,11 +5507,9 @@ impl Integer for StorageFormat {
 		let quantizer = self.spec().ok_or_else(|| self.unavailable())?.codec.quantization().quantizer;
 		if let Quantizer::Scalar { bits, variant } = quantizer {
 			let block = 32;
-			let mut data = Vec::new();
-			for values in weights.chunks(block) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
-				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, block, |_, values, data| {
+				let (minimum, maximum) = values.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(*value), high.max(*value)));
+				let extreme = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let scale = match (bits, variant) {
 					(8, _) => extreme.abs() / 127.0,
 					(_, 0) => extreme / -(1_i32 << (bits - 1)) as f32,
@@ -5503,17 +5517,17 @@ impl Integer for StorageFormat {
 					_ => unreachable!(),
 				};
 				let inverse = if scale == 0.0 { 0.0 } else { scale.recip() };
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				if variant == 1 && bits != 8 {
-					put_half(&mut data, minimum)
+					put_half(data, minimum)
 				}
 				let (mut low, mut high) = ([0_u8; 32], [0_u8; 4]);
 				let mut sum = 0_i32;
 				for index in 0..block {
 					let shifted = match (bits, variant) {
-						(8, _) => (value(index) * inverse).round() + 128.0,
-						(_, 0) => value(index) * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
-						(_, 1) => (value(index) - minimum) * inverse + 0.5,
+						(8, _) => (values[index] * inverse).round() + 128.0,
+						(_, 0) => values[index] * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
+						(_, 1) => (values[index] - minimum) * inverse + 0.5,
 						_ => unreachable!(),
 					};
 					let code = shifted.max(0.0).min(f32::from((1_u16 << bits) - 1)) as u8;
@@ -5532,7 +5546,7 @@ impl Integer for StorageFormat {
 					data.extend(high)
 				}
 				if bits == 8 && variant == 1 {
-					put_half(&mut data, scale * sum as f32)
+					put_half(data, scale * sum as f32)
 				}
 				data.extend_from_slice(
 					&low[..match bits {
@@ -5541,13 +5555,10 @@ impl Integer for StorageFormat {
 						_ => unreachable!(),
 					}],
 				);
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q2K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut scales, mut minima) = ([0_u8; 256], [0.0_f32; 16], [0.0_f32; 16]);
 				for block in 0..16 {
 					let weights = values[block * 16..block * 16 + 16].iter().map(|value| value.abs()).collect::<Vec<_>>();
@@ -5576,15 +5587,12 @@ impl Integer for StorageFormat {
 				}
 				data.extend(packed_scales);
 				data.extend(packed);
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+				put_half(data, minimum);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q3K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -5628,15 +5636,11 @@ impl Integer for StorageFormat {
 				data.extend(high);
 				data.extend(low);
 				data.extend(scales);
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if let Quantizer::Q45K { bits } = quantizer {
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			let data = parallel_map(chunks.len(), |chunk| {
-				let values = (0..256).map(|index| chunks[chunk].get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let mut data = Vec::new();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
 				for block in 0..8 {
 					let slice = &values[block * 32..block * 32 + 32];
@@ -5677,21 +5681,17 @@ impl Integer for StorageFormat {
 						high[offset] |= (codes[group + offset] >> 4) << (group / 32) | (codes[group + offset + 32] >> 4) << (group / 32 + 1)
 					}
 				}
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
+				put_half(data, scale);
+				put_half(data, minimum);
 				data.extend(metadata);
 				if bits == 5 {
 					data.extend(high)
 				}
 				data.extend(packed);
-				data
-			})?;
-			return Ok((data.concat(), Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q6K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -5726,25 +5726,21 @@ impl Integer for StorageFormat {
 				data.extend(low);
 				data.extend(high);
 				data.extend(scales.map(|value| value as u8));
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q8K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, 256, |_, values, data| {
+				let maximum = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum };
 				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
 				data.extend(scale.to_le_bytes());
-				let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				let codes = values.iter().map(|value| qround(inverse * value).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
 				data.extend(codes.iter().map(|code| *code as u8));
 				for block in codes.chunks(16) {
 					data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes())
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Nf4) {
 			const NF4: [f64; 16] = [
@@ -5780,21 +5776,16 @@ impl Integer for StorageFormat {
 			return Ok((data, metadata));
 		}
 		if matches!(quantizer, Quantizer::Iq4Nl) {
-			let mut data = Vec::new();
-			for values in weights.chunks(32) {
-				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let (scale, codes) = iq4_fit(&values, -1);
-				put_half(&mut data, scale);
+			return encode_blocks(weights, 32, |_, values, data| {
+				let (scale, codes) = iq4_fit(values, -1);
+				put_half(data, scale);
 				for index in 0..16 {
 					data.push(codes[index] | codes[index + 16] << 4)
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Iq4Xs) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..8 {
@@ -5820,7 +5811,7 @@ impl Integer for StorageFormat {
 						codes[block * 32 + offset] = iq4_code(values[block * 32 + offset] * inverse)
 					}
 				}
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				data.extend(high.to_le_bytes());
 				data.extend(low);
 				for block in 0..8 {
@@ -5828,40 +5819,38 @@ impl Integer for StorageFormat {
 						data.push(codes[block * 32 + offset] | codes[block * 32 + offset + 16] << 4)
 					}
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
+		let weighted = |chunk: usize| block_values(importance, chunk, 256);
 		if matches!(quantizer, Quantizer::Iq2Xxs) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XXS requires trained importance weights",
 			)?;
-			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_xxs(values, &weighted(chunk))));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: true, xs: true }) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XS requires trained importance weights",
 			)?;
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_16(values, Some(&weighted(chunk)), true)));
 		}
 		if let Quantizer::Iq1 { medium } = quantizer {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				format!("GGML IQ1_{} requires trained importance weights", if medium { "M" } else { "S" }),
 			)?;
-			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), medium), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq1(values, &weighted(chunk), medium)));
 		}
 		if matches!(quantizer, Quantizer::Iq3Xxs) {
-			let weights = weights.iter().map(|value| *value as f32).collect::<Vec<_>>();
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			return Ok((parallel_map(chunks.len(), |chunk| iq3_xxs(chunks[chunk]))?.concat(), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_xxs(values)));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: false, xs: false }) {
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq2_16(values, None, false)));
 		}
 		if matches!(quantizer, Quantizer::Iq3S) {
-			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_s(values)));
 		}
 		Err(self.unavailable())
 	}
