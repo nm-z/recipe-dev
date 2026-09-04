@@ -130,6 +130,11 @@ fn causal_sequence_head_128_forward_and_backward() {
 }
 
 #[test]
+fn causal_sequence_head_256_forward_and_backward() {
+	compare(256, 16, "causal_sequence_head_256_forward_and_backward")
+}
+
+#[test]
 fn causal_sequence_fp32_forward_and_backward() {
 	compare(64, 32, "causal_sequence_fp32_forward_and_backward")
 }
