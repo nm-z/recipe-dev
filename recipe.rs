@@ -10802,6 +10802,8 @@ struct Prepared {
 struct Table {
 	name: String,
 	headers: Vec<String>,
+	/// Whether the source names the headers; a headerless table takes positional names instead.
+	declared: bool,
 	rows: Vec<Vec<String>>,
 	/// Row-major image values are channel-major when each image row is one channel.
 	attention: Option<Shape>,
@@ -10989,13 +10991,15 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			}
 			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
 	}
 	if aligned {
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	// Only a declared column overrides the directory names; the positional names a headerless
+	// sample takes name its one field by convention rather than carrying a label.
+	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
 		return Ok(None);
 	}
 	let mut builder = SampleTableBuilder::new(target.clone());
@@ -11033,7 +11037,7 @@ impl SampleTableBuilder {
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
+		Ok(Table { name, headers: self.headers, declared: true, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
@@ -11729,7 +11733,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
+	Ok(vec![Table { name: "data".to_owned(), headers, declared: true, rows, attention: None }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -11747,7 +11751,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), declared: true, rows: Vec::new(), attention: None };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
@@ -11766,7 +11770,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 		}
 	}
 	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows, attention: None }])
+	Ok(vec![Table { name, headers, declared: true, rows, attention: None }])
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -11839,7 +11843,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, rows, attention: None });
+		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -12372,7 +12376,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, rows: table_rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows: table_rows, attention: None })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -12595,7 +12599,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows, attention: None })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -12620,7 +12624,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, rows, attention: None }, blank))
+	Ok((Table { name, headers, declared: !headerless, rows, attention: None }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
