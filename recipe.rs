@@ -4337,6 +4337,9 @@ mod bundle {
 	}
 	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let (_, graphs) = load_semantic(path)?;
+		infer_graphs(&graphs, input, forward)
+	}
+	pub(super) fn infer_graphs(graphs: &[SemanticGraph], input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
 		require(input.len() == first.inputs.len(), format!("model input expected {} values, received {}", first.inputs.len(), input.len()))?;
 		let mut values = first.inputs.iter().cloned().zip(input.iter().copied()).collect::<BTreeMap<_, _>>();
@@ -6086,6 +6089,164 @@ impl Recipe {
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
 }
+/// A saved model placed across the selected devices: contiguous block ranges,
+/// each on its own device, run in sequence with the stream moved at every hop.
+pub struct Placed {
+	graphs: Vec<bundle::SemanticGraph>,
+	split: Vec<usize>,
+	devices: &'static [&'static Gpu],
+	resident: Vec<usize>,
+	moved: usize,
+}
+/// The saved statistics a batch normalization carries into inference, as the
+/// node index and the channels it normalizes.
+fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
+	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels)))
+}
+/// The values a device holds for a range of nodes: their parameters and the
+/// state their batch normalizations carry.
+fn resident_values(nodes: &[Node]) -> usize {
+	nodes.iter().map(|node| node.parameters).sum::<usize>() + carried_state(nodes).map(|(_, channels)| 2 * channels).sum::<usize>()
+}
+/// Whether a device boundary before node `start` cuts a connection into a later
+/// node: a residual reaching back over it, or the model input.
+fn cuts_connection(graph: &Graph, start: usize) -> bool {
+	graph.nodes[start..].iter().flat_map(|node| [(node.source, 1), (node.second, 0)]).any(|(index, first)| match usize::try_from(index) {
+		Ok(from) => from + first < start,
+		Err(_) => index == -1 && start != 0,
+	})
+}
+/// Blocks per device measured from the free memory of each: a block joins the
+/// current device while its resident values fit and the boundary before it cuts
+/// no connection, so the device listed last takes the tail.
+fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
+	let mut starts = Vec::new();
+	for (index, node) in graph.nodes.iter().enumerate() {
+		if index == 0 || node.block_index != graph.nodes[index - 1].block_index {
+			starts.push(index)
+		}
+	}
+	let (mut split, mut taken, mut free) = (Vec::new(), 0, devices[0].free_bytes()?);
+	for (block, &start) in starts.iter().enumerate() {
+		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
+		let resident = (resident_values(&graph.nodes[start..end]) * bytes) as u64;
+		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
+			split.push(taken);
+			(taken, free) = (0, devices[split.len()].free_bytes()?);
+		}
+		free = free.saturating_sub(resident);
+		taken += 1;
+	}
+	require(taken != 0, "model has no block")?;
+	split.push(taken);
+	Ok(split)
+}
+/// The nodes of the blocks each device takes, rebased so every part is a graph
+/// of its own whose input is the previous part's output.
+fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
+	let (mut parts, mut start, mut first_block) = (Vec::new(), 0, 0);
+	for (device, blocks) in split.iter().enumerate() {
+		first_block += blocks;
+		let end = if device + 1 == split.len() { graph.nodes.len() } else { graph.nodes.iter().position(|node| node.block_index >= first_block).unwrap_or(graph.nodes.len()) };
+		require(end > start, format!("device {device} takes no blocks"))?;
+		require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
+		let base = graph.nodes[start].offset;
+		let rebase = |index: i32| {
+			if index >= start as i32 {
+				index - start as i32
+			} else if index == -2 {
+				-2
+			} else {
+				-1
+			}
+		};
+		let nodes = graph.nodes[start..end]
+			.iter()
+			.map(|node| {
+				require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
+				Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let last = &graph.nodes[end - 1];
+		let parameters = last.offset + last.parameters;
+		parts.push(Graph {
+			nodes,
+			parameters: graph.parameters[base..parameters].to_vec(),
+			frozen: graph.frozen[base..parameters].to_vec(),
+			programs: graph.programs.clone(),
+			stored: graph.stored[start..end].to_vec(),
+			input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
+			output: last.output,
+			source: (end - start) as i32 - 1,
+			state: TrainingState::default(),
+			block_index: last.block_index,
+			block_kind: last.block_kind,
+		});
+		start = end;
+	}
+	Ok(parts)
+}
+fn place_model(path: &Path, split: &[usize]) -> Result<Placed> {
+	let path = resolve_path(path)?;
+	let devices = selected_gpus()?;
+	let (_, graphs) = bundle::load_semantic(&path)?;
+	let (mut split, mut resident, mut moved) = (split.to_vec(), vec![0; devices.len()], 0);
+	for stored in &graphs {
+		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
+		let bytes = stored.precision.bytes();
+		if split.is_empty() {
+			split = measured_split(&graph, bytes, devices)?;
+		}
+		let blocks = stored.model.blocks.len();
+		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
+		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
+		for (index, part) in split_graph(&graph, &split)?.iter().enumerate() {
+			resident[index] += resident_values(&part.nodes) * bytes;
+			if index + 1 < split.len() {
+				moved += part.output.elements() * bytes;
+			}
+		}
+	}
+	Ok(Placed { graphs, split, devices, resident, moved })
+}
+impl Recipe {
+	/// Place a saved model across the selected devices: `split` gives every
+	/// device, in `--device` order, the number of blocks it takes, and an empty
+	/// split is measured from the free memory of each device.
+	pub fn place(&self, path: impl AsRef<Path>, split: &[usize]) -> Placed {
+		place_model(path.as_ref(), split).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
+impl Placed {
+	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
+		bundle::infer_graphs(&self.graphs, input, |stored, samples| self.forward(stored, samples)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn forward(&self, stored: &bundle::SemanticGraph, samples: &[f64]) -> Result<Vec<f64>> {
+		let graph = materialize_saved_graph(stored, samples, self.devices[0], Config::load()?)?;
+		let (mut stream, mut statistics) = (samples.to_vec(), 0);
+		for (part, device) in split_graph(&graph, &self.split)?.iter().zip(self.devices) {
+			let mut tape = NativeTape::new(part, &stream, &[], device, stored.precision, None)?;
+			let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+			tape.inject_bn_stats(stored.bn_stats.get(statistics..statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+			statistics += count;
+			tape.forward()?;
+			stream = tape.predictions()?;
+		}
+		Ok(stream)
+	}
+	/// The blocks each device takes, in `--device` order.
+	pub fn split(&self) -> &[usize] {
+		&self.split
+	}
+	/// Parameter and carried state bytes each device holds, in the model precision.
+	pub fn resident_bytes(&self) -> &[usize] {
+		&self.resident
+	}
+	/// Bytes one row moves across all hops.
+	pub fn moved_bytes(&self) -> usize {
+		self.moved
+	}
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {
 	channels: usize,
@@ -7021,16 +7182,19 @@ impl NativeTape {
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
-		let zeros = vec![0.0; parameters.max(1)];
-		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
+		// Only the epoch entrypoint reads the optimizer state, the gradient and
+		// the adjoints, so an inference tape holds none of them on the device.
+		let training = program.artifact.training;
+		let state_values = if training { parameters.max(1) } else { 1 };
+		let zeros = vec![0.0; state_values];
+		let gradient_bytes = if training { checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")? } else { 1 };
 		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
 		require(graph.state.variances.is_empty() || graph.state.variances.len() == parameters, "saved optimizer variances have the wrong shape")?;
 		require(graph.frozen.is_empty() || graph.frozen.len() == parameters, "frozen parameters have the wrong shape")?;
-		let moments = if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() };
-		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
-		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
-		let batch_normalizations =
-			graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
+		let moments = if training && !graph.state.moments.is_empty() { graph.state.moments.clone() } else { zeros.clone() };
+		let variances = if training && !graph.state.variances.is_empty() { graph.state.variances.clone() } else { zeros.clone() };
+		let frozen = if training && !graph.frozen.is_empty() { graph.frozen.clone() } else { vec![0_u8; state_values] };
+		let batch_normalizations = carried_state(&graph.nodes).collect();
 		let best_loss = if graph.state.best_loss.is_empty() {
 			[f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY]
 		} else {
@@ -7039,8 +7203,8 @@ impl NativeTape {
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
-		let adjoints_bytes = layout.adjoints_bytes.max(1);
-		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
+		let adjoints_bytes = if training { layout.adjoints_bytes.max(1) } else { 1 };
+		let input_adjoint_bytes = if training { checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
@@ -7913,6 +8077,7 @@ struct Cuda {
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
 	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> i32,
 	load: unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32,
@@ -7955,6 +8120,7 @@ struct Hsa {
 	executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32,
 	symbol: HsaSymbol,
 	symbol_info: HsaSymbolInfo,
+	info: HsaInfo,
 	allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32,
 	free: unsafe extern "C" fn(Ptr) -> i32,
 	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
@@ -7980,6 +8146,7 @@ const REMOTE_DOWNLOAD: u8 = 4;
 const REMOTE_SYNCHRONIZE: u8 = 5;
 const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
+const REMOTE_MEMORY: u8 = 8;
 struct Wire<R: Read, W: Write> {
 	input: std::io::BufReader<R>,
 	output: std::io::BufWriter<W>,
@@ -8446,6 +8613,36 @@ impl Gpu {
 			}
 		}
 	}
+	/// The memory the device has free now. The host is not bounded by device
+	/// memory, so the CPU reports its whole capacity.
+	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
+	fn free_bytes(&self) -> Result<u64> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => Ok(self.memory),
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => {
+					let (mut free, mut total) = (0, 0);
+					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
+					Ok(free as u64)
+				}
+				#[cfg(amd)]
+				Driver::Hsa(driver) => {
+					let mut free = 0_u64;
+					self.status((driver.info)(driver.agent, 0xA011, (&mut free as *mut u64).cast()), "free memory")?;
+					Ok(free)
+				}
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_MEMORY)?;
+					channel.flush()?;
+					channel.read_status("free memory")?;
+					channel.read_u64()
+				}
+			}
+		}
+	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn synchronize(&self) -> Result<()> {
 		self.activate()?;
@@ -8489,12 +8686,12 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() {
-				if cfg!(any(amd, nvidia)) {
-					return Err(RecipeError::new(errors.join("; ")));
-				}
-				found.push(cpu_device()?);
+			if found.is_empty() && cfg!(any(amd, nvidia)) {
+				return Err(RecipeError::new(errors.join("; ")));
 			}
+			// The CPU is always selectable, after the accelerators, so a placement
+			// can end on the host.
+			found.push(cpu_device()?);
 			Ok(found)
 		})
 		.as_ref()
@@ -8506,7 +8703,7 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
+	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
 fn local_host() -> Result<String> {
@@ -9223,6 +9420,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			executable_freeze,
 			symbol,
 			symbol_info,
+			info,
 			allocate,
 			allow,
 			queue,
@@ -9305,6 +9503,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
 				launch: runtime.function(b"cuLaunchKernel\0")?,
 				load,
@@ -9421,6 +9620,13 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				}
 			}
 			REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
+			REMOTE_MEMORY => {
+				let free = gpu.free_bytes();
+				wire.status(&free.as_ref().map(|_| ()).map_err(Clone::clone))?;
+				if let Ok(bytes) = free {
+					wire.write_bytes(&bytes.to_le_bytes())?;
+				}
+			}
 			REMOTE_LOAD => {
 				let bytes = wire.read_u64()? as usize;
 				let mut artifact = vec![0_u8; bytes];
