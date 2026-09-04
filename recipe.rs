@@ -7658,8 +7658,14 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// Four statistic planes over the group count the emitted kernel walks:
+		// batch and evaluation groups are channels, layer and RMS groups are row
+		// positions.
 		Primitive::Normalize => {
-			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
+			let groups = match normalize_mode(node.argument[0])? {
+				program_ir::NormalizeMode::Batch | program_ir::NormalizeMode::Evaluation => node.output.channels,
+				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => checked_mul(rows, node.output.length, "layer groups")?,
+			};
 			checked_mul(4, groups, "normalization context")?
 		}
 		_ => 1,
