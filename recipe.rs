@@ -6954,20 +6954,20 @@ fn count(name: &str, text: &str) -> Result<usize> {
 }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
-	// Every selected target column is an output, in the order the user declared them.
-	let outputs = if data.autoregressive {
-		vec!["char-id".to_owned()]
-	} else if data.target.is_empty() {
-		vec!["target".to_owned()]
-	} else {
-		data.target.clone()
-	};
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
 	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
+	// Every selected target column is an output, in the order the user declared them.
+	let outputs = if data.autoregressive {
+		vec!["char-id".to_owned()]
+	} else if data.target.is_empty() {
+		vec!["target".to_owned()]
+	} else {
+		schema.iter().filter(|(kind, _)| kind == "target").map(|(_, name)| name.clone()).collect()
+	};
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
@@ -11406,7 +11406,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		require(data.tests.is_empty(), "autoregressive test data is unsupported")?;
 		return prepare_autoregression(data, &tables);
 	}
-	let mut selected = Vec::new();
+	let (mut selected, mut target_names) = (Vec::new(), Vec::new());
 	for name in &data.target {
 		let mut matches = Vec::new();
 		for (table, value) in tables.iter().enumerate() {
@@ -11420,9 +11420,11 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			let grouped = !matches.is_empty()
 				&& matches.iter().all(|(table, column)| tables[*table].headers[*column].rsplit_once('.').is_some_and(|(base, suffix)| base == name && suffix.parse::<usize>().is_ok()));
 			require(grouped, format!("target {name:?} must identify exactly one feature or a numbered group"))?;
+			target_names.extend(matches.iter().map(|(table, column)| tables[*table].headers[*column].clone()));
 			selected.extend(matches);
 			continue;
 		}
+		target_names.push(name.clone());
 		selected.push(matches[0]);
 	}
 	let table_index = selected.first().map_or(0, |target| target.0);
@@ -11512,7 +11514,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let schema = columns
 		.iter()
 		.map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1])))
-		.chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target)))
+		.chain(target_names.into_iter().map(|target| ("target".to_owned(), target)))
 		.collect();
 	finish_prepared(data, samples, targets, target_width, source_rows, features, shapes, target_categorical, schema)
 }
