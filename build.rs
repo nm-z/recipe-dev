@@ -526,7 +526,10 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 }
 fn half_ir(ir: String) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
-	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %result = fptrunc float %value to half ret half %result }";
+	// Saturate to the half range before rounding, the way the integer codec clamps
+	// to its own extremes. A plain truncation encodes every larger result as an
+	// infinity, so one overflowing activation makes the whole model nonfinite.
+	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %below = fcmp olt float %value, -65504.0 %above = fcmp ogt float %value, 65504.0 %lowered = select i1 %below, float -65504.0, float %value %clamped = select i1 %above, float 65504.0, float %lowered %result = fptrunc float %clamped to half ret half %result }";
 	let numeric = numeric_program("half", "float", codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", "@contraction_tile_f16").replace("align 8", "align 2");
 	kernel = kernel.replace("RECIPE_STATE_ALIGN", "4").replace("RECIPE_STATE", "float");
