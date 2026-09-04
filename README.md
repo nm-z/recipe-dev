@@ -51,7 +51,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)
+	attn(heads)[.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
@@ -83,6 +83,34 @@ Feature generation is banned.
 ```
 relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
+```
+
+## 4 normalizations
+
+```rust
+.norm(batch)   per-channel statistics over the batch
+.norm(layer)   per-row statistics over the channels
+.norm(rms)     per-row root mean square, one trainable scale per channel
+.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
+```
+
+`.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
+over its head-width slice, leaving the values untouched:
+
+```rust
+.attn(4).qk(rms)
+```
+
+## sparse attention
+
+`attn(heads)` builds one query, key and value plane per head. `.kv(heads)` unties
+the key-value head count, so each key-value head serves `heads / kv` query heads.
+`.index(heads, width, block, keep)` adds a side projection that scores every group
+of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
+attention output by a sigmoid of its own projection of the block input.
+
+```rust
+.attn(8).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
 ```
 
 ## compute precisions

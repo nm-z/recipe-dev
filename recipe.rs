@@ -821,6 +821,17 @@ mod program_ir {
 		Rms,
 		/// Stored batch statistics used by evaluation and inference.
 		Evaluation,
+		/// Row L2 statistics use layer-shaped groups with a zero mean, no item
+		/// average, and an epsilon floor on the norm.
+		L2,
+	}
+
+	impl NormalizeMode {
+		/// Layer-shaped modes group one row position; the group holds `width`
+		/// channels, so a row of `channels` splits into `channels / width` heads.
+		pub fn per_row(self) -> bool {
+			matches!(self, Self::Layer | Self::Rms | Self::L2)
+		}
 	}
 
 	#[derive(Clone, Copy)]
@@ -833,13 +844,82 @@ mod program_ir {
 		pub rows: &'a str,
 		pub channels: usize,
 		pub length: usize,
+		/// Channels per group in the per-row modes.
+		pub width: usize,
+		/// Channels the per-row modes normalize; the rest pass through.
+		pub span: usize,
+		/// The per-channel scale applied after normalization, when the node carries one.
+		pub weight: Option<&'a str>,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
+	}
+
+	impl NormalizeContext<'_> {
+		fn shape(&self) -> GroupShape<'_> {
+			GroupShape { mode: self.mode, channels: self.channels, length: self.length, width: self.width, span: self.span, rows: self.rows }
+		}
 	}
 
 	pub struct NormalizeFragment {
 		pub code: String,
 		pub value: String,
+	}
+
+	#[derive(Clone, Copy)]
+	struct GroupShape<'a> {
+		mode: NormalizeMode,
+		channels: usize,
+		length: usize,
+		width: usize,
+		span: usize,
+		rows: &'a str,
+	}
+
+	struct GroupIndex {
+		group: String,
+		groups: String,
+		channel: String,
+		/// The predicate that holds where the element normalizes, when a channel of
+		/// the row passes through instead.
+		inside: Option<String>,
+	}
+
+	/// Names the statistics group of one element. A per-row mode splits the leading
+	/// `span` channels into groups of `width`, so one attention head owns one group;
+	/// a channel past the span has no group and clamps to the first one.
+	fn emit_group_index(code: &mut String, prefix: &str, shape: GroupShape<'_>, element: &str) -> GroupIndex {
+		let (channels, length, elements) = (shape.channels, shape.length, shape.channels * shape.length);
+		let (row, local, position) = (format!("%{prefix}.row"), format!("%{prefix}.local"), format!("%{prefix}.position"));
+		let (group, groups, channel) = (format!("%{prefix}.group"), format!("%{prefix}.groups"), format!("%{prefix}.channel"));
+		let _ = writeln!(code, "{row} = udiv i32 {element}, {elements}");
+		let _ = writeln!(code, "{local} = urem i32 {element}, {elements}");
+		let _ = writeln!(code, "{position} = urem i32 {local}, {length}");
+		let _ = writeln!(code, "{channel} = udiv i32 {local}, {length}");
+		if !shape.mode.per_row() {
+			let _ = writeln!(code, "{group} = add i32 {channel}, 0");
+			let _ = writeln!(code, "{groups} = add i32 0, {channels}");
+			return GroupIndex { group, groups, channel, inside: None };
+		}
+		let (span, width) = (shape.span, shape.width);
+		let inside = (span < channels).then(|| format!("%{prefix}.inside"));
+		let head = format!("%{prefix}.head");
+		match &inside {
+			Some(inside) => {
+				let _ = writeln!(code, "{inside} = icmp ult i32 {channel}, {span}");
+				let _ = writeln!(code, "%{prefix}.head.whole = udiv i32 {channel}, {width}");
+				let _ = writeln!(code, "{head} = select i1 {inside}, i32 %{prefix}.head.whole, i32 0");
+			}
+			None => {
+				let _ = writeln!(code, "{head} = udiv i32 {channel}, {width}");
+			}
+		}
+		let plane = length * (span / width);
+		let _ = writeln!(code, "%{prefix}.head.base = mul i32 {head}, {length}");
+		let _ = writeln!(code, "%{prefix}.row.base = mul i32 {row}, {plane}");
+		let _ = writeln!(code, "%{prefix}.row.group = add i32 %{prefix}.row.base, %{prefix}.head.base");
+		let _ = writeln!(code, "{group} = add i32 %{prefix}.row.group, {position}");
+		let _ = writeln!(code, "{groups} = mul i32 {rows}, {plane}", rows = shape.rows);
+		GroupIndex { group, groups, channel, inside }
 	}
 
 	/// Emit one normalized element from the fixed statistics arena. The arena is
@@ -848,37 +928,16 @@ mod program_ir {
 	/// pass before this fragment; evaluation and inference reuse the stored arena.
 	pub fn emit_normalize(context: NormalizeContext<'_>, element: &str) -> NormalizeFragment {
 		let mut output = String::new();
-		let elements = context.channels * context.length;
-		let length = context.length;
-		let local = format!("%{}.normalize.local", context.prefix);
-		let row = format!("%{}.normalize.row", context.prefix);
-		let position = format!("%{}.normalize.position", context.prefix);
-		let group = format!("%{}.normalize.group", context.prefix);
-		let groups = format!("%{}.normalize.groups", context.prefix);
-		let scale_index = format!("%{}.normalize.scale.index", context.prefix);
-		let mean_pointer = format!("%{}.normalize.mean.ptr", context.prefix);
-		let scale_pointer = format!("%{}.normalize.scale.ptr", context.prefix);
-		let mean = format!("%{}.normalize.mean", context.prefix);
-		let scale = format!("%{}.normalize.scale", context.prefix);
-		let centered = format!("%{}.normalize.centered", context.prefix);
-		let value = format!("%{}.normalize.value", context.prefix);
-		let _ = writeln!(output, "{row} = udiv i32 {element}, {elements}");
-		let _ = writeln!(output, "{local} = urem i32 {element}, {elements}");
-		let _ = writeln!(output, "{position} = urem i32 {local}, {length}");
-		match context.mode {
-			NormalizeMode::Batch | NormalizeMode::Evaluation => {
-				let channel = format!("%{}.normalize.channel", context.prefix);
-				let _ = writeln!(output, "{channel} = udiv i32 {local}, {length}");
-				let _ = writeln!(output, "{group} = add i32 {channel}, 0");
-				let _ = writeln!(output, "{groups} = add i32 0, {channels}", channels = context.channels);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let row_base = format!("%{}.normalize.layer.row.base", context.prefix);
-				let _ = writeln!(output, "{row_base} = mul i32 {row}, {length}");
-				let _ = writeln!(output, "{group} = add i32 {row_base}, {position}");
-				let _ = writeln!(output, "{groups} = mul i32 {rows}, {length}", rows = context.rows);
-			}
-		}
+		let prefix = format!("{}.normalize", context.prefix);
+		let index = emit_group_index(&mut output, &prefix, context.shape(), element);
+		let (group, groups) = (&index.group, &index.groups);
+		let scale_index = format!("%{prefix}.scale.index");
+		let mean_pointer = format!("%{prefix}.mean.ptr");
+		let scale_pointer = format!("%{prefix}.scale.ptr");
+		let mean = format!("%{prefix}.mean");
+		let scale = format!("%{prefix}.scale");
+		let centered = format!("%{prefix}.centered");
+		let value = format!("%{prefix}.value");
 		let _ = writeln!(output, "{scale_index} = add i32 {groups}, {group}");
 		let _ = writeln!(
 			output,
@@ -912,7 +971,33 @@ mod program_ir {
 		);
 		let _ = writeln!(output, "{centered} = call {ty} @recipe.sub({ty} {source}, {ty} {mean})", ty = context.value_type, source = context.source_value);
 		let _ = writeln!(output, "{value} = call {ty} @recipe.mul({ty} {centered}, {ty} {scale})", ty = context.value_type);
-		NormalizeFragment { code: output, value }
+		let value = match context.weight {
+			None => value,
+			Some(weight) => {
+				let weight_pointer = format!("%{prefix}.weight.ptr");
+				let weight_value = format!("%{prefix}.weight");
+				let scaled = format!("%{prefix}.scaled");
+				let column = weight_column(&mut output, &prefix, &index);
+				let _ = writeln!(output, "{weight_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i32 {column}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ =
+					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul({ty} {value}, {ty} {weight_value})", ty = context.value_type);
+				scaled
+			}
+		};
+		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
+		let passed = format!("%{prefix}.passed");
+		let _ = writeln!(output, "{passed} = select i1 {inside}, {ty} {value}, {ty} {source}", ty = context.value_type, source = context.source_value);
+		NormalizeFragment { code: output, value: passed }
+	}
+
+	/// The scale column of one element. Only the normalized span carries a scale, so
+	/// a passing channel reads the first column and drops the product.
+	fn weight_column(code: &mut String, prefix: &str, index: &GroupIndex) -> String {
+		let Some(inside) = &index.inside else { return index.channel.clone() };
+		let column = format!("%{prefix}.weight.channel");
+		let _ = writeln!(code, "{column} = select i1 {inside}, i32 {channel}, i32 0", channel = index.channel);
+		column
 	}
 
 	#[derive(Clone, Copy)]
@@ -926,8 +1011,22 @@ mod program_ir {
 		pub rows: &'a str,
 		pub channels: usize,
 		pub length: usize,
+		/// Channels per group in the per-row modes.
+		pub width: usize,
+		/// Channels the per-row modes normalize; the rest pass through.
+		pub span: usize,
+		/// The per-channel scale the forward pass applied, when the node carries one.
+		pub weight: Option<&'a str>,
+		/// The node input, which a weighted node re-normalizes in reverse.
+		pub source: &'a str,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
+	}
+
+	impl NormalizeReverseContext<'_> {
+		fn shape(&self) -> GroupShape<'_> {
+			GroupShape { mode: self.mode, channels: self.channels, length: self.length, width: self.width, span: self.span, rows: self.rows }
+		}
 	}
 
 	pub struct NormalizeReverseFragment {
@@ -946,14 +1045,15 @@ mod program_ir {
 		let group = format!("%{prefix}.group");
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
+		let heads = context.span / context.width;
 		match context.mode {
 			NormalizeMode::Batch => {
 				let _ = writeln!(code, "{groups} = add i32 0, {}", context.channels);
 				let _ = writeln!(code, "{items} = mul i32 {}, {}", context.rows, context.length);
 			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let _ = writeln!(code, "{groups} = mul i32 {}, {}", context.rows, context.length);
-				let _ = writeln!(code, "{items} = add i32 0, {}", context.channels);
+			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
+				let _ = writeln!(code, "{groups} = mul i32 {}, {}", context.rows, context.length * heads);
+				let _ = writeln!(code, "{items} = add i32 0, {}", context.width);
 			}
 			NormalizeMode::Evaluation => return code,
 		}
@@ -983,11 +1083,15 @@ mod program_ir {
 				let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
 				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 {group}, {}", context.length);
 			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let _ = writeln!(code, "%{prefix}.row = udiv i32 {group}, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.position = urem i32 {group}, {}", context.length);
+			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
+				let _ = writeln!(code, "%{prefix}.row = udiv i32 {group}, {}", context.length * heads);
+				let _ = writeln!(code, "%{prefix}.row.local = urem i32 {group}, {}", context.length * heads);
+				let _ = writeln!(code, "%{prefix}.head = udiv i32 %{prefix}.row.local, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.position = urem i32 %{prefix}.row.local, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.head.base = mul i32 %{prefix}.head, {}", context.width);
+				let _ = writeln!(code, "%{prefix}.channel = add i32 %{prefix}.head.base, %{prefix}.p");
 				let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
-				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 %{prefix}.p, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 %{prefix}.channel, {}", context.length);
 			}
 			NormalizeMode::Evaluation => unreachable!(),
 		}
@@ -1003,9 +1107,56 @@ mod program_ir {
 		);
 		let _ = writeln!(code, "%{prefix}.delta.model = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 		let _ = writeln!(code, "%{prefix}.output.model = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-		let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model({ty} %{prefix}.delta.model)", state = context.state_type, ty = context.value_type);
-		let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model({ty} %{prefix}.output.model)", state = context.state_type, ty = context.value_type);
-		if context.mode == NormalizeMode::Rms {
+		// A weighted node stored `weight * normalized`, so the reverse formula takes
+		// the delta scaled by the weight and re-normalizes the input for the projection.
+		let (delta_model, output_model) = match context.weight {
+			Some(weight) => {
+				let _ = writeln!(code, "%{prefix}.scale.index = add i32 {groups}, {group}");
+				let _ = writeln!(
+					code,
+					"%{prefix}.scale.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.scale.index",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					context_ptr = context.context
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.scale = load {ty}, {ptrty} %{prefix}.scale.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.source.ptr = getelementptr inbounds {ty}, {ptrty} {source}, i32 %{prefix}.index",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					source = context.source
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.source.model = load {ty}, {ptrty} %{prefix}.source.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(code, "%{prefix}.normalized = call {ty} @recipe.mul({ty} %{prefix}.source.model, {ty} %{prefix}.scale)", ty = context.value_type);
+				let _ = writeln!(code, "%{prefix}.weight.ptr = getelementptr inbounds {ty}, {ptrty} {weight}, i32 %{prefix}.channel", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(
+					code,
+					"%{prefix}.weight = load {ty}, {ptrty} %{prefix}.weight.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(code, "%{prefix}.delta.weighted = call {ty} @recipe.mul({ty} %{prefix}.delta.model, {ty} %{prefix}.weight)", ty = context.value_type);
+				(format!("%{prefix}.delta.weighted"), format!("%{prefix}.normalized"))
+			}
+			None => (format!("%{prefix}.delta.model"), format!("%{prefix}.output.model")),
+		};
+		let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model({ty} {delta_model})", state = context.state_type, ty = context.value_type);
+		let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model({ty} {output_model})", state = context.state_type, ty = context.value_type);
+		if matches!(context.mode, NormalizeMode::Rms | NormalizeMode::L2) {
 			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} {zero})", ty = context.state_type, zero = context.state_zero);
 		} else {
 			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.state_type);
@@ -1017,7 +1168,11 @@ mod program_ir {
 		let _ = writeln!(code, "{prefix}.store:");
 		let _ = writeln!(code, "%{prefix}.items.value = call {ty} @recipe.state.from.u32(i32 {items})", ty = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.mean = call {ty} @recipe.state.div({ty} %{prefix}.sum, {ty} %{prefix}.items.value)", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div({ty} %{prefix}.projected, {ty} %{prefix}.items.value)", ty = context.state_type);
+		// An L2 group scales by its norm rather than its root mean square, so its
+		// reverse projection is the whole sum over the group.
+		let projected_divisor = if context.mode == NormalizeMode::L2 { "one" } else { "items.value" };
+		let _ = writeln!(code, "%{prefix}.one = call {ty} @recipe.state.from.u32(i32 1)", ty = context.state_type);
+		let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div({ty} %{prefix}.projected, {ty} %{prefix}.{projected_divisor})", ty = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.model = call {ty} @recipe.model.from.state({state} %{prefix}.sum.mean)", ty = context.value_type, state = context.state_type);
 		let _ = writeln!(code, "%{prefix}.projected.model = call {ty} @recipe.model.from.state({state} %{prefix}.projected.mean)", ty = context.value_type, state = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.base = mul i32 {groups}, 2");
@@ -1060,41 +1215,21 @@ mod program_ir {
 	/// uses stored scale directly because its stats are not differentiated.
 	pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &str, delta: &str, output_value: &str) -> NormalizeReverseFragment {
 		let mut code = String::new();
-		let elements = context.channels * context.length;
-		let length = context.length;
-		let row = format!("%{}.normalize.reverse.row", context.prefix);
-		let local = format!("%{}.normalize.reverse.local", context.prefix);
-		let position = format!("%{}.normalize.reverse.position", context.prefix);
-		let group = format!("%{}.normalize.reverse.group", context.prefix);
-		let groups = format!("%{}.normalize.reverse.groups", context.prefix);
-		let scale_index = format!("%{}.normalize.reverse.scale.index", context.prefix);
-		let sum_base = format!("%{}.normalize.reverse.sum.base", context.prefix);
-		let projected_base = format!("%{}.normalize.reverse.projected.base", context.prefix);
-		let sum_index = format!("%{}.normalize.reverse.sum.index", context.prefix);
-		let projected_index = format!("%{}.normalize.reverse.projected.index", context.prefix);
-		let scale_pointer = format!("%{}.normalize.reverse.scale.ptr", context.prefix);
-		let sum_pointer = format!("%{}.normalize.reverse.sum.ptr", context.prefix);
-		let projected_pointer = format!("%{}.normalize.reverse.projected.ptr", context.prefix);
-		let scale = format!("%{}.normalize.reverse.scale", context.prefix);
-		let sum = format!("%{}.normalize.reverse.sum", context.prefix);
-		let projected = format!("%{}.normalize.reverse.projected", context.prefix);
-		let _ = writeln!(code, "{row} = udiv i32 {element}, {elements}");
-		let _ = writeln!(code, "{local} = urem i32 {element}, {elements}");
-		let _ = writeln!(code, "{position} = urem i32 {local}, {length}");
-		match context.mode {
-			NormalizeMode::Batch | NormalizeMode::Evaluation => {
-				let channel = format!("%{}.normalize.reverse.channel", context.prefix);
-				let _ = writeln!(code, "{channel} = udiv i32 {local}, {length}");
-				let _ = writeln!(code, "{group} = add i32 {channel}, 0");
-				let _ = writeln!(code, "{groups} = add i32 0, {channels}", channels = context.channels);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let row_base = format!("%{}.normalize.reverse.row.base", context.prefix);
-				let _ = writeln!(code, "{row_base} = mul i32 {row}, {length}");
-				let _ = writeln!(code, "{group} = add i32 {row_base}, {position}");
-				let _ = writeln!(code, "{groups} = mul i32 {rows}, {length}", rows = context.rows);
-			}
-		}
+		let prefix = format!("{}.normalize.reverse", context.prefix);
+		let index = emit_group_index(&mut code, &prefix, context.shape(), element);
+		let (group, groups) = (&index.group, &index.groups);
+		let passing = delta;
+		let scale_index = format!("%{prefix}.scale.index");
+		let sum_base = format!("%{prefix}.sum.base");
+		let projected_base = format!("%{prefix}.projected.base");
+		let sum_index = format!("%{prefix}.sum.index");
+		let projected_index = format!("%{prefix}.projected.index");
+		let scale_pointer = format!("%{prefix}.scale.ptr");
+		let sum_pointer = format!("%{prefix}.sum.ptr");
+		let projected_pointer = format!("%{prefix}.projected.ptr");
+		let scale = format!("%{prefix}.scale");
+		let sum = format!("%{prefix}.sum");
+		let projected = format!("%{prefix}.projected");
 		let _ = writeln!(code, "{scale_index} = add i32 {groups}, {group}");
 		let _ = writeln!(code, "{sum_base} = mul i32 {groups}, 2");
 		let _ = writeln!(code, "{projected_base} = mul i32 {groups}, 3");
@@ -1130,15 +1265,46 @@ mod program_ir {
 		}
 		let _ = writeln!(code, "{sum} = load {ty}, {ptrty} {sum_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
 		let _ = writeln!(code, "{projected} = load {ty}, {ptrty} {projected_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-		let output_projection = format!("%{}.normalize.reverse.output.projection", context.prefix);
-		let centered = format!("%{}.normalize.reverse.centered", context.prefix);
-		let numerator = format!("%{}.normalize.reverse.numerator", context.prefix);
-		let contribution = format!("%{}.normalize.reverse.contribution", context.prefix);
+		let output_projection = format!("%{prefix}.output.projection");
+		let centered = format!("%{prefix}.centered");
+		let numerator = format!("%{prefix}.numerator");
+		let contribution = format!("%{prefix}.contribution");
+		// A weighted node stored `weight * normalized`: the formula takes the delta
+		// scaled by the weight and the re-normalized input.
+		let (delta, output_value) = match context.weight {
+			Some(weight) => {
+				let source_pointer = format!("%{prefix}.source.ptr");
+				let source_value = format!("%{prefix}.source");
+				let normalized = format!("%{prefix}.normalized");
+				let weight_pointer = format!("%{prefix}.weight.ptr");
+				let weight_value = format!("%{prefix}.weight");
+				let weighted = format!("%{prefix}.delta.weighted");
+				let _ = writeln!(
+					code,
+					"{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {element}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					source = context.source
+				);
+				let _ = writeln!(code, "{source_value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{normalized} = call {ty} @recipe.mul({ty} {source_value}, {ty} {scale})", ty = context.value_type);
+				let column = weight_column(&mut code, &prefix, &index);
+				let _ = writeln!(code, "{weight_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i32 {column}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{weighted} = call {ty} @recipe.mul({ty} {delta}, {ty} {weight_value})", ty = context.value_type);
+				(weighted, normalized)
+			}
+			None => (delta.to_owned(), output_value.to_owned()),
+		};
 		let _ = writeln!(code, "{output_projection} = call {ty} @recipe.mul({ty} {output_value}, {ty} {projected})", ty = context.value_type);
 		let _ = writeln!(code, "{centered} = call {ty} @recipe.sub({ty} {delta}, {ty} {sum})", ty = context.value_type);
 		let _ = writeln!(code, "{numerator} = call {ty} @recipe.sub({ty} {centered}, {ty} {output_projection})", ty = context.value_type);
 		let _ = writeln!(code, "{contribution} = call {ty} @recipe.mul({ty} {scale}, {ty} {numerator})", ty = context.value_type);
-		NormalizeReverseFragment { code, contribution }
+		// A channel outside the span keeps its own adjoint, so the delta passes through.
+		let Some(inside) = &index.inside else { return NormalizeReverseFragment { code, contribution } };
+		let passed = format!("%{prefix}.passed");
+		let _ = writeln!(code, "{passed} = select i1 {inside}, {ty} {contribution}, {ty} {passing}", ty = context.value_type);
+		NormalizeReverseFragment { code, contribution: passed }
 	}
 }
 
@@ -2372,6 +2538,24 @@ impl NativeModelIr {
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
+				(reverse, Primitive::Rope) => {
+					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
+					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
+					let ty = self.precision.model_type;
+					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
+							pointer = pointer_type(backend),
+							channels = node.output.channels,
+							length = node.output.length,
+							head_width = node.argument[2],
+							dims = node.argument[0],
+							rotated = node.argument[3]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -2394,7 +2578,23 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					let blocks = attention_blocks(node);
+					if blocks != 0 {
+						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
+						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
+						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
+						emit_fixed_loop(&mut ir, index, "index", checked_mul(self.rows, blocks, "indexer block count")?, |ir, p| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+						emit_fixed_loop(&mut ir, index, "select", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+					}
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -2531,8 +2731,19 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
+					if attention_blocks(node) != 0 {
+						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
+						emit_fixed_loop(&mut ir, index, "index.reverse", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+							ir.push_str(&format!(
+								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
+							));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
@@ -2671,7 +2882,8 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize");
-					if mode != program_ir::NormalizeMode::Evaluation && (training || matches!(mode, program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms)) {
+					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
+					if mode != program_ir::NormalizeMode::Evaluation && (training || mode.per_row()) {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
@@ -2693,6 +2905,9 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
 								mode,
 								prefix: &prefix,
 							},
@@ -2715,6 +2930,7 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize.reverse");
+					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
 					if mode != program_ir::NormalizeMode::Evaluation {
 						let stats_prefix = format!("{prefix}.stats");
 						let state_zero = native_literal(self.precision.state, self.precision.state_type, 0.0);
@@ -2729,6 +2945,10 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
+								source: &pointers.source,
 								mode,
 								prefix: &stats_prefix,
 							},
@@ -2755,6 +2975,10 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
+								source: &pointers.source,
 								mode,
 								prefix: &prefix,
 							},
@@ -2768,6 +2992,69 @@ impl NativeModelIr {
 						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, &format!("{prefix}.owned")));
 					})?;
 					ir.push_str(barrier(backend));
+					if node.parameters != 0 {
+						// The weight gradient is one column per channel summed over every
+						// row and position: each partition accumulates its own contiguous
+						// run into its own scratch row, and one owner folds the rows in order.
+						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let (columns, offset) = (narrow(node.parameters, "normalization weight columns")?, narrow(node.offset, "normalization weight offset")?);
+						let statistics = narrow(checked_mul(4, normalize_groups(node, self.rows)?, "normalization statistics")?, "normalization statistics")?;
+						let scratch = format!("%{prefix}.scratch");
+						let zero = native_literal(self.precision.model, ty, 0.0);
+						ir.push_str(&format!("{scratch} = getelementptr inbounds {ty}, {pointer} {context}, i32 {statistics}\n", context = pointers.context));
+						let name = "normalize.weight";
+						let row = format!("%n{index}.{name}.partition.row");
+						let weight_prefix = format!("{prefix}.weight");
+						emit_partitioned_loop(
+							&mut ir,
+							index,
+							name,
+							PartitionedLoop { count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							|ir, p| {
+								let source_pointer = format!("%{weight_prefix}.source.ptr");
+								let source_value = format!("%{weight_prefix}.source.value");
+								let delta_pointer = format!("%{weight_prefix}.delta.ptr");
+								let delta_value = format!("%{weight_prefix}.delta.value");
+								ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n", source = pointers.source, delta = pointers.delta, align = alignment(ty)));
+								// The forward fragment without its weight is the normalized input.
+								let fragment = program_ir::emit_normalize(
+									program_ir::NormalizeContext {
+										value_type: ty,
+										pointer_type: pointer,
+										alignment: alignment(ty),
+										source_value: &source_value,
+										context: &pointers.context,
+										rows: "%rows",
+										channels: node.output.channels,
+										length: node.output.length,
+										width: normalize_width(node),
+										span: normalize_span(node),
+										weight: None,
+										mode,
+										prefix: &weight_prefix,
+									},
+									p,
+								);
+								ir.push_str(&fragment.code);
+								// The partitions span the row capacity; rows past `%rows` hold stale
+								// values and contribute nothing, and neither does a channel outside
+								// the normalized span, which owns no scale column.
+								let live = if normalize_span(node) < node.output.channels {
+									format!(
+										"%{weight_prefix}.live.row = icmp ult i32 %{weight_prefix}.normalize.row, %rows\n%{weight_prefix}.live = and i1 %{weight_prefix}.live.row, %{weight_prefix}.normalize.inside\n"
+									)
+								} else {
+									format!("%{weight_prefix}.live = icmp ult i32 %{weight_prefix}.normalize.row, %rows\n")
+								};
+								ir.push_str(&format!("%{weight_prefix}.product = call {ty} @recipe.mul({ty} {delta_value}, {ty} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {ty} %{weight_prefix}.product, {ty} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i32 %{weight_prefix}.normalize.channel, i32 0\n%{weight_prefix}.column = add i32 {row}, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {ty}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {ty} @recipe.add({ty} %{weight_prefix}.column.value, {ty} %{weight_prefix}.contribution)\nstore {ty} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = fragment.value, align = alignment(ty)));
+							},
+						)?;
+						ir.push_str(barrier(backend));
+						ir.push_str(&format!(
+							"call void @reduce_rows({pointer} {scratch}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n"
+						));
+						ir.push_str(barrier(backend));
+					}
 				}
 			}
 		}
@@ -2794,18 +3081,21 @@ impl NativeModelIr {
 		let epsilon = native_literal(self.precision.state, state_ty, node.argument[1]);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
+		let width = i32::try_from(normalize_width(node)).map_err(|_| RecipeError::new("normalization width exceeds i32"))?;
+		let span = i32::try_from(normalize_span(node)).map_err(|_| RecipeError::new("normalization span exceeds i32"))?;
+		let heads = span / width;
 		match mode {
 			program_ir::NormalizeMode::Batch => {
 				ir.push_str(&format!("{items} = mul i32 %rows, {length}\n", length = length));
 			}
-			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => {
-				ir.push_str(&format!("{groups} = mul i32 %rows, {length}\n{items} = add i32 0, {channels}\n", length = length, channels = channels));
+			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+				ir.push_str(&format!("{groups} = mul i32 %rows, {}\n{items} = add i32 0, {width}\n", length * heads));
 			}
 			program_ir::NormalizeMode::Evaluation => return Ok(ir),
 		}
 		let group_limit = match mode {
 			program_ir::NormalizeMode::Batch => channels.to_string(),
-			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => groups.clone(),
+			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => groups.clone(),
 			program_ir::NormalizeMode::Evaluation => unreachable!(),
 		};
 		let group = format!("%{prefix}.group");
@@ -2820,8 +3110,12 @@ impl NativeModelIr {
 				program_ir::NormalizeMode::Batch => {
 					code.push_str(&format!("{row} = udiv i32 {p}, {length}\n{position} = urem i32 {p}, {length}\n{row_base} = mul i32 {row}, {elements}\n{channel_base} = mul i32 {group}, {length}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", p = p, length = length, elements = elements, group = group));
 				}
-				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => {
-					code.push_str(&format!("{row} = udiv i32 {group}, {length}\n{position} = urem i32 {group}, {length}\n{row_base} = mul i32 {row}, {elements}\n{channel_base} = mul i32 {p}, {length}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", p = p, length = length, elements = elements, group = group));
+				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+					let row_local = format!("%{prefix}.{phase}.row.local");
+					let head = format!("%{prefix}.{phase}.head");
+					let head_base = format!("%{prefix}.{phase}.head.base");
+					let channel = format!("%{prefix}.{phase}.channel");
+					code.push_str(&format!("{row} = udiv i32 {group}, {span}\n{row_local} = urem i32 {group}, {span}\n{head} = udiv i32 {row_local}, {length}\n{position} = urem i32 {row_local}, {length}\n{head_base} = mul i32 {head}, {width}\n{channel} = add i32 {head_base}, {p}\n{channel_base} = mul i32 {channel}, {length}\n{row_base} = mul i32 {row}, {elements}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", span = length * heads));
 				}
 				program_ir::NormalizeMode::Evaluation => unreachable!(),
 			}
@@ -2831,9 +3125,21 @@ impl NativeModelIr {
 		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n%{prefix}.mean.next = add i32 %{prefix}.mean.p, 1\nbr label %{prefix}.mean.loop\n{prefix}.variance.loop:\n%{prefix}.variance.p = phi i32 [ 0, %{prefix}.mean.loop ], [ %{prefix}.variance.next, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, %{prefix}.mean.loop ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n%{prefix}.items.value = call {state_ty} @recipe.state.from.u32(i32 {items})\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.variance.more = icmp ult i32 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label %{prefix}.store\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty)));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, align = alignment(ty)));
-		let difference = if mode == program_ir::NormalizeMode::Rms { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
-		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, epsilon = epsilon, one = one, group = group, group_limit = group_limit));
-		let stored_mean = if mode == program_ir::NormalizeMode::Rms { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
+		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
+		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
+		// L2 divides by the norm itself, floored at epsilon, instead of the root of
+		// the epsilon-shifted mean square.
+		let scale_code = if mode == program_ir::NormalizeMode::L2 {
+			format!(
+				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.variance.sum)\n%{prefix}.floored = call i1 @recipe.state.ogt({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n"
+			)
+		} else {
+			format!(
+				"%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n"
+			)
+		};
+		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, one = one, group = group, group_limit = group_limit));
+		let stored_mean = if zero_mean { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
 		ir.push_str(&format!("store {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n%{prefix}.group.next = add i32 {group}, %threads\nbr label %{prefix}.group.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, stored_mean = stored_mean, align = alignment(ty), group = group));
 		Ok(ir)
 	}
@@ -3166,6 +3472,19 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
+/// The selector arguments every attention kernel takes after its tiling.
+fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+	Ok(format!(
+		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		kv = integer_argument(node.argument[1], "attention key-value heads")?,
+		index_heads = integer_argument(node.argument[5], "indexer heads")?,
+		index_width = integer_argument(node.argument[6], "indexer width")?,
+		block = integer_argument(node.argument[3], "indexer block")?,
+		gate = node.argument[2] != 0.0,
+		ty = precision.model_type,
+		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+	))
+}
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
 		"double" => type_literal(ty, value),
@@ -3181,8 +3500,26 @@ fn normalize_mode(value: f64) -> Result<program_ir::NormalizeMode> {
 		1 => Ok(program_ir::NormalizeMode::Layer),
 		2 => Ok(program_ir::NormalizeMode::Rms),
 		3 => Ok(program_ir::NormalizeMode::Evaluation),
+		4 => Ok(program_ir::NormalizeMode::L2),
 		_ => Err(RecipeError::new("normalization mode is unsupported")),
 	}
+}
+
+/// Channels per normalization group: the node's declared width, or the whole row.
+fn normalize_width(node: &Node) -> usize {
+	if node.argument[2] == 0.0 { node.output.channels } else { node.argument[2] as usize }
+}
+
+/// Channels the node normalizes: its declared span, or the whole row. Attention
+/// normalizes the leading query and key planes and passes the value plane through.
+fn normalize_span(node: &Node) -> usize {
+	if node.argument[3] == 0.0 { node.output.channels } else { node.argument[3] as usize }
+}
+
+/// The statistics arena holds four values per group for either group shape.
+fn normalize_groups(node: &Node, rows: usize) -> Result<usize> {
+	let heads = normalize_span(node) / normalize_width(node);
+	Ok(node.output.channels.max(checked_mul(checked_mul(rows, node.output.length, "row groups")?, heads, "head groups")?))
 }
 
 fn alignment(ty: &str) -> usize {
@@ -3348,11 +3685,18 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.t = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.advance, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.t, {partitions}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
 	ir.push_str(&format!("%{prefix}.t.plus = add i32 %{prefix}.t, 1\n%{prefix}.first.short = icmp ult i32 %{prefix}.t, {extra}\n%{prefix}.first.extra = select i1 %{prefix}.first.short, i32 %{prefix}.t, i32 {extra}\n%{prefix}.first.whole = mul i32 %{prefix}.t, {whole}\n%{prefix}.first = add i32 %{prefix}.first.whole, %{prefix}.first.extra\n"));
 	ir.push_str(&format!("%{prefix}.limit.short = icmp ult i32 %{prefix}.t.plus, {extra}\n%{prefix}.limit.extra = select i1 %{prefix}.limit.short, i32 %{prefix}.t.plus, i32 {extra}\n%{prefix}.limit.whole = mul i32 %{prefix}.t.plus, {whole}\n%{prefix}.limit = add i32 %{prefix}.limit.whole, %{prefix}.limit.extra\n"));
-	ir.push_str(&format!(
-		"%{prefix}.row = mul i32 %{prefix}.t, {columns}\nbr label %{prefix}.inner\n{prefix}.inner:\n%{prefix}.p = phi i32 [ %{prefix}.first, %{prefix}.body ], [ %{prefix}.p.next, %{prefix}.fold ]\n"
-	));
+	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
+	// A body with no fixed sums accumulates into its partition's scratch row at
+	// `%{prefix}.row`, so the row starts at zero and keeps what the body left.
+	let entry = if gradients.is_empty() {
+		ir.push_str(&format!("br label %{prefix}.zero\n{prefix}.zero:\n%{prefix}.zero.c = phi i32 [ 0, %{prefix}.body ], [ %{prefix}.zero.next, %{prefix}.zero.step ]\n%{prefix}.zero.more = icmp ult i32 %{prefix}.zero.c, {columns}\nbr i1 %{prefix}.zero.more, label %{prefix}.zero.step, label %{prefix}.zeroed\n{prefix}.zero.step:\n%{prefix}.zero.index = add i32 %{prefix}.row, %{prefix}.zero.c\n%{prefix}.zero.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.zero.index\nstore {ty} {zero}, {pointer} %{prefix}.zero.ptr, align {align}\n%{prefix}.zero.next = add i32 %{prefix}.zero.c, 1\nbr label %{prefix}.zero\n{prefix}.zeroed:\n"));
+		"zeroed"
+	} else {
+		"body"
+	};
+	ir.push_str(&format!("br label %{prefix}.inner\n{prefix}.inner:\n%{prefix}.p = phi i32 [ %{prefix}.first, %{prefix}.{entry} ], [ %{prefix}.p.next, %{prefix}.fold ]\n"));
 	for (parameter, _) in gradients {
-		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.body ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
+		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.{entry} ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
 	}
 	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
 	body(ir, &format!("%{prefix}.p"));
@@ -3363,7 +3707,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("%{prefix}.p.next = add i32 %{prefix}.p, 1\nbr label %{prefix}.inner\n{prefix}.store:\n"));
 	// Every column of the row is written, including the parameters this program
 	// never touches, so the fold below never reads an uninitialised slot.
-	for column in 0..columns {
+	for column in 0..if gradients.is_empty() { 0 } else { columns } {
 		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
 		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
 	}
@@ -3798,7 +4142,11 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Attention(attention) => {
+				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
+				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+				format!("attn,{},{},{dims},{base},{},{},{},{},{}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
@@ -3829,7 +4177,25 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
-			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"attn" => {
+				let heads = value_at(fields.next(), "attention heads")?;
+				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
+				let base = value_at::<f64>(fields.next(), "rotary base")?;
+				let index = Indexer {
+					heads: value_at(fields.next(), "indexer heads")?,
+					width: value_at(fields.next(), "indexer width")?,
+					block: value_at(fields.next(), "indexer block")?,
+					keep: value_at(fields.next(), "indexer blocks kept")?,
+				};
+				Ok(Operation::Attention(AttentionBlock {
+					heads,
+					kv,
+					rope: (dims != 0).then_some((dims, base.to_bits())),
+					index: (index.block != 0).then_some(index),
+					gate: value_at::<u8>(fields.next(), "attention gate")? != 0,
+				}))
+			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
@@ -3842,22 +4208,38 @@ mod bundle {
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
-	fn block_text(block: &Block) -> String {
-		format!("{}|{}|{}|{}|{}", operation_text(&block.operation), block.activation as u8, block.normalization.map_or(0, |value| value as u8 + 1), block.quantization, u8::from(block.profile))
+	fn normalization_text(normalization: Option<BlockNormalization>) -> u8 {
+		normalization.map_or(0, |value| value as u8 + 1)
 	}
-	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
-		require(fields.len() == 5, "semantic model block has the wrong width")?;
-		let normalization = match value_at::<u8>(Some(fields[2]), "block normalization")? {
+	fn normalization(field: Option<&str>, role: &str) -> Result<Option<BlockNormalization>> {
+		Ok(match value_at::<u8>(field, role)? {
 			0 => None,
 			1 => Some(BlockNormalization::Batch),
 			2 => Some(BlockNormalization::Layer),
+			3 => Some(BlockNormalization::Rms),
+			4 => Some(BlockNormalization::L2),
 			_ => return Err(RecipeError::new("invalid block normalization")),
-		};
+		})
+	}
+	fn block_text(block: &Block) -> String {
+		format!(
+			"{}|{}|{}|{}|{}|{}",
+			operation_text(&block.operation),
+			block.activation as u8,
+			normalization_text(block.normalization),
+			block.quantization,
+			u8::from(block.profile),
+			normalization_text(block.qk)
+		)
+	}
+	fn block(value: &str) -> Result<Block> {
+		let fields = value.split('|').collect::<Vec<_>>();
+		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(fields[0])?,
 			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization,
+			normalization: normalization(Some(fields[2]), "block normalization")?,
+			qk: normalization(Some(fields[5]), "block query and key normalization")?,
 			quantization: value_at(Some(fields[3]), "block quantization")?,
 			profile: bool_value(fields[4], "block quantization profile")?,
 		})
@@ -4479,13 +4861,38 @@ impl PartialEq for Estimator {
 	}
 }
 impl Eq for Estimator {}
+/// Indexer that scores every key block and keeps the best `keep` blocks per
+/// query. `heads` query projections and one shared key projection, both
+/// `width` wide, compress `block` keys into one block score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indexer {
+	heads: usize,
+	width: usize,
+	block: usize,
+	keep: usize,
+}
+/// One attention block: query heads, key-value heads, and the rotary, indexer
+/// and output gate selectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionBlock {
+	heads: usize,
+	kv: usize,
+	rope: Option<(usize, u64)>,
+	index: Option<Indexer>,
+	gate: bool,
+}
+impl AttentionBlock {
+	fn new(heads: usize) -> Self {
+		Self { heads, kv: heads, rope: None, index: None, gate: false }
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Attention(usize),
+	Attention(AttentionBlock),
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
@@ -4517,9 +4924,24 @@ pub enum Activation {
 pub enum BlockNormalization {
 	Batch,
 	Layer,
+	/// Root mean square over the row with one trainable scale per channel.
+	Rms,
+	/// The row divided by its Euclidean norm, floored at the normalization epsilon.
+	L2,
 }
-/// The normalization selectors with a declared identity: the batch marker and the layer
-/// residual constructor. Any other selector is rejected instead of guessing a mode.
+impl BlockNormalization {
+	/// The mode argument of the normalization node; evaluation holds 3.
+	const fn mode(self) -> f64 {
+		match self {
+			Self::Batch => 0.0,
+			Self::Layer => 1.0,
+			Self::Rms => 2.0,
+			Self::L2 => 4.0,
+		}
+	}
+}
+/// The normalization selectors with a declared identity: the batch, rms, and l2 markers
+/// and the layer residual constructor. Any other selector is rejected instead of guessing a mode.
 pub trait NormalizationSelector {
 	fn normalization(self) -> BlockNormalization;
 }
@@ -4528,11 +4950,21 @@ impl NormalizationSelector for Batch {
 		BlockNormalization::Batch
 	}
 }
+impl NormalizationSelector for Rms {
+	fn normalization(self) -> BlockNormalization {
+		BlockNormalization::Rms
+	}
+}
+impl NormalizationSelector for L2 {
+	fn normalization(self) -> BlockNormalization {
+		BlockNormalization::L2
+	}
+}
 impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
 		match self(0) {
 			Residual::Layer(_) => BlockNormalization::Layer,
-			_ => panic!("normalization selector must be batch or layer"),
+			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
@@ -4551,6 +4983,8 @@ struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
+	/// The per-head normalization of the attention queries and keys.
+	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
 }
@@ -4569,6 +5003,7 @@ impl Model {
 			operation,
 			activation: Activation::Linear,
 			normalization: None,
+			qk: None,
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
 		});
@@ -4595,7 +5030,7 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(heads);
+	fn attn(heads: usize) = Operation::Attention(AttentionBlock::new(heads));
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -4606,10 +5041,56 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
 	}
+	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		match &mut block.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		model
+	}
+	/// Key-value heads of the preceding `attn` block. Each key-value head serves
+	/// `heads / kv` query heads.
+	pub fn kv(&self, heads: usize) -> Self {
+		self.attention("kv", |attention| attention.kv = heads)
+	}
+	/// Rotary position embedding on the preceding `attn` block: the first `dims`
+	/// channels of every query and key head rotate by their position at
+	/// frequencies `base^(-2i/dims)`.
+	pub fn rope(&self, dims: usize, base: f64) -> Self {
+		self.attention("rope", |attention| attention.rope = Some((dims, base.to_bits())))
+	}
+	/// Sparse key selection on the preceding `attn` block. `heads` query
+	/// projections and one key projection, each `width` wide, score every group
+	/// of `block` keys, and each query attends to its best `keep` blocks.
+	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+	}
+	/// Sigmoid gate on the output of the preceding `attn` block, from its own
+	/// projection of the block input.
+	pub fn gate(&self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
+	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
 		block.normalization = Some(normalization.normalization());
+		model
+	}
+	/// Normalizes each attention head's query and key rows after the projection.
+	/// The value rows keep their projected magnitudes.
+	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("query and key normalization requires a preceding block"));
+		let normalization = normalization.normalization();
+		if !matches!(block.operation, Operation::Attention(_)) {
+			panic!("query and key normalization requires an attention block");
+		}
+		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
+			panic!("query and key normalization must be rms or l2");
+		}
+		block.qk = Some(normalization);
 		model
 	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
@@ -4653,10 +5134,13 @@ impl Model {
 				if selected.1 && block.activation != Activation::Linear {
 					names.push(block.activation.name().to_owned())
 				}
-				if selected.2
-					&& let Some(name) = block.normalization.map(BlockNormalization::name)
-				{
-					names.push(name.to_owned())
+				if selected.2 {
+					if let Some(name) = block.qk.map(BlockNormalization::name) {
+						names.push(format!("qk-{name}"))
+					}
+					if let Some(name) = block.normalization.map(BlockNormalization::name) {
+						names.push(name.to_owned())
+					}
 				}
 				if selected.3 && block.quantization != 0 {
 					names.push(quantization(block.quantization))
@@ -5640,8 +6124,8 @@ impl Integer for StorageFormat {
 				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
 				for block in 0..8 {
 					let slice = &values[block * 32..block * 32 + 32];
-					let rms = (slice.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
-					let weights = slice.iter().map(|value| rms + value.abs()).collect::<Vec<_>>();
+					let magnitude = (slice.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
+					let weights = slice.iter().map(|value| magnitude + value.abs()).collect::<Vec<_>>();
 					let (levels, range) = if bits == 4 { (15, (-1.0, 0.1, 20)) } else { (31, (-0.5, 0.1, 15)) };
 					(block_scales[block], minima[block]) = qkx2(slice, &weights, levels, range, false, &mut codes[block * 32..block * 32 + 32]);
 				}
@@ -5912,7 +6396,7 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Attention(_) => "attn",
+			Self::Attention(..) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
@@ -5949,6 +6433,8 @@ impl BlockNormalization {
 		match self {
 			Self::Batch => "bnorm",
 			Self::Layer => "lnorm",
+			Self::Rms => "rms",
+			Self::L2 => "l2",
 		}
 	}
 }
@@ -6019,6 +6505,12 @@ pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
 #[derive(Clone, Copy, Debug)]
 pub struct Batch;
+pub const rms: Rms = Rms;
+#[derive(Clone, Copy, Debug)]
+pub struct Rms;
+pub const l2: L2 = L2;
+#[derive(Clone, Copy, Debug)]
+pub struct L2;
 impl LossFunction {
 	const fn name(self) -> &'static str {
 		match self.0 {
@@ -6106,6 +6598,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Rope = 11,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -6143,6 +6636,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Rope => "Rope",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -6339,7 +6833,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads)?,
+		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -6354,14 +6848,14 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		lower_activation(graph, block.activation, config)?;
 	}
 	if let Some(normalization) = block.normalization {
-		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
-		push_node(graph, Primitive::Normalize, graph.output, 0, arguments(normalization as u8 as f64, epsilon), -2)?;
+		let channels = graph.output.channels;
+		lower_normalize(graph, normalization, channels, channels)?;
 	}
 	if block.quantization != 0 {
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
-			if node.op != Primitive::Predictor && node.parameters != 0 {
+			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.parameters != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
@@ -6548,13 +7042,60 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
+/// Lowers one attention block into its projection, the optional query and key
+/// normalization and rotary nodes, the attention node and the output
+/// projection. The projection carries the query, key and value planes, then
+/// the indexer planes, then the gate plane.
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
+	let AttentionBlock { heads, kv, rope, index, gate } = attention;
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
+	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let input = graph.output;
-	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
 	let width = input.channels / heads;
-	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
+	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let side = match index {
+		Some(index) => {
+			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
+			require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
+			checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?
+		}
+		None => 0,
+	};
+	let gated = if gate { input.channels } else { 0 };
+	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
+	if let Some(normalization) = qk {
+		// The projection lays the queries and keys out ahead of the values, so the
+		// normalized span stops at the value plane and each head owns one group.
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
+	}
+	if let Some((dims, base)) = rope {
+		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
+		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	}
+	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	push_node(graph, Primitive::Attention, input, 0, argument, -2)?;
 	lower_project(graph, input.channels)
+}
+/// Pushes a normalization over the graph output. A per-row mode splits the leading
+/// `span` channels into groups of `width`; the rest pass through untouched.
+fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	// RMS carries one trainable scale per normalized channel, starting at identity.
+	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	let output = graph.output;
+	push_node(graph, Primitive::Normalize, output, parameters, [normalization.mode(), epsilon, width as f64, span as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let offset = graph.parameters.len() - parameters;
+	graph.parameters[offset..].fill(1.0);
+	Ok(())
+}
+/// Key blocks the indexer scores for a sequence of `length` positions.
+fn attention_blocks(node: &Node) -> usize {
+	let block = node.argument[3] as usize;
+	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -6758,7 +7299,8 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
 	for node in &graph.nodes {
-		if node.op == Primitive::Elementwise {
+		// Scalar programs and normalizations set their own initial parameters.
+		if matches!(node.op, Primitive::Elementwise | Primitive::Normalize) {
 			continue;
 		}
 		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
@@ -7642,8 +8184,17 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// minimum allocation below.
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		// Softmax statistics, then the indexer block representatives, then one
+		// row of block scores and one admission flag per block per query, then
+		// one block score gradient per attention head per query.
 		Primitive::Attention => {
-			checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?
+			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let blocks = attention_blocks(node);
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
+			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
+			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -7653,8 +8204,9 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
 		Primitive::Normalize => {
-			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
-			checked_mul(4, groups, "normalization context")?
+			let statistics = checked_mul(4, normalize_groups(node, rows)?, "normalization context")?;
+			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
+			checked_add(statistics, partials, "normalization")?
 		}
 		_ => 1,
 	};
@@ -8216,7 +8768,10 @@ impl Gpu {
 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
 			let heads = integer_argument(node.argument[0], "attention heads")?;
 			require(heads != 0, "attention heads are empty")?;
-			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
+			// The matrix path covers dense attention with tied heads, no gate and
+			// no indexer.
+			let plain = node.argument[1] == node.argument[0] && node.argument[2] == 0.0 && node.argument[3] == 0.0;
+			Ok::<_, RecipeError>(aligned && plain && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
 			&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
