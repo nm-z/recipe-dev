@@ -10160,32 +10160,38 @@ fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result
 	Ok(Predictor::fitted(boosted_predictor(base, &trees, config.boost_rate)?, move |sample| trees.iter().fold(base, |value, tree| value + config.boost_rate * tree_predict(tree, sample))))
 }
 struct LightNode {
-	rows: Vec<usize>,
+	candidate: Option<(f64, usize, f64, Vec<usize>, Vec<usize>)>,
 	value: f64,
 	split: Option<(usize, f64, usize, usize)>,
 }
-fn lightgbm_split(samples: &[f64], residuals: &[f64], features: usize, rows: &[usize], bins: usize, minimum: usize) -> Option<(f64, usize, f64, Vec<usize>, Vec<usize>)> {
+/// Grows a leaf and the best split of its rows. Residuals stay fixed while a
+/// tree grows, so every later round reads this split instead of rescanning the
+/// leaf it already scanned.
+fn light_node(columns: &[Vec<f64>], residuals: &[f64], residual_squares: &[f64], rows: Vec<usize>, config: Config) -> Result<LightNode> {
+	let candidate = lightgbm_split(columns, residuals, residual_squares, &rows, config.lightgbm_bins, config.tree_min_rows)?;
+	Ok(LightNode { candidate, value: tree_mean(&rows, residuals), split: None })
+}
+fn lightgbm_split(columns: &[Vec<f64>], residuals: &[f64], residual_squares: &[f64], rows: &[usize], bins: usize, minimum: usize) -> Result<Option<(f64, usize, f64, Vec<usize>, Vec<usize>)>> {
 	let total = rows.iter().map(|&row| residuals[row]).sum::<f64>();
-	let square = rows.iter().map(|&row| residuals[row].powi(2)).sum::<f64>();
+	let square = rows.iter().map(|&row| residual_squares[row]).sum::<f64>();
 	let parent = square - total * total / rows.len() as f64;
-	let mut best = None;
-	for feature in 0..features {
-		let minimum_value = rows.iter().map(|&row| samples[row * features + feature]).fold(f64::INFINITY, f64::min);
-		let maximum_value = rows.iter().map(|&row| samples[row * features + feature]).fold(f64::NEG_INFINITY, f64::max);
+	let best = parallel_map(columns.len(), |feature| {
+		let column = &columns[feature];
+		let (minimum_value, maximum_value) = rows.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), &row| (f64::min(low, column[row]), f64::max(high, column[row])));
 		if minimum_value >= maximum_value {
-			continue;
+			return None;
 		}
 		let width = (maximum_value - minimum_value) / bins as f64;
 		let mut counts = vec![0_usize; bins];
 		let mut sums = vec![0.0; bins];
 		let mut squares = vec![0.0; bins];
 		for &row in rows {
-			let bin = (((samples[row * features + feature] - minimum_value) / width).floor() as usize).min(bins - 1);
+			let bin = (((column[row] - minimum_value) / width) as usize).min(bins - 1);
 			counts[bin] += 1;
 			sums[bin] += residuals[row];
-			squares[bin] += residuals[row].powi(2);
+			squares[bin] += residual_squares[row];
 		}
-		let (mut left_count, mut left_sum, mut left_square) = (0, 0.0, 0.0);
+		let (mut left_count, mut left_sum, mut left_square, mut best) = (0, 0.0, 0.0, None);
 		for bin in 0..bins - 1 {
 			left_count += counts[bin];
 			left_sum += sums[bin];
@@ -10198,15 +10204,20 @@ fn lightgbm_split(samples: &[f64], residuals: &[f64], features: usize, rows: &[u
 			let right_square = square - left_square;
 			let gain = parent - (left_square - left_sum * left_sum / left_count as f64) - (right_square - right_sum * right_sum / right_count as f64);
 			let threshold = minimum_value + width * (bin + 1) as f64;
-			if gain > 0.0 && best.as_ref().is_none_or(|value: &(f64, usize, f64)| gain > value.0) {
-				best = Some((gain, feature, threshold))
+			if gain > 0.0 && best.as_ref().is_none_or(|value: &(f64, f64)| gain > value.0) {
+				best = Some((gain, threshold))
 			}
 		}
-	}
-	best.map(|(gain, feature, threshold)| {
-		let (left, right) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
+		best
+	})?
+	.into_iter()
+	.enumerate()
+	.filter_map(|(feature, best)| best.map(|(gain, threshold)| (gain, feature, threshold)))
+	.reduce(|best, candidate| if candidate.0 > best.0 { candidate } else { best });
+	Ok(best.map(|(gain, feature, threshold)| {
+		let (left, right) = rows.iter().copied().partition(|&row| columns[feature][row] < threshold);
 		(gain, feature, threshold, left, right)
-	})
+	}))
 }
 fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 	match nodes[index].split {
@@ -10220,22 +10231,21 @@ fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config) -> Resul
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut trees = Vec::with_capacity(config.boost_iterations);
+	// One scan reads one feature of every row, so the rows are transposed once
+	// into a column per feature instead of striding across every sample.
+	let columns = parallel_map(data.features, |feature| data.samples[..rows * data.features].iter().skip(feature).step_by(data.features).copied().collect::<Vec<_>>())?;
 	for _ in 0..config.boost_iterations {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
-		let indices = (0..rows).collect::<Vec<_>>();
-		let mut nodes = vec![LightNode { value: tree_mean(&indices, &residuals), rows: indices, split: None }];
+		let residual_squares = residuals.iter().map(|residual| residual * residual).collect::<Vec<_>>();
+		let mut nodes = vec![light_node(&columns, &residuals, &residual_squares, (0..rows).collect(), config)?];
 		for _ in 1..config.lightgbm_leaves {
-			let selected = nodes
-				.iter()
-				.enumerate()
-				.filter(|(_, node)| node.split.is_none())
-				.filter_map(|(index, node)| lightgbm_split(&data.samples, &residuals, data.features, &node.rows, config.lightgbm_bins, config.tree_min_rows).map(|split| (index, split)))
-				.max_by(|left, right| left.1.0.total_cmp(&right.1.0));
-			let Some((index, (_, feature, threshold, left, right))) = selected else { break };
+			let selected = nodes.iter().enumerate().filter_map(|(index, node)| node.candidate.as_ref().map(|candidate| (index, candidate.0))).max_by(|left, right| left.1.total_cmp(&right.1));
+			let Some((index, _)) = selected else { break };
+			let Some((_, feature, threshold, left, right)) = nodes[index].candidate.take() else { break };
 			let left_index = nodes.len();
-			nodes.push(LightNode { value: tree_mean(&left, &residuals), rows: left, split: None });
+			nodes.push(light_node(&columns, &residuals, &residual_squares, left, config)?);
 			let right_index = nodes.len();
-			nodes.push(LightNode { value: tree_mean(&right, &residuals), rows: right, split: None });
+			nodes.push(light_node(&columns, &residuals, &residual_squares, right, config)?);
 			nodes[index].split = Some((feature, threshold, left_index, right_index));
 		}
 		let tree = materialize_lightgbm(&nodes, 0);
