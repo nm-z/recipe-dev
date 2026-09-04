@@ -7393,9 +7393,17 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		gpu.synchronize()?;
 		Ok(started.elapsed().as_secs_f64())
 	};
+	// The first dispatch of either kind pays a one-time cost, and one later
+	// sample can still carry a thread wake or a scheduler stall larger than the
+	// gradient work, so both kinds warm up and the two costs then interleave and
+	// each takes its floor over the configured surrogate epochs.
 	timed(&mut tape, true)?;
-	let overhead = timed(&mut tape, false)?;
-	let epoch = timed(&mut tape, true)?;
+	timed(&mut tape, false)?;
+	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
+	for _ in 0..config.surrogate_epochs {
+		overhead = overhead.min(timed(&mut tape, false)?);
+		epoch = epoch.min(timed(&mut tape, true)?);
+	}
 	let gradient = epoch - overhead;
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
@@ -10835,24 +10843,21 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
+	let mut paths = BTreeSet::new();
 	for source in sources {
 		collect_files(&resolve_path(source)?, &mut paths)?;
 	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// ZIP sources contribute data entries at virtual archive paths, preserving directory layouts while ignoring object metadata.
 	let mut files = Vec::new();
 	for path in &paths {
 		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
 			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+					&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
+				if metadata {
+					continue;
+				}
 				files.push((path.join(entry), contents));
 			}
 		} else {
@@ -10870,7 +10875,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
-		return Ok((vec![table], paths));
+		return Ok((vec![table], paths.into_iter().collect()));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
@@ -10889,7 +10894,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			}
 		}
 	}
-	Ok((tables, paths))
+	Ok((tables, paths.into_iter().collect()))
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -11631,10 +11636,10 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
 	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
 	if metadata.is_file() {
-		files.push(path.to_owned());
+		files.insert(fs::canonicalize(path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?);
 		return Ok(());
 	}
 	let mut children = fs::read_dir(path)
