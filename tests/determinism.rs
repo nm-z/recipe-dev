@@ -16,12 +16,9 @@ use recipe::*;
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-// The libtest harness captures the print macros on passing tests, so write reports straight to the inherited stderr descriptor.
+// The libtest harness captures the print macros on passing tests, so write reports straight to the inherited stderr handle.
 fn report(text: String) {
-	use std::os::fd::FromRawFd;
-	let mut stderr = unsafe { std::fs::File::from_raw_fd(2) };
-	let _ = stderr.write_all(text.as_bytes());
-	std::mem::forget(stderr);
+	let _ = std::io::stderr().lock().write_all(text.as_bytes());
 }
 
 /// Rows and columns are prime-adjacent on purpose: they force partial M, N, and

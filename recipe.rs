@@ -1173,7 +1173,7 @@ impl BackendTarget {
 
 	fn artifact_extension(&self) -> &'static str {
 		match self {
-			Self::Cpu { .. } => "so",
+			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
 			Self::Nvidia { .. } => "ptx",
 		}
@@ -1242,8 +1242,9 @@ fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
 fn native_cpu_target() -> Result<BackendTarget> {
 	let compiler = native_cpu_compiler()?;
 	let target = option_env!("RECIPE_CPU_TARGET").ok_or_else(|| RecipeError::new("CPU native target is unavailable"))?;
+	let null = option_env!("RECIPE_NULL_DEVICE").ok_or_else(|| RecipeError::new("CPU null device is unavailable"))?;
 	let output = Command::new(compiler)
-		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", "/dev/null", "-o", "/dev/null"])
+		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", null, "-o", null])
 		.output()
 		.map_err(|error| RecipeError::new(format!("cannot query CPU native target: {error}")))?;
 	require(output.status.success(), format!("CPU native target query failed: {}", String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no compiler diagnostic")))?;
@@ -2944,17 +2945,9 @@ impl NativeModelIr {
 		}
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let mut ir = format!(
-			"define {kernel}void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
+			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
 			kernel = kernel,
 			pointer = pointer,
 			thread = thread
@@ -3004,15 +2997,7 @@ impl NativeModelIr {
 		let state_ty = self.precision.state_type;
 		let model_align = alignment(model_ty);
 		let state_align = alignment(state_ty);
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
@@ -3025,7 +3010,7 @@ impl NativeModelIr {
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
+		body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
@@ -3033,7 +3018,7 @@ impl NativeModelIr {
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
-			body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
@@ -3048,7 +3033,11 @@ impl NativeModelIr {
 			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
 		}
 		ir.push_str(&body);
-		Ok(prune_internal_definitions(ir))
+		let mut ir = prune_internal_definitions(ir);
+		if matches!(backend, Backend::Cpu) {
+			ir.push_str(native_cpu_setting("module-suffix")?);
+		}
+		Ok(ir)
 	}
 
 	fn emit_loss_and_seed(
@@ -3394,15 +3383,18 @@ impl Drop for NativeTemporaryFiles {
 	}
 }
 
+fn home_directory() -> Result<PathBuf> {
+	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).ok_or_else(|| RecipeError::new("home directory is absent"))
+}
+
 fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	require(!key.is_empty() && key != "." && key != ".." && !key.contains('/') && !key.contains('\\'), "native artifact key is not a single path component")?;
-	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-	Ok(PathBuf::from(home).join(".cache").join("recipe").join("native").join(key))
+	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v2".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
+	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -3472,6 +3464,27 @@ fn native_cpu_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_CPU_COMPILER").ok_or_else(|| RecipeError::new("CPU native compiler is unavailable"))
 }
 
+fn native_cpu_setting(name: &str) -> Result<&'static str> {
+	match name {
+		"linker" => option_env!("RECIPE_CPU_LINKER"),
+		"linker-driver" => option_env!("RECIPE_CPU_LINKER_DRIVER"),
+		"library-flags" => option_env!("RECIPE_CPU_LIBRARY_FLAGS"),
+		"link-flags" => option_env!("RECIPE_CPU_LINK_FLAGS"),
+		"entry-linkage" => option_env!("RECIPE_CPU_ENTRY_LINKAGE"),
+		"module-suffix" => option_env!("RECIPE_CPU_MODULE_SUFFIX"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("CPU native {name} is unavailable")))
+}
+
+fn native_entry(backend: Backend) -> Result<(&'static str, &'static str)> {
+	Ok(match backend {
+		Backend::Cpu => (native_cpu_setting("entry-linkage")?, "call i32 @recipe.cpu.thread.id()"),
+		Backend::Amd => ("protected amdgpu_kernel", "call i32 @global_id()"),
+		Backend::Nvidia => ("protected ptx_kernel", "call i32 @global_id()"),
+	})
+}
+
 fn native_amd_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_HSA_COMPILER").ok_or_else(|| RecipeError::new("AMD native compiler is unavailable"))
 }
@@ -3490,11 +3503,21 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 		.ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn native_nvidia_device_library() -> Result<&'static str> {
+	option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))
+}
+
+fn native_nvidia_ptx_version() -> Result<&'static str> {
+	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
+}
+
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
 			let (target, compiler_identity, _, _) = cpu_identity(target)?;
+			let linker = Path::new(native_cpu_setting("linker")?);
+			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", target, "-march=native"]);
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
@@ -3503,7 +3526,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
-			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command
+				.args(["-x", "ir", "-O2"])
+				.args(native_cpu_setting("library-flags")?.split_whitespace())
+				.arg(format!("-B{}", linker_directory.display()))
+				.arg(format!("-fuse-ld={}", native_cpu_setting("linker-driver")?))
+				.args(["-shared"])
+				.args(native_cpu_setting("link-flags")?.split_whitespace())
+				.args(["-o"])
+				.arg(output)
+				.arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
@@ -3523,22 +3555,17 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
-			let device = option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))?;
-			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
-			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
-			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"])
+			let device = native_nvidia_device_library()?;
+			let ptx_version = native_nvidia_ptx_version()?;
+			let mut command = Command::new(compiler);
+			command
+				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"])
-				.arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?)
+				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
+				.arg(source)
 				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(bitcode);
-			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
-			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
-			let mut llc = Command::new(generator);
-			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
-			native_command(llc, "NVIDIA PTX generator", key)?;
+				.arg(output);
+			native_command(command, "NVIDIA LLVM IR compiler", key)?;
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -3580,8 +3607,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
-		let bitcode = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.bc")));
-		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(bitcode.iter().cloned()).collect() };
+		let temporary = NativeTemporaryFiles { paths: vec![source.clone(), output.clone()] };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?;
 		debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
@@ -3591,7 +3617,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
@@ -4363,10 +4389,14 @@ mod bundle {
 		Ok(result)
 	}
 }
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	error::Error,
-	ffi::c_void,
+	ffi::{OsStr, c_void},
 	fmt, fs,
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
@@ -4388,12 +4418,32 @@ const DEBUG_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recipe.log");
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
-extern "C" fn interrupt(_: i32) {
+fn record_interrupt() {
 	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
 		let message = b"\ninterrupt received, finishing checkpoint\n";
 		unsafe {
 			write(2, message.as_ptr().cast(), message.len());
 		}
+	}
+}
+#[cfg(unix)]
+extern "C" fn interrupt(_: i32) {
+	record_interrupt()
+}
+#[cfg(windows)]
+unsafe extern "system" fn interrupt(event: u32) -> i32 {
+	if event != CTRL_C_EVENT {
+		return 0;
+	}
+	record_interrupt();
+	1
+}
+fn register_interrupt() -> usize {
+	unsafe {
+		#[cfg(unix)]
+		return signal(SIGINT, interrupt);
+		#[cfg(windows)]
+		return SetConsoleCtrlHandler(Some(interrupt), 1) as usize;
 	}
 }
 fn debug(message: &str) -> Result<()> {
@@ -7731,6 +7781,7 @@ impl Drop for Buffer {
 }
 #[derive(Clone, Copy)]
 struct Kernel {
+	#[cfg(any(amd, nvidia))]
 	object: u64,
 	shared: u32,
 	element: u8,
@@ -7761,7 +7812,6 @@ enum NativeCpuEpoch {
 	F8(NativeEpochF8),
 }
 
-#[cfg(unix)]
 struct NativeCpuProgram {
 	_library: Library,
 	thread: NativeCpuThread,
@@ -7838,7 +7888,6 @@ impl Drop for NativeCudaProgram {
 }
 
 enum NativeBackend {
-	#[cfg(unix)]
 	Cpu(NativeCpuProgram),
 	#[cfg(amd)]
 	Amd(NativeHsaProgram),
@@ -7893,6 +7942,7 @@ fn native_artifact_contract(artifact: &NativeArtifact) -> Result<()> {
 impl Kernel {
 	const fn remote(shared: u32, element: u8, layout: &'static [u8]) -> Self {
 		Self {
+			#[cfg(any(amd, nvidia))]
 			object: 0,
 			shared,
 			element,
@@ -8111,39 +8161,43 @@ struct HsaPacket {
 }
 #[cfg(nvidia)]
 type NvQuery = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
-#[cfg(any(unix, all(nvidia, windows)))]
 struct Library(usize);
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Library {
-	fn open(name: &str) -> Result<Self> {
-		let name = format!("{name}\0");
-		let handle = unsafe { dlopen(name.as_ptr().cast(), 2) };
-		require(!handle.is_null(), format!("cannot load {name:?}"))?;
+	fn open(name: impl AsRef<OsStr>) -> Result<Self> {
+		let name = name.as_ref();
+		let handle = unsafe { native_library(name) };
+		require(!handle.is_null(), format!("cannot load {:?}", name.to_string_lossy()))?;
 		Ok(Self(handle as usize))
 	}
 	fn function<F: Copy>(&self, name: &[u8]) -> Result<F> {
-		let pointer = unsafe { dlsym(self.0 as Ptr, name.as_ptr().cast()) };
+		let pointer = unsafe {
+			#[cfg(unix)]
+			{
+				dlsym(self.0 as Ptr, name.as_ptr().cast())
+			}
+			#[cfg(windows)]
+			{
+				GetProcAddress(self.0 as Ptr, name.as_ptr().cast())
+			}
+		};
 		require(!pointer.is_null(), format!("runtime symbol {:?} is absent", name))?;
 		Ok(unsafe { std::mem::transmute_copy(&pointer) })
 	}
 }
 
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Drop for Library {
 	fn drop(&mut self) {
 		unsafe {
 			#[cfg(unix)]
 			dlclose(self.0 as Ptr);
-			#[cfg(all(nvidia, windows))]
+			#[cfg(windows)]
 			FreeLibrary(self.0 as Ptr);
 		}
 	}
 }
 
-#[cfg(unix)]
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
-	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
-	let library = Library::open(path)?;
+	let library = Library::open(&artifact.path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
@@ -8299,10 +8353,12 @@ impl Gpu {
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
 		let mut owned = 1_u32;
-		for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-			let k_lanes = (block / output_lanes).max(2);
-			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+		if block > 1 {
+			for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
+				let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+				let k_lanes = (block / output_lanes).max(2);
+				owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+			}
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
@@ -8509,11 +8565,19 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
+#[cfg(unix)]
 fn local_host() -> Result<String> {
 	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	require(output.status.success(), "cannot read hostname")?;
 	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
+}
+#[cfg(windows)]
+fn local_host() -> Result<String> {
+	let mut words = [0_u16; 256];
+	let mut length = words.len() as u32;
+	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
+	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
@@ -8812,12 +8876,40 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 	unsafe { *arguments[index].cast::<T>() }
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
 }
 
-#[cfg(unix)]
+macro_rules! launch_native_cpu_epoch {
+	($function:expr, $arguments:expr) => {
+		($function)(
+			native_cpu_pointer($arguments, 0),
+			native_cpu_pointer($arguments, 1),
+			native_cpu_pointer($arguments, 2),
+			native_cpu_pointer($arguments, 3),
+			native_cpu_pointer($arguments, 4),
+			native_cpu_pointer($arguments, 5),
+			native_cpu_pointer($arguments, 6),
+			native_cpu_pointer($arguments, 7),
+			native_cpu_pointer($arguments, 8),
+			native_cpu_pointer($arguments, 9),
+			native_cpu_pointer($arguments, 10),
+			native_cpu_pointer($arguments, 11),
+			native_cpu_value($arguments, 12),
+			native_cpu_value($arguments, 13),
+			native_cpu_value($arguments, 14),
+			native_cpu_value($arguments, 15),
+			native_cpu_value($arguments, 16),
+			native_cpu_value($arguments, 17),
+			native_cpu_value($arguments, 18),
+			native_cpu_value($arguments, 19),
+			native_cpu_value($arguments, 20),
+			native_cpu_value($arguments, 21),
+			native_cpu_value($arguments, 22),
+		)
+	};
+}
+
 unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
@@ -8834,41 +8926,11 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 			}
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
-				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-				macro_rules! launch {
-					($function:expr) => {
-						$function(
-							pointers[0],
-							pointers[1],
-							pointers[2],
-							pointers[3],
-							pointers[4],
-							pointers[5],
-							pointers[6],
-							pointers[7],
-							pointers[8],
-							pointers[9],
-							pointers[10],
-							pointers[11],
-							native_cpu_value(arguments, 12),
-							native_cpu_value(arguments, 13),
-							native_cpu_value(arguments, 14),
-							native_cpu_value(arguments, 15),
-							native_cpu_value(arguments, 16),
-							native_cpu_value(arguments, 17),
-							native_cpu_value(arguments, 18),
-							native_cpu_value(arguments, 19),
-							native_cpu_value(arguments, 20),
-							native_cpu_value(arguments, 21),
-							native_cpu_value(arguments, 22),
-						)
-					};
-				}
 				match epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
-					NativeCpuEpoch::F64(function) => launch!(function),
-					NativeCpuEpoch::F32(function) => launch!(function),
-					NativeCpuEpoch::F16(function) => launch!(function),
-					NativeCpuEpoch::F8(function) => launch!(function),
+					NativeCpuEpoch::F64(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F32(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F16(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F8(function) => launch_native_cpu_epoch!(function, arguments),
 				}
 			}
 			NativeEntry::ModelLoad => {
@@ -8881,7 +8943,6 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 	}
 }
 
-#[cfg(unix)]
 unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
 	require(threads != 0, "native CPU worker count is empty")?;
 	let slots = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
@@ -8917,18 +8978,12 @@ impl NativeProgram {
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
-				#[cfg(unix)]
-				{
-					let cpu = load_native_cpu(&artifact)?;
-					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
-					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
-					let model_load =
-						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
-					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
-				}
-				#[cfg(not(unix))]
-				return Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"));
+				let cpu = load_native_cpu(&artifact)?;
+				let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+				let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+				let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
+				let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+				(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
@@ -9042,11 +9097,13 @@ impl NativeProgram {
 /// Dispatches one loaded entrypoint on the device that loaded it. The caller
 /// holds the device dispatch lock and has already validated the argument list
 /// and shared-memory budget.
-unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, shared: u32) -> Result<()> {
+unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, _shared: u32) -> Result<()> {
+	#[cfg(any(amd, nvidia))]
 	let block = dispatch.geometry.block;
+	#[cfg(not(any(amd, nvidia)))]
+	let _ = (threads, dynamic, _shared);
 	unsafe {
 		match (backend, &gpu.driver) {
-			#[cfg(unix)]
 			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
@@ -9101,7 +9158,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					grid_y: 1,
 					grid_z: 1,
 					private: dispatch.kernel.private,
-					group: shared,
+					group: _shared,
 					object: dispatch.kernel.object,
 					kernarg,
 					reserved1: 0,
@@ -9259,7 +9316,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const REGISTERS_PER_SM: i32 = 82;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
-		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
+		let runtime = std::sync::Arc::new(Library::open(env!("RECIPE_NV_RUNTIME"))?);
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
@@ -9356,15 +9413,12 @@ struct WorkerProgram {
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
-	let probe = device(Some(name)).and_then(|gpu| {
-		let (backend, wave) = match &gpu.driver {
-			#[cfg(amd)]
-			Driver::Hsa(driver) => (1_u8, driver.wave),
-			#[cfg(nvidia)]
-			Driver::Cuda(driver) => (2_u8, driver.wave),
-			_ => return Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
-		};
-		Ok((gpu, backend, wave))
+	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		#[cfg(amd)]
+		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
+		_ => Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
 	});
 	let (gpu, backend, wave) = match probe {
 		Ok(probe) => probe,
@@ -9432,6 +9486,8 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
+				#[cfg(not(any(amd, nvidia)))]
+				let _ = (waves, element, training, epoch_layout, has_storage);
 				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
@@ -9485,29 +9541,39 @@ pub fn worker_serve(name: &str) -> Result<()> {
 		wire.flush()?;
 	}
 }
-#[cfg(all(unix, not(windows)))]
+#[cfg(unix)]
 #[link(name = "dl")]
 unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn dlclose(handle: Ptr) -> i32;
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
-	unsafe { LoadLibraryA(name) }
+#[cfg(unix)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let mut name = name.as_bytes().to_vec();
+	name.push(0);
+	unsafe { dlopen(name.as_ptr().cast(), 2) }
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr {
-	unsafe { GetProcAddress(handle, name) }
+#[cfg(windows)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let name = name.encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	unsafe { LoadLibraryW(name.as_ptr()) }
 }
-#[cfg(all(nvidia, windows))]
+#[cfg(windows)]
+const CTRL_C_EVENT: u32 = 0;
+#[cfg(windows)]
+const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-	fn LoadLibraryA(name: *const std::ffi::c_char) -> Ptr;
+	fn LoadLibraryW(name: *const u16) -> Ptr;
 	fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn FreeLibrary(handle: Ptr) -> i32;
+	fn GetComputerNameExW(format: i32, name: *mut u16, length: *mut u32) -> i32;
+	fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
 }
 unsafe extern "C" {
+	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
@@ -11626,8 +11692,7 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
 	if components.next().is_some_and(|component| component.as_os_str() == "~") {
-		let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-		return Ok(PathBuf::from(home).join(components.as_path()));
+		return Ok(home_directory()?.join(components.as_path()));
 	}
 	Ok(path.to_owned())
 }
@@ -12890,7 +12955,7 @@ impl Train {
 		self
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
-		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
+		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);

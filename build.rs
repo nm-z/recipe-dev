@@ -559,6 +559,59 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into())
 }
+fn configured_entry<'a>(manifest: &'a str, key: &str, os: &str) -> BuildResult<Option<&'a str>> {
+	let entries = setting(manifest, key)?.trim().strip_prefix('{').and_then(|value| value.strip_suffix('}')).ok_or_else(|| io::Error::other(format!("{key} must be a platform table")))?;
+	let Some((_, entry)) = entries.split_once(&format!(" {os} = \"")) else { return Ok(None) };
+	entry.split_once('"').map(|(value, _)| Some(value)).ok_or_else(|| io::Error::other(format!("{key} entry for {os} must be quoted")).into())
+}
+fn configured(manifest: &str, key: &str, os: &str) -> BuildResult<Option<String>> {
+	let Some(value) = configured_entry(manifest, key, os)? else { return Ok(None) };
+	let Some(reference) = value.strip_prefix('$') else { return Ok(Some(value.to_owned())) };
+	let (name, inside) = reference.split_once('/').unwrap_or((reference, ""));
+	Ok(env::var_os(name).map(PathBuf::from).map(|root| if inside.is_empty() { root } else { root.join(inside) }.to_string_lossy().into_owned()))
+}
+fn native_configuration(manifest: &str, os: &str) -> u64 {
+	let mut hash = 14695981039346656037_u64;
+	let mut update = |value: &str| {
+		for byte in (value.len() as u64).to_le_bytes().into_iter().chain(value.bytes()) {
+			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+		}
+	};
+	update(manifest);
+	update(os);
+	let marker = format!("{os} = \"$");
+	let mut variables = Vec::new();
+	for line in manifest.lines() {
+		let Some((_, reference)) = line.split_once(&marker) else { continue };
+		let name = reference.split(['/', '"']).next().unwrap_or_default();
+		if variables.contains(&name) {
+			continue;
+		}
+		variables.push(name);
+		println!("cargo:rerun-if-env-changed={name}");
+		update(name);
+		match env::var_os(name) {
+			Some(value) => {
+				update("present");
+				update(&value.to_string_lossy());
+			}
+			None => update("absent"),
+		}
+	}
+	hash
+}
+fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
+	configured(manifest, key, os)?.ok_or_else(|| io::Error::other(format!("{key} is not configured for {os}")).into())
+}
+struct NvidiaToolkit {
+	device_library: PathBuf,
+	required: bool,
+}
+fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
+	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
+	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), required: entry.starts_with('$') }))
+}
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
 		"@contraction_tile = external addrspace(3) global [0 x double], align 16",
@@ -580,7 +633,7 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
 @recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
-define void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
 define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
 /// Compile-time contraction shape. A reverse K extent is cut into one contiguous
@@ -648,7 +701,7 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
-fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
@@ -667,8 +720,9 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 		}
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
-	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
 	for (key, environment) in [
+		("hsa-compiler", "RECIPE_HSA_COMPILER"),
+		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
 		("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"),
 		("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"),
 		("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"),
@@ -676,11 +730,11 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 		("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"),
 		("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY"),
 	] {
-		println!("cargo:rustc-env={environment}={}", text(manifest, key)?);
+		println!("cargo:rustc-env={environment}={}", platform(manifest, key, os)?);
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
@@ -698,22 +752,28 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
-	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", text(manifest, "nvidia-compiler")?);
-	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", text(manifest, "nvidia-device-library")?);
+	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
+	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
+	println!(
+		"cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}",
+		nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?.device_library.display()
+	);
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
-	println!("cargo:rustc-env=RECIPE_NV_PTX_GENERATOR={}", text(manifest, "nvidia-ptx-generator")?);
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
 	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
-	ir.push_str(CPU_PARALLEL);
-	let clang = text(manifest, "cpu-compiler")?;
-	if !Path::new(clang).exists() {
-		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
+	ir.push_str(&CPU_PARALLEL.replace("RECIPE_CPU_ENTRY_LINKAGE", &platform(manifest, "cpu-entry-linkage", os)?));
+	let clang = platform(manifest, "cpu-compiler", os)?;
+	for (key, tool) in [("cpu-compiler", &clang), ("cpu-linker", &platform(manifest, "cpu-linker", os)?)] {
+		let path = Path::new(tool);
+		if !path.is_absolute() || !path.exists() {
+			return Err(io::Error::other(format!("{key} {tool:?} is not an absolute existing path")).into());
+		}
 	}
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
@@ -730,6 +790,17 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	println!("cargo:rustc-env=RECIPE_CPU_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_CPU_COMPILER={clang}");
 	println!("cargo:rustc-env=RECIPE_CPU_TARGET={target}");
+	for (key, environment) in [
+		("null-device", "RECIPE_NULL_DEVICE"),
+		("cpu-linker", "RECIPE_CPU_LINKER"),
+		("cpu-linker-driver", "RECIPE_CPU_LINKER_DRIVER"),
+		("cpu-library-flags", "RECIPE_CPU_LIBRARY_FLAGS"),
+		("cpu-link-flags", "RECIPE_CPU_LINK_FLAGS"),
+		("cpu-entry-linkage", "RECIPE_CPU_ENTRY_LINKAGE"),
+		("cpu-module-suffix", "RECIPE_CPU_MODULE_SUFFIX"),
+	] {
+		println!("cargo:rustc-env={environment}={}", platform(manifest, key, os)?);
+	}
 	Ok(())
 }
 fn main() -> BuildResult<()> {
@@ -806,9 +877,6 @@ fn main() -> BuildResult<()> {
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
-		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
-	}
 	let placement = setting(&manifest, "multi-device")?;
 	println!(
 		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",
@@ -821,19 +889,28 @@ fn main() -> BuildResult<()> {
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
-	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
-	compile_cpu(&manifest, &out, schedule)?;
+	let os = env::var("CARGO_CFG_TARGET_OS")?;
+	println!("cargo:rustc-env=RECIPE_NATIVE_CONFIGURATION={:016x}", native_configuration(&manifest, &os));
+	let installed = |key: &str| -> BuildResult<bool> { Ok(configured(&manifest, key, &os)?.is_some_and(|path| Path::new(&path).exists())) };
+	compile_cpu(&manifest, &out, &os, schedule)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
-	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-generator")?).exists();
+	let amd = native && installed("hsa-compiler")? && installed("hsa-device-library")?;
+	let toolkit = nvidia_toolkit(&manifest, &os)?;
+	if let Some(toolkit) = &toolkit
+		&& toolkit.required
+		&& !toolkit.device_library.exists()
+	{
+		return Err(io::Error::other(format!("nvidia-toolkit is installed but its device library {} is absent", toolkit.device_library.display())).into());
+	}
+	let nvidia = native && installed("nvidia-compiler")? && toolkit.as_ref().is_some_and(|toolkit| toolkit.device_library.exists());
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out, schedule)?;
+		compile_amd(&manifest, &out, &os, schedule)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out, schedule)?;
+		compile_nvidia(&manifest, &out, &os, schedule)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
