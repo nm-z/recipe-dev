@@ -78,6 +78,28 @@ estimators:
 ```
 Feature generation is banned.
 
+## 2 block qualifiers
+
+```rust
+blck.atvn.norm.quant
+frozen.blck.atvn.norm.quant
+packed.blck.atvn.norm.quant
+frozen.packed.blck.atvn.norm.quant
+```
+
+`frozen` holds a block's own weights at their current values for the whole run and creates no
+optimizer state for them; the block still passes an input adjoint back, so earlier blocks learn.
+`packed` keeps a block's weights in their selected quantized representation and decodes each
+weight inside the consuming kernel, so inference never holds a decoded copy. `frozen` affects
+training only, `packed` affects inference only, and neither changes the selected precision or
+quantization. A qualifier on a block that owns no weights is rejected, as is `packed.frozen`.
+
+```rust
+let model = recipe.model()
+	.frozen().packed().layer(32).qi(4).0.gelu()
+	.layer(1);
+```
+
 ## 15 activations
 
 ```
