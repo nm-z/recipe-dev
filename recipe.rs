@@ -3643,7 +3643,13 @@ impl FloatLayout {
 							exponent += 1
 						}
 						let stored_exponent = exponent + self.bias() as i64;
-						if stored_exponent >= exponent_limit as i64 { sign | exponent_limit << self.man } else { sign | (stored_exponent as u64) << self.man | mantissa }
+						// A finite value above the format's range saturates to its largest finite
+						// magnitude. Encoding infinity makes an in-range sample nonfinite instead.
+						if stored_exponent >= exponent_limit as i64 {
+							sign | (exponent_limit - 1) << self.man | (mantissa_limit - 1)
+						} else {
+							sign | (stored_exponent as u64) << self.man | mantissa
+						}
 					}
 				}
 			}
