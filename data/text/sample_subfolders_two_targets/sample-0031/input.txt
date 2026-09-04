@@ -1,0 +1,1 @@
+Sample 00031: Cooling stays inside the nominal band for the whole window.

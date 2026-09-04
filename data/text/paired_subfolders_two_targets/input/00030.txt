@@ -1,0 +1,1 @@
+Sample 00030: The engine responds under load and holds its rated output.

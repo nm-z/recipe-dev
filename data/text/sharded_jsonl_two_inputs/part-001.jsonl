@@ -1,0 +1,15 @@
+{"title":"engine status 0015","body":"The engine responds under load and holds its rated output.","target":1}
+{"title":"cooling report 0016","body":"Cooling stays inside the nominal band for the whole window.","target":0}
+{"title":"network notice 0017","body":"The link recovered after a brief drop and now runs clean.","target":1}
+{"title":"storage digest 0018","body":"Free capacity fell slowly and remains above the reserve mark.","target":0}
+{"title":"sensor summary 0019","body":"All sensors reported on schedule with no gaps in the series.","target":1}
+{"title":"engine status 0020","body":"The engine responds under load and holds its rated output.","target":0}
+{"title":"cooling report 0021","body":"Cooling stays inside the nominal band for the whole window.","target":1}
+{"title":"network notice 0022","body":"The link recovered after a brief drop and now runs clean.","target":0}
+{"title":"storage digest 0023","body":"Free capacity fell slowly and remains above the reserve mark.","target":1}
+{"title":"sensor summary 0024","body":"All sensors reported on schedule with no gaps in the series.","target":0}
+{"title":"engine status 0025","body":"The engine responds under load and holds its rated output.","target":1}
+{"title":"cooling report 0026","body":"Cooling stays inside the nominal band for the whole window.","target":0}
+{"title":"network notice 0027","body":"The link recovered after a brief drop and now runs clean.","target":1}
+{"title":"storage digest 0028","body":"Free capacity fell slowly and remains above the reserve mark.","target":0}
+{"title":"sensor summary 0029","body":"All sensors reported on schedule with no gaps in the series.","target":1}

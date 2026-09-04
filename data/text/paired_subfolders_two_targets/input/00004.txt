@@ -1,0 +1,1 @@
+Sample 00004: All sensors reported on schedule with no gaps in the series.

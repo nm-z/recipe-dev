@@ -1,0 +1,15 @@
+{"input":"Sample 00030: The engine responds under load and holds its rated output.","label":0,"length":58}
+{"input":"Sample 00031: Cooling stays inside the nominal band for the whole window.","label":1,"length":59}
+{"input":"Sample 00032: The link recovered after a brief drop and now runs clean.","label":0,"length":57}
+{"input":"Sample 00033: Free capacity fell slowly and remains above the reserve mark.","label":1,"length":61}
+{"input":"Sample 00034: All sensors reported on schedule with no gaps in the series.","label":0,"length":60}
+{"input":"Sample 00035: The engine responds under load and holds its rated output.","label":1,"length":58}
+{"input":"Sample 00036: Cooling stays inside the nominal band for the whole window.","label":0,"length":59}
+{"input":"Sample 00037: The link recovered after a brief drop and now runs clean.","label":1,"length":57}
+{"input":"Sample 00038: Free capacity fell slowly and remains above the reserve mark.","label":0,"length":61}
+{"input":"Sample 00039: All sensors reported on schedule with no gaps in the series.","label":1,"length":60}
+{"input":"Sample 00040: The engine responds under load and holds its rated output.","label":0,"length":58}
+{"input":"Sample 00041: Cooling stays inside the nominal band for the whole window.","label":1,"length":59}
+{"input":"Sample 00042: The link recovered after a brief drop and now runs clean.","label":0,"length":57}
+{"input":"Sample 00043: Free capacity fell slowly and remains above the reserve mark.","label":1,"length":61}
+{"input":"Sample 00044: All sensors reported on schedule with no gaps in the series.","label":0,"length":60}
