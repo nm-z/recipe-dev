@@ -801,6 +801,7 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("delta-chunk", "RECIPE_DELTA_CHUNK"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
