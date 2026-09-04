@@ -85,6 +85,22 @@ relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
 ```
 
+## 4 normalizations
+
+```rust
+.norm(batch)   per-channel statistics over the batch
+.norm(layer)   per-row statistics over the channels
+.norm(rms)     per-row root mean square, one trainable scale per channel
+.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
+```
+
+`.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
+over its head-width slice, leaving the values untouched:
+
+```rust
+.attn(4).qk(rms)
+```
+
 ## compute precisions
 key:<br>
 `.`       optional continue<br>
