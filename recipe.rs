@@ -10111,17 +10111,18 @@ fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<Predict
 fn xgboost_leaf(rows: &[usize], gradients: &[f64], regularization: f64) -> f64 {
 	-rows.iter().map(|&row| gradients[row]).sum::<f64>() / (rows.len() as f64 + regularization)
 }
-fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> TreeNode {
+fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> Result<TreeNode> {
 	if depth == 0 || rows.len() < 2 * minimum {
-		return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization));
+		return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)));
 	}
 	let total = rows.iter().map(|&row| gradients[row]).sum::<f64>();
 	let parent = total * total / (rows.len() as f64 + regularization);
-	let mut best = None;
-	for feature in 0..features {
+	// Each feature orders and scans the node rows independently, so the candidate
+	// splits divide over the workers and the best gains reduce in feature order.
+	let best = parallel_map(features, |feature| {
 		let mut ordered = rows.iter().map(|&row| (samples[row * features + feature], row)).collect::<Vec<_>>();
 		ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
-		let mut left = 0.0;
+		let (mut left, mut best) = (0.0, None);
 		for split in 1..ordered.len() {
 			left += gradients[ordered[split - 1].1];
 			if split < minimum || ordered.len() - split < minimum || ordered[split - 1].0 >= ordered[split].0 {
@@ -10129,19 +10130,23 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 			}
 			let right = total - left;
 			let gain = 0.5 * (left * left / (split as f64 + regularization) + right * right / ((ordered.len() - split) as f64 + regularization) - parent);
-			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, usize, f64)| gain > value.0) {
-				best = Some((gain, feature, (ordered[split - 1].0 + ordered[split].0) * 0.5))
+			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, f64)| gain > value.0) {
+				best = Some((gain, (ordered[split - 1].0 + ordered[split].0) * 0.5))
 			}
 		}
-	}
-	let Some((_, feature, threshold)) = best else { return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)) };
+		best.map(|(gain, threshold)| (gain, feature, threshold))
+	})?
+	.into_iter()
+	.flatten()
+	.reduce(|best, candidate| if candidate.0 > best.0 { candidate } else { best });
+	let Some((_, feature, threshold)) = best else { return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization))) };
 	let (left, right): (Vec<_>, Vec<_>) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
-	TreeNode::Split {
+	Ok(TreeNode::Split {
 		feature,
 		threshold,
-		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)),
-		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)),
-	}
+		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)?),
+		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)?),
+	})
 }
 fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
@@ -10151,7 +10156,7 @@ fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result
 	let mut trees = Vec::with_capacity(config.boost_iterations);
 	for _ in 0..config.boost_iterations {
 		let gradients = predictions.iter().zip(&data.targets[..rows]).map(|(prediction, target)| prediction - target).collect::<Vec<_>>();
-		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain);
+		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain)?;
 		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
 			predictions[row] += config.boost_rate * tree_predict(&tree, sample)
 		}
