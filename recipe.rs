@@ -3723,6 +3723,339 @@ impl IntFormat {
 		((bits << (u64::BITS as u8 - self.bits)) as i64 >> (u64::BITS as u8 - self.bits)) as f64
 	}
 }
+/// GGUF, the container open-weight models ship in: a little-endian header of
+/// key-value metadata and tensor descriptors, then an aligned data section
+/// whose tensors use the same GGML block layouts as Recipe's storage formats.
+mod gguf {
+	use super::{Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, require, unfp16};
+	use std::{
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
+
+	const MAGIC: u32 = 0x4655_4747;
+	const VERSION: u32 = 3;
+	const DEFAULT_ALIGNMENT: u64 = 32;
+
+	/// One metadata value, in the width the file declares.
+	#[derive(Clone, Debug, PartialEq)]
+	pub enum GgufValue {
+		U8(u8),
+		I8(i8),
+		U16(u16),
+		I16(i16),
+		U32(u32),
+		I32(i32),
+		F32(f32),
+		Bool(bool),
+		String(String),
+		Array(Vec<GgufValue>),
+		U64(u64),
+		I64(i64),
+		F64(f64),
+	}
+	impl GgufValue {
+		/// The value as a count or index, whichever integer width the file chose.
+		pub fn integer(&self) -> Option<u64> {
+			match *self {
+				Self::U8(value) => Some(u64::from(value)),
+				Self::U16(value) => Some(u64::from(value)),
+				Self::U32(value) => Some(u64::from(value)),
+				Self::U64(value) => Some(value),
+				Self::I8(value) => u64::try_from(value).ok(),
+				Self::I16(value) => u64::try_from(value).ok(),
+				Self::I32(value) => u64::try_from(value).ok(),
+				Self::I64(value) => u64::try_from(value).ok(),
+				_ => None,
+			}
+		}
+		pub fn text(&self) -> Option<&str> {
+			match self {
+				Self::String(value) => Some(value),
+				_ => None,
+			}
+		}
+	}
+
+	/// One tensor descriptor: `kind` is the GGML type id and `offset` counts bytes
+	/// from the start of its shard's data section.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct GgufTensor {
+		pub name: String,
+		pub shape: Vec<u64>,
+		pub kind: u32,
+		pub offset: usize,
+		pub bytes: usize,
+		shard: usize,
+	}
+	impl GgufTensor {
+		/// The element count the shape declares.
+		pub fn elements(&self) -> usize {
+			self.shape.iter().product::<u64>() as usize
+		}
+	}
+
+	/// GGML type id to its name, elements per block, bytes per block, and the Recipe
+	/// storage format that decodes the block, for the types that are block quantized.
+	fn layout(kind: u32) -> Result<(&'static str, usize, usize, Option<StorageFormat>)> {
+		let name = match kind {
+			0 => return Ok(("F32", 1, 4, None)),
+			1 => return Ok(("F16", 1, 2, None)),
+			24 => return Ok(("I8", 1, 1, None)),
+			25 => return Ok(("I16", 1, 2, None)),
+			26 => return Ok(("I32", 1, 4, None)),
+			27 => return Ok(("I64", 1, 8, None)),
+			28 => return Ok(("F64", 1, 8, None)),
+			30 => return Ok(("BF16", 1, 2, None)),
+			2 => "q4_0",
+			3 => "q4_1",
+			6 => "q5_0",
+			7 => "q5_1",
+			8 => "q8_0",
+			9 => "q8_1",
+			10 => "q2k",
+			11 => "q3k",
+			12 => "q4k",
+			13 => "q5k",
+			14 => "q6k",
+			15 => "q8k",
+			16 => "iq2xxs",
+			17 => "iq2xs",
+			18 => "iq3xxs",
+			19 => "iq1s",
+			20 => "iq4nl",
+			21 => "iq3s",
+			22 => "iq2s",
+			23 => "iq4xs",
+			29 => "iq1m",
+			other => return Err(RecipeError::new(format!("GGUF tensor type {other} is unsupported"))),
+		};
+		let spec = StorageFormat::named(name).and_then(|format| format.spec().map(|spec| (format, spec)));
+		let (format, spec) = spec.ok_or_else(|| RecipeError::new(format!("GGUF type {name} has no Recipe storage layout")))?;
+		Ok((name, spec.block, spec.stride, Some(format)))
+	}
+
+	/// A read-only view of one file: mapped by the kernel on unix, read into
+	/// memory elsewhere. A stored weight holds a shard's mapping alive for as long
+	/// as the tape reads its bytes.
+	pub(super) struct Mapping {
+		pointer: *const u8,
+		length: usize,
+		owned: Option<Vec<u8>>,
+	}
+	unsafe impl Send for Mapping {}
+	unsafe impl Sync for Mapping {}
+	impl Mapping {
+		#[cfg(unix)]
+		fn open(path: &Path) -> Result<Self> {
+			use std::os::unix::io::AsRawFd;
+			let file = std::fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+			let length = usize::try_from(file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len())
+				.map_err(|_| RecipeError::new("GGUF file exceeds the address space"))?;
+			require(length != 0, format!("{} is empty", path.display()))?;
+			let pointer = unsafe { super::mmap(std::ptr::null_mut(), length, 1, 2, file.as_raw_fd(), 0) };
+			require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
+			Ok(Self { pointer: pointer.cast(), length, owned: None })
+		}
+		#[cfg(not(unix))]
+		fn open(path: &Path) -> Result<Self> {
+			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
+			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
+		}
+		pub(super) fn bytes(&self) -> &[u8] {
+			unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+		}
+	}
+	impl Drop for Mapping {
+		fn drop(&mut self) {
+			#[cfg(unix)]
+			if self.owned.is_none() {
+				unsafe { super::munmap(self.pointer.cast_mut().cast(), self.length) };
+			}
+		}
+	}
+
+	struct Reader<'a> {
+		bytes: &'a [u8],
+		at: usize,
+		depth: u32,
+	}
+	impl<'a> Reader<'a> {
+		fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+			let end = self.at.checked_add(count).filter(|end| *end <= self.bytes.len()).ok_or_else(|| RecipeError::new("GGUF header is truncated"))?;
+			let slice = &self.bytes[self.at..end];
+			self.at = end;
+			Ok(slice)
+		}
+		fn u32(&mut self) -> Result<u32> {
+			self.take(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn u64(&mut self) -> Result<u64> {
+			self.take(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn string(&mut self) -> Result<String> {
+			let length = usize::try_from(self.u64()?).map_err(|_| RecipeError::new("GGUF string length exceeds the address space"))?;
+			String::from_utf8(self.take(length)?.to_vec()).map_err(|error| RecipeError::new(format!("GGUF string is not UTF-8: {error}")))
+		}
+		fn value(&mut self, kind: u32) -> Result<GgufValue> {
+			Ok(match kind {
+				0 => GgufValue::U8(self.take(1)?[0]),
+				1 => GgufValue::I8(self.take(1)?[0] as i8),
+				2 => GgufValue::U16(u16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				3 => GgufValue::I16(i16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				4 => GgufValue::U32(self.u32()?),
+				5 => GgufValue::I32(self.u32()? as i32),
+				6 => GgufValue::F32(f32::from_bits(self.u32()?)),
+				7 => GgufValue::Bool(self.take(1)?[0] != 0),
+				8 => GgufValue::String(self.string()?),
+				9 => {
+					let (kind, count) = (self.u32()?, self.u64()?);
+					let count = usize::try_from(count).map_err(|_| RecipeError::new("GGUF array length exceeds the address space"))?;
+					self.depth += 1;
+					require(self.depth <= 64, "GGUF arrays nest deeper than 64 levels")?;
+					let values = (0..count).map(|_| self.value(kind)).collect::<Result<Vec<_>>>()?;
+					self.depth -= 1;
+					GgufValue::Array(values)
+				}
+				10 => GgufValue::U64(self.u64()?),
+				11 => GgufValue::I64(self.u64()? as i64),
+				12 => GgufValue::F64(f64::from_bits(self.u64()?)),
+				other => return Err(RecipeError::new(format!("GGUF value type {other} is unsupported"))),
+			})
+		}
+	}
+
+	struct Shard {
+		mapping: Arc<Mapping>,
+		data: usize,
+	}
+
+	/// One model: a single file or every shard of a split, opened by name.
+	pub struct Gguf {
+		shards: Vec<Shard>,
+		metadata: Vec<(String, GgufValue)>,
+		tensors: Vec<GgufTensor>,
+	}
+	impl Gguf {
+		pub(super) fn open(path: &Path) -> Result<Self> {
+			let first = Self::shard(path, 0)?;
+			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
+			let mut shards = vec![first];
+			for index in 1..count {
+				shards.push(Self::shard(&sibling(path, index, count)?, index)?);
+			}
+			let (metadata, mut tensors) = (shards[0].1.clone(), Vec::new());
+			let declared = metadata.iter().find(|(key, _)| key == "split.tensors.count").and_then(|(_, value)| value.integer());
+			for (index, (_, _, shard_tensors)) in shards.iter_mut().enumerate() {
+				tensors.extend(shard_tensors.drain(..).map(|mut tensor| {
+					tensor.shard = index;
+					tensor
+				}));
+			}
+			if let Some(declared) = declared {
+				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
+			}
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+		}
+		/// Parses one file: its metadata, its tensors, and where its data begins.
+		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
+			let mapping = Mapping::open(path)?;
+			let bytes = mapping.bytes();
+			let mut reader = Reader { bytes, at: 0, depth: 0 };
+			require(reader.u32()? == MAGIC, format!("{} is not a GGUF file", path.display()))?;
+			let version = reader.u32()?;
+			require(version == VERSION, format!("{} is GGUF version {version}; version {VERSION} is supported", path.display()))?;
+			let (tensor_count, pair_count) = (reader.u64()?, reader.u64()?);
+			let mut metadata = Vec::new();
+			for _ in 0..pair_count {
+				let key = reader.string()?;
+				let kind = reader.u32()?;
+				metadata.push((key, reader.value(kind)?));
+			}
+			let alignment = metadata.iter().find(|(key, _)| key == "general.alignment").and_then(|(_, value)| value.integer()).unwrap_or(DEFAULT_ALIGNMENT);
+			require(alignment != 0 && alignment.is_power_of_two(), format!("{} declares alignment {alignment}", path.display()))?;
+			if let Some(declared) = metadata.iter().find(|(key, _)| key == "split.no").and_then(|(_, value)| value.integer()) {
+				require(declared == index, format!("{} is shard {declared}, expected shard {index}", path.display()))?;
+			}
+			let mut tensors = Vec::new();
+			for _ in 0..tensor_count {
+				let name = reader.string()?;
+				let dimensions = reader.u32()?;
+				let shape = (0..dimensions).map(|_| reader.u64()).collect::<Result<Vec<_>>>()?;
+				let (kind, offset) = (reader.u32()?, reader.u64()?);
+				let (_, block, stride, _) = layout(kind)?;
+				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
+				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
+				let bytes = usize::try_from(elements / block as u64 * stride as u64).map_err(|_| RecipeError::new(format!("tensor {name} exceeds the address space")))?;
+				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
+				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
+			}
+			let data = usize::try_from((reader.at as u64).div_ceil(alignment) * alignment).map_err(|_| RecipeError::new("GGUF data offset exceeds the address space"))?;
+			for tensor in &tensors {
+				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
+				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
+			}
+			Ok((Shard { mapping: Arc::new(mapping), data }, metadata, tensors))
+		}
+		/// Every key-value pair of the first shard, in file order.
+		pub fn metadata(&self) -> &[(String, GgufValue)] {
+			&self.metadata
+		}
+		pub fn value(&self, key: &str) -> Option<&GgufValue> {
+			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+		}
+		/// Every tensor across every shard, in shard then file order.
+		pub fn tensors(&self) -> &[GgufTensor] {
+			&self.tensors
+		}
+		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
+			self.tensors.iter().find(|tensor| tensor.name == name)
+		}
+		/// The tensor's bytes in the mapped file, in its GGML block layout.
+		pub fn data(&self, tensor: &GgufTensor) -> &[u8] {
+			let shard = &self.shards[tensor.shard];
+			&shard.mapping.bytes()[shard.data + tensor.offset..shard.data + tensor.offset + tensor.bytes]
+		}
+		/// The tensor's elements decoded to f64, dequantizing block formats through
+		/// the same decoders the saved-model path uses.
+		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
+			let data = self.data(tensor);
+			match tensor.kind {
+				0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
+				30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
+				28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
+				24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
+				25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
+				_ => {
+					let stored = self.stored(tensor)?;
+					stored.format.decompress(&stored.bytes, &[], stored.count)
+				}
+			}
+		}
+		/// The tensor as the weight the tape binds: a view of its block bytes where the
+		/// file is mapped, in the Recipe storage format the kernels already decode.
+		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
+			let (name, _, _, format) = layout(tensor.kind)?;
+			let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))?;
+			let shard = &self.shards[tensor.shard];
+			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
+			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
+	}
+
+	/// The path of shard `index` of a split named like `model-00001-of-00004.gguf`.
+	fn sibling(path: &Path, index: u64, count: u64) -> Result<PathBuf> {
+		let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("GGUF split path has no file name"))?;
+		let stem = name.strip_suffix(".gguf").and_then(|stem| stem.rsplit_once("-of-")).and_then(|(head, _)| head.rsplit_once('-')).map(|(prefix, _)| prefix);
+		let prefix = stem.ok_or_else(|| RecipeError::new(format!("{name} declares a split but is not named <prefix>-<number>-of-<count>.gguf")))?;
+		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
+	}
+}
+pub use gguf::{Gguf, GgufTensor, GgufValue};
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -3905,8 +4238,8 @@ mod bundle {
 	}
 
 	fn raw_weight(values: &[f64]) -> StoredWeight {
-		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-		StoredWeight { format: StorageFormat(0), count: values.len(), bytes, codebook: Vec::new(), arithmetic: values.to_vec() }
+		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+		StoredWeight { format: StorageFormat(0), count: values.len(), bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec() }
 	}
 	fn semantic_graph(stored: &StoredGraph) -> Result<SemanticGraph> {
 		let graph = &stored.graph;
@@ -4055,7 +4388,7 @@ mod bundle {
 		} else {
 			StorageFormat(format).decompress(&bytes, &codebook, count)?
 		};
-		Ok(StoredWeight { format: StorageFormat(format), count, bytes, codebook, arithmetic })
+		Ok(StoredWeight { format: StorageFormat(format), count, bytes: bytes.into(), codebook, arithmetic })
 	}
 	pub(super) fn load_semantic(path: &Path) -> Result<(DataSchema, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
@@ -4374,7 +4707,7 @@ use std::{
 	process::Command,
 	ptr,
 	sync::{
-		Mutex, OnceLock,
+		Arc, Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
@@ -5402,11 +5735,40 @@ pub(crate) struct StorageSpec {
 	pub(crate) stride: usize,
 }
 
+/// A weight's block bytes: owned by the graph, or a view of the mapped file they
+/// were read from, which the view keeps mapped.
+#[derive(Clone)]
+pub(crate) enum StoredBytes {
+	Owned(Vec<u8>),
+	Mapped(Arc<gguf::Mapping>, usize, usize),
+}
+impl StoredBytes {
+	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
+		Self::Mapped(mapping.clone(), at, length)
+	}
+}
+impl std::ops::Deref for StoredBytes {
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		match self {
+			Self::Owned(bytes) => bytes,
+			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
+		}
+	}
+}
+impl From<Vec<u8>> for StoredBytes {
+	fn from(bytes: Vec<u8>) -> Self {
+		Self::Owned(bytes)
+	}
+}
+
+/// One node's parameters as they are stored. `arithmetic` is the host copy the
+/// graph trains and saves; a weight the device decodes from `bytes` carries none.
 #[derive(Clone)]
 pub(crate) struct StoredWeight {
 	pub(crate) format: StorageFormat,
 	pub(crate) count: usize,
-	pub(crate) bytes: Vec<u8>,
+	pub(crate) bytes: StoredBytes,
 	pub(crate) codebook: Vec<f64>,
 	pub(crate) arithmetic: Vec<f64>,
 }
@@ -5414,6 +5776,10 @@ pub(crate) struct StoredWeight {
 impl StorageFormat {
 	fn valid(self) -> bool {
 		self.spec().is_some() || self.selection().is_some()
+	}
+	/// The format a storage name in the quantization table selects, at its first variant.
+	pub(crate) fn named(name: &str) -> Option<Self> {
+		QUANTIZATIONS.iter().find(|format| format.name == name).map(|format| Self(format.family << 12 | format.variants[0] << 8 | u16::from(format.bits)))
 	}
 	pub(crate) fn spec(self) -> Option<StorageSpec> {
 		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
@@ -5425,7 +5791,7 @@ impl StorageFormat {
 	}
 	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
 		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
-		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes, codebook, arithmetic: arithmetic.to_vec() })
+		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes: bytes.into(), codebook, arithmetic: arithmetic.to_vec() })
 	}
 	fn unavailable(self) -> RecipeError {
 		RecipeError::new(format!(
@@ -6072,6 +6438,12 @@ impl Recipe {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF model, following every shard of a split, with its tensor data
+	/// mapped rather than read.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))
+	}
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
@@ -6085,6 +6457,43 @@ impl Recipe {
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
+}
+impl Gguf {
+	/// Contracts `input` through the named tensor into `width` outputs. The tensor's
+	/// mapped bytes are the contraction's parameters, so the tape decodes the file's
+	/// own blocks and never holds a second copy of the weight.
+	pub fn contract(&self, name: &str, input: &[f64], width: usize) -> Vec<f64> {
+		contract_gguf(self, name, input, width).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
+fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Result<Vec<f64>> {
+	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent")))?;
+	let stored = model.stored(tensor)?;
+	let device = selected_gpu()?;
+	let config = Config::load()?;
+	let data = Prepared {
+		samples: input.to_vec(),
+		targets: vec![0.0; width],
+		target_width: width,
+		rows: 1,
+		source_rows: 1,
+		features: input.len(),
+		schema: DataSchema::default(),
+		sequence: None,
+		target_categorical: false,
+		norm_mean: Vec::new(),
+		norm_scale: Vec::new(),
+		identities: Vec::new(),
+		fitted: Vec::new(),
+	};
+	let mut graph = compile(&recipe.model().layer(width), &data, &data.targets, 1, device, config, false)?;
+	let index = graph.nodes.iter().position(|node| node.parameters != 0).ok_or_else(|| RecipeError::new("contraction has no parameters"))?;
+	let parameters = graph.nodes[index].parameters;
+	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
+	graph.stored[index] = Some(stored);
+	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
+	tape.forward()?;
+	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {
@@ -9491,6 +9900,8 @@ unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn dlclose(handle: Ptr) -> i32;
+	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
+	fn munmap(address: Ptr, length: usize) -> i32;
 }
 #[cfg(all(nvidia, windows))]
 unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {

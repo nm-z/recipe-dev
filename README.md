@@ -36,6 +36,19 @@ recipe --device amd0 model.rs
 recipe --device amd0 --device archy:nv0 model.rs
 ```
 
+## gguf
+
+```rust
+let model = recipe.gguf("model-00001-of-00004.gguf");
+model.value("general.architecture");
+model.tensors();
+model.contract("blk.0.ffn_up.weight", &input, 16);
+```
+
+Every shard of a split is opened by name and the tensor data stays mapped. A
+quantized tensor binds to the tape in its own GGML layout, so the contraction
+reads the mapped bytes through the block decoders that read saved `.ogdl` models.
+
 ## files
 
 ```bash
