@@ -46,13 +46,14 @@ cli.rs          cli options
 test.rs         combo testing
 ```
 
-## 18 thingys:
+## 19 thingys:
 ```rust
 weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)
 	perc(width)
+	embed(vocab, width)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
@@ -77,6 +78,8 @@ estimators:
 	bayes()
 ```
 Feature generation is banned.
+
+`embed` must be the first block and must carry a quantization. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather decodes each addressed row out of the packed table, so `width` must be a whole number of the layout's blocks and the run reads one packed row per token instead of the table. The table keeps the values it was quantized from and no optimizer step writes it back.
 
 ## 15 activations
 

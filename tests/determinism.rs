@@ -24,11 +24,15 @@ fn report(text: String) {
 	std::mem::forget(stderr);
 }
 
+/// The vocabulary is prime so no addressed row aligns with a tile or a partition.
+const VOCABULARY: usize = 257;
+
 /// Rows and columns are prime-adjacent on purpose: they force partial M, N, and
 /// K tiles, a partial register block, and a partition count that does not divide
 /// the element count evenly.
-fn dataset(rows: usize, columns: usize) -> std::path::PathBuf {
-	let path = std::env::temp_dir().join(format!("recipe-determinism-{rows}x{columns}.csv"));
+/// With `ids` the columns are token ids below `VOCABULARY` rather than reals.
+fn dataset(rows: usize, columns: usize, ids: bool) -> std::path::PathBuf {
+	let path = std::env::temp_dir().join(format!("recipe-determinism-{rows}x{columns}{}.csv", if ids { "-ids" } else { "" }));
 	if path.exists() {
 		return path;
 	}
@@ -44,7 +48,11 @@ fn dataset(rows: usize, columns: usize) -> std::path::PathBuf {
 	text.push_str("y\n");
 	for _ in 0..rows {
 		for _ in 0..columns {
-			let _ = write!(text, "{:.6},", random());
+			if ids {
+				let _ = write!(text, "{},", (((random() + 1.0) * 0.5 * VOCABULARY as f64) as usize).min(VOCABULARY - 1));
+			} else {
+				let _ = write!(text, "{:.6},", random());
+			}
 		}
 		let _ = writeln!(text, "{:.6}", random());
 	}
@@ -73,6 +81,9 @@ const CASES: &[Case] = &[
 	Case { name: "deep-bf16", shape: "deep", precision: "bf16", rows: 131, columns: 17 },
 	Case { name: "deep-int8", shape: "deep", precision: "int8", rows: 131, columns: 17 },
 	Case { name: "deep-int4", shape: "deep", precision: "int4", rows: 131, columns: 17 },
+	Case { name: "embed-q8", shape: "embed-q8", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "embed-q8-fp16", shape: "embed-q8", precision: "fp16", rows: 131, columns: 17 },
+	Case { name: "embed-iq4xs", shape: "embed-iq4xs", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter", shape: "prelu", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter-bf16", shape: "prelu", precision: "bf16", rows: 131, columns: 17 },
 	Case { name: "transcendental-tanh", shape: "tanh", precision: "fp32", rows: 131, columns: 17 },
@@ -99,6 +110,10 @@ fn build(case: &Case) -> Model {
 	match case.shape {
 		"linear" => recipe.model().layer(1).loss(mse),
 		"deep" => recipe.model().layer(9).relu().layer(5).relu().layer(1).loss(mse),
+		// An embedding row is one whole block of its layout, so the width follows
+		// the block: 32 values for q8_0 and 256 for iq4_xs.
+		"embed-q8" => recipe.model().embed(VOCABULARY, 32).qi(8).0.layer(5).relu().layer(1).loss(mse),
+		"embed-iq4xs" => recipe.model().embed(VOCABULARY, 256).iq(4).xs.layer(5).relu().layer(1).loss(mse),
 		"prelu" => recipe.model().layer(9).prelu().layer(5).prelu().layer(1).loss(mse),
 		"tanh" => recipe.model().layer(9).tanh().layer(5).tanh().layer(1).loss(mse),
 		"gelu" => recipe.model().layer(9).gelu().layer(5).gelu().layer(1).loss(mse),
@@ -192,7 +207,7 @@ fn stable_bundle(path: &std::path::Path) -> Vec<u8> {
 
 fn run(case: &Case) -> Evidence {
 	let bundle = std::env::temp_dir().join(format!("recipe-determinism-{}-{}.ogdl", case.name, std::process::id()));
-	let data = recipe.data(dataset(case.rows, case.columns).to_string_lossy().as_ref()).target("y");
+	let data = recipe.data(dataset(case.rows, case.columns, case.shape.starts_with("embed")).to_string_lossy().as_ref()).target("y");
 	// The persistence case trains, saves, reloads the bundle, trains again, and
 	// saves again, so the evidence covers the save, reload, resume, and rerun
 	// path rather than one uninterrupted run.
