@@ -3723,6 +3723,884 @@ impl IntFormat {
 		((bits << (u64::BITS as u8 - self.bits)) as i64 >> (u64::BITS as u8 - self.bits)) as f64
 	}
 }
+/// GGUF, the container open-weight models ship in: a little-endian header of
+/// key-value metadata and tensor descriptors, then an aligned data section
+/// whose tensors use the same GGML block layouts as Recipe's storage formats.
+mod gguf {
+	use super::{Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, require, unfp16};
+	use std::{
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
+
+	const MAGIC: u32 = 0x4655_4747;
+	const VERSION: u32 = 3;
+	const DEFAULT_ALIGNMENT: u64 = 32;
+
+	/// One metadata value, in the width the file declares.
+	#[derive(Clone, Debug, PartialEq)]
+	pub enum GgufValue {
+		U8(u8),
+		I8(i8),
+		U16(u16),
+		I16(i16),
+		U32(u32),
+		I32(i32),
+		F32(f32),
+		Bool(bool),
+		String(String),
+		Array(Vec<GgufValue>),
+		U64(u64),
+		I64(i64),
+		F64(f64),
+	}
+	impl GgufValue {
+		/// The value as a count or index, whichever integer width the file chose.
+		pub fn integer(&self) -> Option<u64> {
+			match *self {
+				Self::U8(value) => Some(u64::from(value)),
+				Self::U16(value) => Some(u64::from(value)),
+				Self::U32(value) => Some(u64::from(value)),
+				Self::U64(value) => Some(value),
+				Self::I8(value) => u64::try_from(value).ok(),
+				Self::I16(value) => u64::try_from(value).ok(),
+				Self::I32(value) => u64::try_from(value).ok(),
+				Self::I64(value) => u64::try_from(value).ok(),
+				_ => None,
+			}
+		}
+		pub fn text(&self) -> Option<&str> {
+			match self {
+				Self::String(value) => Some(value),
+				_ => None,
+			}
+		}
+	}
+
+	/// One tensor descriptor: `kind` is the GGML type id and `offset` counts bytes
+	/// from the start of its shard's data section.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct GgufTensor {
+		pub name: String,
+		pub shape: Vec<u64>,
+		pub kind: u32,
+		pub offset: usize,
+		pub bytes: usize,
+		shard: usize,
+	}
+	impl GgufTensor {
+		/// The element count the shape declares.
+		pub fn elements(&self) -> usize {
+			self.shape.iter().product::<u64>() as usize
+		}
+	}
+
+	/// GGML type id to its name, elements per block, bytes per block, and the Recipe
+	/// storage format that decodes the block, for the types that are block quantized.
+	fn layout(kind: u32) -> Result<(&'static str, usize, usize, Option<StorageFormat>)> {
+		let name = match kind {
+			0 => return Ok(("F32", 1, 4, None)),
+			1 => return Ok(("F16", 1, 2, None)),
+			24 => return Ok(("I8", 1, 1, None)),
+			25 => return Ok(("I16", 1, 2, None)),
+			26 => return Ok(("I32", 1, 4, None)),
+			27 => return Ok(("I64", 1, 8, None)),
+			28 => return Ok(("F64", 1, 8, None)),
+			30 => return Ok(("BF16", 1, 2, None)),
+			2 => "q4_0",
+			3 => "q4_1",
+			6 => "q5_0",
+			7 => "q5_1",
+			8 => "q8_0",
+			9 => "q8_1",
+			10 => "q2k",
+			11 => "q3k",
+			12 => "q4k",
+			13 => "q5k",
+			14 => "q6k",
+			15 => "q8k",
+			16 => "iq2xxs",
+			17 => "iq2xs",
+			18 => "iq3xxs",
+			19 => "iq1s",
+			20 => "iq4nl",
+			21 => "iq3s",
+			22 => "iq2s",
+			23 => "iq4xs",
+			29 => "iq1m",
+			other => return Err(RecipeError::new(format!("GGUF tensor type {other} is unsupported"))),
+		};
+		let spec = StorageFormat::named(name).and_then(|format| format.spec().map(|spec| (format, spec)));
+		let (format, spec) = spec.ok_or_else(|| RecipeError::new(format!("GGUF type {name} has no Recipe storage layout")))?;
+		Ok((name, spec.block, spec.stride, Some(format)))
+	}
+
+	/// A read-only view of one file: mapped by the kernel on unix, read into
+	/// memory elsewhere. A stored weight holds a shard's mapping alive for as long
+	/// as the tape reads its bytes.
+	pub(super) struct Mapping {
+		pointer: *const u8,
+		length: usize,
+		owned: Option<Vec<u8>>,
+	}
+	unsafe impl Send for Mapping {}
+	unsafe impl Sync for Mapping {}
+	impl Mapping {
+		#[cfg(unix)]
+		fn open(path: &Path) -> Result<Self> {
+			use std::os::unix::io::AsRawFd;
+			let file = std::fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+			let length = usize::try_from(file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len())
+				.map_err(|_| RecipeError::new("GGUF file exceeds the address space"))?;
+			require(length != 0, format!("{} is empty", path.display()))?;
+			let pointer = unsafe { super::mmap(std::ptr::null_mut(), length, 1, 2, file.as_raw_fd(), 0) };
+			require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
+			Ok(Self { pointer: pointer.cast(), length, owned: None })
+		}
+		#[cfg(not(unix))]
+		fn open(path: &Path) -> Result<Self> {
+			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
+			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
+		}
+		pub(super) fn bytes(&self) -> &[u8] {
+			unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+		}
+	}
+	impl Drop for Mapping {
+		fn drop(&mut self) {
+			#[cfg(unix)]
+			if self.owned.is_none() {
+				unsafe { super::munmap(self.pointer.cast_mut().cast(), self.length) };
+			}
+		}
+	}
+
+	struct Reader<'a> {
+		bytes: &'a [u8],
+		at: usize,
+		depth: u32,
+	}
+	impl<'a> Reader<'a> {
+		fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+			let end = self.at.checked_add(count).filter(|end| *end <= self.bytes.len()).ok_or_else(|| RecipeError::new("GGUF header is truncated"))?;
+			let slice = &self.bytes[self.at..end];
+			self.at = end;
+			Ok(slice)
+		}
+		fn u32(&mut self) -> Result<u32> {
+			self.take(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn u64(&mut self) -> Result<u64> {
+			self.take(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn string(&mut self) -> Result<String> {
+			let length = usize::try_from(self.u64()?).map_err(|_| RecipeError::new("GGUF string length exceeds the address space"))?;
+			String::from_utf8(self.take(length)?.to_vec()).map_err(|error| RecipeError::new(format!("GGUF string is not UTF-8: {error}")))
+		}
+		fn value(&mut self, kind: u32) -> Result<GgufValue> {
+			Ok(match kind {
+				0 => GgufValue::U8(self.take(1)?[0]),
+				1 => GgufValue::I8(self.take(1)?[0] as i8),
+				2 => GgufValue::U16(u16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				3 => GgufValue::I16(i16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				4 => GgufValue::U32(self.u32()?),
+				5 => GgufValue::I32(self.u32()? as i32),
+				6 => GgufValue::F32(f32::from_bits(self.u32()?)),
+				7 => GgufValue::Bool(self.take(1)?[0] != 0),
+				8 => GgufValue::String(self.string()?),
+				9 => {
+					let (kind, count) = (self.u32()?, self.u64()?);
+					let count = usize::try_from(count).map_err(|_| RecipeError::new("GGUF array length exceeds the address space"))?;
+					self.depth += 1;
+					require(self.depth <= 64, "GGUF arrays nest deeper than 64 levels")?;
+					let values = (0..count).map(|_| self.value(kind)).collect::<Result<Vec<_>>>()?;
+					self.depth -= 1;
+					GgufValue::Array(values)
+				}
+				10 => GgufValue::U64(self.u64()?),
+				11 => GgufValue::I64(self.u64()? as i64),
+				12 => GgufValue::F64(f64::from_bits(self.u64()?)),
+				other => return Err(RecipeError::new(format!("GGUF value type {other} is unsupported"))),
+			})
+		}
+	}
+
+	struct Shard {
+		mapping: Arc<Mapping>,
+		data: usize,
+	}
+
+	/// One model: a single file or every shard of a split, opened by name.
+	pub struct Gguf {
+		shards: Vec<Shard>,
+		metadata: Vec<(String, GgufValue)>,
+		tensors: Vec<GgufTensor>,
+	}
+	impl Gguf {
+		pub(super) fn open(path: &Path) -> Result<Self> {
+			let first = Self::shard(path, 0)?;
+			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
+			let mut shards = vec![first];
+			for index in 1..count {
+				shards.push(Self::shard(&sibling(path, index, count)?, index)?);
+			}
+			let (metadata, mut tensors) = (shards[0].1.clone(), Vec::new());
+			let declared = metadata.iter().find(|(key, _)| key == "split.tensors.count").and_then(|(_, value)| value.integer());
+			for (index, (_, _, shard_tensors)) in shards.iter_mut().enumerate() {
+				tensors.extend(shard_tensors.drain(..).map(|mut tensor| {
+					tensor.shard = index;
+					tensor
+				}));
+			}
+			if let Some(declared) = declared {
+				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
+			}
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+		}
+		/// Parses one file: its metadata, its tensors, and where its data begins.
+		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
+			let mapping = Mapping::open(path)?;
+			let bytes = mapping.bytes();
+			let mut reader = Reader { bytes, at: 0, depth: 0 };
+			require(reader.u32()? == MAGIC, format!("{} is not a GGUF file", path.display()))?;
+			let version = reader.u32()?;
+			require(version == VERSION, format!("{} is GGUF version {version}; version {VERSION} is supported", path.display()))?;
+			let (tensor_count, pair_count) = (reader.u64()?, reader.u64()?);
+			let mut metadata = Vec::new();
+			for _ in 0..pair_count {
+				let key = reader.string()?;
+				let kind = reader.u32()?;
+				metadata.push((key, reader.value(kind)?));
+			}
+			let alignment = metadata.iter().find(|(key, _)| key == "general.alignment").and_then(|(_, value)| value.integer()).unwrap_or(DEFAULT_ALIGNMENT);
+			require(alignment != 0 && alignment.is_power_of_two(), format!("{} declares alignment {alignment}", path.display()))?;
+			if let Some(declared) = metadata.iter().find(|(key, _)| key == "split.no").and_then(|(_, value)| value.integer()) {
+				require(declared == index, format!("{} is shard {declared}, expected shard {index}", path.display()))?;
+			}
+			let mut tensors = Vec::new();
+			for _ in 0..tensor_count {
+				let name = reader.string()?;
+				let dimensions = reader.u32()?;
+				let shape = (0..dimensions).map(|_| reader.u64()).collect::<Result<Vec<_>>>()?;
+				let (kind, offset) = (reader.u32()?, reader.u64()?);
+				let (_, block, stride, _) = layout(kind)?;
+				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
+				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
+				let bytes = usize::try_from(elements / block as u64 * stride as u64).map_err(|_| RecipeError::new(format!("tensor {name} exceeds the address space")))?;
+				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
+				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
+			}
+			let data = usize::try_from((reader.at as u64).div_ceil(alignment) * alignment).map_err(|_| RecipeError::new("GGUF data offset exceeds the address space"))?;
+			for tensor in &tensors {
+				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
+				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
+			}
+			Ok((Shard { mapping: Arc::new(mapping), data }, metadata, tensors))
+		}
+		/// Every key-value pair of the first shard, in file order.
+		pub fn metadata(&self) -> &[(String, GgufValue)] {
+			&self.metadata
+		}
+		pub fn value(&self, key: &str) -> Option<&GgufValue> {
+			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+		}
+		/// Every tensor across every shard, in shard then file order.
+		pub fn tensors(&self) -> &[GgufTensor] {
+			&self.tensors
+		}
+		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
+			self.tensors.iter().find(|tensor| tensor.name == name)
+		}
+		/// The tensor's bytes in the mapped file, in its GGML block layout.
+		pub fn data(&self, tensor: &GgufTensor) -> &[u8] {
+			let shard = &self.shards[tensor.shard];
+			&shard.mapping.bytes()[shard.data + tensor.offset..shard.data + tensor.offset + tensor.bytes]
+		}
+		/// The byte-level BPE tokenizer the metadata describes.
+		pub fn tokenizer(&self) -> super::Tokenizer {
+			super::Tokenizer::from_gguf(self).unwrap_or_else(|error| panic!("{error}"))
+		}
+		/// The tensor's elements decoded to f64, dequantizing block formats through
+		/// the same decoders the saved-model path uses.
+		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
+			let data = self.data(tensor);
+			match tensor.kind {
+				0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
+				30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
+				28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
+				24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
+				25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
+				_ => {
+					let stored = self.stored(tensor)?;
+					stored.format.decompress(&stored.bytes, &[], stored.count)
+				}
+			}
+		}
+		/// The tensor as the weight the tape binds: a view of its block bytes where the
+		/// file is mapped, in the Recipe storage format the kernels already decode.
+		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
+			let (name, _, _, format) = layout(tensor.kind)?;
+			let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))?;
+			let shard = &self.shards[tensor.shard];
+			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
+			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
+	}
+
+	/// The path of shard `index` of a split named like `model-00001-of-00004.gguf`.
+	fn sibling(path: &Path, index: u64, count: u64) -> Result<PathBuf> {
+		let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("GGUF split path has no file name"))?;
+		let stem = name.strip_suffix(".gguf").and_then(|stem| stem.rsplit_once("-of-")).and_then(|(head, _)| head.rsplit_once('-')).map(|(prefix, _)| prefix);
+		let prefix = stem.ok_or_else(|| RecipeError::new(format!("{name} declares a split but is not named <prefix>-<number>-of-<count>.gguf")))?;
+		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
+	}
+}
+pub use gguf::{Gguf, GgufTensor, GgufValue};
+mod tokenizer {
+	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
+	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
+	//! special ids, and the chat template.
+	use super::{Gguf, GgufValue, RecipeError, Result, require};
+	use std::collections::HashMap;
+
+	/// The pre-tokenizer alternation that cuts text into words before merging.
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum Family {
+		Gpt2,
+		Llama3,
+		Qwen2,
+	}
+
+	fn letter(value: char) -> bool {
+		value.is_alphabetic()
+	}
+	fn number(value: char) -> bool {
+		value.is_numeric()
+	}
+	fn space(value: char) -> bool {
+		value.is_whitespace()
+	}
+	fn newline(value: char) -> bool {
+		value == '\r' || value == '\n'
+	}
+	fn other(value: char) -> bool {
+		!space(value) && !letter(value) && !number(value)
+	}
+	fn run(chars: &[char], at: usize, class: fn(char) -> bool) -> usize {
+		chars[at.min(chars.len())..].iter().take_while(|value| class(**value)).count()
+	}
+	/// `'s|'t|'re|'ve|'m|'ll|'d`, case-insensitive for the newer families.
+	fn contraction(chars: &[char], at: usize, insensitive: bool) -> usize {
+		if chars.get(at) != Some(&'\'') {
+			return 0;
+		}
+		let same = |index: usize, expected: char| chars.get(at + index).is_some_and(|value| if insensitive { value.to_ascii_lowercase() == expected } else { *value == expected });
+		["s", "t", "re", "ve", "m", "ll", "d"].iter().find(|suffix| suffix.chars().enumerate().all(|(index, expected)| same(1 + index, expected))).map_or(0, |suffix| 1 + suffix.len())
+	}
+	/// `\s+(?!\S)`: a whitespace run that leaves its last character to the
+	/// following word unless it ends the text.
+	fn trailing_space(chars: &[char], at: usize) -> usize {
+		let count = run(chars, at, space);
+		if count == 0 {
+			0
+		} else if at + count == chars.len() {
+			count
+		} else {
+			count - 1
+		}
+	}
+
+	impl Family {
+		fn named(pre: &str) -> Result<Self> {
+			Ok(match pre {
+				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
+				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
+				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
+				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
+			})
+		}
+		/// The length in characters of the word that starts at `at`.
+		fn word(self, chars: &[char], at: usize) -> usize {
+			let space_prefix = usize::from(chars[at] == ' ');
+			let prefixed = |class: fn(char) -> bool| {
+				let count = run(chars, at + space_prefix, class);
+				if count == 0 { 0 } else { space_prefix + count }
+			};
+			if self == Self::Gpt2 {
+				let count = contraction(chars, at, false);
+				if count != 0 {
+					return count;
+				}
+				for class in [letter, number, other] {
+					let count = prefixed(class);
+					if count != 0 {
+						return count;
+					}
+				}
+			} else {
+				let count = contraction(chars, at, true);
+				if count != 0 {
+					return count;
+				}
+				// [^\r\n\p{L}\p{N}]?\p{L}+
+				let prefix = usize::from(!newline(chars[at]) && !letter(chars[at]) && !number(chars[at]));
+				let count = run(chars, at + prefix, letter);
+				if count != 0 {
+					return prefix + count;
+				}
+				// \p{N}{1,3} for llama3, \p{N} for qwen2
+				let count = run(chars, at, number).min(if self == Self::Llama3 { 3 } else { 1 });
+				if count != 0 {
+					return count;
+				}
+				// ?[^\s\p{L}\p{N}]+[\r\n]*
+				let count = prefixed(other);
+				if count != 0 {
+					return count + run(chars, at + count, newline);
+				}
+				// \s*[\r\n]+
+				let spaces = run(chars, at, space);
+				if let Some(last) = (0..spaces).rev().find(|index| newline(chars[at + index])) {
+					return last + 1;
+				}
+			}
+			let count = trailing_space(chars, at);
+			if count != 0 {
+				return count;
+			}
+			run(chars, at, space).max(1)
+		}
+		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+			let (offsets, chars): (Vec<usize>, Vec<char>) = text.char_indices().unzip();
+			let (mut at, mut words) = (0, Vec::new());
+			while at < chars.len() {
+				let next = at + self.word(&chars, at);
+				words.push(&text[offsets[at]..offsets.get(next).copied().unwrap_or(text.len())]);
+				at = next;
+			}
+			words
+		}
+	}
+
+	/// The GPT-2 byte map: printable Latin-1 bytes stay themselves, the rest
+	/// take the code points from U+0100 upward in byte order.
+	fn byte_map() -> [char; 256] {
+		let mut map = ['\0'; 256];
+		let mut next = 0x100;
+		for byte in 0..=255_u8 {
+			let printable = (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174;
+			map[usize::from(byte)] = if printable {
+				char::from(byte)
+			} else {
+				next += 1;
+				char::from_u32(next - 1).unwrap()
+			};
+		}
+		map
+	}
+
+	/// Where the vocabulary ranks its pieces: the merge list names each pair and
+	/// its rank, while scores rank every piece on their own, best first.
+	enum Ranks {
+		Merges(HashMap<(u32, u32), (u32, u32)>),
+		Scores(Vec<u32>),
+	}
+
+	/// Piece ranks from `tokenizer.ggml.scores`, the highest score merging first.
+	fn ranked(scores: &[GgufValue], vocabulary: usize) -> Result<Vec<u32>> {
+		require(scores.len() == vocabulary, format!("tokenizer.ggml.scores holds {} scores for {vocabulary} tokens", scores.len()))?;
+		let scores = scores
+			.iter()
+			.map(|item| match *item {
+				GgufValue::F32(score) => Ok(score),
+				GgufValue::F64(score) => Ok(score as f32),
+				_ => Err(RecipeError::new("tokenizer.ggml.scores holds a non-float")),
+			})
+			.collect::<Result<Vec<_>>>()?;
+		let mut order = (0..scores.len()).collect::<Vec<_>>();
+		order.sort_by(|left, right| scores[*right].total_cmp(&scores[*left]).then(left.cmp(right)));
+		let mut ranks = vec![0; scores.len()];
+		for (rank, id) in order.into_iter().enumerate() {
+			ranks[id] = rank as u32;
+		}
+		Ok(ranks)
+	}
+
+	pub struct Tokenizer {
+		tokens: Vec<String>,
+		ids: HashMap<String, u32>,
+		ranks: Ranks,
+		added: Vec<(String, u32)>,
+		is_added: Vec<bool>,
+		bytes: [u32; 256],
+		byte_of: HashMap<char, u8>,
+		family: Family,
+		template: Option<String>,
+		add_bos: bool,
+		add_eos: bool,
+		bos: Option<u32>,
+		eos: Option<u32>,
+		pad: Option<u32>,
+	}
+
+	impl Tokenizer {
+		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
+			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
+			let kind = text("tokenizer.ggml.model")?;
+			require(kind == "gpt2", format!("tokenizer model {kind:?} is not byte-level BPE"))?;
+			let family = Family::named(text("tokenizer.ggml.pre")?)?;
+			let array = |key: &str| match model.value(key) {
+				Some(GgufValue::Array(items)) => Ok(items.as_slice()),
+				_ => Err(RecipeError::new(format!("{key} is absent"))),
+			};
+			let tokens = array("tokenizer.ggml.tokens")?
+				.iter()
+				.map(|item| item.text().map(str::to_owned).ok_or_else(|| RecipeError::new("tokenizer.ggml.tokens holds a non-string")))
+				.collect::<Result<Vec<_>>>()?;
+			let ids = tokens.iter().enumerate().map(|(id, token)| (token.clone(), id as u32)).collect::<HashMap<_, _>>();
+			let id = |token: &str| ids.get(token).copied().ok_or_else(|| RecipeError::new(format!("token {token:?} is absent from the vocabulary")));
+			let ranks = match (array("tokenizer.ggml.merges"), array("tokenizer.ggml.scores")) {
+				(Ok(list), _) => {
+					let mut merges = HashMap::new();
+					for (rank, merge) in list.iter().enumerate() {
+						let merge = merge.text().ok_or_else(|| RecipeError::new("tokenizer.ggml.merges holds a non-string"))?;
+						let (left, right) = merge.split_once(' ').ok_or_else(|| RecipeError::new(format!("merge {merge:?} has no pair")))?;
+						merges.insert((id(left)?, id(right)?), (rank as u32, id(&format!("{left}{right}"))?));
+					}
+					Ranks::Merges(merges)
+				}
+				(_, Ok(scores)) => Ranks::Scores(ranked(scores, tokens.len())?),
+				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
+			};
+			let map = byte_map();
+			let mut bytes = [0; 256];
+			for (byte, symbol) in map.iter().enumerate() {
+				bytes[byte] = id(&symbol.to_string())?;
+			}
+			// Control and user-defined tokens are the added tokens: `encode` matches
+			// them whole and no merge ever spells one out of ordinary pieces.
+			let types = array("tokenizer.ggml.token_type").ok();
+			let kind = |index: usize| types.and_then(|types| types.get(index)).and_then(GgufValue::integer);
+			let mut added = tokens.iter().enumerate().filter(|(index, _)| matches!(kind(*index), Some(3 | 4))).map(|(index, token)| (token.clone(), index as u32)).collect::<Vec<_>>();
+			added.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+			let mut is_added = vec![false; tokens.len()];
+			for (_, id) in &added {
+				is_added[*id as usize] = true;
+			}
+			let special_id = |key: &str| model.value(key).and_then(GgufValue::integer).map(|value| value as u32);
+			let flag = |key: &str| matches!(model.value(key), Some(GgufValue::Bool(true)));
+			Ok(Self {
+				byte_of: map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect(),
+				ids,
+				ranks,
+				added,
+				is_added,
+				bytes,
+				family,
+				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
+				add_bos: flag("tokenizer.ggml.add_bos_token"),
+				add_eos: flag("tokenizer.ggml.add_eos_token"),
+				bos: special_id("tokenizer.ggml.bos_token_id"),
+				eos: special_id("tokenizer.ggml.eos_token_id"),
+				pad: special_id("tokenizer.ggml.padding_token_id"),
+				tokens,
+			})
+		}
+		pub fn bos(&self) -> Option<u32> {
+			self.bos
+		}
+		pub fn eos(&self) -> Option<u32> {
+			self.eos
+		}
+		pub fn pad(&self) -> Option<u32> {
+			self.pad
+		}
+		pub fn vocabulary(&self) -> usize {
+			self.tokens.len()
+		}
+		/// The token's text in the byte-map alphabet, as the vocabulary spells it.
+		pub fn token(&self, id: u32) -> &str {
+			&self.tokens[id as usize]
+		}
+		/// Token ids for `text`, framed by the beginning- and end-of-sequence ids
+		/// when the model asks for them. Added tokens written out in the text are
+		/// matched whole, longest first, before the pre-tokenizer sees the rest.
+		pub fn encode(&self, text: &str) -> Vec<u32> {
+			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			let (mut start, mut at) = (0, 0);
+			while at < text.len() {
+				if let Some((added, id)) = self.added.iter().find(|(added, _)| text[at..].starts_with(added.as_str())) {
+					self.encode_plain(&text[start..at], &mut output);
+					output.push(*id);
+					at += added.len();
+					start = at;
+				} else {
+					at += text[at..].chars().next().map_or(1, char::len_utf8);
+				}
+			}
+			self.encode_plain(&text[start..], &mut output);
+			output.extend(self.eos.filter(|_| self.add_eos));
+			output
+		}
+		/// The rank and id of the piece that joins `left` to `right`, the lowest
+		/// rank merging first. A merge never spells an added token.
+		fn merge(&self, left: u32, right: u32) -> Option<(u32, u32)> {
+			let (rank, merged) = match &self.ranks {
+				Ranks::Merges(merges) => *merges.get(&(left, right))?,
+				Ranks::Scores(ranks) => {
+					let merged = *self.ids.get(&format!("{}{}", self.tokens[left as usize], self.tokens[right as usize]))?;
+					(ranks[merged as usize], merged)
+				}
+			};
+			(!self.is_added[merged as usize]).then_some((rank, merged))
+		}
+		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+			for word in self.family.split(text) {
+				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>();
+				// Llama 3 vocabularies take a whole word that is already a token as is.
+				if self.family == Family::Llama3
+					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
+				{
+					output.push(*id);
+					continue;
+				}
+				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
+					.filter_map(|index| self.merge(symbols[index], symbols[index + 1]).map(|(rank, merged)| (rank, index, merged)))
+					.min()
+					.map(|(_, index, merged)| (index, merged))
+				{
+					symbols[index] = merged;
+					symbols.remove(index + 1);
+				}
+				output.extend(symbols);
+			}
+		}
+		fn byte_of_token(&self, byte: u8) -> char {
+			self.tokens[self.bytes[usize::from(byte)] as usize].chars().next().unwrap()
+		}
+		/// The text the ids spell. Bytes split across tokens rejoin before the
+		/// UTF-8 decode, and a token outside the byte alphabet keeps its own text.
+		pub fn decode(&self, ids: &[u32]) -> String {
+			let mut bytes = Vec::new();
+			for id in ids {
+				for symbol in self.tokens[*id as usize].chars() {
+					match self.byte_of.get(&symbol) {
+						Some(byte) => bytes.push(*byte),
+						None => bytes.extend(symbol.to_string().as_bytes()),
+					}
+				}
+			}
+			String::from_utf8_lossy(&bytes).into_owned()
+		}
+		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
+		/// content. `generation` sets `add_generation_prompt`, which the template
+		/// reads to open the reply. Unsupported template syntax is an error.
+		pub fn chat(&self, messages: &[(&str, &str)], generation: bool) -> String {
+			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
+		}
+		fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
+			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
+			let scope = Scope { messages, generation, bos: token(self.bos), eos: token(self.eos), bound: None };
+			let (pieces, mut out, mut at) = (parse(template)?, String::new(), 0);
+			render(&pieces, &mut at, &mut out, &scope, true, &[])?;
+			Ok(out)
+		}
+	}
+
+	/// One piece of a chat template: literal text, a `{{ ... }}` substitution, or
+	/// a `{% ... %}` statement.
+	enum Piece {
+		Text(String),
+		Write(String),
+		Tag(String),
+	}
+
+	fn push_text(pieces: &mut Vec<Piece>, text: &str, start: bool, end: bool) {
+		let text = if start { text.trim_start() } else { text };
+		let text = if end { text.trim_end() } else { text };
+		if !text.is_empty() {
+			pieces.push(Piece::Text(text.to_owned()));
+		}
+	}
+
+	/// Splits a chat template into its pieces, applying the `-` controls that trim
+	/// the whitespace around a tag.
+	fn parse(template: &str) -> Result<Vec<Piece>> {
+		let (mut pieces, mut rest, mut start) = (Vec::new(), template, false);
+		while let Some(open) = rest.as_bytes().windows(2).position(|pair| pair == b"{{" || pair == b"{%") {
+			let write = rest.as_bytes()[open + 1] == b'{';
+			let close = if write { "}}" } else { "%}" };
+			let body = &rest[open + 2..];
+			let end = body.find(close).ok_or_else(|| RecipeError::new(format!("chat template leaves a {} tag unclosed", if write { "{{" } else { "{%" })))?;
+			push_text(&mut pieces, &rest[..open], start, body.starts_with('-'));
+			let source = body[..end].trim_matches('-').trim().to_owned();
+			pieces.push(if write { Piece::Write(source) } else { Piece::Tag(source) });
+			start = body[..end].ends_with('-');
+			rest = &body[end + close.len()..];
+		}
+		push_text(&mut pieces, rest, start, false);
+		Ok(pieces)
+	}
+
+	/// A value a chat template can name.
+	enum Value<'a> {
+		Text(String),
+		Flag(bool),
+		Messages(&'a [(&'a str, &'a str)]),
+		Message(&'a (&'a str, &'a str)),
+	}
+	impl Value<'_> {
+		fn truth(&self) -> bool {
+			match self {
+				Self::Text(text) => !text.is_empty(),
+				Self::Flag(flag) => *flag,
+				Self::Messages(messages) => !messages.is_empty(),
+				Self::Message(_) => true,
+			}
+		}
+		fn text(&self) -> Result<&str> {
+			match self {
+				Self::Text(text) => Ok(text),
+				_ => Err(RecipeError::new("a chat template compares or writes a value that is not text")),
+			}
+		}
+	}
+
+	/// The names a chat template resolves: the conversation, the generation flag,
+	/// the sequence tokens, and the message a `for` statement binds.
+	#[derive(Clone)]
+	struct Scope<'a> {
+		messages: &'a [(&'a str, &'a str)],
+		generation: bool,
+		bos: String,
+		eos: String,
+		bound: Option<(String, &'a (&'a str, &'a str))>,
+	}
+
+	/// A literal, a name, or a name read through `['key']` and `.key` accessors.
+	fn value<'a>(source: &str, scope: &Scope<'a>) -> Result<Value<'a>> {
+		let source = source.trim();
+		let quoted = |mark: char| source.strip_prefix(mark).and_then(|rest| rest.strip_suffix(mark));
+		if let Some(text) = quoted('\'').or_else(|| quoted('"')) {
+			return Ok(Value::Text(text.to_owned()));
+		}
+		let head = source.find(['[', '.']).unwrap_or(source.len());
+		let name = source[..head].trim();
+		let mut value = match name {
+			"messages" => Value::Messages(scope.messages),
+			"add_generation_prompt" => Value::Flag(scope.generation),
+			"bos_token" => Value::Text(scope.bos.clone()),
+			"eos_token" => Value::Text(scope.eos.clone()),
+			_ => match &scope.bound {
+				Some((bound, message)) if bound.as_str() == name => Value::Message(message),
+				_ => return Err(RecipeError::new(format!("chat template names {name:?}, which this tokenizer does not define"))),
+			},
+		};
+		let mut rest = &source[head..];
+		while !rest.is_empty() {
+			let (key, next) = match rest.strip_prefix('[') {
+				Some(body) => {
+					let end = body.find(']').ok_or_else(|| RecipeError::new("chat template leaves a [ accessor unclosed"))?;
+					(body[..end].trim().trim_matches(['\'', '"']), &body[end + 1..])
+				}
+				None => {
+					let body = &rest[1..];
+					let end = body.find(['[', '.']).unwrap_or(body.len());
+					(&body[..end], &body[end..])
+				}
+			};
+			value = match (&value, key) {
+				(Value::Message(message), "role") => Value::Text(message.0.to_owned()),
+				(Value::Message(message), "content") => Value::Text(message.1.to_owned()),
+				_ => return Err(RecipeError::new(format!("chat template reads {key:?} from a value that has no such field"))),
+			};
+			rest = next;
+		}
+		Ok(value)
+	}
+
+	/// `not a`, `a == b`, `a != b`, or the truth of one value.
+	fn condition(source: &str, scope: &Scope) -> Result<bool> {
+		if let Some(rest) = source.trim().strip_prefix("not ") {
+			return Ok(!condition(rest, scope)?);
+		}
+		for (operator, equal) in [("==", true), ("!=", false)] {
+			if let Some((left, right)) = source.split_once(operator) {
+				return Ok((value(left, scope)?.text()? == value(right, scope)?.text()?) == equal);
+			}
+		}
+		Ok(value(source, scope)?.truth())
+	}
+
+	/// Renders the pieces from `at` until one of `stop`, returning the tag that
+	/// ended the block. A branch that is not taken still parses, with `emit` off,
+	/// so the walk lands past its `endif` or `endfor`.
+	fn render(pieces: &[Piece], at: &mut usize, out: &mut String, scope: &Scope, emit: bool, stop: &[&str]) -> Result<String> {
+		while *at < pieces.len() {
+			let piece = &pieces[*at];
+			*at += 1;
+			match piece {
+				Piece::Text(text) if emit => out.push_str(text),
+				Piece::Write(source) if emit => out.push_str(value(source, scope)?.text()?),
+				Piece::Text(_) | Piece::Write(_) => {}
+				Piece::Tag(source) => {
+					let (head, rest) = source.split_once(' ').unwrap_or((source.as_str(), ""));
+					if stop.contains(&head) {
+						return Ok(source.clone());
+					}
+					match head {
+						"if" => {
+							// Each branch renders in turn; only the first whose condition
+							// holds writes, and the others parse with `emit` off.
+							let (mut branch, mut test, mut taken) = (head.to_owned(), rest.to_owned(), false);
+							loop {
+								let live = emit && !taken && (branch == "else" || condition(&test, scope)?);
+								taken |= live;
+								let ended = render(pieces, at, out, scope, live, &["elif", "else", "endif"])?;
+								let (next, tail) = ended.split_once(' ').unwrap_or((ended.as_str(), ""));
+								if next == "endif" {
+									break;
+								}
+								(branch, test) = (next.to_owned(), tail.to_owned());
+							}
+						}
+						"for" => {
+							let (name, iterable) = rest.split_once(" in ").ok_or_else(|| RecipeError::new(format!("chat template for statement {rest:?} has no \"in\"")))?;
+							let (name, body) = (name.trim().to_owned(), *at);
+							let items = match emit {
+								true => match value(iterable, scope)? {
+									Value::Messages(messages) => messages,
+									_ => return Err(RecipeError::new(format!("chat template iterates {:?}, which is not a list", iterable.trim()))),
+								},
+								false => &[][..],
+							};
+							for message in items {
+								*at = body;
+								let inner = Scope { bound: Some((name.clone(), message)), ..scope.clone() };
+								render(pieces, at, out, &inner, true, &["endfor"])?;
+							}
+							if items.is_empty() {
+								*at = body;
+								render(pieces, at, out, scope, false, &["endfor"])?;
+							}
+						}
+						_ => return Err(RecipeError::new(format!("chat template statement {head:?} is not supported"))),
+					}
+				}
+			}
+		}
+		match stop.is_empty() {
+			true => Ok(String::new()),
+			false => Err(RecipeError::new(format!("chat template ends before its {}", stop.join(" or ")))),
+		}
+	}
+}
+pub use tokenizer::Tokenizer;
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -3905,8 +4783,8 @@ mod bundle {
 	}
 
 	fn raw_weight(values: &[f64]) -> StoredWeight {
-		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-		StoredWeight { format: StorageFormat(0), count: values.len(), bytes, codebook: Vec::new(), arithmetic: values.to_vec() }
+		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+		StoredWeight { format: StorageFormat(0), count: values.len(), bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec() }
 	}
 	fn semantic_graph(stored: &StoredGraph) -> Result<SemanticGraph> {
 		let graph = &stored.graph;
@@ -4055,7 +4933,7 @@ mod bundle {
 		} else {
 			StorageFormat(format).decompress(&bytes, &codebook, count)?
 		};
-		Ok(StoredWeight { format: StorageFormat(format), count, bytes, codebook, arithmetic })
+		Ok(StoredWeight { format: StorageFormat(format), count, bytes: bytes.into(), codebook, arithmetic })
 	}
 	pub(super) fn load_semantic(path: &Path) -> Result<(DataSchema, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
@@ -4374,7 +5252,7 @@ use std::{
 	process::Command,
 	ptr,
 	sync::{
-		Mutex, OnceLock,
+		Arc, Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
@@ -5402,11 +6280,40 @@ pub(crate) struct StorageSpec {
 	pub(crate) stride: usize,
 }
 
+/// A weight's block bytes: owned by the graph, or a view of the mapped file they
+/// were read from, which the view keeps mapped.
+#[derive(Clone)]
+pub(crate) enum StoredBytes {
+	Owned(Vec<u8>),
+	Mapped(Arc<gguf::Mapping>, usize, usize),
+}
+impl StoredBytes {
+	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
+		Self::Mapped(mapping.clone(), at, length)
+	}
+}
+impl std::ops::Deref for StoredBytes {
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		match self {
+			Self::Owned(bytes) => bytes,
+			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
+		}
+	}
+}
+impl From<Vec<u8>> for StoredBytes {
+	fn from(bytes: Vec<u8>) -> Self {
+		Self::Owned(bytes)
+	}
+}
+
+/// One node's parameters as they are stored. `arithmetic` is the host copy the
+/// graph trains and saves; a weight the device decodes from `bytes` carries none.
 #[derive(Clone)]
 pub(crate) struct StoredWeight {
 	pub(crate) format: StorageFormat,
 	pub(crate) count: usize,
-	pub(crate) bytes: Vec<u8>,
+	pub(crate) bytes: StoredBytes,
 	pub(crate) codebook: Vec<f64>,
 	pub(crate) arithmetic: Vec<f64>,
 }
@@ -5414,6 +6321,10 @@ pub(crate) struct StoredWeight {
 impl StorageFormat {
 	fn valid(self) -> bool {
 		self.spec().is_some() || self.selection().is_some()
+	}
+	/// The format a storage name in the quantization table selects, at its first variant.
+	pub(crate) fn named(name: &str) -> Option<Self> {
+		QUANTIZATIONS.iter().find(|format| format.name == name).map(|format| Self(format.family << 12 | format.variants[0] << 8 | u16::from(format.bits)))
 	}
 	pub(crate) fn spec(self) -> Option<StorageSpec> {
 		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
@@ -5425,7 +6336,7 @@ impl StorageFormat {
 	}
 	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
 		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
-		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes, codebook, arithmetic: arithmetic.to_vec() })
+		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes: bytes.into(), codebook, arithmetic: arithmetic.to_vec() })
 	}
 	fn unavailable(self) -> RecipeError {
 		RecipeError::new(format!(
@@ -6072,6 +6983,12 @@ impl Recipe {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF model, following every shard of a split, with its tensor data
+	/// mapped rather than read.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))
+	}
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
@@ -6085,6 +7002,43 @@ impl Recipe {
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
+}
+impl Gguf {
+	/// Contracts `input` through the named tensor into `width` outputs. The tensor's
+	/// mapped bytes are the contraction's parameters, so the tape decodes the file's
+	/// own blocks and never holds a second copy of the weight.
+	pub fn contract(&self, name: &str, input: &[f64], width: usize) -> Vec<f64> {
+		contract_gguf(self, name, input, width).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
+fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Result<Vec<f64>> {
+	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent")))?;
+	let stored = model.stored(tensor)?;
+	let device = selected_gpu()?;
+	let config = Config::load()?;
+	let data = Prepared {
+		samples: input.to_vec(),
+		targets: vec![0.0; width],
+		target_width: width,
+		rows: 1,
+		source_rows: 1,
+		features: input.len(),
+		schema: DataSchema::default(),
+		sequence: None,
+		target_categorical: false,
+		norm_mean: Vec::new(),
+		norm_scale: Vec::new(),
+		identities: Vec::new(),
+		fitted: Vec::new(),
+	};
+	let mut graph = compile(&recipe.model().layer(width), &data, &data.targets, 1, device, config, false)?;
+	let index = graph.nodes.iter().position(|node| node.parameters != 0).ok_or_else(|| RecipeError::new("contraction has no parameters"))?;
+	let parameters = graph.nodes[index].parameters;
+	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
+	graph.stored[index] = Some(stored);
+	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
+	tape.forward()?;
+	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {
@@ -9491,6 +10445,8 @@ unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn dlclose(handle: Ptr) -> i32;
+	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
+	fn munmap(address: Ptr, length: usize) -> i32;
 }
 #[cfg(all(nvidia, windows))]
 unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
