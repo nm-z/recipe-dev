@@ -12280,7 +12280,7 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
-/// The stored entries of a ZIP archive, resolved through the central directory.
+/// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
 	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -12294,16 +12294,17 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let mut entries = Vec::new();
 	for _ in 0..count {
 		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
-		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
-		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let (method, compressed, name_length, extra, comment) = (read16(offset + 10), read32(offset + 20), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, compressed) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, compressed.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
 		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
 		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec())
 			.map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
 		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
 		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
 		let start = local + 30 + local_name + local_extra;
-		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
-		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		require(matches!(method, 0 | 8), format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let stored = bytes.get(start..start + compressed).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?;
+		let contents = if method == 8 { inflate(stored)? } else { stored.to_vec() };
 		if !name.ends_with('/') {
 			entries.push((name, contents));
 		}
