@@ -2372,6 +2372,55 @@ impl NativeModelIr {
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Expand) => {
+					let count = checked_mul(self.rows, node.output.elements(), "expand count")?;
+					emit_fixed_loop(&mut ir, index, "expand", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expand_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							value = pointers.value,
+							channels = node.input.channels,
+							length = node.input.length,
+							lanes = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Read) => {
+					let count = checked_mul(self.rows, node.output.elements(), "read count")?;
+					emit_fixed_loop(&mut ir, index, "read", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @read_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							gate = pointers.second,
+							value = pointers.value,
+							channels = node.output.channels,
+							length = node.output.length,
+							lanes = node.argument[0],
+							gated = node.second >= 0
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Outer) => {
+					let count = checked_mul(self.rows, node.output.elements(), "outer count")?;
+					emit_fixed_loop(&mut ir, index, "outer", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @outer_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							gate = pointers.second,
+							value = pointers.value,
+							channels = node.input.channels,
+							length = node.input.length,
+							lanes = node.argument[0],
+							gated = node.second >= 0
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -2509,6 +2558,61 @@ impl NativeModelIr {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Expand) => {
+					let count = checked_mul(self.rows, node.input.elements(), "expand reverse count")?;
+					emit_fixed_loop(&mut ir, index, "expand.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expand_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+							pointer = pointer_type(backend),
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							channels = node.input.channels,
+							length = node.input.length,
+							lanes = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Read) => {
+					let count = checked_mul(self.rows, node.input.elements(), "read reverse count")?;
+					emit_fixed_loop(&mut ir, index, "read.reverse", count, |ir, p| {
+						ir.push_str(&format!("call void @read_reverse_body( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Outer) => {
+					let count = checked_mul(self.rows, node.input.elements(), "outer reverse count")?;
+					emit_fixed_loop(&mut ir, index, "outer.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @outer_reverse_branch_body( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							pointer = pointer_type(backend),
+							gate = pointers.second,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							channels = node.input.channels,
+							length = node.input.length,
+							lanes = node.argument[0],
+							gated = node.second >= 0
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					if node.second >= 0 {
+						let gates = checked_mul(checked_mul(self.rows, node.argument[0] as usize, "outer gate rows")?, node.input.length, "outer gate count")?;
+						emit_fixed_loop(&mut ir, index, "outer.gate.reverse", gates, |ir, p| {
+							ir.push_str(&format!(
+								"call void @outer_reverse_gate_body( {pointer} {source}, {pointer} {delta}, {pointer} {gate_adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+								pointer = pointer_type(backend),
+								source = pointers.source,
+								delta = pointers.delta,
+								gate_adjoint = pointers.second_adjoint,
+								channels = node.input.channels,
+								length = node.input.length,
+								lanes = node.argument[0]
+							));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				(true, Primitive::Pool) => {
 					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
@@ -3804,6 +3908,7 @@ mod bundle {
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Hyper(lanes, rank, parts) => format!("hyper,{lanes},{rank},{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 		}
 	}
@@ -3839,6 +3944,15 @@ mod bundle {
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
+			"hyper" => {
+				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
+				let (rank, parts) = rest.split_once(',').unwrap_or((rest, ""));
+				Ok(Operation::Hyper(
+					value_at(Some(lanes), "hyper-connection lanes")?,
+					value_at(Some(rank), "hyper-connection rank")?,
+					parts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				))
+			}
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -4492,6 +4606,7 @@ enum Operation {
 	Residual(Vec<Residual>),
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
+	Hyper(usize, usize, Vec<Residual>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -4605,6 +4720,12 @@ impl Model {
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	/// Hyper-connections: a stream of `lanes` copies of the width feeds `parts`
+	/// through a gated read and takes their output back through gated writes.
+	/// `rank` sizes the gate bottleneck; zero fixes every gate at one.
+	pub fn hyper<const N: usize>(&self, lanes: usize, rank: usize, parts: [Residual; N]) -> Self {
+		self.push(Operation::Hyper(lanes, rank, parts.into()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -5919,6 +6040,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
+			Self::Hyper(..) => "hyper",
 		}
 	}
 }
@@ -6106,6 +6228,9 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Expand = 12,
+	Read = 13,
+	Outer = 14,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -6143,6 +6268,9 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Expand => "Expand",
+			Primitive::Read => "Read",
+			Primitive::Outer => "Outer",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -6187,6 +6315,8 @@ struct Graph {
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
+	lanes: usize,
+	rank: usize,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -6199,6 +6329,8 @@ impl Graph {
 			input: shape,
 			output: shape,
 			source: -1,
+			lanes: 0,
+			rank: 0,
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -6243,6 +6375,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
+	}
+	if graph.lanes != 0 {
+		lower_collapse(&mut graph)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	// A model whose last block already emits one value per target needs no projection; the
@@ -6333,6 +6468,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	Ok(graph.source)
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..)) {
+		lower_collapse(graph)?;
+	}
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -6345,6 +6483,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Hyper(lanes, rank, parts) => lower_hyper(graph, *lanes, *rank, parts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
@@ -6701,6 +6840,75 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, skip, &[], program)
+}
+fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, parts: &[Residual], config: Config) -> Result<()> {
+	require(lanes != 0 && !parts.is_empty(), "hyper-connections need at least one lane and one operation")?;
+	if graph.lanes == 0 {
+		let shape = graph.output;
+		push_node(graph, Primitive::Expand, Shape { channels: checked_mul(shape.channels, lanes, "hyper-connection stream")?, length: shape.length }, 0, arguments(lanes as f64, 0.0), -2)?;
+		graph.lanes = lanes;
+	}
+	require(graph.lanes == lanes, format!("hyper-connections with {lanes} lanes follow a stream of {}", graph.lanes))?;
+	graph.rank = rank;
+	let (stream, shape) = (graph.source, graph.output);
+	let width = shape.channels / lanes;
+	let (read, write) = lower_gates(graph, lanes, rank, true)?;
+	reset(graph, stream, shape);
+	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	for part in parts {
+		match part {
+			Residual::Layer(width) => lower_project(graph, *width)?,
+			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
+			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
+		}
+	}
+	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
+	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
+	let mut program = ScalarProgram(Vec::new());
+	program.op(ScalarOpcode::Add, -1.0, -2.0);
+	push_program(graph, stream, &[], program)
+}
+/// Data-dependent gates from the layer-normalized stream: a read gate the width
+/// of the stream through a bottleneck of `rank`, and one write gate per lane,
+/// both offset by one so a fresh model starts at the plain residual. With
+/// `rank` zero every gate is one and no node is added.
+fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Result<(i32, i32)> {
+	if rank == 0 {
+		return Ok((-2, -2));
+	}
+	let (stream, shape) = (graph.source, graph.output);
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	push_node(graph, Primitive::Normalize, shape, 0, arguments(1.0, epsilon), -2)?;
+	let normalized = graph.source;
+	lower_project(graph, rank)?;
+	lower_project(graph, shape.channels)?;
+	lower_offset_one(graph)?;
+	let read = graph.source;
+	if !write {
+		reset(graph, stream, shape);
+		return Ok((read, -2));
+	}
+	reset(graph, normalized, shape);
+	lower_project(graph, lanes)?;
+	lower_offset_one(graph)?;
+	let write = graph.source;
+	reset(graph, stream, shape);
+	Ok((read, write))
+}
+fn lower_offset_one(graph: &mut Graph) -> Result<()> {
+	let mut program = ScalarProgram(Vec::new());
+	let one = program.constant(1.0);
+	program.op(ScalarOpcode::Add, -1.0, one);
+	push_program(graph, -2, &[], program)
+}
+/// The head read: the stream collapses to the width through its own read gate.
+fn lower_collapse(graph: &mut Graph) -> Result<()> {
+	let (lanes, rank, stream, shape) = (graph.lanes, graph.rank, graph.source, graph.output);
+	let (read, _) = lower_gates(graph, lanes, rank, false)?;
+	reset(graph, stream, shape);
+	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	graph.lanes = 0;
+	Ok(())
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
