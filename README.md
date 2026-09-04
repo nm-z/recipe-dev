@@ -36,6 +36,36 @@ recipe --device amd0 model.rs
 recipe --device amd0 --device archy:nv0 model.rs
 ```
 
+## gguf
+
+```rust
+let model = recipe.gguf("model-00001-of-00004.gguf");
+model.value("general.architecture");
+model.tensors();
+model.contract("blk.0.ffn_up.weight", &input, 16);
+```
+
+Every shard of a split is opened by name and the tensor data stays mapped. A
+quantized tensor binds to the tape in its own GGML layout, so the contraction
+reads the mapped bytes through the block decoders that read saved `.ogdl` models.
+
+## ngram
+
+```rust
+let table = recipe.gguf("ngram.gguf");
+let ngram = table.ngram();
+let prediction = ngram.infer("model.ogdl", &input, &ids);
+```
+
+N-gram embeddings from a table too large for device memory. Each of `ngram.heads`
+heads hashes the current token with its previous one, and as many heads with its
+previous two, into its own row range of the mapped `[width, rows]` tensor
+`ngram.table` names, seeded by `ngram.seeds` and reset at the end-of-sequence id.
+Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
+convolves them across as many trailing positions; and the gathered vector is
+added to the stream before the block `ngram.layer` names. The gather stays on the
+host holding the table and the blocks either side of it run on the device.
+
 ## files
 
 ```bash
