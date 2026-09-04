@@ -231,7 +231,7 @@ fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 		17 => (model.layer(8).res([layer(8), layer(8)]), ".layer(8)|.res([layer(8), layer(8)])"),
 		18 => (model.layer(8).res([conv(8, 1), conv(8, 1)]), ".layer(8)|.res([conv(8, 1), conv(8, 1)])"),
 		19 => (model.layer(8).res([conv(8, 1), relu(), layer(8)]), ".layer(8)|.res([conv(8, 1), relu(), layer(8)])"),
-		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8)|.moe(1, [layer(8), layer(8)])"),
+		20 => (model.layer(8).moe(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true), ".layer(8)|.moe(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true)"),
 		21 => (model.perc(8), ".perc(8)"),
 		_ => unreachable!(),
 	}

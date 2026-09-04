@@ -58,7 +58,7 @@ weights:
 	lstm(hidden)
 
 blocks:
-	moe(topk, [...])
+	moe(experts, topk, hidden, activation, scoring, renormalize, shared)
 	res([...])
 
 feature reduction:
@@ -77,6 +77,8 @@ estimators:
 	bayes()
 ```
 Feature generation is banned.
+
+`moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
 
 ## 15 activations
 
