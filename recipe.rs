@@ -10840,9 +10840,11 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	// path, so the directory-layout rules that already interpret a real
 	// class-subfolder tree interpret an archived or nested one identically.
 	let mut files = Vec::new();
+	let mut named = Vec::new();
 	for source in sources {
 		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
 		collect_files(&path, None, &mut files)?;
+		named.push(path);
 	}
 	files.sort_by(|left, right| left.0.cmp(&right.0));
 	files.dedup_by(|left, right| left.0 == right.0);
@@ -10853,7 +10855,14 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			continue;
 		}
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		for table in decode_tables(path, bytes)? {
+		// A discovered leaf whose contents are no table contributes nothing, like a leaf whose
+		// extension names no table format. A source the caller named must decode.
+		let decoded = match decode_tables(path, bytes) {
+			Ok(decoded) => decoded,
+			Err(error) if named.contains(path) => return Err(error),
+			Err(_) => continue,
+		};
+		for table in decoded {
 			grouped.push((directory.clone(), table));
 		}
 	}
