@@ -6743,8 +6743,17 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			fitted: Vec::new(),
 		};
 		let fitted = estimator.fit(&prepared, rows, config)?;
-		let targets = predict_rows(&fitted, &inputs, input.elements())?;
-		(fitted.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		// The surrogate exists to carry this block's adjoint into its input, so a prefix
+		// whose parameters are all frozen never reads the weights a fit would produce.
+		let surrogate = if graph.frozen.contains(&0) {
+			let targets = predict_rows(&fitted, &inputs, input.elements())?;
+			fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+		} else {
+			let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+			untrained.frozen.fill(1);
+			untrained
+		};
+		(fitted.program, surrogate)
 	};
 	reset(graph, source, input);
 	push_predictor(graph, predictor)?;
