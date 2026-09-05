@@ -10835,30 +10835,18 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
-	for source in sources {
-		collect_files(&resolve_path(source)?, &mut paths)?;
-	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// A container contributes its contents, not itself: the container is not a
+	// table or a sample, and its contents take virtual paths anchored at its own
+	// path, so the directory-layout rules that already interpret a real
+	// class-subfolder tree interpret an archived or nested one identically.
 	let mut files = Vec::new();
-	for path in &paths {
-		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
-				files.push((path.join(entry), contents));
-			}
-		} else {
-			files.push((path.clone(), bytes));
-		}
+	for source in sources {
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+		collect_files(&path, None, &mut files)?;
 	}
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files.dedup_by(|left, right| left.0 == right.0);
+	let paths = files.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
@@ -11631,20 +11619,34 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
-	if metadata.is_file() {
-		files.push(path.to_owned());
+/// Every leaf file a container holds, to any depth: a folder contributes its
+/// entries and an archive its members, both anchored at the container's path.
+fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	let bytes = match member {
+		Some(bytes) => bytes,
+		None => {
+			let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+			if !metadata.is_file() {
+				let mut children = fs::read_dir(path)
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+					.collect::<std::io::Result<Vec<_>>>()
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				children.sort_by_key(fs::DirEntry::path);
+				for child in children {
+					collect_files(&child.path(), None, files)?;
+				}
+				return Ok(());
+			}
+			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		}
+	};
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+			collect_files(&path.join(entry), Some(contents), files)?;
+		}
 		return Ok(());
 	}
-	let mut children = fs::read_dir(path)
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
-		.collect::<std::io::Result<Vec<_>>>()
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	children.sort_by_key(fs::DirEntry::path);
-	for child in children {
-		collect_files(&child.path(), files)?;
-	}
+	files.push((path.to_owned(), bytes));
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> {
@@ -12280,7 +12282,7 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
-/// The stored entries of a ZIP archive, resolved through the central directory.
+/// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
 	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -12294,16 +12296,17 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let mut entries = Vec::new();
 	for _ in 0..count {
 		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
-		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
-		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let (method, compressed, name_length, extra, comment) = (read16(offset + 10), read32(offset + 20), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, compressed) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, compressed.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
 		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
 		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec())
 			.map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
 		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
 		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
 		let start = local + 30 + local_name + local_extra;
-		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
-		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		require(matches!(method, 0 | 8), format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let stored = bytes.get(start..start + compressed).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?;
+		let contents = if method == 8 { inflate(stored)? } else { stored.to_vec() };
 		if !name.ends_with('/') {
 			entries.push((name, contents));
 		}
