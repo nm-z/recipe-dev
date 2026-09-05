@@ -9925,13 +9925,18 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
+	// Centering a row once serves its prediction and its gradient, and the reduced sums divide by the row count once.
 	let blocks = (cpu_worker_threads()? as usize).min(rows);
+	let share = (rows as f64).recip();
 	for _ in 0..config.svm_iterations {
 		let partials = parallel_map(blocks, |block| {
 			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
-			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
+			let (mut bias_partial, mut partial, mut centered) = (0.0, vec![0.0; data.features], vec![0.0; data.features]);
 			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
-				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				for (((value, mean), scale), centered) in sample.iter().zip(&means).zip(&inverse).zip(&mut centered) {
+					*centered = (value - mean) * scale
+				}
+				let prediction = bias + weights.iter().zip(&centered).map(|(weight, centered)| weight * centered).sum::<f64>();
 				let error = prediction - target;
 				let direction = if error > config.svm_epsilon {
 					1.0
@@ -9940,14 +9945,14 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				} else {
 					0.0
 				};
-				bias_partial += direction / rows as f64;
-				for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut partial) {
-					*value_gradient += direction * (value - mean) * scale / rows as f64
+				bias_partial += direction;
+				for (centered, value_gradient) in centered.iter().zip(&mut partial) {
+					*value_gradient += direction * centered
 				}
 			}
 			(bias_partial, partial)
 		})?;
-		let mut gradient = weights.iter().map(|weight| config.svm_regularization * weight).collect::<Vec<_>>();
+		let mut gradient = vec![0.0; data.features];
 		let mut bias_gradient = 0.0;
 		for (bias_partial, partial) in partials {
 			bias_gradient += bias_partial;
@@ -9955,9 +9960,9 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		bias -= config.svm_rate * bias_gradient * share;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
-			*weight -= config.svm_rate * gradient
+			*weight -= config.svm_rate * (config.svm_regularization * *weight + gradient * share)
 		}
 	}
 	// The fitted model lives in the predictor table as three feature-length
