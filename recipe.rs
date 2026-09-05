@@ -1393,10 +1393,10 @@ impl NativeModelIr {
 			require(node.program_offset.checked_add(program_width).is_some_and(|end| end <= graph.programs.len()), format!("{} program range exceeds {} values", id(), graph.programs.len()))?;
 			let stored = graph.stored.get(index).cloned().unwrap_or(None);
 			if let Some(weight) = &stored {
-				require(weight.count == node.parameters, format!("{} stored weight count {} does not match parameter count {}", id(), weight.count, node.parameters))?;
+				require(weight.count == node.weights(), format!("{} stored weight count {} does not match tensor count {}", id(), weight.count, node.weights()))?;
 			}
 			let storage_offset = align(storage_bytes, alignment("float"))?;
-			if let Some(weight) = &stored {
+			if let Some(weight) = arena_weight(&node, &stored) {
 				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
@@ -1406,7 +1406,7 @@ impl NativeModelIr {
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
 		for plan in &self.plans {
-			if let Some(weight) = &plan.stored {
+			if let Some(weight) = arena_weight(&plan.node, &plan.stored) {
 				storage.resize(plan.storage_offset, 0);
 				storage.extend_from_slice(&weight.bytes);
 			}
@@ -2372,6 +2372,26 @@ impl NativeModelIr {
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Gather) => {
+					let (layout, _) = embedding_row(node)?;
+					let count = checked_mul(self.rows, node.output.elements(), "gather output count")?;
+					let per_row = checked_mul(node.output.channels, node.output.length, "gather row elements")?;
+					let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
+					let prefix = format!("n{index}.gather");
+					emit_fixed_loop(&mut ir, index, "gather", count, |ir, p| {
+						ir.push_str(&format!(
+							"%{prefix}.row = udiv i32 {p}, {per_row}\n%{prefix}.within = urem i32 {p}, {per_row}\n%{prefix}.channel = udiv i32 %{prefix}.within, {length}\n%{prefix}.position = urem i32 %{prefix}.within, {length}\n%{prefix}.base = mul i32 %{prefix}.row, {length}\n%{prefix}.token = add i32 %{prefix}.base, %{prefix}.position\n%{prefix}.id.ptr = getelementptr inbounds i32, {pointer} {source}, i32 %{prefix}.token\n%{prefix}.id = load i32, {pointer} %{prefix}.id.ptr, align 4\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} {table}, i32 %{prefix}.id, i32 %{prefix}.channel, i32 {width})\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							source = pointers.source,
+							table = pointers.context,
+							value = pointers.value,
+							length = node.output.length,
+							width = node.output.channels,
+							name = layout.name,
+							align = alignment(ty)
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -2510,6 +2530,9 @@ impl NativeModelIr {
 					}
 					ir.push_str(barrier(backend));
 				}
+				// The gather reads the packed table the run was given and the optimizer
+				// leaves it frozen, so the embedding contributes no reverse pass.
+				(true, Primitive::Gather) => {}
 				(true, Primitive::Pool) => {
 					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
 					let pointer = pointer_type(backend);
@@ -2961,7 +2984,7 @@ impl NativeModelIr {
 		);
 		let mut predecessor = "entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
-			let Some(stored) = &plan.stored else { continue };
+			let Some(stored) = arena_weight(&plan.node, &plan.stored) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
 			let native = format.native;
@@ -3805,6 +3828,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
+			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -3839,6 +3863,7 @@ mod bundle {
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
+			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -3912,12 +3937,13 @@ mod bundle {
 		let graph = &stored.graph;
 		let mut tensors = Vec::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
-			if node.parameters == 0 {
+			let count = node.weights();
+			if count == 0 {
 				continue;
 			}
 			let values = graph.parameters.get(node.offset..node.offset + node.parameters).ok_or_else(|| RecipeError::new("model parameter span is invalid"))?;
 			let encoded = graph.stored.get(index).and_then(Clone::clone).unwrap_or_else(|| raw_weight(values));
-			require(encoded.count == node.parameters && encoded.arithmetic.len() == node.parameters, format!("model tensor {index} has the wrong shape"))?;
+			require(encoded.count == count && encoded.arithmetic.len() == count, format!("model tensor {index} has the wrong shape"))?;
 			tensors.push(encoded);
 		}
 		let mut predictors = Vec::new();
@@ -4016,7 +4042,13 @@ mod bundle {
 				"semantic model normalization stats have the wrong width",
 			)?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
-			require(self.frozen.len() == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
+			// An embed block saves its table as the gather's packed context, so it owns a
+			// tensor without a parameter span for the frozen mask to cover.
+			let tables = model.blocks.iter().filter_map(|block| match block.operation {
+				Operation::Embed(vocabulary, width) => Some(vocabulary.saturating_mul(width)),
+				_ => None,
+			});
+			require(self.frozen.len().saturating_add(tables.sum::<usize>()) == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
@@ -4310,12 +4342,12 @@ mod bundle {
 				let current_training_rows = current.graph.state.training_rows;
 				let mut tensor = 0;
 				for (index, node) in current.graph.nodes.iter().enumerate() {
-					if node.parameters == 0 {
+					if node.weights() == 0 {
 						continue;
 					}
 					let encoded = saved.tensors.get(tensor).ok_or_else(|| RecipeError::new("saved semantic tensor is absent"))?;
-					require(encoded.count == node.parameters, "saved semantic tensor has the wrong shape")?;
-					current.graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic);
+					require(encoded.count == node.weights(), "saved semantic tensor has the wrong shape")?;
+					current.graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic[..node.parameters]);
 					if let Some(slot) = current.graph.stored.get_mut(index) {
 						*slot = (encoded.format.0 != 0).then_some(encoded.clone())
 					}
@@ -4492,6 +4524,7 @@ enum Operation {
 	Residual(Vec<Residual>),
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
+	Embed(usize, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -4599,7 +4632,8 @@ impl Model {
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
-	fn perc(width: usize) = Operation::Perceptron(width); }
+	fn perc(width: usize) = Operation::Perceptron(width);
+	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -5919,6 +5953,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
+			Self::Embed(..) => "embed",
 		}
 	}
 }
@@ -6106,6 +6141,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Gather = 10,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -6134,6 +6170,11 @@ impl ScalarProgram {
 	}
 }
 impl Node {
+	// A gather owns no trainable parameters: its table is the packed context the
+	// kernel reads, so its tensor spans the vocabulary instead of a parameter span.
+	fn weights(&self) -> usize {
+		if self.op == Primitive::Gather { (self.argument[0] as usize).saturating_mul(self.output.channels) } else { self.parameters }
+	}
 	fn identity(&self, index: usize) -> String {
 		let prim = match self.op {
 			Primitive::Contraction => "Contraction",
@@ -6143,6 +6184,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Gather => "Gather",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -6211,21 +6253,22 @@ impl Graph {
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	require(graph.stored.len() == graph.nodes.len(), "model graph storage spans are incomplete")?;
 	for (index, node) in graph.nodes.iter().enumerate() {
-		if node.parameters == 0 || node.argument[8] == 0.0 {
-			graph.stored[index] = None;
+		// A gather owns no parameter span, so its table is the tensor it was drawn into.
+		let drawn = graph.stored[index].take().filter(|_| node.op == Primitive::Gather).map(|stored| stored.arithmetic);
+		let weights = drawn.as_deref().unwrap_or(&graph.parameters[node.offset..node.offset + node.parameters]);
+		if weights.is_empty() || node.argument[8] == 0.0 {
 			continue;
 		}
 		let format = StorageFormat(node.argument[8] as u16);
 		require(format.spec().is_some(), format.unavailable().to_string())?;
-		let weights = &graph.parameters[node.offset..node.offset + node.parameters];
 		// A node that never received gradient, like an unrouted expert, has an all-zero
 		// variance slice: it carries no importance signal, so weight it uniformly.
 		let importance = graph
 			.state
 			.variances
 			.get(node.offset..node.offset + node.parameters)
-			.filter(|values| values.len() == node.parameters && values.iter().any(|value| *value > 0.0))
-			.map_or_else(|| vec![1.0; node.parameters], |values| values.to_vec());
+			.filter(|values| values.len() == weights.len() && values.iter().any(|value| *value > 0.0))
+			.map_or_else(|| vec![1.0; weights.len()], |values| values.to_vec());
 		graph.stored[index] = Some(format.encode(weights, &importance, config)?);
 	}
 	Ok(())
@@ -6257,7 +6300,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		output_profile = StorageFormat(model.quantization).selection().map(|_| StorageFormat(model.quantization));
 	}
 	if let Some(format) = output_profile
-		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.parameters != 0 && node.block_index + 1 == model.blocks.len())
+		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
 	{
 		node.argument[8] = f64::from(format.tensor(0, false, true))
 	}
@@ -6290,15 +6333,15 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
-	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
+	require(graph.nodes.iter().map(Node::weights).sum::<usize>() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
 	let mut tensor = 0;
 	for (index, node) in graph.nodes.iter().enumerate() {
-		if node.parameters == 0 {
+		if node.weights() == 0 {
 			continue;
 		}
 		let encoded = saved.tensors.get(tensor).ok_or_else(|| RecipeError::new("saved semantic tensor is absent"))?;
-		require(encoded.count == node.parameters, "saved semantic tensor has the wrong shape")?;
-		graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic);
+		require(encoded.count == node.weights(), "saved semantic tensor has the wrong shape")?;
+		graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic[..node.parameters]);
 		if let Some(slot) = graph.stored.get_mut(index) {
 			*slot = (encoded.format.0 != 0).then_some(encoded.clone())
 		}
@@ -6339,6 +6382,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
+		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Attention(heads) => lower_attention(graph, *heads)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -6361,7 +6405,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
-			if node.op != Primitive::Predictor && node.parameters != 0 {
+			if node.op != Primitive::Predictor && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
@@ -6547,6 +6591,15 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
+}
+fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()> {
+	require(vocabulary != 0 && width != 0, "embedding dimensions must be positive")?;
+	require(graph.nodes.is_empty(), "embedding must be the first block: it reads token ids from the model input")?;
+	checked_mul(vocabulary, width, "embedding table")?;
+	let output = Shape { channels: width, length: graph.output.elements() };
+	// The table is the packed context the gather reads, so the node owns no
+	// trainable parameters and no run holds a second copy of it.
+	push_node(graph, Primitive::Gather, output, 0, arguments(vocabulary as f64, width as f64), -2)
 }
 fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
@@ -6755,18 +6808,31 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
 	program(graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat).map(drop)
 }
+fn next_weight(state: &mut u64, scale: f64) -> f64 {
+	*state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+	((*state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale
+}
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
-	for node in &graph.nodes {
+	for (position, node) in graph.nodes.iter().enumerate() {
 		if node.op == Primitive::Elementwise {
 			continue;
 		}
-		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
+		// An embedding row feeds the next block with its width, not with the vocabulary.
+		let fan_in = if node.op == Primitive::Gather { node.output.channels } else { (node.parameters / node.output.channels.max(1)).max(1) } as f64;
 		let scale = config.initial / fan_in.sqrt();
+		// The table is the gather's packed context rather than a trainable span, so it
+		// is drawn once into the node's tensor and no optimizer step can write it back.
+		if node.op == Primitive::Gather {
+			if graph.stored[position].is_none() {
+				let arithmetic = (0..node.weights()).map(|_| next_weight(&mut state, scale)).collect::<Vec<_>>();
+				graph.stored[position] = Some(StoredWeight { format: StorageFormat(0), count: arithmetic.len(), bytes: Vec::new(), codebook: Vec::new(), arithmetic });
+			}
+			continue;
+		}
 		for index in node.offset..node.offset + node.parameters {
 			if graph.frozen[index] == 0 {
-				state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-				graph.parameters[index] = ((state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale;
+				graph.parameters[index] = next_weight(&mut state, scale);
 			}
 		}
 		if node.op == Primitive::Contraction {
@@ -7041,6 +7107,18 @@ impl NativeTape {
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
+		// A graph that starts with a gather reads its input as i32 token ids.
+		let samples = match graph.nodes.first().filter(|node| node.op == Primitive::Gather) {
+			Some(node) => {
+				let vocabulary = node.argument[0];
+				let ids = samples
+					.iter()
+					.map(|id: &f64| require(id.fract() == 0.0 && *id >= 0.0 && *id < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32))
+					.collect::<Result<Vec<_>>>()?;
+				Buffer::upload(gpu, &ids)?
+			}
+			None => Buffer::upload_float(gpu, samples, precision.model)?,
+		};
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
@@ -7052,14 +7130,26 @@ impl NativeTape {
 		} else {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
 		}
+		// The packed embedding table is the gather's context, so it reaches the
+		// device whole once and the kernel then reads only the rows it addresses.
+		let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if node.op == Primitive::Gather {
+				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
+				let offset = layout.contexts[index];
+				let end = checked_add(offset, table.bytes.len(), "embedding table context")?;
+				require(end <= contexts.len(), "embedding table exceeds its context arena")?;
+				contexts[offset..end].copy_from_slice(&table.bytes);
+			}
+		}
 		Ok(Self {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+			contexts: Buffer::upload(gpu, &contexts)?,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision.model)?,
+			samples,
 			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
@@ -7595,7 +7685,14 @@ impl DeviceTape {
 		self.shards[0].capture(graph)
 	}
 	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
-	fn print_devices(&self) -> Result<()> {
+	fn print_devices(&self, graph: &Graph) -> Result<()> {
+		for node in &graph.nodes {
+			if node.op == Primitive::Gather {
+				let (layout, row) = embedding_row(node)?;
+				let table = checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, row, "embedding table bytes")?;
+				eprintln!("movement gather {} {row} bytes per token of a {table} byte table", layout.name);
+			}
+		}
 		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
 			eprintln!("{}.{} rows {} share {share:.6}", shard.device_label()?, shard.precision.model.label(), shard.rows);
 		}
@@ -7635,6 +7732,20 @@ fn structural(value: f64) -> Result<i32> {
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
 }
+// An embedding row is addressed inside the packed table, so the row must span
+// whole blocks and the layout must keep one row's blocks together.
+fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
+	let format = StorageFormat(node.argument[8] as u16);
+	let layout = format.spec().ok_or_else(|| RecipeError::new("embedding table must be stored in a quantization"))?.codec.quantization();
+	require(!matches!(layout.native, NativeDequant::Nf4), format!("embedding table cannot use {}: its codebook addresses the whole tensor", layout.name))?;
+	require(node.output.channels % layout.block == 0, format!("embedding width {} must be a multiple of the {} block of {}", node.output.channels, layout.name, layout.block))?;
+	checked_mul(node.output.channels / layout.block, layout.stride, "embedding row bytes").map(|row| (layout, row))
+}
+// The embedding table is decoded one row at a time from the context arena, so
+// it is absent from the storage the model-load kernel expands into weights.
+fn arena_weight<'a>(node: &Node, stored: &'a Option<StoredWeight>) -> Option<&'a StoredWeight> {
+	stored.as_ref().filter(|_| node.op != Primitive::Gather)
+}
 fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
@@ -7652,6 +7763,9 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// The packed embedding table is the node's persistent state: the gather
+		// decodes rows out of it and never expands it into the weights.
+		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
 		Primitive::Normalize => {
 			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
 			checked_mul(4, groups, "normalization context")?
@@ -12954,7 +13068,7 @@ impl Train {
 			&tape,
 			None,
 		)?;
-		tape.print_devices()?;
+		tape.print_devices(&stored.graph)?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
