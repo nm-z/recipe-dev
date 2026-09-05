@@ -9924,27 +9924,45 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
+	// Centering a row once serves its prediction and its gradient, and the reduced sums divide by the row count once.
+	let blocks = (cpu_worker_threads()? as usize).min(rows);
+	let share = (rows as f64).recip();
 	for _ in 0..config.svm_iterations {
-		let mut gradient = weights.iter().map(|weight| config.svm_regularization * weight).collect::<Vec<_>>();
+		let partials = parallel_map(blocks, |block| {
+			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
+			let (mut bias_partial, mut partial, mut centered) = (0.0, vec![0.0; data.features], vec![0.0; data.features]);
+			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
+				for (((value, mean), scale), centered) in sample.iter().zip(&means).zip(&inverse).zip(&mut centered) {
+					*centered = (value - mean) * scale
+				}
+				let prediction = bias + weights.iter().zip(&centered).map(|(weight, centered)| weight * centered).sum::<f64>();
+				let error = prediction - target;
+				let direction = if error > config.svm_epsilon {
+					1.0
+				} else if error < -config.svm_epsilon {
+					-1.0
+				} else {
+					0.0
+				};
+				bias_partial += direction;
+				for (centered, value_gradient) in centered.iter().zip(&mut partial) {
+					*value_gradient += direction * centered
+				}
+			}
+			(bias_partial, partial)
+		})?;
+		let mut gradient = vec![0.0; data.features];
 		let mut bias_gradient = 0.0;
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
-			let error = prediction - target;
-			let direction = if error > config.svm_epsilon {
-				1.0
-			} else if error < -config.svm_epsilon {
-				-1.0
-			} else {
-				0.0
-			};
-			bias_gradient += direction / rows as f64;
-			for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut gradient) {
-				*value_gradient += direction * (value - mean) * scale / rows as f64
+		for (bias_partial, partial) in partials {
+			bias_gradient += bias_partial;
+			for (value_gradient, partial) in gradient.iter_mut().zip(partial) {
+				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		bias -= config.svm_rate * bias_gradient * share;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
-			*weight -= config.svm_rate * gradient
+			*weight -= config.svm_rate * (config.svm_regularization * *weight + gradient * share)
 		}
 	}
 	// The fitted model lives in the predictor table as three feature-length
@@ -9985,72 +10003,82 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config) -> Res
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::fitted(program.finish()?, move |sample| forest.iter().fold(0.0, |sum, tree| sum + tree_predict(tree, sample)) / trees as f64))
 }
-fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Result<Vec<f64>> {
-	let width = values.len();
-	require(matrix.len() == width * width && width != 0, "linear system shape is invalid")?;
-	for column in 0..width {
-		let pivot = (column..width)
-			.max_by(|left, right| matrix[*left * width + column].abs().total_cmp(&matrix[*right * width + column].abs()))
-			.ok_or_else(|| RecipeError::new("linear system has no pivot"))?;
-		require(matrix[pivot * width + column].abs() > epsilon, "linear system is singular")?;
-		for entry in 0..width {
-			matrix.swap(column * width + entry, pivot * width + entry)
-		}
-		values.swap(column, pivot);
-		let scale = matrix[column * width + column];
-		for entry in column..width {
-			matrix[column * width + entry] /= scale
-		}
-		values[column] /= scale;
+/// Solves the ridge system in the smaller of feature space and row space.
+fn solve_bayes(samples: &[f64], targets: &[f64], means: &[f64], target_mean: f64, config: Config) -> Result<Vec<f64>> {
+	let (rows, features) = (targets.len(), means.len());
+	require(rows != 0 && features != 0 && samples.len() == checked_mul(rows, features, "Bayes sample matrix")?, "Bayes system shape is invalid")?;
+	let dual = rows < features;
+	let (width, terms) = if dual { (rows, features) } else { (features, rows) };
+	let mut matrix = vec![0.0; checked_mul(width, width, "Bayes system matrix")?];
+	let mut values = vec![0.0; width];
+	// The covariance is symmetric, so only its lower triangle accumulates. Row space
+	// reads a pair of sample rows in order, and feature space centers one sample at a time.
+	if dual {
 		for row in 0..width {
-			if row == column {
-				continue;
+			for column in 0..row + 1 {
+				matrix[row * width + column] = (0..terms).map(|term| (samples[row * features + term] - means[term]) * (samples[column * features + term] - means[term])).sum()
 			}
-			let factor = matrix[row * width + column];
-			for entry in column..width {
-				matrix[row * width + entry] -= factor * matrix[column * width + entry]
+		}
+		for (value, target) in values.iter_mut().zip(targets) {
+			*value = target - target_mean
+		}
+	} else {
+		let mut centered = vec![0.0; width];
+		for (sample, target) in samples.chunks_exact(features).zip(targets) {
+			for (entry, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(means)) {
+				*entry = value - mean
 			}
-			values[row] -= factor * values[column];
+			let response = target - target_mean;
+			for row in 0..width {
+				values[row] += centered[row] * response;
+				for column in 0..row + 1 {
+					matrix[row * width + column] += centered[row] * centered[column]
+				}
+			}
 		}
 	}
-	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
+	// The noise variance is invariant, so it divides each accumulated sum once.
+	for row in 0..width {
+		values[row] /= config.bayes_noise_variance;
+		for column in 0..row + 1 {
+			matrix[row * width + column] /= config.bayes_noise_variance
+		}
+		matrix[row * width + row] += config.bayes_prior_precision
+	}
+	// Ridge regularization makes the system positive definite, so factor only its lower triangle.
+	for row in 0..width {
+		for column in 0..row + 1 {
+			let value = matrix[row * width + column] - (0..column).map(|inner| matrix[row * width + inner] * matrix[column * width + inner]).sum::<f64>();
+			if row == column {
+				require(value > config.bayes_variance_epsilon, "Bayes system is not positive definite")?;
+				matrix[row * width + column] = value.sqrt()
+			} else {
+				matrix[row * width + column] = value / matrix[column * width + column]
+			}
+		}
+	}
+	for row in 0..width {
+		values[row] = (values[row] - (0..row).map(|column| matrix[row * width + column] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	for row in (0..width).rev() {
+		values[row] = (values[row] - (row + 1..width).map(|column| matrix[column * width + row] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	let weights =
+		if dual { (0..features).map(|feature| samples.chunks_exact(features).zip(&values).map(|(sample, value)| (sample[feature] - means[feature]) * value).sum()).collect() } else { values };
+	require(weights.iter().all(|value| value.is_finite()), "Bayes system produced a nonfinite solution").map(|_| weights)
 }
 fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
-		let mut means = vec![0.0; data.features];
+		let samples = &data.samples[..rows * data.features];
 		let target_mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-		for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
+		let mut means = vec![0.0; data.features];
+		for sample in samples.chunks_exact(data.features) {
 			for (mean, value) in means.iter_mut().zip(sample) {
 				*mean += value / rows as f64
 			}
 		}
-		// The covariance is symmetric and the noise variance is invariant, so only
-		// the upper triangle accumulates and the noise divides each sum once.
-		let mut matrix = vec![0.0; data.features * data.features];
-		let mut values = vec![0.0; data.features];
-		let mut centered = vec![0.0; data.features];
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			for (centered, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(&means)) {
-				*centered = value - mean
-			}
-			for left in 0..data.features {
-				values[left] += centered[left] * (target - target_mean);
-				for right in left..data.features {
-					matrix[left * data.features + right] += centered[left] * centered[right]
-				}
-			}
-		}
-		for left in 0..data.features {
-			values[left] /= config.bayes_noise_variance;
-			for right in left..data.features {
-				let entry = matrix[left * data.features + right] / config.bayes_noise_variance;
-				matrix[left * data.features + right] = entry;
-				matrix[right * data.features + left] = entry;
-			}
-			matrix[left * data.features + left] += config.bayes_prior_precision
-		}
-		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
+		let weights = solve_bayes(samples, &data.targets[..rows], &means, target_mean, config)?;
 		let mut table = vec![1.0; 2 * data.features];
 		table[..data.features].copy_from_slice(&means);
 		table.extend(weights);
