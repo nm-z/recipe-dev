@@ -10280,19 +10280,25 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 }
 fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Result<Option<(usize, f64)>> {
 	let Some(groups) = 1_usize.checked_shl((level + 1) as u32) else { return Ok(None) };
+	// Every candidate of every feature rescans the same rows in the same order
+	// against the same group divisors, so the scan reads both in sequence
+	// instead of gathering a permuted row and widening a count on each step.
+	let ordered = permutation.iter().map(|&row| (residuals[row], codes[row])).collect::<Vec<_>>();
+	let divisors = (0..=permutation.len()).map(|count| count as f64 + prior).collect::<Vec<_>>();
 	// Each feature's candidate scan is independent; the reduction keeps the first
 	// strict minimum in feature order, matching the sequential scan.
 	Ok(parallel_map(borders.len(), |feature| {
 		let candidates = &borders[feature];
+		let bins = permutation.iter().map(|&row| candidates.bins[row]).collect::<Vec<_>>();
 		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
 			counts.fill(0);
 			sums.fill(0.0);
 			let mut error = 0.0;
-			for &row in permutation {
-				let group = codes[row] | usize::from(candidates.bins[row] <= index) << level;
-				error += (residuals[row] - sums[group] / (counts[group] as f64 + prior)).powi(2);
-				sums[group] += residuals[row];
+			for (&(residual, code), &bin) in ordered.iter().zip(&bins) {
+				let group = code | usize::from(bin <= index) << level;
+				error += (residual - sums[group] / divisors[counts[group]]).powi(2);
+				sums[group] += residual;
 				counts[group] += 1;
 			}
 			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, f64)| error < value.0) {
