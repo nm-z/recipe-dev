@@ -2135,10 +2135,10 @@ i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %s
 %sin.magnitude = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %partner.wide, RECIPE_STATE %sin)
 br i1 %upper, label %rotate.upper.result, label %rotate.lower.result
 rotate.lower.result:
-%lower.result = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.magnitude)
+%lower.result = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %cos.part, RECIPE_STATE %sin.magnitude)
 br label %rotate.result
 rotate.upper.result:
-%upper.result = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %cos.part, RECIPE_STATE %sin.magnitude)
+%upper.result = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.magnitude)
 br label %rotate.result
 rotate.result:
 %rotated = phi RECIPE_STATE [ %lower.result, %rotate.lower.result ], [ %upper.result, %rotate.upper.result ]
