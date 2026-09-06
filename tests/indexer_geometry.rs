@@ -75,11 +75,19 @@ fn mean(keys: &[[f64; 2]]) -> [f64; 2] {
 	let count = keys.len() as f64;
 	[keys.iter().map(|key| key[0]).sum::<f64>() / count, keys.iter().map(|key| key[1]).sum::<f64>() / count]
 }
-fn corrected_representative(keys: &[[f64; 2]], block: usize) -> [f64; 2] {
-	rope(rms2(mean(keys)), block * 2)
+fn corrected_representative(keys: &[[f64; 2]], block: usize, gamma: [f64; 2]) -> [f64; 2] {
+	let unit = rms2(mean(keys));
+	rope([unit[0] * gamma[0], unit[1] * gamma[1]], block * 2)
 }
-fn per_key_representative(keys: &[[f64; 2]], start: usize) -> [f64; 2] {
-	let transformed = keys.iter().enumerate().map(|(index, key)| rope(rms2(*key), start + index)).collect::<Vec<_>>();
+fn per_key_representative(keys: &[[f64; 2]], start: usize, gamma: [f64; 2]) -> [f64; 2] {
+	let transformed = keys
+		.iter()
+		.enumerate()
+		.map(|(index, key)| {
+			let unit = rms2(*key);
+			rope([unit[0] * gamma[0], unit[1] * gamma[1]], start + index)
+		})
+		.collect::<Vec<_>>();
 	mean(&transformed)
 }
 fn score(query: [f64; 2], representative: [f64; 2]) -> f64 {
@@ -94,8 +102,11 @@ fn score_after_head_sum(query: [f64; 2], representative: [f64; 2]) -> f64 {
 
 #[test]
 fn scored_attention_matches_pooled_reference_and_per_head_relu() {
-	// Keep device selection local to this standalone integration test.
-	unsafe { std::env::set_var("RECIPE_FORCE_CPU", "1") };
+	// Keep this test runnable on hosts without an accelerator while preserving an
+	// explicit RECIPE_DEVICE or RECIPE_FORCE_CPU requested by the caller.
+	if std::env::var_os("RECIPE_DEVICE").is_none() && std::env::var_os("RECIPE_FORCE_CPU").is_none() {
+		unsafe { std::env::set_var("RECIPE_FORCE_CPU", "1") };
+	}
 
 	// Positions 0 and 1 form the first block. Positions 2 and 3 form the
 	// second. The second block's raw keys have unequal magnitudes, so the
@@ -110,7 +121,7 @@ fn scored_attention_matches_pooled_reference_and_per_head_relu() {
 	// This query is the inverse block-3 rotation of the second block's pooled
 	// representative. The second head is its negation, which makes head-wise
 	// ReLU observable independently of the pooling correction.
-	let query = [0.8787217874078402, -1.1080823237366482];
+	let query = [3.2045682331608485, 0.21809619538928263];
 	let main_rows: [&[f64]; 6] = [
 		&[0.0, 0.0, 0.0],
 		&[0.0, 0.0, 0.0],
@@ -124,7 +135,7 @@ fn scored_attention_matches_pooled_reference_and_per_head_relu() {
 	let main_values = output_major(3, &main_rows);
 	let index_values = output_major(3, &index_rows);
 	let output_values = output_major(2, &output_rows);
-	let scales = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+	let scales = [1.0, 1.0, 1.0, 1.0, 1.1, 20.0];
 	let path = std::env::temp_dir().join(format!("recipe-indexer-{}.gguf", std::process::id()));
 	let _temporary = TemporaryFile(path.clone());
 	write_f64_gguf(&path, &[("main", &[3, 6], &main_values), ("index", &[3, 6], &index_values), ("scale", &[6], &scales), ("output", &[2, 3], &output_values)]);
@@ -135,11 +146,12 @@ fn scored_attention_matches_pooled_reference_and_per_head_relu() {
 	let actual = file.infer(&blocks, &plan, &input, 3);
 
 	let transformed_query = rope(rms2(query), 3);
-	let first = corrected_representative(&raw_blocks[0..2], 0);
-	let second = corrected_representative(&raw_blocks[2..4], 1);
+	let key_gamma = [1.1, 20.0];
+	let first = corrected_representative(&raw_blocks[0..2], 0, key_gamma);
+	let second = corrected_representative(&raw_blocks[2..4], 1, key_gamma);
 	let corrected_scores = [score(transformed_query, first), score(transformed_query, second)];
-	let old_first = per_key_representative(&raw_blocks[0..2], 0);
-	let old_second = per_key_representative(&raw_blocks[2..4], 2);
+	let old_first = per_key_representative(&raw_blocks[0..2], 0, key_gamma);
+	let old_second = per_key_representative(&raw_blocks[2..4], 2, key_gamma);
 	let old_scores = [score(transformed_query, old_first), score(transformed_query, old_second)];
 	let summed_scores = [score_after_head_sum(transformed_query, first), score_after_head_sum(transformed_query, second)];
 	let corrected_selected = corrected_scores.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0))).map(|(index, _)| index).unwrap();
