@@ -2862,19 +2862,28 @@ impl NativeModelIr {
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
-						// The indexer scores and selects over the whole sequence, as the
-						// matrix body does: the positions past the window are zero and the
-						// causal mask drops them, so a step stays correct but reworks the
-						// blocks the window skips.
-						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
+						// The indexer reads its own projection, the node's second source, and
+						// keeps its state in the context arena: one running sum of indexer
+						// keys per block. The index loop visits only the blocks the window's
+						// positions land in and extends their sums by those positions, and
+						// the select loop scores only the window's queries, so a step costs
+						// the blocks it touches and a whole forward costs the sequence once.
+						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
-						let whole = |length: usize| NodeWindow { begin: "0".to_owned(), span: length.to_string() };
-						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &whole(blocks), |ir, p| {
-							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
+						let block = integer_argument(node.argument[3], "indexer block")?;
+						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
+						let end = format!("%n{index}.end");
+						ir.push_str(&format!(
+							"{first} = udiv i32 {begin}, {block}\n%n{index}.index.stop = add i32 {end}, {last}\n%n{index}.index.last = udiv i32 %n{index}.index.stop, {block}\n%n{index}.index.touched = sub i32 %n{index}.index.last, {first}\n%n{index}.index.empty = icmp eq i32 {span}, 0\n{count} = select i1 %n{index}.index.empty, i32 0, i32 %n{index}.index.touched\n",
+							last = block - 1
+						));
+						let touched = NodeWindow { begin: first, span: count };
+						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, p| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
-						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &whole(node.output.length), |ir, p| {
+						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
 							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
@@ -3256,7 +3265,9 @@ impl NativeModelIr {
 					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 					if attention_blocks(node) != 0 {
-						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
+						// The indexer gradient lands in the side projection's adjoint, which
+						// the attention node alone writes.
+						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.second, &pointers.context, &pointers.second_adjoint);
 						emit_fixed_loop(&mut ir, index, "index.reverse", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
 							ir.push_str(&format!(
 								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
@@ -6183,9 +6194,10 @@ mod bundle {
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
 				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
-				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+				let index = attention.index.unwrap_or(Indexer::NONE);
+				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{}",
+					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims}",
 					attention.heads,
 					attention.kv,
 					index.heads,
@@ -6193,7 +6205,9 @@ mod bundle {
 					index.block,
 					index.keep,
 					u8::from(attention.gate),
-					attention.width
+					attention.width,
+					index.tokens,
+					normalization_text(score_normalization)
 				)
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
@@ -6240,21 +6254,22 @@ mod bundle {
 				let kv = value_at(fields.next(), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
-				let index = Indexer {
+				let mut index = Indexer {
 					heads: value_at(fields.next(), "indexer heads")?,
 					width: value_at(fields.next(), "indexer width")?,
 					block: value_at(fields.next(), "indexer block")?,
 					keep: value_at(fields.next(), "indexer blocks kept")?,
+					..Indexer::NONE
 				};
 				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
-				Ok(Operation::Attention(AttentionBlock {
-					heads,
-					kv,
-					width: fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.unwrap_or(0),
-					rope: (dims != 0).then_some((dims, base.to_bits())),
-					index: (index.block != 0).then_some(index),
-					gate,
-				}))
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.unwrap_or(0);
+				// The token budget and the scoring geometry follow the head width, so a
+				// model saved without them reads as a block budget over raw planes.
+				index.tokens = fields.next().map(|field| value_at(Some(field), "indexer token budget")).transpose()?.unwrap_or(0);
+				let score_normalization = fields.next().map(|field| normalization(Some(field), "indexer scoring normalization")).transpose()?.flatten();
+				let score_dims = fields.next().map(|field| value_at(Some(field), "indexer rotary dimensions")).transpose()?.unwrap_or(0);
+				index.score = score_normalization.map(|normalization| (normalization, score_dims));
+				Ok(Operation::Attention(AttentionBlock { heads, kv, width, rope: (dims != 0).then_some((dims, base.to_bits())), index: (index.block != 0).then_some(index), gate }))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
@@ -6978,13 +6993,25 @@ impl PartialEq for Estimator {
 impl Eq for Estimator {}
 /// Indexer that scores every key block and keeps the best `keep` blocks per
 /// query. `heads` query projections and one shared key projection, both
-/// `width` wide, compress `block` keys into one block score.
+/// `width` wide, compress `block` keys into one block score. A `tokens` budget
+/// states the admission in keys instead and keeps the blocks that cover it.
+/// `score` normalizes each indexer head with a trained scale and rotates its
+/// leading dimensions before scoring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Indexer {
 	heads: usize,
 	width: usize,
 	block: usize,
 	keep: usize,
+	tokens: usize,
+	score: Option<(BlockNormalization, usize)>,
+}
+impl Indexer {
+	const NONE: Self = Self { heads: 0, width: 0, block: 0, keep: 0, tokens: 0, score: None };
+	/// Blocks a query keeps: the blocks that cover the token budget, or `keep`.
+	fn admitted(self) -> usize {
+		if self.tokens == 0 { self.keep } else { self.tokens.div_ceil(self.block) }
+	}
 }
 /// One attention block: query heads, key-value heads, the head width, and the
 /// rotary, indexer and output gate selectors. A zero width takes the head width
@@ -7322,7 +7349,30 @@ impl Model {
 	/// projections and one key projection, each `width` wide, score every group
 	/// of `block` keys, and each query attends to its best `keep` blocks.
 	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
+	}
+	/// Token budget of the preceding `index`: each query keeps the blocks that
+	/// cover `tokens` keys, which is how a checkpoint's `attention.indexer.top_k`
+	/// states its admission. A budget that covers the sequence is dense attention.
+	pub fn budget(&self, tokens: usize) -> Self {
+		self.indexer("budget", |index| index.tokens = tokens)
+	}
+	/// Trained scoring geometry of the preceding `index`: every indexer query and
+	/// key head normalizes under `normalization` with its own trained scale, and
+	/// its leading `dims` channels rotate at the block's `rope` base before the
+	/// indexer scores. Zero `dims` leaves the planes unrotated.
+	pub fn score(&self, normalization: impl NormalizationSelector, dims: usize) -> Self {
+		let normalization = normalization.normalization();
+		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
+			panic!("indexer scoring normalization must be rms or l2");
+		}
+		self.indexer("score", |index| index.score = Some((normalization, dims)))
+	}
+	fn indexer(&self, selector: &str, apply: impl FnOnce(&mut Indexer)) -> Self {
+		self.attention(selector, |attention| match &mut attention.index {
+			Some(index) => apply(index),
+			None => panic!("{selector} requires a preceding index"),
+		})
 	}
 	/// Sigmoid gate on the output of the preceding `attn` block, from its own
 	/// projection of the block input.
@@ -10988,22 +11038,14 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
 	let AttentionBlock { heads, kv, rope, index, gate, .. } = attention;
-	let input = graph.output;
+	let (input, source) = (graph.output, graph.source);
 	// The heads attend at their own width, so the inner width the block spans is
 	// independent of the stream the output projection returns to.
 	let (width, inner) = attention.extent(input.channels)?;
 	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
-	let side = match index {
-		Some(index) => {
-			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
-			require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
-			checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?
-		}
-		None => 0,
-	};
 	let gated = if gate { inner } else { 0 };
-	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
+	lower_project(graph, checked_add(pairs, gated, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
@@ -11015,10 +11057,33 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	}
-	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+	let (main, main_shape) = (graph.source, graph.output);
+	// The indexer is its own projection of the block input, so a checkpoint binds
+	// its indexer tensors as their own node in whatever layout they hold, and the
+	// normalization and rotary the model trained sit on that projection as graph
+	// nodes: every indexer head normalizes under `.score`, or to unit length
+	// without it, before the attention node scores plain dot products.
+	let indexer = index.unwrap_or(Indexer::NONE);
+	let mut side = -2;
+	if let Some(index) = index {
+		require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
+		require(index.block != 0 && index.admitted() != 0, "indexer selection must be positive")?;
+		reset(graph, source, input);
+		lower_project(graph, checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?)?;
+		let (normalization, dims) = index.score.unwrap_or((BlockNormalization::L2, 0));
+		let planes = graph.output.channels;
+		lower_normalize(graph, normalization, index.width, planes)?;
+		if dims != 0 {
+			let (_, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
+			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, planes as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+		}
+		side = graph.source;
+		reset(graph, main, main_shape);
+	}
 	let epsilon = graph.epsilon;
-	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
-	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
+	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading

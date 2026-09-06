@@ -1965,34 +1965,6 @@ define internal double @attention_tile_score(i32 %query, i32 %key, i32 %width, i
 %result = call double @recipe.encode(RECIPE_STATE %score)
 ret double %result
 }
-; Inverse Euclidean norm of a strided indexer vector, floored by the epsilon.
-define internal double @attention_index_scale(ptr addrspace(1) nocapture readonly %input, i32 %base, i32 %count, i32 %stride, double %epsilon) #1 { entry:
-%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
-br label %loop
-loop:
-%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
-%sum = phi RECIPE_STATE [ %zero, %entry ], [ %sum.next, %step ]
-%more = icmp ult i32 %i, %count
-br i1 %more, label %step, label %done
-step:
-%offset = mul i32 %i, %stride
-%index = add i32 %base, %offset
-%ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
-%value = load double, ptr addrspace(1) %ptr, align 8
-%wide = call RECIPE_STATE @recipe.decode(double %value)
-%square = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %wide, RECIPE_STATE %wide)
-%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %square)
-%i.next = add i32 %i, 1
-br label %loop
-done:
-%epsilon.wide = call RECIPE_STATE @recipe.decode(double %epsilon)
-%shifted = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %epsilon.wide)
-%root = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %shifted)
-%one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
-%inverse = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %root)
-%result = call double @recipe.encode(RECIPE_STATE %inverse)
-ret double %result
-}
 ; True when the query keeps the block that holds this key. Each query owns one
 ; row of block scores followed by one admission flag per block.
 define internal i1 @attention_selected(ptr addrspace(1) nocapture readonly %context, i32 %score.row, i32 %blocks, i32 %select.block, i32 %query, i32 %key) #1 { entry:
@@ -2007,25 +1979,67 @@ define internal i1 @attention_selected(ptr addrspace(1) nocapture readonly %cont
 %result = call i1 @recipe.ogt(double %flag, double 5.000000e-01)
 ret i1 %result
 }
-; One key-block representative of the indexer: the sum of the unit norm indexer
-; keys inside the block.
-define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) %context,
-i32 %p, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads, i32 %index.width,
+; The indexer planes live in their own arena, the side projection's output: one
+; row holds %index.heads query heads of %index.width channels, then one key
+; plane of %index.width channels, each channel %length positions long. Whatever
+; normalization and rotary the model trained sit on that arena as graph nodes,
+; so the scores here are plain dot products of what the graph delivered.
+; One dimension of the block representative a query scores: the mean of the
+; indexer keys of the block that the query can see. A block before the query's
+; own is whole, so its mean is the running sum the index body keeps over
+; `select.block` keys; the query's own block is the causal prefix through the
+; query, summed here in key order, which is the order the running sum took.
+define internal double @attention_index_representative(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %context,
+i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d) #1 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
+%start = mul i32 %block.index, %select.block
+%query.block = udiv i32 %query, %select.block
+%own = icmp eq i32 %block.index, %query.block
+%query.next = add i32 %query, 1
+%count = select i1 %own, i32 %query.next, i32 %select.block
+%count.less = select i1 %own, i32 %start, i32 0
+%filled = sub i32 %count, %count.less
+%d.offset = mul i32 %d, %length
+br i1 %own, label %prefix.loop, label %cached
+cached:
+%cached.block = mul i32 %block.index, %index.width
+%cached.row = add i32 %representative.start, %cached.block
+%cached.index = add i32 %cached.row, %d
+%cached.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cached.index
+%cached.value = load double, ptr addrspace(1) %cached.ptr, align 8
+br label %done
+prefix.loop:
+%key = phi i32 [ %start, %entry ], [ %key.next, %prefix.step ]
+%sum = phi double [ %model.zero, %entry ], [ %sum.next, %prefix.step ]
+%more = icmp ult i32 %key, %query.next
+br i1 %more, label %prefix.step, label %done
+prefix.step:
+%key.position = add i32 %key.origin, %key
+%key.index = add i32 %key.position, %d.offset
+%key.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %key.index
+%key.value = load double, ptr addrspace(1) %key.ptr, align 8
+%sum.next = call double @recipe.add(double %sum, double %key.value)
+%key.next = add i32 %key, 1
+br label %prefix.loop
+done:
+%total = phi double [ %cached.value, %cached ], [ %sum, %prefix.loop ]
+%filled.value = call double @recipe.from.u32(i32 %filled)
+%mean = call double @recipe.div(double %total, double %filled.value)
+ret double %mean
+}
+; The running sum of indexer keys of one key block, extended by the keys of the
+; block that lie in the forward window `begin..end`. A block whose first key
+; lies in the window starts from zero; one that began earlier keeps the sum an
+; earlier window left, so a decode step adds one key to one block.
+define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) %context,
+i32 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads, i32 %index.width,
 i32 %select.block, i1 %gate, double %epsilon ) #1 { entry:
 %length = udiv i32 %from, %channels
-%head.width = udiv i32 %channels, %heads
-%kv.channels = mul i32 %kv.heads, %head.width
-%kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
 %index.query.channels = mul i32 %index.heads, %index.width
 %index.channels = add i32 %index.query.channels, %index.width
-%index.plane = mul i32 %index.channels, %length
-%gate.plane = select i1 %gate, i32 %from, i32 0
-%index.query.base = add i32 %from, %kv.planes
-%index.key.plane = mul i32 %index.query.channels, %length
-%index.key.base = add i32 %index.query.base, %index.key.plane
-%row.stride.index = add i32 %index.query.base, %index.plane
-%row.stride = add i32 %row.stride.index, %gate.plane
+%row.stride = mul i32 %index.channels, %length
+%index.key.base = mul i32 %index.query.channels, %length
 %blocks.numerator = add i32 %length, %select.block
 %blocks.less = sub i32 %blocks.numerator, 1
 %blocks = udiv i32 %blocks.less, %select.block
@@ -2043,11 +2057,16 @@ i32 %select.block, i1 %gate, double %epsilon ) #1 { entry:
 %representative.start = add i32 %representative.start.row, %representative.block
 %start = mul i32 %block.index, %select.block
 %stop.full = add i32 %start, %select.block
-%stop.over = icmp ugt i32 %stop.full, %length
-%stop = select i1 %stop.over, i32 %length, i32 %stop.full
+%stop.over = icmp ugt i32 %stop.full, %end
+%stop = select i1 %stop.over, i32 %end, i32 %stop.full
+%first.before = icmp ult i32 %start, %begin
+%first = select i1 %first.before, i32 %begin, i32 %start
+%fresh = icmp uge i32 %start, %begin
+%extends = icmp ult i32 %first, %stop
+%clear = and i1 %fresh, %extends
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
-br label %clear.loop
+br i1 %clear, label %clear.loop, label %key.loop
 clear.loop:
 %clear.d = phi i32 [ 0, %entry ], [ %clear.next, %clear.step ]
 %clear.more = icmp ult i32 %clear.d, %index.width
@@ -2059,12 +2078,11 @@ store double %model.zero, ptr addrspace(1) %clear.ptr, align 8
 %clear.next = add i32 %clear.d, 1
 br label %clear.loop
 key.loop:
-%key = phi i32 [ %start, %clear.loop ], [ %key.advance, %key.step ]
+%key = phi i32 [ %first, %entry ], [ %first, %clear.loop ], [ %key.advance, %key.step ]
 %key.more = icmp ult i32 %key, %stop
 br i1 %key.more, label %key.prepare, label %exit
 key.prepare:
 %key.position = add i32 %key.origin, %key
-%key.scale = call double @attention_index_scale(ptr addrspace(1) %input, i32 %key.position, i32 %index.width, i32 %length, double %epsilon)
 br label %dim.loop
 dim.loop:
 %dim = phi i32 [ 0, %key.prepare ], [ %dim.advance, %dim.step ]
@@ -2073,13 +2091,12 @@ br i1 %dim.more, label %dim.step, label %key.step
 dim.step:
 %dim.offset = mul i32 %dim, %length
 %dim.index = add i32 %key.position, %dim.offset
-%dim.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %dim.index
+%dim.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %dim.index
 %dim.value = load double, ptr addrspace(1) %dim.ptr, align 8
-%dim.unit = call double @recipe.mul(double %dim.value, double %key.scale)
 %dim.target = add i32 %representative.start, %dim
 %dim.target.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dim.target
 %dim.prior = load double, ptr addrspace(1) %dim.target.ptr, align 8
-%dim.sum = call double @recipe.add(double %dim.prior, double %dim.unit)
+%dim.sum = call double @recipe.add(double %dim.prior, double %dim.value)
 store double %dim.sum, ptr addrspace(1) %dim.target.ptr, align 8
 %dim.advance = add i32 %dim, 1
 br label %dim.loop
@@ -2089,24 +2106,18 @@ br label %key.loop
 exit:
 ret void
 }
-; Block scores and the selection threshold of one query. The indexer scores
-; every causal block and the threshold is the score of the keep-th best, so a
-; query keeps every block whose score reaches it.
-define internal void @attention_select_body( ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) %context,
+; Block scores and the selection threshold of one query. Every indexer query
+; head scores every causal block representative, the heads' scores add, and
+; the threshold is the score of the keep-th best, so a query keeps every block
+; whose score reaches it.
+define internal void @attention_select_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) %context,
 i32 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads,
 i32 %index.width, i32 %select.block, i1 %gate, double %epsilon ) #1 { entry:
 %length = udiv i32 %from, %channels
-%head.width = udiv i32 %channels, %heads
-%kv.channels = mul i32 %kv.heads, %head.width
-%kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
 %index.query.channels = mul i32 %index.heads, %index.width
 %index.channels = add i32 %index.query.channels, %index.width
-%index.plane = mul i32 %index.channels, %length
-%gate.plane = select i1 %gate, i32 %from, i32 0
-%index.query.base = add i32 %from, %kv.planes
-%row.stride.index = add i32 %index.query.base, %index.plane
-%row.stride = add i32 %row.stride.index, %gate.plane
+%row.stride = mul i32 %index.channels, %length
+%index.key.base = mul i32 %index.query.channels, %length
 %blocks.numerator = add i32 %length, %select.block
 %blocks.less = sub i32 %blocks.numerator, 1
 %blocks = udiv i32 %blocks.less, %select.block
@@ -2120,8 +2131,8 @@ i32 %index.width, i32 %select.block, i1 %gate, double %epsilon ) #1 { entry:
 %row = udiv i32 %p, %length
 %query = urem i32 %p, %length
 %row.base = mul i32 %row, %row.stride
-%query.origin = add i32 %row.base, %index.query.base
-%query.position = add i32 %query.origin, %query
+%key.origin = add i32 %row.base, %index.key.base
+%query.position = add i32 %row.base, %query
 %count.less = udiv i32 %query, %select.block
 %count = add i32 %count.less, 1
 %score.query = mul i32 %p, %score.stride
@@ -2173,16 +2184,12 @@ head.prepare:
 %head.offset = mul i32 %head, %index.width
 %head.plane = mul i32 %head.offset, %length
 %head.base = add i32 %query.position, %head.plane
-%head.scale = call double @attention_index_scale(ptr addrspace(1) %input, i32 %head.base, i32 %index.width, i32 %length, double %epsilon)
-%head.scale.wide = call RECIPE_STATE @recipe.decode(double %head.scale)
 br label %score.loop
 score.loop:
 %score.b = phi i32 [ 0, %head.prepare ], [ %score.advance, %score.store ]
 %score.more = icmp ult i32 %score.b, %count
 br i1 %score.more, label %score.prepare, label %head.done
 score.prepare:
-%score.representative = mul i32 %score.b, %index.width
-%score.representative.base = add i32 %representative.start, %score.representative
 br label %score.dim.loop
 score.dim.loop:
 %score.d = phi i32 [ 0, %score.prepare ], [ %score.d.advance, %score.dim.step ]
@@ -2192,11 +2199,10 @@ br i1 %score.dim.more, label %score.dim.step, label %score.store
 score.dim.step:
 %score.dim.offset = mul i32 %score.d, %length
 %score.query.index = add i32 %head.base, %score.dim.offset
-%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %score.query.index
+%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %score.query.index
 %score.query.value = load double, ptr addrspace(1) %score.query.ptr, align 8
-%score.representative.index = add i32 %score.representative.base, %score.d
-%score.representative.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %score.representative.index
-%score.representative.value = load double, ptr addrspace(1) %score.representative.ptr, align 8
+%score.representative.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
+i32 %key.origin, i32 %representative.start, i32 %query, i32 %score.b, i32 %select.block, i32 %index.width, i32 %length, i32 %score.d)
 %score.query.wide = call RECIPE_STATE @recipe.decode(double %score.query.value)
 %score.representative.wide = call RECIPE_STATE @recipe.decode(double %score.representative.value)
 %score.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %score.query.wide, RECIPE_STATE %score.representative.wide)
@@ -2204,12 +2210,11 @@ score.dim.step:
 %score.d.advance = add i32 %score.d, 1
 br label %score.dim.loop
 score.store:
-%score.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %score.sum, RECIPE_STATE %head.scale.wide)
 %score.index = add i32 %score.start, %score.b
 %score.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %score.index
 %score.prior = load double, ptr addrspace(1) %score.ptr, align 8
 %score.prior.wide = call RECIPE_STATE @recipe.decode(double %score.prior)
-%score.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %score.prior.wide, RECIPE_STATE %score.scaled)
+%score.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %score.prior.wide, RECIPE_STATE %score.sum)
 %score.value = call double @recipe.encode(RECIPE_STATE %score.total)
 store double %score.value, ptr addrspace(1) %score.ptr, align 8
 %score.advance = add i32 %score.b, 1
@@ -2282,10 +2287,11 @@ br label %loop
 done:
 ret RECIPE_STATE %sum
 }
-; One channel of the unit indexer query gradient: every causal block
-; representative weighted by the gradient of the block score it scored.
-define internal RECIPE_STATE @attention_index_query_gradient(ptr addrspace(1) nocapture readonly %context, i32 %derivative.base,
-i32 %derivative.stride, i32 %representative.base, i32 %heads, i32 %count, i32 %index.width, i32 %channel) #1 { entry:
+; One channel of an indexer query head's gradient: every causal block
+; representative the query scored, weighted by the gradient of its block score.
+define internal RECIPE_STATE @attention_index_query_gradient(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %context,
+i32 %key.origin, i32 %derivative.base, i32 %derivative.stride, i32 %representative.base, i32 %heads, i32 %query, i32 %count,
+i32 %select.block, i32 %index.width, i32 %length, i32 %channel) #1 { entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 br label %loop
 loop:
@@ -2296,11 +2302,8 @@ br i1 %more, label %step, label %done
 step:
 %slot = add i32 %derivative.base, %block
 %gradient = call RECIPE_STATE @attention_index_block_gradient(ptr addrspace(1) %context, i32 %slot, i32 %derivative.stride, i32 %heads)
-%representative.offset = mul i32 %block, %index.width
-%representative.row = add i32 %representative.base, %representative.offset
-%representative.index = add i32 %representative.row, %channel
-%representative.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %representative.index
-%representative.value = load double, ptr addrspace(1) %representative.ptr, align 8
+%representative.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
+i32 %key.origin, i32 %representative.base, i32 %query, i32 %block, i32 %select.block, i32 %index.width, i32 %length, i32 %channel)
 %representative.wide = call RECIPE_STATE @recipe.decode(double %representative.value)
 %term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %gradient, RECIPE_STATE %representative.wide)
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %term)
@@ -2309,17 +2312,19 @@ br label %loop
 done:
 ret RECIPE_STATE %sum
 }
-; One channel of the unit indexer key gradient. The representative sums the
-; unit keys of the block, so every query that scores the block contributes its
-; block score gradient times the sum of its unit indexer queries.
-define internal RECIPE_STATE @attention_index_key_gradient(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %context,
+; One channel of the indexer key gradient. The representative a query scores is
+; the mean of the keys it can see, so every query from the key's own position
+; on contributes its block score gradient times the sum of its indexer query
+; heads over the keys its representative averaged.
+define internal RECIPE_STATE @attention_index_key_gradient(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %context,
 i32 %query.origin, i32 %derivative.row, i32 %derivative.stride, i32 %heads, i32 %index.heads, i32 %index.width,
-i32 %length, i32 %blocks, i32 %block.index, i32 %start, i32 %channel, double %epsilon ) #1 { entry:
+i32 %length, i32 %blocks, i32 %block.index, i32 %start, i32 %position, i32 %select.block, i32 %channel ) #1 { entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %channel.offset = mul i32 %channel, %length
+%whole.count = call RECIPE_STATE @recipe.state.from.u32(i32 %select.block)
 br label %query.loop
 query.loop:
-%query = phi i32 [ %start, %entry ], [ %query.next, %query.step ]
+%query = phi i32 [ %position, %entry ], [ %query.next, %query.step ]
 %sum = phi RECIPE_STATE [ %zero, %entry ], [ %sum.next, %query.step ]
 %more = icmp ult i32 %query, %length
 br i1 %more, label %query.prepare, label %done
@@ -2328,6 +2333,12 @@ query.prepare:
 %query.row = add i32 %derivative.row, %query.offset
 %query.slot = add i32 %query.row, %block.index
 %gradient = call RECIPE_STATE @attention_index_block_gradient(ptr addrspace(1) %context, i32 %query.slot, i32 %derivative.stride, i32 %heads)
+%query.block = udiv i32 %query, %select.block
+%own = icmp eq i32 %query.block, %block.index
+%own.next = add i32 %query, 1
+%own.filled = sub i32 %own.next, %start
+%own.count = call RECIPE_STATE @recipe.state.from.u32(i32 %own.filled)
+%filled = select i1 %own, RECIPE_STATE %own.count, RECIPE_STATE %whole.count
 %query.position = add i32 %query.origin, %query
 br label %head.loop
 head.loop:
@@ -2339,44 +2350,34 @@ head.step:
 %head.channels = mul i32 %head, %index.width
 %head.plane = mul i32 %head.channels, %length
 %head.base = add i32 %query.position, %head.plane
-%head.scale = call double @attention_index_scale(ptr addrspace(1) %input, i32 %head.base, i32 %index.width, i32 %length, double %epsilon)
 %head.index = add i32 %head.base, %channel.offset
-%head.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %head.index
+%head.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %head.index
 %head.value = load double, ptr addrspace(1) %head.ptr, align 8
-%head.unit = call double @recipe.mul(double %head.value, double %head.scale)
-%head.wide = call RECIPE_STATE @recipe.decode(double %head.unit)
+%head.wide = call RECIPE_STATE @recipe.decode(double %head.value)
 %unit.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %unit, RECIPE_STATE %head.wide)
 %head.next = add i32 %head, 1
 br label %head.loop
 query.step:
-%term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %gradient, RECIPE_STATE %unit)
+%unit.mean = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %unit, RECIPE_STATE %filled)
+%term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %gradient, RECIPE_STATE %unit.mean)
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %term)
 %query.next = add i32 %query, 1
 br label %query.loop
 done:
 ret RECIPE_STATE %sum
 }
-; Indexer gradient of one sequence position. A block score biases the logits of
-; the keys the block admits, so its gradient is the softmax derivative summed
-; over those keys, and the chain rule carries it through the unit norms into
-; the indexer query planes and the shared indexer key plane.
-define internal void @attention_index_reverse_body( ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %context,
-ptr addrspace(1) nocapture writeonly %previous, i32 %p, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads,
+; Indexer gradient of one sequence position, written into the side
+; projection's adjoint. A block score gates the keys the block admits, so its
+; gradient is the softmax derivative summed over those keys, and the chain rule
+; carries it into the indexer query heads and the shared indexer key plane.
+define internal void @attention_index_reverse_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %context,
+ptr addrspace(1) nocapture writeonly %adjoint, i32 %p, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads,
 i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon ) #3 { entry:
 %length = udiv i32 %from, %channels
-%head.width = udiv i32 %channels, %heads
-%kv.channels = mul i32 %kv.heads, %head.width
-%kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
 %index.query.channels = mul i32 %index.heads, %index.width
 %index.channels = add i32 %index.query.channels, %index.width
-%index.plane = mul i32 %index.channels, %length
-%gate.plane = select i1 %gate, i32 %from, i32 0
-%index.query.base = add i32 %from, %kv.planes
-%index.key.plane = mul i32 %index.query.channels, %length
-%index.key.base = add i32 %index.query.base, %index.key.plane
-%row.stride.index = add i32 %index.query.base, %index.plane
-%row.stride = add i32 %row.stride.index, %gate.plane
+%row.stride = mul i32 %index.channels, %length
+%index.key.base = mul i32 %index.query.channels, %length
 %blocks.numerator = add i32 %length, %select.block
 %blocks.less = sub i32 %blocks.numerator, 1
 %blocks = udiv i32 %blocks.less, %select.block
@@ -2395,7 +2396,6 @@ i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon
 %row = udiv i32 %p, %length
 %position = urem i32 %p, %length
 %row.base = mul i32 %row, %row.stride
-%query.origin = add i32 %row.base, %index.query.base
 %key.origin = add i32 %row.base, %index.key.base
 %representative.row = mul i32 %row, %representative.stride
 %representative.start = add i32 %representative.base, %representative.row
@@ -2405,9 +2405,8 @@ i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon
 %derivative.start = add i32 %derivative.row.start, %derivative.query
 %count.less = udiv i32 %position, %select.block
 %count = add i32 %count.less, 1
-%query.position = add i32 %query.origin, %position
+%query.position = add i32 %row.base, %position
 %key.position = add i32 %key.origin, %position
-%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 br label %query.head.loop
 query.head.loop:
 %query.head = phi i32 [ 0, %entry ], [ %query.head.next, %query.head.done ]
@@ -2417,48 +2416,18 @@ query.head.prepare:
 %query.head.channels = mul i32 %query.head, %index.width
 %query.head.plane = mul i32 %query.head.channels, %length
 %query.head.base = add i32 %query.position, %query.head.plane
-%query.head.scale = call double @attention_index_scale(ptr addrspace(1) %input, i32 %query.head.base, i32 %index.width, i32 %length, double %epsilon)
-%query.head.scale.wide = call RECIPE_STATE @recipe.decode(double %query.head.scale)
-br label %query.dot.loop
-query.dot.loop:
-%query.dot.d = phi i32 [ 0, %query.head.prepare ], [ %query.dot.next, %query.dot.step ]
-%query.dot.sum = phi RECIPE_STATE [ %state.zero, %query.head.prepare ], [ %query.dot.sum.next, %query.dot.step ]
-%query.dot.more = icmp ult i32 %query.dot.d, %index.width
-br i1 %query.dot.more, label %query.dot.step, label %query.store.prepare
-query.dot.step:
-%query.dot.gradient = call RECIPE_STATE @attention_index_query_gradient(ptr addrspace(1) %context, i32 %derivative.start,
-i32 %derivative.head.stride, i32 %representative.start, i32 %heads, i32 %count, i32 %index.width, i32 %query.dot.d)
-%query.dot.offset = mul i32 %query.dot.d, %length
-%query.dot.index = add i32 %query.head.base, %query.dot.offset
-%query.dot.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.dot.index
-%query.dot.value = load double, ptr addrspace(1) %query.dot.ptr, align 8
-%query.dot.wide = call RECIPE_STATE @recipe.decode(double %query.dot.value)
-%query.dot.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.dot.wide, RECIPE_STATE %query.dot.gradient)
-%query.dot.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %query.dot.sum, RECIPE_STATE %query.dot.term)
-%query.dot.next = add i32 %query.dot.d, 1
-br label %query.dot.loop
-query.store.prepare:
-%query.dot.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.dot.sum, RECIPE_STATE %query.head.scale.wide)
-%query.scale.square = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.head.scale.wide, RECIPE_STATE %query.head.scale.wide)
-%query.factor = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.dot.scaled, RECIPE_STATE %query.scale.square)
 br label %query.store.loop
 query.store.loop:
-%query.store.d = phi i32 [ 0, %query.store.prepare ], [ %query.store.next, %query.store.step ]
+%query.store.d = phi i32 [ 0, %query.head.prepare ], [ %query.store.next, %query.store.step ]
 %query.store.more = icmp ult i32 %query.store.d, %index.width
 br i1 %query.store.more, label %query.store.step, label %query.head.done
 query.store.step:
-%query.store.gradient = call RECIPE_STATE @attention_index_query_gradient(ptr addrspace(1) %context, i32 %derivative.start,
-i32 %derivative.head.stride, i32 %representative.start, i32 %heads, i32 %count, i32 %index.width, i32 %query.store.d)
+%query.store.gradient = call RECIPE_STATE @attention_index_query_gradient(ptr addrspace(1) %indexer, ptr addrspace(1) %context, i32 %key.origin, i32 %derivative.start,
+i32 %derivative.head.stride, i32 %representative.start, i32 %heads, i32 %position, i32 %count, i32 %select.block, i32 %index.width, i32 %length, i32 %query.store.d)
 %query.store.offset = mul i32 %query.store.d, %length
 %query.store.index = add i32 %query.head.base, %query.store.offset
-%query.store.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.store.index
-%query.store.value = load double, ptr addrspace(1) %query.store.ptr, align 8
-%query.store.wide = call RECIPE_STATE @recipe.decode(double %query.store.value)
-%query.store.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.store.gradient, RECIPE_STATE %query.head.scale.wide)
-%query.store.projection = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.store.wide, RECIPE_STATE %query.factor)
-%query.store.total = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %query.store.scaled, RECIPE_STATE %query.store.projection)
-%query.store.result = call double @recipe.encode(RECIPE_STATE %query.store.total)
-%query.store.target = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %query.store.index
+%query.store.result = call double @recipe.encode(RECIPE_STATE %query.store.gradient)
+%query.store.target = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %query.store.index
 store double %query.store.result, ptr addrspace(1) %query.store.target, align 8
 %query.store.next = add i32 %query.store.d, 1
 br label %query.store.loop
@@ -2468,50 +2437,19 @@ br label %query.head.loop
 key.prepare:
 %key.block = udiv i32 %position, %select.block
 %key.start = mul i32 %key.block, %select.block
-%key.scale = call double @attention_index_scale(ptr addrspace(1) %input, i32 %key.position, i32 %index.width, i32 %length, double %epsilon)
-%key.scale.wide = call RECIPE_STATE @recipe.decode(double %key.scale)
-br label %key.dot.loop
-key.dot.loop:
-%key.dot.d = phi i32 [ 0, %key.prepare ], [ %key.dot.next, %key.dot.step ]
-%key.dot.sum = phi RECIPE_STATE [ %state.zero, %key.prepare ], [ %key.dot.sum.next, %key.dot.step ]
-%key.dot.more = icmp ult i32 %key.dot.d, %index.width
-br i1 %key.dot.more, label %key.dot.step, label %key.store.prepare
-key.dot.step:
-%key.dot.gradient = call RECIPE_STATE @attention_index_key_gradient(ptr addrspace(1) %input, ptr addrspace(1) %context,
-i32 %query.origin, i32 %derivative.row.start, i32 %derivative.head.stride, i32 %heads, i32 %index.heads, i32 %index.width,
-i32 %length, i32 %blocks, i32 %key.block, i32 %key.start, i32 %key.dot.d, double %epsilon)
-%key.dot.offset = mul i32 %key.dot.d, %length
-%key.dot.index = add i32 %key.position, %key.dot.offset
-%key.dot.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %key.dot.index
-%key.dot.value = load double, ptr addrspace(1) %key.dot.ptr, align 8
-%key.dot.wide = call RECIPE_STATE @recipe.decode(double %key.dot.value)
-%key.dot.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.dot.wide, RECIPE_STATE %key.dot.gradient)
-%key.dot.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %key.dot.sum, RECIPE_STATE %key.dot.term)
-%key.dot.next = add i32 %key.dot.d, 1
-br label %key.dot.loop
-key.store.prepare:
-%key.dot.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.dot.sum, RECIPE_STATE %key.scale.wide)
-%key.scale.square = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.scale.wide, RECIPE_STATE %key.scale.wide)
-%key.factor = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.dot.scaled, RECIPE_STATE %key.scale.square)
 br label %key.store.loop
 key.store.loop:
-%key.store.d = phi i32 [ 0, %key.store.prepare ], [ %key.store.next, %key.store.step ]
+%key.store.d = phi i32 [ 0, %key.prepare ], [ %key.store.next, %key.store.step ]
 %key.store.more = icmp ult i32 %key.store.d, %index.width
 br i1 %key.store.more, label %key.store.step, label %exit
 key.store.step:
-%key.store.gradient = call RECIPE_STATE @attention_index_key_gradient(ptr addrspace(1) %input, ptr addrspace(1) %context,
-i32 %query.origin, i32 %derivative.row.start, i32 %derivative.head.stride, i32 %heads, i32 %index.heads, i32 %index.width,
-i32 %length, i32 %blocks, i32 %key.block, i32 %key.start, i32 %key.store.d, double %epsilon)
+%key.store.gradient = call RECIPE_STATE @attention_index_key_gradient(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
+i32 %row.base, i32 %derivative.row.start, i32 %derivative.head.stride, i32 %heads, i32 %index.heads, i32 %index.width,
+i32 %length, i32 %blocks, i32 %key.block, i32 %key.start, i32 %position, i32 %select.block, i32 %key.store.d)
 %key.store.offset = mul i32 %key.store.d, %length
 %key.store.index = add i32 %key.position, %key.store.offset
-%key.store.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %key.store.index
-%key.store.value = load double, ptr addrspace(1) %key.store.ptr, align 8
-%key.store.wide = call RECIPE_STATE @recipe.decode(double %key.store.value)
-%key.store.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.store.gradient, RECIPE_STATE %key.scale.wide)
-%key.store.projection = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %key.store.wide, RECIPE_STATE %key.factor)
-%key.store.total = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.store.scaled, RECIPE_STATE %key.store.projection)
-%key.store.result = call double @recipe.encode(RECIPE_STATE %key.store.total)
-%key.store.target = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %key.store.index
+%key.store.result = call double @recipe.encode(RECIPE_STATE %key.store.gradient)
+%key.store.target = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %key.store.index
 store double %key.store.result, ptr addrspace(1) %key.store.target, align 8
 %key.store.next = add i32 %key.store.d, 1
 br label %key.store.loop
@@ -2656,7 +2594,7 @@ i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, 
 %index.plane = mul i32 %index.channels, %length
 %gate.plane = select i1 %gate, i32 %from, i32 0
 %index.query.base = add i32 %from, %kv.planes
-%gate.base = add i32 %index.query.base, %index.plane
+%gate.base = add i32 %index.query.base, 0
 %row.stride = add i32 %gate.base, %gate.plane
 %select = icmp ne i32 %select.block, 0
 %block.divisor = select i1 %select, i32 %select.block, i32 1
@@ -2885,7 +2823,12 @@ probability.prepare:
 %denominator.index = add i32 %denominator.base.shared, %softmax.query
 %denominator.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %denominator.index
 %denominator.old = load double, ptr addrspace(3) %denominator.ptr, align 8
-%maximum.old.centered = call double @recipe.sub(double %maximum.old, double %maximum.value)
+; A query whose admitted keys all lie in later tiles has no score yet, so its
+; maximum is still the initial negative infinity. Centering on zero instead
+; keeps its rescale and probabilities at zero rather than exp(-inf - -inf).
+%maximum.scored = call i1 @recipe.ogt(double %maximum.value, double 0xFFF0000000000000)
+%maximum.safe = select i1 %maximum.scored, double %maximum.value, double 0.0
+%maximum.old.centered = call double @recipe.sub(double %maximum.old, double %maximum.safe)
 %old.rescale = call double @recipe.exp(double %maximum.old.centered)
 %denominator.old.wide = call RECIPE_STATE @recipe.decode(double %denominator.old)
 %old.rescale.wide = call RECIPE_STATE @recipe.decode(double %old.rescale)
@@ -2902,7 +2845,7 @@ probability.step:
 %probability.score.index = add i32 %score.base.shared, %probability.local
 %probability.score.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.score.index
 %probability.score = load double, ptr addrspace(3) %probability.score.ptr, align 8
-%probability.centered = call double @recipe.sub(double %probability.score, double %maximum.value)
+%probability.centered = call double @recipe.sub(double %probability.score, double %maximum.safe)
 %probability.value = call double @recipe.exp(double %probability.centered)
 %probability.index = add i32 %probability.base.shared, %probability.local
 %probability.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.index
@@ -3659,7 +3602,7 @@ i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, 
 %index.plane = mul i32 %index.channels, %length
 %gate.plane = select i1 %gate, i32 %from, i32 0
 %index.query.base = add i32 %from, %kv.planes
-%gate.base = add i32 %index.query.base, %index.plane
+%gate.base = add i32 %index.query.base, 0
 %row.stride = add i32 %gate.base, %gate.plane
 %select = icmp ne i32 %select.block, 0
 %block.divisor = select i1 %select, i32 %select.block, i32 1
