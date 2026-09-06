@@ -2735,7 +2735,7 @@ impl NativeModelIr {
 				(false, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {decode} )\n",
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2743,7 +2743,22 @@ impl NativeModelIr {
 							value = pointers.value,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Inject) => {
+					emit_fixed_loop(&mut ir, index, "inject", self.rows, node.output, &window, |ir, p| {
+						ir.push_str(&format!(
+							"call void @inject_forward_body( {pointer} {source}, {pointer} {context}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							context = pointers.context,
+							value = pointers.value,
+							channels = node.output.channels,
+							length = node.output.length
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3002,14 +3017,15 @@ impl NativeModelIr {
 				(true, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3019,14 +3035,26 @@ impl NativeModelIr {
 					let whole = NodeWindow { begin: "0".to_owned(), span: kernel.to_string() };
 					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {offset} )\n",
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							delta = pointers.delta,
 							channels = node.output.channels,
 							length = node.output.length,
 							kernel = node.argument[0],
+							dilation = node.argument[1],
 							offset = node.offset
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Inject) => {
+					emit_fixed_loop(&mut ir, index, "inject.reverse", self.rows, node.input, &window, |ir, p| {
+						ir.push_str(&format!(
+							"call void @inject_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i32 {p} )\n",
+							pointer = pointer_type(backend),
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -5902,30 +5930,47 @@ mod ngram {
 			}
 			Ok(injected)
 		}
-		/// Inference with the gathered vector added to the stream: the blocks before
-		/// `ngram.layer` run on the selected device, the gather and the addition on
-		/// the host that holds the table, and the blocks from it on the device again.
-		pub fn infer(&self, path: impl AsRef<Path>, input: &[f64], ids: &[u32]) -> Vec<f64> {
-			self.decode(path.as_ref(), input, ids).unwrap_or_else(|error| panic!("{error}"))
+		/// The host stage of a stepped forward: the vector each token the step
+		/// reaches adds to the stream before `ngram.layer`, gathered from the table
+		/// this host holds.
+		fn stage(&self) -> Stage<'_> {
+			Stage {
+				block: self.layer,
+				width: self.width(),
+				values: Box::new(move |ids, mut tokens| {
+					tokens.try_fold(Vec::with_capacity(self.width()), |mut values, token| {
+						values.extend(self.inject(&ids[..=token])?);
+						Ok(values)
+					})
+				}),
+			}
 		}
-		fn decode(&self, path: &Path, input: &[f64], ids: &[u32]) -> Result<Vec<f64>> {
+		/// Inference with the gathered vector added to the stream: one tape holds
+		/// every block on the selected device, and the gather runs on the host that
+		/// holds the table before the tape reaches the block it feeds.
+		pub fn infer(&self, path: impl AsRef<Path>, input: &[f64], ids: &[u32]) -> Vec<f64> {
+			self.forward(path.as_ref(), input, ids).unwrap_or_else(|error| panic!("{error}"))
+		}
+		fn forward(&self, path: &Path, input: &[f64], ids: &[u32]) -> Result<Vec<f64>> {
 			let path = resolve_path(path)?;
 			let device = selected_gpu()?;
-			let injected = self.inject(ids)?;
 			bundle::run_infer(&path, input, |stored, samples| {
 				let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
-				let (head, tail) = split_at_block(&graph, self.layer)?;
-				let mut statistics = 0;
-				let mut stream = match &head {
-					Some(head) => forward_part(head, samples, device, stored, &mut statistics)?,
-					None => samples.to_vec(),
-				};
-				require(stream.len() == injected.len(), format!("block {} takes {} values, the n-gram table gathers {}", self.layer, stream.len(), injected.len()))?;
-				for (value, added) in stream.iter_mut().zip(&injected) {
-					*value += added;
-				}
-				forward_part(&tail, &stream, device, stored, &mut statistics)
+				let mut stepper = Stepper::new(graph, &[], &[device], samples, stored, vec![self.stage()])?;
+				stepper.forward(ids)?;
+				stepper.predictions()
 			})
+		}
+		/// Autoregressive decode with the gathered vector of every id added to the
+		/// stream: the same step as `recipe.decode`, with this host stage extending
+		/// the injected stream by the position each new id reaches.
+		pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+			try_decode(path, prompt, sampler, stop, budget, vec![self.stage()], |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		}
+		/// Answer `requests` decodes over HTTP, as `recipe.serve` does, with the
+		/// gathered vector of every id added to the stream.
+		pub fn serve(&self, path: impl AsRef<Path>, address: &str, requests: usize) {
+			try_serve(&path, address, requests, || vec![self.stage()]).unwrap_or_else(|error| panic!("{error}"));
 		}
 	}
 
@@ -6044,7 +6089,7 @@ mod bundle {
 			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
-			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
+			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!("delta,{},{},{},{},{},{}", delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output),
 		}
 	}
@@ -6115,7 +6160,12 @@ mod bundle {
 					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?,
 				))
 			}
-			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
+			"dconv" => {
+				let kernel = value_at(fields.next(), "depthwise convolution kernel")?;
+				// A bundle written before the taps could spread names no dilation, so an absent field is the contiguous form.
+				let dilation = fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1);
+				Ok(Operation::Dconv(kernel, dilation))
+			}
 			"delta" => {
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				// A bundle written before the extents were separable names neither, so
@@ -6882,7 +6932,7 @@ enum Operation {
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(usize, usize, Vec<Block>),
-	Dconv(usize),
+	Dconv(usize, usize),
 	Delta(DeltaBlock),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7053,7 +7103,7 @@ impl Model {
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
-	fn dconv(kernel: usize) = Operation::Dconv(kernel);
+	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
 	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
@@ -7103,6 +7153,17 @@ impl Model {
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
 		self.delta_block("out", |delta| delta.output = width)
+	}
+	/// Dilation of the preceding `dconv` block: its taps read positions `steps`
+	/// apart, so position `t` sees `t - (kernel - 1) * steps ..= t` in steps.
+	pub fn dilate(&self, steps: usize) -> Self {
+		let mut model = self.suffix();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("dilate requires a preceding dconv block"));
+		match &mut block.operation {
+			Operation::Dconv(_, dilation) => *dilation = steps,
+			_ => panic!("dilate requires a preceding dconv block"),
+		}
+		model
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -8549,7 +8610,7 @@ impl Operation {
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
-			Self::Dconv(_) => "dconv",
+			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 		}
 	}
@@ -8930,13 +8991,13 @@ impl Recipe {
 	/// position the decode has already settled. The decode ends at a `stop` id,
 	/// after `budget` ids, or when the ids fill the model's sequence.
 	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		try_decode(path, prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		try_decode(path, prompt, sampler, stop, budget, Vec::new(), |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP and return. A request names its prompt
 	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
 	/// and the answer sends each id as its own chunk as the decode reaches it.
 	pub fn serve(&self, path: impl AsRef<Path>, address: &str, requests: usize) {
-		try_serve(&path, address, requests).unwrap_or_else(|error| panic!("{error}"));
+		try_serve(&path, address, requests, Vec::new).unwrap_or_else(|error| panic!("{error}"));
 	}
 }
 fn request_field<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -8949,12 +9010,12 @@ fn request_ids(query: &str, name: &str) -> Result<Vec<u32>> {
 	request_field(query, name)
 		.map_or_else(|| Ok(Vec::new()), |value| value.split(',').map(|id| id.parse().map_err(|_| RecipeError::new(format!("request {name} holds {id:?}, which is not an id")))).collect())
 }
-fn try_serve(path: &impl AsRef<Path>, address: &str, requests: usize) -> Result<()> {
+fn try_serve<'a>(path: &impl AsRef<Path>, address: &str, requests: usize, stages: impl Fn() -> Vec<Stage<'a>>) -> Result<()> {
 	use std::io::Write as _;
 	let listener = std::net::TcpListener::bind(address).map_err(|error| RecipeError::new(format!("cannot serve decode on {address}: {error}")))?;
 	for _ in 0..requests {
 		let mut stream = listener.accept().map_err(|error| RecipeError::new(format!("cannot accept a decode request: {error}")))?.0;
-		if let Err(error) = serve_decode(path, &mut stream) {
+		if let Err(error) = serve_decode(path, &mut stream, stages()) {
 			let body = error.to_string();
 			let answer = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
 			stream.write_all(answer.as_bytes()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))?;
@@ -8962,7 +9023,7 @@ fn try_serve(path: &impl AsRef<Path>, address: &str, requests: usize) -> Result<
 	}
 	Ok(())
 }
-fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Result<()> {
+fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream, stages: Vec<Stage<'_>>) -> Result<()> {
 	use std::io::{Read as _, Write as _};
 	let mut head = Vec::new();
 	let mut byte = [0_u8; 1];
@@ -9002,13 +9063,16 @@ fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Re
 		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
 	};
 	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-	try_decode(path, &prompt, &mut sampler, &stop, budget, |id| {
+	try_decode(path, &prompt, &mut sampler, &stop, budget, stages, |id| {
 		let chunk = format!("{id}\n");
 		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
 	})?;
 	write(stream, b"0\r\n\r\n")
 }
-fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+/// The decode loop: one stepper holds the state of every block for the whole
+/// decode, the prefill fills it from the prompt, and each step extends it by the
+/// one position the new id reaches, the host stages included.
+fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, stages: Vec<Stage<'_>>, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 	let path = resolve_path(path)?;
 	let device = selected_gpu()?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
@@ -9025,8 +9089,7 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 		*slot = f64::from(*id);
 	}
 	let graph = materialize_saved_graph(stored, &samples, device, Config::load()?)?;
-	let mut tape = NativeTape::new(&graph, &samples, &[], device, stored.precision, None)?;
-	tape.inject_bn_stats(&stored.bn_stats)?;
+	let mut stepper = Stepper::new(graph, &[], &[device], &samples, stored, stages)?;
 	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
 	let mut settled = 0;
 	for step in 0..=budget {
@@ -9034,10 +9097,10 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 		let started = std::time::Instant::now();
 		let logits = bundle::infer_graphs(&graphs, &samples, |_, prepared| {
 			for position in settled as usize..reached as usize {
-				tape.write_sample(position, prepared[position])?;
+				stepper.write_sample(position, prepared[position])?;
 			}
-			tape.forward_window(settled, reached)?;
-			tape.predictions()
+			stepper.forward_window(&generation.ids, settled, reached)?;
+			stepper.predictions()
 		})?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
@@ -9069,15 +9132,55 @@ pub struct Placed {
 	resident: Vec<usize>,
 	moved: usize,
 }
-/// The saved statistics a batch normalization carries into inference, as the
-/// node index and the channels it normalizes.
-fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
-	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels)))
+/// The state a node carries across steps for one sequence: the positions of
+/// history it keeps and the values it holds per position. The tape's arenas
+/// hold it, so a step reads what the earlier positions left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carried {
+	history: usize,
+	width: usize,
+}
+/// The state `node` carries, if any. Attention keeps the keys and values of
+/// every position; a scan its last output, and its cell when it is an LSTM; a
+/// delta rule one key by value matrix per head; a depthwise convolution the
+/// positions its taps reach back over; an injected stream every position's
+/// vector; a batch normalization its saved mean and variance.
+fn carried(node: &Node) -> Result<Option<Carried>> {
+	Ok(match node.op {
+		Primitive::Normalize if node.argument[0] == 0.0 => Some(Carried { history: 1, width: checked_mul(2, node.output.channels, "normalization statistics")? }),
+		Primitive::Attention => {
+			let (heads, kv) = (integer_argument(node.argument[0], "attention heads")? as usize, integer_argument(node.argument[1], "attention key-value heads")? as usize);
+			require(heads != 0 && node.output.channels % heads == 0, "attention heads do not partition the block")?;
+			Some(Carried { history: node.output.length, width: checked_mul(checked_mul(2, kv, "attention key and value planes")?, node.output.channels / heads, "attention state")? })
+		}
+		Primitive::Scan => Some(Carried { history: 1, width: checked_mul(if node.argument[0] == 4.0 { 2 } else { 1 }, node.output.channels, "scan state")? }),
+		Primitive::Delta => {
+			let (_, key_width, heads, width) = delta_extent(node)?;
+			Some(Carried { history: 1, width: checked_mul(heads as usize, checked_mul(key_width as usize, width as usize, "delta state")?, "delta states")? })
+		}
+		Primitive::Dconv => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")? as usize);
+			Some(Carried { history: checked_mul(kernel.saturating_sub(1), dilation, "depthwise history")?, width: node.output.channels })
+		}
+		Primitive::Inject => Some(Carried { history: node.output.length, width: node.output.channels }),
+		_ => None,
+	})
+}
+/// The state a range of nodes carries, as each node's index and extent.
+fn carried_state(nodes: &[Node]) -> Result<Vec<(usize, Carried)>> {
+	nodes.iter().enumerate().filter_map(|(index, node)| carried(node).map(|state| state.map(|state| (index, state))).transpose()).collect()
+}
+/// The batch normalizations of a range of nodes, as the node index and the
+/// channels whose saved mean and variance it carries.
+fn batch_normalizations(nodes: &[Node]) -> Vec<(usize, usize)> {
+	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect()
 }
 /// The values a device holds for a range of nodes: their parameters and the
-/// state their batch normalizations carry.
-fn resident_values(nodes: &[Node]) -> usize {
-	nodes.iter().map(|node| node.parameters).sum::<usize>() + carried_state(nodes).map(|(_, channels)| 2 * channels).sum::<usize>()
+/// state they carry.
+fn resident_values(nodes: &[Node]) -> Result<usize> {
+	carried_state(nodes)?
+		.iter()
+		.try_fold(nodes.iter().map(|node| node.parameters).sum::<usize>(), |total, (_, state)| checked_add(total, checked_mul(state.history, state.width, "carried state")?, "resident values"))
 }
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
@@ -9100,7 +9203,7 @@ fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Resu
 	let (mut split, mut taken, mut free) = (Vec::new(), 0, devices[0].free_bytes()?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = (resident_values(&graph.nodes[start..end]) * bytes) as u64;
+		let resident = (resident_values(&graph.nodes[start..end])? * bytes) as u64;
 		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
 			split.push(taken);
 			(taken, free) = (0, devices[split.len()].free_bytes()?);
@@ -9178,7 +9281,7 @@ fn place_model(path: &Path, split: &[usize]) -> Result<Placed> {
 		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
 		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
 		for (index, part) in split_graph(&graph, &split)?.iter().enumerate() {
-			resident[index] += resident_values(&part.nodes) * bytes;
+			resident[index] += resident_values(&part.nodes)? * bytes;
 			if index + 1 < split.len() {
 				moved += part.output.elements() * bytes;
 			}
@@ -9200,11 +9303,9 @@ impl Placed {
 	}
 	fn forward(&self, stored: &bundle::SemanticGraph, samples: &[f64]) -> Result<Vec<f64>> {
 		let graph = materialize_saved_graph(stored, samples, self.devices[0], Config::load()?)?;
-		let (mut stream, mut statistics) = (samples.to_vec(), 0);
-		for (part, device) in split_graph(&graph, &self.split)?.iter().zip(self.devices) {
-			stream = forward_part(part, &stream, device, stored, &mut statistics)?;
-		}
-		Ok(stream)
+		let mut stepper = Stepper::new(graph, &self.split, self.devices, samples, stored, Vec::new())?;
+		stepper.forward(&[])?;
+		stepper.predictions()
 	}
 	/// The blocks each device takes, in `--device` order.
 	pub fn split(&self) -> &[usize] {
@@ -9249,6 +9350,7 @@ enum Primitive {
 	Dconv = 17,
 	Delta = 18,
 	ExpertOut = 19,
+	Inject = 20,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -9301,6 +9403,7 @@ impl Node {
 			Primitive::TopK => "TopK",
 			Primitive::ExpertIn => "ExpertIn",
 			Primitive::ExpertOut => "ExpertOut",
+			Primitive::Inject => "Inject",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -9520,47 +9623,173 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 	graph.state = saved.state.clone();
 	Ok(graph)
 }
-/// The graph either side of a block boundary: the nodes before `block`, when it
-/// is not the first, and the nodes from it on, whose reads of the boundary node
-/// become reads of the stream the host hands back.
-fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)> {
-	let at = graph.nodes.iter().position(|node| node.block_index >= block).unwrap_or(graph.nodes.len());
-	require(at < graph.nodes.len(), format!("the model has no block {block} to inject before"))?;
-	let boundary = at as i32 - 1;
-	let rebase = |reference: i32| match reference {
-		_ if reference == boundary => Ok(-1),
-		-2 => Ok(-2),
-		_ if reference > boundary => Ok(reference - at as i32),
-		_ => Err(RecipeError::new(format!("block {block} reads node {reference}, which an earlier block holds"))),
-	};
-	let mut tail = graph.clone();
-	tail.nodes = graph.nodes[at..].to_vec();
-	tail.stored = graph.stored[at..].to_vec();
-	for node in &mut tail.nodes {
-		node.source = rebase(node.source)?;
-		node.second = rebase(node.second)?;
-	}
-	tail.input = tail.nodes[0].input;
-	tail.source = tail.nodes.len() as i32 - 1;
-	let head = (at != 0).then(|| {
-		let mut head = graph.clone();
-		head.nodes.truncate(at);
-		head.stored.truncate(at);
-		head.output = graph.nodes[at - 1].output;
-		head.source = boundary;
-		head
-	});
-	Ok((head, tail))
+/// A host stage of a stepped forward: the values it adds to the stream before
+/// `block`, `width` per position, computed from the ids the step has reached.
+/// `values(ids, tokens)` returns the vectors of the tokens in `tokens`, in
+/// order, each from the ids up to and including its own.
+struct Stage<'a> {
+	block: usize,
+	width: usize,
+	values: Box<dyn Fn(&[u32], std::ops::Range<usize>) -> Result<Vec<f64>> + 'a>,
 }
-/// One part of a split graph run forward on its device, reading the batch
-/// normalization statistics that follow the parts already run.
-fn forward_part(graph: &Graph, samples: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let mut tape = NativeTape::new(graph, samples, &[], gpu, stored.precision, None)?;
-	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
-	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
-	*statistics += count;
-	tape.forward()?;
-	tape.predictions()
+/// Insert one injection node before the block each stage feeds. The node adds
+/// the host's stream to the block's input, keeps it as its carried state, and
+/// every read of the boundary from that block on reads the injected stream.
+/// Returns the index of each stage's node, in stage order.
+fn insert_injections(graph: &mut Graph, stages: &[Stage]) -> Result<Vec<usize>> {
+	let mut order = (0..stages.len()).collect::<Vec<_>>();
+	order.sort_by_key(|&stage| stages[stage].block);
+	let mut nodes = vec![0; stages.len()];
+	for stage in order {
+		let block = stages[stage].block;
+		let at = graph.nodes.iter().position(|node| node.block_index >= block).unwrap_or(graph.nodes.len());
+		require(at < graph.nodes.len(), format!("the model has no block {block} to inject before"))?;
+		require(at != 0 || graph.nodes[0].op != Primitive::Gather, format!("block {block} reads token ids, which a host stage cannot add to"))?;
+		let shape = graph.nodes[at].input;
+		require(shape.channels == stages[stage].width, format!("block {block} takes {} values per position, the host stage injects {}", shape.channels, stages[stage].width))?;
+		let boundary = at as i32 - 1;
+		let rebase = |reference: i32| {
+			if reference == boundary {
+				at as i32
+			} else if reference >= at as i32 {
+				reference + 1
+			} else {
+				reference
+			}
+		};
+		for node in &mut graph.nodes[at..] {
+			node.source = rebase(node.source);
+			node.second = rebase(node.second);
+		}
+		let next = &graph.nodes[at];
+		let injected = Node {
+			op: Primitive::Inject,
+			source: boundary,
+			second: -2,
+			input: shape,
+			output: shape,
+			offset: next.offset,
+			parameters: 0,
+			argument: arguments(0.0, 0.0),
+			program_offset: 0,
+			program_count: 0,
+			block_index: next.block_index,
+			block_kind: next.block_kind,
+			frozen: next.frozen,
+			packed: false,
+		};
+		graph.nodes.insert(at, injected);
+		graph.stored.insert(at, None);
+		graph.source = rebase(graph.source);
+		nodes[stage] = at;
+	}
+	Ok(nodes)
+}
+/// The window every node writes for the input window `begin..end`, derived as
+/// the emitted forward derives it: a pool fills whole windows, a convolution
+/// finishes a position once its kernel has arrived, a predictor writes the
+/// whole sequence, and every other node keeps its source's window. The last
+/// entry is the window of the graph's input, for a graph of no nodes.
+fn node_windows(graph: &Graph, begin: u32, end: u32) -> Result<Vec<(u32, u32)>> {
+	let mut windows = Vec::with_capacity(graph.nodes.len() + 1);
+	for node in &graph.nodes {
+		let (begin, end) = if node.source >= 0 { windows[node.source as usize] } else { (begin, end) };
+		let length = narrow(node.output.length, "node length")? as u32;
+		windows.push(match node.op {
+			Primitive::Predictor => (0, length),
+			Primitive::Pool => {
+				let size = integer_argument(node.argument[0], "pool size")? as u32;
+				(begin / size, ((end + size - 1) / size).min(length))
+			}
+			Primitive::Contraction if node.argument[0] > 1.0 => {
+				let lag = integer_argument(node.argument[0], "contraction kernel")? as u32 - 1;
+				(begin.saturating_sub(lag), end.saturating_sub(lag))
+			}
+			_ => (begin, end),
+		});
+	}
+	windows.push((begin, end));
+	Ok(windows)
+}
+/// A stepped forward over one graph: its tapes in device order, each holding
+/// the arenas of its own block range, and the host stages that write the
+/// injected streams. `forward_window(begin, end)` extends every part by the
+/// input positions `begin..end`: the stages write the vectors of the ids those
+/// positions hold, each tape runs its window, and the window of the stream hops
+/// to the next device. `forward` is the window of every position.
+struct Stepper<'a> {
+	parts: Vec<Graph>,
+	tapes: Vec<NativeTape>,
+	stages: Vec<(Stage<'a>, usize, usize)>,
+	positions: u32,
+}
+impl<'a> Stepper<'a> {
+	/// Tapes for the block ranges `split` names, on `devices` in that order, or
+	/// one tape of the whole graph on the first device when `split` is empty.
+	/// Every tape reads the saved batch normalization statistics of its range.
+	fn new(mut graph: Graph, split: &[usize], devices: &[&'static Gpu], samples: &[f64], stored: &bundle::SemanticGraph, stages: Vec<Stage<'a>>) -> Result<Self> {
+		let injected = insert_injections(&mut graph, &stages)?;
+		let parts = if split.is_empty() { vec![graph] } else { split_graph(&graph, split)? };
+		require(parts.len() <= devices.len(), format!("the split names {} devices but {} are selected", parts.len(), devices.len()))?;
+		let (mut tapes, mut starts) = (Vec::with_capacity(parts.len()), Vec::with_capacity(parts.len()));
+		let (mut stream, mut statistics, mut start) = (samples.to_vec(), 0, 0);
+		for (part, device) in parts.iter().zip(devices) {
+			let tape = NativeTape::new(part, &stream, &[], device, stored.precision, None)?;
+			let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+			tape.inject_bn_stats(stored.bn_stats.get(statistics..statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+			statistics += count;
+			stream = vec![0.0; checked_mul(tape.rows as usize, part.output.elements(), "stream hop")?];
+			starts.push(start);
+			start += part.nodes.len();
+			tapes.push(tape);
+		}
+		require(stages.is_empty() || tapes[0].rows == 1, "a host stage steps one sequence at a time")?;
+		let stages = stages
+			.into_iter()
+			.zip(injected)
+			.map(|(stage, node)| {
+				let tape = starts.iter().rposition(|&first| first <= node).unwrap_or(0);
+				(stage, tape, node - starts[tape])
+			})
+			.collect();
+		let positions = tapes[0].positions;
+		Ok(Self { parts, tapes, stages, positions })
+	}
+	fn forward(&mut self, ids: &[u32]) -> Result<()> {
+		self.forward_window(ids, 0, self.positions)
+	}
+	fn forward_window(&mut self, ids: &[u32], begin: u32, end: u32) -> Result<()> {
+		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		let mut window = (begin, end);
+		for index in 0..self.tapes.len() {
+			if index != 0 {
+				let hop = self.tapes[index - 1].read_output(self.parts[index - 1].output, window)?;
+				self.tapes[index].write_input(self.parts[index].input, window, &hop)?;
+			}
+			// A stage writes the window its node reaches. The ids align with the
+			// node's last positions: a decode has reached as many ids as positions,
+			// and an inference may hold context ids before the sequence starts.
+			let windows = node_windows(&self.parts[index], window.0, window.1)?;
+			for (stage, _, node) in self.stages.iter().filter(|(_, tape, _)| *tape == index) {
+				let (shape, (first, last)) = (self.parts[index].nodes[*node].output, windows[*node]);
+				let offset = ids.len().saturating_sub(shape.length);
+				let tokens = offset + first as usize..offset + last as usize;
+				require(tokens.end <= ids.len(), format!("positions {first}..{last} of the stream before block {} reach past the {} ids given", stage.block, ids.len()))?;
+				let values = (stage.values)(ids, tokens)?;
+				require(values.len() == (last - first) as usize * stage.width, format!("host stage wrote {} values for {} positions of {}", values.len(), last - first, stage.width))?;
+				self.tapes[index].write_injected(*node, shape, first, &values)?;
+			}
+			self.tapes[index].forward_window(window.0, window.1)?;
+			window = if self.parts[index].source >= 0 { windows[self.parts[index].source as usize] } else { window };
+		}
+		Ok(())
+	}
+	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
+		self.tapes[0].write_sample(position, value)
+	}
+	fn predictions(&self) -> Result<Vec<f64>> {
+		self.tapes.last().ok_or_else(|| RecipeError::new("stepped forward has no tape"))?.predictions()
+	}
 }
 fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let source = graph.source;
@@ -9596,7 +9825,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
-		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
+		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
@@ -9882,11 +10111,13 @@ fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()>
 	// trainable parameters and no run holds a second copy of it.
 	push_node(graph, Primitive::Gather, output, 0, arguments(vocabulary as f64, width as f64), -2)
 }
-/// A causal depthwise convolution keeps the shape: every channel mixes its own
-/// last `kernel` positions with one tap each, left-padded with zeros.
-fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
+/// A causal depthwise convolution keeps the shape: every channel mixes `kernel`
+/// of its own positions, `dilation` apart and ending at the current one, with
+/// one tap each, left-padded with zeros.
+fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> {
 	require(kernel != 0, "depthwise convolution kernel must be positive")?;
-	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
+	require(dilation != 0, "depthwise convolution dilation must be positive")?;
+	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, dilation as f64), -2)
 }
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
@@ -9908,7 +10139,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
-	lower_dconv(graph, kernel)?;
+	lower_dconv(graph, kernel, 1)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
@@ -10519,7 +10750,7 @@ impl NativeTape {
 		let moments = if training && !graph.state.moments.is_empty() { graph.state.moments.clone() } else { zeros.clone() };
 		let variances = if training && !graph.state.variances.is_empty() { graph.state.variances.clone() } else { zeros.clone() };
 		let frozen = if training && !graph.frozen.is_empty() { graph.frozen.clone() } else { vec![0_u8; state_values] };
-		let batch_normalizations = carried_state(&graph.nodes).collect();
+		let batch_normalizations = batch_normalizations(&graph.nodes);
 		let best_loss = if graph.state.best_loss.is_empty() {
 			[f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY]
 		} else {
@@ -10610,6 +10841,47 @@ impl NativeTape {
 		} else {
 			self.samples.write_float_bytes(checked_mul(position, self.precision.model.bytes(), "sample offset")?, &[value], self.precision.model)
 		}
+	}
+	/// Write the injected stream of node `node`, of `shape`, from its position
+	/// `first` on: one vector per position, position-major, into every row.
+	fn write_injected(&self, node: usize, shape: Shape, first: u32, values: &[f64]) -> Result<()> {
+		let bytes = self.precision.model.bytes();
+		let base = *self.program.artifact.layout.contexts.get(node).ok_or_else(|| RecipeError::new("injected stream node is absent"))?;
+		for row in 0..self.rows as usize {
+			let offset = checked_mul(checked_add(checked_mul(row, shape.length, "injected rows")?, first as usize, "injected position")?, shape.channels, "injected values")?;
+			self.contexts.write_float_bytes(checked_add(base, checked_mul(offset, bytes, "injected bytes")?, "injected offset")?, values, self.precision.model)?;
+		}
+		Ok(())
+	}
+	/// The output values of the positions `window` names, as one span per row
+	/// and channel in row and channel order.
+	fn read_output(&self, shape: Shape, window: (u32, u32)) -> Result<Vec<f64>> {
+		let base = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let (bytes, span) = (self.precision.model.bytes(), (window.1 - window.0) as usize);
+		if span == shape.length {
+			return self.values.download_float_bytes(base, self.rows as usize * shape.elements(), self.precision.model);
+		}
+		let mut values = Vec::with_capacity(self.rows as usize * shape.channels * span);
+		for plane in 0..self.rows as usize * shape.channels {
+			let offset = checked_add(checked_mul(plane, shape.length, "output plane")?, window.0 as usize, "output position")?;
+			values.extend(self.values.download_float_bytes(checked_add(base, checked_mul(offset, bytes, "output bytes")?, "output offset")?, span, self.precision.model)?);
+		}
+		Ok(values)
+	}
+	/// Replace the input values of the positions `window` names with `values`,
+	/// laid out as `read_output` returns them.
+	fn write_input(&self, shape: Shape, window: (u32, u32), values: &[f64]) -> Result<()> {
+		require(self.vocabulary == 0.0, "a stream cannot hop into a block that reads token ids")?;
+		let (bytes, span) = (self.precision.model.bytes(), (window.1 - window.0) as usize);
+		require(values.len() == self.rows as usize * shape.channels * span, format!("stream hop of {} values does not fill {} positions of {} channels", values.len(), span, shape.channels))?;
+		if span == shape.length {
+			return self.samples.write_float_bytes(0, values, self.precision.model);
+		}
+		for (plane, chunk) in values.chunks_exact(span).enumerate() {
+			let offset = checked_add(checked_mul(plane, shape.length, "input plane")?, window.0 as usize, "input position")?;
+			self.samples.write_float_bytes(checked_mul(offset, bytes, "input bytes")?, chunk, self.precision.model)?;
+		}
+		Ok(())
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
@@ -11223,6 +11495,9 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
+		// The injected stream is the node's persistent state: one vector per
+		// position, written by a host stage before the positions run.
+		Primitive::Inject => checked_mul(rows, node.output.elements(), "injected stream")?,
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order.
 		Primitive::ExpertIn | Primitive::ExpertOut => {

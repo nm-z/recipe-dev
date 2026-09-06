@@ -1048,24 +1048,25 @@ br i1 %more, label %step, label %done step: %channel.offset = mul i32 %channel, 
 %adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
 %total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
 ; Causal depthwise convolution. Output element %p of a [rows][channels][length]
-; batch sums the last %kernel positions of its own channel, tap j reading
-; position t + j + 1 - kernel, with positions before the start reading zero.
-define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %kernel, i32 %decode ) #1 { entry:
+; batch sums %kernel positions of its own channel spaced %dilation apart, tap j
+; reading position t - (kernel - 1 - j) * dilation, with positions before the
+; start reading zero.
+define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation, i32 %decode ) #1 { entry:
 %narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %base = add i32 %row.base, %channel.base %tap.base = mul i32 %channel, %kernel
 %reach = sub i32 %kernel, 1 br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
-%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = add i32 %position, %tap %source = sub i32 %ahead, %reach
+%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %back = sub i32 %reach, %tap %span = mul i32 %back, %dilation %source = sub i32 %position, %span
 %valid = icmp sge i32 %source, 0 %source.clamped = select i1 %valid, i32 %source, i32 0 %index = add i32 %base, %source.clamped
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index %loaded = load double, ptr addrspace(1) %input.ptr, align 8 %value = select i1 %valid, double %loaded, double 0.0
 %tap.index = add i32 %tap.base, %tap %weight = call double @recipe.model.weight(ptr addrspace(1) %weights, i32 %tap.index, i32 %decode)
 %product = call double @recipe.mul(double %weight, double %value) %sum.next = call double @recipe.add(double %sum, double %product) %tap.next = add i32 %tap, 1 br label %loop
 done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
-; Input element %p receives tap j times the adjoint at position t + kernel - 1 - j while that position exists.
-define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %kernel ) #1 { entry:
+; Input element %p receives tap j times the adjoint at position t + (kernel - 1 - j) * dilation while that position exists.
+define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation ) #1 { entry:
 %narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %base = add i32 %row.base, %channel.base %tap.base = mul i32 %channel, %kernel
 %reach = sub i32 %kernel, 1 br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
-%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = add i32 %position, %reach %target = sub i32 %ahead, %tap
+%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = sub i32 %reach, %tap %span = mul i32 %ahead, %dilation %target = add i32 %position, %span
 %valid = icmp ult i32 %target, %length %target.clamped = select i1 %valid, i32 %target, i32 0 %index = add i32 %base, %target.clamped
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index %loaded = load double, ptr addrspace(1) %delta.ptr, align 8 %value = select i1 %valid, double %loaded, double 0.0
 %tap.index = add i32 %tap.base, %tap %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %tap.index %weight = load double, ptr addrspace(1) %weight.ptr, align 8
@@ -1073,8 +1074,8 @@ define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr a
 done: %adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
 %total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
 ; Tap %p (channel * kernel + j) sums input * adjoint over every row and position in order and writes its gradient.
-define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %channels, i32 %length, i32 %kernel, i32 %offset ) #1 { entry:
-%channel = udiv i32 %p, %kernel %tap = urem i32 %p, %kernel %narrow = mul i32 %channels, %length %channel.base = mul i32 %channel, %length %reach = sub i32 %kernel, 1 %shift = sub i32 %reach, %tap
+define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %channels, i32 %length, i32 %kernel, i32 %dilation, i32 %offset ) #1 { entry:
+%channel = udiv i32 %p, %kernel %tap = urem i32 %p, %kernel %narrow = mul i32 %channels, %length %channel.base = mul i32 %channel, %length %reach = sub i32 %kernel, 1 %back = sub i32 %reach, %tap %shift = mul i32 %back, %dilation
 %count = mul i32 %rows, %length br label %loop loop: %step.index = phi i32 [ 0, %entry ], [ %step.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
 %more = icmp ult i32 %step.index, %count br i1 %more, label %step, label %done step: %row = udiv i32 %step.index, %length %position = urem i32 %step.index, %length
 %valid = icmp uge i32 %position, %shift %source = sub i32 %position, %shift %source.clamped = select i1 %valid, i32 %source, i32 0
@@ -1083,6 +1084,21 @@ define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr ad
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index %incoming = load double, ptr addrspace(1) %delta.ptr, align 8
 %product = call double @recipe.mul(double %value, double %incoming) %sum.next = call double @recipe.add(double %sum, double %product) %step.next = add i32 %step.index, 1 br label %loop
 done: %gradient.index = add i32 %offset, %p %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index store double %sum, ptr addrspace(1) %gradient.ptr, align 8 ret void }
+; Output element %p of a [rows][channels][length] batch is its input plus the
+; value a host stage wrote for its row, position and channel. The injected
+; values sit position-major, so the positions one step reaches are contiguous.
+define internal void @inject_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %context, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length ) #1 { entry:
+%narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %channel = udiv i32 %within, %length %position = urem i32 %within, %length
+%row.base = mul i32 %row, %narrow %position.base = mul i32 %position, %channels %row.position = add i32 %row.base, %position.base %index = add i32 %row.position, %channel
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %p %value = load double, ptr addrspace(1) %input.ptr, align 8
+%context.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %index %injected = load double, ptr addrspace(1) %context.ptr, align 8
+%sum = call double @recipe.add(double %value, double %injected)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
+; Input element %p receives the adjoint unchanged: the injected values are constants.
+define internal void @inject_reverse_body( ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p ) #1 { entry:
+%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %p %value = load double, ptr addrspace(1) %delta.ptr, align 8
+%adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
+%total = call double @recipe.add(double %prior, double %value) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
 ; log(1 + exp(x)) taken on the negative side so a large x cannot overflow.
 define internal double @softplus(double %x) #1 { entry: %magnitude = call double @recipe.abs(double %x)
 %negative = call double @recipe.neg(double %magnitude) %exponential = call double @recipe.exp(double %negative)

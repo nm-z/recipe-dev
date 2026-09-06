@@ -90,7 +90,9 @@ generation.prefill_seconds;
 generation.step_seconds;
 ```
 
-The model reads a sequence of ids and returns one logit per id. The prefill runs the prompt and the decode then holds that state: a step adds one id, extends the attention keys and values, the recurrent state, and the convolution tail by the one position the id reaches, and samples from the new logits (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy). A step therefore reads what earlier calls left rather than running the sequence again, and the result is the result of one forward of the same ids. The decode stops at a stop id, after the budget, or when the ids fill the model's sequence.
+The model reads a sequence of ids and returns one logit per id. The prefill runs the prompt and the decode then holds that state: a step adds one id, extends the attention keys and values, the recurrent state, the convolution tail and any injected stream by the one position the id reaches, and samples from the new logits (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy). A step therefore reads what earlier calls left rather than running the sequence again, and the result is the result of one forward of the same ids. The decode stops at a stop id, after the budget, or when the ids fill the model's sequence.
+
+Every node declares the state it carries per sequence, as positions of history and values per position: attention every position's keys and values, a scan its last output, a delta rule its state matrix, a depthwise convolution the `(kernel - 1) * dilation` positions its taps reach back over, an injected stream every position's vector, and a batch normalization its saved statistics. The tape's arenas hold that state, placement counts it as resident, and a step is one graph-level window over an ordered list of parts: each host stage writes the vectors of the ids the window reaches into the injected stream of the block it feeds, each device tape runs the window, and the window of the stream hops to the next tape. `infer`, `Ngram::infer`, `Placed::infer` and `decode` all run that stepper; a whole forward is the window of every position.
 
 ```rust
 recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
@@ -104,6 +106,8 @@ recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
 let table = recipe.gguf("ngram.gguf");
 let ngram = table.ngram();
 let prediction = ngram.infer("model.ogdl", &input, &ids);
+let generation = ngram.decode("model.ogdl", &prompt_ids, &mut sampler, &[eos], 64);
+ngram.serve("model.ogdl", "127.0.0.1:8080", 64);
 ```
 
 N-gram embeddings from a table too large for device memory. Each of `ngram.heads`
@@ -112,8 +116,11 @@ previous two, into its own row range of the mapped `[width, rows]` tensor
 `ngram.table` names, seeded by `ngram.seeds` and reset at the end-of-sequence id.
 Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
 convolves them across as many trailing positions; and the gathered vector is
-added to the stream before the block `ngram.layer` names. The gather stays on the
-host holding the table and the blocks either side of it run on the device.
+added to the stream before the block `ngram.layer` names. The gather is a host
+stage of the stepper: one tape holds every block on the device, the host that
+holds the table writes each position's vector into the injected stream before
+the tape reaches the block, and `decode` and `serve` extend it one id at a time
+exactly as `recipe.decode` and `recipe.serve` do.
 
 ## placement
 
@@ -146,7 +153,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	dconv(kernel)
+	dconv(kernel)[.dilate(steps)]
 	delta(heads, kernel)[.keys(heads, width)][.values(width)][.out(width)]
 	attn(heads)[.kv(heads)][.head(width)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
 	perc(width)
@@ -181,7 +188,7 @@ Feature generation is banned.
 
 `hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into a Recipe submodel through a gate, writes its output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
 
-`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`. `.dilate(steps)` spreads the taps `steps` positions apart, so position `t` sees `t - (kernel - 1) * steps, ..., t - steps, t` and the carried history is `(kernel - 1) * steps` positions; the default is one, the contiguous form.
 
 `delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
 
