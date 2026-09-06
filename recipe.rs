@@ -9992,36 +9992,6 @@ fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")
 }
-/// The bytes a device holds for the nodes `range` of an inference graph, as
-/// the tape lays them out: each node's packed or decoded weights, and its
-/// value and context arenas for one row, which keep every position's
-/// activations, attention keys and values, recurrent state, convolution tail
-/// and batch normalization statistics.
-fn resident_bytes(graph: &Graph, range: std::ops::Range<usize>, precision: Compute) -> Result<usize> {
-	let element = precision.bytes();
-	let mut bytes = 0;
-	for index in range {
-		let node = &graph.nodes[index];
-		let weights = match packed_weight(graph, index, true) {
-			Some(weight) => weight.bytes.len(),
-			None => checked_mul(node.parameters, element, "resident weights")?,
-		};
-		for span in [align(weights, element)?, align(graph_rows_buffer(node.output, 1, element)?, element.max(8))?, align(node_context(node, 1, element)?, element.max(8))?] {
-			bytes = checked_add(bytes, span, "resident bytes")?;
-		}
-	}
-	Ok(bytes)
-}
-/// The input row a range starting at node `start` holds: the model's ids for
-/// a gather, else the stream the previous node leaves.
-fn input_row_bytes(graph: &Graph, start: usize, element: usize) -> Result<usize> {
-	let (shape, element) = match start {
-		0 if graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) => (graph.input, size_of::<i32>()),
-		0 => (graph.input, element),
-		_ => (graph.nodes[start - 1].output, element),
-	};
-	checked_mul(shape.elements(), element, "input row bytes")
-}
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
