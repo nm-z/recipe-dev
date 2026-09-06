@@ -2589,7 +2589,7 @@ mod quantized {
 		}
 	}
 }
-use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
+use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
@@ -5145,6 +5145,14 @@ mod gguf {
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
 			Ok(StoredWeight { format: block_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
 		}
+		/// The embedding table's native layout. F32 and F16 tables use the same
+		/// mapped gather path as block-quantized tables, with one raw value per
+		/// block and a decoder that reads its element directly.
+		fn embedding_stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
+			let shard = &self.shards[tensor.shard];
+			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
+			Ok(StoredWeight { format: embedding_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
 		/// Resolves a plan against this file, one bound weight per entry. The views
 		/// of one entry must share a layout: block-quantized views join as runs of
 		/// their own mappings, so nothing is decoded or copied here, and views in
@@ -5184,6 +5192,13 @@ mod gguf {
 							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
 							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new() })
 						}
+						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
+							let tensor = match first {
+								Plane::Mapped(tensor) => tensor,
+								Plane::Owned { .. } => unreachable!(),
+							};
+							BoundWeight::Stored(self.embedding_stored(tensor)?)
+						}
 						None => {
 							let mut values = Vec::with_capacity(elements);
 							for plane in planes {
@@ -5198,6 +5213,15 @@ mod gguf {
 					Ok(BoundNode { names, elements, weight })
 				})
 				.collect()
+		}
+	}
+
+	/// The Recipe storage format a block-quantized tensor decodes through.
+	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
+		match tensor.kind {
+			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
+			1 => StorageFormat::named("f16").ok_or_else(|| RecipeError::new("F16 embedding layout is unavailable")),
+			_ => block_format(tensor),
 		}
 	}
 
@@ -8078,6 +8102,8 @@ pub(crate) struct StorageFormat(pub(crate) u16);
 
 #[derive(Clone, Copy)]
 enum NativeDequant {
+	F16,
+	F32,
 	Nf4,
 	Scalar(ScalarLayout),
 	Q2K,
@@ -8093,6 +8119,16 @@ enum NativeDequant {
 impl NativeDequant {
 	fn decode<Q: QuantOps>(self, operations: &mut Q) -> Q::Value {
 		match self {
+			Self::F16 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(2));
+				operations.half(offset)
+			}
+			Self::F32 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(4));
+				operations.float(offset)
+			}
 			Self::Nf4 => unreachable!("NF4 dequantization requires its model codebook"),
 			Self::Scalar(layout) => quantized::dequant_scalar(operations, layout),
 			Self::Q2K => quantized::dequant_q2k(operations),
@@ -8145,6 +8181,7 @@ impl NativeQuantTable {
 
 #[derive(Clone, Copy)]
 enum Quantizer {
+	Raw,
 	Scalar { bits: u8, variant: u8 },
 	Q2K,
 	Q3K,
@@ -8183,6 +8220,8 @@ macro_rules! quantizations {
 }
 
 quantizations! {
+	F16 { code: (2, 16, [0]), block: 1, stride: 2, name: "f16", quant: Quantizer::Raw, native: Some(NativeDequant::F16) }
+	F32 { code: (2, 32, [0]), block: 1, stride: 4, name: "f32", quant: Quantizer::Raw, native: Some(NativeDequant::F32) }
 	Q4_0 { code: (0, 4, [0]), block: 32, stride: 18, name: "q4_0", quant: Quantizer::Scalar { bits: 4, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 0 })) }
 	Q4_1 { code: (0, 4, [1]), block: 32, stride: 20, name: "q4_1", quant: Quantizer::Scalar { bits: 4, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 1 })) }
 	Q5_0 { code: (0, 5, [0]), block: 32, stride: 22, name: "q5_0", quant: Quantizer::Scalar { bits: 5, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 5, variant: 0 })) }
@@ -9367,14 +9406,14 @@ impl<'a> Builder<'a> {
 			format!("token_embd.weight has shape {:?}, not [{}, vocabulary]", embedding.shape, dimensions.width),
 		)?;
 		let vocabulary = embedding.shape[1] as usize;
-		let format = gguf::block_format(&embedding).map_err(|_| RecipeError::new("token_embd.weight is not block quantized, and a gather reads packed rows"))?;
+		let format = gguf::embedding_format(&embedding)?;
 		let mut model = recipe.model();
 		if builder.present("attention.layer_norm_rms_epsilon") {
 			model = model.epsilon(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
 		// The gather addresses rows of the file's own layout, so the block's
-		// quantization is the tensor's format rather than a selection.
+		// storage format is the tensor's format rather than a selection.
 		let block = model.blocks.last_mut().ok_or_else(|| RecipeError::new("the embedding block is absent"))?;
 		(block.quantization, block.profile) = (format.0, false);
 		builder.mapped(vec![embedding.clone()]);
