@@ -9688,14 +9688,23 @@ impl<'a> Builder<'a> {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
 			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
 			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
-			self.mapped(vec![query, key]);
+			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
+			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
+			// reaches the adjacent-pair Rope with the matching columns.
+			let index_order = self.head_order(index_width, rope_dims);
+			let mut index_planes = Vec::new();
+			for index in 0..index_heads {
+				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
+			}
+			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
+			self.mapped(index_planes);
 			block = block.index(index_heads, index_width, block_size, 1).budget(top_k);
 			let query_norm = name("indexer.q_norm.weight");
 			let key_norm = name("indexer.k_norm.weight");
 			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
 				block = block.score(rms, rope_dims);
-				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &(0..index_width).collect::<Vec<_>>())?;
-				scales.extend(self.scale(&key_norm, &role, index_width, 1, &(0..index_width).collect::<Vec<_>>())?);
+				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
+				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
 				self.slot(scales);
 			}
 		}
