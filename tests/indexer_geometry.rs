@@ -88,6 +88,9 @@ fn score(query: [f64; 2], representative: [f64; 2]) -> f64 {
 	let value = dot(query, representative);
 	value.max(0.0) + (-value).max(0.0)
 }
+fn score_after_head_sum(query: [f64; 2], representative: [f64; 2]) -> f64 {
+	(dot(query, representative) + dot([-query[0], -query[1]], representative)).max(0.0)
+}
 
 #[test]
 fn scored_attention_matches_pooled_reference_and_per_head_relu() {
@@ -138,10 +141,12 @@ fn scored_attention_matches_pooled_reference_and_per_head_relu() {
 	let old_first = per_key_representative(&raw_blocks[0..2], 0);
 	let old_second = per_key_representative(&raw_blocks[2..4], 2);
 	let old_scores = [score(transformed_query, old_first), score(transformed_query, old_second)];
+	let summed_scores = [score_after_head_sum(transformed_query, first), score_after_head_sum(transformed_query, second)];
 	let corrected_selected = corrected_scores.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0))).map(|(index, _)| index).unwrap();
 	let old_selected = old_scores.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0))).map(|(index, _)| index).unwrap();
 	assert_eq!(corrected_selected, 1, "host reference selects scores {corrected_scores:?}");
 	assert_eq!(old_selected, 0, "the pre-pooling geometry should select the other block: {old_scores:?}");
+	assert_eq!(summed_scores, [0.0, 0.0], "head-wise ReLU must precede the head reduction: {summed_scores:?}");
 	assert!(corrected_scores[1] > corrected_scores[0] + 0.5, "pooled reference lacks a discriminating margin: {corrected_scores:?}");
 	assert!(old_scores[0] > old_scores[1], "old geometry unexpectedly agrees: {old_scores:?}");
 
