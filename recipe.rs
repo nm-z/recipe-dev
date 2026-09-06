@@ -5216,7 +5216,8 @@ mod gguf {
 		}
 	}
 
-	/// The Recipe storage format a block-quantized tensor decodes through.
+	/// The Recipe storage format an embedding tensor decodes through, including
+	/// raw F32 and F16 tables.
 	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
 		match tensor.kind {
 			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
