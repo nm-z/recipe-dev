@@ -6221,7 +6221,10 @@ mod bundle {
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
-			Operation::Delta(delta) => format!("delta,{},{},{},{},{},{}", delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output),
+			Operation::Delta(delta) => format!(
+				"delta,{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation as u8, delta.output_activation as u8
+			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", *activation as u8),
@@ -6303,7 +6306,11 @@ mod bundle {
 				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
 				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
 				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output }))
+				// Older bundles always used a linear convolution and sigmoid output gate.
+				// Keep those defaults when the optional activation selectors are absent.
+				let conv_activation = fields.next().map(|field| value_at(Some(field), "delta convolution activation").and_then(activation)).transpose()?.unwrap_or(Activation::Linear);
+				let output_activation = fields.next().map(|field| value_at(Some(field), "delta output activation").and_then(activation)).transpose()?.unwrap_or(Activation::Sigmoid);
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -7053,10 +7060,17 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
+	/// Activation applied after the causal convolution. Existing hand-built
+	/// models default to linear for compatibility; GGUF Qwen delta blocks set
+	/// this to SiLU from their architecture row.
+	conv_activation: Activation,
+	/// Activation applied to the output gate. Existing hand-built models
+	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
+	output_activation: Activation,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0 }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -9166,7 +9180,9 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 				tape.write_sample(position, samples[position])?;
 			}
 			tape.forward_window(settled, reached)?;
-			tape.predictions()
+			let predictions = tape.predictions()?;
+			let logits = tape.last_logits(&predictions, settled, reached)?;
+			Ok((predictions, logits))
 		},
 	)
 }
@@ -9220,12 +9236,13 @@ enum RopePairs {
 struct Architecture {
 	names: &'static [&'static str],
 	rope: RopePairs,
+	delta_activation: Option<(Activation, Activation)>,
 }
 const ARCHITECTURES: &[Architecture] = &[
-	Architecture { names: &["llama"], rope: RopePairs::Neighbours },
-	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves },
-	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves },
-	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves },
+	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
+	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
+	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
 ];
 /// A model built from a GGUF file: the blocks its architecture metadata declares
 /// and the plan that binds every weighted node to the file's tensors by name.
@@ -9298,6 +9315,7 @@ struct Builder<'a> {
 	file: &'a Gguf,
 	architecture: &'a str,
 	rope: RopePairs,
+	delta_activation: Option<(Activation, Activation)>,
 	plan: Binding,
 	consumed: std::collections::BTreeSet<String>,
 }
@@ -9340,7 +9358,7 @@ impl<'a> Builder<'a> {
 			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -9628,7 +9646,14 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![gate]);
 		let output = self.projection(&name("ssm_out.weight"), &role, inner, width)?;
 		self.mapped(vec![output]);
-		Ok(branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width))
+		// A missing row selector keeps the historical hand-built defaults;
+		// architecture rows that use this block provide their trained pair.
+		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
+		let block = branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width);
+		Ok(block.delta_block("activations", |delta| {
+			delta.conv_activation = conv_activation;
+			delta.output_activation = output_activation;
+		}))
 	}
 	/// One gated feed-forward and the plan of its gate, up and down projections.
 	fn feed_forward(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -9931,14 +9956,14 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 /// through `logits`, and `samples` holds the whole sequence as the ids settle.
 fn decode_steps(
 	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
-	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<Vec<f64>>,
+	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
 	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
 	let mut settled = 0;
 	for step in 0..=budget {
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
 		let started = std::time::Instant::now();
-		let logits = logits(tape, samples, settled, reached)?;
+		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
 			generation.prefill_seconds = seconds;
@@ -9946,11 +9971,11 @@ fn decode_steps(
 			generation.step_seconds.push(seconds);
 		}
 		settled = reached;
-		generation.logits = logits;
+		generation.logits = predictions;
 		if step == budget {
 			break;
 		}
-		let id = sampler.sample(&generation.logits, &generation.ids);
+		let id = sampler.sample(&sample_logits, &generation.ids);
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
@@ -10203,7 +10228,8 @@ impl Placed {
 		for step in 0..=budget {
 			let reached = narrow(generation.ids.len(), "decode position")? as u32;
 			let started = std::time::Instant::now();
-			let logits = self.run_window(&samples, settled, reached)?;
+			let predictions = self.run_window(&samples, settled, reached)?;
+			let sample_logits = self.last_logits(&predictions, settled, reached)?;
 			let seconds = started.elapsed().as_secs_f64();
 			if step == 0 {
 				generation.prefill_seconds = seconds;
@@ -10211,11 +10237,11 @@ impl Placed {
 				generation.step_seconds.push(seconds);
 			}
 			settled = reached;
-			generation.logits = logits;
+			generation.logits = predictions;
 			if step == budget {
 				break;
 			}
-			let id = sampler.sample(&generation.logits, &generation.ids);
+			let id = sampler.sample(&sample_logits, &generation.ids);
 			emit(id)?;
 			samples[generation.ids.len()] = f64::from(id);
 			generation.ids.push(id);
@@ -10224,6 +10250,10 @@ impl Placed {
 			}
 		}
 		Ok(generation)
+	}
+	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		tape.last_logits(predictions, begin, end)
 	}
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
@@ -10280,6 +10310,12 @@ impl Shape {
 	fn elements(self) -> usize {
 		self.channels * self.length
 	}
+}
+fn select_last_logits(predictions: &[f64], output: Shape, position: usize) -> Result<Vec<f64>> {
+	require(position < output.length, format!("decode output position {position} exceeds {}", output.length))?;
+	let elements = output.elements();
+	require(predictions.len() >= elements, format!("native output has {} values, expected at least {elements}", predictions.len()))?;
+	Ok((0..output.channels).map(|channel| predictions[channel * output.length + position]).collect())
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -11079,6 +11115,11 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
+	if delta.conv_activation != Activation::Linear {
+		// Qwen's gated delta recurrence applies SiLU to the causal convolution
+		// before splitting the query, key, and value planes.
+		lower_activation(graph, delta.conv_activation, config)?;
+	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
@@ -11088,7 +11129,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, Activation::Sigmoid, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
@@ -11982,6 +12023,15 @@ impl NativeTape {
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.capacity * self.output.elements())
+	}
+	/// Select the last output position reached by an input window for
+	/// autoregressive sampling. Predictions stay channel-major (`channel,
+	/// position`) so a decode must sample one value from each channel while
+	/// retaining the full tensor for `Generation::logits`.
+	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let (_, reached) = self.output_window(begin, end)?;
+		require(reached != 0, "decode window reaches no output position")?;
+		select_last_logits(predictions, self.output, reached as usize - 1)
 	}
 	/// A run of `count` output values from element `first` of the output arena.
 	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
@@ -18368,4 +18418,23 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn decode_samples_the_last_channel_major_position() {
+		let output = Shape { channels: 3, length: 4 };
+		let predictions = (0..output.elements()).map(|value| value as f64).collect::<Vec<_>>();
+		assert_eq!(select_last_logits(&predictions, output, 3).unwrap(), [3.0, 7.0, 11.0]);
+	}
+
+	#[test]
+	fn decode_rejects_a_position_outside_the_output() {
+		let output = Shape { channels: 2, length: 3 };
+		let predictions = vec![0.0; output.elements()];
+		assert!(select_last_logits(&predictions, output, output.length).is_err());
+	}
 }
