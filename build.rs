@@ -803,6 +803,7 @@ fn main() -> BuildResult<()> {
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("delta-chunk", "RECIPE_DELTA_CHUNK"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);

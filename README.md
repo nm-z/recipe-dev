@@ -90,7 +90,7 @@ generation.prefill_seconds;
 generation.step_seconds;
 ```
 
-The model reads a sequence of ids and returns one logit per id. The prefill runs the prompt and the decode then holds that state: a step adds one id, extends the attention keys and values, the recurrent state, and the convolution tail by the one position the id reaches, and samples from the new logits (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy). A step therefore reads what earlier calls left rather than running the sequence again, and the result is the result of one forward of the same ids. The decode stops at a stop id, after the budget, or when the ids fill the model's sequence.
+The model reads a sequence of ids and returns one logit per id. The prefill runs the prompt and the decode then holds that state: a step adds one id, extends the attention keys and values, the recurrent state, and the convolution tail by the one position the id reaches, and samples from the new logits (penalty, top-k, top-p, min-p, temperature, seeded draw; temperature zero is greedy). A step therefore reads what earlier calls left rather than running the sequence again, and the result is the result of one forward of the same ids. The decode stops at a stop id, after the budget, or when the ids fill the model's sequence. `recipe.decode` is the one-device case of a placement: the model placed as one range on the primary device, decoded over its one tape.
 
 ```rust
 recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
@@ -106,14 +106,47 @@ let ngram = table.ngram();
 let prediction = ngram.infer("model.ogdl", &input, &ids);
 ```
 
-N-gram embeddings from a table too large for device memory. Each of `ngram.heads`
-heads hashes the current token with its previous one, and as many heads with its
-previous two, into its own row range of the mapped `[width, rows]` tensor
-`ngram.table` names, seeded by `ngram.seeds` and reset at the end-of-sequence id.
-Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
-convolves them across as many trailing positions; and the gathered vector is
-added to the stream before the block `ngram.layer` names. The gather stays on the
-host holding the table and the blocks either side of it run on the device.
+N-gram embeddings from a table too large for device memory. Every token hashes
+itself with its predecessors into one row per head of the mapped `[width, rows]`
+table, the context cut at an end-of-sequence id, and only the addressed rows
+decode, in any quantization. One description addresses the rows: the head
+ranges as `offsets` and `vocabularies`, the fold, the end id, and the id a
+missing predecessor reads as. The `ngram.*` keys fill it with `ngram.heads` heads
+per order over equal ranges of `ngram.table`, folded from `ngram.seeds`; the
+`<arch>.ple.*` keys of a per-layer embedding fill it with the reference
+multiply-xor fold over `layer_multipliers` into `head_offsets` and
+`head_vocab_sizes` of `per_layer_token_embd.weight`, cut at `eos_token_id`.
+`ngram.rows(&ids, position)` names the rows, `ngram.bytes()` the table bytes one
+token reads.
+
+`ngram.infer` is the injection form: an `ngram.conv` tensor convolves the gathered
+rows across as many trailing positions, and the gathered vector is added to the
+stream before the block `ngram.layer` names, the gather on the host holding the
+table and the blocks either side of it on the device.
+
+```rust
+let model = recipe.model().embed(vocab, 2560).hyper(4, 320, &branch).ple(&table);
+let plan = shards.plan().named(&shards, "per_layer_token_embd.weight").named(&shards, "blk.1.ple_key.weight");
+let output = shards.infer(&model, &plan, &ids, 1);
+let generation = shards.decode(&model, &plan, 64, &prompt, &mut sampler, &[], 1);
+```
+
+`ple(&table)` is the block form, a per-layer embedding at any layer of a model,
+on a stream of any width. The host gathers the table's rows for every position
+and stages them for the device; everything after the gather is ordinary nodes:
+bias-free key and value projections of the gathered vector, root-mean-square
+norms grouped over one lane of the stream with a scale over every lane, a
+per-lane dot product of the normalized key and stream over the root of the lane
+width, the gate `sigmoid(sign(s) * sqrt(max(|s|, 1e-6)))`, the value broadcast
+over the lanes under that gate, a third grouped norm, a causal depthwise
+convolution of `ple.conv_kernel` taps dilated by the n-gram size, SiLU, and the
+sum of both terms added into the stream. A decode step reads the convolution's
+earlier positions from the tape, so a chunked prefill equals a single-shot one.
+Its weighted nodes bind in order: the table, the key projection, the key norm,
+the stream norm, the value projection, the convolution norm, and the taps. The
+table's bytes join no device: `place` keeps it on the host and `resident_bytes`
+never counts it. `Gguf::decode` runs a bound model as `recipe.decode` runs a saved
+one, over a sequence of that many id positions.
 
 ## placement
 
@@ -151,6 +184,7 @@ weights:
 	attn(heads)[.kv(heads)][.head(width)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)[.budget(tokens)][.score(rms|l2, dims)]][.gate()]
 	perc(width)
 	embed(vocab, width)
+	ple(&table)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
@@ -179,9 +213,11 @@ Feature generation is banned.
 
 `embed` must be the first block and must carry a quantization. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather decodes each addressed row out of the packed table, so `width` must be a whole number of the layout's blocks and the run reads one packed row per token instead of the table. The table keeps the values it was quantized from and no optimizer step writes it back.
 
-`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into a Recipe submodel through a gate, writes its output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
+`hyper` widens the residual stream to `lanes` copies of the width. Each block normalizes the stream with per-lane `rms` statistics under one trainable scale over the whole stream, reads the normalized lanes into a Recipe submodel as their mean under a read gate, writes the submodel output back through one write gate per lane, and the head reads the stream once more before the output projection. The read gate is `sigmoid(up(silu(down(xn) / lanes)))` through a `rank` bottleneck, the write gate is `2 sigmoid(inject(xn) / lanes)`, and no projection carries a bias, so the mixer holds `stream + 2 stream rank + stream lanes` parameters per block and `stream + 2 stream rank` at the head. `rank` zero adds no node and fixes every gate at one: the read is the mean of the raw lanes, which for one lane is the plain residual.
 
-`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`. The taps may sit a dilation apart, as a per-layer embedding's do, so tap `j` reads `t - (kernel - 1 - j) * dilation`; a dilation of one is the plain form.
+
+`ple(&table)` is a per-layer embedding block over the hashed row table a GGUF describes; see the ngram section.
 
 `delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
 

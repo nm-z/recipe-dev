@@ -33,6 +33,9 @@ attention-query-tile = 24
 # is the decode schedule; the value never changes the result.
 delta-chunk = 8
 topology-probe-bytes = 4194304
+# Device memory left free for backend allocations made by the first inference
+# dispatch after a placement has loaded its module and resident buffers.
+placement-launch-reserve-bytes = 16777216
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
 cpu-worker-threads = 0
 cpu-compiler = "/usr/bin/clang"
