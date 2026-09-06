@@ -6783,7 +6783,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	if graph.lanes != 0 {
-		lower_collapse(&mut graph)?;
+		lower_collapse(&mut graph, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	// A model whose last block already emits one value per target needs no projection; the
@@ -6875,7 +6875,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..)) {
-		lower_collapse(graph)?;
+		lower_collapse(graph, config)?;
 	}
 	let skip = graph.source;
 	let first = graph.nodes.len();
@@ -7074,10 +7074,25 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3);
 	push_program(graph, -2, initial, program)
 }
+/// A contraction's arguments: the convolution kernel, or zero for a projection;
+/// the fused ReLU flag, which activation lowering sets; and whether the node
+/// carries no bias row, which the kernels read to skip the bias term and which
+/// `output_bias_offset` follows.
+fn contraction_arguments(kernel: usize, bias: bool) -> [f64; 9] {
+	[kernel as f64, 0.0, f64::from(u8::from(!bias)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+/// A projection of the graph output onto `channels`, with a bias row.
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
+	lower_contraction(graph, channels, true)
+}
+/// A contraction of the graph output onto `channels` whose lowering owns a bias
+/// row when `bias` is set; a gate lowered without one spans the matrix alone.
+fn lower_contraction(graph: &mut Graph, channels: usize, bias: bool) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let (parameters, output) = (checked_add(checked_mul(graph.output.channels, channels, "projection matrix")?, channels, "projection bias")?, Shape { channels, length: graph.output.length });
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2)
+	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
+	let parameters = if bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
+	let output = Shape { channels, length: graph.output.length };
+	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, bias), -2)
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
@@ -7276,8 +7291,8 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	graph.rank = rank;
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (read, write) = lower_gates(graph, lanes, rank, true)?;
-	reset(graph, stream, shape);
+	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	graph.lanes = 0;
 	for block in blocks {
@@ -7285,7 +7300,7 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
 	if graph.lanes != 0 {
-		lower_collapse(graph)?;
+		lower_collapse(graph, config)?;
 	}
 	graph.lanes = lanes;
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
@@ -7294,44 +7309,49 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, stream, &[], program)
 }
-/// Data-dependent gates from the layer-normalized stream: a read gate the width
-/// of the stream through a bottleneck of `rank`, and one write gate per lane,
-/// both offset by one so a fresh model starts at the plain residual. With
-/// `rank` zero every gate is one and no node is added.
-fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Result<(i32, i32)> {
-	if rank == 0 {
-		return Ok((-2, -2));
-	}
+/// The mixer gates from the stream: per-lane RMS statistics under one trainable
+/// scale over the whole stream give `xn`; the read gate is
+/// `sigmoid(W_up · silu(W_down · xn / lanes))` over the stream, and the write
+/// gate is `2 sigmoid(W_inject · xn / lanes)` per lane, so a zero injection is
+/// the plain residual. No projection carries a bias. Returns the node the read
+/// consumes, the read gate, and the write gate. With `rank` zero no node is
+/// added, every gate is one, and the read takes the raw stream.
+fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config: Config) -> Result<(i32, i32, i32)> {
 	let (stream, shape) = (graph.source, graph.output);
-	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
-	push_node(graph, Primitive::Normalize, shape, 0, arguments(1.0, epsilon), -2)?;
+	if rank == 0 {
+		return Ok((stream, -2, -2));
+	}
+	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
 	let normalized = graph.source;
-	lower_project(graph, rank)?;
-	lower_project(graph, shape.channels)?;
-	lower_offset_one(graph)?;
+	lower_contraction(graph, rank, false)?;
+	lower_scale(graph, 1.0 / lanes as f64)?;
+	lower_activation(graph, Activation::Silu, config)?;
+	lower_contraction(graph, shape.channels, false)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
 	let read = graph.source;
 	if !write {
-		reset(graph, stream, shape);
-		return Ok((read, -2));
+		return Ok((normalized, read, -2));
 	}
 	reset(graph, normalized, shape);
-	lower_project(graph, lanes)?;
-	lower_offset_one(graph)?;
-	let write = graph.source;
-	reset(graph, stream, shape);
-	Ok((read, write))
+	lower_contraction(graph, lanes, false)?;
+	lower_scale(graph, 1.0 / lanes as f64)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
+	lower_scale(graph, 2.0)?;
+	Ok((normalized, read, graph.source))
 }
-fn lower_offset_one(graph: &mut Graph) -> Result<()> {
+/// Multiplies the graph output by `factor`.
+fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 	let mut program = ScalarProgram(Vec::new());
-	let one = program.constant(1.0);
-	program.op(ScalarOpcode::Add, -1.0, one);
+	let factor = program.constant(factor);
+	program.op(ScalarOpcode::Multiply, -1.0, factor);
 	push_program(graph, -2, &[], program)
 }
-/// The head read: the stream collapses to the width through its own read gate.
-fn lower_collapse(graph: &mut Graph) -> Result<()> {
-	let (lanes, rank, stream, shape) = (graph.lanes, graph.rank, graph.source, graph.output);
-	let (read, _) = lower_gates(graph, lanes, rank, false)?;
-	reset(graph, stream, shape);
+/// The head read: the stream collapses to the mean of its lanes under its own
+/// read gate.
+fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
+	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
+	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
+	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	graph.lanes = 0;
 	Ok(())

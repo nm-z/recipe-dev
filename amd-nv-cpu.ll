@@ -923,9 +923,10 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narro
 %sum.next = call double @recipe.add(double %sum, double %value) %lane.next = add i32 %lane, 1 br label %loop done:
 %adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
 %total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
-; Output element %p of the narrow batch is the gate-weighted sum of its lanes; without a gate every lane weighs one.
+; Output element %p of the narrow batch is the gate-weighted mean of its lanes: the sum in lane order times 1 / lanes; without a gate every lane weighs one.
 define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
 %narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow
+%lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value)
 %row.base = mul i32 %row, %per.row %base = add i32 %row.base, %within br label %loop loop:
 %lane = phi i32 [ 0, %entry ], [ %lane.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ] %more = icmp ult i32 %lane, %lanes
 br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narrow %index = add i32 %base, %lane.offset
@@ -933,13 +934,16 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i32 %lane, %narro
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i32 %index %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
 %weight = select i1 %gated, double %gate.loaded, double 1.0 %product = call double @recipe.mul(double %weight, double %value)
 %sum.next = call double @recipe.add(double %sum, double %product) %lane.next = add i32 %lane, 1 br label %loop done:
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
-; Stream element %p receives gate * dh, and its gate receives stream * dh.
+%mean = call double @recipe.mul(double %sum, double %scale)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %mean, ptr addrspace(1) %output.ptr, align 8 ret void }
+; Stream element %p receives gate * dh / lanes, and its gate receives stream * dh / lanes.
 define internal void @read_reverse_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %stream.adjoint, ptr addrspace(1) %gate.adjoint, i32 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
 %narrow = mul i32 %channels, %length %per.row = mul i32 %narrow, %lanes %row = udiv i32 %p, %per.row %within = urem i32 %p, %per.row
 %lane.channel = udiv i32 %within, %length %position = urem i32 %within, %length %channel = urem i32 %lane.channel, %channels
 %row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %h.row = add i32 %row.base, %channel.base %h = add i32 %h.row, %position
-%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %h %dh = load double, ptr addrspace(1) %delta.ptr, align 8
+%lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value)
+%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %h %dh.loaded = load double, ptr addrspace(1) %delta.ptr, align 8
+%dh = call double @recipe.mul(double %dh.loaded, double %scale)
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i32 %p %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
 %weight = select i1 %gated, double %gate.loaded, double 1.0 %stream.term = call double @recipe.mul(double %weight, double %dh)
 %stream.adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %stream.adjoint, i32 %p %stream.prior = load double, ptr addrspace(1) %stream.adjoint.ptr, align 8

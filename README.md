@@ -79,7 +79,7 @@ estimators:
 ```
 Feature generation is banned.
 
-`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into a Recipe submodel through a gate, writes its output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
+`hyper` widens the residual stream to `lanes` copies of the width. Each block normalizes the stream with per-lane `rms` statistics under one trainable scale over the whole stream, reads the normalized lanes into a Recipe submodel as their mean under a read gate, writes the submodel output back through one write gate per lane, and the head reads the stream once more before the output projection. The read gate is `sigmoid(up(silu(down(xn) / lanes)))` through a `rank` bottleneck, the write gate is `2 sigmoid(inject(xn) / lanes)`, and no projection carries a bias, so the mixer holds `stream + 2 stream rank + stream lanes` parameters per block and `stream + 2 stream rank` at the head. `rank` zero adds no node and fixes every gate at one: the read is the mean of the raw lanes, which for one lane is the plain residual.
 
 ## 15 activations
 
