@@ -9532,12 +9532,6 @@ impl<'a> Builder<'a> {
 		}
 		planes.push(value);
 		let mut block = branch.attn(heads).kv(kv).head(head);
-		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
-			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
-			planes.push(self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?);
-			planes.push(self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?);
-			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size).max(1));
-		}
 		if gated {
 			for index in 0..heads {
 				planes.push(query.rows(index * stride + head, head)?);
@@ -9554,6 +9548,21 @@ impl<'a> Builder<'a> {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
+		}
+		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
+			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
+			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
+			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
+			self.mapped(vec![query, key]);
+			block = block.index(index_heads, index_width, block_size, 1).budget(top_k);
+			let query_norm = name("indexer.q_norm.weight");
+			let key_norm = name("indexer.k_norm.weight");
+			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
+				block = block.score(rms, rope_dims);
+				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &(0..index_width).collect::<Vec<_>>())?;
+				scales.extend(self.scale(&key_norm, &role, index_width, 1, &(0..index_width).collect::<Vec<_>>())?);
+				self.slot(scales);
+			}
 		}
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
