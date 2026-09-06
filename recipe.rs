@@ -2858,7 +2858,8 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					let selectors = attention_selectors(node, &self.precision)?;
+					let geometry = self.indexer_geometry(index)?;
+					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
@@ -2869,6 +2870,7 @@ impl NativeModelIr {
 						// the select loop scores only the window's queries, so a step costs
 						// the blocks it touches and a whole forward costs the sequence once.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
+						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						let block = integer_argument(node.argument[3], "indexer block")?;
@@ -2884,7 +2886,9 @@ impl NativeModelIr {
 						})?;
 						ir.push_str(barrier(backend));
 						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
-							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+							ir.push_str(&format!(
+								"call void @attention_select_body( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"
+							));
 						})?;
 						ir.push_str(barrier(backend));
 					}
@@ -3260,21 +3264,14 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					let selectors = attention_selectors(node, &self.precision)?;
+					let geometry = self.indexer_geometry(index)?;
+					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
-					if attention_blocks(node) != 0 {
-						// The indexer gradient lands in the side projection's adjoint, which
-						// the attention node alone writes.
-						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.second, &pointers.context, &pointers.second_adjoint);
-						emit_fixed_loop(&mut ir, index, "index.reverse", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
-							ir.push_str(&format!(
-								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
-							));
-						})?;
-						ir.push_str(barrier(backend));
-					}
+					// Index admission is a hard rank gate. Its score has no
+					// differentiable path into the attention output, so the ordinary
+					// attention reverse above is the complete backward pass.
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
@@ -4078,17 +4075,78 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
-/// The selector arguments every attention kernel takes after its tiling.
-fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+#[derive(Clone, Debug)]
+struct IndexerGeometry {
+	mode: i32,
+	dims: i32,
+	/// Whether key representatives need the trained post-pooling transform.
+	pooled: bool,
+	base: f64,
+	key_weights: String,
+}
+
+impl IndexerGeometry {
+	fn none(index: usize) -> Self {
+		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: format!("%n{index}.weights") }
+	}
+}
+
+impl NativeModelIr {
+	/// Finds the side normalization and rotary nodes that feed an indexed
+	/// attention. The query transform is represented by those nodes; the key
+	/// scale, when present, is the trailing part of the same normalization node
+	/// and is consumed only after the kernel pools raw keys.
+	fn indexer_geometry(&self, index: usize) -> Result<IndexerGeometry> {
+		let node = &self.plans[index].node;
+		let mut geometry = IndexerGeometry::none(index);
+		if attention_blocks(node) == 0 {
+			return Ok(geometry);
+		}
+		let query_channels = checked_mul(node.argument[5] as usize, node.argument[6] as usize, "indexer query width")?;
+		let mut cursor = node.second;
+		let (mut mode_seen, mut dims_seen) = (false, false);
+		while cursor >= 0 {
+			let candidate = &self.plans[usize::try_from(cursor).map_err(|_| RecipeError::new("indexer side node is invalid"))?].node;
+			match candidate.op {
+				Primitive::Normalize if !mode_seen => {
+					geometry.mode = integer_argument(candidate.argument[0], "indexer scoring normalization")?;
+					geometry.pooled = candidate.argument[3] as usize == query_channels;
+					mode_seen = true;
+					if geometry.pooled && candidate.parameters > query_channels {
+						geometry.key_weights = format!("%n{cursor}.weights");
+					}
+				}
+				Primitive::Rope if !dims_seen => {
+					geometry.dims = integer_argument(candidate.argument[0], "indexer rotary dimensions")?;
+					geometry.base = candidate.argument[1];
+					dims_seen = true;
+				}
+				_ => {}
+			}
+			cursor = candidate.source;
+		}
+		Ok(geometry)
+	}
+}
+
+/// The selector arguments every attention kernel takes after its tiling. The
+/// model epsilon stays in model storage; the rotary base stays in arithmetic
+/// state so narrow or integer model encodings cannot clip it.
+fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
 	Ok(format!(
-		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
 		block = integer_argument(node.argument[3], "indexer block")?,
 		gate = node.argument[2] != 0.0,
-		ty = precision.model_type,
-		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+		model_ty = precision.model_type,
+		state_ty = precision.state_type,
+		epsilon = native_literal(precision.model, precision.model_type, node.argument[7]),
+		index_mode = index_mode,
+		index_dims = index_dims,
+		pooled = index_pooled,
+		index_base = native_literal(precision.state, precision.state_type, index_base),
 	))
 }
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
@@ -11200,10 +11258,9 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
-	// its indexer tensors as their own node in whatever layout they hold, and the
-	// normalization and rotary the model trained sit on that projection as graph
-	// nodes: every indexer head normalizes under `.score`, or to unit length
-	// without it, before the attention node scores plain dot products.
+	// its indexer tensors as their own node in whatever layout they hold. Query
+	// normalization and rotary stay graph nodes. A trained score keeps keys raw
+	// until the selector pools each block, then applies the matching key geometry.
 	let indexer = index.unwrap_or(Indexer::NONE);
 	let mut side = -2;
 	if let Some(index) = index {
@@ -11212,12 +11269,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		reset(graph, source, input);
 		lower_project(graph, checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?)?;
 		let (normalization, dims) = index.score.unwrap_or((BlockNormalization::L2, 0));
-		let planes = graph.output.channels;
-		lower_normalize(graph, normalization, index.width, planes)?;
+		let scored = index.score.is_some();
+		// The query heads are normalized and rotated before scoring. A trained
+		// score leaves the key plane raw: the reference pools raw keys first, then
+		// applies its RMS/L2 norm and rotary at the block position in the indexer
+		// kernel. The unscored index path keeps its historical per-key L2
+		// normalization before pooling.
+		let query_channels = checked_mul(index.heads, index.width, "indexer query width")?;
+		let span = if scored { query_channels } else { graph.output.channels };
+		let parameters = if normalization == BlockNormalization::Rms { if scored { checked_add(query_channels, index.width, "indexer query and key scales")? } else { span } } else { 0 };
+		lower_normalize_parameters(graph, normalization, index.width, span, parameters)?;
 		if dims != 0 {
 			let (_, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, planes as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
@@ -11230,9 +11295,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
+	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	lower_normalize_parameters(graph, normalization, width, span, parameters)
+}
+/// Pushes a normalization whose trainable scale may include deferred columns.
+/// The ordinary forward path only applies the first `span` columns; an indexer
+/// uses the trailing columns as key scales after raw key pooling in its kernel.
+fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize, parameters: usize) -> Result<()> {
+	if normalization == BlockNormalization::Rms {
+		require(parameters >= span, "normalization scale is narrower than its span")?;
+	} else {
+		require(parameters == 0, "non-RMS normalization cannot carry a scale")?;
+	}
 	let epsilon = graph.epsilon;
 	// RMS carries one trainable scale per normalized channel, starting at identity.
-	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
 	let output = graph.output;
 	push_node(graph, Primitive::Normalize, output, parameters, [normalization.mode(), epsilon, width as f64, span as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	let offset = graph.parameters.len() - parameters;
@@ -12652,16 +12728,14 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
 		// Softmax statistics, then the indexer block representatives, then one
-		// row of block scores and one admission flag per block per query, then
-		// one block score gradient per attention head per query.
+		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
 			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
 			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
 			let blocks = attention_blocks(node);
 			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
-			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
-			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
+			checked_add(statistics, checked_add(representatives, scores, "indexer context")?, "attention context")?
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
