@@ -9174,9 +9174,14 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 /// `channels` names the input's channel axis, so the rest of its length is the
 /// sequence the blocks walk.
 fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<(Graph, &'static Gpu)> {
+	let device = selected_gpu()?;
+	let graph = bound_graph_on(model, blocks, plan, input, channels, device)?;
+	Ok((graph, device))
+}
+fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	let (device, config) = (selected_gpu()?, Config::load()?);
+	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
@@ -9195,8 +9200,7 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 		fitted: Vec::new(),
 		bound: Some(model.bound(plan)?),
 	};
-	let graph = compile(blocks, &data, &data.targets, 1, device, config, false)?;
-	Ok((graph, device))
+	compile(blocks, &data, &data.targets, 1, device, config, false)
 }
 /// How an architecture pairs the channels its rotary embedding rotates. Recipe's
 /// rope pairs each channel with the one half the rotated span away; an
@@ -9270,6 +9274,21 @@ impl Bound {
 	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
 		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
 		self.file.infer(&self.model, &self.plan, &input, 1)
+	}
+	/// Place this bound model across the selected devices for a sequence of
+	/// `positions` token ids. `split` names the Recipe blocks each device takes;
+	/// an empty split is measured from each device's free memory.
+	pub fn place(&self, positions: usize, split: &[usize]) -> Placed {
+		selected_gpus().and_then(|devices| place_bound(self, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Decode through this bound model after placing it across the selected devices.
+	pub fn decode(&self, positions: usize, split: &[usize], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.place(positions, split).decode(prompt, sampler, stop, budget)
+	}
+	/// Serve `requests` decodes through this bound model after placing it across
+	/// the selected devices.
+	pub fn serve(&self, positions: usize, split: &[usize], address: &str, requests: usize) {
+		self.place(positions, split).serve(address, requests);
 	}
 }
 /// Walks the standard metadata and tensor names of one file, emitting the
@@ -9941,12 +9960,18 @@ fn decode_steps(
 	}
 	Ok(generation)
 }
-/// A saved model placed across the selected devices: contiguous block ranges,
-/// each held by one persistent tape on its own device, run in sequence with
-/// the stream moved at every hop. The tapes are the model's state, so a decode
+/// The interface in front of placed tapes: a saved semantic pipeline applies
+/// its named-input transforms, while a bound graph reads its input directly.
+enum PlacedSource {
+	Saved(Vec<bundle::SemanticGraph>),
+	Bound(Shape),
+}
+/// A model placed across the selected devices: contiguous block ranges, each
+/// held by one persistent tape on its own device, run in sequence with the
+/// stream moved at every hop. The tapes are the model's state, so a decode
 /// extends them one position at a time.
 pub struct Placed {
-	graphs: Vec<bundle::SemanticGraph>,
+	source: PlacedSource,
 	split: Vec<usize>,
 	/// One tape per range of every graph, on the range's device.
 	tapes: Vec<Vec<NativeTape>>,
@@ -9957,6 +9982,15 @@ pub struct Placed {
 /// node index and the channels it normalizes.
 fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
 	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels)))
+}
+/// The bytes a device holds to run one row of a graph part: its input, weight
+/// arena, and value and context arenas for the part's own layout.
+fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+	let (_, weights) = native_weight_arena(part, precision, true)?;
+	let layout = NativeLayout::for_graph(part, 1, precision)?;
+	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { precision.bytes() };
+	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
+	checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")
 }
 /// The bytes a device holds for the nodes `range` of an inference graph, as
 /// the tape lays them out: each node's packed or decoded weights, and its
@@ -10009,23 +10043,66 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 			starts.push(index)
 		}
 	}
-	let (mut split, mut taken, mut free) = (Vec::new(), 0, available(&devices[0])?);
+	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = resident_bytes(graph, start..end, precision)? as u64;
+		let resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
 			split.push(taken);
-			(taken, free) = (0, available(&devices[split.len()])?);
+			(taken, first, free) = (0, start, available(&devices[split.len()])?);
 		}
-		if taken == 0 {
-			free = free.saturating_sub(input_row_bytes(graph, start, precision.bytes())? as u64);
-		}
-		free = free.saturating_sub(resident);
 		taken += 1;
 	}
 	require(taken != 0, "model has no block")?;
 	split.push(taken);
 	Ok(split)
+}
+/// The nodes `start..end`, rebased as a graph of their own whose input is the
+/// node before `start`.
+fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
+	require(end > start, "a device takes no blocks")?;
+	require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
+	let base = graph.nodes[start].offset;
+	let rebase = |index: i32| {
+		if index >= start as i32 {
+			index - start as i32
+		} else if index == -2 {
+			-2
+		} else {
+			-1
+		}
+	};
+	let nodes = graph.nodes[start..end]
+		.iter()
+		.map(|node| {
+			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
+			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+		})
+		.collect::<Result<Vec<_>>>()?;
+	let last = &graph.nodes[end - 1];
+	// A packed bound node owns logical parameters without an arithmetic arena
+	// span. The next node's offset is the actual end of this part's span.
+	let parameters = graph.nodes.get(end).map_or(graph.parameters.len(), |node| node.offset);
+	Ok(Graph {
+		nodes,
+		parameters: graph.parameters[base..parameters].to_vec(),
+		frozen: graph.frozen[base..parameters].to_vec(),
+		programs: graph.programs.clone(),
+		lanes: graph.lanes,
+		rank: graph.rank,
+		stored: graph.stored[start..end].to_vec(),
+		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
+		output: last.output,
+		source: (end - start) as i32 - 1,
+		state: TrainingState::default(),
+		block_index: last.block_index,
+		block_kind: last.block_kind,
+		block_frozen: false,
+		block_packed: false,
+		bound: None,
+		bound_values: Vec::new(),
+		epsilon: graph.epsilon,
+	})
 }
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
@@ -10035,46 +10112,7 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 		first_block += blocks;
 		let end = if device + 1 == split.len() { graph.nodes.len() } else { graph.nodes.iter().position(|node| node.block_index >= first_block).unwrap_or(graph.nodes.len()) };
 		require(end > start, format!("device {device} takes no blocks"))?;
-		require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
-		let base = graph.nodes[start].offset;
-		let rebase = |index: i32| {
-			if index >= start as i32 {
-				index - start as i32
-			} else if index == -2 {
-				-2
-			} else {
-				-1
-			}
-		};
-		let nodes = graph.nodes[start..end]
-			.iter()
-			.map(|node| {
-				require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-				Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
-			})
-			.collect::<Result<Vec<_>>>()?;
-		let last = &graph.nodes[end - 1];
-		let parameters = last.offset + last.parameters;
-		parts.push(Graph {
-			nodes,
-			parameters: graph.parameters[base..parameters].to_vec(),
-			frozen: graph.frozen[base..parameters].to_vec(),
-			programs: graph.programs.clone(),
-			lanes: graph.lanes,
-			rank: graph.rank,
-			stored: graph.stored[start..end].to_vec(),
-			input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
-			output: last.output,
-			source: (end - start) as i32 - 1,
-			state: TrainingState::default(),
-			block_index: last.block_index,
-			block_kind: last.block_kind,
-			block_frozen: false,
-			block_packed: false,
-			bound: None,
-			bound_values: Vec::new(),
-			epsilon: graph.epsilon,
-		});
+		parts.push(graph_part(graph, start, end)?);
 		start = end;
 	}
 	Ok(parts)
@@ -10086,43 +10124,59 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	let (begin, end) = (begin as usize, end as usize);
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
+/// Build one persistent tape for every contiguous device range of `graph`.
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, usize)> {
+	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
+	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
+	require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
+	let (mut ranges, mut resident, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], 0, 0);
+	let tokens = vec![0.0; graph_positions(graph)];
+	for (index, (part, device)) in split_graph(graph, &split)?.iter().zip(devices).enumerate() {
+		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics)?;
+		resident[index] = tape.resident_bytes();
+		if index + 1 < split.len() {
+			moved += part.output.channels * precision.bytes();
+		}
+		ranges.push(tape);
+	}
+	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
+	Ok((split, ranges, resident, moved))
+}
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
 fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
 	let path = resolve_path(path)?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
-	let (mut split, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
+	let (mut chosen, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		if split.is_empty() {
-			split = measured_split(&graph, stored.precision, devices)?;
+		let (next, ranges, bytes, movement) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		if chosen.is_empty() {
+			chosen = next;
 		}
-		let blocks = stored.model.blocks.len();
-		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
-		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
-		let (mut ranges, mut statistics) = (Vec::new(), 0);
-		let tokens = vec![0.0; stored.input.elements()];
-		for (index, (part, device)) in split_graph(&graph, &split)?.iter().zip(devices).enumerate() {
-			let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, stored, &mut statistics)?;
-			resident[index] += tape.resident_bytes();
-			if index + 1 < split.len() {
-				moved += part.output.channels * stored.precision.bytes();
-			}
-			ranges.push(tape);
+		for (total, bytes) in resident.iter_mut().zip(bytes) {
+			*total += bytes;
 		}
+		moved += movement;
 		tapes.push(ranges);
 	}
-	Ok(Placed { graphs, split, tapes, resident, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), split: chosen, tapes, resident, moved })
+}
+/// Place a GGUF-bound model over the selected devices through the same graph
+/// partition and tape construction used by a saved model.
+fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
+	require(positions != 0, "a placed bound model has no positions")?;
+	let samples = vec![0.0; positions];
+	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
+	let input = graph.input;
+	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Compute::FP64, &[])?;
+	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
 }
 impl Placed {
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
-		let mut graph = 0;
-		bundle::infer_graphs(&self.graphs, input, |_, samples| {
-			let tapes = &self.tapes[graph];
-			graph += 1;
-			self.forward_window(tapes, samples, 0, tapes.first().map_or(0, |tape| tape.positions))
-		})
-		.unwrap_or_else(|error| panic!("{error}"))
+		let end = self.tapes.first().and_then(|ranges| ranges.first()).map_or(0, |tape| tape.positions);
+		self.run_window(input, 0, end).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Autoregressive decode over the placed model, whose input is a sequence
 	/// of ids and whose output is one logit per id. The tapes hold the state of
@@ -10154,13 +10208,21 @@ impl Placed {
 		self.moved
 	}
 	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
-		let (stored, tapes) = match (self.graphs.as_slice(), self.tapes.as_slice()) {
-			([only], [tapes]) => (only, tapes.as_slice()),
-			_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", self.graphs.len()))),
+		let sequence = match &self.source {
+			PlacedSource::Saved(graphs) => match graphs.as_slice() {
+				[only] => {
+					require(only.input.channels == 1 || only.input.length == 1, "decode expects one input value per position")?;
+					only.inputs.len()
+				}
+				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
+			},
+			PlacedSource::Bound(input) => {
+				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
+				input.elements()
+			}
 		};
-		let sequence = stored.inputs.len();
+		require(self.tapes.len() == 1, format!("decode expects one range set, this placement has {}", self.tapes.len()))?;
 		require(!prompt.is_empty(), "decode prompt is empty")?;
-		require(stored.input.channels == 1 || stored.input.length == 1, "decode expects one input value per position")?;
 		require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
 		let mut samples = vec![0.0; sequence];
 		for (slot, id) in samples.iter_mut().zip(prompt) {
@@ -10171,7 +10233,7 @@ impl Placed {
 		for step in 0..=budget {
 			let reached = narrow(generation.ids.len(), "decode position")? as u32;
 			let started = std::time::Instant::now();
-			let logits = bundle::infer_graphs(&self.graphs, &samples, |_, prepared| self.forward_window(tapes, prepared, settled, reached))?;
+			let logits = self.run_window(&samples, settled, reached)?;
 			let seconds = started.elapsed().as_secs_f64();
 			if step == 0 {
 				generation.prefill_seconds = seconds;
@@ -10192,6 +10254,25 @@ impl Placed {
 			}
 		}
 		Ok(generation)
+	}
+	/// Run a window through either a saved semantic pipeline or one directly
+	/// bound GGUF graph, using the placement's persistent range tapes.
+	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		match &self.source {
+			PlacedSource::Saved(graphs) => {
+				let mut graph = 0;
+				bundle::infer_graphs(graphs, samples, |_, prepared| {
+					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
+					graph += 1;
+					self.forward_window(ranges, prepared, begin, end)
+				})
+			}
+			PlacedSource::Bound(input) => {
+				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
+				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
+				self.forward_window(ranges, samples, begin, end)
+			}
+		}
 	}
 	/// Run the input positions `begin..end` through every range in order. A
 	/// window from position zero starts a new sequence. The window's rows of
@@ -10577,16 +10658,16 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 }
 /// The tape of one part of a split graph on its device, holding the batch
 /// normalization statistics that follow the parts already made.
-fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<NativeTape> {
-	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, stored.precision, None)?;
+fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize) -> Result<NativeTape> {
+	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, precision, None)?;
 	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
-	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+	tape.inject_bn_stats(bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
 	Ok(tape)
 }
 /// One part of a split graph run forward on its device.
 fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let tape = range_tape(graph, samples, tokens, gpu, stored, statistics)?;
+	let tape = range_tape(graph, samples, tokens, gpu, stored.precision, &stored.bn_stats, statistics)?;
 	tape.forward()?;
 	tape.predictions()
 }
