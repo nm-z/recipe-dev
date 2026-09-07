@@ -71,7 +71,7 @@ fn bare(path: &Path) -> String {
 	name
 }
 
-fn cases() -> Vec<(&'static str, String, Arity, PathBuf, [&'static str; 2])> {
+fn cases() -> Vec<(&'static str, String, Arity, PathBuf, Vec<&'static str>)> {
 	let mut cases = Vec::new();
 	for (family, pair) in FAMILIES {
 		let directory = PathBuf::from("data").join(family);
@@ -93,12 +93,38 @@ fn cases() -> Vec<(&'static str, String, Arity, PathBuf, [&'static str; 2])> {
 			}
 			found.sort_by_key(|(arity, _)| *arity);
 			for (arity, path) in found {
-				cases.push((*family, base.clone(), arity, path, *pair));
+				// A delimited fixture names its own targets in its header, which is
+				// what to believe: the family pair is the fallback for the layouts
+				// that carry no header to read.
+				let targets = declared_targets(&path, arity).unwrap_or_else(|| if arity.targets { pair.to_vec() } else { vec!["target"] });
+				cases.push((*family, base.clone(), arity, path, targets));
 			}
 		}
 	}
 	assert!(!cases.is_empty(), "the data tree names no arity variants");
 	cases
+}
+
+/// The target columns a delimited fixture declares: the last one or two names
+/// in its header, by arity. `None` for anything with no header to read, such as
+/// a directory layout or a container format.
+fn declared_targets(path: &Path, arity: Arity) -> Option<Vec<&'static str>> {
+	let extension = path.extension().and_then(|value| value.to_str())?;
+	let delimiter = match extension {
+		"csv" => ',',
+		"tsv" => '\t',
+		_ => return None,
+	};
+	let text = std::fs::read_to_string(path).ok()?;
+	let header = text.lines().next()?;
+	let names = header.split(delimiter).map(str::trim).collect::<Vec<_>>();
+	let wanted = if arity.targets { 2 } else { 1 };
+	if names.len() <= wanted {
+		return None;
+	}
+	// Leaked so the case list can hold one lifetime throughout; the suite reads
+	// each fixture header once.
+	Some(names[names.len() - wanted..].iter().map(|name| &*Box::leak(name.to_string().into_boxed_str())).collect())
 }
 
 /// The message a panic carried, so one refusing case reports itself instead of
@@ -112,13 +138,13 @@ fn caught(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// Trains, saves and reads back one fixture, answering the failure to report.
-fn run(arity: Arity, path: &Path, pair: [&'static str; 2]) -> Option<String> {
+fn run(path: &Path, targets: &[&'static str]) -> Option<String> {
 	let source = path.to_string_lossy().into_owned();
-	let data = if arity.targets { recipe.data(source).target(pair) } else { recipe.data(source).target(["target"]) };
+	let data = recipe.data(source).target(targets.to_vec());
 	let model = recipe.model().layer(4).gelu().layer(1).loss(mse);
 	let bundle = std::env::temp_dir().join(format!("recipe-arity-{}-{}.ogdl", std::process::id(), path.display().to_string().replace(['/', '\\', '.'], "-")));
 	let report = recipe.train().epochs(2).save(&bundle).run(&model, &data);
-	let outputs = if arity.targets { 2 } else { 1 };
+	let outputs = targets.len();
 	let predictions = report.predictions();
 	let failure = if !report.final_loss().is_finite() {
 		Some(format!("final loss is {}", report.final_loss()))
@@ -147,7 +173,7 @@ fn every_arity_in_every_representation() {
 	std::panic::set_hook(Box::new(|_| {}));
 	let outcomes = cases
 		.iter()
-		.map(|(_, _, arity, path, pair)| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(*arity, path, *pair))).unwrap_or_else(|payload| Some(caught(payload))))
+		.map(|(_, _, _, path, targets)| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(path, targets))).unwrap_or_else(|payload| Some(caught(payload))))
 		.collect::<Vec<_>>();
 	std::panic::set_hook(hook);
 	for ((family, base, arity, _, _), outcome) in cases.iter().zip(outcomes) {
