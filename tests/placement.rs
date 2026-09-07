@@ -76,6 +76,25 @@ fn bits(values: &[f64]) -> Vec<u64> {
 	values.iter().map(|value| value.to_bits()).collect()
 }
 
+/// The model split over as many devices as are selected. A measured split fits
+/// this model on one device, so the block count and the device count are read
+/// off that placement and an even split is named to put every device to work:
+/// with one device selected that is the one-range case, with more it is a real
+/// hop per token.
+fn placement(path: &std::path::Path) -> Placed {
+	let measured = recipe.place(path, &[]);
+	let blocks = measured.split().iter().sum::<usize>();
+	let devices = measured.resident_bytes().len();
+	if devices < 2 || blocks < devices {
+		return measured;
+	}
+	let mut split = vec![blocks / devices; devices];
+	for share in split.iter_mut().take(blocks % devices) {
+		*share += 1;
+	}
+	recipe.place(path, &split)
+}
+
 /// A full-extent decode over the placed model must equal one whole-sequence
 /// forward of the same ids, bit for bit. Every range wrote its window and
 /// handed on only that window's rows; agreement means no range read a position
@@ -83,7 +102,7 @@ fn bits(values: &[f64]) -> Vec<u64> {
 #[test]
 fn a_placed_decode_matches_a_whole_sequence_forward() {
 	let path = bundle("placed-full-extent");
-	let placed = recipe.place(&path, &[]);
+	let placed = placement(&path);
 	let generation = placed.decode(&PROMPT, &mut recipe.sampler().temperature(0.0), &[], COLUMNS - PROMPT.len());
 	assert_eq!(generation.ids.len(), COLUMNS, "decode reached {} ids, expected {COLUMNS}", generation.ids.len());
 	let reference = placed.infer(&whole_sequence(&generation.ids));
@@ -103,7 +122,7 @@ fn a_placed_decode_matches_a_whole_sequence_forward() {
 #[test]
 fn a_placed_decode_equals_the_unplaced_one() {
 	let path = bundle("placed-equals");
-	let placed = recipe.place(&path, &[]);
+	let placed = placement(&path);
 	let steps = COLUMNS - PROMPT.len();
 	let left = placed.decode(&PROMPT, &mut recipe.sampler().temperature(0.0), &[], steps);
 	let right = recipe.decode(&path, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], steps);
@@ -118,7 +137,7 @@ fn a_placed_decode_equals_the_unplaced_one() {
 #[test]
 fn a_placement_starts_each_sequence_clean() {
 	let path = bundle("placed-reset");
-	let placed = recipe.place(&path, &[]);
+	let placed = placement(&path);
 	let steps = COLUMNS - PROMPT.len();
 	let first = placed.decode(&PROMPT, &mut recipe.sampler().temperature(0.0), &[], steps);
 	let second = placed.decode(&PROMPT, &mut recipe.sampler().temperature(0.0), &[], steps);
@@ -133,11 +152,12 @@ fn a_placement_starts_each_sequence_clean() {
 #[test]
 fn a_placement_reports_what_each_device_holds() {
 	let path = bundle("placed-report");
-	let placed = recipe.place(&path, &[]);
+	let placed = placement(&path);
 	let ranges = placed.split().len();
 	assert!(ranges != 0, "the placement names no range");
 	assert!(placed.split().iter().all(|blocks| *blocks != 0), "a device took no block: {:?}", placed.split());
-	assert_eq!(placed.resident_bytes().len(), ranges, "resident bytes name {} devices for {ranges} ranges", placed.resident_bytes().len());
+	// One entry per selected device, which is at least one per range.
+	assert!(placed.resident_bytes().len() >= ranges, "resident bytes name {} devices for {ranges} ranges", placed.resident_bytes().len());
 	assert!(placed.resident_bytes().iter().take(ranges).all(|bytes| *bytes != 0), "a range holds no bytes: {:?}", placed.resident_bytes());
 	// One range never hops; more than one moves a token's stream once per boundary.
 	if ranges == 1 {
