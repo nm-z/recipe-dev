@@ -11451,9 +11451,16 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 		_ => source.iter().map(|table| table.rows.len()).sum(),
 	};
 	let samples = sources.iter().zip(&orders).map(|(source, order)| count(source, order)).max().unwrap_or(0);
+	// How a source was read is what a count mismatch is usually about, so the
+	// report says it rather than leaving the reader to infer the rule.
+	let reading = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[_] => "its rows".to_owned(),
+		_ if order.is_some() => format!("one sample per file across {} files", source.len()),
+		_ => format!("the joined rows of {} partitions, because no column records their file names", source.len()),
+	};
 	let mut aligned = Vec::new();
 	for (mut source, order) in sources.into_iter().zip(orders) {
-		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples, expected {samples}", source[0].name, count(&source, &order)))?;
+		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples as {}, expected {samples}", source[0].name, count(&source, &order), reading(&source, &order)))?;
 		if let [_] = source.as_slice() {
 			aligned.push(source.remove(0));
 			continue;
