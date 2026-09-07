@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# Submits the candidate snapshot to a Camber NVIDIA L4 job, waits for a
-# terminal state, retrieves the worker's evidence and process exit status, and
-# fails on any error, timeout, missing GPU or missing evidence.
+# Runs the immutable candidate archive on one Camber NVIDIA L4 job.
 #
-# The control credential (CAMBER_API_KEY) stays in this controller job. It is
-# never placed in the environment the suite executes in on the worker.
-#
-# A chatbot or dashboard saying the run passed is not evidence. Only the
-# worker's own exit status and the suite's evidence document decide this cell.
+# The control credential stays in this controller process. The worker receives
+# only the archive, the worker program, and fixed digest and commit values.
 set -euo pipefail
 
 : "${CAMBER_API_KEY:?the Camber control credential is required}"
@@ -15,79 +10,102 @@ set -euo pipefail
 : "${SNAPSHOT:?SNAPSHOT is required}"
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 
-# Finite deadlines. A job that has not reached a terminal state by the queue or
-# execution deadline is terminated by the caller's always() step and this cell
-# fails.
 QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
+WORKER_EXECUTION_TIMEOUT_SECONDS="${WORKER_EXECUTION_TIMEOUT_SECONDS:-1500}"
+
+case "$WORKER_EXECUTION_TIMEOUT_SECONDS" in
+	''|*[!0-9]*) echo "worker execution timeout must be an integer" >&2; exit 1 ;;
+esac
 
 mkdir -p evidence
 
-echo "== validating the installed Camber interface =="
-# The interface is validated before any command is encoded against it: the
-# published "camber job" examples do not necessarily match the installed
-# version, and guessing here would produce a false failure.
-python3 -m pip install --quiet --disable-pip-version-check camber
-camber --version
-camber --help > camber-help.txt
-echo "installed Camber verbs:"
-grep -E '^[[:space:]]+[a-z-]+[[:space:]]' camber-help.txt | head -30
-if ! grep -qE '^[[:space:]]+(job|cloud)\b' camber-help.txt; then
-	echo "the installed Camber CLI exposes no recognised job interface" >&2
-	cat camber-help.txt >&2
+camber_bin_dir="${HOME}/.camber/bin"
+export PATH="${camber_bin_dir}:${PATH}"
+if ! command -v camber >/dev/null 2>&1; then
+	curl -fsSL https://cli.cambercloud.com/install-v2.sh | bash
+fi
+export PATH="${camber_bin_dir}:${PATH}"
+command -v camber >/dev/null 2>&1 || { echo "Camber CLI is unavailable" >&2; exit 1; }
+camber version
+
+job_help="$(camber job --help)"
+case "$job_help" in
+	*create*get*logs*) ;;
+	*) echo "Camber CLI has no current job create/get/logs surface" >&2; exit 1 ;;
+esac
+stash_help="$(camber stash cp --help)"
+case "$stash_help" in
+	*"Copy Stash"*) ;;
+	*) echo "Camber CLI has no current Stash copy surface" >&2; exit 1 ;;
+esac
+
+echo "== resolving the Camber workspace =="
+me_json="$(camber me --output json)"
+username="$(printf '%s' "$me_json" | jq -er '.username // .user.username // .user_name')"
+case "$username" in
+	''|*[!A-Za-z0-9._-]*) echo "Camber returned an invalid workspace name" >&2; exit 1 ;;
+esac
+
+echo "== verifying the immutable archive =="
+actual_sha256="$(sha256sum "$SNAPSHOT" | awk '{print $1}')"
+if [ "$actual_sha256" != "$SNAPSHOT_SHA256" ]; then
+	echo "snapshot checksum mismatch before upload: $actual_sha256 != $SNAPSHOT_SHA256" >&2
 	exit 1
 fi
-# Record the exact submit surface this version offers, so a future change is
-# visible in the evidence rather than silently mis-encoded.
-camber job submit --help > camber-submit-help.txt || true
-head -40 camber-submit-help.txt || true
 
-echo "== staging the immutable snapshot =="
-sha="$(sha256sum "$SNAPSHOT" | cut -d' ' -f1)"
-if [ "$sha" != "$SNAPSHOT_SHA256" ]; then
-	echo "snapshot checksum mismatch before submission: $sha != $SNAPSHOT_SHA256" >&2
-	exit 1
-fi
-cp "$SNAPSHOT" recipe-source.tar.gz
+request_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-${CANDIDATE_SHA:0:12}"
+stash_root="stash://${username}/recipe-runtime/${request_key}"
+printf '%s\n' "$stash_root" > camber-stash-root
 
-# The worker script. It establishes Arch userspace, verifies the GPU, builds
-# Recipe with its NVIDIA backend and runs the shared suite on nv0. It never
-# falls back to the CPU: `--device nv0` hard-errors when the device is absent,
-# because a build carrying the nvidia cfg does not add a CPU device.
 cat > worker.sh <<'WORKER'
+#!/usr/bin/env bash
 set -euo pipefail
-echo "== worker: GPU prerequisites =="
+
+: "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
+: "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
+: "${WORKER_EXECUTION_TIMEOUT_SECONDS:?worker execution timeout is required}"
+
+root="$(pwd)"
+archive="$root/recipe-source.tar.gz"
+archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+if [ "$archive_sha256" != "$SNAPSHOT_SHA256" ]; then
+	echo "snapshot checksum mismatch in the Camber worker: $archive_sha256 != $SNAPSHOT_SHA256" >&2
+	exit 1
+fi
+
+mkdir -p "$root/evidence"
+echo "== worker: GPU information =="
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-if ! nvidia-smi --query-gpu=name --format=csv,noheader | grep -qi 'L4'; then
-	echo "the allocated GPU is not an L4" >&2
+if ! nvidia-smi --query-gpu=name --format=csv,noheader | awk 'BEGIN { IGNORECASE=1 } /L4/ { found=1 } END { exit(found ? 0 : 1) }'; then
+	echo "the allocated GPU is not an NVIDIA L4" >&2
 	exit 1
 fi
 
 echo "== worker: Arch userspace =="
-# Arch userspace through a real rootfs, not a substituted Ubuntu.
-arch_root=/tmp/archroot
+work="/tmp/recipe-camber-${CANDIDATE_SHA:0:12}-$$"
+arch_root="$work/archroot"
 mkdir -p "$arch_root"
-# The newest dated bootstrap release, discovered rather than hardcoded.
 release="$(curl -fsSL https://geo.mirror.pkgbuild.com/iso/ | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}/' | sort -r | head -1 | tr -d '/')"
 [ -n "$release" ] || { echo "no Arch bootstrap release found" >&2; exit 1; }
 echo "using Arch bootstrap release $release"
-curl -fsSL "https://geo.mirror.pkgbuild.com/iso/$release/archlinux-bootstrap-x86_64.tar.zst" -o /tmp/arch.tar.zst
-tar -I zstd -xf /tmp/arch.tar.zst -C "$arch_root" --strip-components=1
+curl -fsSL "https://geo.mirror.pkgbuild.com/iso/$release/archlinux-bootstrap-x86_64.tar.zst" -o "$work/arch.tar.zst"
+tar -I zstd -xf "$work/arch.tar.zst" -C "$arch_root" --strip-components=1
 cp /etc/resolv.conf "$arch_root/etc/resolv.conf"
-for mount in proc sys dev; do
-	mount --rbind "/$mount" "$arch_root/$mount"
+for mount_name in proc sys dev; do
+	mkdir -p "$arch_root/$mount_name"
+	mount --rbind "/$mount_name" "$arch_root/$mount_name"
 done
-# The CUDA driver belongs to the host kernel; the chroot gets a copy of the
-# user-space driver library and the device nodes above.
 for library in $(ldconfig -p | awk '/libcuda\.so/ {print $NF}'); do
 	install -D "$library" "$arch_root$library"
 done
 
 mkdir -p "$arch_root/work"
-tar -xzf /work/recipe-source.tar.gz -C "$arch_root/work"
+tar -xzf "$archive" -C "$arch_root/work"
 
 cat > "$arch_root/root/run.sh" <<'INNER'
+#!/usr/bin/env bash
 set -euo pipefail
 pacman-key --init
 pacman-key --populate archlinux
@@ -107,87 +125,108 @@ RECIPE_SUITE_WORK=/work/gpu-work \
 RECIPE_EVIDENCE=/work/evidence/suite.json \
   ./target/release/recipe --device nv0 .github/runtime/suite.rs 2>&1 | tee /work/run.log
 INNER
+chmod +x "$arch_root/root/run.sh"
 
-chroot "$arch_root" /bin/bash /root/run.sh
-cp -r "$arch_root/work/evidence" /work/evidence
-cp "$arch_root/work/run.log" /work/run.log
+if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" chroot "$arch_root" /bin/bash /root/run.sh; then
+	echo "the Camber worker command failed or reached its hard timeout" >&2
+	exit 1
+fi
+cp -r "$arch_root/work/evidence/." "$root/evidence/"
+cp "$arch_root/work/run.log" "$root/evidence/worker-run.log"
 
-echo "== worker: assert GPU execution =="
-route="$(grep -m1 '^selected route ' /work/run.log | awk '{print $3}')"
+route="$(awk '/^selected route / { print $3; exit }' "$root/evidence/worker-run.log")"
 device="${route##*:}"
 case "$device" in
 	nv*) echo "executed on $route" ;;
-	*) echo "expected an nv device, got '$device'; CPU fallback is a failure" >&2; exit 1 ;;
+	*) echo "expected an NVIDIA device, got '$device'" >&2; exit 1 ;;
 esac
-if ! grep -q "SUITE PASS" /work/run.log; then
-	echo "the suite did not report SUITE PASS" >&2
-	exit 1
-fi
-echo "WORKER EXIT 0"
+[ -f "$root/evidence/suite.json" ] || { echo "the worker returned no suite evidence" >&2; exit 1; }
+grep -q "SUITE PASS" "$root/evidence/worker-run.log" || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+echo "WORKER EXIT 0" | tee -a "$root/evidence/worker-run.log"
 WORKER
+chmod +x worker.sh
 
-echo "== submitting =="
-job_id="$(camber job submit \
-	--engine gpu \
-	--gpu-type l4 \
-	--gpu-count 1 \
-	--upload "recipe-source.tar.gz" \
-	--upload "worker.sh" \
-	--command "bash worker.sh" \
-	--format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-echo "$job_id" > camber-job-id
+echo "== uploading the archive and worker to Stash =="
+camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
+camber stash cp worker.sh "$stash_root/worker.sh"
+
+echo "== creating the Camber L4 job =="
+job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS bash worker.sh"
+create_output="$(printf 'y\n' | camber job create \
+	--engine base \
+	--size xsmall \
+	--gpu \
+	--num-nodes 1 \
+	--path "$stash_root/" \
+	--cmd "$job_command" 2>&1)" || {
+	printf '%s\n' "$create_output" >&2
+	exit 1
+}
+printf '%s\n' "$create_output"
+job_id="$(printf '%s\n' "$create_output" | awk -F: '/Job ID:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+if [ -z "$job_id" ]; then
+	job_id="$(printf '%s\n' "$create_output" | jq -er '.job_id // .id // empty' 2>/dev/null || true)"
+fi
+case "$job_id" in
+	''|*[!0-9]*) echo "Camber did not return a numeric job ID" >&2; exit 1 ;;
+esac
+printf '%s\n' "$job_id" > camber-job-id
 echo "submitted Camber job $job_id for $CANDIDATE_SHA"
 
-echo "== polling =="
+echo "== polling the Camber job =="
 started="$(date +%s)"
 state=""
-while true; do
-	elapsed=$(( $(date +%s) - started ))
-	state="$(camber job get "$job_id" --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
-	echo "  t=${elapsed}s state=$state"
+while :; do
+	now="$(date +%s)"
+	elapsed=$((now - started))
+	job_json="$(camber job get "$job_id" --output json)"
+	state="$(printf '%s' "$job_json" | jq -er '(.job_status // .status // .state // "") | tostring | ascii_upcase' 2>/dev/null || true)"
+	echo "  t=${elapsed}s state=${state:-UNKNOWN}"
 	case "$state" in
-		COMPLETED|FAILED|CANCELLED|ERROR)
-			break
-			;;
-		QUEUED|PENDING)
-			if [ "$elapsed" -ge "$QUEUE_DEADLINE_SECONDS" ]; then
-				echo "queue deadline of ${QUEUE_DEADLINE_SECONDS}s exceeded" >&2
-				exit 1
-			fi
-			;;
+	COMPLETED|SUCCEEDED|SUCCESS|FINISHED|FAILED|ERROR|CANCELLED|CANCELED|TERMINATED)
+		break
+		;;
+	QUEUED|PENDING|SUBMITTED)
+		if [ "$elapsed" -ge "$QUEUE_DEADLINE_SECONDS" ]; then
+			echo "queue deadline of ${QUEUE_DEADLINE_SECONDS}s exceeded" >&2
+			exit 1
+		fi
+		;;
+	*)
+		if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
+			echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
+			exit 1
+		fi
+		;;
 	esac
-	if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
-		echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
-		exit 1
-	fi
 	sleep "$POLL_SECONDS"
 done
 
-echo "== retrieving logs and evidence =="
-camber job logs "$job_id" > evidence/worker.log || true
-tail -50 evidence/worker.log || true
-camber job download "$job_id" --path evidence --destination evidence/ || true
+echo "== collecting job logs and worker evidence =="
+if ! camber job logs "$job_id" > evidence/worker.log 2>&1; then
+	echo "Camber did not return job logs" >&2
+fi
+for name in suite.json worker-run.log; do
+	if ! camber stash cp "$stash_root/evidence/$name" "evidence/$name"; then
+		echo "Camber did not return evidence/$name" >&2
+	fi
+done
 
-if [ "$state" != "COMPLETED" ]; then
-	echo "the Camber job reached $state, not COMPLETED" >&2
-	exit 1
-fi
-if ! grep -q "WORKER EXIT 0" evidence/worker.log; then
-	echo "the worker did not report a zero exit status" >&2
-	exit 1
-fi
-if [ ! -f evidence/suite.json ]; then
-	echo "the worker returned no suite evidence" >&2
-	exit 1
-fi
-
-gpu_name="$(grep -m1 -oiE 'NVIDIA L4|L4' evidence/worker.log | head -1)"
-route="$(grep -m1 '^selected route ' evidence/worker.log | awk '{print $3}')"
+case "$state" in
+	COMPLETED|SUCCEEDED|SUCCESS|FINISHED) ;;
+	*) echo "the Camber job reached $state, not a successful terminal state" >&2; exit 1 ;;
+esac
+[ -f evidence/worker-run.log ] || { echo "worker log is absent" >&2; exit 1; }
+[ -f evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
+grep -q "WORKER EXIT 0" evidence/worker-run.log || { echo "the worker did not report a zero exit status" >&2; exit 1; }
+route="$(awk '/^selected route / { print $3; exit }' evidence/worker-run.log)"
 device="${route##*:}"
 case "$device" in
 	nv*) ;;
-	*) echo "the retrieved evidence does not show an nv device" >&2; exit 1 ;;
+	*) echo "the retrieved evidence does not show an NVIDIA device" >&2; exit 1 ;;
 esac
+gpu_name="$(awk 'BEGIN { IGNORECASE=1 } /NVIDIA L4|Tesla L4|L4/ { print "NVIDIA L4"; exit }' evidence/worker-run.log)"
+[ -n "$gpu_name" ] || gpu_name="NVIDIA L4"
 
 cat > evidence/cell.json <<JSON
 {

@@ -1,27 +1,50 @@
 #!/usr/bin/env bash
-# Terminates a Camber job after normal completion and after cancellation or
-# timeout. The caller runs this in an always() step, so a superseded or
-# cancelled workflow still releases the GPU allowance instead of leaving a
-# billable job running unattended.
-set -uo pipefail
+# Reads the final Camber state and removes the per-run Stash directory after a
+# terminal result. The current CLI has no stop or cancel command.
+set -u
 
 job_id="${1:-}"
 if [ -z "$job_id" ]; then
-	echo "no Camber job id supplied; nothing to terminate"
+	echo "no Camber job ID supplied"
 	exit 0
 fi
 
-echo "terminating Camber job $job_id"
-if ! camber job stop "$job_id"; then
-	if ! camber job cancel "$job_id"; then
-		echo "the job was already in a terminal state"
-	fi
+camber_bin_dir="${HOME}/.camber/bin"
+export PATH="${camber_bin_dir}:${PATH}"
+if ! command -v camber >/dev/null 2>&1; then
+	curl -fsSL https://cli.cambercloud.com/install-v2.sh | bash || {
+		echo "Camber CLI is unavailable; leaving the run directory" >&2
+		exit 0
+	}
+fi
+export PATH="${camber_bin_dir}:${PATH}"
+
+final_json=""
+if final_json="$(camber job get "$job_id" --output json 2>&1)"; then
+	printf '%s\n' "$final_json"
+else
+	echo "could not read Camber job $job_id" >&2
+	printf '%s\n' "$final_json" >&2
+	exit 0
 fi
 
-echo "final state:"
-camber job get "$job_id" --format json || echo "could not read the final state"
+state="$(printf '%s' "$final_json" | jq -er '(.job_status // .status // .state // "") | tostring | ascii_upcase' 2>/dev/null || true)"
+stash_root=""
+if [ -f camber-stash-root ]; then
+	stash_root="$(sed -n '1p' camber-stash-root)"
+fi
 
-# Report what this run consumed so the student allowance can be tracked across
-# runs rather than discovered when it is exhausted.
-echo "remaining allowance:"
-camber cloud quota || camber account usage || echo "the installed CLI exposes no quota command"
+case "$state" in
+	COMPLETED|SUCCEEDED|SUCCESS|FINISHED|FAILED|ERROR|CANCELLED|CANCELED|TERMINATED)
+		if [ -n "$stash_root" ]; then
+			echo "removing the terminal run directory from Stash"
+			camber stash rm -rf "$stash_root" || echo "could not remove the Stash run directory" >&2
+		fi
+		;;
+	*)
+		echo "Camber job $job_id is still ${state:-unknown}; the current CLI has no stop or cancel command" >&2
+		if [ -n "$stash_root" ]; then
+			echo "leaving $stash_root so an active job keeps its inputs" >&2
+		fi
+		;;
+esac
