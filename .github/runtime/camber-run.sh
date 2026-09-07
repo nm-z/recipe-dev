@@ -11,7 +11,7 @@
 set -euo pipefail
 
 : "${CAMBER_API_KEY:?the Camber control credential is required}"
-: "${TEST_SHA:?TEST_SHA is required}"
+: "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${SNAPSHOT:?SNAPSHOT is required}"
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 
@@ -68,7 +68,11 @@ echo "== worker: Arch userspace =="
 # Arch userspace through a real rootfs, not a substituted Ubuntu.
 arch_root=/tmp/archroot
 mkdir -p "$arch_root"
-curl -fsSL "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst" -o /tmp/arch.tar.zst
+# The newest dated bootstrap release, discovered rather than hardcoded.
+release="$(curl -fsSL https://geo.mirror.pkgbuild.com/iso/ | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}/' | sort -r | head -1 | tr -d '/')"
+[ -n "$release" ] || { echo "no Arch bootstrap release found" >&2; exit 1; }
+echo "using Arch bootstrap release $release"
+curl -fsSL "https://geo.mirror.pkgbuild.com/iso/$release/archlinux-bootstrap-x86_64.tar.zst" -o /tmp/arch.tar.zst
 tar -I zstd -xf /tmp/arch.tar.zst -C "$arch_root" --strip-components=1
 cp /etc/resolv.conf "$arch_root/etc/resolv.conf"
 for mount in proc sys dev; do
@@ -132,7 +136,7 @@ job_id="$(camber job submit \
 	--command "bash worker.sh" \
 	--format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 echo "$job_id" > camber-job-id
-echo "submitted Camber job $job_id for $TEST_SHA"
+echo "submitted Camber job $job_id for $CANDIDATE_SHA"
 
 echo "== polling =="
 started="$(date +%s)"
@@ -188,7 +192,7 @@ esac
 cat > evidence/cell.json <<JSON
 {
   "cell": "recipe/linux-gpu",
-  "commit": "$TEST_SHA",
+  "commit": "$CANDIDATE_SHA",
   "run_id": "${GITHUB_RUN_ID:-unknown}",
   "run_attempt": "${GITHUB_RUN_ATTEMPT:-unknown}",
   "provider": "camber",

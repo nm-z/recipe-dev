@@ -3,7 +3,7 @@
 # candidate snapshot, executes the Recipe GPU suite through managed Run
 # Command, and reads the guest process's actual result.
 #
-# A successful deployment is not a successful test. The only thing that decides
+# A successful deployment is not a successful run. The only thing that decides
 # this cell is the guest command's exit code and the evidence it returns.
 #
 # No cloud-management credential is ever placed in the guest environment, and
@@ -11,7 +11,7 @@
 # Azure control plane.
 set -euo pipefail
 
-: "${TEST_SHA:?TEST_SHA is required}"
+: "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${SNAPSHOT:?SNAPSHOT is required}"
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${RUN_ID:?RUN_ID is required}"
@@ -21,8 +21,8 @@ GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
 LOCATION="${AZURE_LOCATION:-eastus}"
 # Standard_NC4as_T4_v3 is the smallest T4 shape; the quota request targets it.
 SIZE="${AZURE_VM_SIZE:-Standard_NC4as_T4_v3}"
-IMAGE="${AZURE_VM_IMAGE:-MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition:latest}"
-# One worker per run: two candidates must never share a mutable test directory.
+IMAGE="${AZURE_VM_IMAGE:-Win2022AzureEdition}"
+# One worker per run: two candidates must never share a mutable working directory.
 WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
 
@@ -86,7 +86,7 @@ echo "driver extension installed"
 
 echo "== transferring the immutable snapshot =="
 # The snapshot travels as base64 through the Run Command payload, so the guest
-# never needs network credentials or a clone of "latest".
+# never needs network credentials or a clone of the newest commit.
 base64 -w0 "$SNAPSHOT" > snapshot.b64
 split -b 60000 snapshot.b64 chunk-
 chunks=(chunk-*)
@@ -123,7 +123,7 @@ az vm run-command invoke \
 	--resource-group "$GROUP" --name "$WORKER" \
 	--command-id RunPowerShellScript \
 	--scripts "@guest.ps1" \
-	--parameters "testSha=$TEST_SHA" "snapshotSha256=$SNAPSHOT_SHA256" \
+	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" \
 	--only-show-errors -o json > evidence/azure-runcommand.json
 elapsed=$(( $(date +%s) - started ))
 echo "run command returned after ${elapsed}s"
@@ -170,7 +170,7 @@ gpu_model="$(grep -m1 -oE 'Tesla T4|NVIDIA T4|T4' evidence/guest.log | head -1)"
 cat > evidence/cell.json <<JSON
 {
   "cell": "recipe/windows-gpu",
-  "commit": "$TEST_SHA",
+  "commit": "$CANDIDATE_SHA",
   "run_id": "$RUN_ID",
   "run_attempt": "$RUN_ATTEMPT",
   "provider": "azure",

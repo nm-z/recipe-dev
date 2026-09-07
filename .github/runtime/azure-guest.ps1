@@ -1,5 +1,5 @@
 param(
-	[Parameter(Mandatory = $true)] [string] $testSha,
+	[Parameter(Mandatory = $true)] [string] $candidateSha,
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256
 )
 
@@ -22,8 +22,8 @@ function Invoke-Native {
 try {
 	$root = "C:\recipe"
 	# One directory per candidate: two commits must never share a mutable tree.
-	$work = Join-Path $root $testSha
-	if (Test-Path -LiteralPath $work) { Remove-Item -Recurse -Force -LiteralPath $work }
+	$work = Join-Path $root $candidateSha
+	if ([IO.Directory]::Exists($work)) { Remove-Item -Recurse -Force -LiteralPath $work }
 	New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 	Write-Output "== guest: verifying the snapshot =="
@@ -36,7 +36,7 @@ try {
 
 	Write-Output "== guest: GPU and driver =="
 	$smi = "C:\Windows\System32\nvidia-smi.exe"
-	if (!(Test-Path -LiteralPath $smi)) { throw "nvidia-smi is absent: the GPU driver extension did not install" }
+	if (![IO.File]::Exists($smi)) { throw "nvidia-smi is absent: the GPU driver extension did not install" }
 	Invoke-Native $smi @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader") "nvidia-smi"
 	$gpu = (& $smi --query-gpu=name --format=csv,noheader) -join ""
 	if ($gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $gpu" }
@@ -48,7 +48,7 @@ try {
 	Invoke-Native "rustc" @("--version") "rustc"
 	Invoke-Native "cargo" @("--version") "cargo"
 	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
-	if (!(Test-Path -LiteralPath $clang -PathType Leaf)) { throw "native clang is absent: $clang" }
+	if (![IO.File]::Exists($clang)) { throw "native clang is absent: $clang" }
 	if (-not $env:CUDA_PATH) { throw "CUDA_PATH is not set: the CUDA toolkit is required for Recipe's NVIDIA backend" }
 	Write-Output "CUDA_PATH=$env:CUDA_PATH"
 

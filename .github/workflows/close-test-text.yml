@@ -41,10 +41,10 @@ jobs:
             > "$scan_directory/pull.diff"
 
           locations=()
-          if rg --ignore-case --quiet 'test' "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
-          if rg --ignore-case --quiet 'test' "$scan_directory/files.txt"; then locations+=("changed path or patch"); fi
-          if rg --ignore-case --quiet 'test' "$scan_directory/commits.txt"; then locations+=("commit message"); fi
-          if rg --ignore-case --quiet 'test' "$scan_directory/pull.diff"; then locations+=("diff"); fi
+          if grep --ignore-case --quiet 'test' "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
+          if grep --ignore-case --quiet 'test' "$scan_directory/files.txt"; then locations+=("changed path or patch"); fi
+          if grep --ignore-case --quiet 'test' "$scan_directory/commits.txt"; then locations+=("commit message"); fi
+          if grep --ignore-case --quiet 'test' "$scan_directory/pull.diff"; then locations+=("diff"); fi
 
           if ((${#locations[@]} == 0)); then
             exit 0

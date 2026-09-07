@@ -26,7 +26,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Establishes the one candidate SHA every cell must test and publishes an
+  # Establishes the one candidate SHA every cell must exercise and publishes an
   # immutable, checksummed source snapshot for the external workers.
   # ---------------------------------------------------------------------------
   candidate:
@@ -34,36 +34,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      test_sha: ${{ steps.resolve.outputs.test_sha }}
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v4
         with:
           # For pull_request this is GitHub's candidate merge commit, which is
-          # what all six cells must test.
+          # what all six cells must exercise.
           ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
-      - name: Resolve TEST_SHA
+      - name: Resolve the candidate SHA
         id: resolve
         run: |
           set -euo pipefail
-          test_sha="$(git rev-parse HEAD)"
+          candidate_sha="$(git rev-parse HEAD)"
           expected="${{ github.event.pull_request.merge_commit_sha || github.sha }}"
-          if [ "$test_sha" != "$expected" ]; then
-            echo "checkout $test_sha does not match the candidate $expected" >&2
+          if [ "$candidate_sha" != "$expected" ]; then
+            echo "checkout $candidate_sha does not match the candidate $expected" >&2
             exit 1
           fi
-          echo "test_sha=$test_sha" >> "$GITHUB_OUTPUT"
-          echo "candidate $test_sha (event=${{ github.event_name }})"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "candidate $candidate_sha (event=${{ github.event_name }})"
 
       - name: Build the immutable source snapshot
         id: snapshot
         run: |
           set -euo pipefail
           # A reproducible archive of the exact candidate tree. External workers
-          # receive this, never an instruction to clone "latest".
+          # receive this, never an instruction to clone the newest commit.
           git archive --format=tar HEAD | gzip -n > /tmp/recipe-source.tar.gz
           sha256="$(sha256sum /tmp/recipe-source.tar.gz | cut -d' ' -f1)"
           echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
@@ -98,7 +98,7 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Verify the checkout is the candidate
@@ -106,7 +106,7 @@ jobs:
           set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           head="$(git rev-parse HEAD)"
-          [ "$head" = "${{ needs.candidate.outputs.test_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
+          [ "$head" = "${{ needs.candidate.outputs.candidate_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
           echo "candidate verified: $head"
 
       - name: Record the toolchain
@@ -163,7 +163,7 @@ jobs:
           cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "commit": "${{ needs.candidate.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "os": "$(. /etc/os-release && echo "$PRETTY_NAME")",
@@ -207,7 +207,7 @@ jobs:
       - name: Check out the controller sources
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Download the immutable snapshot
@@ -246,7 +246,7 @@ jobs:
           set -euo pipefail
           bash .github/runtime/camber-run.sh
         env:
-          TEST_SHA: ${{ needs.candidate.outputs.test_sha }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
 
@@ -269,7 +269,7 @@ jobs:
             cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "commit": "${{ needs.candidate.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "backend": "unavailable",
@@ -306,7 +306,7 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Verify the checkout and record the toolchain
@@ -314,12 +314,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $head = (git rev-parse HEAD).Trim()
-          if ($head -ne "${{ needs.candidate.outputs.test_sha }}") { throw "checkout $head is not the candidate" }
+          if ($head -ne "${{ needs.candidate.outputs.candidate_sha }}") { throw "checkout $head is not the candidate" }
           if (git status --porcelain) { throw "the native checkout is not clean" }
           $clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
           $linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
-          if (!(Test-Path -LiteralPath $clang -PathType Leaf)) { throw "native clang is absent: $clang" }
-          if (!(Test-Path -LiteralPath $linker -PathType Leaf)) { throw "native linker is absent: $linker" }
+          if (![IO.File]::Exists($clang)) { throw "native clang is absent: $clang" }
+          if (![IO.File]::Exists($linker)) { throw "native linker is absent: $linker" }
           rustc --version
           cargo --version
           & $clang --version
@@ -386,7 +386,7 @@ jobs:
             & $recipe $source
             if ($LASTEXITCODE -ne 0) { throw "lifecycle phase $phase failed with exit code $LASTEXITCODE" }
           }
-          if (!(Test-Path -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE -PathType Leaf)) { throw "the lifecycle did not save a bundle" }
+          if (![IO.File]::Exists($env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE)) { throw "the lifecycle did not save a bundle" }
           "lifecycle train/resume/infer completed"
 
       - name: Write the cell evidence
@@ -397,7 +397,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path evidence | Out-Null
           $document = [ordered]@{
             cell           = $env:CELL
-            commit         = "${{ needs.candidate.outputs.test_sha }}"
+            commit         = "${{ needs.candidate.outputs.candidate_sha }}"
             run_id         = "${{ github.run_id }}"
             run_attempt    = "${{ github.run_attempt }}"
             os             = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -446,7 +446,7 @@ jobs:
       - name: Check out the controller sources
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Download the immutable snapshot
@@ -491,7 +491,7 @@ jobs:
           set -euo pipefail
           bash .github/runtime/azure-run.sh
         env:
-          TEST_SHA: ${{ needs.candidate.outputs.test_sha }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
           RUN_ID: ${{ github.run_id }}
@@ -516,7 +516,7 @@ jobs:
             cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "commit": "${{ needs.candidate.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "backend": "unavailable",
@@ -551,7 +551,7 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Verify the checkout and discover the toolchain
@@ -559,7 +559,7 @@ jobs:
         run: |
           set -euo pipefail
           head="$(git rev-parse HEAD)"
-          [ "$head" = "${{ needs.candidate.outputs.test_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
+          [ "$head" = "${{ needs.candidate.outputs.candidate_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
           [ "$(uname -m)" = "arm64" ] || { echo "this cell requires an ARM64 runner, got $(uname -m)" >&2; exit 1; }
           # Discover the real paths rather than assuming Linux locations.
           clang_path="$(xcrun --find clang)"
@@ -594,7 +594,7 @@ jobs:
         id: device
         run: |
           set -euo pipefail
-          # A Metal device being present must not turn this cell into a GPU test.
+          # A Metal device being present must not turn this cell into a GPU cell.
           route="$(grep -m1 '^selected route ' evidence/run.log | awk '{print $3}')"
           [ -n "$route" ] || { echo "no route line: the suite did not dispatch" >&2; exit 1; }
           device="${route##*:}"
@@ -610,7 +610,7 @@ jobs:
           cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "commit": "${{ needs.candidate.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
@@ -654,7 +654,7 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.candidate.outputs.test_sha }}
+          ref: ${{ needs.candidate.outputs.candidate_sha }}
           persist-credentials: false
 
       - name: Probe the Metal device
@@ -695,7 +695,7 @@ jobs:
           cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "commit": "${{ needs.candidate.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
@@ -776,6 +776,6 @@ jobs:
       - name: Decide
         run: |
           set -euo pipefail
-          # candidate must itself have succeeded for TEST_SHA to be meaningful.
+          # candidate must itself have succeeded for the SHA to be meaningful.
           [ "${{ needs.candidate.result }}" = "success" ] || { echo "the candidate job did not succeed" >&2; exit 1; }
-          ./gate evidence results.json "${{ needs.candidate.outputs.test_sha }}" "${{ github.run_id }}" "${{ github.run_attempt }}"
+          ./gate evidence results.json "${{ needs.candidate.outputs.candidate_sha }}" "${{ github.run_id }}" "${{ github.run_attempt }}"

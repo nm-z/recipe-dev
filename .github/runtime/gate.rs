@@ -4,7 +4,7 @@
 //! with `rustc` directly so that the aggregate cannot be affected by a failure
 //! in the crate it is judging.
 //!
-//! Run it as `gate <evidence-directory> <results-json> <test-sha> <run-id> <run-attempt>`.
+//! Run it as `gate <evidence-directory> <results-json> <candidate-sha> <run-id> <run-attempt>`.
 //! `--self-check` instead runs the decision table below, which covers every
 //! state the gate must reject.
 use std::collections::BTreeMap;
@@ -78,7 +78,7 @@ fn parse_evidence(cell_document: &str, suite_document: &str) -> Result<Evidence,
 }
 
 /// The whole decision. Every rejected state returns `Verdict::Fail`.
-fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result<Evidence, String>>, test_sha: &str, run_id: &str, run_attempt: &str) -> Verdict {
+fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result<Evidence, String>>, candidate_sha: &str, run_id: &str, run_attempt: &str) -> Verdict {
 	let mut problems = Vec::new();
 	for cell in EXPECTED {
 		let Some(result) = results.get(cell) else {
@@ -105,8 +105,8 @@ fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result
 		if found.cell != cell {
 			problems.push(format!("{cell}: evidence declares cell {:?}", found.cell));
 		}
-		if found.commit != test_sha {
-			problems.push(format!("{cell}: evidence commit {} is not the candidate {test_sha}", found.commit));
+		if found.commit != candidate_sha {
+			problems.push(format!("{cell}: evidence commit {} is not the candidate {candidate_sha}", found.commit));
 		}
 		if found.run_id != run_id || found.run_attempt != run_attempt {
 			problems.push(format!("{cell}: evidence is from run {}/{} not {run_id}/{run_attempt}", found.run_id, found.run_attempt));
@@ -151,8 +151,8 @@ fn main() {
 		self_check();
 		return;
 	}
-	let [directory, results_path, test_sha, run_id, run_attempt] = <[String; 5]>::try_from(arguments).unwrap_or_else(|_| {
-		eprintln!("usage: gate <evidence-directory> <results-json> <test-sha> <run-id> <run-attempt>");
+	let [directory, results_path, candidate_sha, run_id, run_attempt] = <[String; 5]>::try_from(arguments).unwrap_or_else(|_| {
+		eprintln!("usage: gate <evidence-directory> <results-json> <candidate-sha> <run-id> <run-attempt>");
 		std::process::exit(2)
 	});
 	let results_document = std::fs::read_to_string(&results_path).unwrap_or_else(|error| panic!("cannot read {results_path}: {error}"));
@@ -175,7 +175,7 @@ fn main() {
 			}
 		}
 	}
-	println!("gate candidate={test_sha} run={run_id}/{run_attempt}");
+	println!("gate candidate={candidate_sha} run={run_id}/{run_attempt}");
 	for cell in EXPECTED {
 		let summary = match evidence.get(cell) {
 			Some(Ok(found)) => format!("commit={} executed={} failed={} backend={} device={}", found.commit, found.executed, found.failed, found.backend, found.device),
@@ -184,8 +184,8 @@ fn main() {
 		};
 		println!("  {cell}: result={} evidence={summary}", results.get(cell).map_or("<missing>", String::as_str));
 	}
-	match decide(&results, &evidence, &test_sha, &run_id, &run_attempt) {
-		Verdict::Pass => println!("GATE PASS: all {} cells succeeded for {test_sha}", EXPECTED.len()),
+	match decide(&results, &evidence, &candidate_sha, &run_id, &run_attempt) {
+		Verdict::Pass => println!("GATE PASS: all {} cells succeeded for {candidate_sha}", EXPECTED.len()),
 		Verdict::Fail(reason) => {
 			eprintln!("GATE FAIL: {reason}");
 			std::process::exit(1)
