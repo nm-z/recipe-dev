@@ -8,111 +8,177 @@
 set -uo pipefail
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
-RUN="${RUN_ID:-unknown}"
-ATTEMPT="${RUN_ATTEMPT:-1}"
-WORKER="recipe-wgpu-${RUN}-${ATTEMPT}"
-# Nothing in this resource group should outlive a workflow run by more than the
-# longest legitimate job.
+RUN="${RUN_ID:-${GITHUB_RUN_ID:-}}"
+ATTEMPT="${RUN_ATTEMPT:-${GITHUB_RUN_ATTEMPT:-}}"
 MAX_AGE_HOURS="${AZURE_MAX_AGE_HOURS:-3}"
-cleanup_failed=0
+
+if [[ ! "$RUN" =~ ^[0-9]+$ ]] || [[ ! "$ATTEMPT" =~ ^[0-9]+$ ]]; then
+	echo "RUN_ID/RUN_ATTEMPT or GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT must identify the worker" >&2
+	exit 2
+fi
+
+WORKER="recipe-wgpu-${RUN}-${ATTEMPT}"
+cleanup_status=0
 
 if ! az account show -o none; then
-	echo "not authenticated to Azure; cleanup cannot verify billable resources" >&2
+	echo "Azure authentication is unavailable; cleanup cannot verify deletion" >&2
 	exit 1
 fi
 
-echo "== deleting $WORKER from $GROUP =="
-if az vm show --resource-group "$GROUP" --name "$WORKER" --only-show-errors -o none; then
-	if ! az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true --only-show-errors; then
-		echo "the worker deletion command failed" >&2
-	fi
-else
-	echo "the worker was already gone"
-fi
-if az vm show --resource-group "$GROUP" --name "$WORKER" --only-show-errors -o none; then
-	echo "the worker still exists after cleanup" >&2
-	cleanup_failed=1
-fi
-if ! remaining_worker="$(az vm list --resource-group "$GROUP" --query "[?name=='${WORKER}'].name" -o tsv --only-show-errors)"; then
-	echo "could not verify the worker readback" >&2
-	cleanup_failed=1
-elif [ -n "$remaining_worker" ]; then
-	echo "worker readback still lists $remaining_worker" >&2
-	cleanup_failed=1
-fi
+list_vm() {
+	local name="$1"
+	az vm list \
+		--resource-group "$GROUP" \
+		--query "[?name=='$name'].name" \
+		-o tsv \
+		--only-show-errors
+}
 
-echo "== removing disks, interfaces and addresses it left behind =="
-for kind in disk nic public-ip; do
-	if ! names="$(az "$kind" list --resource-group "$GROUP" --query "[?starts_with(name, '${WORKER}')].name" -o tsv --only-show-errors)"; then
-		echo "could not list $kind resources" >&2
-		cleanup_failed=1
-		continue
+list_resources() {
+	local kind="$1"
+	local prefix="$2"
+	local query="[?starts_with(name, '$prefix')].name"
+	case "$kind" in
+		disk) az disk list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
+		nic) az network nic list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
+		public-ip) az network public-ip list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
+		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
+	esac
+}
+
+delete_resource() {
+	local kind="$1"
+	local name="$2"
+	case "$kind" in
+		disk) az disk delete --resource-group "$GROUP" --name "$name" --yes --only-show-errors ;;
+		nic) az network nic delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
+		public-ip) az network public-ip delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
+		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
+	esac
+}
+
+wait_for_vm_absent() {
+	local name="$1"
+	local attempt remaining
+	for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+		if ! remaining="$(list_vm "$name")"; then
+			echo "could not read back VM $name" >&2
+			return 1
+		fi
+		if [ -z "$remaining" ]; then
+			return 0
+		fi
+		sleep 5
+	done
+	echo "VM $name is still present after deletion" >&2
+	return 1
+}
+
+wait_for_resources_absent() {
+	local kind="$1"
+	local prefix="$2"
+	local attempt remaining
+	for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+		if ! remaining="$(list_resources "$kind" "$prefix")"; then
+			echo "could not read back $kind resources for $prefix" >&2
+			return 1
+		fi
+		if [ -z "$remaining" ]; then
+			return 0
+		fi
+		sleep 5
+	done
+	echo "$kind resources remain for $prefix: $remaining" >&2
+	return 1
+}
+
+remove_worker() {
+	local name="$1"
+	local current resource
+	local status=0
+	if ! current="$(list_vm "$name")"; then
+		echo "could not determine whether VM $name exists" >&2
+		return 1
 	fi
-	for resource in $names; do
-		echo "removing $kind $resource"
-		if ! az "$kind" delete --resource-group "$GROUP" --name "$resource" --yes --only-show-errors; then
-			if ! az "$kind" delete --resource-group "$GROUP" --name "$resource" --only-show-errors; then
-				echo "could not remove $kind $resource" >&2
-				cleanup_failed=1
+	if [ -n "$current" ]; then
+		echo "deleting VM $name from $GROUP"
+		if ! az vm delete --resource-group "$GROUP" --name "$name" --yes --force-deletion true --only-show-errors; then
+			echo "VM deletion failed for $name" >&2
+			status=1
+		fi
+	else
+		echo "VM $name was already absent"
+	fi
+	if ! wait_for_vm_absent "$name"; then
+		status=1
+	fi
+
+	for kind in disk nic public-ip; do
+		local resources
+		if ! resources="$(list_resources "$kind" "$name")"; then
+			status=1
+			continue
+		fi
+		while IFS= read -r resource; do
+			if [ -z "$resource" ]; then
+				continue
 			fi
+			echo "deleting $kind $resource"
+			if ! delete_resource "$kind" "$resource"; then
+				echo "could not delete $kind $resource" >&2
+				status=1
+			fi
+		done <<< "$resources"
+		if ! wait_for_resources_absent "$kind" "$name"; then
+			status=1
 		fi
 	done
-	if ! residual="$(az "$kind" list --resource-group "$GROUP" --query "[?starts_with(name, '${WORKER}')].name" -o tsv --only-show-errors)"; then
-		echo "could not verify $kind cleanup" >&2
-		cleanup_failed=1
-	elif [ -n "$residual" ]; then
-		echo "residual $kind resources: $residual" >&2
-		cleanup_failed=1
-	fi
-done
+	return "$status"
+}
+
+echo "== deleting $WORKER from $GROUP =="
+if ! remove_worker "$WORKER"; then
+	cleanup_status=1
+fi
 
 echo "== expiry watchdog =="
-# Independent of this run: a controller that died without cleaning up must not
-# leave a GPU VM running and billing.
-if ! cutoff="$(date -u -d "${MAX_AGE_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"; then
-	echo "could not compute the expiry cutoff" >&2
-	cleanup_failed=1
-	cutoff=""
-fi
+cutoff="$(date -u -d "${MAX_AGE_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
 echo "removing recipe-wgpu-* workers created before $cutoff"
-if ! stale="$(az vm list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-')].name" -o tsv --only-show-errors)"; then
-	echo "could not list worker VMs" >&2
-	cleanup_failed=1
+stale="$(az vm list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-')].name" -o tsv --only-show-errors)" || {
+	echo "could not list workers for the expiry watchdog" >&2
 	stale=""
-fi
+	cleanup_status=1
+}
 for worker in $stale; do
-	if ! created="$(az vm show --resource-group "$GROUP" --name "$worker" --query "timeCreated" -o tsv --only-show-errors)"; then
+	if ! created="$(az resource show --resource-group "$GROUP" --name "$worker" --resource-type Microsoft.Compute/virtualMachines --query "systemData.createdAt" -o tsv --only-show-errors)"; then
 		echo "could not read creation time for $worker" >&2
-		cleanup_failed=1
+		cleanup_status=1
 		continue
 	fi
 	if [ -n "$created" ] && [[ "$created" < "$cutoff" ]]; then
 		echo "watchdog removing stale worker $worker created $created"
-		if ! az vm delete --resource-group "$GROUP" --name "$worker" --yes --force-deletion true --only-show-errors; then
-			echo "watchdog deletion failed for $worker" >&2
-		fi
-		if az vm show --resource-group "$GROUP" --name "$worker" --only-show-errors -o none; then
-			echo "watchdog worker remains: $worker" >&2
-			cleanup_failed=1
+		if ! remove_worker "$worker"; then
+			cleanup_status=1
 		fi
 	fi
 done
 
-echo "== residual billable resources in $GROUP =="
-# Anything still listed here is still costing money; it is printed so the run
-# log carries the evidence rather than leaving it to be discovered on a bill.
-if ! residual="$(az resource list --resource-group "$GROUP" --query "[].{name:name, type:type}" -o tsv --only-show-errors)"; then
-	echo "could not list residual resources" >&2
-	cleanup_failed=1
-elif [ -n "$residual" ]; then
-	echo "$residual"
-	echo "residual billable resources remain in $GROUP" >&2
-	cleanup_failed=1
+echo "== residual resources for $WORKER =="
+residual="$(az resource list --resource-group "$GROUP" --query "[?starts_with(name,'$WORKER')].{name:name, type:type}" -o table --only-show-errors)" || {
+	echo "could not read back residual resources for $WORKER" >&2
+	residual="unknown"
+	cleanup_status=1
+}
+if [ -n "$residual" ] && [ "$residual" != "unknown" ]; then
+	echo "$residual" >&2
+	echo "residual resources remain for $WORKER" >&2
+	cleanup_status=1
 else
-	echo "no residual resources"
+	echo "no residual resources remain for $WORKER"
 fi
-if [ "$cleanup_failed" -ne 0 ]; then
-	echo "cleanup failed closed"
+
+if [ "$cleanup_status" -ne 0 ]; then
+	echo "cleanup failed for $WORKER" >&2
 	exit 1
 fi
 echo "cleanup complete"

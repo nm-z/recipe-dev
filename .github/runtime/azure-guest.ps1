@@ -20,6 +20,74 @@ function Invoke-Native {
 	if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-Download {
+	param([string] $Uri, [string] $Destination, [string] $Sha256)
+	Write-Output "downloading $Uri"
+	Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+	$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash.ToLowerInvariant()
+	if ($actual -ne $Sha256.ToLowerInvariant()) { throw "download checksum mismatch for ${Uri}: $actual != $Sha256" }
+}
+
+function Install-Toolchain {
+	param([string] $Root)
+	$bootstrap = Join-Path $Root "bootstrap"
+	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
+	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+	Write-Output "== guest: installing Rust toolchain =="
+	$rustup = Join-Path $bootstrap "rustup-init.exe"
+	Invoke-WebRequest -UseBasicParsing -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile $rustup
+	Invoke-Native $rustup @("-y", "--profile", "minimal", "--default-toolchain", "stable-x86_64-pc-windows-msvc", "--no-modify-path") "rustup installation"
+	$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+	$env:Path = "$cargoBin;$env:Path"
+
+	Write-Output "== guest: installing LLVM toolchain =="
+	$llvmInstaller = Join-Path $bootstrap "LLVM-18.1.8-win64.exe"
+	Invoke-Download `
+		"https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe" `
+		$llvmInstaller `
+		"94af030060d88cc17e9f00ef1663ebdc1126b35e16bebdfa1e807984b70abd8f"
+	Invoke-Native $llvmInstaller @("/S") "LLVM installation"
+
+	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
+	$linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+	if (![IO.File]::Exists($clang)) { throw "native clang is absent after installation: $clang" }
+	if (![IO.File]::Exists($linker)) { throw "native linker is absent after installation: $linker" }
+
+	Write-Output "== guest: installing the CUDA device toolkit =="
+	$cudaArchive = Join-Path $bootstrap "cuda_nvcc.zip"
+	Invoke-Download `
+		"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.6.85-archive.zip" `
+		$cudaArchive `
+		"3fb9f76b87c37d02f947354be89b718ad5f2c76b6ab47995265bfa3a068a5e14"
+	$cudaStage = Join-Path $bootstrap "cuda-stage"
+	if ([IO.Directory]::Exists($cudaStage)) { Remove-Item -Recurse -Force -LiteralPath $cudaStage }
+	Expand-Archive -LiteralPath $cudaArchive -DestinationPath $cudaStage -Force
+	$cudaPayload = Join-Path $cudaStage "cuda_nvcc-windows-x86_64-12.6.85-archive"
+	$cudaRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+	New-Item -ItemType Directory -Force -Path $cudaRoot | Out-Null
+	Copy-Item -Recurse -Force -Path (Join-Path $cudaPayload "*") -Destination $cudaRoot
+	[Environment]::SetEnvironmentVariable("CUDA_PATH", $cudaRoot, [EnvironmentVariableTarget]::Machine)
+	$env:CUDA_PATH = $cudaRoot
+	$env:Path = "$(Join-Path $cudaRoot 'bin');$env:Path"
+	$deviceLibrary = Join-Path $cudaRoot "nvvm\libdevice\libdevice.10.bc"
+	$nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+	if (![IO.File]::Exists($deviceLibrary)) { throw "CUDA device library is absent after installation: $deviceLibrary" }
+	if (![IO.File]::Exists($nvcc)) { throw "CUDA compiler is absent after installation: $nvcc" }
+
+	foreach ($tool in @("rustc", "cargo")) {
+		if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is absent after installation" }
+	}
+	& $clang --version | Select-Object -First 1
+	if ($LASTEXITCODE -ne 0) { throw "clang failed after installation with exit code $LASTEXITCODE" }
+	& $linker --version | Select-Object -First 1
+	if ($LASTEXITCODE -ne 0) { throw "lld-link failed after installation with exit code $LASTEXITCODE" }
+	Invoke-Native "rustc" @("--version") "rustc"
+	Invoke-Native "cargo" @("--version") "cargo"
+	Invoke-Native $nvcc @("--version") "nvcc"
+	Write-Output "toolchain ready clang=$clang linker=$linker cuda=$cudaRoot"
+}
+
 try {
 	$root = "C:\recipe"
 	# One directory per candidate: two commits must never share a mutable tree.
@@ -52,16 +120,8 @@ try {
 	$gpu = (& $smi --query-gpu=name --format=csv,noheader) -join ""
 	if ($gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $gpu" }
 
-	Write-Output "== guest: toolchain =="
-	foreach ($tool in @("rustc", "cargo")) {
-		if (!(Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is absent from the worker image" }
-	}
-	Invoke-Native "rustc" @("--version") "rustc"
-	Invoke-Native "cargo" @("--version") "cargo"
+	Install-Toolchain -Root $root
 	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
-	if (![IO.File]::Exists($clang)) { throw "native clang is absent: $clang" }
-	if (-not $env:CUDA_PATH) { throw "CUDA_PATH is not set: the CUDA toolkit is required for Recipe's NVIDIA backend" }
-	Write-Output "CUDA_PATH=$env:CUDA_PATH"
 
 	Write-Output "== guest: building with the NVIDIA backend =="
 	Push-Location $work

@@ -17,6 +17,10 @@ set -euo pipefail
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_ATTEMPT:?RUN_ATTEMPT is required}"
 : "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
+if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+	echo "RUN_ID and RUN_ATTEMPT must be decimal workflow identifiers" >&2
+	exit 2
+fi
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
 LOCATION="${AZURE_LOCATION:-eastus}"
@@ -53,20 +57,62 @@ JSON
 	exit 1
 fi
 
+list_worker() {
+	az vm list \
+		--resource-group "$GROUP" \
+		--query "[?name=='$WORKER'].name" \
+		-o tsv \
+		--only-show-errors
+}
+
+wait_for_worker_absent() {
+	local attempt remaining
+	for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+		if ! remaining="$(list_worker)"; then
+			echo "could not read back worker state during cleanup" >&2
+			return 1
+		fi
+		if [ -z "$remaining" ]; then
+			return 0
+		fi
+		sleep 5
+	done
+	echo "worker $WORKER is still present after deletion" >&2
+	return 1
+}
+
 cleanup_on_exit() {
-	local primary_status="$1"
+	local primary=$?
 	local cleanup_status=0
+	trap - EXIT
 	echo "== releasing the worker =="
-	if ! az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true; then
-		echo "worker deletion reported a problem" >&2
+	local current
+	if ! current="$(list_worker)"; then
+		cleanup_status=1
+		echo "could not determine whether worker $WORKER exists" >&2
+	elif [ -n "$current" ]; then
+		if ! az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true --only-show-errors; then
+			cleanup_status=1
+			echo "worker deletion failed for $WORKER" >&2
+		fi
+	else
+		echo "worker $WORKER was already absent"
+	fi
+	if ! wait_for_worker_absent; then
 		cleanup_status=1
 	fi
-	if [ "$primary_status" -ne 0 ]; then
-		return "$primary_status"
+	if [ "$primary" -ne 0 ]; then
+		if [ "$cleanup_status" -ne 0 ]; then
+			echo "primary status $primary preserved; cleanup also failed" >&2
+		fi
+		exit "$primary"
 	fi
-	return "$cleanup_status"
+	if [ "$cleanup_status" -ne 0 ]; then
+		exit 1
+	fi
+	exit 0
 }
-trap 'status=$?; set +e; cleanup_on_exit "$status"; cleanup_status=$?; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; else exit "$cleanup_status"; fi' EXIT
+trap cleanup_on_exit EXIT
 
 echo "== provisioning the isolated worker =="
 az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
