@@ -11417,21 +11417,28 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 		let [table] = source.as_slice() else { continue };
 		for column in 0..table.headers.len() {
 			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
-			recorded.push((table.name.clone(), table.headers[column].clone(), table.rows.iter().map(stem).collect::<Vec<_>>()))
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, table.rows.iter().map(stem).collect::<Vec<_>>()))
 		}
 	}
 	// The recorded order of each group, when exactly one reading exists. Two
 	// columns naming the same files in different orders leave the association
 	// ambiguous, and files sharing a name cannot be ordered by name at all.
 	let mut orders = Vec::new();
+	// The (table, column) pairs that turned out to name files.
+	let mut references = BTreeSet::new();
 	for source in &sources {
 		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
 		let mut found: Option<(&String, &String, &Vec<String>)> = None;
 		if source.len() > 1 && names.len() == source.len() {
-			for (table, header, order) in &recorded {
+			for (table, header, column, order) in &recorded {
 				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
 					continue;
 				}
+				// A column that resolves a group's files is that group's identity, not
+				// one of the row values the caller selected. Every column that reads as
+				// the record is one, including a second column that agrees with the
+				// first, so none of them is left to be encoded as a feature.
+				references.insert((table.clone(), *column));
 				match found {
 					Some((first, first_header, first_order)) => require(
 						first_order == order,
@@ -11462,7 +11469,23 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 	for (mut source, order) in sources.into_iter().zip(orders) {
 		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples as {}, expected {samples}", source[0].name, count(&source, &order), reading(&source, &order)))?;
 		if let [_] = source.as_slice() {
-			aligned.push(source.remove(0));
+			let mut table = source.remove(0);
+			// Drop the columns that resolved a group's files. They identified the
+			// samples; encoding a file name as numbers alongside the values it points
+			// at feeds the model the label of a vector it already has, and a stem
+			// like "scan-0000" reaches the row as its bytes.
+			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
+			if !dropped.is_empty() && dropped.len() < table.headers.len() {
+				for column in dropped.into_iter().rev() {
+					table.headers.remove(column);
+					for row in &mut table.rows {
+						if column < row.len() {
+							row.remove(column);
+						}
+					}
+				}
+			}
+			aligned.push(table);
 			continue;
 		}
 		let declared = source[0].declared;
