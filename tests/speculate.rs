@@ -57,6 +57,27 @@ fn write_gguf(path: &PathBuf, tensors: &[(&str, Vec<u64>, Vec<f32>)]) {
 	std::fs::write(path, bytes).unwrap();
 }
 
+/// Every tensor the head reads, one element each. `Draft::open` looks up each
+/// tensor's dimension before it checks any shape, so a fixture that names fewer
+/// than all ten reports an absent tensor rather than the shape it wanted.
+fn placeholders() -> Vec<(&'static str, Vec<u64>, Vec<f32>)> {
+	[
+		"token_embd.weight",
+		"nextn.enorm.weight",
+		"nextn.hnorm.weight",
+		"nextn.eh_proj.weight",
+		"blk.0.ffn_up.weight",
+		"blk.0.ffn_down.weight",
+		"nextn.shared_head.gate.weight",
+		"nextn.shared_head.norm.weight",
+		"nextn.shared_head.head.weight",
+		"nextn.shared_head.head.bias",
+	]
+	.into_iter()
+	.map(|name| (name, vec![1, 1], vec![0.0]))
+	.collect()
+}
+
 /// Small deterministic values, spread so the head's logits are not all equal.
 fn weights(count: usize, seed: u64) -> Vec<f32> {
 	let mut state = seed | 1;
@@ -114,7 +135,7 @@ fn panic_text(result: std::thread::Result<()>) -> String {
 /// report the shape it wanted, and the test builds the real head from that.
 fn hidden_width(model: &PathBuf) -> usize {
 	let probe = std::env::temp_dir().join(format!("recipe-speculate-{}-probe.gguf", std::process::id()));
-	write_gguf(&probe, &[("token_embd.weight", vec![1, 1], vec![0.0])]);
+	write_gguf(&probe, &placeholders());
 	let message = panic_text(std::panic::catch_unwind(|| {
 		let _ = recipe.speculate(model, &probe, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], 1);
 	}));
@@ -188,7 +209,9 @@ fn the_draft_head_proposes_and_the_model_verifies() {
 fn a_draft_head_of_the_wrong_shape_is_refused() {
 	let model = bundle("shape");
 	let wrong = std::env::temp_dir().join(format!("recipe-speculate-{}-wrong.gguf", std::process::id()));
-	write_gguf(&wrong, &[("token_embd.weight", vec![3, 5], weights(15, 7))]);
+	let mut tensors = placeholders();
+	tensors[0] = ("token_embd.weight", vec![3, 5], weights(15, 7));
+	write_gguf(&wrong, &tensors);
 
 	let message = panic_text(std::panic::catch_unwind(|| {
 		let _ = recipe.speculate(&model, &wrong, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], 4);
