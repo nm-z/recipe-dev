@@ -2375,7 +2375,7 @@ i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels,
 i32 %length, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 %precompute.next = add i32 %precompute.gate, 1 br label %precompute.loop precompute.done:
-call void @llvm.amdgcn.s.barrier() br label %row.loop row.loop:
+call void @grid_barrier(i32 %threads) br label %row.loop row.loop:
 %row = phi i32 [ %tid, %precompute.done ], [ %row.next, %time.done ] %row.more = icmp ult i32 %row, %rows
 br i1 %row.more, label %time.loop, label %exit time.loop: %time = phi i32 [ 0, %row.loop ], [ %time.next, %output.done ]
 %previous.exists = icmp ne i32 %time, 0 %output.row.base = mul i32 %row, %out.elements
@@ -2995,10 +2995,10 @@ br label %hidden.gradient.sum.loop hidden.gradient.store: %state.dh.index = add 
 %state.total = call double @recipe.add(double %state.sum, double %state.direct)
 store double %state.total, ptr addrspace(1) %state.dh.ptr, align 8 %state.channel.next = add nuw i32 %state.channel, 1
 br label %hidden.gradient.loop time.done: br label %time.loop row.done: %row.next = add i32 %row, %threads
-br label %row.loop reduce.entry: call void @llvm.amdgcn.s.barrier()
+br label %row.loop reduce.entry: call void @grid_barrier(i32 %threads)
 call void @reduce_rows(ptr addrspace(1) %context, ptr addrspace(1) %gradient, i32 %rows, i32 %parameters, i32 %parameters, i32 %row.gradient.base, i32 %offset, i32 %threads)
 br label %projection.entry
-projection.entry: call void @llvm.amdgcn.s.barrier() br label %projection.loop projection.loop:
+projection.entry: call void @grid_barrier(i32 %threads) br label %projection.loop projection.loop:
 %projection.gate = phi i32 [ 0, %projection.entry ], [ %projection.next, %projection.step ]
 %projection.more = icmp ult i32 %projection.gate, %gates
 br i1 %projection.more, label %projection.step, label %exit projection.step:
@@ -3012,7 +3012,7 @@ call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %
 ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false, i1 false, i1 false,
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
 i32 %projection.gradient.offset, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k,
-i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) call void @llvm.amdgcn.s.barrier() %projection.next = add i32 %projection.gate, 1 br label %projection.loop
+i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) call void @grid_barrier(i32 %threads) %projection.next = add i32 %projection.gate, 1 br label %projection.loop
 invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = { nounwind "amdgpu-flat-work-group-size"="RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE" } attributes #1 = { alwaysinline nounwind } attributes #3 = { noinline nounwind }
 ; Fully unroll the product loop so each insertelement uses a constant lane index
 ; and the accumulator vector remains in registers.
