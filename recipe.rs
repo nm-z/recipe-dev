@@ -1424,7 +1424,7 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
@@ -2487,12 +2487,15 @@ impl NativeModelIr {
 		for (index, plan) in order {
 			let pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
+			// The reverse pass differentiates the whole sequence at once.
+			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, &mut ir)? };
+			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
 						pointer = pointer_type(backend),
 						source = pointers.source,
 						weights = pointers.weights,
@@ -2512,8 +2515,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
-					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
-					emit_fixed_loop(&mut ir, index, "pool", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "pool", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
 							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n",
 							pointer = pointer_type(backend),
@@ -2532,16 +2534,19 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					// The matrix body scores the whole sequence at once. Its keys past
+					// the window are zero and the causal mask drops them, so it stays
+					// correct on a step but reworks the positions the window skips.
+					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
-					let count = checked_mul(self.rows, node.output.elements(), "scalar output count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
@@ -2568,7 +2573,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "scalar", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "scalar", self.rows, node.output, &window, |ir, p| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
@@ -2592,7 +2597,6 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Predictor) => {
-					let count = checked_mul(self.rows, node.output.elements(), "predictor output count")?;
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2623,7 +2627,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "predictor", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 						ir.push_str(&forward.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -2645,16 +2649,15 @@ impl NativeModelIr {
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
-					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.pool.reverse");
-					emit_fixed_loop(&mut ir, index, "pool.reverse", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "pool.reverse", self.rows, node.output, &window, |ir, p| {
 						let context_pointer = format!("%{prefix}.context.ptr");
 						let context_wide = format!("%{prefix}.context.index.wide");
 						let context_index = format!("%{prefix}.context.index");
@@ -2682,7 +2685,6 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Elementwise) => {
-					let count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
@@ -2770,7 +2772,7 @@ impl NativeModelIr {
 						}
 					};
 					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, scalar_body)?;
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, scalar_body)?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -2778,6 +2780,7 @@ impl NativeModelIr {
 						// the schedule. Each partition sums its own contiguous run of
 						// elements in ascending order into its own scratch row, and one
 						// owner then folds the rows in ascending partition order.
+						let count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
 						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
 						emit_partitioned_loop(
 							&mut ir,
@@ -2805,7 +2808,6 @@ impl NativeModelIr {
 					}
 				}
 				(false, Primitive::Normalize) => {
-					let count = checked_mul(self.rows, node.output.elements(), "normalize output count")?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2815,7 +2817,7 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize", self.rows, node.output, &window, |ir, p| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						ir.push_str(&format!(
@@ -2853,6 +2855,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Normalize) => {
+					// The windowed forward loop takes its extent from the window, but the
+					// weight gradient below still sums every row and position, so it keeps
+					// the whole-output count the backward pass always differentiates.
 					let count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
@@ -2885,7 +2890,7 @@ impl NativeModelIr {
 						));
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize.reverse", self.rows, node.output, &window, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -3072,6 +3077,40 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
+	/// The window a node writes, from the window its source wrote. A convolution
+	/// finishes an output position once the whole window it reads has arrived, a
+	/// pool once its window is full, and every other primitive reads one input
+	/// position per output position. A node therefore extends by whole positions
+	/// and never rewrites a position whose inputs are already present.
+	fn emit_node_window(&self, index: usize, node: &Node, ir: &mut String) -> Result<NodeWindow> {
+		let prefix = format!("n{index}");
+		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) } else { ("%begin".to_owned(), "%end".to_owned()) };
+		let length = node.output.length;
+		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
+		match node.op {
+			Primitive::Predictor => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n")),
+			Primitive::Pool => {
+				let size = integer_argument(node.argument[0], "pool size")?;
+				require(size > 0, "native pool size must be positive")?;
+				ir.push_str(&format!(
+					"%{prefix}.begin = udiv i32 {begin}, {size}\n%{prefix}.end.filled = add i32 {end}, {last}\n%{prefix}.end.rounded = udiv i32 %{prefix}.end.filled, {size}\n%{prefix}.end.over = icmp ugt i32 %{prefix}.end.rounded, {length}\n%{prefix}.end = select i1 %{prefix}.end.over, i32 {length}, i32 %{prefix}.end.rounded\n",
+					last = size - 1
+				));
+			}
+			Primitive::Contraction if kernel > 1 => {
+				for (name, source) in [("begin", &begin), ("end", &end)] {
+					ir.push_str(&format!(
+						"%{prefix}.{name}.shifted = sub i32 {source}, {lag}\n%{prefix}.{name}.partial = icmp ult i32 {source}, {lag}\n%{prefix}.{name} = select i1 %{prefix}.{name}.partial, i32 0, i32 %{prefix}.{name}.shifted\n",
+						lag = kernel - 1
+					));
+				}
+			}
+			_ => ir.push_str(&format!("%{prefix}.begin = add i32 {begin}, 0\n%{prefix}.end = add i32 {end}, 0\n")),
+		}
+		ir.push_str(&format!("%{prefix}.span = sub i32 %{prefix}.end, %{prefix}.begin\n"));
+		Ok(NodeWindow { begin: format!("%{prefix}.begin"), span: format!("%{prefix}.span") })
+	}
+
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
 		let source = if plan.node.source >= 0 { format!("%{prefix}.source") } else { "%samples".to_owned() };
@@ -3233,7 +3272,7 @@ impl NativeModelIr {
 		let (kernel, thread) = native_entry(backend)?;
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
-		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
+		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
@@ -3263,7 +3302,10 @@ impl NativeModelIr {
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
-			body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads)\n"));
+			body.push_str(&format!(
+				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\n",
+				positions = graph_positions(&self.graph)
+			));
 			body.push('\n');
 			body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 			body.push_str(barrier(backend));
@@ -3556,6 +3598,18 @@ fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, t
 	}
 }
 
+/// The positions one forward consumes: the input sequence, one value per
+/// position along the length of the input shape.
+fn graph_positions(graph: &Graph) -> usize {
+	graph.input.length
+}
+
+/// The output positions one forward writes, named in the emitted IR.
+struct NodeWindow {
+	begin: String,
+	span: String,
+}
+
 fn integer_argument(value: f64, role: &str) -> Result<i32> {
 	require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), format!("native {role} is not an integer"))?;
 	Ok(value as i32)
@@ -3635,12 +3689,20 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	Ok(())
 }
 
-fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+/// Walk the elements of one window of output positions. The positions of a
+/// channel are contiguous, so the window is a run per row and channel and the
+/// loop index maps onto the element it owns.
+fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
-	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
-	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
-	body(ir, &format!("%{prefix}.p"));
-	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native loop row elements")?;
+	let (channels, length) = (narrow(shape.channels, "native loop channels")?, narrow(shape.length, "native loop length")?);
+	let rows = narrow(rows, "native loop rows")?;
+	let (begin, span) = (&window.begin, &window.span);
+	ir.push_str(&format!(
+		"%{prefix}.at.plane = mul i32 {channels}, {span}\n%{prefix}.at.count = mul i32 {rows}, %{prefix}.at.plane\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.q = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i32 %{prefix}.at.q, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.row = udiv i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i32 %{prefix}.at.within, {span}\n%{prefix}.at.offset = urem i32 %{prefix}.at.within, {span}\n%{prefix}.at.position = add i32 %{prefix}.at.offset, {begin}\n%{prefix}.at.row.base = mul i32 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i32 %{prefix}.at.channel, {length}\n%{prefix}.at.local = add i32 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i32 %{prefix}.at.row.base, %{prefix}.at.local\n"
+	));
+	body(ir, &format!("%{prefix}.at.p"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i32 %{prefix}.at.q, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
 }
 
@@ -4030,6 +4092,349 @@ impl IntFormat {
 		((bits << (u64::BITS as u8 - self.bits)) as i64 >> (u64::BITS as u8 - self.bits)) as f64
 	}
 }
+/// GGUF, the container open-weight models ship in: a little-endian header of
+/// key-value metadata and tensor descriptors, then an aligned data section
+/// whose tensors use the same GGML block layouts as Recipe's storage formats.
+mod gguf {
+	use super::{Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, require, unfp16};
+	use std::{
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
+
+	const MAGIC: u32 = 0x4655_4747;
+	const VERSION: u32 = 3;
+	const DEFAULT_ALIGNMENT: u64 = 32;
+
+	/// One metadata value, in the width the file declares.
+	#[derive(Clone, Debug, PartialEq)]
+	pub enum GgufValue {
+		U8(u8),
+		I8(i8),
+		U16(u16),
+		I16(i16),
+		U32(u32),
+		I32(i32),
+		F32(f32),
+		Bool(bool),
+		String(String),
+		Array(Vec<GgufValue>),
+		U64(u64),
+		I64(i64),
+		F64(f64),
+	}
+	impl GgufValue {
+		/// The value as a count or index, whichever integer width the file chose.
+		pub fn integer(&self) -> Option<u64> {
+			match *self {
+				Self::U8(value) => Some(u64::from(value)),
+				Self::U16(value) => Some(u64::from(value)),
+				Self::U32(value) => Some(u64::from(value)),
+				Self::U64(value) => Some(value),
+				Self::I8(value) => u64::try_from(value).ok(),
+				Self::I16(value) => u64::try_from(value).ok(),
+				Self::I32(value) => u64::try_from(value).ok(),
+				Self::I64(value) => u64::try_from(value).ok(),
+				_ => None,
+			}
+		}
+		pub fn text(&self) -> Option<&str> {
+			match self {
+				Self::String(value) => Some(value),
+				_ => None,
+			}
+		}
+	}
+
+	/// One tensor descriptor: `kind` is the GGML type id and `offset` counts bytes
+	/// from the start of its shard's data section.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct GgufTensor {
+		pub name: String,
+		pub shape: Vec<u64>,
+		pub kind: u32,
+		pub offset: usize,
+		pub bytes: usize,
+		shard: usize,
+	}
+	impl GgufTensor {
+		/// The element count the shape declares.
+		pub fn elements(&self) -> usize {
+			self.shape.iter().product::<u64>() as usize
+		}
+	}
+
+	/// GGML type id to its name, elements per block, bytes per block, and the Recipe
+	/// storage format that decodes the block, for the types that are block quantized.
+	fn layout(kind: u32) -> Result<(&'static str, usize, usize, Option<StorageFormat>)> {
+		let name = match kind {
+			0 => return Ok(("F32", 1, 4, None)),
+			1 => return Ok(("F16", 1, 2, None)),
+			24 => return Ok(("I8", 1, 1, None)),
+			25 => return Ok(("I16", 1, 2, None)),
+			26 => return Ok(("I32", 1, 4, None)),
+			27 => return Ok(("I64", 1, 8, None)),
+			28 => return Ok(("F64", 1, 8, None)),
+			30 => return Ok(("BF16", 1, 2, None)),
+			2 => "q4_0",
+			3 => "q4_1",
+			6 => "q5_0",
+			7 => "q5_1",
+			8 => "q8_0",
+			9 => "q8_1",
+			10 => "q2k",
+			11 => "q3k",
+			12 => "q4k",
+			13 => "q5k",
+			14 => "q6k",
+			15 => "q8k",
+			16 => "iq2xxs",
+			17 => "iq2xs",
+			18 => "iq3xxs",
+			19 => "iq1s",
+			20 => "iq4nl",
+			21 => "iq3s",
+			22 => "iq2s",
+			23 => "iq4xs",
+			29 => "iq1m",
+			other => return Err(RecipeError::new(format!("GGUF tensor type {other} is unsupported"))),
+		};
+		let spec = StorageFormat::named(name).and_then(|format| format.spec().map(|spec| (format, spec)));
+		let (format, spec) = spec.ok_or_else(|| RecipeError::new(format!("GGUF type {name} has no Recipe storage layout")))?;
+		Ok((name, spec.block, spec.stride, Some(format)))
+	}
+
+	/// A read-only view of one file: mapped by the kernel on unix, read into
+	/// memory elsewhere. A stored weight holds a shard's mapping alive for as long
+	/// as the tape reads its bytes.
+	pub(super) struct Mapping {
+		pointer: *const u8,
+		length: usize,
+		owned: Option<Vec<u8>>,
+	}
+	unsafe impl Send for Mapping {}
+	unsafe impl Sync for Mapping {}
+	impl Mapping {
+		#[cfg(unix)]
+		fn open(path: &Path) -> Result<Self> {
+			use std::os::unix::io::AsRawFd;
+			let file = std::fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+			let length = usize::try_from(file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len())
+				.map_err(|_| RecipeError::new("GGUF file exceeds the address space"))?;
+			require(length != 0, format!("{} is empty", path.display()))?;
+			let pointer = unsafe { super::mmap(std::ptr::null_mut(), length, 1, 2, file.as_raw_fd(), 0) };
+			require(pointer as isize != -1, format!("cannot map {}: {}", path.display(), std::io::Error::last_os_error()))?;
+			Ok(Self { pointer: pointer.cast(), length, owned: None })
+		}
+		#[cfg(not(unix))]
+		fn open(path: &Path) -> Result<Self> {
+			let owned = std::fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+			require(!owned.is_empty(), format!("{} is empty", path.display()))?;
+			Ok(Self { pointer: owned.as_ptr(), length: owned.len(), owned: Some(owned) })
+		}
+		pub(super) fn bytes(&self) -> &[u8] {
+			unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+		}
+	}
+	impl Drop for Mapping {
+		fn drop(&mut self) {
+			#[cfg(unix)]
+			if self.owned.is_none() {
+				unsafe { super::munmap(self.pointer.cast_mut().cast(), self.length) };
+			}
+		}
+	}
+
+	struct Reader<'a> {
+		bytes: &'a [u8],
+		at: usize,
+		depth: u32,
+	}
+	impl<'a> Reader<'a> {
+		fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+			let end = self.at.checked_add(count).filter(|end| *end <= self.bytes.len()).ok_or_else(|| RecipeError::new("GGUF header is truncated"))?;
+			let slice = &self.bytes[self.at..end];
+			self.at = end;
+			Ok(slice)
+		}
+		fn u32(&mut self) -> Result<u32> {
+			self.take(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn u64(&mut self) -> Result<u64> {
+			self.take(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+		}
+		fn string(&mut self) -> Result<String> {
+			let length = usize::try_from(self.u64()?).map_err(|_| RecipeError::new("GGUF string length exceeds the address space"))?;
+			String::from_utf8(self.take(length)?.to_vec()).map_err(|error| RecipeError::new(format!("GGUF string is not UTF-8: {error}")))
+		}
+		fn value(&mut self, kind: u32) -> Result<GgufValue> {
+			Ok(match kind {
+				0 => GgufValue::U8(self.take(1)?[0]),
+				1 => GgufValue::I8(self.take(1)?[0] as i8),
+				2 => GgufValue::U16(u16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				3 => GgufValue::I16(i16::from_le_bytes(self.take(2)?.try_into().unwrap())),
+				4 => GgufValue::U32(self.u32()?),
+				5 => GgufValue::I32(self.u32()? as i32),
+				6 => GgufValue::F32(f32::from_bits(self.u32()?)),
+				7 => GgufValue::Bool(self.take(1)?[0] != 0),
+				8 => GgufValue::String(self.string()?),
+				9 => {
+					let (kind, count) = (self.u32()?, self.u64()?);
+					let count = usize::try_from(count).map_err(|_| RecipeError::new("GGUF array length exceeds the address space"))?;
+					self.depth += 1;
+					require(self.depth <= 64, "GGUF arrays nest deeper than 64 levels")?;
+					let values = (0..count).map(|_| self.value(kind)).collect::<Result<Vec<_>>>()?;
+					self.depth -= 1;
+					GgufValue::Array(values)
+				}
+				10 => GgufValue::U64(self.u64()?),
+				11 => GgufValue::I64(self.u64()? as i64),
+				12 => GgufValue::F64(f64::from_bits(self.u64()?)),
+				other => return Err(RecipeError::new(format!("GGUF value type {other} is unsupported"))),
+			})
+		}
+	}
+
+	struct Shard {
+		mapping: Arc<Mapping>,
+		data: usize,
+	}
+
+	/// One model: a single file or every shard of a split, opened by name.
+	pub struct Gguf {
+		shards: Vec<Shard>,
+		metadata: Vec<(String, GgufValue)>,
+		tensors: Vec<GgufTensor>,
+	}
+	impl Gguf {
+		pub(super) fn open(path: &Path) -> Result<Self> {
+			let first = Self::shard(path, 0)?;
+			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
+			let mut shards = vec![first];
+			for index in 1..count {
+				shards.push(Self::shard(&sibling(path, index, count)?, index)?);
+			}
+			let (metadata, mut tensors) = (shards[0].1.clone(), Vec::new());
+			let declared = metadata.iter().find(|(key, _)| key == "split.tensors.count").and_then(|(_, value)| value.integer());
+			for (index, (_, _, shard_tensors)) in shards.iter_mut().enumerate() {
+				tensors.extend(shard_tensors.drain(..).map(|mut tensor| {
+					tensor.shard = index;
+					tensor
+				}));
+			}
+			if let Some(declared) = declared {
+				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
+			}
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+		}
+		/// Parses one file: its metadata, its tensors, and where its data begins.
+		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
+			let mapping = Mapping::open(path)?;
+			let bytes = mapping.bytes();
+			let mut reader = Reader { bytes, at: 0, depth: 0 };
+			require(reader.u32()? == MAGIC, format!("{} is not a GGUF file", path.display()))?;
+			let version = reader.u32()?;
+			require(version == VERSION, format!("{} is GGUF version {version}; version {VERSION} is supported", path.display()))?;
+			let (tensor_count, pair_count) = (reader.u64()?, reader.u64()?);
+			let mut metadata = Vec::new();
+			for _ in 0..pair_count {
+				let key = reader.string()?;
+				let kind = reader.u32()?;
+				metadata.push((key, reader.value(kind)?));
+			}
+			let alignment = metadata.iter().find(|(key, _)| key == "general.alignment").and_then(|(_, value)| value.integer()).unwrap_or(DEFAULT_ALIGNMENT);
+			require(alignment != 0 && alignment.is_power_of_two(), format!("{} declares alignment {alignment}", path.display()))?;
+			if let Some(declared) = metadata.iter().find(|(key, _)| key == "split.no").and_then(|(_, value)| value.integer()) {
+				require(declared == index, format!("{} is shard {declared}, expected shard {index}", path.display()))?;
+			}
+			let mut tensors = Vec::new();
+			for _ in 0..tensor_count {
+				let name = reader.string()?;
+				let dimensions = reader.u32()?;
+				let shape = (0..dimensions).map(|_| reader.u64()).collect::<Result<Vec<_>>>()?;
+				let (kind, offset) = (reader.u32()?, reader.u64()?);
+				let (_, block, stride, _) = layout(kind)?;
+				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
+				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
+				let bytes = elements
+					.checked_div(block as u64)
+					.and_then(|blocks| blocks.checked_mul(stride as u64))
+					.and_then(|bytes| usize::try_from(bytes).ok())
+					.ok_or_else(|| RecipeError::new(format!("tensor {name} byte extent overflows")))?;
+				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
+				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
+			}
+			let header = u64::try_from(reader.at).map_err(|_| RecipeError::new("GGUF header offset exceeds the address space"))?;
+			let data = header
+				.checked_add(alignment - 1)
+				.and_then(|offset| offset.checked_div(alignment))
+				.and_then(|blocks| blocks.checked_mul(alignment))
+				.and_then(|offset| usize::try_from(offset).ok())
+				.ok_or_else(|| RecipeError::new("GGUF data offset exceeds the address space"))?;
+			for tensor in &tensors {
+				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
+				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
+			}
+			Ok((Shard { mapping: Arc::new(mapping), data }, metadata, tensors))
+		}
+		/// Every key-value pair of the first shard, in file order.
+		pub fn metadata(&self) -> &[(String, GgufValue)] {
+			&self.metadata
+		}
+		pub fn value(&self, key: &str) -> Option<&GgufValue> {
+			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+		}
+		/// Every tensor across every shard, in shard then file order.
+		pub fn tensors(&self) -> &[GgufTensor] {
+			&self.tensors
+		}
+		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
+			self.tensors.iter().find(|tensor| tensor.name == name)
+		}
+		/// The tensor's bytes in the mapped file, in its GGML block layout.
+		pub fn data(&self, tensor: &GgufTensor) -> &[u8] {
+			let shard = &self.shards[tensor.shard];
+			&shard.mapping.bytes()[shard.data + tensor.offset..shard.data + tensor.offset + tensor.bytes]
+		}
+		/// The tensor's elements decoded to f64, dequantizing block formats through
+		/// the same decoders the saved-model path uses.
+		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
+			let data = self.data(tensor);
+			match tensor.kind {
+				0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
+				30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
+				28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
+				24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
+				25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+				27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
+				_ => {
+					let stored = self.stored(tensor)?;
+					stored.format.decompress(&stored.bytes, &[], stored.count)
+				}
+			}
+		}
+		/// The tensor as the weight the tape binds: a view of its block bytes where the
+		/// file is mapped, in the Recipe storage format the kernels already decode.
+		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
+			let (name, _, _, format) = layout(tensor.kind)?;
+			let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))?;
+			let shard = &self.shards[tensor.shard];
+			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
+			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
+	}
+
+	/// The path of shard `index` of a split named like `model-00001-of-00004.gguf`.
+	fn sibling(path: &Path, index: u64, count: u64) -> Result<PathBuf> {
+		let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("GGUF split path has no file name"))?;
+		let stem = name.strip_suffix(".gguf").and_then(|stem| stem.rsplit_once("-of-")).and_then(|(head, _)| head.rsplit_once('-')).map(|(prefix, _)| prefix);
+		let prefix = stem.ok_or_else(|| RecipeError::new(format!("{name} declares a split but is not named <prefix>-<number>-of-<count>.gguf")))?;
+		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
+	}
+}
+pub use gguf::{Gguf, GgufTensor, GgufValue};
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -4228,8 +4633,8 @@ mod bundle {
 	}
 
 	fn raw_weight(values: &[f64]) -> StoredWeight {
-		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect();
-		StoredWeight { format: StorageFormat(0), count: values.len(), bytes, codebook: Vec::new(), arithmetic: values.to_vec() }
+		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+		StoredWeight { format: StorageFormat(0), count: values.len(), bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec() }
 	}
 	fn semantic_graph(stored: &StoredGraph) -> Result<SemanticGraph> {
 		let graph = &stored.graph;
@@ -4378,7 +4783,7 @@ mod bundle {
 		} else {
 			StorageFormat(format).decompress(&bytes, &codebook, count)?
 		};
-		Ok(StoredWeight { format: StorageFormat(format), count, bytes, codebook, arithmetic })
+		Ok(StoredWeight { format: StorageFormat(format), count, bytes: bytes.into(), codebook, arithmetic })
 	}
 	pub(super) fn load_semantic(path: &Path) -> Result<(DataSchema, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
@@ -4658,8 +5063,11 @@ mod bundle {
 		require(received != 0 && (answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")), "model mismatch not overwritten")?;
 		save_semantic(path, schema, graphs)
 	}
-	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
+	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl FnMut(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let (_, graphs) = load_semantic(path)?;
+		infer_graphs(&graphs, input, forward)
+	}
+	pub(super) fn infer_graphs(graphs: &[SemanticGraph], input: &[f64], mut forward: impl FnMut(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
 		require(input.len() == first.inputs.len(), format!("model input expected {} values, received {}", first.inputs.len(), input.len()))?;
 		let mut values = first.inputs.iter().cloned().zip(input.iter().copied()).collect::<BTreeMap<_, _>>();
@@ -4672,7 +5080,7 @@ mod bundle {
 					*value = (*value - mean) / scale;
 				}
 			}
-			result = forward(&stored, &samples)?;
+			result = forward(stored, &samples)?;
 			if stored.target_span > 0.0 {
 				for value in &mut result {
 					*value = stored.target_min + stored.target_span * logistic(*value);
@@ -4701,7 +5109,7 @@ use std::{
 	process::Command,
 	ptr,
 	sync::{
-		Mutex, OnceLock,
+		Arc, Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
@@ -5795,11 +6203,40 @@ pub(crate) struct StorageSpec {
 	pub(crate) stride: usize,
 }
 
+/// A weight's block bytes: owned by the graph, or a view of the mapped file they
+/// were read from, which the view keeps mapped.
+#[derive(Clone)]
+pub(crate) enum StoredBytes {
+	Owned(Vec<u8>),
+	Mapped(Arc<gguf::Mapping>, usize, usize),
+}
+impl StoredBytes {
+	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
+		Self::Mapped(mapping.clone(), at, length)
+	}
+}
+impl std::ops::Deref for StoredBytes {
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		match self {
+			Self::Owned(bytes) => bytes,
+			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
+		}
+	}
+}
+impl From<Vec<u8>> for StoredBytes {
+	fn from(bytes: Vec<u8>) -> Self {
+		Self::Owned(bytes)
+	}
+}
+
+/// One node's parameters as they are stored. `arithmetic` is the host copy the
+/// graph trains and saves; a weight the device decodes from `bytes` carries none.
 #[derive(Clone)]
 pub(crate) struct StoredWeight {
 	pub(crate) format: StorageFormat,
 	pub(crate) count: usize,
-	pub(crate) bytes: Vec<u8>,
+	pub(crate) bytes: StoredBytes,
 	pub(crate) codebook: Vec<f64>,
 	pub(crate) arithmetic: Vec<f64>,
 }
@@ -5807,6 +6244,10 @@ pub(crate) struct StoredWeight {
 impl StorageFormat {
 	fn valid(self) -> bool {
 		self.spec().is_some() || self.selection().is_some()
+	}
+	/// The format a storage name in the quantization table selects, at its first variant.
+	pub(crate) fn named(name: &str) -> Option<Self> {
+		QUANTIZATIONS.iter().find(|format| format.name == name).map(|format| Self(format.family << 12 | format.variants[0] << 8 | u16::from(format.bits)))
 	}
 	pub(crate) fn spec(self) -> Option<StorageSpec> {
 		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
@@ -5818,7 +6259,7 @@ impl StorageFormat {
 	}
 	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
 		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
-		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes, codebook, arithmetic: arithmetic.to_vec() })
+		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes: bytes.into(), codebook, arithmetic: arithmetic.to_vec() })
 	}
 	fn unavailable(self) -> RecipeError {
 		RecipeError::new(format!(
@@ -6462,6 +6903,12 @@ impl Recipe {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF model, following every shard of a split, with its tensor data
+	/// mapped rather than read.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))
+	}
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
@@ -6475,6 +6922,425 @@ impl Recipe {
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
+}
+/// One id at a time from a model's logits: a repetition penalty over the
+/// recent ids, then top-k, top-p, min-p, temperature, and a seeded draw.
+/// Temperature zero is greedy.
+pub struct Sampler {
+	temperature: f64,
+	top_k: usize,
+	top_p: f64,
+	min_p: f64,
+	penalty: f64,
+	window: usize,
+	state: u64,
+}
+impl Sampler {
+	pub fn temperature(mut self, value: f64) -> Self {
+		self.temperature = value;
+		self
+	}
+	/// Keep the `count` highest logits; zero keeps every id.
+	pub fn top_k(mut self, count: usize) -> Self {
+		self.top_k = count;
+		self
+	}
+	/// Keep the smallest set of ids whose probability sums to at least `mass`.
+	pub fn top_p(mut self, mass: f64) -> Self {
+		self.top_p = mass;
+		self
+	}
+	/// Drop ids whose probability is below `ratio` times the highest.
+	pub fn min_p(mut self, ratio: f64) -> Self {
+		self.min_p = ratio;
+		self
+	}
+	/// Divide positive logits of the last `window` ids by `penalty`, and
+	/// multiply negative ones.
+	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
+		(self.penalty, self.window) = (penalty, window);
+		self
+	}
+	pub fn seed(mut self, seed: u64) -> Self {
+		self.state = seed;
+		self
+	}
+	pub fn sample(&mut self, logits: &[f64], history: &[u32]) -> u32 {
+		assert!(!logits.is_empty(), "sampler received no logits");
+		let mut candidates = logits.iter().copied().enumerate().map(|(id, logit)| (id as u32, logit)).collect::<Vec<_>>();
+		for id in history.iter().rev().take(self.window) {
+			let logit = &mut candidates[*id as usize].1;
+			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
+		}
+		candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+		if self.temperature <= 0.0 {
+			return candidates[0].0;
+		}
+		if self.top_k != 0 {
+			candidates.truncate(self.top_k);
+		}
+		let probabilities = |candidates: &[(u32, f64)], temperature: f64| {
+			let weights = candidates.iter().map(|(_, logit)| ((logit - candidates[0].1) / temperature).exp()).collect::<Vec<_>>();
+			let total = weights.iter().sum::<f64>();
+			weights.into_iter().map(|weight| weight / total).collect::<Vec<_>>()
+		};
+		let mass = probabilities(&candidates, 1.0);
+		let mut kept = 1;
+		let mut cumulative = mass[0];
+		while kept < candidates.len() && cumulative < self.top_p && mass[kept] >= self.min_p * mass[0] {
+			cumulative += mass[kept];
+			kept += 1;
+		}
+		candidates.truncate(kept);
+		let mass = probabilities(&candidates, self.temperature);
+		self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		let mut draw = (self.state >> 11) as f64 / (1_u64 << 53) as f64;
+		for (candidate, probability) in candidates.iter().zip(&mass) {
+			if draw < *probability {
+				return candidate.0;
+			}
+			draw -= probability;
+		}
+		candidates.last().unwrap().0
+	}
+}
+/// What `decode` produced: the prompt followed by the generated ids, the logits
+/// of the last forward, the seconds of the prefill, and the seconds of each
+/// later step.
+pub struct Generation {
+	pub ids: Vec<u32>,
+	pub logits: Vec<f64>,
+	pub prefill_seconds: f64,
+	pub step_seconds: Vec<f64>,
+	/// The proposals a draft head made and a later step verified, and how many of
+	/// them the model's own id confirmed. A decode without a draft head has none.
+	pub proposed: usize,
+	pub accepted: usize,
+}
+impl Recipe {
+	pub fn sampler(&self) -> Sampler {
+		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15 }
+	}
+	/// Autoregressive decode over a saved model whose input is a sequence of ids
+	/// and whose output is one logit per id. One tape holds the state of every
+	/// block for the whole decode: the prefill fills it from the prompt and each
+	/// step extends it by the one position the new id reaches, so no step runs a
+	/// position the decode has already settled. The decode ends at a `stop` id,
+	/// after `budget` ids, or when the ids fill the model's sequence.
+	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		try_decode(path, None, prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// The same decode with a multi-token-prediction draft head read from `draft`,
+	/// a GGUF holding a block set and the `nextn` tensors. After each step the
+	/// head fuses the embedding of the id just produced with the model's final
+	/// hidden state and proposes the next id; the step after it accepts the
+	/// proposal when the model reaches the same id and discards it otherwise. The
+	/// ids are the model's own either way, so they are the ids `decode` produces.
+	pub fn speculate(&self, path: impl AsRef<Path>, draft: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		try_decode(path, Some(draft.as_ref()), prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Answer `requests` decodes over HTTP and return. A request names its prompt
+	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
+	/// and the answer sends each id as its own chunk as the decode reaches it.
+	pub fn serve(&self, path: impl AsRef<Path>, address: &str, requests: usize) {
+		try_serve(&path, address, requests).unwrap_or_else(|error| panic!("{error}"));
+	}
+}
+fn request_field<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+	query.split('&').find_map(|pair| pair.strip_prefix(name)?.strip_prefix('=')).filter(|value| !value.is_empty())
+}
+fn request_number<T: std::str::FromStr>(query: &str, name: &str) -> Result<Option<T>> {
+	request_field(query, name).map(|value| value.parse().map_err(|_| RecipeError::new(format!("request {name} is {value:?}, which is not a number")))).transpose()
+}
+fn request_ids(query: &str, name: &str) -> Result<Vec<u32>> {
+	request_field(query, name)
+		.map_or_else(|| Ok(Vec::new()), |value| value.split(',').map(|id| id.parse().map_err(|_| RecipeError::new(format!("request {name} holds {id:?}, which is not an id")))).collect())
+}
+fn try_serve(path: &impl AsRef<Path>, address: &str, requests: usize) -> Result<()> {
+	use std::io::Write as _;
+	let listener = std::net::TcpListener::bind(address).map_err(|error| RecipeError::new(format!("cannot serve decode on {address}: {error}")))?;
+	for _ in 0..requests {
+		let mut stream = listener.accept().map_err(|error| RecipeError::new(format!("cannot accept a decode request: {error}")))?.0;
+		if let Err(error) = serve_decode(path, &mut stream) {
+			let body = error.to_string();
+			let answer = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+			stream.write_all(answer.as_bytes()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))?;
+		}
+	}
+	Ok(())
+}
+fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Result<()> {
+	use std::io::{Read as _, Write as _};
+	let mut head = Vec::new();
+	let mut byte = [0_u8; 1];
+	while !head.ends_with(b"\r\n\r\n") {
+		require(head.len() < 8192, "decode request head is longer than 8192 bytes")?;
+		let read = stream.read(&mut byte).map_err(|error| RecipeError::new(format!("cannot read a decode request: {error}")))?;
+		require(read == 1, "decode request ended before its head")?;
+		head.push(byte[0]);
+	}
+	let head = String::from_utf8_lossy(&head).into_owned();
+	let target = head.split_whitespace().nth(1).ok_or_else(|| RecipeError::new("decode request names no target"))?;
+	let query = target.split_once('?').map_or("", |(_, query)| query);
+	let prompt = request_ids(query, "ids")?;
+	let stop = request_ids(query, "stop")?;
+	let budget = request_number(query, "budget")?.unwrap_or(16);
+	// An absent field keeps the sampler's own default rather than restating it.
+	let mut sampler = recipe.sampler();
+	if let Some(value) = request_number(query, "temperature")? {
+		sampler = sampler.temperature(value);
+	}
+	if let Some(value) = request_number(query, "top_k")? {
+		sampler = sampler.top_k(value);
+	}
+	if let Some(value) = request_number(query, "top_p")? {
+		sampler = sampler.top_p(value);
+	}
+	if let Some(value) = request_number(query, "min_p")? {
+		sampler = sampler.min_p(value);
+	}
+	if let Some(value) = request_number(query, "penalty")? {
+		sampler = sampler.repeat(value, request_number(query, "penalty_window")?.unwrap_or(64));
+	}
+	if let Some(value) = request_number(query, "seed")? {
+		sampler = sampler.seed(value);
+	}
+	let write = |stream: &mut std::net::TcpStream, bytes: &[u8]| {
+		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
+	};
+	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
+	try_decode(path, None, &prompt, &mut sampler, &stop, budget, |id| {
+		let chunk = format!("{id}\n");
+		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+	})?;
+	write(stream, b"0\r\n\r\n")
+}
+fn try_decode(path: impl AsRef<Path>, draft: Option<&Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+	let path = resolve_path(path)?;
+	let device = selected_gpu()?;
+	let (_, graphs) = bundle::load_semantic(&path)?;
+	let stored = match graphs.as_slice() {
+		[only] => only,
+		graphs => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
+	};
+	let sequence = stored.inputs.len();
+	require(!prompt.is_empty(), "decode prompt is empty")?;
+	require(stored.input.channels == 1, "decode expects one input value per position")?;
+	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
+	let mut samples = vec![0.0; sequence];
+	for (slot, id) in samples.iter_mut().zip(prompt) {
+		*slot = f64::from(*id);
+	}
+	let graph = materialize_saved_graph(stored, &samples, device, Config::load()?)?;
+	let mut tape = NativeTape::new(&graph, &samples, &[], device, stored.precision, None)?;
+	tape.inject_bn_stats(&stored.bn_stats)?;
+	let mut draft = draft.map(|path| Draft::open(path, &graph, device)).transpose()?;
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new(), proposed: 0, accepted: 0 };
+	let mut settled = 0;
+	let mut seeded = false;
+	for step in 0..=budget {
+		let reached = narrow(generation.ids.len(), "decode position")? as u32;
+		let started = std::time::Instant::now();
+		let logits = bundle::infer_graphs(&graphs, &samples, |_, prepared| {
+			// The tape was uploaded from the raw id vector, so the tail the decode has
+			// not reached holds 0.0 while a whole-sequence forward of the same ids sees
+			// the prepared padding. A pool window rounds its end up and legitimately
+			// reads one unsettled position, so the first forward seeds every position
+			// and later steps write only what the new id reached.
+			let written = if seeded { settled as usize..reached as usize } else { 0..prepared.len() };
+			seeded = true;
+			for position in written {
+				tape.write_sample(position, prepared[position])?;
+			}
+			tape.forward_window(settled, reached, ForwardMode::Inference)?;
+			tape.predictions()
+		})?;
+		let seconds = started.elapsed().as_secs_f64();
+		if step == 0 {
+			generation.prefill_seconds = seconds;
+		} else {
+			generation.step_seconds.push(seconds);
+		}
+		settled = reached;
+		generation.logits = logits;
+		if step == budget {
+			break;
+		}
+		let id = sampler.sample(&generation.logits, &generation.ids);
+		if let Some(draft) = &mut draft {
+			let started = std::time::Instant::now();
+			if let Some(proposal) = draft.proposal {
+				generation.proposed += 1;
+				generation.accepted += usize::from(proposal == id);
+			}
+			let hidden = tape.activations(draft.hidden, draft.width)?;
+			draft.proposal = Some(draft.propose(&hidden, id)?);
+			// The proposal belongs to the step that reached the id it follows.
+			let seconds = started.elapsed().as_secs_f64();
+			match generation.step_seconds.last_mut() {
+				Some(step) => *step += seconds,
+				None => generation.prefill_seconds += seconds,
+			}
+		}
+		emit(id)?;
+		samples[generation.ids.len()] = f64::from(id);
+		generation.ids.push(id);
+		if stop.contains(&id) {
+			break;
+		}
+	}
+	Ok(generation)
+}
+/// One named draft-head tensor, checked against the shape the head takes.
+fn draft_tensor(model: &Gguf, name: &str, shape: &[usize]) -> Result<Vec<f64>> {
+	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is absent")))?;
+	let declared = tensor.shape.iter().map(|value| *value as usize).collect::<Vec<_>>();
+	require(declared == shape, format!("draft head tensor {name} is {declared:?}, and the head takes {shape:?}"))?;
+	model.values(tensor)
+}
+/// A multi-token-prediction draft head: a block set read from a GGUF beside the
+/// model it drafts for. The `nextn` projection fuses the embedding of the last
+/// id with the model's final hidden state, each half under its own norm, one
+/// block runs on the fusion behind its head-side residual gate, and the shared
+/// head reads the block. The fusion is two positions of one channel, so the
+/// projection is the convolution that folds them, and each per-channel scale is
+/// the diagonal factor of the matrix beside it.
+struct Draft {
+	table: Vec<f64>,
+	enorm: Vec<f64>,
+	hnorm: Vec<f64>,
+	epsilon: f64,
+	hidden: usize,
+	width: usize,
+	tape: NativeTape,
+	proposal: Option<u32>,
+}
+impl Draft {
+	fn open(path: &Path, model: &Graph, device: &'static Gpu) -> Result<Self> {
+		// The node the output head reads is the model's final hidden state.
+		let head = model.nodes.last().ok_or_else(|| RecipeError::new("model has no nodes"))?;
+		let hidden = usize::try_from(head.source).map_err(|_| RecipeError::new("model has no hidden state before its head"))?;
+		let width = model.nodes[hidden].output.elements();
+		let model = Gguf::open(path)?;
+		let dimension = |name: &str| {
+			let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is absent")))?;
+			tensor.shape.get(1).map(|value| *value as usize).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is not a matrix")))
+		};
+		let (inner, vocabulary, ids) = (dimension("blk.0.ffn_up.weight")?, dimension("nextn.shared_head.head.weight")?, dimension("token_embd.weight")?);
+		let table = draft_tensor(&model, "token_embd.weight", &[width, ids])?;
+		let enorm = draft_tensor(&model, "nextn.enorm.weight", &[width])?;
+		let hnorm = draft_tensor(&model, "nextn.hnorm.weight", &[width])?;
+		let projection = draft_tensor(&model, "nextn.eh_proj.weight", &[2 * width, width])?;
+		let up = draft_tensor(&model, "blk.0.ffn_up.weight", &[width, inner])?;
+		let mut down = draft_tensor(&model, "blk.0.ffn_down.weight", &[inner, width])?;
+		let gate = draft_tensor(&model, "nextn.shared_head.gate.weight", &[width])?;
+		let scale = draft_tensor(&model, "nextn.shared_head.norm.weight", &[width])?;
+		let mut out = draft_tensor(&model, "nextn.shared_head.head.weight", &[width, vocabulary])?;
+		let prior = draft_tensor(&model, "nextn.shared_head.head.bias", &[vocabulary])?;
+		let mut fusion = vec![0.0; projection.len()];
+		for (index, value) in projection.iter().enumerate() {
+			let column = index % (2 * width);
+			fusion[index - column + (column % width) * 2 + column / width] = *value;
+		}
+		for (index, value) in down.iter_mut().enumerate() {
+			*value *= gate[index / inner];
+		}
+		for (index, value) in out.iter_mut().enumerate() {
+			*value *= scale[index % width];
+		}
+		let data = Prepared {
+			samples: vec![0.0; 2 * width],
+			targets: vec![0.0; vocabulary],
+			target_width: vocabulary,
+			rows: 1,
+			source_rows: 1,
+			features: 2 * width,
+			schema: DataSchema::default(),
+			sequence: Some((Shape { channels: width, length: 2 }, Shape { channels: width, length: 2 })),
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let block = recipe.model().conv(width, 2).res([layer(inner), Residual::Activation(Activation::Relu), layer(width)]).norm(layer).layer(vocabulary);
+		let mut graph = compile(&block, &data, &data.targets, 1, device, Config::load()?, false)?;
+		let slots = graph.nodes.iter().enumerate().filter(|(_, node)| node.parameters != 0).map(|(index, _)| index).collect::<Vec<_>>();
+		require(slots.len() == 4, format!("draft head compiled to {} weighted nodes, and it holds four matrices", slots.len()))?;
+		for (slot, values) in slots.iter().zip([fusion, up, down, out]) {
+			let node = &graph.nodes[*slot];
+			require(
+				node.parameters == values.len() + node.output.channels,
+				format!("draft head node {slot} takes {} values, and its tensor holds {}", node.parameters - node.output.channels, values.len()),
+			)?;
+			graph.parameters[node.offset..node.offset + values.len()].copy_from_slice(&values);
+		}
+		// The head's bias is the prior it holds over the ids it proposes.
+		let head = &graph.nodes[*slots.last().ok_or_else(|| RecipeError::new("draft head has no shared head"))?];
+		graph.parameters[head.offset + head.parameters - vocabulary..head.offset + head.parameters].copy_from_slice(&prior);
+		let tape = NativeTape::new(&graph, &data.samples, &[], device, Compute::FP64, None)?;
+		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+		Ok(Self { table, enorm, hnorm, epsilon, hidden, width, tape, proposal: None })
+	}
+	/// The id the head proposes follows `id`, given the hidden state the model
+	/// reached at it. Ties go to the lower id, as a greedy sampler resolves them.
+	fn propose(&mut self, hidden: &[f64], id: u32) -> Result<u32> {
+		require(hidden.len() == self.width, format!("draft head fuses a {}-wide hidden state, received {}", self.width, hidden.len()))?;
+		let row = checked_mul(id as usize, self.width, "draft head embedding row")?;
+		require(checked_add(row, self.width, "draft head embedding row")? <= self.table.len(), format!("draft head has no embedding for id {id}"))?;
+		let normalize = |values: &[f64], scale: &[f64]| {
+			let power = values.iter().map(|value| value * value).sum::<f64>() / values.len() as f64;
+			let inverse = 1.0 / (power + self.epsilon).sqrt();
+			values.iter().zip(scale).map(|(value, scale)| value * inverse * scale).collect::<Vec<_>>()
+		};
+		let (embedding, state) = (normalize(&self.table[row..row + self.width], &self.enorm), normalize(hidden, &self.hnorm));
+		let mut fused = vec![0.0; 2 * self.width];
+		for (channel, (embedding, state)) in embedding.iter().zip(&state).enumerate() {
+			(fused[channel * 2], fused[channel * 2 + 1]) = (*embedding, *state);
+		}
+		self.tape.write_input(&fused)?;
+		self.tape.forward(ForwardMode::Inference)?;
+		let logits = self.tape.predictions()?;
+		let proposal = logits.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then(right.0.cmp(&left.0)));
+		Ok(narrow(proposal.ok_or_else(|| RecipeError::new("draft head produced no logits"))?.0, "draft head proposal")? as u32)
+	}
+}
+impl Gguf {
+	/// Contracts `input` through the named tensor into `width` outputs. The tensor's
+	/// mapped bytes are the contraction's parameters, so the tape decodes the file's
+	/// own blocks and never holds a second copy of the weight.
+	pub fn contract(&self, name: &str, input: &[f64], width: usize) -> Vec<f64> {
+		contract_gguf(self, name, input, width).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
+fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Result<Vec<f64>> {
+	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent")))?;
+	let stored = model.stored(tensor)?;
+	let device = selected_gpu()?;
+	let config = Config::load()?;
+	let data = Prepared {
+		samples: input.to_vec(),
+		targets: vec![0.0; width],
+		target_width: width,
+		rows: 1,
+		source_rows: 1,
+		features: input.len(),
+		schema: DataSchema::default(),
+		sequence: None,
+		target_categorical: false,
+		norm_mean: Vec::new(),
+		norm_scale: Vec::new(),
+		identities: Vec::new(),
+		fitted: Vec::new(),
+	};
+	let mut graph = compile(&recipe.model().layer(width), &data, &data.targets, 1, device, config, false)?;
+	let index = graph.nodes.iter().position(|node| node.parameters != 0).ok_or_else(|| RecipeError::new("contraction has no parameters"))?;
+	let parameters = graph.nodes[index].parameters;
+	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
+	graph.stored[index] = Some(stored);
+	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
+	tape.forward(ForwardMode::Inference)?;
+	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shape {
@@ -7417,6 +8283,7 @@ struct NativeTape {
 	step: u32,
 	output: usize,
 	capacity: usize,
+	positions: u32,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -7517,16 +8384,29 @@ impl NativeTape {
 			step,
 			output,
 			capacity: rows,
+			positions: narrow(graph_positions(graph), "native input positions")? as u32,
 		})
 	}
 	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
+		self.forward_window(0, self.positions, mode)
+	}
+	/// Write the output positions that the input positions before `end` reach and
+	/// that the input positions before `begin` did not. The arenas keep every
+	/// earlier position, so a step reads the attention keys and values, the
+	/// recurrent state, and the convolution tail that earlier calls left.
+	fn forward_window(&mut self, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
+		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let mode = mode as i32;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
+	}
+	/// Replace the input value at one position.
+	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
+		self.samples.write_float_bytes(checked_mul(position, self.precision.model.bytes(), "sample offset")?, &[value], self.precision.model)
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
@@ -7546,9 +8426,18 @@ impl NativeTape {
 		}
 		Ok(stats)
 	}
+	/// The `width` values one node reached, for every row of the batch.
+	fn activations(&self, node: usize, width: usize) -> Result<Vec<f64>> {
+		let offset = *self.program.artifact.layout.values.get(node).ok_or_else(|| RecipeError::new("native model has no arena for that node"))?;
+		self.values.download_float_bytes(offset, self.capacity * width, self.precision.model)
+	}
+	/// Replaces the whole input a graph of packed values reads.
+	fn write_input(&self, values: &[f64]) -> Result<()> {
+		self.samples.write_float_bytes(0, values, self.precision.model)
+	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		let last = self.program.artifact.layout.values.len().checked_sub(1).ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let values = self.activations(last, self.output)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -8219,7 +9108,7 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
@@ -9353,6 +10242,8 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 					native_cpu_value(arguments, 4),
 					native_cpu_value(arguments, 5),
 					native_cpu_value(arguments, 6),
+					native_cpu_value(arguments, 7),
+					native_cpu_value(arguments, 8),
 				);
 			}
 			NativeEntry::Epoch => {
@@ -9983,6 +10874,8 @@ unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn dlclose(handle: Ptr) -> i32;
+	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
+	fn munmap(address: Ptr, length: usize) -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
