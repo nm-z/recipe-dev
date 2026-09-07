@@ -9009,6 +9009,116 @@ fn local_host() -> Result<String> {
 	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
 	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
+/// The leases this process holds, kept for its lifetime. The lock lives on the
+/// open file description, so the kernel releases it however the process ends —
+/// there is no cleanup path to get wrong and no state to leave behind.
+static LEASES: Mutex<Vec<fs::File>> = Mutex::new(Vec::new());
+/// The directory the device leases live in. `XDG_RUNTIME_DIR` when the session
+/// provides one, and a per-user directory under the temporary directory
+/// otherwise, so two users never contend for each other's devices.
+fn lease_directory() -> Result<PathBuf> {
+	let root = match std::env::var_os("XDG_RUNTIME_DIR") {
+		Some(runtime) => PathBuf::from(runtime),
+		None => std::env::temp_dir().join(format!("recipe-{}", std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "shared".to_owned()))),
+	};
+	let directory = root.join("recipe-devices");
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot open the device lease directory {}: {error}", directory.display())))?;
+	Ok(directory)
+}
+/// One exclusive lease, taken without blocking. `None` means another process
+/// holds it; an error means the lease itself could not be attempted.
+fn take_lease(path: &Path) -> Result<Option<fs::File>> {
+	let file = fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(false)
+		.open(path)
+		.map_err(|error| RecipeError::new(format!("cannot open the device lease {}: {error}", path.display())))?;
+	#[cfg(unix)]
+	{
+		use std::os::fd::AsRawFd;
+		// LOCK_EX | LOCK_NB. The lock is released with the file description, so a
+		// killed process frees its device without anything running afterwards.
+		let held = unsafe { flock(file.as_raw_fd(), 2 | 4) } == 0;
+		Ok(held.then_some(file))
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt;
+		// share_mode(0) is the same exclusion without a second handle type: the
+		// open fails while another process holds the file, and Windows closes the
+		// handle when the process ends.
+		let held = fs::OpenOptions::new().write(true).create(true).share_mode(0).open(path);
+		Ok(held.ok().map(|_| file))
+	}
+}
+/// Admits this run to the local accelerators it named. One run at a time holds a
+/// device: a second run naming it waits rather than opening a second context on
+/// it and contending for its memory.
+///
+/// The CPU is deliberately not leased. It is shared by design — `cpu-worker-threads`
+/// already divides it — and leasing it would serialize every forced-CPU run on the
+/// machine, including the child processes the determinism suite spawns per case.
+/// Remote devices are not leased either: the lease is local to one machine, and
+/// admitting a run on another host is what #262 still needs.
+fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
+	let mut names = selected
+		.iter()
+		.filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':'))
+		.map(|gpu| gpu.name.clone())
+		.collect::<Vec<_>>();
+	if names.is_empty() {
+		return Ok(selected);
+	}
+	// Acquired in name order, and all or nothing: a run that cannot take every
+	// device it named releases what it holds and retries, so two runs naming the
+	// same pair in opposite orders cannot hold half of it each.
+	names.sort();
+	names.dedup();
+	let directory = lease_directory()?;
+	let timeout = Duration::from_millis(natural("device admission timeout", env!("RECIPE_ADMISSION_TIMEOUT_MS"))? as u64);
+	let poll = Duration::from_millis(natural("device admission poll", env!("RECIPE_ADMISSION_POLL_MS"))? as u64);
+	let started = Instant::now();
+	let mut reported = false;
+	loop {
+		let mut held = Vec::new();
+		let mut blocked = None;
+		for name in &names {
+			match take_lease(&directory.join(format!("{name}.lease")))? {
+				Some(file) => held.push(file),
+				None => {
+					blocked = Some(name.clone());
+					break;
+				}
+			}
+		}
+		if blocked.is_none() {
+			LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
+			return Ok(selected);
+		}
+		// Releasing before sleeping is what keeps this deadlock-free: nothing is
+		// held across the wait, so no run can be waiting on a device another
+		// waiting run is holding.
+		drop(held);
+		let device = blocked.unwrap_or_default();
+		if INTERRUPTED.load(Ordering::Acquire) {
+			std::process::exit(INTERRUPTED_EXIT);
+		}
+		require(
+			started.elapsed() < timeout,
+			format!("device {device:?} is in use by another run and did not become free within {:.0}s", timeout.as_secs_f64()),
+		)?;
+		if !reported {
+			// A queued run says so once. A silent wait is indistinguishable from a
+			// hang, which is the failure this is most likely to be blamed for.
+			let waiting = format!("device {device:?} is in use by another run; waiting");
+			eprintln!("{waiting}");
+			debug(&waiting)?;
+			reported = true;
+		}
+		std::thread::sleep(poll);
+	}
+}
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
 /// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
@@ -9016,7 +9126,7 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
-			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]) };
+			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]).and_then(admit) };
 			let (host, local_only) = (local_host()?, Config::load()?.multi_device == MultiDevice::Local);
 			let mut selected = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
@@ -9033,7 +9143,7 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 				selected.push(gpu);
 			}
 			require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
-			Ok(selected)
+			admit(selected)
 		})
 		.as_ref()
 		.map(Vec::as_slice)
@@ -10011,6 +10121,8 @@ unsafe extern "system" {
 unsafe extern "C" {
 	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+	#[cfg(unix)]
+	fn flock(descriptor: i32, operation: i32) -> i32;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
 }
