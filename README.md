@@ -52,6 +52,7 @@ weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)
+	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
