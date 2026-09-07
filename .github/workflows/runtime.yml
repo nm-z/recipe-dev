@@ -211,10 +211,8 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          # Dispatch runs are always controlled by minimal. Pull requests keep
-          # the existing merge-ref behavior while the controller has its own
-          # directory.
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          # Bind the controller to the immutable commit that triggered the run.
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -347,7 +345,7 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -450,7 +448,7 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -608,7 +606,7 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -720,7 +718,7 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -842,7 +840,7 @@ jobs:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
@@ -958,7 +956,7 @@ jobs:
         # merge ref while the aggregate still has its own checkout directory.
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
 
