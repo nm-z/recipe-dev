@@ -54,6 +54,21 @@ recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
 ```
 
 `serve` answers that many decode requests over HTTP and returns. A request names its prompt in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&top_k=40&top_p=0.95&min_p=0.05&penalty=1.1&seed=7`, and each field it leaves out keeps the sampler's default. The answer is chunked and carries one id per chunk as the decode reaches it.
+## placement
+
+```text
+recipe --device nv0 --device nv1 --device cpu model.rs
+```
+
+```rust
+let placed = recipe.place("model.ogdl", &[]);
+let prediction = placed.infer(&input);
+placed.split();
+placed.resident_bytes();
+placed.moved_bytes();
+```
+
+Inference blocks across the selected devices. An empty split is measured: each block joins the current device while its parameters and carried state fit that device's free memory, and starts the next device when they do not. A block no remaining device can hold is reported, so a measured placement never plans an allocation its device cannot take. Every named device takes a nonempty range, so a device too small to hold even one block is reported rather than passed over. The CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run.
 
 ## files
 
