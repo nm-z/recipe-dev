@@ -4446,9 +4446,17 @@ mod ngram {
 		/// gather and everything after it stay where the table is mapped.
 		fn placed(&self) -> Result<(&'static Gpu, &'static Gpu)> {
 			let devices = selected_gpus()?;
+			let named = std::env::var("RECIPE_DEVICE").map_or(1, |selection| selection.split(',').count());
 			require(
-				devices.len() <= 2,
-				format!("an n-gram placement names the device before block {} and the device from it on, so at most two; {} are selected", self.layer, devices.len()),
+				named <= 2,
+				format!("an n-gram placement names the device before block {} and the device from it on, so at most two; {named} are selected", self.layer),
+			)?;
+			// `multi-device = false` truncates the selection to its first name, which
+			// would turn an explicit two-device placement back into one device with no
+			// diagnostic. A placement that was asked for and not honored is refused.
+			require(
+				devices.len() == named,
+				format!("an n-gram placement of {named} devices needs multi-device; the selection resolved to {}", devices.len()),
 			)?;
 			Ok((devices[0], devices[devices.len() - 1]))
 		}
