@@ -4440,6 +4440,23 @@ mod ngram {
 		pub fn bytes(&self) -> usize {
 			2 * self.heads * (self.table.bytes / self.rows) * self.taps.len().max(1)
 		}
+		/// The device each of the two ranges runs on: the blocks before
+		/// `ngram.layer`, then the blocks from it on. One named device runs both;
+		/// naming the host last gives it the range that reads the table, so the
+		/// gather and everything after it stay where the table is mapped.
+		fn placed(&self) -> Result<(&'static Gpu, &'static Gpu)> {
+			let devices = selected_gpus()?;
+			require(
+				devices.len() <= 2,
+				format!("an n-gram placement names the device before block {} and the device from it on, so at most two; {} are selected", self.layer, devices.len()),
+			)?;
+			Ok((devices[0], devices[devices.len() - 1]))
+		}
+		/// The device each range runs on, in placement order.
+		pub fn placement(&self) -> Vec<String> {
+			let (before, from) = self.placed().unwrap_or_else(|error| panic!("{error}"));
+			vec![before.name.clone(), from.name.clone()]
+		}
 		/// The row each head addresses for the token at `position`: the first
 		/// `heads` rows hash the bigram, the rest the trigram. A token before the
 		/// sequence start or behind an end id is absent from the context.
@@ -4487,29 +4504,30 @@ mod ngram {
 			}
 			Ok(injected)
 		}
-		/// Inference with the gathered vector added to the stream: the blocks before
-		/// `ngram.layer` run on the selected device, the gather and the addition on
-		/// the host that holds the table, and the blocks from it on the device again.
+		/// Inference with the gathered vector added to the stream: the blocks
+		/// before `ngram.layer` run on the first selected device, the gather and
+		/// the addition on the host that holds the table, and the blocks from
+		/// `ngram.layer` on run on the last selected device.
 		pub fn infer(&self, path: impl AsRef<Path>, input: &[f64], ids: &[u32]) -> Vec<f64> {
 			self.decode(path.as_ref(), input, ids).unwrap_or_else(|error| panic!("{error}"))
 		}
 		fn decode(&self, path: &Path, input: &[f64], ids: &[u32]) -> Result<Vec<f64>> {
 			let path = resolve_path(path)?;
-			let device = selected_gpu()?;
+			let (before, from) = self.placed()?;
 			let injected = self.inject(ids)?;
 			bundle::run_infer(&path, input, |stored, samples| {
-				let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
+				let graph = materialize_saved_graph(stored, samples, before, Config::load()?)?;
 				let (head, tail) = split_at_block(&graph, self.layer)?;
 				let mut statistics = 0;
 				let mut stream = match &head {
-					Some(head) => forward_part(head, samples, device, stored, &mut statistics)?,
+					Some(head) => forward_part(head, samples, before, stored, &mut statistics)?,
 					None => samples.to_vec(),
 				};
 				require(stream.len() == injected.len(), format!("block {} takes {} values, the n-gram table gathers {}", self.layer, stream.len(), injected.len()))?;
 				for (value, added) in stream.iter_mut().zip(&injected) {
 					*value += added;
 				}
-				forward_part(&tail, &stream, device, stored, &mut statistics)
+				forward_part(&tail, &stream, from, stored, &mut statistics)
 			})
 		}
 	}
@@ -7041,7 +7059,7 @@ fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Resul
 	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
 	graph.stored[index] = Some(stored);
 	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
-	tape.forward()?;
+	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7312,7 +7330,7 @@ fn forward_part(graph: &Graph, samples: &[f64], gpu: &'static Gpu, stored: &bund
 	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
 	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
-	tape.forward()?;
+	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
 fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
@@ -9586,11 +9604,13 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() && !cfg!(any(amd, nvidia)) {
-				found.push(cpu_device()?);
-			}
 			// A selection names devices on other hosts too, so an empty local list is not an error.
-			require(!found.is_empty() || selection.is_some(), errors.join("; "))?;
+			if found.is_empty() && cfg!(any(amd, nvidia)) && selection.is_none() {
+				return Err(RecipeError::new(errors.join("; ")));
+			}
+			// The CPU is always selectable, after the accelerators, so a placement
+			// can end on the host.
+			found.push(cpu_device()?);
 			Ok(found)
 		})
 		.as_ref()
@@ -9602,7 +9622,7 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
+	require(found.iter().filter(|gpu| !matches!(gpu.backend, Backend::Cpu)).count() <= 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
 #[cfg(unix)]

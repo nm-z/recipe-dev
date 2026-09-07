@@ -64,7 +64,16 @@ previous two, into its own row range of the mapped `[width, rows]` tensor
 Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
 convolves them across as many trailing positions; and the gathered vector is
 added to the stream before the block `ngram.layer` names. The gather stays on the
-host holding the table and the blocks either side of it run on the device.
+host holding the table. The first `--device` runs the blocks before
+`ngram.layer` and the last runs the blocks from it on, so one name runs both
+ranges on that device and
+
+```text
+recipe --device nv0 --device cpu model.rs
+```
+
+gives the host that has the table mapped the range that reads it. A placement
+names at most two devices.
 
 ## files
 
