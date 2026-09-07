@@ -1,0 +1,57 @@
+name: Close pull requests containing test text
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  close:
+    if: github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close a pull request containing test text
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
+          mkdir -p "$scan_directory"
+
+          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '[.title, (.body // "")] | .[]' \
+            > "$scan_directory/metadata.txt"
+          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty), (.patch // empty)' \
+            > "$scan_directory/files.txt"
+          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
+            --jq '.[].commit.message' \
+            > "$scan_directory/commits.txt"
+          gh api \
+            -H 'Accept: application/vnd.github.v3.diff' \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER" \
+            > "$scan_directory/pull.diff"
+
+          locations=()
+          if rg --ignore-case --quiet 'test' "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
+          if rg --ignore-case --quiet 'test' "$scan_directory/files.txt"; then locations+=("changed path or patch"); fi
+          if rg --ignore-case --quiet 'test' "$scan_directory/commits.txt"; then locations+=("commit message"); fi
+          if rg --ignore-case --quiet 'test' "$scan_directory/pull.diff"; then locations+=("diff"); fi
+
+          if ((${#locations[@]} == 0)); then
+            exit 0
+          fi
+
+          IFS=,
+          location_text="${locations[*]}"
+          reason="Closed automatically because this pull request contains the banned text \`test\` in: $location_text. Remove every occurrence from this PR's existing branch and metadata, then reopen this PR. Do not create a replacement branch or PR."
+          gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+          gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
