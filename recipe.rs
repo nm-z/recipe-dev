@@ -2550,9 +2550,9 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					require(node.argument[1] == 0.0, "a recurrent body of more than one stage needs the staged cell, which is not emitted yet")?;
 					let (coded, cell) = self.cell_activation(node)?;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, coded = coded, cell = cell, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let (stages, stage_base) = (integer_argument(node.argument[1], "recurrent stages")?, self.stage_base(node)?);
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base} )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2690,9 +2690,9 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-					require(node.argument[1] == 0.0, "a recurrent body of more than one stage needs the staged cell, which is not emitted yet")?;
 					let (coded, cell) = self.cell_activation(node)?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, coded = coded, cell = cell, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					let (stages, stage_base) = (integer_argument(node.argument[1], "recurrent stages")?, self.stage_base(node)?);
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -3018,8 +3018,24 @@ impl NativeModelIr {
 		if node.program_count == 0 {
 			return Ok((false, 0));
 		}
-		let code = self.graph.programs.get(node.program_offset).ok_or_else(|| RecipeError::new("recurrent cell activation is absent"))?;
-		Ok((true, integer_argument(*code, "recurrent cell activation")? as usize))
+		let codes = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("recurrent stage activations are absent"))?;
+		let mut packed = 0;
+		for (stage, code) in codes.chunks_exact(3).enumerate() {
+			let code = integer_argument(code[0], "recurrent stage activation")? as usize;
+			packed |= code << (4 * stage);
+		}
+		Ok((true, packed))
+	}
+	/// Where a recurrent node's saved stage rows begin: after the gate states,
+	/// the per-row gradients and the scan's own scratch, which is the order
+	/// `node_context` sizes them in.
+	fn stage_base(&self, node: &Node) -> Result<usize> {
+		let gates = integer_argument(node.argument[0], "scan gates")? as usize;
+		let rows = checked_mul(self.rows, node.output.elements(), "recurrent batch")?;
+		let states = checked_mul(2 * gates + 1, rows, "recurrent states")?;
+		let gradients = checked_mul(self.rows, node.parameters, "recurrent gradients")?;
+		let scratch = checked_mul(2 * self.rows, node.output.channels, "recurrent scratch")?;
+		checked_add(states, checked_add(gradients, scratch, "recurrent tail")?, "recurrent stage base")
 	}
 	fn emit_normalize_stats(&self, backend: Backend, index: usize, node: &Node, pointers: &ModelPointers, mode: program_ir::NormalizeMode) -> Result<String> {
 		let pointer = pointer_type(backend);
@@ -7526,6 +7542,8 @@ fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
 			Operation::Layer(width) => {
 				require(width != 0, "recurrent width must be positive")?;
 				require(stages.first().is_none_or(|(first, _)| *first == width), "every layer of a recurrent body carries the width the recurrence carries")?;
+				// The stage activations pack a nibble each into one word.
+				require(stages.len() < 8, "a recurrent body takes at most eight stages")?;
 				stages.push((width, recur_activation(block.activation)?));
 			}
 			// An activation on its own closes the stage before it.
@@ -7555,6 +7573,8 @@ fn lower_recur(graph: &mut Graph, parts: &[Block]) -> Result<()> {
 	let cell = checked_add(checked_add(checked_mul(graph.output.channels, width, "recurrent input matrix")?, checked_mul(width, width, "recurrent state matrix")?, "recurrent cell")?, width, "recurrent bias")?;
 	let stage = checked_add(checked_mul(width, width, "recurrent stage matrix")?, width, "recurrent stage bias")?;
 	let parameters = checked_add(cell, checked_mul(extra, stage, "recurrent stages")?, "recurrent parameters")?;
+	// The program store is validated and read in entries of three, so a stage
+	// spends one slot on its activation and leaves the other two at zero.
 	let program_offset = graph.programs.len();
 	for (_, activation) in &stages {
 		graph.programs.extend([*activation as f64, 0.0, 0.0]);
@@ -8626,8 +8646,10 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
 			// Every stage past the cell saves the activation it produced at each
-			// position, which the reverse reads back in place of a pre-activation.
-			let staged = checked_mul(node.argument[1] as usize, state_count, "recurrent stage states")?;
+			// position, and the reverse needs one more row of the same shape to
+			// hold a stage's pre-activation gradient while it forms the next one.
+			let stages = node.argument[1] as usize;
+			let staged = checked_mul(if stages == 0 { 0 } else { stages + 1 }, state_count, "recurrent stage states")?;
 			checked_add(staged, checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?, "recurrent context")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
