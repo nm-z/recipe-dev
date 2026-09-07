@@ -177,7 +177,10 @@ jobs:
             echo "snapshot checksum mismatch: $sha256 != $expected" >&2
             exit 1
           fi
-          archive_commit="$(gzip -dc /tmp/recipe-source.tar.gz | git get-tar-commit-id)"
+          archive_tar="$(mktemp /tmp/recipe-source.XXXXXX.tar)"
+          trap 'rm -f "$archive_tar"' EXIT
+          gzip -dc /tmp/recipe-source.tar.gz > "$archive_tar"
+          archive_commit="$(git get-tar-commit-id < "$archive_tar")"
           [ "$archive_commit" = "$EXPECTED_COMMIT" ] || {
             echo "snapshot commit mismatch: $archive_commit != $EXPECTED_COMMIT" >&2
             exit 1
