@@ -61,6 +61,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	recur([...])
 
 feature reduction:
 	pool(size)
@@ -78,6 +79,15 @@ estimators:
 	bayes()
 ```
 Feature generation is banned.
+
+`recur([...])` declares a body once and runs it at every sequence position, reading the position's input and the previous position's output, with one parameter set shared across the positions. The state starts at zero for each independent sequence and there is no iteration count: the input sequence length is the number of steps. Every layer of the body carries the width the recurrence carries, since the body's output is the next position's state.
+
+```rust
+.recur([layer(width), tanh()])
+.recur([layer(width), relu()])
+```
+
+`recur([layer(w), tanh()])` is the cell `rnn(w)` runs, bit for bit; the body form lets the cell name a different activation, which `rnn` cannot. A body of more than one stage, and a body holding `res`/`moe`, are refused with a message rather than silently reduced.
 
 A step of `res([...])` or `moe(topk, [...])` is an ordinary model fragment, so a branch takes whatever the outer sequence takes: a normalization, an attention, a recurrent block, a nested `res` or `moe`, at any depth.
 
