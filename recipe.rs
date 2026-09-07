@@ -132,6 +132,7 @@ mod program_ir {
 		pub first: &'a str,
 		pub second: &'a str,
 		pub weights: &'a str,
+		pub decode: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
 	}
@@ -207,23 +208,35 @@ mod program_ir {
 					if parameter < 0 {
 						return Err(EmitError::InvalidOperand { kind: "scalar parameter", value: instruction.left });
 					}
-					let pointer = format!("{name}.ptr");
-					let _ = writeln!(
-						output,
-						"{pointer} = getelementptr inbounds {ty}, {ptrty} {weights}, i32 {parameter}",
-						ty = context.value_type,
-						ptrty = context.pointer_type,
-						weights = context.weights,
-						parameter = parameter
-					);
-					let _ = writeln!(
-						output,
-						"{name} = load {ty}, {ptrty} {pointer}, align {align}",
-						ty = context.value_type,
-						ptrty = context.pointer_type,
-						pointer = pointer,
-						align = context.alignment
-					);
+					if context.decode == 0 {
+						let pointer = format!("{name}.ptr");
+						let _ = writeln!(
+							output,
+							"{pointer} = getelementptr inbounds {ty}, {ptrty} {weights}, i32 {parameter}",
+							ty = context.value_type,
+							ptrty = context.pointer_type,
+							weights = context.weights,
+							parameter = parameter
+						);
+						let _ = writeln!(
+							output,
+							"{name} = load {ty}, {ptrty} {pointer}, align {align}",
+							ty = context.value_type,
+							ptrty = context.pointer_type,
+							pointer = pointer,
+							align = context.alignment
+						);
+					} else {
+						let _ = writeln!(
+							output,
+							"{name} = call {ty} @recipe.model.decode({ptrty} {weights}, i32 {parameter}, i32 {decode})",
+							ty = context.value_type,
+							ptrty = context.pointer_type,
+							weights = context.weights,
+							parameter = parameter,
+							decode = context.decode
+						);
+					}
 					name
 				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
@@ -1425,8 +1438,8 @@ const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
+const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888844888888844";
+const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
@@ -1458,6 +1471,48 @@ fn align(value: usize, boundary: usize) -> Result<usize> {
 	if remainder == 0 { Ok(value) } else { checked_add(value, boundary - remainder, "native arena alignment") }
 }
 
+fn encode_floats(values: &[f64], precision: Compute) -> Vec<u8> {
+	let bytes = precision.bytes();
+	values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect()
+}
+
+/// The stored representation a packed node keeps, or `None` when the node decodes at load.
+fn packed_weight(graph: &Graph, index: usize, inference: bool) -> Option<&StoredWeight> {
+	if !inference || !graph.nodes[index].packed {
+		return None;
+	}
+	graph.stored.get(index)?.as_ref()
+}
+
+/// Byte offset of every node's weights, and the arena size. A packed node keeps its stored bytes.
+fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Result<(Vec<usize>, usize)> {
+	let mut offsets = Vec::with_capacity(graph.nodes.len());
+	let mut bytes = 0;
+	for index in 0..graph.nodes.len() {
+		let offset = align(bytes, precision.bytes())?;
+		let span = match packed_weight(graph, index, inference) {
+			Some(weight) => weight.bytes.len(),
+			None => checked_mul(graph.nodes[index].parameters, precision.bytes(), "native weight arena")?,
+		};
+		offsets.push(offset);
+		bytes = checked_add(offset, span, "native weight arena")?;
+	}
+	Ok((offsets, bytes))
+}
+
+fn native_weight_bytes(graph: &Graph, precision: Compute, inference: bool) -> Result<Vec<u8>> {
+	let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
+	let mut arena = vec![0_u8; bytes.max(1)];
+	for (index, node) in graph.nodes.iter().enumerate() {
+		let encoded = match packed_weight(graph, index, inference) {
+			Some(weight) => weight.bytes.clone(),
+			None => encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], precision),
+		};
+		arena[offsets[index]..offsets[index] + encoded.len()].copy_from_slice(&encoded);
+	}
+	Ok(arena)
+}
+
 impl NativeLayout {
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute) -> Result<Self> {
 		let element = precision.bytes();
@@ -1487,6 +1542,15 @@ struct NodePlan {
 	adjoint: usize,
 	stored: Option<StoredWeight>,
 	storage_offset: usize,
+	weight_offset: usize,
+	packed: bool,
+}
+
+impl NodePlan {
+	/// The decoder selector a consuming kernel passes back, or zero for a dense node.
+	fn decode(&self, index: usize) -> usize {
+		if self.packed { index + 1 } else { 0 }
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -1515,9 +1579,10 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
+		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision)?;
 		let mut plans = Vec::with_capacity(graph.nodes.len());
 		let mut storage_bytes = 0usize;
@@ -1533,18 +1598,32 @@ impl NativeModelIr {
 			if let Some(weight) = &stored {
 				require(weight.count == node.parameters, format!("{} stored weight count {} does not match parameter count {}", id(), weight.count, node.parameters))?;
 			}
+			let packed = packed_weight(graph, index, inference).is_some();
 			let storage_offset = align(storage_bytes, alignment("float"))?;
-			if let Some(weight) = &stored {
+			if let Some(weight) = &stored
+				&& !packed
+			{
 				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
 			}
-			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
+			plans.push(NodePlan {
+				node,
+				value: layout.values[index],
+				context: layout.contexts[index],
+				adjoint: layout.adjoints[index],
+				stored,
+				storage_offset,
+				weight_offset: weight_offsets[index],
+				packed,
+			});
 		}
 		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
 	}
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
 		for plan in &self.plans {
-			if let Some(weight) = &plan.stored {
+			if let Some(weight) = &plan.stored
+				&& !plan.packed
+			{
 				storage.resize(plan.storage_offset, 0);
 				storage.extend_from_slice(&weight.bytes);
 			}
@@ -2476,6 +2555,35 @@ mod quantized {
 }
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
 
+/// The parameter runs the optimizer owns: every maximal run of unfrozen
+/// parameters, as the parameter it starts at, its length, and the optimizer
+/// slot its first parameter takes. Optimizer state covers these slots alone, so
+/// a frozen weight has none.
+fn trainable_runs(frozen: &[u8], parameters: usize) -> Vec<(usize, usize, usize)> {
+	if frozen.is_empty() {
+		return if parameters == 0 { Vec::new() } else { vec![(0, parameters, 0)] };
+	}
+	let (mut runs, mut open, mut slot) = (Vec::new(), None, 0);
+	for index in 0..parameters {
+		match (frozen.get(index).is_some_and(|&value| value == 0), open) {
+			(true, None) => open = Some(index),
+			(false, Some(start)) => {
+				runs.push((start, index - start, slot));
+				slot += index - start;
+				open = None
+			}
+			_ => {}
+		}
+	}
+	if let Some(start) = open {
+		runs.push((start, parameters - start, slot))
+	}
+	runs
+}
+/// The parameters the optimizer owns, which is every unfrozen parameter.
+fn trainable_parameters(frozen: &[u8], parameters: usize) -> usize {
+	if frozen.is_empty() { parameters } else { frozen.iter().take(parameters).filter(|&&value| value == 0).count() }
+}
 impl NativeModelIr {
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
@@ -2492,8 +2600,9 @@ impl NativeModelIr {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode} )\n",
 						pointer = pointer_type(backend),
+						decode = plan.decode(index),
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
@@ -2537,7 +2646,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode} )\n", decode = plan.decode(index), pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2563,6 +2672,7 @@ impl NativeModelIr {
 							first: &first,
 							second: second_operand,
 							weights: &pointers.weights,
+							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
 						},
@@ -2645,7 +2755,7 @@ impl NativeModelIr {
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i32 0, i32 0 )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -2704,6 +2814,7 @@ impl NativeModelIr {
 							first: &first,
 							second: second_operand,
 							weights: &pointers.weights,
+							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
 						},
@@ -2719,6 +2830,7 @@ impl NativeModelIr {
 							first: &first,
 							second: second_operand,
 							weights: &pointers.weights,
+							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
 						},
@@ -3095,8 +3207,7 @@ impl NativeModelIr {
 		if reverse {
 			ir.push_str(&ptr_gep(backend, "adjoints", plan.adjoint, &format!("{prefix}.delta")));
 		}
-		let weight_bytes = checked_mul(plan.node.offset, self.precision.model.bytes(), "native parameter offset")?;
-		ir.push_str(&ptr_gep(backend, "weights", weight_bytes, &format!("{prefix}.weights")));
+		ir.push_str(&ptr_gep(backend, "weights", plan.weight_offset, &format!("{prefix}.weights")));
 		let source_adjoint = if reverse && plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source adjoint node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[source], &format!("{prefix}.source.adjoint")));
@@ -3172,6 +3283,29 @@ impl NativeModelIr {
 		Ok(emitted)
 	}
 
+	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
+	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
+		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
+		let (mut arms, mut bodies) = (String::new(), String::new());
+		for (index, plan) in self.plans.iter().enumerate() {
+			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
+			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
+			let format = spec.codec.quantization();
+			let (name, block) = match format.native {
+				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
+				_ => (format.name.to_owned(), spec.block),
+			};
+			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
+			arms.push_str(&format!("i32 {}, label %decode.n{index}\n", index + 1));
+			bodies.push_str(&format!(
+				"decode.n{index}:\n%decode.n{index}.value = call {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 0, i32 %index, i32 {columns})\nret {ty} %decode.n{index}.value\n"
+			));
+		}
+		Ok(format!(
+			"define internal {ty} @recipe.model.decode({pointer} %matrix, i32 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"
+		))
+	}
+
 	fn emit_model_load(&self, backend: Backend) -> Result<String> {
 		if self.storage_bytes == 0 {
 			return Ok(String::new());
@@ -3187,7 +3321,7 @@ impl NativeModelIr {
 		);
 		let mut predecessor = "entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
-			let Some(stored) = &plan.stored else { continue };
+			let Some(stored) = plan.stored.as_ref().filter(|_| !plan.packed) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
 			let native = format.native;
@@ -3198,7 +3332,7 @@ impl NativeModelIr {
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
 			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
-			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
+			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.base = getelementptr i8, {pointer} %weights, i32 {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %{prefix}.base, i32 %{prefix}.p\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.weight_offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 			ir.push_str(barrier(backend));
 			predecessor = format!("{prefix}.done");
 		}
@@ -3220,9 +3354,12 @@ impl NativeModelIr {
 			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
 			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
 			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
+		ir = strip_definition(ir, "recipe.model.decode");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
+		let weight_decode = self.emit_weight_decode(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&quantized_definitions);
+		ir.push_str(&weight_decode);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
 		let model_ty = self.precision.model_type;
@@ -3256,7 +3393,7 @@ impl NativeModelIr {
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
-				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
+				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
 			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
@@ -3332,39 +3469,51 @@ impl NativeModelIr {
 	}
 
 	fn emit_adamw(&self, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize) -> Result<String> {
-		let parameters = i32::try_from(self.graph.parameters.len()).map_err(|_| RecipeError::new("native parameter count exceeds i32"))?;
 		let one = native_literal(state_precision, state_ty, 1.0);
-		let mut ir = String::new();
-		ir.push_str(&format!("optimizer.entry:\n%optimizer.base = add i32 0, %tid\nbr label %optimizer.loop\noptimizer.loop:\n%optimizer.p = phi i32 [ %optimizer.base, %optimizer.entry ], [ %optimizer.next, %optimizer.advance ]\n%optimizer.more = icmp ult i32 %optimizer.p, {parameters}\nbr i1 %optimizer.more, label %optimizer.step, label %optimizer.done\noptimizer.step:\n"));
-		ir.push_str(&format!("%optimizer.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %optimizer.p\n%optimizer.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %optimizer.p\n%optimizer.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %optimizer.p\n%optimizer.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %optimizer.p\n%optimizer.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %optimizer.p\n"));
-		ir.push_str(&format!("%optimizer.frozen.value = load i8, {pointer} %optimizer.frozen.ptr, align 1\n%optimizer.is.frozen = icmp ne i8 %optimizer.frozen.value, 0\nbr i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update\noptimizer.update:\n"));
-		ir.push_str(&format!("%optimizer.gradient.model = load {model_ty}, {pointer} %optimizer.gradient.ptr, align {model_align}\n%optimizer.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.gradient.model)\n%optimizer.moment.old = load {state_ty}, {pointer} %optimizer.moment.ptr, align {state_align}\n%optimizer.variance.old = load {state_ty}, {pointer} %optimizer.variance.ptr, align {state_align}\n%optimizer.weight.model = load {model_ty}, {pointer} %optimizer.weight.ptr, align {model_align}\n%optimizer.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.weight.model)\n"));
-		append_binary(&mut ir, state_ty, "optimizer.one.beta1", "sub", &one, "%beta1");
-		append_binary(&mut ir, state_ty, "optimizer.one.beta2", "sub", &one, "%beta2");
-		append_binary(&mut ir, state_ty, "optimizer.moment.part", "mul", "%beta1", "%optimizer.moment.old");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.part", "mul", "%optimizer.one.beta1", "%optimizer.gradient.value");
-		append_binary(&mut ir, state_ty, "optimizer.moment.new", "add", "%optimizer.moment.part", "%optimizer.gradient.part");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.square", "mul", "%optimizer.gradient.value", "%optimizer.gradient.value");
-		append_binary(&mut ir, state_ty, "optimizer.variance.part", "mul", "%beta2", "%optimizer.variance.old");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.variance", "mul", "%optimizer.one.beta2", "%optimizer.gradient.square");
-		append_binary(&mut ir, state_ty, "optimizer.variance.new", "add", "%optimizer.variance.part", "%optimizer.gradient.variance");
-		ir.push_str(&format!(
-			"store {state_ty} %optimizer.moment.new, {pointer} %optimizer.moment.ptr, align {state_align}\nstore {state_ty} %optimizer.variance.new, {pointer} %optimizer.variance.ptr, align {state_align}\n"
-		));
-		append_binary(&mut ir, state_ty, "optimizer.m.correct", "sub", &one, "%beta1.power");
-		append_binary(&mut ir, state_ty, "optimizer.v.correct", "sub", &one, "%beta2.power");
-		append_binary(&mut ir, state_ty, "optimizer.m.hat", "div", "%optimizer.moment.new", "%optimizer.m.correct");
-		append_binary(&mut ir, state_ty, "optimizer.v.hat", "div", "%optimizer.variance.new", "%optimizer.v.correct");
-		ir.push_str(&format!("%optimizer.root = call {state_ty} @recipe.state.sqrt({state_ty} %optimizer.v.hat)\n"));
-		append_binary(&mut ir, state_ty, "optimizer.denominator", "add", "%optimizer.root", "%epsilon");
-		append_binary(&mut ir, state_ty, "optimizer.direction", "div", "%optimizer.m.hat", "%optimizer.denominator");
-		append_binary(&mut ir, state_ty, "optimizer.decay", "mul", "%decay", "%optimizer.weight.value");
-		append_binary(&mut ir, state_ty, "optimizer.total", "add", "%optimizer.direction", "%optimizer.decay");
-		append_binary(&mut ir, state_ty, "optimizer.change", "mul", "%rate", "%optimizer.total");
-		append_binary(&mut ir, state_ty, "optimizer.next.state", "sub", "%optimizer.weight.value", "%optimizer.change");
-		ir.push_str(&format!("%optimizer.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %optimizer.next.state)\nstore {model_ty} %optimizer.next.weight, {pointer} %optimizer.weight.ptr, align {model_align}\nbr label %optimizer.advance\noptimizer.advance:\n%optimizer.next = add i32 %optimizer.p, %threads\nbr label %optimizer.loop\noptimizer.done:\n"));
+		let runs = trainable_runs(&self.graph.frozen, self.graph.parameters.len());
+		let mut ir = String::from("optimizer.entry:\n");
+		let mut previous = String::from("optimizer.entry");
+		for (run, &(start, length, slot)) in runs.iter().enumerate() {
+			let length = i32::try_from(length).map_err(|_| RecipeError::new("native trainable run length exceeds i32"))?;
+			let start = i32::try_from(start).map_err(|_| RecipeError::new("native trainable run start exceeds i32"))?;
+			let slot = i32::try_from(slot).map_err(|_| RecipeError::new("native optimizer slot exceeds i32"))?;
+			let this = format!("optimizer.r{run}");
+			ir.push_str(&format!("br label %{this}.loop\n{this}.loop:\n%{this}.p = phi i32 [ %tid, %{previous} ], [ %{this}.next, %{this}.advance ]\n%{this}.more = icmp ult i32 %{this}.p, {length}\nbr i1 %{this}.more, label %{this}.step, label %{this}.done\n{this}.step:\n"));
+			// The run is contiguous in both spaces, so the weight it updates and
+			// the optimizer slot carrying its moments are each one offset away.
+			ir.push_str(&format!("%{this}.param = add i32 %{this}.p, {start}\n%{this}.slot = add i32 %{this}.p, {slot}\n"));
+			ir.push_str(&format!("%{this}.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %{this}.param\n%{this}.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %{this}.slot\n%{this}.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %{this}.slot\n%{this}.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %{this}.param\n"));
+			ir.push_str(&format!("%{this}.gradient.model = load {model_ty}, {pointer} %{this}.gradient.ptr, align {model_align}\n%{this}.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %{this}.gradient.model)\n%{this}.moment.old = load {state_ty}, {pointer} %{this}.moment.ptr, align {state_align}\n%{this}.variance.old = load {state_ty}, {pointer} %{this}.variance.ptr, align {state_align}\n%{this}.weight.model = load {model_ty}, {pointer} %{this}.weight.ptr, align {model_align}\n%{this}.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %{this}.weight.model)\n"));
+			append_binary(&mut ir, state_ty, &format!("{this}.one.beta1"), "sub", &one, "%beta1");
+			append_binary(&mut ir, state_ty, &format!("{this}.one.beta2"), "sub", &one, "%beta2");
+			append_binary(&mut ir, state_ty, &format!("{this}.moment.part"), "mul", "%beta1", &format!("%{this}.moment.old"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.part"), "mul", &format!("%{this}.one.beta1"), &format!("%{this}.gradient.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.moment.new"), "add", &format!("%{this}.moment.part"), &format!("%{this}.gradient.part"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.square"), "mul", &format!("%{this}.gradient.value"), &format!("%{this}.gradient.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.variance.part"), "mul", "%beta2", &format!("%{this}.variance.old"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.variance"), "mul", &format!("%{this}.one.beta2"), &format!("%{this}.gradient.square"));
+			append_binary(&mut ir, state_ty, &format!("{this}.variance.new"), "add", &format!("%{this}.variance.part"), &format!("%{this}.gradient.variance"));
+			ir.push_str(&format!(
+				"store {state_ty} %{this}.moment.new, {pointer} %{this}.moment.ptr, align {state_align}\nstore {state_ty} %{this}.variance.new, {pointer} %{this}.variance.ptr, align {state_align}\n"
+			));
+			append_binary(&mut ir, state_ty, &format!("{this}.m.correct"), "sub", &one, "%beta1.power");
+			append_binary(&mut ir, state_ty, &format!("{this}.v.correct"), "sub", &one, "%beta2.power");
+			append_binary(&mut ir, state_ty, &format!("{this}.m.hat"), "div", &format!("%{this}.moment.new"), &format!("%{this}.m.correct"));
+			append_binary(&mut ir, state_ty, &format!("{this}.v.hat"), "div", &format!("%{this}.variance.new"), &format!("%{this}.v.correct"));
+			ir.push_str(&format!("%{this}.root = call {state_ty} @recipe.state.sqrt({state_ty} %{this}.v.hat)\n"));
+			append_binary(&mut ir, state_ty, &format!("{this}.denominator"), "add", &format!("%{this}.root"), "%epsilon");
+			append_binary(&mut ir, state_ty, &format!("{this}.direction"), "div", &format!("%{this}.m.hat"), &format!("%{this}.denominator"));
+			append_binary(&mut ir, state_ty, &format!("{this}.decay"), "mul", "%decay", &format!("%{this}.weight.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.total"), "add", &format!("%{this}.direction"), &format!("%{this}.decay"));
+			append_binary(&mut ir, state_ty, &format!("{this}.change"), "mul", "%rate", &format!("%{this}.total"));
+			append_binary(&mut ir, state_ty, &format!("{this}.next.state"), "sub", &format!("%{this}.weight.value"), &format!("%{this}.change"));
+			ir.push_str(&format!("%{this}.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %{this}.next.state)\nstore {model_ty} %{this}.next.weight, {pointer} %{this}.weight.ptr, align {model_align}\nbr label %{this}.advance\n{this}.advance:\n%{this}.next = add i32 %{this}.p, %threads\nbr label %{this}.loop\n{this}.done:\n"));
+			previous = format!("{this}.done");
+		}
+		ir.push_str("br label %optimizer.done\noptimizer.done:\n");
 		Ok(ir)
 	}
+
 	fn emit_clear_bytes(&self, backend: Backend, base: &str, bytes: usize, label: &str, from: &str) -> Result<String> {
 		let count = i64::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i64")))?;
 		let pointer = pointer_type(backend);
@@ -3854,7 +4003,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
 	let matrix = match target {
 		BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11),
 		BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12),
@@ -4164,18 +4313,20 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			block.activation as u8,
 			normalization_text(block.normalization),
 			block.quantization,
 			u8::from(block.profile),
-			normalization_text(block.qk)
+			normalization_text(block.qk),
+			u8::from(block.frozen),
+			u8::from(block.packed)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = value.split('|').collect::<Vec<_>>();
-		require(fields.len() == 6, "semantic model block has the wrong width")?;
+		require(fields.len() == 8, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(fields[0])?,
 			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
@@ -4183,6 +4334,8 @@ mod bundle {
 			qk: normalization(Some(fields[5]), "block query and key normalization")?,
 			quantization: value_at(Some(fields[3]), "block quantization")?,
 			profile: bool_value(fields[4], "block quantization profile")?,
+			frozen: bool_value(fields[6], "block frozen qualifier")?,
+			packed: bool_value(fields[7], "block packed qualifier")?,
 		})
 	}
 	fn model_text(model: &Model) -> Vec<String> {
@@ -4191,7 +4344,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, frozen: false, packed: false })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4340,8 +4493,11 @@ mod bundle {
 			)?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
 			require(self.frozen.len() == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
+			// Optimizer state covers the trainable parameters alone, so a frozen
+			// weight contributes none to a saved model.
+			let trainable = trainable_parameters(&self.frozen, self.frozen.len());
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
-				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
+				require(values.is_empty() || values.len() == trainable, format!("semantic model {name} are incomplete"))?;
 			}
 			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
 			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
@@ -4927,18 +5083,23 @@ struct Block {
 	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
+	frozen: bool,
+	packed: bool,
 }
 #[derive(Clone)]
 pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	frozen: bool,
+	packed: bool,
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
+		assert!(operation.weighted() || !(model.frozen || model.packed), "{} owns no weights to qualify", operation.name());
 		model.blocks.push(Block {
 			operation,
 			activation: Activation::Linear,
@@ -4946,11 +5107,31 @@ impl Model {
 			qk: None,
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
+			frozen: model.frozen,
+			packed: model.packed,
 		});
+		model.frozen = false;
+		model.packed = false;
+		model
+	}
+	/// Clones a model that a block suffix extends, so a pending qualifier cannot outlive its block.
+	fn suffix(&self) -> Self {
+		assert!(!(self.frozen || self.packed), "block qualifier requires a following block");
+		self.clone()
+	}
+	pub fn frozen(&self) -> Self {
+		let mut model = self.clone();
+		assert!(!model.packed, "frozen must precede packed");
+		model.frozen = true;
+		model
+	}
+	pub fn packed(&self) -> Self {
+		let mut model = self.clone();
+		model.packed = true;
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
-		let mut model = self.clone();
+		let mut model = self.suffix();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("activation requires a preceding block"));
 		if block.normalization.is_some() {
 			panic!("activation must precede normalization");
@@ -4982,7 +5163,7 @@ impl Model {
 		self.push(Operation::Moe(top_k, experts.into()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
-		let mut model = self.clone();
+		let mut model = self.suffix();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
 		block.normalization = Some(normalization.normalization());
 		model
@@ -6303,6 +6484,14 @@ impl Operation {
 			Self::Perceptron(_) => "perc",
 		}
 	}
+	/// Reports whether the operation owns weights that a qualifier can govern.
+	fn weighted(&self) -> bool {
+		match self {
+			Self::Pool(_) | Self::Estimator(_) => false,
+			Self::Residual(parts) => parts.iter().any(|part| !matches!(part, Residual::Activation(_))),
+			_ => true,
+		}
+	}
 }
 impl Activation {
 	const fn name(self) -> &'static str {
@@ -6455,7 +6644,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, frozen: false, packed: false }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -6554,6 +6743,8 @@ struct Node {
 	program_count: usize,
 	block_index: usize,
 	block_kind: &'static str,
+	frozen: bool,
+	packed: bool,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
@@ -6577,6 +6768,8 @@ struct Graph {
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
+	block_frozen: bool,
+	block_packed: bool,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -6592,6 +6785,8 @@ impl Graph {
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
+			block_frozen: false,
+			block_packed: false,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -6638,8 +6833,12 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
+		graph.block_frozen = block.frozen;
+		graph.block_packed = block.packed;
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
+	graph.block_frozen = false;
+	graph.block_packed = false;
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	// A model whose last block already emits one value per target needs no projection; the
 	// channel and length are checked separately because a matching element count can still
@@ -6663,6 +6862,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 			graph.parameters[offset] = mean;
 		}
+	}
+	// A frozen block keeps its initialized weights, so the mask lands after initialization.
+	for (offset, parameters) in graph.nodes.iter().filter(|node| node.frozen).map(|node| (node.offset, node.parameters)).collect::<Vec<_>>() {
+		graph.frozen[offset..offset + parameters].fill(1);
 	}
 	encode_graph_storage(&mut graph, config)?;
 	Ok(graph)
@@ -6786,6 +6989,8 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		program_count: 0,
 		block_index: graph.block_index,
 		block_kind: graph.block_kind,
+		frozen: graph.block_frozen,
+		packed: graph.block_packed,
 	});
 	graph.stored.push(None);
 	graph.output = output;
@@ -7406,7 +7611,6 @@ struct NativeTape {
 	input_adjoint: Buffer,
 	targets: Buffer,
 	weights: Buffer,
-	frozen: Buffer,
 	moments: Buffer,
 	variances: Buffer,
 	gradient: Buffer,
@@ -7414,6 +7618,7 @@ struct NativeTape {
 	best_loss: [f64; 4],
 	rows: u32,
 	parameters: usize,
+	trainable: usize,
 	step: u32,
 	output: usize,
 	capacity: usize,
@@ -7462,16 +7667,19 @@ impl NativeTape {
 		let rows = samples.len() / input;
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
+		let inference = loss.is_none();
 		let program = gpu.native_program(graph, rows, precision, loss)?;
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
-		let zeros = vec![0.0; parameters.max(1)];
 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
-		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
-		require(graph.state.variances.is_empty() || graph.state.variances.len() == parameters, "saved optimizer variances have the wrong shape")?;
 		require(graph.frozen.is_empty() || graph.frozen.len() == parameters, "frozen parameters have the wrong shape")?;
-		let moments = if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() };
-		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
-		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
+		// A frozen weight has no optimizer state, so the moments and variances
+		// cover the trainable parameters alone.
+		let trainable = trainable_parameters(&graph.frozen, parameters);
+		require(graph.state.moments.is_empty() || graph.state.moments.len() == trainable, "saved optimizer moments have the wrong shape")?;
+		require(graph.state.variances.is_empty() || graph.state.variances.len() == trainable, "saved optimizer variances have the wrong shape")?;
+		let optimizer_zeros = vec![0.0; trainable.max(1)];
+		let moments = if graph.state.moments.is_empty() { optimizer_zeros.clone() } else { graph.state.moments.clone() };
+		let variances = if graph.state.variances.is_empty() { optimizer_zeros } else { graph.state.variances.clone() };
 		let batch_normalizations =
 			graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
 		let best_loss = if graph.state.best_loss.is_empty() {
@@ -7481,10 +7689,9 @@ impl NativeTape {
 		};
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
-		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
-		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
+		let weights = Buffer::upload(gpu, &native_weight_bytes(graph, precision.model, inference)?)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
 			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
@@ -7506,7 +7713,6 @@ impl NativeTape {
 			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
-			frozen: Buffer::upload(gpu, &frozen)?,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
@@ -7514,6 +7720,7 @@ impl NativeTape {
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
+			trainable,
 			step,
 			output,
 			capacity: rows,
@@ -7569,7 +7776,6 @@ impl NativeTape {
 			self.samples.pointer,
 			self.targets.pointer,
 			self.weights.pointer,
-			self.frozen.pointer,
 			self.moments.pointer,
 			self.variances.pointer,
 			self.gradient.pointer,
@@ -7634,7 +7840,7 @@ impl NativeTape {
 		self.weights.write_float_bytes(0, weights, self.precision.model)
 	}
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
+		Ok((self.weights()?, self.moments.download_float(self.trainable, self.precision.state)?, self.variances.download_float(self.trainable, self.precision.state)?))
 	}
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		let (weights, moments, variances) = self.optimizer_state()?;
@@ -8147,9 +8353,7 @@ impl Buffer {
 		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
 	}
 	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: Compute) -> Result<Self> {
-		let bytes = precision.bytes();
-		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
-		Self::upload(runtime, &encoded)
+		Self::upload(runtime, &encode_floats(values, precision))
 	}
 	fn write_float_bytes(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -8222,10 +8426,10 @@ struct Dispatch {
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32, i32);
+type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
+type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
+type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
+type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32, i32);
 
 #[derive(Clone, Copy)]
 enum NativeCpuEpoch {
@@ -9324,7 +9528,7 @@ macro_rules! launch_native_cpu_epoch {
 			native_cpu_pointer($arguments, 8),
 			native_cpu_pointer($arguments, 9),
 			native_cpu_pointer($arguments, 10),
-			native_cpu_pointer($arguments, 11),
+			native_cpu_value($arguments, 11),
 			native_cpu_value($arguments, 12),
 			native_cpu_value($arguments, 13),
 			native_cpu_value($arguments, 14),
@@ -9335,7 +9539,6 @@ macro_rules! launch_native_cpu_epoch {
 			native_cpu_value($arguments, 19),
 			native_cpu_value($arguments, 20),
 			native_cpu_value($arguments, 21),
-			native_cpu_value($arguments, 22),
 		)
 	};
 }
