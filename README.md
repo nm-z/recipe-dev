@@ -52,7 +52,7 @@ weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
-	attn(q, k, v) // n heads
+	attn([q, k, v]) // query, key and value head counts
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
@@ -110,6 +110,11 @@ and the residual width must divide by the head count, with it a head is `d` wide
 whatever the residual width is, and the block projects `heads * d` back to the
 residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
+`attn([q, k, v])` states the three counts in one place instead, and is the same
+block as `attn(q).kv(k)` when `k` and `v` are equal. They are head counts, not
+head widths, and each must divide the query count. An untied key and value count
+is refused at compile time, naming all three, because the kernels lay one key
+plane and one value plane of the same width and walk both with one count.
 `.index(heads, width, block, keep)` adds a side projection that scores every group
 of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
 attention output by a sigmoid of its own projection of the block input.

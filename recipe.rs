@@ -4166,8 +4166,18 @@ mod bundle {
 			Operation::Attention(attention) => {
 				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
-				format!("attn,{},{},{dims},{base},{},{},{},{},{}{width}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				// The value count rides after the optional head width, so a record
+				// written with one key-value count reads back with both equal to it.
+				let values = if attention.values == attention.keys { String::new() } else { format!(",{}", attention.values) };
+				// A value count needs the width slot filled or it would be read as
+				// the width. Zero is the derived width: a declared one must be
+				// positive, so no record that ever loaded can spell it.
+				let width = match (attention.width, values.is_empty()) {
+					(Some(width), _) => format!(",{width}"),
+					(None, false) => ",0".to_string(),
+					(None, true) => String::new(),
+				};
+				format!("attn,{},{},{dims},{base},{},{},{},{},{}{width}{values}", attention.heads, attention.keys, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4201,7 +4211,7 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let heads = value_at(fields.next(), "attention heads")?;
-				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let keys = value_at(fields.next(), "attention key heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
 				let index = Indexer {
@@ -4213,11 +4223,17 @@ mod bundle {
 				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
 				// A bundle written before the width could be declared has nine fields
 				// and derives its width, which is what it meant when it was saved.
-				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
+				// Zero is the width a record carries when it only needed the slot
+				// filled to reach the value count behind it, and it means derived.
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.filter(|width| *width != 0);
+				// A record written with one key-value count carries no value count, and
+				// reads back with the value count equal to the key count.
+				let values = fields.next().map(|field| value_at(Some(field), "attention value heads")).transpose()?.unwrap_or(keys);
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
-					kv,
+					keys,
+					values,
 					rope: (dims != 0).then_some((dims, base.to_bits())),
 					index: (index.block != 0).then_some(index),
 					gate,
@@ -4930,14 +4946,17 @@ struct AttentionBlock {
 	/// The width of one query, key and value head. `None` derives it from the
 	/// residual width, which is what `attn(heads)` alone has always meant.
 	width: Option<usize>,
-	kv: usize,
+	/// The key head count and the value head count. They are separate fields
+	/// rather than one `kv`, so a model states all three counts.
+	keys: usize,
+	values: usize,
 	rope: Option<(usize, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, width: None, kv: heads, rope: None, index: None, gate: false }
+		Self { heads, width: None, keys: heads, values: heads, rope: None, index: None, gate: false }
 	}
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4996,6 +5015,22 @@ impl BlockNormalization {
 }
 /// The normalization selectors with a declared identity: the batch, rms, and l2 markers
 /// and the layer residual constructor. Any other selector is rejected instead of guessing a mode.
+/// The head counts of an attention block: one count for all three, or the query,
+/// key and value counts stated separately. Rust cannot overload `attn` by
+/// argument count, so the two spellings share one typed input.
+pub trait HeadCounts {
+	fn counts(self) -> [usize; 3];
+}
+impl HeadCounts for usize {
+	fn counts(self) -> [usize; 3] {
+		[self, self, self]
+	}
+}
+impl HeadCounts for [usize; 3] {
+	fn counts(self) -> [usize; 3] {
+		self
+	}
+}
 pub trait NormalizationSelector {
 	fn normalization(self) -> BlockNormalization;
 }
@@ -5063,6 +5098,16 @@ impl Model {
 		});
 		model
 	}
+	/// Attention over `heads` query heads. `attn(heads)` gives keys and values the
+	/// same count; `attn([q, k, v])` states the query, key and value head counts
+	/// separately. They are head counts, not head widths.
+	pub fn attn(&self, heads: impl HeadCounts) -> Self {
+		let [query, keys, values] = heads.counts();
+		let mut attention = AttentionBlock::new(query);
+		attention.keys = keys;
+		attention.values = values;
+		self.push(Operation::Attention(attention))
+	}
 	pub fn activate(&self, activation: Activation) -> Self {
 		let mut model = self.clone();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("activation requires a preceding block"));
@@ -5084,7 +5129,7 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(AttentionBlock::new(heads));
+
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -5113,9 +5158,14 @@ impl Model {
 		self.attention("width", |attention| attention.width = Some(d))
 	}
 	/// Key-value heads of the preceding `attn` block. Each key-value head serves
-	/// `heads / kv` query heads.
+	/// `heads / keys` query heads. Superseded by the three counts `attn` takes;
+	/// kept because it is the shorter spelling when only the key-value count
+	/// differs, and it sets both the key and the value count.
 	pub fn kv(&self, heads: usize) -> Self {
-		self.attention("kv", |attention| attention.kv = heads)
+		self.attention("kv", |attention| {
+			attention.keys = heads;
+			attention.values = heads;
+		})
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -7105,12 +7155,25 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, width, kv, rope, index, gate } = attention;
+	let AttentionBlock { heads, width, keys, values, rope, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
 	// A declared head width stands on its own; a derived one is still the residual
 	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
 	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
-	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
+	require(
+		keys != 0 && keys <= heads && heads % keys == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
+	require(
+		values != 0 && values <= heads && heads % values == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
+	// The kernels lay one key plane and one value plane of the same width and
+	// walk them with one head count, so an untied pair has nowhere to go yet.
+	require(
+		keys == values,
+		format!("attention key and value head counts must match: {heads} query, {keys} key and {values} value heads"),
+	)?;
 	let input = graph.output;
 	let width = match width {
 		Some(width) => {
@@ -7123,7 +7186,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	// `input.channels`, so every expression below is the one this code emitted
 	// before the width could be declared.
 	let inner = checked_mul(heads, width, "attention query plane")?;
-	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	let side = match index {
 		Some(index) => {
 			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
@@ -7142,17 +7205,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
-		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, keys, "attention query and key heads")?, "attention query and key span")?)?;
 	}
 	if let Some((dims, base)) = rope {
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
-		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
+		let rotated = checked_mul(width, checked_add(heads, keys, "rotary head partition")?, "rotary width")?;
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
-	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	// Argument 8 carries the value head count. The kernels read argument 1 for the
+	// key-value walk; the value count is preserved beside it so the graph holds
+	// all three declared counts rather than two.
+	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
 	// shape, so declaring the width is a matter of pushing the query plane here
 	// rather than the block input. The closing projection maps it back to the
