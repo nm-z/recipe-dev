@@ -79,6 +79,15 @@ estimators:
 ```
 Feature generation is banned.
 
+A step of `res([...])` or `moe(topk, [...])` is an ordinary model fragment, so a branch takes whatever the outer sequence takes: a normalization, an attention, a recurrent block, a nested `res` or `moe`, at any depth.
+
+```rust
+.res([layer(width), gelu(), layer(width)])
+.res([normalize(rms), attn(2).qk(rms), gelu(), res([layer(8), relu(), layer(8)]), moe(1, [layer(8), layer(8)]), layer(8)])
+```
+
+Inside the array each step is an expression: `layer(w)`, `conv(f, k)`, `pool(n)`, `perc(w)`, `attn(h)`, `rnn(w)`, `gru(w)`, `lstm(w)`, an activation such as `gelu()`, `normalize(rms)`, `res([...])`, and `moe(topk, [...])`. A step carries its own activation, normalization and query-key normalization through `.act(..)`, `.norm(..)` and `.qk(..)`, exactly as the chained forms do on the outer sequence. The standalone normalization is spelled `normalize` because `norm` already names a log metric. The steps run in order from the incoming activation and the branch adds its last output back to that same activation, so a branch still has to return to the shape it received.
+
 ## 15 activations
 
 ```

@@ -4056,21 +4056,46 @@ mod bundle {
 		}
 	}
 
-	fn residual_text(value: &Residual) -> String {
-		match value {
-			Residual::Layer(width) => format!("layer,{width}"),
-			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
-			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+	/// A branch step is a whole block, so its record is the block's own text with
+	/// every character that separates steps or fields escaped. A nested branch
+	/// therefore escapes its children once more at each level, and the split that
+	/// reads a level back never sees a separator that belongs to a deeper one.
+	fn escape(value: &str) -> String {
+		let mut text = String::with_capacity(value.len());
+		for character in value.chars() {
+			match character {
+				'\\' => text.push_str("\\\\"),
+				';' => text.push_str("\\s"),
+				',' => text.push_str("\\c"),
+				'|' => text.push_str("\\p"),
+				other => text.push(other),
+			}
 		}
+		text
+	}
+	fn unescape(value: &str) -> Result<String> {
+		let mut text = String::with_capacity(value.len());
+		let mut characters = value.chars();
+		while let Some(character) = characters.next() {
+			if character != '\\' {
+				text.push(character);
+				continue;
+			}
+			match characters.next() {
+				Some('\\') => text.push('\\'),
+				Some('s') => text.push(';'),
+				Some('c') => text.push(','),
+				Some('p') => text.push('|'),
+				other => return Err(RecipeError::new(format!("invalid branch escape {other:?}"))),
+			}
+		}
+		Ok(text)
+	}
+	fn residual_text(value: &Residual) -> String {
+		escape(&block_text(&value.block))
 	}
 	fn residual(value: &str) -> Result<Residual> {
-		let mut fields = value.split(',');
-		match fields.next().unwrap_or("") {
-			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
-			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
-			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
-			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
-		}
+		block(&unescape(value)?).map(|block| Residual { block })
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -4101,6 +4126,7 @@ mod bundle {
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
+			Operation::Identity => "identity".to_owned(),
 			Operation::Layer(width) => format!("layer,{width}"),
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
@@ -4132,6 +4158,7 @@ mod bundle {
 		let (name, rest) = value.split_once(',').unwrap_or((value, ""));
 		let mut fields = rest.split(',');
 		match name {
+			"identity" => Ok(Operation::Identity),
 			"layer" => Ok(Operation::Layer(value_at(Some(rest), "layer width")?)),
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
@@ -4799,17 +4826,75 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// One step of a composite branch: an ordinary model block, so a branch accepts
+/// whatever the outer model sequence accepts, nested branches included.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Conv(usize, usize),
-	Activation(Activation),
+pub struct Residual {
+	block: Block,
 }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+impl Residual {
+	fn of(operation: Operation) -> Self {
+		Self { block: Block { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false } }
+	}
+	/// The activation this step applies to its own output.
+	pub fn act(mut self, activation: Activation) -> Self {
+		self.block.activation = activation;
+		self
+	}
+	/// The normalization this step applies to its own output.
+	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.block.normalization = Some(normalization.normalization());
+		self
+	}
+	/// The per-head normalization of an attention step's queries and keys.
+	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		if !matches!(self.block.operation, Operation::Attention(_)) {
+			panic!("query and key normalization requires an attention step");
+		}
+		let normalization = normalization.normalization();
+		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
+			panic!("query and key normalization must be rms or l2");
+		}
+		self.block.qk = Some(normalization);
+		self
+	}
 }
-pub const fn conv(filters: usize, kernel: usize) -> Residual {
-	Residual::Conv(filters, kernel)
+pub fn layer(width: usize) -> Residual {
+	Residual::of(Operation::Layer(width))
+}
+pub fn conv(filters: usize, kernel: usize) -> Residual {
+	Residual::of(Operation::Conv(filters, kernel))
+}
+pub fn pool(size: usize) -> Residual {
+	Residual::of(Operation::Pool(size))
+}
+pub fn perc(width: usize) -> Residual {
+	Residual::of(Operation::Perceptron(width))
+}
+pub fn attn(heads: usize) -> Residual {
+	Residual::of(Operation::Attention(heads))
+}
+pub fn rnn(width: usize) -> Residual {
+	Residual::of(Operation::Rnn(width))
+}
+pub fn gru(width: usize) -> Residual {
+	Residual::of(Operation::Gru(width))
+}
+pub fn lstm(width: usize) -> Residual {
+	Residual::of(Operation::Lstm(width))
+}
+/// A normalization as a step of its own, the expression form of `.norm(..)`.
+/// Named `normalize` because `norm` is the log metric of that name.
+pub fn normalize(normalization: impl NormalizationSelector) -> Residual {
+	Residual::of(Operation::Identity).norm(normalization)
+}
+/// A nested residual branch.
+pub fn res<const N: usize>(parts: [Residual; N]) -> Residual {
+	Residual::of(Operation::Residual(parts.into()))
+}
+/// A nested mixture of experts.
+pub fn moe<const N: usize>(top_k: usize, experts: [Residual; N]) -> Residual {
+	Residual::of(Operation::Moe(top_k, experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -4828,6 +4913,9 @@ impl PartialEq for Estimator {
 impl Eq for Estimator {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
+	/// Computes nothing. A step that is only an activation or only a
+	/// normalization carries this, so every step is still a whole block.
+	Identity,
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
@@ -4902,16 +4990,16 @@ impl NormalizationSelector for L2 {
 }
 impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0) {
-			Residual::Layer(_) => BlockNormalization::Layer,
+		match self(0).block.operation {
+			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
-	Residual::Activation(Activation::$value) })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub fn $name() -> Residual {
+	Residual::of(Operation::Identity).act(Activation::$value) })+}; }
 pub mod atv {
-	use super::{Activation, Residual};
+	use super::{Activation, Operation, Residual};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -6290,6 +6378,7 @@ impl Estimator {
 impl Operation {
 	const fn name(&self) -> &'static str {
 		match self {
+			Self::Identity => "identity",
 			Self::Layer(_) => "layer",
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
@@ -6629,7 +6718,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
 	let convolutional = model.blocks.iter().any(|block| match &block.operation {
 		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.block.operation)),
 		_ => false,
 	});
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
@@ -6732,6 +6821,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
+		Operation::Identity => {}
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
@@ -6739,8 +6829,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
-		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -6996,14 +7086,9 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 	}
 	Ok((graph.source, graph.output))
 }
-fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, config: Config) -> Result<(i32, Shape)> {
+fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
-	match value {
-		Residual::Layer(width) => lower_project(graph, *width)?,
-		Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-		Residual::Activation(value) if *value != Activation::Linear => lower_activation(graph, *value, config)?,
-		Residual::Activation(_) => {}
-	}
+	lower_block(graph, &value.block, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
@@ -7071,13 +7156,13 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 	reset(graph, output.ok_or_else(|| RecipeError::new("selection has no output"))?, shape);
 	Ok(())
 }
-fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Config) -> Result<()> {
+fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
 	let mut output = None;
 	for value in experts {
-		let (branch, shape) = expert(graph, source, input, value, config)?;
+		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
 		if let Some(expected) = output {
 			require(shape == expected, "moe experts must have one output shape")?;
 		}
@@ -7101,15 +7186,21 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
 }
-fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
+/// Whether an operation reads along the sequence, itself or through a branch.
+fn sequenced_operation(operation: &Operation) -> bool {
+	match operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.block.operation)),
+		_ => false,
+	}
+}
+fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
+	// Every step is an ordinary block, so a nested branch or mixture lowers
+	// through the same path the outer sequence takes.
 	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+		lower_block(graph, &part.block, total, data, targets, rows, gpu, config)?;
 	}
 	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
 	let mut program = ScalarProgram(Vec::new());
