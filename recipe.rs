@@ -7012,6 +7012,10 @@ pub struct Generation {
 	pub logits: Vec<f64>,
 	pub prefill_seconds: f64,
 	pub step_seconds: Vec<f64>,
+	/// The proposals a draft head made and a later step verified, and how many of
+	/// them the model's own id confirmed. A decode without a draft head has none.
+	pub proposed: usize,
+	pub accepted: usize,
 }
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
@@ -7024,7 +7028,16 @@ impl Recipe {
 	/// position the decode has already settled. The decode ends at a `stop` id,
 	/// after `budget` ids, or when the ids fill the model's sequence.
 	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		try_decode(path, prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		try_decode(path, None, prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// The same decode with a multi-token-prediction draft head read from `draft`,
+	/// a GGUF holding a block set and the `nextn` tensors. After each step the
+	/// head fuses the embedding of the id just produced with the model's final
+	/// hidden state and proposes the next id; the step after it accepts the
+	/// proposal when the model reaches the same id and discards it otherwise. The
+	/// ids are the model's own either way, so they are the ids `decode` produces.
+	pub fn speculate(&self, path: impl AsRef<Path>, draft: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		try_decode(path, Some(draft.as_ref()), prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP and return. A request names its prompt
 	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
@@ -7096,13 +7109,13 @@ fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Re
 		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
 	};
 	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-	try_decode(path, &prompt, &mut sampler, &stop, budget, |id| {
+	try_decode(path, None, &prompt, &mut sampler, &stop, budget, |id| {
 		let chunk = format!("{id}\n");
 		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
 	})?;
 	write(stream, b"0\r\n\r\n")
 }
-fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+fn try_decode(path: impl AsRef<Path>, draft: Option<&Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 	let path = resolve_path(path)?;
 	let device = selected_gpu()?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
@@ -7121,7 +7134,8 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 	let graph = materialize_saved_graph(stored, &samples, device, Config::load()?)?;
 	let mut tape = NativeTape::new(&graph, &samples, &[], device, stored.precision, None)?;
 	tape.inject_bn_stats(&stored.bn_stats)?;
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+	let mut draft = draft.map(|path| Draft::open(path, &graph, device)).transpose()?;
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new(), proposed: 0, accepted: 0 };
 	let mut settled = 0;
 	let mut seeded = false;
 	for step in 0..=budget {
@@ -7153,6 +7167,21 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 			break;
 		}
 		let id = sampler.sample(&generation.logits, &generation.ids);
+		if let Some(draft) = &mut draft {
+			let started = std::time::Instant::now();
+			if let Some(proposal) = draft.proposal {
+				generation.proposed += 1;
+				generation.accepted += usize::from(proposal == id);
+			}
+			let hidden = tape.activations(draft.hidden, draft.width)?;
+			draft.proposal = Some(draft.propose(&hidden, id)?);
+			// The proposal belongs to the step that reached the id it follows.
+			let seconds = started.elapsed().as_secs_f64();
+			match generation.step_seconds.last_mut() {
+				Some(step) => *step += seconds,
+				None => generation.prefill_seconds += seconds,
+			}
+		}
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
@@ -7161,6 +7190,120 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 		}
 	}
 	Ok(generation)
+}
+/// One named draft-head tensor, checked against the shape the head takes.
+fn draft_tensor(model: &Gguf, name: &str, shape: &[usize]) -> Result<Vec<f64>> {
+	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is absent")))?;
+	let declared = tensor.shape.iter().map(|value| *value as usize).collect::<Vec<_>>();
+	require(declared == shape, format!("draft head tensor {name} is {declared:?}, and the head takes {shape:?}"))?;
+	model.values(tensor)
+}
+/// A multi-token-prediction draft head: a block set read from a GGUF beside the
+/// model it drafts for. The `nextn` projection fuses the embedding of the last
+/// id with the model's final hidden state, each half under its own norm, one
+/// block runs on the fusion behind its head-side residual gate, and the shared
+/// head reads the block. The fusion is two positions of one channel, so the
+/// projection is the convolution that folds them, and each per-channel scale is
+/// the diagonal factor of the matrix beside it.
+struct Draft {
+	table: Vec<f64>,
+	enorm: Vec<f64>,
+	hnorm: Vec<f64>,
+	epsilon: f64,
+	hidden: usize,
+	width: usize,
+	tape: NativeTape,
+	proposal: Option<u32>,
+}
+impl Draft {
+	fn open(path: &Path, model: &Graph, device: &'static Gpu) -> Result<Self> {
+		// The node the output head reads is the model's final hidden state.
+		let head = model.nodes.last().ok_or_else(|| RecipeError::new("model has no nodes"))?;
+		let hidden = usize::try_from(head.source).map_err(|_| RecipeError::new("model has no hidden state before its head"))?;
+		let width = model.nodes[hidden].output.elements();
+		let model = Gguf::open(path)?;
+		let dimension = |name: &str| {
+			let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is absent")))?;
+			tensor.shape.get(1).map(|value| *value as usize).ok_or_else(|| RecipeError::new(format!("draft head tensor {name} is not a matrix")))
+		};
+		let (inner, vocabulary, ids) = (dimension("blk.0.ffn_up.weight")?, dimension("nextn.shared_head.head.weight")?, dimension("token_embd.weight")?);
+		let table = draft_tensor(&model, "token_embd.weight", &[width, ids])?;
+		let enorm = draft_tensor(&model, "nextn.enorm.weight", &[width])?;
+		let hnorm = draft_tensor(&model, "nextn.hnorm.weight", &[width])?;
+		let projection = draft_tensor(&model, "nextn.eh_proj.weight", &[2 * width, width])?;
+		let up = draft_tensor(&model, "blk.0.ffn_up.weight", &[width, inner])?;
+		let mut down = draft_tensor(&model, "blk.0.ffn_down.weight", &[inner, width])?;
+		let gate = draft_tensor(&model, "nextn.shared_head.gate.weight", &[width])?;
+		let scale = draft_tensor(&model, "nextn.shared_head.norm.weight", &[width])?;
+		let mut out = draft_tensor(&model, "nextn.shared_head.head.weight", &[width, vocabulary])?;
+		let prior = draft_tensor(&model, "nextn.shared_head.head.bias", &[vocabulary])?;
+		let mut fusion = vec![0.0; projection.len()];
+		for (index, value) in projection.iter().enumerate() {
+			let column = index % (2 * width);
+			fusion[index - column + (column % width) * 2 + column / width] = *value;
+		}
+		for (index, value) in down.iter_mut().enumerate() {
+			*value *= gate[index / inner];
+		}
+		for (index, value) in out.iter_mut().enumerate() {
+			*value *= scale[index % width];
+		}
+		let data = Prepared {
+			samples: vec![0.0; 2 * width],
+			targets: vec![0.0; vocabulary],
+			target_width: vocabulary,
+			rows: 1,
+			source_rows: 1,
+			features: 2 * width,
+			schema: DataSchema::default(),
+			sequence: Some((Shape { channels: width, length: 2 }, Shape { channels: width, length: 2 })),
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let block = recipe.model().conv(width, 2).res([layer(inner), Residual::Activation(Activation::Relu), layer(width)]).norm(layer).layer(vocabulary);
+		let mut graph = compile(&block, &data, &data.targets, 1, device, Config::load()?, false)?;
+		let slots = graph.nodes.iter().enumerate().filter(|(_, node)| node.parameters != 0).map(|(index, _)| index).collect::<Vec<_>>();
+		require(slots.len() == 4, format!("draft head compiled to {} weighted nodes, and it holds four matrices", slots.len()))?;
+		for (slot, values) in slots.iter().zip([fusion, up, down, out]) {
+			let node = &graph.nodes[*slot];
+			require(
+				node.parameters == values.len() + node.output.channels,
+				format!("draft head node {slot} takes {} values, and its tensor holds {}", node.parameters - node.output.channels, values.len()),
+			)?;
+			graph.parameters[node.offset..node.offset + values.len()].copy_from_slice(&values);
+		}
+		// The head's bias is the prior it holds over the ids it proposes.
+		let head = &graph.nodes[*slots.last().ok_or_else(|| RecipeError::new("draft head has no shared head"))?];
+		graph.parameters[head.offset + head.parameters - vocabulary..head.offset + head.parameters].copy_from_slice(&prior);
+		let tape = NativeTape::new(&graph, &data.samples, &[], device, Compute::FP64, None)?;
+		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+		Ok(Self { table, enorm, hnorm, epsilon, hidden, width, tape, proposal: None })
+	}
+	/// The id the head proposes follows `id`, given the hidden state the model
+	/// reached at it. Ties go to the lower id, as a greedy sampler resolves them.
+	fn propose(&mut self, hidden: &[f64], id: u32) -> Result<u32> {
+		require(hidden.len() == self.width, format!("draft head fuses a {}-wide hidden state, received {}", self.width, hidden.len()))?;
+		let row = checked_mul(id as usize, self.width, "draft head embedding row")?;
+		require(checked_add(row, self.width, "draft head embedding row")? <= self.table.len(), format!("draft head has no embedding for id {id}"))?;
+		let normalize = |values: &[f64], scale: &[f64]| {
+			let power = values.iter().map(|value| value * value).sum::<f64>() / values.len() as f64;
+			let inverse = 1.0 / (power + self.epsilon).sqrt();
+			values.iter().zip(scale).map(|(value, scale)| value * inverse * scale).collect::<Vec<_>>()
+		};
+		let (embedding, state) = (normalize(&self.table[row..row + self.width], &self.enorm), normalize(hidden, &self.hnorm));
+		let mut fused = vec![0.0; 2 * self.width];
+		for (channel, (embedding, state)) in embedding.iter().zip(&state).enumerate() {
+			(fused[channel * 2], fused[channel * 2 + 1]) = (*embedding, *state);
+		}
+		self.tape.write_input(&fused)?;
+		self.tape.forward(ForwardMode::Inference)?;
+		let logits = self.tape.predictions()?;
+		let proposal = logits.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then(right.0.cmp(&left.0)));
+		Ok(narrow(proposal.ok_or_else(|| RecipeError::new("draft head produced no logits"))?.0, "draft head proposal")? as u32)
+	}
 }
 impl Gguf {
 	/// Contracts `input` through the named tensor into `width` outputs. The tensor's
@@ -8283,9 +8426,18 @@ impl NativeTape {
 		}
 		Ok(stats)
 	}
+	/// The `width` values one node reached, for every row of the batch.
+	fn activations(&self, node: usize, width: usize) -> Result<Vec<f64>> {
+		let offset = *self.program.artifact.layout.values.get(node).ok_or_else(|| RecipeError::new("native model has no arena for that node"))?;
+		self.values.download_float_bytes(offset, self.capacity * width, self.precision.model)
+	}
+	/// Replaces the whole input a graph of packed values reads.
+	fn write_input(&self, values: &[f64]) -> Result<()> {
+		self.samples.write_float_bytes(0, values, self.precision.model)
+	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		let last = self.program.artifact.layout.values.len().checked_sub(1).ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let values = self.activations(last, self.output)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {

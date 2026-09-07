@@ -54,6 +54,22 @@ recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
 ```
 
 `serve` answers that many decode requests over HTTP and returns. A request names its prompt in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&top_k=40&top_p=0.95&min_p=0.05&penalty=1.1&seed=7`, and each field it leaves out keeps the sampler's default. The answer is chunked and carries one id per chunk as the decode reaches it.
+## speculate
+
+```rust
+let run = recipe.speculate("model.ogdl", "draft.gguf", &prompt, &mut sampler, &[eos], 64);
+run.proposed;
+run.accepted;
+```
+
+`speculate` decodes with a multi-token-prediction draft head read from a second
+GGUF: a block set plus the `nextn` tensors, which are a projection that fuses
+the embedding of the last id with the model's final hidden state, a norm for
+each half, a head-side residual gate, and the shared head. After each step the
+head proposes the next id and the step after it accepts the proposal when the
+model reaches the same id. The ids are the model's own either way, so they are
+the ids `decode` produces from the same prompt and sampler.
+
 ## gguf
 
 ```rust
