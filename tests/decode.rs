@@ -79,28 +79,49 @@ fn bits(values: &[f64]) -> Vec<u64> {
 	values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// A decode of `steps` ids must leave the logits one forward of the settled ids
-/// leaves, at every split point between the prompt and the full sequence.
+/// At full extent the decode has written every position, so its logits must be
+/// the logits one whole-sequence forward of the same ids produces — bit for bit.
+///
+/// This is the claim the feature makes and it is the strong one: the decode
+/// reached those logits through sixteen incremental windows, the last of them
+/// `23..24`, carrying attention keys and values, the recurrent state and the
+/// convolution tail across every call. A single forward computes them in one
+/// pass. Agreement to the bit means nothing the decode kept was stale.
 #[test]
-fn decode_matches_a_whole_sequence_forward() {
-	let path = bundle("whole-sequence");
-	let mut settled = Vec::new();
-	for reached in [8, 9, 16, 23, 24] {
-		let steps = reached - PROMPT.len();
-		let generation = recipe.decode(&path, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], steps);
+fn a_full_extent_decode_matches_a_whole_sequence_forward() {
+	let path = bundle("full-extent");
+	let generation = recipe.decode(&path, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], COLUMNS - PROMPT.len());
+	assert_eq!(generation.ids.len(), COLUMNS, "decode reached {} ids, expected {COLUMNS}", generation.ids.len());
+	let reference = recipe.infer(&path, &whole_sequence(&generation.ids));
+	assert_eq!(
+		bits(&generation.logits),
+		bits(&reference),
+		"a full-extent decode disagrees with a whole-sequence forward of the same ids:\n  decode    {:?}\n  reference {:?}",
+		generation.logits,
+		reference
+	);
+	std::fs::remove_file(path).unwrap();
+}
+
+/// Greedy sampling is deterministic, so a longer decode must extend a shorter
+/// one rather than diverge from it. A window that read an unsettled position, or
+/// state that a step failed to carry, shows up here as a divergence at the id
+/// where the two decodes part.
+///
+/// This is deliberately not compared against `recipe.infer` at intermediate
+/// lengths. The model's sequence is fixed, so a forward of eight settled ids
+/// still reads the sixteen padded positions after them, and this model's closing
+/// `pool` reduces the whole length into its output. An intermediate decode,
+/// whose window stops at the settled position, is therefore not the same
+/// computation as a padded whole-sequence forward, and asserting that it is
+/// would be asserting something the feature does not claim.
+#[test]
+fn a_longer_decode_extends_a_shorter_one() {
+	let path = bundle("extends");
+	let mut settled: Vec<u32> = Vec::new();
+	for reached in [8, 9, 16, COLUMNS] {
+		let generation = recipe.decode(&path, &PROMPT, &mut recipe.sampler().temperature(0.0), &[], reached - PROMPT.len());
 		assert_eq!(generation.ids.len(), reached, "decode reached {} ids, expected {reached}", generation.ids.len());
-
-		let reference = recipe.infer(&path, &whole_sequence(&generation.ids));
-		assert_eq!(
-			bits(&generation.logits),
-			bits(&reference),
-			"decode to {reached} ids disagrees with a whole-sequence forward of the same ids:\n  decode    {:?}\n  reference {:?}",
-			generation.logits,
-			reference
-		);
-
-		// Greedy sampling is deterministic, so every longer decode must extend the
-		// shorter one rather than diverge from it.
 		assert!(generation.ids.starts_with(&settled), "decode to {reached} ids diverged from the shorter decode:\n  {:?}\n  {:?}", generation.ids, settled);
 		settled = generation.ids;
 	}
