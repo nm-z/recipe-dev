@@ -1,0 +1,1 @@
+{"rustc":12019306335353385202,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[3982280191595656461,"build_script_build",false,15048478673844939004]],"local":[{"RerunIfChanged":{"output":"debug/build/recipe-d0123acc1f20da63/output","paths":["Cargo.toml","amd-nv-cpu.ll"]}}],"rustflags":["-C","codegen-units=12"],"config":0,"compile_kind":0}
