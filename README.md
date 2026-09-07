@@ -48,7 +48,7 @@ cli.rs          cli options
 ## blocks
 
 ```
-frozen.packed.blck.atvn.norm.quant
+frozen.packed.blck
 ```
 
 ## 18 thingys
@@ -166,7 +166,7 @@ importance quantized:
 ## observability
 
 ```rust
-.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
+.log(Run|Loss|R2|Time|Epoch|blck|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 

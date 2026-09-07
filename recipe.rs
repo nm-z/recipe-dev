@@ -5029,30 +5029,27 @@ impl Model {
 		Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
-		let has = |value| metrics.iter().any(|metric| metric.0 == value);
-		let selected = (has(5), has(6), has(7), has(9));
+		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
 		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
 		self.blocks
 			.iter()
 			.take(self.blocks.len() - output)
 			.filter_map(|block| {
 				let mut names = Vec::new();
-				if selected.0 {
-					names.push(block.operation.name().to_owned())
-				}
-				if selected.1 && block.activation != Activation::Linear {
-					names.push(block.activation.name().to_owned())
-				}
-				if selected.2 {
+				if selected {
+					names.push(block.operation.name().to_owned());
+					if block.activation != Activation::Linear {
+						names.push(block.activation.name().to_owned())
+					}
 					if let Some(name) = block.qk.map(BlockNormalization::name) {
 						names.push(format!("qk-{name}"))
 					}
 					if let Some(name) = block.normalization.map(BlockNormalization::name) {
 						names.push(name.to_owned())
 					}
-				}
-				if selected.3 && block.quantization != 0 {
-					names.push(quantization(block.quantization))
+					if block.quantization != 0 {
+						names.push(quantization(block.quantization))
+					}
 				}
 				(!names.is_empty()).then(|| names.join("."))
 			})
@@ -6378,13 +6375,14 @@ pub const Loss: Metric = Metric(1);
 pub const R2: Metric = Metric(2);
 pub const Time: Metric = Metric(3);
 pub const Epoch: Metric = Metric(4);
+/// The whole of a block: its operation, its activation, its normalization and
+/// Q/K normalization, its tokens and its quantization. One block is one thing,
+/// so selecting parts of its description separately was a distinction the
+/// caller never wanted, and it spent four names on it -- including `norm`,
+/// which a model step wants.
 pub const blck: Metric = Metric(5);
-pub const atvn: Metric = Metric(6);
-pub const norm: Metric = Metric(7);
-pub const tok: Metric = Metric(8);
-pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
-pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+pub const all: [Metric; 7] = [Run, Time, Epoch, R2, Loss, blck, tile];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -13544,7 +13542,7 @@ impl Train {
 			graph.parameters = tape.weights()?;
 			predictions.clear();
 			let mut raw_outputs = Vec::new();
-			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+			let stream = self.log_metrics.iter().any(|metric| metric.0 == blck.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
