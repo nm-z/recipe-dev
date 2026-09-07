@@ -101,6 +101,16 @@ fn cases() -> Vec<(&'static str, String, Arity, PathBuf, [&'static str; 2])> {
 	cases
 }
 
+/// The message a panic carried, so one refusing case reports itself instead of
+/// ending the walk: this suite exists to show the whole matrix, and a case that
+/// cannot even load is exactly what it is meant to surface.
+fn caught(payload: Box<dyn std::any::Any + Send>) -> String {
+	match payload.downcast::<String>() {
+		Ok(message) => *message,
+		Err(payload) => payload.downcast::<&str>().map_or_else(|_| "non-string panic".to_owned(), |message| (*message).to_owned()),
+	}
+}
+
 /// Trains, saves and reads back one fixture, answering the failure to report.
 fn run(arity: Arity, path: &Path, pair: [&'static str; 2]) -> Option<String> {
 	let source = path.to_string_lossy().into_owned();
@@ -132,8 +142,16 @@ fn every_arity_in_every_representation() {
 	let cases = cases();
 	let mut summary = String::from("\ninput-target arity coverage\n");
 	let mut failures = Vec::new();
-	for (family, base, arity, path, pair) in &cases {
-		match run(*arity, path, *pair) {
+	// A refusing case is reported with the rest rather than ending the walk.
+	let hook = std::panic::take_hook();
+	std::panic::set_hook(Box::new(|_| {}));
+	let outcomes = cases
+		.iter()
+		.map(|(_, _, arity, path, pair)| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(*arity, path, *pair))).unwrap_or_else(|payload| Some(caught(payload))))
+		.collect::<Vec<_>>();
+	std::panic::set_hook(hook);
+	for ((family, base, arity, _, _), outcome) in cases.iter().zip(outcomes) {
+		match outcome {
 			None => {
 				let _ = writeln!(summary, "  {family:<10} {base:<34} {}  ok", arity.label());
 			}
