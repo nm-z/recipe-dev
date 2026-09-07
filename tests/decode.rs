@@ -61,7 +61,11 @@ fn bundle(name: &str) -> PathBuf {
 	let directory = dataset();
 	let path = std::env::temp_dir().join(format!("recipe-decode-{}-{name}.ogdl", std::process::id()));
 	let names = (0..TARGETS).map(|target| format!("y{target}")).collect::<Vec<_>>();
-	let data = recipe.data(directory.to_str().unwrap()).target(names.as_slice());
+	// Normalized on purpose. The tape uploads the raw ids, so the tail a decode
+	// has not reached holds 0.0 while a whole-sequence forward sees the prepared
+	// padding `(0 - mean) / scale`. Without a normalizing dataset those two are
+	// the same value and the seeding this exercises would be untestable.
+	let data = recipe.data(directory.to_str().unwrap()).target(names.as_slice()).norm(z_score);
 	recipe.train().fp(32).seed(17).lr(0.01).epochs(3).stop(0.0).save(&path).run(&model(), &data);
 	path
 }
