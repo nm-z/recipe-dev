@@ -4056,21 +4056,66 @@ mod bundle {
 		}
 	}
 
-	fn residual_text(value: &Residual) -> String {
-		match value {
-			Residual::Layer(width) => format!("layer,{width}"),
-			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
-			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+	/// One backslash per nesting level, so a fragment's steps can be whole
+	/// blocks that themselves hold fragments.
+	fn escape(value: &str) -> String {
+		let mut text = String::with_capacity(value.len());
+		for character in value.chars() {
+			if matches!(character, '\\' | ';' | '|' | ',') {
+				text.push('\\')
+			}
+			text.push(character)
 		}
+		text
 	}
-	fn residual(value: &str) -> Result<Residual> {
-		let mut fields = value.split(',');
-		match fields.next().unwrap_or("") {
-			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
-			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
-			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
-			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+	fn unescape(value: &str) -> Result<String> {
+		let mut text = String::with_capacity(value.len());
+		let mut characters = value.chars();
+		while let Some(character) = characters.next() {
+			match character {
+				'\\' => text.push(characters.next().ok_or_else(|| RecipeError::new("model record ends in an escape"))?),
+				other => text.push(other),
+			}
 		}
+		Ok(text)
+	}
+	/// Splits on the delimiters this level wrote, leaving escaped ones for the
+	/// level below. Text with no escapes splits exactly as `str::split` does,
+	/// which is what keeps older records readable.
+	fn split_escaped(value: &str, delimiter: char) -> Vec<String> {
+		let (mut parts, mut current, mut escaped) = (Vec::new(), String::new(), false);
+		for character in value.chars() {
+			if escaped {
+				(current.push(character), escaped = false).1
+			} else if character == '\\' {
+				(current.push(character), escaped = true).1
+			} else if character == delimiter {
+				parts.push(std::mem::take(&mut current))
+			} else {
+				current.push(character)
+			}
+		}
+		parts.push(current);
+		parts
+	}
+	fn residual_text(value: &Block) -> String {
+		escape(&block_text(value))
+	}
+	fn residual(value: &str) -> Result<Block> {
+		let text = unescape(value)?;
+		// A fragment step used to be one of three fixed shapes carrying no
+		// fields of its own, written without a block's six. Those records still
+		// read: only the newer form holds the block separator.
+		if !text.contains('|') {
+			let mut fields = text.split(',');
+			return match fields.next().unwrap_or("") {
+				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
+				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
+				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+			};
+		}
+		block(&text)
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -4112,6 +4157,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
+			Operation::Identity => "identity".to_owned(),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4140,10 +4186,11 @@ mod bundle {
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
-			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
+			"identity" => Ok(Operation::Identity),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -4174,15 +4221,15 @@ mod bundle {
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
+		let fields = split_escaped(value, '|');
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
-			operation: operation(fields[0])?,
-			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization: normalization(Some(fields[2]), "block normalization")?,
-			qk: normalization(Some(fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(fields[3]), "block quantization")?,
-			profile: bool_value(fields[4], "block quantization profile")?,
+			operation: operation(&fields[0])?,
+			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			normalization: normalization(Some(&fields[2]), "block normalization")?,
+			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
+			quantization: value_at(Some(&fields[3]), "block quantization")?,
+			profile: bool_value(&fields[4], "block quantization profile")?,
 		})
 	}
 	fn model_text(model: &Model) -> Vec<String> {
@@ -4799,17 +4846,45 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Conv(usize, usize),
-	Activation(Activation),
+/// A step of a model, and equally a step of a fragment inside one. `res`,
+/// `moe` and the model builder all take the same thing, because a branch step
+/// is an ordinary step: it carries an operation with its activation, its
+/// normalization, its Q/K normalization, its quantization and its profile, and
+/// its operation may itself be another fragment.
+pub const fn layer(width: usize) -> Block {
+	Block::of(Operation::Layer(width))
 }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+pub const fn conv(filters: usize, kernel: usize) -> Block {
+	Block::of(Operation::Conv(filters, kernel))
 }
-pub const fn conv(filters: usize, kernel: usize) -> Residual {
-	Residual::Conv(filters, kernel)
+/// A normalization on its own, computing nothing before it.
+pub fn norm(normalization: impl NormalizationSelector) -> Block {
+	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+}
+pub fn pool(size: usize) -> Block {
+	Block::of(Operation::Pool(size))
+}
+pub fn attn(heads: usize) -> Block {
+	Block::of(Operation::Attention(heads))
+}
+pub fn rnn(width: usize) -> Block {
+	Block::of(Operation::Rnn(width))
+}
+pub fn gru(width: usize) -> Block {
+	Block::of(Operation::Gru(width))
+}
+pub fn lstm(width: usize) -> Block {
+	Block::of(Operation::Lstm(width))
+}
+pub fn perc(width: usize) -> Block {
+	Block::of(Operation::Perceptron(width))
+}
+/// A fragment as one step, so a branch nests inside a branch.
+pub fn res<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Residual(parts.into()))
+}
+pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
+	Block::of(Operation::Moe(top_k, experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -4836,9 +4911,12 @@ enum Operation {
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
-	Residual(Vec<Residual>),
-	Moe(usize, Vec<Residual>),
+	Residual(Vec<Block>),
+	Moe(usize, Vec<Block>),
 	Perceptron(usize),
+	/// Computes nothing. It carries a step that is only an activation or only
+	/// a normalization, so those need no operation of their own.
+	Identity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -4900,18 +4978,18 @@ impl NormalizationSelector for L2 {
 		BlockNormalization::L2
 	}
 }
-impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
+impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0) {
-			Residual::Layer(_) => BlockNormalization::Layer,
+		match self(0).operation {
+			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
-	Residual::Activation(Activation::$value) })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false } })+}; }
 pub mod atv {
-	use super::{Activation, Residual};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -4919,7 +4997,7 @@ pub mod atv {
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Block {
+pub struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
@@ -4927,6 +5005,40 @@ struct Block {
 	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
+}
+impl Block {
+	const fn of(operation: Operation) -> Self {
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false }
+	}
+	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
+	/// the pair `layer(8), relu()` are the same step written two ways.
+	pub fn act(mut self, activation: Activation) -> Self {
+		self.activation = activation;
+		self
+	}
+	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.normalization = Some(normalization.normalization());
+		self
+	}
+	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
+		self.qk = Some(normalization);
+		self
+	}
+	/// A step inside a fragment keeps its own storage format, exactly as a step
+	/// of the model does.
+	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
+		let format = family << 12 | variant << 8 | u16::from(bits);
+		self.quantization = format;
+		self.profile = StorageFormat(format).selection().is_some();
+		self
+	}
+	pub fn profile(mut self, profile: bool) -> Self {
+		self.profile = profile;
+		self
+	}
 }
 #[derive(Clone)]
 pub struct Model {
@@ -4975,10 +5087,10 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
-	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
+	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
@@ -6296,6 +6408,7 @@ impl Operation {
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
 		}
@@ -6358,7 +6471,7 @@ pub struct LossFunction(u8);
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
 pub struct ZScore;
-pub type Normalization = fn(usize) -> Residual;
+pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
 pub type Loss = LossFunction;
 pub const adamw: Adamw = Adamw;
@@ -6624,12 +6737,8 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
-	let convolutional = model.blocks.iter().any(|block| match &block.operation {
-		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
-		_ => false,
-	});
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch at any depth.
+	let convolutional = model.blocks.iter().any(|block| sequenced_operation(&block.operation));
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
@@ -6737,8 +6846,9 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
-		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -6994,14 +7104,9 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 	}
 	Ok((graph.source, graph.output))
 }
-fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, config: Config) -> Result<(i32, Shape)> {
+fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
-	match value {
-		Residual::Layer(width) => lower_project(graph, *width)?,
-		Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-		Residual::Activation(value) if *value != Activation::Linear => lower_activation(graph, *value, config)?,
-		Residual::Activation(_) => {}
-	}
+	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
@@ -7069,13 +7174,13 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 	reset(graph, output.ok_or_else(|| RecipeError::new("selection has no output"))?, shape);
 	Ok(())
 }
-fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Config) -> Result<()> {
+fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
 	let mut output = None;
 	for value in experts {
-		let (branch, shape) = expert(graph, source, input, value, config)?;
+		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
 		if let Some(expected) = output {
 			require(shape == expected, "moe experts must have one output shape")?;
 		}
@@ -7099,15 +7204,19 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
 }
-fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
+/// Whether an operation reads along the sequence, itself or through a branch.
+fn sequenced_operation(operation: &Operation) -> bool {
+	match operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
+		_ => false,
+	}
+}
+fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
 	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
 	let mut program = ScalarProgram(Vec::new());

@@ -67,6 +67,17 @@ blocks:
 	moe(topk, [...])
 	res([...])
 
+	A branch step is an ordinary model step, so anything above goes inside one,
+	carrying its own activation, normalization, quantization and profile, and a
+	branch nests inside a branch:
+
+	res([layer(8), relu(), layer(8)])
+	res([norm(rms), layer(8).act(Activation::Relu), layer(8).quantize(0, 8, 0)])
+	res([res([layer(8), relu(), layer(8)]), gelu()])
+	moe(1, [layer(8), res([layer(8), relu(), layer(8)])])
+
+	norm(rms)          a normalization on its own, computing nothing before it
+
 feature reduction:
 	pool(size)
 	kmeans(clusters)
