@@ -928,9 +928,10 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local
 ; from the fast boundary, where the frequency is kept, to the slow boundary,
 ; where it is divided by the extension factor; between them the two are blended.
 %yarn.on = call i1 @recipe.ogt(double %yarn.factor, double 1.0)
-%tau = call double @recipe.mul(double 6.283185307179586, double 1.0)
-%wavelength = call double @recipe.div(double %tau, double %frequency.raw)
-%rotations = call double @recipe.div(double %yarn.context, double %wavelength)
+; %yarn.context arrives already divided by two pi, so the turns a dimension
+; completes over the original context are one multiply and the kernel carries no
+; literal that a narrower precision cannot spell.
+%rotations = call double @recipe.mul(double %yarn.context, double %frequency.raw)
 %ramp.span = call double @recipe.sub(double %yarn.fast, double %yarn.slow)
 %ramp.offset = call double @recipe.sub(double %rotations, double %yarn.slow)
 %ramp.span.zero = call i1 @recipe.ogt(double 0.000000000001, double %ramp.span)

@@ -7224,8 +7224,10 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		// so the layout is carried for the record and for a future second layout
 		// rather than to switch anything here.
 		// A zero factor is no scaling, which is what a model without yarn carries.
+		// The context is divided by two pi here so the kernel needs no literal for
+		// it: a narrower precision cannot spell one and LLVM rejects it outright.
 		let (factor, context, fast, slow) = yarn.map_or((0.0, 0.0, 0.0, 0.0), |(factor, context, fast, slow)| {
-			(f64::from_bits(factor), context as f64, f64::from_bits(fast), f64::from_bits(slow))
+			(f64::from_bits(factor), context as f64 / std::f64::consts::TAU, f64::from_bits(fast), f64::from_bits(slow))
 		});
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), factor, context, fast, slow], -2)?;
 	}
