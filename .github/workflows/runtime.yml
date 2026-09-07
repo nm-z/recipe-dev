@@ -81,6 +81,7 @@ jobs:
               echo "candidate_sha must be a 40-character commit SHA" >&2
               exit 1
             fi
+            candidate_sha="${candidate_sha,,}"
             echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
             echo "candidate $candidate_sha supplied by the gateway dispatch"
             exit 0
