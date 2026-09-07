@@ -6507,8 +6507,11 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 	})
 }
 /// Blocks per device measured from the free memory of each: a block joins the
-/// current device while its resident values fit and the boundary before it cuts
-/// no connection, so the device listed last takes the tail.
+/// current device while its resident values fit that device's measured free
+/// memory, and starts the next device when they do not. Every block is checked
+/// against the device that takes it, including a device's first block and the
+/// blocks of the device listed last, so a block no remaining device can hold is
+/// reported instead of placed.
 fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
 	let mut starts = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -6520,11 +6523,17 @@ fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Resu
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
 		let resident = (resident_values(&graph.nodes[start..end]) * bytes) as u64;
-		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
+		let index = graph.nodes[start].block_index;
+		if resident > free {
+			let device = split.len();
+			require(taken != 0, format!("block {index} needs {resident} bytes but device {device} has {free} free"))?;
+			require(device + 1 < devices.len(), format!("block {index} needs {resident} bytes but device {device} has {free} free and no device is left"))?;
+			require(!cuts_connection(graph, start), format!("block {index} does not fit device {device} and the boundary before it cuts a connection"))?;
 			split.push(taken);
-			(taken, free) = (0, devices[split.len()].free_bytes()?);
+			(taken, free) = (0, devices[device + 1].free_bytes()?);
+			require(resident <= free, format!("block {index} needs {resident} bytes but device {} has {free} free", device + 1))?;
 		}
-		free = free.saturating_sub(resident);
+		free -= resident;
 		taken += 1;
 	}
 	require(taken != 0, "model has no block")?;
