@@ -14,7 +14,9 @@ use recipe::*;
 use std::path::PathBuf;
 
 const COLUMNS: usize = 24;
-const TARGETS: usize = 4;
+/// The decode samples an id from the logits, so the target count is the
+/// vocabulary and every prompt id has to fall inside it.
+const TARGETS: usize = 12;
 const PROMPT: [u32; 8] = [3, 1, 4, 1, 5, 9, 2, 6];
 
 fn model() -> Model {
@@ -58,7 +60,8 @@ fn dataset() -> PathBuf {
 fn bundle(name: &str) -> PathBuf {
 	let directory = dataset();
 	let path = std::env::temp_dir().join(format!("recipe-decode-{}-{name}.ogdl", std::process::id()));
-	let data = recipe.data(directory.to_str().unwrap()).target(["y0", "y1", "y2", "y3"]);
+	let names = (0..TARGETS).map(|target| format!("y{target}")).collect::<Vec<_>>();
+	let data = recipe.data(directory.to_str().unwrap()).target(names.as_slice());
 	recipe.train().fp(32).seed(17).lr(0.01).epochs(3).stop(0.0).save(&path).run(&model(), &data);
 	path
 }
