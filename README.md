@@ -54,6 +54,7 @@ weights:
 	dconv(kernel)
 	delta(heads, kernel)
 	attn(heads)
+	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
