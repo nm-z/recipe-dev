@@ -37,42 +37,51 @@ jobs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
     steps:
-      - name: Check out the candidate
+      - name: Check out the repository
         uses: actions/checkout@v4
         with:
-          # For pull_request this is GitHub's candidate merge commit, which is
-          # what all six cells must exercise.
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
       - name: Resolve the candidate SHA
         id: resolve
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          candidate_sha="$(git rev-parse HEAD)"
-          expected="${{ github.event.pull_request.merge_commit_sha || github.sha }}"
-          if [ "$candidate_sha" != "$expected" ]; then
-            echo "checkout $candidate_sha does not match the candidate $expected" >&2
+          if [ -z "${HEAD_SHA:-}" ]; then
+            # workflow_dispatch: there is no merge candidate, so the dispatched
+            # commit is what every cell exercises.
+            candidate_sha="$(git rev-parse HEAD)"
+            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+            echo "candidate $candidate_sha (event=${{ github.event_name }}, no merge candidate)"
+            exit 0
+          fi
+          # The merge commit in the event payload lags the head it is supposed
+          # to incorporate, so it is not used. refs/pull/N/merge is the live
+          # ref; GitHub recomputes it a moment after a push, so it is polled.
+          merged=""
+          for attempt in 1 2 3 4 5 6; do
+            git fetch --quiet --force origin "refs/pull/${PR_NUMBER}/merge:refs/candidate" || true
+            if git rev-parse --verify --quiet refs/candidate >/dev/null; then
+              parents="$(git rev-list --parents -n 1 refs/candidate)"
+              case " $parents " in
+                *" $HEAD_SHA "*) merged="yes"; break ;;
+              esac
+            fi
+            echo "attempt $attempt: the merge ref does not yet incorporate $HEAD_SHA"
+            sleep 10
+          done
+          if [ -z "$merged" ]; then
+            # Fail closed: a candidate without the current head would let all
+            # six cells agree on stale code.
+            echo "refs/pull/${PR_NUMBER}/merge never incorporated head $HEAD_SHA" >&2
             exit 1
           fi
-          # GitHub's merge_commit_sha can lag the head it is supposed to
-          # incorporate. A candidate that does not contain the current head
-          # would let every cell agree on stale code, so it fails closed here
-          # and the event that advanced the PR supersedes this run.
-          head_sha="${{ github.event.pull_request.head.sha }}"
-          if [ -n "$head_sha" ]; then
-            parents="$(git rev-list --parents -n 1 HEAD)"
-            case " $parents " in
-              *" $head_sha "*) echo "candidate merges head $head_sha" ;;
-              *)
-                echo "candidate $candidate_sha does not merge the current head $head_sha" >&2
-                echo "parents: $parents" >&2
-                exit 1
-                ;;
-            esac
-          fi
+          git checkout --quiet --detach refs/candidate
+          candidate_sha="$(git rev-parse HEAD)"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-          echo "candidate $candidate_sha (event=${{ github.event_name }})"
+          echo "candidate $candidate_sha merges head $HEAD_SHA (event=${{ github.event_name }})"
 
       - name: Build the immutable source snapshot
         id: snapshot
@@ -767,9 +776,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out the aggregate
+        # The default ref is enough: the aggregate only needs its own source,
+        # and it judges the cells against the candidate SHA the candidate job
+        # resolved, never against whatever this checkout happens to be.
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
           persist-credentials: false
 
       - name: Compile the aggregate
