@@ -4,7 +4,7 @@
 //! with `rustc` directly so that the aggregate cannot be affected by a failure
 //! in the crate it is judging.
 //!
-//! Run it as `gate <evidence-directory> <results-json> <candidate-sha> <run-id> <run-attempt>`.
+//! Run it as `gate <evidence-directory> <results-json> <candidate-sha> <snapshot-sha256> <run-id> <run-attempt>`.
 //! `--self-check` instead runs the decision table below, which covers every
 //! state the gate must reject.
 use std::collections::BTreeMap;
@@ -26,6 +26,7 @@ enum Verdict {
 struct Evidence {
 	cell: String,
 	commit: String,
+	snapshot_sha256: String,
 	run_id: String,
 	run_attempt: String,
 	backend: String,
@@ -68,6 +69,7 @@ fn parse_evidence(cell_document: &str, suite_document: &str) -> Result<Evidence,
 	Ok(Evidence {
 		cell: field(cell_document, "cell").ok_or_else(|| missing("cell"))?,
 		commit: field(cell_document, "commit").ok_or_else(|| missing("commit"))?,
+		snapshot_sha256: field(cell_document, "snapshot_sha256").ok_or_else(|| missing("snapshot_sha256"))?,
 		run_id: field(cell_document, "run_id").ok_or_else(|| missing("run_id"))?,
 		run_attempt: field(cell_document, "run_attempt").ok_or_else(|| missing("run_attempt"))?,
 		backend: field(cell_document, "backend").ok_or_else(|| missing("backend"))?,
@@ -79,7 +81,7 @@ fn parse_evidence(cell_document: &str, suite_document: &str) -> Result<Evidence,
 }
 
 /// The whole decision. Every rejected state returns `Verdict::Fail`.
-fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result<Evidence, String>>, candidate_sha: &str, run_id: &str, run_attempt: &str) -> Verdict {
+fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result<Evidence, String>>, candidate_sha: &str, snapshot_sha256: &str, run_id: &str, run_attempt: &str) -> Verdict {
 	let mut problems = Vec::new();
 	for cell in EXPECTED {
 		let Some(result) = results.get(cell) else {
@@ -108,6 +110,9 @@ fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result
 		}
 		if found.commit != candidate_sha {
 			problems.push(format!("{cell}: evidence commit {} is not the candidate {candidate_sha}", found.commit));
+		}
+		if found.snapshot_sha256 != snapshot_sha256 {
+			problems.push(format!("{cell}: evidence snapshot {} is not the dispatched archive {snapshot_sha256}", found.snapshot_sha256));
 		}
 		if found.run_id != run_id || found.run_attempt != run_attempt {
 			problems.push(format!("{cell}: evidence is from run {}/{} not {run_id}/{run_attempt}", found.run_id, found.run_attempt));
@@ -152,8 +157,8 @@ fn main() {
 		self_check();
 		return;
 	}
-	let [directory, results_path, candidate_sha, run_id, run_attempt] = <[String; 5]>::try_from(arguments).unwrap_or_else(|_| {
-		eprintln!("usage: gate <evidence-directory> <results-json> <candidate-sha> <run-id> <run-attempt>");
+	let [directory, results_path, candidate_sha, snapshot_sha256, run_id, run_attempt] = <[String; 6]>::try_from(arguments).unwrap_or_else(|_| {
+		eprintln!("usage: gate <evidence-directory> <results-json> <candidate-sha> <snapshot-sha256> <run-id> <run-attempt>");
 		std::process::exit(2)
 	});
 	let results_document = std::fs::read_to_string(&results_path).unwrap_or_else(|error| panic!("cannot read {results_path}: {error}"));
@@ -176,7 +181,7 @@ fn main() {
 			}
 		}
 	}
-	println!("gate candidate={candidate_sha} run={run_id}/{run_attempt}");
+	println!("gate candidate={candidate_sha} snapshot={snapshot_sha256} run={run_id}/{run_attempt}");
 	for cell in EXPECTED {
 		let summary = match evidence.get(cell) {
 			Some(Ok(found)) => format!("commit={} executed={} failed={} backend={} device={}", found.commit, found.executed, found.failed, found.backend, found.device),
@@ -185,7 +190,7 @@ fn main() {
 		};
 		println!("  {cell}: result={} evidence={summary}", results.get(cell).map_or("<missing>", String::as_str));
 	}
-	match decide(&results, &evidence, &candidate_sha, &run_id, &run_attempt) {
+	match decide(&results, &evidence, &candidate_sha, &snapshot_sha256, &run_id, &run_attempt) {
 		Verdict::Pass => println!("GATE PASS: all {} cells succeeded for {candidate_sha}", EXPECTED.len()),
 		Verdict::Fail(reason) => {
 			eprintln!("GATE FAIL: {reason}");
@@ -203,6 +208,7 @@ fn sample(cell: &str, gpu: bool) -> Evidence {
 	Evidence {
 		cell: cell.to_owned(),
 		commit: "cafe1234".to_owned(),
+		snapshot_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
 		run_id: "42".to_owned(),
 		run_attempt: "1".to_owned(),
 		backend: if gpu { "nvidia".to_owned() } else { "cpu".to_owned() },
@@ -259,6 +265,11 @@ fn self_check() {
 			found.commit = "deadbeef".to_owned();
 			evidence.insert("recipe/linux-cpu".to_owned(), Ok(found));
 		}), false),
+		("evidence is for another archive", Box::new(|_: &mut _, evidence: &mut BTreeMap<String, Result<Evidence, String>>| {
+			let mut found = sample("recipe/linux-cpu", false);
+			found.snapshot_sha256 = "deadbeef".to_owned();
+			evidence.insert("recipe/linux-cpu".to_owned(), Ok(found));
+		}), false),
 		("evidence is from another run", Box::new(|_: &mut _, evidence: &mut BTreeMap<String, Result<Evidence, String>>| {
 			let mut found = sample("recipe/linux-cpu", false);
 			found.run_id = "41".to_owned();
@@ -301,7 +312,7 @@ fn self_check() {
 	for (name, mutate, expected_pass) in cases {
 		let (mut results, mut evidence) = healthy();
 		mutate(&mut results, &mut evidence);
-		let verdict = decide(&results, &evidence, "cafe1234", "42", "1");
+		let verdict = decide(&results, &evidence, "cafe1234", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "42", "1");
 		let passed = verdict == Verdict::Pass;
 		let outcome = match &verdict {
 			Verdict::Pass => "pass".to_owned(),
