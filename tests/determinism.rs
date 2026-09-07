@@ -16,12 +16,9 @@ use recipe::*;
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-// The libtest harness captures the print macros on passing tests, so write reports straight to the inherited stderr descriptor.
+// The libtest harness captures the print macros on passing tests, so write reports straight to the inherited stderr handle.
 fn report(text: String) {
-	use std::os::fd::FromRawFd;
-	let mut stderr = unsafe { std::fs::File::from_raw_fd(2) };
-	let _ = stderr.write_all(text.as_bytes());
-	std::mem::forget(stderr);
+	let _ = std::io::stderr().lock().write_all(text.as_bytes());
 }
 
 /// Rows and columns are prime-adjacent on purpose: they force partial M, N, and
@@ -81,6 +78,8 @@ const CASES: &[Case] = &[
 	Case { name: "transcendental-sigmoid", shape: "sigmoid", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "transcendental-fp64", shape: "tanh", precision: "fp64", rows: 131, columns: 17 },
 	Case { name: "normalization", shape: "norm", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "normalization-rms", shape: "rms", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "normalization-l2", shape: "l2", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "convolution", shape: "conv", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "residual", shape: "residual", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "residual-bf16", shape: "residual", precision: "bf16", rows: 131, columns: 17 },
@@ -88,11 +87,15 @@ const CASES: &[Case] = &[
 	Case { name: "deep-int1", shape: "deep", precision: "int1", rows: 131, columns: 17 },
 	Case { name: "deep-custom-float", shape: "deep", precision: "f6.9", rows: 131, columns: 17 },
 	Case { name: "attention", shape: "attention", precision: "fp32", rows: 131, columns: 18 },
+	Case { name: "attention-qk-rms", shape: "attention-qk-rms", precision: "fp32", rows: 131, columns: 18 },
+	Case { name: "attention-qk-l2", shape: "attention-qk-l2", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "scan-gru", shape: "gru", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "scan-lstm", shape: "lstm", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "pool", shape: "pool", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "moe", shape: "moe", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "moe-top2", shape: "moe-top2", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "route", shape: "route", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "route-top2", shape: "route-top2", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "persistence", shape: "deep", precision: "fp32", rows: 131, columns: 17 },
 ];
 
@@ -106,14 +109,22 @@ fn build(case: &Case) -> Model {
 		"silu" => recipe.model().layer(9).silu().layer(5).silu().layer(1).loss(mse),
 		"sigmoid" => recipe.model().layer(9).sigmoid().layer(5).sigmoid().layer(1).loss(mse),
 		"norm" => recipe.model().layer(9).relu().norm(batch).layer(5).relu().layer(1).loss(mse),
+		"rms" => recipe.model().layer(9).relu().norm(rms).layer(5).relu().layer(1).loss(mse),
+		"l2" => recipe.model().layer(9).relu().norm(l2).layer(5).relu().layer(1).loss(mse),
 		"conv" => recipe.model().conv(3, 3).relu().conv(2, 1).relu().layer(1).loss(mse),
 		"residual" => recipe.model().layer(9).relu().res([layer(9), layer(9)]).relu().layer(1).loss(mse),
 		"attention" => recipe.model().attn(2).relu().layer(1).loss(mse),
+		"attention-qk-rms" => recipe.model().pool(1).layer(4).attn(2).qk(rms).relu().layer(1).loss(mse),
+		"attention-qk-l2" => recipe.model().pool(1).layer(4).attn(2).qk(l2).relu().layer(1).loss(mse),
 		"gru" => recipe.model().gru(6).relu().layer(1).loss(mse),
 		"lstm" => recipe.model().lstm(6).relu().layer(1).loss(mse),
 		"pool" => recipe.model().conv(4, 3).relu().pool(2).relu().layer(1).loss(mse),
-		"moe" => recipe.model().layer(9).relu().moe(2, 1, 9, Activation::Silu, Scoring::Softmax, true, false).relu().layer(1).loss(mse),
-		"moe-top2" => recipe.model().layer(9).relu().moe(3, 2, 9, Activation::Gelu, Scoring::Sigmoid, false, true).relu().layer(1).loss(mse),
+		// The composed form evaluates every expert and masks the rest away; the
+		// routed form runs only the experts it keeps. Both stay covered.
+		"moe" => recipe.model().layer(9).relu().moe(1, [layer(9), relu(), layer(9)]).relu().layer(1).loss(mse),
+		"moe-top2" => recipe.model().layer(9).relu().moe(2, [layer(9), relu(), layer(9), gelu()]).relu().layer(1).loss(mse),
+		"route" => recipe.model().layer(9).relu().route(2, 1, 9, Activation::Silu, Scoring::Softmax, true, false).relu().layer(1).loss(mse),
+		"route-top2" => recipe.model().layer(9).relu().route(3, 2, 9, Activation::Gelu, Scoring::Sigmoid, false, true).relu().layer(1).loss(mse),
 		other => panic!("unknown topology {other:?}"),
 	}
 }

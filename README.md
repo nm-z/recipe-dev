@@ -58,7 +58,8 @@ weights:
 	lstm(hidden)
 
 blocks:
-	moe(experts, topk, hidden, activation, scoring, renormalize, shared)
+	moe(topk, [...])
+	route(experts, topk, hidden, activation, scoring, renormalize, shared)
 	res([...])
 
 feature reduction:
@@ -78,13 +79,31 @@ estimators:
 ```
 Feature generation is banned.
 
-`moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
+`moe` composes its own experts, each written like a `res` branch. Every expert is evaluated and the scores outside the `topk` highest are masked away, so a position costs every expert. It is the reference the routed form is measured against, and the form a model saved with composed experts still loads as.
+
+`route` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is what `moe` computes. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
 
 ## 15 activations
 
 ```
 relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
+```
+
+## 4 normalizations
+
+```rust
+.norm(batch)   per-channel statistics over the batch
+.norm(layer)   per-row statistics over the channels
+.norm(rms)     per-row root mean square, one trainable scale per channel
+.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
+```
+
+`.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
+over its head-width slice, leaving the values untouched:
+
+```rust
+.attn(4).qk(rms)
 ```
 
 ## compute precisions

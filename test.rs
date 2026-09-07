@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DATA_MODES: usize = 4;
 const AUTOREGRESSIVE_DATA_MODES: usize = 4;
-const MODEL_OPERATIONS: usize = 22;
+const MODEL_OPERATIONS: usize = 23;
 const ACTIVATIONS: usize = 16;
 const NORMALIZATIONS: usize = 2;
 const QUANTIZATIONS: &[(u16, u8, u16)] = &[
@@ -231,8 +231,12 @@ fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 		17 => (model.layer(8).res([layer(8), layer(8)]), ".layer(8)|.res([layer(8), layer(8)])"),
 		18 => (model.layer(8).res([conv(8, 1), conv(8, 1)]), ".layer(8)|.res([conv(8, 1), conv(8, 1)])"),
 		19 => (model.layer(8).res([conv(8, 1), relu(), layer(8)]), ".layer(8)|.res([conv(8, 1), relu(), layer(8)])"),
-		20 => (model.layer(8).moe(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true), ".layer(8)|.moe(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true)"),
+		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8)|.moe(1, [layer(8), layer(8)])"),
 		21 => (model.perc(8), ".perc(8)"),
+		22 => (
+			model.layer(8).route(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true),
+			".layer(8)|.route(2, 1, 8, Activation::Silu, Scoring::Softmax, true, true)",
+		),
 		_ => unreachable!(),
 	}
 }
