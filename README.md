@@ -61,33 +61,9 @@ the order the node's planes are laid out: a whole tensor, one expert of a
 `[k, n, experts]` tensor (`expert`), or a run of output rows (`rows`). A
 contraction whose views hold exactly its matrix lowers and runs without a bias
 row; one whose views hold the matrix plus one output row binds that row as its
-bias; any other count, a view that cuts a block, or block-quantized views of
-different layouts in one node are rejected before anything runs, naming the
-tensor, the node and both counts. A node with any F32 or F16 view, such as a
-bias row behind a quantized matrix, decodes every view into its values.
-`contract` and `expert` are the one-node plans of `infer`.
-
-```rust
-let bound = recipe.gguf("model-00001-of-00004.gguf").model();
-bound.blocks(); bound.tensors(); bound.vocabulary();
-let logits = bound.infer(&ids);
-```
-
-`model` builds the whole model the file describes. `general.architecture`
-selects a row of the architecture table (`llama`, `qwen2`, `qwen3`, `qwen2moe`,
-`qwen3moe`, `qwen35`, `qwen3next`, `qwen4exp`); the `<architecture>.*` namespace
-sizes every block (`block_count`, `embedding_length`, `attention.*`, `rope.*`,
-`feed_forward_length`, `expert_*`, `ssm.*`, `full_attention_interval`,
-`hyper_connection.*`); and every parameterized node binds by the standard tensor
-names: `token_embd`, `blk.<n>.attn_*`, `ssm_*`, `ffn_*`, `hc_*`, `output_norm`
-and `output` (tied to the embedding when absent). Each block is an attention or
-delta block and its feed-forward, each on the residual stream behind its
-pre-normalization, or inside the hyper-connection mixer the file declares. A
-row adds only what the names leave implicit, such as which channels the rotary
-embedding pairs. A tensor no node reads, a node no tensor fills, a shape that
-does not match the block, or a tensor the file lacks is an error before any
-device is touched, naming the tensor and the node. `infer` runs one forward
-over token ids and returns `vocabulary` rows of one logit per position.
+bias; any other count, a view that cuts a block, or views of different layouts
+in one node are rejected before anything runs, naming the tensor, the node
+and both counts. `contract` and `expert` are the one-node plans of `infer`.
 
 ## tokenizer
 
@@ -198,7 +174,7 @@ cli.rs          cli options
 test.rs         combo testing
 ```
 
-## 20 thingys:
+## 19 thingys:
 ```rust
 weights:
 	layer(neurons)
@@ -214,7 +190,6 @@ weights:
 	lstm(hidden)
 
 blocks:
-	glu(hidden, activation)
 	moe(experts, topk, hidden, activation, scoring, renormalize, shared)
 	res([...])
 	hyper(lanes, rank, &model)
@@ -236,7 +211,7 @@ estimators:
 ```
 Feature generation is banned.
 
-`embed` must be the first block and must carry a storage layout. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather reads block-quantized rows in the file's layout, or raw F32/F16 rows through their native decoder; a block-quantized width must be a whole number of that layout's blocks. The table stays in its mapped storage and no optimizer step writes it back.
+`embed` must be the first block and must carry a quantization. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather decodes each addressed row out of the packed table, so `width` must be a whole number of the layout's blocks and the run reads one packed row per token instead of the table. The table keeps the values it was quantized from and no optimizer step writes it back.
 
 `hyper` widens the residual stream to `lanes` copies of the width. Each block normalizes the stream with per-lane `rms` statistics under one trainable scale over the whole stream, reads the normalized lanes into a Recipe submodel as their mean under a read gate, writes the submodel output back through one write gate per lane, and the head reads the stream once more before the output projection. The read gate is `sigmoid(up(silu(down(xn) / lanes)))` through a `rank` bottleneck, the write gate is `2 sigmoid(inject(xn) / lanes)`, and no projection carries a bias, so the mixer holds `stream + 2 stream rank + stream lanes` parameters per block and `stream + 2 stream rank` at the head. `rank` zero adds no node and fixes every gate at one: the read is the mean of the raw lanes, which for one lane is the plain residual.
 
@@ -244,15 +219,13 @@ Feature generation is banned.
 
 `ple(&table)` is a per-layer embedding block over the hashed row table a GGUF describes; see the ngram section.
 
-`delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key, and value stream, applies `dconv(kernel)` followed by its configured activation, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k (g S))`, reading `o = q S / sqrt(key_width)`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, its configured gate activation from a third projection, and a fourth projection back to the input width. Hand-built delta models retain the historical linear convolution and sigmoid gate defaults; the GGUF builder selects SiLU/SiLU for Qwen3.5 and Qwen3-Next, and SiLU/sigmoid for Qwen4. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
+`delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
 
 `.keys(heads, width)`, `.values(width)` and `.out(width)` name the extents instead of taking them from the stream. `heads` remains the value head count; each key head serves `heads / keys` of them, the carried state per value head is `key width` by `value width`, and the closing projection ends at `out`. Without them the value width is the stream over `heads`, the keys match the values one for one, and `out` is the stream.
 
 ```rust
 .delta(48, 4).keys(16, 128).values(128).out(2560)
 ```
-
-`glu(hidden, activation)` is one gated feed-forward, `down(activation(gate(x)) * up(x))`, through `hidden` and back to the block input width.
 
 `moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position under its own gate: a `[width]` projection of the position with no bias, through a sigmoid, is the routing weight its output joins the sum under, so the block holds, trains and binds a per-position shared-expert gate. A bound `moe` takes its tensors in that order: the router, the gate, up and down tables, then the shared gate vector and the shared gate, up and down tables.
 
@@ -293,10 +266,6 @@ prelu cos   exp      log    ln     huber  tan
 .norm(rms)     per-row root mean square, one trainable scale per channel
 .norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
 ```
-
-A normalization that leads a model normalizes the model input before its first
-block, so `hyper(1, 0, &recipe.model().norm(rms).attn(8))` is a residual branch
-behind its pre-normalization.
 
 `.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
 over its head-width slice, leaving the values untouched:

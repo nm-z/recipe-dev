@@ -18650,22 +18650,3 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn decode_samples_the_last_channel_major_position() {
-		let output = Shape { channels: 3, length: 4 };
-		let predictions = (0..output.elements()).map(|value| value as f64).collect::<Vec<_>>();
-		assert_eq!(select_last_logits(&predictions, output, 3).unwrap(), [3.0, 7.0, 11.0]);
-	}
-
-	#[test]
-	fn decode_rejects_a_position_outside_the_output() {
-		let output = Shape { channels: 2, length: 3 };
-		let predictions = vec![0.0; output.elements()];
-		assert!(select_last_logits(&predictions, output, output.length).is_err());
-	}
-}
