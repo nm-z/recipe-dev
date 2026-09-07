@@ -541,11 +541,13 @@ jobs:
           $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
           $recipe = Join-Path $candidate "target\release\recipe.exe"
           $source = Join-Path $candidate ".github\windows-native\lifecycle.rs"
+          Push-Location $candidate
           foreach ($phase in @("train", "resume", "infer")) {
             $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = $phase
             & $recipe $source
             if ($LASTEXITCODE -ne 0) { throw "lifecycle phase $phase failed with exit code $LASTEXITCODE" }
           }
+          Pop-Location
           if (![IO.File]::Exists($env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE)) { throw "the lifecycle did not save a bundle" }
           "lifecycle train/resume/infer completed"
 
