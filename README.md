@@ -108,7 +108,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	dconv(kernel)
+	dconv(kernel)[.dilate(steps)]
 	delta(heads, kernel)
 	delta((heads, d_k, d_v), kernel)
 	attn(heads)
@@ -139,7 +139,7 @@ estimators:
 ```
 Feature generation is banned.
 
-`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`. `.dilate(steps)` spaces those taps `steps` positions apart, so the same `kernel` taps reach `(kernel - 1) * steps` positions back and position `t` sees `t - (kernel - 1) * steps, ..., t - steps, t`. A dilation of one is the plain form and emits the same tap sequence. The reach is the history the node carries: a decode step reads it out of the source arena, which already holds every settled position, so a dilated convolution steps exactly as a contiguous one does.
 
 `delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `d_k` by `d_v` state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
 `delta(heads, kernel)` derives both extents as `channels / heads`, which is a

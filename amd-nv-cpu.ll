@@ -906,22 +906,22 @@ store i64 %maximum.index.wide, ptr addrspace(1) %context.ptr, align 8 ret void }
 ; Causal depthwise convolution. Output element %p of a [rows][channels][length]
 ; batch sums the last %kernel positions of its own channel, tap j reading
 ; position t + j + 1 - kernel, with positions before the start reading zero.
-define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %kernel ) #1 { entry:
+define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation ) #1 { entry:
 %narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %base = add i32 %row.base, %channel.base %tap.base = mul i32 %channel, %kernel
-%reach = sub i32 %kernel, 1 br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
-%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = add i32 %position, %tap %source = sub i32 %ahead, %reach
+%span = sub i32 %kernel, 1 %reach = mul i32 %span, %dilation br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %lag = mul i32 %tap, %dilation %ahead = add i32 %position, %lag %source = sub i32 %ahead, %reach
 %valid = icmp sge i32 %source, 0 %source.clamped = select i1 %valid, i32 %source, i32 0 %index = add i32 %base, %source.clamped
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index %loaded = load double, ptr addrspace(1) %input.ptr, align 8 %value = select i1 %valid, double %loaded, double 0.0
 %tap.index = add i32 %tap.base, %tap %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %tap.index %weight = load double, ptr addrspace(1) %weight.ptr, align 8
 %product = call double @recipe.mul(double %weight, double %value) %sum.next = call double @recipe.add(double %sum, double %product) %tap.next = add i32 %tap, 1 br label %loop
 done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
-; Input element %p receives tap j times the adjoint at position t + kernel - 1 - j while that position exists.
-define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %kernel ) #1 { entry:
+; Input element %p receives tap j times the adjoint at position t + (kernel - 1 - j) * dilation while that position exists.
+define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i32 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation ) #1 { entry:
 %narrow = mul i32 %channels, %length %row = udiv i32 %p, %narrow %within = urem i32 %p, %narrow %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %row.base = mul i32 %row, %narrow %channel.base = mul i32 %channel, %length %base = add i32 %row.base, %channel.base %tap.base = mul i32 %channel, %kernel
-%reach = sub i32 %kernel, 1 br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
-%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = add i32 %position, %reach %target = sub i32 %ahead, %tap
+%span = sub i32 %kernel, 1 %reach = mul i32 %span, %dilation br label %loop loop: %tap = phi i32 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+%more = icmp ult i32 %tap, %kernel br i1 %more, label %step, label %done step: %ahead = add i32 %position, %reach %lag = mul i32 %tap, %dilation %target = sub i32 %ahead, %lag
 %valid = icmp ult i32 %target, %length %target.clamped = select i1 %valid, i32 %target, i32 0 %index = add i32 %base, %target.clamped
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index %loaded = load double, ptr addrspace(1) %delta.ptr, align 8 %value = select i1 %valid, double %loaded, double 0.0
 %tap.index = add i32 %tap.base, %tap %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %tap.index %weight = load double, ptr addrspace(1) %weight.ptr, align 8
@@ -929,8 +929,8 @@ define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr a
 done: %adjoint.ptr = getelementptr inbounds double, ptr addrspace(1) %adjoint, i32 %p %prior = load double, ptr addrspace(1) %adjoint.ptr, align 8
 %total = call double @recipe.add(double %prior, double %sum) store double %total, ptr addrspace(1) %adjoint.ptr, align 8 ret void }
 ; Tap %p (channel * kernel + j) sums input * adjoint over every row and position in order and writes its gradient.
-define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %channels, i32 %length, i32 %kernel, i32 %offset ) #1 { entry:
-%channel = udiv i32 %p, %kernel %tap = urem i32 %p, %kernel %narrow = mul i32 %channels, %length %channel.base = mul i32 %channel, %length %reach = sub i32 %kernel, 1 %shift = sub i32 %reach, %tap
+define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %channels, i32 %length, i32 %kernel, i32 %dilation, i32 %offset ) #1 { entry:
+%channel = udiv i32 %p, %kernel %tap = urem i32 %p, %kernel %narrow = mul i32 %channels, %length %channel.base = mul i32 %channel, %length %span = sub i32 %kernel, 1 %reach = mul i32 %span, %dilation %lag = mul i32 %tap, %dilation %shift = sub i32 %reach, %lag
 %count = mul i32 %rows, %length br label %loop loop: %step.index = phi i32 [ 0, %entry ], [ %step.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
 %more = icmp ult i32 %step.index, %count br i1 %more, label %step, label %done step: %row = udiv i32 %step.index, %length %position = urem i32 %step.index, %length
 %valid = icmp uge i32 %position, %shift %source = sub i32 %position, %shift %source.clamped = select i1 %valid, i32 %source, i32 0

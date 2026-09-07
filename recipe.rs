@@ -2516,14 +2516,15 @@ impl NativeModelIr {
 				(false, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							weights = pointers.weights,
 							value = pointers.value,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -2688,27 +2689,29 @@ impl NativeModelIr {
 				(true, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
 						));
 					})?;
 					ir.push_str(barrier(backend));
 					let weights_loop = flat_loop(node.parameters);
 					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, weights_loop.0, &weights_loop.1, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {offset} )\n",
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							delta = pointers.delta,
 							channels = node.output.channels,
 							length = node.output.length,
 							kernel = node.argument[0],
+							dilation = node.argument[1],
 							offset = node.offset
 						));
 					})?;
@@ -4816,7 +4819,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
-			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
+			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(heads, state, kernel) => {
 				// The extents are written only when they were declared, so a block
 				// that took the square default serializes to the text it always did.
@@ -4857,7 +4860,12 @@ mod bundle {
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
-			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
+			// A bundle written before the taps could sit apart names no dilation, so an
+			// absent field reads as the plain form of one position per tap.
+			"dconv" => Ok(Operation::Dconv(
+				value_at(fields.next(), "depthwise convolution kernel")?,
+				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
+			)),
 			"delta" => {
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				// A record written before the extents could be declared has two fields
@@ -5564,7 +5572,7 @@ enum Operation {
 	Residual(Vec<Residual>),
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
-	Dconv(usize),
+	Dconv(usize, usize),
 	Delta(usize, Option<(usize, usize)>, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5718,7 +5726,22 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
-	fn dconv(kernel: usize) = Operation::Dconv(kernel); }
+	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1); }
+	/// Spaces the taps of the preceding `dconv` `steps` positions apart, so its
+	/// `kernel` taps reach `(kernel - 1) * steps` positions back instead of
+	/// `kernel - 1`. A dilation of one is the plain form.
+	pub fn dilate(&self, steps: usize) -> Self {
+		if steps == 0 {
+			panic!("depthwise convolution dilation must be positive");
+		}
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("dilate requires a preceding dconv block"));
+		match &mut block.operation {
+			Operation::Dconv(_, dilation) => *dilation = steps,
+			_ => panic!("dilate requires a preceding dconv block"),
+		}
+		model
+	}
 	/// A gated delta rule of `heads` heads over a causal depthwise convolution of
 	/// `kernel` positions. `heads` alone carries the square per-head state the
 	/// residual width divides into; `(heads, d_k, d_v)` states the two extents, so
@@ -7086,7 +7109,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
-			Self::Dconv(_) => "dconv",
+			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 		}
 	}
@@ -7853,7 +7876,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
+		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(heads, state, kernel) => lower_delta(graph, *heads, *state, *kernel, config)?,
 		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
@@ -8067,9 +8090,14 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 }
 /// A causal depthwise convolution keeps the shape: every channel mixes its own
 /// last `kernel` positions with one tap each, left-padded with zeros.
-fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
+fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> {
 	require(kernel != 0, "depthwise convolution kernel must be positive")?;
-	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
+	require(dilation != 0, "depthwise convolution dilation must be positive")?;
+	// The taps sit `dilation` positions apart, so the node reads
+	// `(kernel - 1) * dilation` positions behind the window it writes.
+	let reach = checked_mul(kernel - 1, dilation, "depthwise reach")?;
+	require(reach < graph.output.length, "depthwise convolution reach exceeds the sequence")?;
+	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, dilation as f64), -2)
 }
 /// A gated delta rule carries one `keys` by `values` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
@@ -8103,7 +8131,7 @@ fn lower_delta(graph: &mut Graph, heads: usize, state: Option<(usize, usize)>, k
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, projection)?;
-	lower_dconv(graph, kernel)?;
+	lower_dconv(graph, kernel, 1)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, keys, checked_mul(2, key_plane, "delta query and key span")?)?;
@@ -9296,6 +9324,52 @@ fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize,
 	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
 	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
 }
+/// Positions of its source a node reads behind the window it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum History {
+	/// The node reads only the positions it writes.
+	None,
+	/// The node reads that many positions before the window.
+	Positions(usize),
+	/// The node reads every position the sequence has settled.
+	Sequence,
+}
+/// What one node carries across the positions of a sequence: the positions of
+/// its source a step reads behind the window it writes, and the values it keeps
+/// in its own context for the whole sequence. Every arena a decode step reads is
+/// named here rather than inferred from what the emitters happen to allocate, so
+/// the step and the context allocation read one description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carried {
+	history: History,
+	values: usize,
+}
+impl Carried {
+	const NONE: Self = Self { history: History::None, values: 0 };
+	const fn history(history: History) -> Self {
+		Self { history, values: 0 }
+	}
+}
+/// What a node carries. A convolution reaches `(kernel - 1) * dilation`
+/// positions back, a depthwise convolution the same over its own taps, attention
+/// and its indexer read every settled position, a scan and a delta rule carry
+/// their state forward one position at a time, a pool reads the positions its
+/// window rounds over, and a batch normalization keeps the statistics it saved.
+fn carried_state(node: &Node) -> Result<Carried> {
+	let carried = match node.op {
+		Primitive::Contraction if node.argument[0] > 1.0 => Carried::history(History::Positions(integer_argument(node.argument[0], "convolution kernel")? as usize - 1)),
+		Primitive::Dconv => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
+			Carried::history(History::Positions(checked_mul(kernel - 1, dilation, "depthwise reach")?))
+		}
+		Primitive::Attention | Primitive::Scan | Primitive::Delta => Carried::history(History::Sequence),
+		Primitive::Pool => Carried::history(History::Positions(integer_argument(node.argument[0], "pool size")?.max(1) as usize - 1)),
+		// The saved mean and variance a batch normalization carries into inference.
+		Primitive::Normalize if node.argument[0] == 0.0 => Carried { history: History::None, values: checked_mul(2, node.output.channels, "saved statistics")? },
+		_ => Carried::NONE,
+	};
+	Ok(carried)
+}
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
 	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
 		return Ok(bytes);
@@ -9327,6 +9401,9 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// A node that only reaches back into its source keeps nothing of its own:
+		// the source arena already holds every position it reads.
+		Primitive::Dconv => carried_state(node)?.values,
 		// Four statistic planes over the group count the emitted kernel walks:
 		// batch and evaluation groups are channels; layer, RMS, and L2 groups
 		// are row positions, multiplied by their normalized head count.
