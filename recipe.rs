@@ -4307,21 +4307,17 @@ mod gguf {
 				let (_, block, stride, _) = layout(kind)?;
 				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
 				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
-				// The block product is bounded rather than wrapped: a wrapped extent
-				// lands back inside the mapping and the range check below accepts it,
-				// so a tensor claiming more bytes than the address space holds would
-				// be read as a short, and possibly empty, one.
-				let bytes = (elements / block as u64)
-					.checked_mul(stride as u64)
+				let bytes = elements
+					.checked_div(block as u64)
+					.and_then(|blocks| blocks.checked_mul(stride as u64))
 					.and_then(|bytes| usize::try_from(bytes).ok())
-					.ok_or_else(|| RecipeError::new(format!("tensor {name} byte extent exceeds the address space")))?;
+					.ok_or_else(|| RecipeError::new(format!("tensor {name} byte extent overflows")))?;
 				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
 				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
 			}
-			// Rounding the header up to the alignment is bounded for the same reason.
-			let data = u64::try_from(reader.at)
-				.ok()
-				.and_then(|at| at.checked_add(alignment - 1))
+			let header = u64::try_from(reader.at).map_err(|_| RecipeError::new("GGUF header offset exceeds the address space"))?;
+			let data = header
+				.checked_add(alignment - 1)
 				.and_then(|offset| offset.checked_div(alignment))
 				.and_then(|blocks| blocks.checked_mul(alignment))
 				.and_then(|offset| usize::try_from(offset).ok())

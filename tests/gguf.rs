@@ -1,10 +1,3 @@
-//! The mapped GGUF reader's bounds.
-//!
-//! A tensor descriptor states a shape and a quantization, and the reader turns
-//! those into a byte extent. That arithmetic has to be bounded: a product that
-//! wraps lands back inside the mapping, so the range check accepts it and the
-//! tensor is read as a short, possibly empty, one instead of being refused.
-
 use recipe::*;
 use std::path::PathBuf;
 
@@ -16,8 +9,6 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
 	bytes.extend(value.to_le_bytes());
 }
 
-/// One tensor named `x`, of the given shape and F32 kind, with `data` after a
-/// 64-byte header.
 fn fixture(name: &str, shape: u64, data: &[u8]) -> PathBuf {
 	let path = std::env::temp_dir().join(format!("recipe-gguf-{name}-{}-{}.gguf", std::process::id(), std::thread::current().name().unwrap_or("test")));
 	let mut bytes = Vec::new();
@@ -54,12 +45,10 @@ fn reader_exposes_a_mapped_f32_descriptor() {
 	std::fs::remove_file(path).unwrap();
 }
 
-/// 2^62 F32 elements is 2^64 bytes, which wraps to zero. Unbounded, the reader
-/// accepted the tensor and reported an empty extent that sits inside the file.
 #[test]
-fn reader_rejects_a_wrapped_tensor_extent() {
-	let path = fixture("wrapped", 1_u64 << 62, &[]);
+fn reader_rejects_an_overflowed_tensor_extent() {
+	let path = fixture("overflow", 1_u64 << 62, &[]);
 	let message = panic_text(std::panic::catch_unwind(|| drop(recipe.gguf(&path))));
-	assert!(message.contains("tensor x byte extent exceeds the address space"), "unexpected error: {message}");
+	assert!(message.contains("tensor x byte extent overflows"), "unexpected error: {message}");
 	std::fs::remove_file(path).unwrap();
 }
