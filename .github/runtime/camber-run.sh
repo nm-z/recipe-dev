@@ -71,7 +71,12 @@ set -euo pipefail
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${WORKER_EXECUTION_TIMEOUT_SECONDS:?worker execution timeout is required}"
 
-root="$(pwd)"
+source_root="$(pwd)"
+root="${TMPDIR:-/tmp}/recipe-camber-${CANDIDATE_SHA:0:12}-$$"
+mkdir -p "$root"
+cp "$source_root/recipe-source.tar.gz" "$root/recipe-source.tar.gz"
+cp "$source_root/trusted-runtime.tar.gz" "$root/trusted-runtime.tar.gz"
+cd "$root"
 archive="$root/recipe-source.tar.gz"
 archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
 if [ "$archive_sha256" != "$SNAPSHOT_SHA256" ]; then
@@ -79,7 +84,6 @@ if [ "$archive_sha256" != "$SNAPSHOT_SHA256" ]; then
 	exit 1
 fi
 
-mkdir -p "$root/evidence"
 echo "== worker: GPU information =="
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 if ! nvidia-smi --query-gpu=name --format=csv,noheader | awk 'BEGIN { IGNORECASE=1 } /L4/ { found=1 } END { exit(found ? 0 : 1) }'; then
@@ -137,6 +141,7 @@ if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}
 	echo "the Camber worker command failed or reached its hard timeout" >&2
 	exit 1
 fi
+mkdir -p "$root/evidence"
 cp -r "$arch_root/work/evidence/." "$root/evidence/"
 cp "$arch_root/work/run.log" "$root/evidence/worker-run.log"
 
@@ -148,6 +153,9 @@ case "$device" in
 esac
 [ -f "$root/evidence/suite.json" ] || { echo "the worker returned no suite evidence" >&2; exit 1; }
 grep -q "SUITE PASS" "$root/evidence/worker-run.log" || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+printf '%s\n' "RECIPE_SUITE_JSON_BEGIN"
+base64 -w0 "$root/evidence/suite.json"
+printf '\n%s\n' "RECIPE_SUITE_JSON_END"
 echo "WORKER EXIT 0" | tee -a "$root/evidence/worker-run.log"
 WORKER
 chmod +x worker.sh
@@ -210,21 +218,20 @@ while :; do
 done
 
 echo "== collecting job logs and worker evidence =="
-if ! camber job logs "$job_id" > evidence/worker.log 2>&1; then
+if ! camber job logs "$job_id" > evidence/worker-run.log 2>&1; then
 	echo "Camber did not return job logs" >&2
 fi
-for name in suite.json worker-run.log; do
-	if ! camber stash cp "$stash_root/evidence/$name" "evidence/$name"; then
-		echo "Camber did not return evidence/$name" >&2
-	fi
-done
 
 case "$state" in
 	COMPLETED|SUCCEEDED|SUCCESS|FINISHED) ;;
 	*) echo "the Camber job reached $state, not a successful terminal state" >&2; exit 1 ;;
 esac
 [ -f evidence/worker-run.log ] || { echo "worker log is absent" >&2; exit 1; }
-[ -f evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
+awk '/^RECIPE_SUITE_JSON_BEGIN$/{capture=1; next} /^RECIPE_SUITE_JSON_END$/{capture=0; exit} capture{print}' evidence/worker-run.log | tr -d '\r\n' | base64 -d > evidence/suite.json || {
+	echo "the Camber job log did not contain valid suite evidence" >&2
+	exit 1
+}
+[ -s evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
 grep -q "WORKER EXIT 0" evidence/worker-run.log || { echo "the worker did not report a zero exit status" >&2; exit 1; }
 route="$(awk '/^selected route / { print $3; exit }' evidence/worker-run.log)"
 device="${route##*:}"
