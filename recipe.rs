@@ -4781,7 +4781,6 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
-	broadcast: bool,
 	normalize: bool,
 	split: f64,
 	prepared: OnceLock<Result<Prepared>>,
@@ -6448,7 +6447,6 @@ impl Recipe {
 			autoregressive: T::AUTO,
 			target: Vec::new(),
 			features: FeatureSelection::All,
-			broadcast: false,
 			normalize: false,
 			split: 1.0,
 			prepared: OnceLock::new(),
@@ -11302,10 +11300,6 @@ impl Data {
 		self.sources.push(source.into());
 		self
 	}
-	pub const fn broadcast(mut self) -> Self {
-		self.broadcast = true;
-		self
-	}
 	pub const fn norm(mut self, _: ZScore) -> Self {
 		self.normalize = true;
 		self
@@ -11395,21 +11389,127 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
-	if tables.len() > 1 {
-		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
-		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
-		if data.broadcast {
-			for table in &mut tables {
-				let count = table.rows.len();
-				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-				if count != rows {
-					table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
+	let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
+	if tables.len() > 1 && tables.iter().any(|table| table.rows.len() != rows) {
+		tables = align_samples(tables)?
+	}
+	Ok((tables, paths))
+}
+/// Align feature sources by logical sample count. A lone table's rows are its
+/// samples. Sibling tables that share a schema are whole-table samples, one per
+/// file, only when another table records exactly their file names in one of its
+/// columns: that column is what identifies them as one source, and what orders
+/// them against the rows naming them. Sharing a schema is not itself an
+/// association, so an unrecorded group is read as row-level partitions of one
+/// source and its rows join instead. No order is ever taken from the path.
+fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
+	let mut sources = Vec::<Vec<Table>>::new();
+	for table in tables {
+		match sources.iter_mut().find(|source| source[0].headers == table.headers) {
+			Some(source) => source.push(table),
+			None => sources.push(vec![table]),
+		}
+	}
+	// Every column of a lone table is a candidate record of file names: the stems
+	// it holds, in that table's own row order.
+	let mut recorded = Vec::new();
+	for source in &sources {
+		let [table] = source.as_slice() else { continue };
+		for column in 0..table.headers.len() {
+			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, table.rows.iter().map(stem).collect::<Vec<_>>()))
+		}
+	}
+	// The recorded order of each group, when exactly one reading exists. Two
+	// columns naming the same files in different orders leave the association
+	// ambiguous, and files sharing a name cannot be ordered by name at all.
+	let mut orders = Vec::new();
+	// The (table, column) pairs that turned out to name files.
+	let mut references = BTreeSet::new();
+	for source in &sources {
+		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		let mut found: Option<(&String, &String, &Vec<String>)> = None;
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, column, order) in &recorded {
+				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
+					continue;
+				}
+				// A column that resolves a group's files is that group's identity, not
+				// one of the row values the caller selected. Every column that reads as
+				// the record is one, including a second column that agrees with the
+				// first, so none of them is left to be encoded as a feature.
+				references.insert((table.clone(), *column));
+				match found {
+					Some((first, first_header, first_order)) => require(
+						first_order == order,
+						format!("{first:?} column {first_header:?} and {table:?} column {header:?} record the same {} file names in different orders", names.len()),
+					)?,
+					None => found = Some((table, header, order)),
 				}
 			}
 		}
+		orders.push(found.map(|(_, _, order)| order.clone()));
 	}
-	Ok((tables, paths))
+	// A recorded group contributes one sample per file. An unrecorded group is one
+	// source whose partitions each contribute their own rows.
+	let count = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[table] => table.rows.len(),
+		_ if order.is_some() => source.len(),
+		_ => source.iter().map(|table| table.rows.len()).sum(),
+	};
+	let samples = sources.iter().zip(&orders).map(|(source, order)| count(source, order)).max().unwrap_or(0);
+	// How a source was read is what a count mismatch is usually about, so the
+	// report says it rather than leaving the reader to infer the rule.
+	let reading = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[_] => "its rows".to_owned(),
+		_ if order.is_some() => format!("one sample per file across {} files", source.len()),
+		_ => format!("the joined rows of {} partitions, because no column records their file names", source.len()),
+	};
+	let mut aligned = Vec::new();
+	for (mut source, order) in sources.into_iter().zip(orders) {
+		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples as {}, expected {samples}", source[0].name, count(&source, &order), reading(&source, &order)))?;
+		if let [_] = source.as_slice() {
+			let mut table = source.remove(0);
+			// Drop the columns that resolved a group's files. They identified the
+			// samples; encoding a file name as numbers alongside the values it points
+			// at feeds the model the label of a vector it already has, and a stem
+			// like "scan-0000" reaches the row as its bytes.
+			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
+			if !dropped.is_empty() && dropped.len() < table.headers.len() {
+				for column in dropped.into_iter().rev() {
+					table.headers.remove(column);
+					for row in &mut table.rows {
+						if column < row.len() {
+							row.remove(column);
+						}
+					}
+				}
+			}
+			aligned.push(table);
+			continue;
+		}
+		let declared = source[0].declared;
+		let Some(order) = order else {
+			// Partitions of one source: every table's rows are samples of the same shape.
+			let headers = source[0].headers.clone();
+			let rows = source.into_iter().flat_map(|table| table.rows).collect::<Vec<_>>();
+			aligned.push(Table { name: "data".to_owned(), headers, declared, rows, attention: None });
+			continue;
+		};
+		source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()));
+		let rows = source[0].rows.len();
+		let mut headers = Vec::new();
+		for row in 1..=rows {
+			headers.extend(source[0].headers.iter().map(|header| if rows == 1 { header.clone() } else { format!("{header}.{row}") }))
+		}
+		let mut values = Vec::with_capacity(source.len());
+		for table in source {
+			require(table.rows.len() == rows, format!("sample {:?} expected {rows} rows, received {}", table.name, table.rows.len()))?;
+			values.push(table.rows.into_iter().flatten().collect())
+		}
+		aligned.push(Table { name: "data".to_owned(), headers, declared, rows: values, attention: None })
+	}
+	Ok(aligned)
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -12205,22 +12305,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 			})
 	};
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
-		let mut tables = Vec::new();
-		for mut group in groups.into_values() {
-			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
-			if group.iter().any(|table| table.headers != group[0].headers) {
-				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-				for table in &mut group {
-					let count = table.rows.len();
-					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-					if count != rows {
-						table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
-					}
-				}
-			}
-			tables.extend(group);
-		}
-		return Ok(tables);
+		return Ok(groups.into_values().flatten().collect());
 	}
 	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
 	require(!groups.is_empty(), "data source contains no usable captures")?;

@@ -27,6 +27,29 @@ let prediction = recipe.infer("model.ogdl", &input);
 
 Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
 
+## samples
+
+A caller selects sources, features and targets. Where the samples begin and end
+is read from the source, not declared.
+
+A lone table's rows are its samples. When a folder holds a group of sibling
+tables and another table has a column recording their file names, that group is
+one sample per file, and the recording column is what both identifies and orders
+them — no order is ever taken from the path. A column used that way is identity
+and not a feature, so the file name never reaches the model as a value.
+
+```
+scans/
+	meta.csv        scan,temperature,y      3001 lines: a header and 3000 rows
+	scan-0000.csv   magnitude,phase         one sample
+	...             (2999 more)
+```
+
+That is 3,000 samples. Each one is the whole vector of the scan its row names
+plus the row's own selected values. Sources that disagree on the sample count
+are refused, saying how each was read; nothing is cycled or repeated to make the
+counts match.
+
 ## devices
 
 Select one or more local or host-qualified devices by repeating `--device`:
