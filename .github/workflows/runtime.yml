@@ -126,13 +126,13 @@ jobs:
       - name: Download the private gateway snapshot
         if: github.event_name == 'workflow_dispatch'
         env:
-          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
           BLOB_NAME: ${{ inputs.blob_name }}
         run: |
           set -euo pipefail
-          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT repository variable is required}"
-          : "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER repository variable is required}"
+          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT repository value is required}"
+          : "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER repository value is required}"
           : "${BLOB_NAME:?blob_name input is required}"
           case "$BLOB_NAME" in
             *$'\n'*|*$'\r'*)
