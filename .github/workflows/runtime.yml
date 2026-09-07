@@ -1,0 +1,781 @@
+name: Recipe runtime
+
+# Six runtime cells plus a fail-closed aggregate. Every cell executes the same
+# checked-in suite (.github/runtime/suite.rs) against one explicitly selected
+# backend and uploads machine-readable evidence; recipe/runtime-gate succeeds
+# only when all six actually succeeded for this candidate.
+
+on:
+  pull_request:
+    branches:
+      - minimal
+    # No path filters: a required check must never be omitted by a path rule.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded candidate is cancelled; the external-worker jobs clean up in
+  # their own always() steps so cancellation still releases cloud resources.
+  group: recipe-runtime-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SUITE_SEED: "17"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Establishes the one candidate SHA every cell must test and publishes an
+  # immutable, checksummed source snapshot for the external workers.
+  # ---------------------------------------------------------------------------
+  candidate:
+    name: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      test_sha: ${{ steps.resolve.outputs.test_sha }}
+      snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          # For pull_request this is GitHub's candidate merge commit, which is
+          # what all six cells must test.
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve TEST_SHA
+        id: resolve
+        run: |
+          set -euo pipefail
+          test_sha="$(git rev-parse HEAD)"
+          expected="${{ github.event.pull_request.merge_commit_sha || github.sha }}"
+          if [ "$test_sha" != "$expected" ]; then
+            echo "checkout $test_sha does not match the candidate $expected" >&2
+            exit 1
+          fi
+          echo "test_sha=$test_sha" >> "$GITHUB_OUTPUT"
+          echo "candidate $test_sha (event=${{ github.event_name }})"
+
+      - name: Build the immutable source snapshot
+        id: snapshot
+        run: |
+          set -euo pipefail
+          # A reproducible archive of the exact candidate tree. External workers
+          # receive this, never an instruction to clone "latest".
+          git archive --format=tar HEAD | gzip -n > /tmp/recipe-source.tar.gz
+          sha256="$(sha256sum /tmp/recipe-source.tar.gz | cut -d' ' -f1)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "snapshot bytes=$(stat -c%s /tmp/recipe-source.tar.gz) sha256=$sha256"
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: /tmp/recipe-source.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # 1. recipe/linux-cpu  -- Arch userspace on a GitHub runner, CPU backend.
+  # ---------------------------------------------------------------------------
+  linux-cpu:
+    name: recipe/linux-cpu
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: archlinux:base-devel
+    env:
+      CELL: recipe/linux-cpu
+    steps:
+      - name: Install the Arch toolchain
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip
+          echo "pacman toolchain installed"
+
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Verify the checkout is the candidate
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          head="$(git rev-parse HEAD)"
+          [ "$head" = "${{ needs.candidate.outputs.test_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
+          echo "candidate verified: $head"
+
+      - name: Record the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          clang --version | head -1
+          ld.lld --version || true
+          {
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "clang=$(clang --version | head -1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the library and CLI
+        run: |
+          set -euo pipefail
+          cargo build --release --lib --bin recipe
+          file target/release/recipe
+
+      - name: Execute the runtime suite on the CPU backend
+        run: |
+          set -euo pipefail
+          mkdir -p evidence work
+          # RECIPE_FORCE_CPU is Recipe's unconditional CPU selection: it short
+          # circuits device discovery before any AMD or NVIDIA probe runs.
+          RECIPE_FORCE_CPU=1 \
+          RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
+          RECIPE_SUITE_WORK="$PWD/work" \
+          RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
+            ./target/release/recipe .github/runtime/suite.rs | tee evidence/run.log
+          grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        run: |
+          set -euo pipefail
+          # Recipe prints the route it selected; this is the fallback detector.
+          route="$(grep -m1 '^selected route ' evidence/run.log | awk '{print $3}')"
+          [ -n "$route" ] || { echo "no route line: the suite did not dispatch" >&2; exit 1; }
+          device="${route##*:}"
+          [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
+          grep -q '\.fp32 rows ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
+          echo "device=$device" >> "$GITHUB_OUTPUT"
+          echo "executed on $route"
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "os": "$(. /etc/os-release && echo "$PRETTY_NAME")",
+            "arch": "$(uname -m)",
+            "kernel": "$(uname -r)",
+            "runner": "ubuntu-24.04 container archlinux:base-devel",
+            "backend": "cpu",
+            "device": "${{ steps.device.outputs.device || 'unknown' }}",
+            "gpu_execution": false,
+            "toolchain": {
+              "rustc": "$(rustc --version 2>/dev/null || echo unknown)",
+              "cargo": "$(cargo --version 2>/dev/null || echo unknown)",
+              "clang": "$(clang --version 2>/dev/null | head -1 || echo unknown)"
+            },
+            "snapshot_sha256": "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-linux-cpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
+  # ---------------------------------------------------------------------------
+  linux-gpu:
+    name: recipe/linux-gpu
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CELL: recipe/linux-gpu
+      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+    steps:
+      - name: Check out the controller sources
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          echo "snapshot verified sha256=$actual"
+
+      - name: Require the Camber control credential
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${CAMBER_API_KEY:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "camber-credential-absent",
+            "detail": "CAMBER_API_KEY is not available to this run. A fork pull request never receives it, and it has not been configured for this repository. The Camber student GPU allowance must be redeemed and the control credential stored as a repository secret before this cell can execute.",
+            "resolution": "Redeem the Camber Student Pack offer, confirm the workspace has the student GPU allowance, then store the API key as the CAMBER_API_KEY repository secret."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/linux-gpu is blocked: the Camber control credential is absent" >&2
+            exit 1
+          fi
+
+      - name: Submit, poll and collect the Camber GPU job
+        id: camber
+        run: |
+          set -euo pipefail
+          bash .github/runtime/camber-run.sh
+        env:
+          TEST_SHA: ${{ needs.candidate.outputs.test_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
+
+      - name: Terminate the Camber job
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
+            bash .github/runtime/camber-terminate.sh "$(cat camber-job-id)"
+          else
+            echo "no Camber job to terminate"
+          fi
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-linux-gpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. recipe/windows-cpu -- native MSVC Windows, CPU backend. This runs the
+  #    shared suite and preserves the train/save/resume/infer lifecycle
+  #    coverage from windows-native-lifecycle.yml.
+  # ---------------------------------------------------------------------------
+  windows-cpu:
+    name: recipe/windows-cpu
+    needs: candidate
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CELL: recipe/windows-cpu
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Verify the checkout and record the toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne "${{ needs.candidate.outputs.test_sha }}") { throw "checkout $head is not the candidate" }
+          if (git status --porcelain) { throw "the native checkout is not clean" }
+          $clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
+          $linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+          if (!(Test-Path -LiteralPath $clang -PathType Leaf)) { throw "native clang is absent: $clang" }
+          if (!(Test-Path -LiteralPath $linker -PathType Leaf)) { throw "native linker is absent: $linker" }
+          rustc --version
+          cargo --version
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { throw "clang failed with exit code $LASTEXITCODE" }
+          "candidate verified: $head"
+
+      - name: Build the native release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          cargo build --locked --release --lib --bin recipe
+          if ($LASTEXITCODE -ne 0) { throw "native release build failed with exit code $LASTEXITCODE" }
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $bytes = [IO.File]::ReadAllBytes($recipe)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "recipe.exe is not a PE executable" }
+          "recipe.exe size=$($bytes.Length) sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $recipe).Hash) magic=MZ"
+
+      - name: Execute the runtime suite on the CPU backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          New-Item -ItemType Directory -Force -Path evidence, work | Out-Null
+          $env:RECIPE_FORCE_CPU = "1"
+          $env:RECIPE_SUITE_ROOT = Join-Path $env:GITHUB_WORKSPACE ".github\runtime"
+          $env:RECIPE_SUITE_WORK = Join-Path $env:GITHUB_WORKSPACE "work"
+          $env:RECIPE_EVIDENCE = Join-Path $env:GITHUB_WORKSPACE "evidence\suite.json"
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE ".github\runtime\suite.rs"
+          # A native failure must not be masked by a later successful command.
+          & $recipe $source 2>&1 | Tee-Object -FilePath evidence\run.log
+          if ($LASTEXITCODE -ne 0) { throw "the runtime suite failed with exit code $LASTEXITCODE" }
+          if (!(Select-String -Path evidence\run.log -SimpleMatch "SUITE PASS" -Quiet)) { throw "the suite did not report SUITE PASS" }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $line = Select-String -Path evidence\run.log -Pattern '^selected route ' | Select-Object -First 1
+          if (!$line) { throw "no route line: the suite did not dispatch" }
+          $route = ($line.Line -split '\s+')[2]
+          $device = $route.Split(':')[-1]
+          if ($device -ne "cpu") { throw "expected the cpu device, got $device" }
+          "device=$device" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "executed on $route"
+
+      - name: Preserve the public train/save/resume/infer lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          $env:RECIPE_FORCE_CPU = "1"
+          $state = Join-Path $env:RUNNER_TEMP "recipe-windows-cpu-lifecycle"
+          Remove-Item -Recurse -Force -LiteralPath $state -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $state | Out-Null
+          $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE = Join-Path $state "model.ogdl"
+          $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE ".github\windows-native\lifecycle.rs"
+          foreach ($phase in @("train", "resume", "infer")) {
+            $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = $phase
+            & $recipe $source
+            if ($LASTEXITCODE -ne 0) { throw "lifecycle phase $phase failed with exit code $LASTEXITCODE" }
+          }
+          if (!(Test-Path -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE -PathType Leaf)) { throw "the lifecycle did not save a bundle" }
+          "lifecycle train/resume/infer completed"
+
+      - name: Write the cell evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          $document = [ordered]@{
+            cell           = $env:CELL
+            commit         = "${{ needs.candidate.outputs.test_sha }}"
+            run_id         = "${{ github.run_id }}"
+            run_attempt    = "${{ github.run_attempt }}"
+            os             = (Get-CimInstance Win32_OperatingSystem).Caption
+            arch           = $env:PROCESSOR_ARCHITECTURE
+            runner         = "windows-2025"
+            backend        = "cpu"
+            device         = "${{ steps.device.outputs.device }}"
+            gpu_execution  = $false
+            toolchain      = [ordered]@{
+              rustc = (rustc --version)
+              cargo = (cargo --version)
+              clang = (& (Join-Path $env:ProgramFiles "LLVM\bin\clang.exe") --version | Select-Object -First 1)
+            }
+            snapshot_sha256 = "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          $document | ConvertTo-Json -Depth 5 | Set-Content -Path evidence\cell.json -Encoding utf8
+          Get-Content evidence\cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-windows-cpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. recipe/windows-gpu -- native Windows NVIDIA VM in Azure, driven through
+  #    GitHub OIDC and managed Run Command.
+  # ---------------------------------------------------------------------------
+  windows-gpu:
+    name: recipe/windows-gpu
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CELL: recipe/windows-gpu
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out the controller sources
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          echo "snapshot verified sha256=$actual"
+
+      - name: Require the Azure federation
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${AZURE_CLIENT_ID:-}" ] || [ -z "${AZURE_TENANT_ID:-}" ] || [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "azure-federation-absent",
+            "detail": "AZURE_CLIENT_ID, AZURE_TENANT_ID or AZURE_SUBSCRIPTION_ID is not available to this run. The Dev Essentials to Azure credit route additionally requires an explicit, human pay-as-you-go billing authorization before GPU quota can be requested, because that upgrade removes the credit spending protection.",
+            "resolution": "Verify Dev Essentials eligibility and remaining credit, obtain explicit billing authorization for the pay-as-you-go upgrade, request NCasT4_v3 quota in a region that stocks Standard_NC4as_T4_v3, then federate this repository with a narrowly scoped app registration and store the three identifiers as repository secrets."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/windows-gpu is blocked: the Azure federation is absent" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision, execute and collect the Windows GPU worker
+        run: |
+          set -euo pipefail
+          bash .github/runtime/azure-run.sh
+        env:
+          TEST_SHA: ${{ needs.candidate.outputs.test_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Deallocate and clean up the worker
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            bash .github/runtime/azure-cleanup.sh || echo "cleanup reported a problem"
+          else
+            echo "no Azure resources to clean up"
+          fi
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-windows-gpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 5. recipe/macos-cpu -- native ARM64 macOS, CPU backend.
+  # ---------------------------------------------------------------------------
+  macos-cpu:
+    name: recipe/macos-cpu
+    needs: candidate
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CELL: recipe/macos-cpu
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Verify the checkout and discover the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [ "$head" = "${{ needs.candidate.outputs.test_sha }}" ] || { echo "checkout $head is not the candidate" >&2; exit 1; }
+          [ "$(uname -m)" = "arm64" ] || { echo "this cell requires an ARM64 runner, got $(uname -m)" >&2; exit 1; }
+          # Discover the real paths rather than assuming Linux locations.
+          clang_path="$(xcrun --find clang)"
+          ld_path="$(xcrun --find ld)"
+          echo "clang_path=$clang_path" >> "$GITHUB_OUTPUT"
+          echo "ld_path=$ld_path" >> "$GITHUB_OUTPUT"
+          rustc --version
+          cargo --version
+          "$clang_path" --version | head -1
+          echo "candidate verified: $head arch=$(uname -m) clang=$clang_path ld=$ld_path"
+
+      - name: Build the native library and CLI
+        run: |
+          set -euo pipefail
+          # Cargo.toml declares /usr/bin/clang and /usr/bin/ld for macos, which
+          # are the Xcode shims present on this image.
+          cargo build --release --lib --bin recipe
+          file target/release/recipe
+
+      - name: Execute the runtime suite on the CPU backend
+        run: |
+          set -euo pipefail
+          mkdir -p evidence work
+          RECIPE_FORCE_CPU=1 \
+          RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
+          RECIPE_SUITE_WORK="$PWD/work" \
+          RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
+            ./target/release/recipe .github/runtime/suite.rs | tee evidence/run.log
+          grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        run: |
+          set -euo pipefail
+          # A Metal device being present must not turn this cell into a GPU test.
+          route="$(grep -m1 '^selected route ' evidence/run.log | awk '{print $3}')"
+          [ -n "$route" ] || { echo "no route line: the suite did not dispatch" >&2; exit 1; }
+          device="${route##*:}"
+          [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
+          echo "device=$device" >> "$GITHUB_OUTPUT"
+          echo "executed on $route"
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
+            "arch": "$(uname -m)",
+            "runner": "macos-15",
+            "backend": "cpu",
+            "device": "${{ steps.device.outputs.device || 'unknown' }}",
+            "gpu_execution": false,
+            "toolchain": {
+              "rustc": "$(rustc --version 2>/dev/null || echo unknown)",
+              "cargo": "$(cargo --version 2>/dev/null || echo unknown)",
+              "clang": "$(${{ steps.toolchain.outputs.clang_path }} --version 2>/dev/null | head -1 || echo unknown)",
+              "clang_path": "${{ steps.toolchain.outputs.clang_path }}",
+              "ld_path": "${{ steps.toolchain.outputs.ld_path }}"
+            },
+            "snapshot_sha256": "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-macos-cpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 6. recipe/macos-gpu -- the paravirtual Metal device on macos-15 ARM64.
+  # ---------------------------------------------------------------------------
+  macos-gpu:
+    name: recipe/macos-gpu
+    needs: candidate
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CELL: recipe/macos-gpu
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.candidate.outputs.test_sha }}
+          persist-credentials: false
+
+      - name: Probe the Metal device
+        id: metal
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          bash .github/runtime/metal-probe.sh | tee evidence/metal.log
+          name="$(grep -m1 '^metal device name=' evidence/metal.log | sed 's/^metal device name=//')"
+          echo "device=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Require Recipe's Metal backend
+        run: |
+          set -euo pipefail
+          # Recipe selects a GPU through load_amd (HSA) or load_nvidia (CUDA).
+          # Neither can drive a Metal device, and the crate contains no Metal
+          # code path, so there is nothing for this cell to execute yet.
+          if grep -rqi 'metal' recipe.rs build.rs cli.rs; then
+            echo "a Metal path now exists in the crate; this guard needs replacing with the real run" >&2
+            exit 1
+          fi
+          cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "recipe-metal-backend-absent",
+            "detail": "recipe.rs, build.rs and cli.rs contain no Metal code. Recipe's GPU device discovery is load_amd (HSA/ROCm) and load_nvidia (CUDA driver); both are compiled out on macOS, so no Recipe kernel can be submitted to the paravirtual Metal device. Reporting this cell as passing would require substituting a diagnostic or another runtime for Recipe, which the contract forbids.",
+            "resolution": "Implement Recipe's Metal backend: MSL or AIR emission alongside the existing PTX and AMDGCN paths in build.rs, a Metal device loader beside load_amd and load_nvidia, and the matching Cargo.toml metadata keys. Then replace this guard with the shared suite run."
+          }
+          JSON
+          cat evidence/blocker.json
+          echo "recipe/macos-gpu is blocked: Recipe has no Metal backend" >&2
+          exit 1
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.candidate.outputs.test_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
+            "arch": "$(uname -m)",
+            "runner": "macos-15",
+            "backend": "metal",
+            "device": "${{ steps.metal.outputs.device || 'unknown' }}",
+            "paravirtual": true,
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.candidate.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-macos-gpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The fail-closed aggregate.
+  # ---------------------------------------------------------------------------
+  runtime-gate:
+    name: recipe/runtime-gate
+    needs:
+      - candidate
+      - linux-cpu
+      - linux-gpu
+      - windows-cpu
+      - windows-gpu
+      - macos-cpu
+      - macos-gpu
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the aggregate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Compile the aggregate
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 -O .github/runtime/gate.rs -o gate
+
+      - name: Run the aggregate's decision-table self-check
+        run: ./gate --self-check
+
+      - name: Download every cell's evidence
+        uses: actions/download-artifact@v4
+        with:
+          path: evidence
+          pattern: recipe-*
+          merge-multiple: false
+
+      - name: Record the reported job results
+        run: |
+          set -euo pipefail
+          cat > results.json <<'JSON'
+          {
+            "recipe/linux-cpu": "${{ needs.linux-cpu.result }}",
+            "recipe/linux-gpu": "${{ needs.linux-gpu.result }}",
+            "recipe/windows-cpu": "${{ needs.windows-cpu.result }}",
+            "recipe/windows-gpu": "${{ needs.windows-gpu.result }}",
+            "recipe/macos-cpu": "${{ needs.macos-cpu.result }}",
+            "recipe/macos-gpu": "${{ needs.macos-gpu.result }}"
+          }
+          JSON
+          cat results.json
+          ls -R evidence || true
+
+      - name: Decide
+        run: |
+          set -euo pipefail
+          # candidate must itself have succeeded for TEST_SHA to be meaningful.
+          [ "${{ needs.candidate.result }}" = "success" ] || { echo "the candidate job did not succeed" >&2; exit 1; }
+          ./gate evidence results.json "${{ needs.candidate.outputs.test_sha }}" "${{ github.run_id }}" "${{ github.run_attempt }}"
