@@ -104,14 +104,18 @@ over its head-width slice, leaving the values untouched:
 
 ## sparse attention
 
-`attn(heads)` builds one query, key and value plane per head. `.kv(heads)` unties
+`attn(heads)` builds one query, key and value plane per head. `.width(d)` unties
+the head width from the block input: without it a head is `channels / heads` wide
+and the residual width must divide by the head count, with it a head is `d` wide
+whatever the residual width is, and the block projects `heads * d` back to the
+residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
 `.index(heads, width, block, keep)` adds a side projection that scores every group
 of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
 attention output by a sigmoid of its own projection of the block input.
 
 ```rust
-.attn(8).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
+.attn(8).width(64).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
 ```
 
 ## compute precisions

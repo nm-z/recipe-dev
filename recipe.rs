@@ -4166,7 +4166,8 @@ mod bundle {
 			Operation::Attention(attention) => {
 				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-				format!("attn,{},{},{dims},{base},{},{},{},{},{}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
+				format!("attn,{},{},{dims},{base},{},{},{},{},{}{width}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4209,12 +4210,17 @@ mod bundle {
 					block: value_at(fields.next(), "indexer block")?,
 					keep: value_at(fields.next(), "indexer blocks kept")?,
 				};
+				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
+				// A bundle written before the width could be declared has nine fields
+				// and derives its width, which is what it meant when it was saved.
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
+					width,
 					kv,
 					rope: (dims != 0).then_some((dims, base.to_bits())),
 					index: (index.block != 0).then_some(index),
-					gate: value_at::<u8>(fields.next(), "attention gate")? != 0,
+					gate,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -4921,6 +4927,9 @@ struct Indexer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AttentionBlock {
 	heads: usize,
+	/// The width of one query, key and value head. `None` derives it from the
+	/// residual width, which is what `attn(heads)` alone has always meant.
+	width: Option<usize>,
 	kv: usize,
 	rope: Option<(usize, u64)>,
 	index: Option<Indexer>,
@@ -4928,7 +4937,7 @@ struct AttentionBlock {
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, kv: heads, rope: None, index: None, gate: false }
+		Self { heads, width: None, kv: heads, rope: None, index: None, gate: false }
 	}
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5094,6 +5103,14 @@ impl Model {
 			_ => panic!("{selector} requires a preceding attn block"),
 		}
 		model
+	}
+	/// Head width of the preceding `attn` block: the width of one query, key and
+	/// value head. Without it the width is the residual width split evenly over
+	/// the heads, so the residual width must divide by the head count; with it the
+	/// two are independent and the block projects `heads * d` back to the residual
+	/// width on the way out.
+	pub fn width(&self, d: usize) -> Self {
+		self.attention("width", |attention| attention.width = Some(d))
 	}
 	/// Key-value heads of the preceding `attn` block. Each key-value head serves
 	/// `heads / kv` query heads.
@@ -7088,11 +7105,24 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, kv, rope, index, gate } = attention;
-	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
+	let AttentionBlock { heads, width, kv, rope, index, gate } = attention;
+	require(heads != 0, "attention head partition is invalid")?;
+	// A declared head width stands on its own; a derived one is still the residual
+	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
+	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
 	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let input = graph.output;
-	let width = input.channels / heads;
+	let width = match width {
+		Some(width) => {
+			require(width != 0, "attention head width must be positive")?;
+			width
+		}
+		None => input.channels / heads,
+	};
+	// The query plane the attention writes. With a derived width this is exactly
+	// `input.channels`, so every expression below is the one this code emitted
+	// before the width could be declared.
+	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	let side = match index {
 		Some(index) => {
@@ -7102,7 +7132,12 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		}
 		None => 0,
 	};
-	let gated = if gate { input.channels } else { 0 };
+	// Every kernel defines the gate plane as the query plane
+	// (`%gate.plane = select i1 %gate, i32 %from, i32 0`), so it sizes from the
+	// query plane and not from the residual width. With a declared width those
+	// two differ, and using the residual width here would shift %row.stride and
+	// silently corrupt the indexer reads and the gate gradient store.
+	let gated = if gate { inner } else { 0 };
 	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
@@ -7118,7 +7153,11 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
-	push_node(graph, Primitive::Attention, input, 0, argument, -2)?;
+	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
+	// shape, so declaring the width is a matter of pushing the query plane here
+	// rather than the block input. The closing projection maps it back to the
+	// residual width.
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
