@@ -59,6 +59,7 @@ weights:
 	conv(filters, kernel)
 	attn(heads)
 	perc(width)
+	attn(q, k, v) // n heads
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
