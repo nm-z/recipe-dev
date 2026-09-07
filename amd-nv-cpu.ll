@@ -2843,11 +2843,31 @@ previous.store.next: %previous.store.register.next = add i32 %previous.store.reg
 ; and has to travel back through every stage before the cell sees it. The
 ; caller folds that carried gradient into the delta and clears it first, which
 ; is why the cell adds nothing further.
-define internal void @recur_stage_reverse_body( ptr addrspace(1) %weights, ptr addrspace(1) %context, ptr addrspace(1) %delta, i32 %row, i32 %time, i32 %length, i32 %channels, i32 %cell.stride, i32 %stages, i32 %activations, i32 %saved, i32 %batch, i32 %scratch, i32 %gradient.start ) #1 { entry:
+define internal void @recur_stage_reverse_body( ptr addrspace(1) %weights, ptr addrspace(1) %context, ptr addrspace(1) %delta, i32 %row, i32 %time, i32 %length, i32 %channels, i32 %cell.stride, i32 %stages, i32 %activations, i32 %saved, i32 %batch, i32 %gradient.base, i32 %parameters, i32 %dh.start ) #1 { entry:
+%none = icmp eq i32 %stages, 0 %before = icmp slt i32 %time, 0 %skip = or i1 %none, %before
+br i1 %skip, label %finish, label %begin
+begin:
 %elements = mul i32 %channels, %length %row.base = mul i32 %row, %elements
 %matrix = mul i32 %channels, %channels %stride = add i32 %matrix, %channels
+%scratch.raw = mul i32 %stages, %batch %scratch = add i32 %saved, %scratch.raw
+%row.gradient = mul i32 %row, %parameters %gradient.start = add i32 %gradient.base, %row.gradient
+br label %carry.loop
+carry.loop: %carry = phi i32 [ 0, %begin ], [ %carry.next, %carry.step ]
+%carry.more = icmp ult i32 %carry, %channels br i1 %carry.more, label %carry.step, label %carry.done
+carry.step: %carry.channel = mul i32 %carry, %length %carry.local = add i32 %carry.channel, %time
+%carry.index = add i32 %row.base, %carry.local
+%carry.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %carry.index
+%carry.dh.index = add i32 %dh.start, %carry
+%carry.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %carry.dh.index
+%carry.delta = load double, ptr addrspace(1) %carry.delta.ptr, align 8
+%carry.dh = load double, ptr addrspace(1) %carry.dh.ptr, align 8
+%carry.total = call double @recipe.add(double %carry.delta, double %carry.dh)
+store double %carry.total, ptr addrspace(1) %carry.delta.ptr, align 8
+store double 0.0, ptr addrspace(1) %carry.dh.ptr, align 8
+%carry.next = add nuw i32 %carry, 1 br label %carry.loop
+carry.done:
 br label %stage.loop
-stage.loop: %stage = phi i32 [ %stages, %entry ], [ %stage.current, %stage.done ]
+stage.loop: %stage = phi i32 [ %stages, %carry.done ], [ %stage.current, %stage.done ]
 %stage.current = sub i32 %stage, 1 %stage.more = icmp sge i32 %stage.current, 0
 br i1 %stage.more, label %stage.entry, label %exit
 stage.entry:
@@ -2915,7 +2935,8 @@ g.j.store: %g.j.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %del
 store double %g.sum, ptr addrspace(1) %g.j.delta.ptr, align 8 br label %g.j.done
 g.j.done: %g.j.next = add nuw i32 %g.j, 1 br label %gradient.loop
 stage.done: br label %stage.loop
-exit: ret void }
+exit: br label %finish
+finish: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
@@ -2955,31 +2976,10 @@ store double 0.0, ptr addrspace(1) %clear.dh.ptr, align 8 store double 0.0, ptr 
 %clear.h.next = add nuw i32 %clear.h, 1 br label %clear.state.loop time.loop:
 %time = phi i32 [ %length, %clear.state.loop ], [ %time.current, %time.done ] %time.current = sub i32 %time, 1
 %row.output.base = mul i32 %row, %out.elements %input.row.base = mul i32 %row, %in.elements
+call void @recur_stage_reverse_body( ptr addrspace(1) %weights, ptr addrspace(1) %context, ptr addrspace(1) %delta, i32 %row, i32 %time.current, i32 %length, i32 %out.channels, i32 %gate.stride, i32 %stages, i32 %activations, i32 %stage.base, i32 %batch, i32 %row.gradient.base, i32 %parameters, i32 %dh.start )
 %previous.time = sub i32 %time.current, 1 %previous.exists = icmp sge i32 %previous.time, 0
 %previous.safe = select i1 %previous.exists, i32 %previous.time, i32 0 %time.more = icmp sge i32 %time.current, 0
-br i1 %time.more, label %stage.reverse, label %row.done
-stage.reverse: %stage.empty = icmp eq i32 %stages, 0 br i1 %stage.empty, label %scan.mode, label %stage.reverse.call
-stage.reverse.call:
-%stage.saved.scratch.raw = mul i32 %stages, %batch %stage.scratch = add i32 %stage.base, %stage.saved.scratch.raw
-%stage.row.gradient = mul i32 %row, %parameters %stage.gradient.start = add i32 %row.gradient.base, %stage.row.gradient
-br label %carry.loop
-carry.loop: %carry = phi i32 [ 0, %stage.reverse.call ], [ %carry.next, %carry.step ]
-%carry.more = icmp ult i32 %carry, %out.channels br i1 %carry.more, label %carry.step, label %carry.done
-carry.step: %carry.channel = mul i32 %carry, %length %carry.local = add i32 %carry.channel, %time.current
-%carry.index = add i32 %row.output.base, %carry.local
-%carry.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %carry.index
-%carry.dh.index = add i32 %dh.start, %carry
-%carry.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %carry.dh.index
-%carry.delta = load double, ptr addrspace(1) %carry.delta.ptr, align 8
-%carry.dh = load double, ptr addrspace(1) %carry.dh.ptr, align 8
-%carry.total = call double @recipe.add(double %carry.delta, double %carry.dh)
-store double %carry.total, ptr addrspace(1) %carry.delta.ptr, align 8
-store double 0.0, ptr addrspace(1) %carry.dh.ptr, align 8
-%carry.next = add nuw i32 %carry, 1 br label %carry.loop
-carry.done:
-call void @recur_stage_reverse_body( ptr addrspace(1) %weights, ptr addrspace(1) %context, ptr addrspace(1) %delta, i32 %row, i32 %time.current, i32 %length, i32 %out.channels, i32 %gate.stride, i32 %stages, i32 %activations, i32 %stage.base, i32 %batch, i32 %stage.scratch, i32 %stage.gradient.start )
-br label %scan.mode
-scan.mode:
+br i1 %time.more, label %scan.mode, label %row.done scan.mode:
 br i1 %lstm, label %gate.delta.loop, label %rnn.check rnn.check:
 br i1 %rnn, label %rnn.delta.loop, label %gru.delta.loop rnn.delta.loop:
 %rnn.hidden = phi i32 [ 0, %rnn.check ], [ %rnn.next, %rnn.delta.step ]
