@@ -4164,10 +4164,10 @@ mod bundle {
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
-				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
+				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
-				format!("attn,{},{},{dims},{base},{},{},{},{},{}{width}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout}{width}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4213,12 +4213,19 @@ mod bundle {
 				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
 				// A bundle written before the width could be declared has nine fields
 				// and derives its width, which is what it meant when it was saved.
+				// The layout precedes the optional head width, and a record written
+				// before rotary layouts were stated carries neither.
+				let layout = fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(0);
+				let layout = match layout {
+					0 | 1 => RopeLayout::Neox,
+					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
+				};
 				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
 					kv,
-					rope: (dims != 0).then_some((dims, base.to_bits())),
+					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
 					index: (index.block != 0).then_some(index),
 					gate,
 				}))
@@ -4885,6 +4892,33 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// How a rotary embedding pairs the channels it rotates. Stated by the model so
+/// the same weights cannot silently run under a different pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+	/// The first half of the rotated channels pairs with the second half.
+	Neox,
+}
+impl RopeLayout {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Neox => 1,
+		}
+	}
+}
+/// The rotary layouts with a declared identity. Any other selector is rejected
+/// rather than guessing a pairing.
+pub trait RopeSelector {
+	fn layout(self) -> RopeLayout;
+}
+pub struct Neox;
+/// The NeoX pairing: channel `i` rotates with channel `i + dimensions / 2`.
+pub const neox: Neox = Neox;
+impl RopeSelector for Neox {
+	fn layout(self) -> RopeLayout {
+		RopeLayout::Neox
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Residual {
 	Layer(usize),
@@ -4931,7 +4965,8 @@ struct AttentionBlock {
 	/// residual width, which is what `attn(heads)` alone has always meant.
 	width: Option<usize>,
 	kv: usize,
-	rope: Option<(usize, u64)>,
+	/// The rotary layout, the rotated channel count, and the base as its bits.
+	rope: Option<(RopeLayout, usize, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
 }
@@ -5120,8 +5155,9 @@ impl Model {
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
 	/// frequencies `base^(-2i/dims)`.
-	pub fn rope(&self, dims: usize, base: f64) -> Self {
-		self.attention("rope", |attention| attention.rope = Some((dims, base.to_bits())))
+	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
@@ -7144,11 +7180,14 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		// normalized span stops at the value plane and each head owns one group.
 		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
 	}
-	if let Some((dims, base)) = rope {
+	if let Some((layout, dims, base)) = rope {
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
 		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+		// The kernel pairs %local with %local +/- %half, which is the NeoX pairing,
+		// so the layout is carried for the record and for a future second layout
+		// rather than to switch anything here.
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), 0.0, 0.0, 0.0, 0.0], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
