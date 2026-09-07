@@ -10863,10 +10863,13 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	Ok((tables, paths))
 }
-/// Align feature sources by logical sample count. Tables that already agree on their row
-/// count are row-level samples; otherwise sibling tables sharing a schema are file-level
-/// samples, one per file, whose own rows become that sample's columns. A column recording
-/// those file names orders them against the tables that name them.
+/// Align feature sources by logical sample count. A lone table's rows are its
+/// samples. Sibling tables that share a schema are whole-table samples, one per
+/// file, only when another table records exactly their file names in one of its
+/// columns: that column is what identifies them as one source, and what orders
+/// them against the rows naming them. Sharing a schema is not itself an
+/// association, so an unrecorded group is read as row-level partitions of one
+/// source and its rows join instead. No order is ever taken from the path.
 fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 	let mut sources = Vec::<Vec<Table>>::new();
 	for table in tables {
@@ -10875,27 +10878,62 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			None => sources.push(vec![table]),
 		}
 	}
-	let count = |source: &[Table]| if let [table] = source { table.rows.len() } else { source.len() };
-	let samples = sources.iter().map(|source| count(source)).max().unwrap_or(0);
+	// Every column of a lone table is a candidate record of file names: the stems
+	// it holds, in that table's own row order.
 	let mut recorded = Vec::new();
 	for source in &sources {
 		let [table] = source.as_slice() else { continue };
 		for column in 0..table.headers.len() {
 			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
-			recorded.push(table.rows.iter().map(stem).collect::<Vec<_>>())
+			recorded.push((table.name.clone(), table.headers[column].clone(), table.rows.iter().map(stem).collect::<Vec<_>>()))
 		}
 	}
+	// The recorded order of each group, when exactly one reading exists. Two
+	// columns naming the same files in different orders leave the association
+	// ambiguous, and files sharing a name cannot be ordered by name at all.
+	let mut orders = Vec::new();
+	for source in &sources {
+		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		let mut found: Option<(&String, &String, &Vec<String>)> = None;
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, order) in &recorded {
+				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
+					continue;
+				}
+				match found {
+					Some((first, first_header, first_order)) => require(
+						first_order == order,
+						format!("{first:?} column {first_header:?} and {table:?} column {header:?} record the same {} file names in different orders", names.len()),
+					)?,
+					None => found = Some((table, header, order)),
+				}
+			}
+		}
+		orders.push(found.map(|(_, _, order)| order.clone()));
+	}
+	// A recorded group contributes one sample per file. An unrecorded group is one
+	// source whose partitions each contribute their own rows.
+	let count = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[table] => table.rows.len(),
+		_ if order.is_some() => source.len(),
+		_ => source.iter().map(|table| table.rows.len()).sum(),
+	};
+	let samples = sources.iter().zip(&orders).map(|(source, order)| count(source, order)).max().unwrap_or(0);
 	let mut aligned = Vec::new();
-	for mut source in sources {
-		require(count(&source) == samples, format!("source {:?} contributes {} samples, expected {samples}", source[0].name, count(&source)))?;
+	for (mut source, order) in sources.into_iter().zip(orders) {
+		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples, expected {samples}", source[0].name, count(&source, &order)))?;
 		if let [_] = source.as_slice() {
 			aligned.push(source.remove(0));
 			continue;
 		}
-		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
-		if let Some(order) = recorded.iter().find(|order| order.len() == names.len() && order.iter().map(String::as_str).collect::<BTreeSet<_>>() == names) {
-			source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()))
-		}
+		let Some(order) = order else {
+			// Partitions of one source: every table's rows are samples of the same shape.
+			let headers = source[0].headers.clone();
+			let rows = source.into_iter().flat_map(|table| table.rows).collect::<Vec<_>>();
+			aligned.push(Table { name: "data".to_owned(), headers, rows, attention: None });
+			continue;
+		};
+		source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()));
 		let rows = source[0].rows.len();
 		let mut headers = Vec::new();
 		for row in 1..=rows {
