@@ -2492,8 +2492,9 @@ impl NativeModelIr {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
 						pointer = pointer_type(backend),
+						has_bias = node.argument[2] == 0.0,
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
@@ -2537,7 +2538,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2643,7 +2644,7 @@ impl NativeModelIr {
 					let composed_previous = kernel <= 1;
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
@@ -2675,7 +2676,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -4188,10 +4189,10 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, exclusions })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4272,7 +4273,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -4301,6 +4302,7 @@ mod bundle {
 	struct ModelParts {
 		loss: Option<u8>,
 		quantization: Option<u16>,
+		exclusions: u8,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -4331,6 +4333,7 @@ mod bundle {
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
 				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				parts.exclusions,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -4413,11 +4416,12 @@ mod bundle {
 			match kind {
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(fields.len() == 2, "semantic model header has the wrong width")?;
+					require(matches!(fields.len(), 2 | 3), "semantic model header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						exclusions: fields.get(2).map(|value| value_at(Some(*value), "semantic model exclusions")).transpose()?.unwrap_or(0),
 						..ModelParts::default()
 					});
 				}
@@ -4501,7 +4505,8 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {}", semantic.model.loss.0, semantic.model.quantization));
+			let exclusions = if semantic.model.exclusions == 0 { String::new() } else { format!(" {}", semantic.model.exclusions) };
+			field(&mut document, "model", &format!("{} {}{exclusions}", semantic.model.loss.0, semantic.model.quantization));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -4593,7 +4598,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};blocks:{};", model.loss.0, model.quantization, model_text(model).join("/")));
+		feed(&format!("loss:{};quant:{};no:{};blocks:{};", model.loss.0, model.quantization, model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -4933,6 +4938,22 @@ pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
+	exclusions: u8,
+}
+/// A default a model excludes through `.no(option)`. Every future exclusion adds
+/// a marker here rather than a negative boolean on a block constructor.
+pub trait Exclusion {
+	fn mask(self) -> u8;
+}
+pub struct Bias;
+/// The bias of every weighted block: layers, attention projections, convolutions
+/// and recurrent gates.
+pub const bias: Bias = Bias;
+impl Exclusion for Bias {
+	fn mask(self) -> u8 {
+		1
+	}
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
@@ -4947,6 +4968,13 @@ impl Model {
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
 		});
+		model
+	}
+	/// Excludes a default from this model. The exclusion applies to every weighted
+	/// block and every nested branch beneath it, and travels with the saved model.
+	pub fn no(&self, option: impl Exclusion) -> Self {
+		let mut model = self.clone();
+		model.exclusions |= option.mask();
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
@@ -6455,7 +6483,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, exclusions: 0 }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -6577,6 +6605,9 @@ struct Graph {
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
+	/// Whether a weighted block allocates its bias. Set once from the model, so
+	/// every lowering below sees it without threading a flag through each one.
+	bias: bool,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -6592,6 +6623,7 @@ impl Graph {
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
+			bias: true,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -6635,6 +6667,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
+	// Set once. Every lowering below reads it from the graph, so a nested branch
+	// inside a residual, a mixture or a product excludes the bias too.
+	graph.bias = model.exclusions & bias.mask() == 0;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -6927,18 +6962,27 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 }
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let (parameters, output) = (checked_add(checked_mul(graph.output.channels, channels, "projection matrix")?, channels, "projection bias")?, Shape { channels, length: graph.output.length });
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2)
+	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
+	let output = Shape { channels, length: graph.output.length };
+	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
-	let parameters = checked_add(checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?, filters, "conv bias")?;
+	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, [kernel as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels)
+	graph
+		.nodes
+		.iter()
+		.rev()
+		.find(|node| node.op == Primitive::Contraction)
+		.filter(|node| node.argument[2] == 0.0)
+		.map(|node| node.offset + node.parameters - node.output.channels)
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
@@ -7097,9 +7141,10 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Conf
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
 	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?, checked_mul(channels, channels, "scan state matrix")?);
-	let stride = checked_add(checked_add(input, state, "scan gate")?, channels, "scan bias")?;
+	let matrices = checked_add(input, state, "scan gate")?;
+	let stride = if graph.bias { checked_add(matrices, channels, "scan bias")? } else { matrices };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
+	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, [gates as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
 	let shape = graph.output;
@@ -10417,7 +10462,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
-	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	let mut intercept = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
 	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
@@ -10425,7 +10470,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
 			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
 			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
-				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let prediction = intercept + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
 				let error = prediction - target;
 				let direction = if error > config.svm_epsilon {
 					1.0
@@ -10449,7 +10494,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		intercept -= config.svm_rate * bias_gradient;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
 			*weight -= config.svm_rate * gradient
 		}
@@ -10463,7 +10508,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	table.extend(inverse);
 	table.extend(weights);
 	let mut program = PredictorBuilder::new();
-	program.constant(bias);
+	program.constant(intercept);
 	program.affine(table);
 	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
