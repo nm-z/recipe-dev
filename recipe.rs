@@ -2510,6 +2510,28 @@ impl NativeModelIr {
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
+				(reverse, Primitive::Rope) => {
+					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
+					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
+					let ty = self.precision.model_type;
+					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							pointer = pointer_type(backend),
+							factor = native_literal(self.precision.model, ty, node.argument[5]),
+							context = native_literal(self.precision.model, ty, node.argument[6]),
+							fast = native_literal(self.precision.model, ty, node.argument[7]),
+							slow = native_literal(self.precision.model, ty, node.argument[8]),
+							channels = node.output.channels,
+							length = node.output.length,
+							head_width = node.argument[2],
+							dims = node.argument[0],
+							rotated = node.argument[3]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
@@ -2532,7 +2554,23 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					let blocks = attention_blocks(node);
+					if blocks != 0 {
+						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
+						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
+						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
+						emit_fixed_loop(&mut ir, index, "index", checked_mul(self.rows, blocks, "indexer block count")?, |ir, p| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+						emit_fixed_loop(&mut ir, index, "select", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+					}
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -2670,8 +2708,19 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
+					if attention_blocks(node) != 0 {
+						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
+						emit_fixed_loop(&mut ir, index, "index.reverse", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+							ir.push_str(&format!(
+								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
+							));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
@@ -3395,6 +3444,19 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
+/// The selector arguments every attention kernel takes after its tiling.
+fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+	Ok(format!(
+		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		kv = integer_argument(node.argument[1], "attention key-value heads")?,
+		index_heads = integer_argument(node.argument[5], "indexer heads")?,
+		index_width = integer_argument(node.argument[6], "indexer width")?,
+		block = integer_argument(node.argument[3], "indexer block")?,
+		gate = node.argument[2] != 0.0,
+		ty = precision.model_type,
+		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+	))
+}
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
 		"double" => type_literal(ty, value),
@@ -4105,7 +4167,16 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Attention(attention) => {
+				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let yarn = attention
+					.yarn
+					.map(|(factor, context, fast, slow)| format!(",{},{context},{},{}", f64::from_bits(factor), f64::from_bits(fast), f64::from_bits(slow)))
+					.unwrap_or_default();
+				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout}{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
@@ -4136,7 +4207,48 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
-			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"attn" => {
+				let heads = value_at(fields.next(), "attention heads")?;
+				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
+				let base = value_at::<f64>(fields.next(), "rotary base")?;
+				let index = Indexer {
+					heads: value_at(fields.next(), "indexer heads")?,
+					width: value_at(fields.next(), "indexer width")?,
+					block: value_at(fields.next(), "indexer block")?,
+					keep: value_at(fields.next(), "indexer blocks kept")?,
+				};
+				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
+				// A bundle written before the width could be declared has nine fields
+				// and derives its width, which is what it meant when it was saved.
+				// The layout precedes the optional head width, and a record written
+				// before rotary layouts were stated carries neither.
+				let layout = fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(0);
+				let layout = match layout {
+					0 | 1 => RopeLayout::Neox,
+					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
+				};
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
+				// The four yarn values follow the head width, all four or none.
+				let yarn = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+					(Some(factor), Some(context), Some(fast), Some(slow)) => Some((
+						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+						value_at(Some(context), "yarn original context")?,
+						value_at::<f64>(Some(fast), "yarn fast boundary")?.to_bits(),
+						value_at::<f64>(Some(slow), "yarn slow boundary")?.to_bits(),
+					)),
+					_ => None,
+				};
+				Ok(Operation::Attention(AttentionBlock {
+					heads,
+					width,
+					kv,
+					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
+					yarn,
+					index: (index.block != 0).then_some(index),
+					gate,
+				}))
+			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
@@ -4799,6 +4911,33 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// How a rotary embedding pairs the channels it rotates. Stated by the model so
+/// the same weights cannot silently run under a different pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+	/// The first half of the rotated channels pairs with the second half.
+	Neox,
+}
+impl RopeLayout {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Neox => 1,
+		}
+	}
+}
+/// The rotary layouts with a declared identity. Any other selector is rejected
+/// rather than guessing a pairing.
+pub trait RopeSelector {
+	fn layout(self) -> RopeLayout;
+}
+pub struct Neox;
+/// The NeoX pairing: channel `i` rotates with channel `i + dimensions / 2`.
+pub const neox: Neox = Neox;
+impl RopeSelector for Neox {
+	fn layout(self) -> RopeLayout {
+		RopeLayout::Neox
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Residual {
 	Layer(usize),
@@ -4826,13 +4965,46 @@ impl PartialEq for Estimator {
 	}
 }
 impl Eq for Estimator {}
+/// Indexer that scores every key block and keeps the best `keep` blocks per
+/// query. `heads` query projections and one shared key projection, both
+/// `width` wide, compress `block` keys into one block score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indexer {
+	heads: usize,
+	width: usize,
+	block: usize,
+	keep: usize,
+}
+/// One attention block: query heads, key-value heads, and the rotary, indexer
+/// and output gate selectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionBlock {
+	heads: usize,
+	/// The width of one query, key and value head. `None` derives it from the
+	/// residual width, which is what `attn(heads)` alone has always meant.
+	width: Option<usize>,
+	kv: usize,
+	/// The rotary layout, the rotated channel count, and the base as its bits.
+	rope: Option<(RopeLayout, usize, u64)>,
+	/// YaRN frequency scaling of the rotary above: the context extension factor,
+	/// the original training context, and the fast and slow rotation boundaries,
+	/// the three real values held as their bits.
+	yarn: Option<(u64, usize, u64, u64)>,
+	index: Option<Indexer>,
+	gate: bool,
+}
+impl AttentionBlock {
+	fn new(heads: usize) -> Self {
+		Self { heads, width: None, kv: heads, rope: None, yarn: None, index: None, gate: false }
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Attention(usize),
+	Attention(AttentionBlock),
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
@@ -4970,7 +5142,7 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(heads);
+	fn attn(heads: usize) = Operation::Attention(AttentionBlock::new(heads));
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -4980,6 +5152,59 @@ impl Model {
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		match &mut block.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		model
+	}
+	/// Head width of the preceding `attn` block: the width of one query, key and
+	/// value head. Without it the width is the residual width split evenly over
+	/// the heads, so the residual width must divide by the head count; with it the
+	/// two are independent and the block projects `heads * d` back to the residual
+	/// width on the way out.
+	pub fn width(&self, d: usize) -> Self {
+		self.attention("width", |attention| attention.width = Some(d))
+	}
+	/// Key-value heads of the preceding `attn` block. Each key-value head serves
+	/// `heads / kv` query heads.
+	pub fn kv(&self, heads: usize) -> Self {
+		self.attention("kv", |attention| attention.kv = heads)
+	}
+	/// Rotary position embedding on the preceding `attn` block: the first `dims`
+	/// channels of every query and key head rotate by their position at
+	/// frequencies `base^(-2i/dims)`.
+	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
+	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
+	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	pub fn yarn(&self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
+			assert!(og_ctx != 0, "yarn original context must be positive");
+			assert!(b_fast.is_finite() && b_slow.is_finite(), "yarn boundaries must be finite, received {b_fast} and {b_slow}");
+			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
+			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
+		})
+	}
+	/// Sparse key selection on the preceding `attn` block. `heads` query
+	/// projections and one key projection, each `width` wide, score every group
+	/// of `block` keys, and each query attends to its best `keep` blocks.
+	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+	}
+	/// Sigmoid gate on the output of the preceding `attn` block, from its own
+	/// projection of the block input.
+	pub fn gate(&self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -6294,7 +6519,7 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Attention(_) => "attn",
+			Self::Attention(..) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
@@ -6496,6 +6721,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Rope = 11,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -6533,6 +6759,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Rope => "Rope",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -6735,7 +6962,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
+		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -6945,17 +7172,73 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize, qk: Option<BlockNormalization>) -> Result<()> {
-	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
+/// Lowers one attention block into its projection, the optional query and key
+/// normalization and rotary nodes, the attention node and the output
+/// projection. The projection carries the query, key and value planes, then
+/// the indexer planes, then the gate plane.
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
+	let AttentionBlock { heads, width, kv, rope, yarn, index, gate } = attention;
+	require(heads != 0, "attention head partition is invalid")?;
+	// A declared head width stands on its own; a derived one is still the residual
+	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
+	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
+	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let input = graph.output;
-	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
-	let width = input.channels / heads;
+	let width = match width {
+		Some(width) => {
+			require(width != 0, "attention head width must be positive")?;
+			width
+		}
+		None => input.channels / heads,
+	};
+	// The query plane the attention writes. With a derived width this is exactly
+	// `input.channels`, so every expression below is the one this code emitted
+	// before the width could be declared.
+	let inner = checked_mul(heads, width, "attention query plane")?;
+	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let side = match index {
+		Some(index) => {
+			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
+			require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
+			checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?
+		}
+		None => 0,
+	};
+	// Every kernel defines the gate plane as the query plane
+	// (`%gate.plane = select i1 %gate, i32 %from, i32 0`), so it sizes from the
+	// query plane and not from the residual width. With a declared width those
+	// two differ, and using the residual width here would shift %row.stride and
+	// silently corrupt the indexer reads and the gate gradient store.
+	let gated = if gate { inner } else { 0 };
+	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
-		lower_normalize(graph, normalization, width, checked_mul(input.channels, 2, "attention query and key span")?)?;
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
 	}
-	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
+	if let Some((layout, dims, base)) = rope {
+		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
+		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
+		// The kernel pairs %local with %local +/- %half, which is the NeoX pairing,
+		// so the layout is carried for the record and for a future second layout
+		// rather than to switch anything here.
+		// A zero factor is no scaling, which is what a model without yarn carries.
+		// The context is divided by two pi here so the kernel needs no literal for
+		// it: a narrower precision cannot spell one and LLVM rejects it outright.
+		let (factor, context, fast, slow) = yarn.map_or((0.0, 0.0, 0.0, 0.0), |(factor, context, fast, slow)| {
+			(f64::from_bits(factor), context as f64 / std::f64::consts::TAU, f64::from_bits(fast), f64::from_bits(slow))
+		});
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), factor, context, fast, slow], -2)?;
+	}
+	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
+	// shape, so declaring the width is a matter of pushing the query plane here
+	// rather than the block input. The closing projection maps it back to the
+	// residual width.
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
@@ -6969,6 +7252,11 @@ fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: 
 	let offset = graph.parameters.len() - parameters;
 	graph.parameters[offset..].fill(1.0);
 	Ok(())
+}
+/// Key blocks the indexer scores for a sequence of `length` positions.
+fn attention_blocks(node: &Node) -> usize {
+	let block = node.argument[3] as usize;
+	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -8111,8 +8399,17 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// minimum allocation below.
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		// Softmax statistics, then the indexer block representatives, then one
+		// row of block scores and one admission flag per block per query, then
+		// one block score gradient per attention head per query.
 		Primitive::Attention => {
-			checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?
+			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let blocks = attention_blocks(node);
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
+			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
+			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -8693,7 +8990,10 @@ impl Gpu {
 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
 			let heads = integer_argument(node.argument[0], "attention heads")?;
 			require(heads != 0, "attention heads are empty")?;
-			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
+			// The matrix path covers dense attention with tied heads, no gate and
+			// no indexer.
+			let plain = node.argument[1] == node.argument[0] && node.argument[2] == 0.0 && node.argument[3] == 0.0;
+			Ok::<_, RecipeError>(aligned && plain && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
 			&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
