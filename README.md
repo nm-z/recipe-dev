@@ -46,7 +46,7 @@ cli.rs          cli options
 test.rs         combo testing
 ```
 
-## 19 thingys:
+## 18 thingys:
 ```rust
 weights:
 	layer(neurons)
