@@ -81,6 +81,14 @@ Feature generation is banned.
 
 `embed` must be the first block and must carry a quantization. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather decodes each addressed row out of the packed table, so `width` must be a whole number of the layout's blocks and the run reads one packed row per token instead of the table. The table keeps the values it was quantized from and no optimizer step writes it back.
 
+Inference over such a model takes the ids themselves, as a batch of sequences:
+
+```rust
+let answers = recipe.infer_ids("model.ogdl", &[&[4_u32, 91, 7], &[11, 11, 2]]);
+```
+
+Every sequence is one row and carries one id per input column, and each answer holds that row's outputs. The batch runs as a single tape.
+
 ## 15 activations
 
 ```

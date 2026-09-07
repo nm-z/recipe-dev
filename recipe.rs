@@ -6106,19 +6106,58 @@ impl Recipe {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
 	}
 }
+/// Infer a batch of token id sequences: every sequence is one row, and the ids
+/// reach the device as ids. The batch runs as one tape, so a sequence is not a
+/// separate launch.
+fn infer_ids(path: &Path, sequences: &[&[u32]], device: &'static Gpu) -> Result<Vec<Vec<f64>>> {
+	let (_, graphs) = bundle::load_semantic(path)?;
+	let stored = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
+	require(graphs.len() == 1, "a token id model takes one graph, so it cannot chain into another")?;
+	require(!sequences.is_empty(), "token id batch is empty")?;
+	let width = stored.input.elements();
+	for (row, sequence) in sequences.iter().enumerate() {
+		require(sequence.len() == width, format!("sequence {row} expected {width} token ids, received {}", sequence.len()))?;
+	}
+	// An id is a token, not a measurement, so a normalized input column has no
+	// meaning on this path.
+	require(stored.norm_mean.is_empty(), "a token id model cannot normalize its input columns")?;
+	let ids = sequences.concat();
+	let graph = materialize_saved_graph(stored, device, Config::load()?)?;
+	require(graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather), "model does not read token ids: its first block is not an embedding")?;
+	let mut tape = NativeTape::new(&graph, TapeInput::Ids(&ids), &[], device, stored.precision, None)?;
+	tape.inject_bn_stats(&stored.bn_stats)?;
+	tape.forward()?;
+	let outputs = stored.output.elements();
+	let mut predictions = tape.predictions()?;
+	require(predictions.len() == sequences.len() * outputs, format!("model output expected {} values, received {}", sequences.len() * outputs, predictions.len()))?;
+	// The value path rescales a bounded target the same way, so both paths answer alike.
+	if stored.target_span > 0.0 {
+		for value in &mut predictions {
+			*value = stored.target_min + stored.target_span * logistic(*value);
+		}
+	}
+	Ok(predictions.chunks(outputs).map(<[f64]>::to_vec).collect())
+}
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
-			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			let graph = materialize_saved_graph(stored, device, config)?;
+			let mut tape = NativeTape::new(&graph, TapeInput::Values(samples), &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Infer from token ids. Every sequence is one row of the batch and carries
+	/// one id per model input column, and the answer holds that row's outputs.
+	pub fn infer_ids(&self, path: impl AsRef<Path>, sequences: &[&[u32]]) -> Vec<Vec<f64>> {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		infer_ids(&path, sequences, device).unwrap_or_else(|error| panic!("{error}"))
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6314,9 +6353,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	encode_graph_storage(&mut graph, config)?;
 	Ok(graph)
 }
-fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
+fn materialize_saved_graph(saved: &bundle::SemanticGraph, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	let prepared = Prepared {
-		samples: samples.to_vec(),
+		samples: vec![0.0; saved.input.elements()],
 		targets: vec![0.0; saved.output.elements()],
 		target_width: saved.output.elements().max(1),
 		rows: 1,
@@ -7078,10 +7117,35 @@ impl EpochOperation {
 	}
 }
 
+/// What a tape reads for its input: model values, or the token ids a gather
+/// addresses. Ids reach the device as ids, so the caller never encodes a token
+/// as a real number.
+#[derive(Clone, Copy)]
+enum TapeInput<'a> {
+	Values(&'a [f64]),
+	Ids(&'a [u32]),
+}
+impl TapeInput<'_> {
+	fn len(&self) -> usize {
+		match self {
+			Self::Values(values) => values.len(),
+			Self::Ids(ids) => ids.len(),
+		}
+	}
+	fn label(&self) -> &'static str {
+		match self {
+			Self::Values(_) => "values",
+			Self::Ids(_) => "token ids",
+		}
+	}
+}
 impl NativeTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+	fn new(graph: &Graph, samples: TapeInput<'_>, targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
-		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
+		require(
+			input != 0 && samples.len() != 0 && samples.len() % input == 0,
+			format!("model input batch expected a nonempty multiple of {input} {}, received {}", samples.label(), samples.len()),
+		)?;
 		let rows = samples.len() / input;
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
@@ -7107,17 +7171,29 @@ impl NativeTape {
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
-		// A graph that starts with a gather reads its input as i32 token ids.
-		let samples = match graph.nodes.first().filter(|node| node.op == Primitive::Gather) {
-			Some(node) => {
+		// A graph that starts with a gather reads its input as i32 token ids. The
+		// id path uploads them as they were given; the value path is what the
+		// training data pipeline carries, so it converts its whole-number columns.
+		let gather = graph.nodes.first().filter(|node| node.op == Primitive::Gather);
+		let samples = match (samples, gather) {
+			(TapeInput::Ids(ids), Some(node)) => {
 				let vocabulary = node.argument[0];
-				let ids = samples
+				let ids = ids
 					.iter()
-					.map(|id: &f64| require(id.fract() == 0.0 && *id >= 0.0 && *id < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32))
+					.map(|id| require(f64::from(*id) < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32))
 					.collect::<Result<Vec<_>>>()?;
 				Buffer::upload(gpu, &ids)?
 			}
-			None => Buffer::upload_float(gpu, samples, precision.model)?,
+			(TapeInput::Ids(_), None) => return Err(RecipeError::new("token ids need a model whose first block is an embedding")),
+			(TapeInput::Values(values), Some(node)) => {
+				let vocabulary = node.argument[0];
+				let ids = values
+					.iter()
+					.map(|id| require(id.fract() == 0.0 && *id >= 0.0 && *id < vocabulary, format!("token id {id} is outside the vocabulary of {vocabulary}")).map(|()| *id as i32))
+					.collect::<Result<Vec<_>>>()?;
+				Buffer::upload(gpu, &ids)?
+			}
+			(TapeInput::Values(values), None) => Buffer::upload_float(gpu, values, precision.model)?,
 		};
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
@@ -7471,7 +7547,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		fitted: Vec::new(),
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?;
 		let started = Instant::now();
@@ -7584,7 +7660,7 @@ impl DeviceTape {
 		let (mut shards, mut start) = (Vec::new(), 0);
 		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
-			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss))?);
+			shards.push(NativeTape::new(graph, TapeInput::Values(&samples[start * input..end * input]), &targets[start * output..end * output], gpus[*device], precision, Some(loss))?);
 			start = end;
 		}
 		Ok(Self { shards, placement })
@@ -9638,7 +9714,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
+	let mut tape = NativeTape::new(graph, TapeInput::Values(&samples[..input_count]), &[], gpu, precision, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -9666,7 +9742,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 		fitted: Vec::new(),
 	};
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, TapeInput::Values(samples), targets, gpu, config.precision, Some(mse))?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.full_epoch(config.surrogate_rate, config)?;
@@ -13117,7 +13193,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
+				let mut validation = NativeTape::new(&graph, TapeInput::Values(sample), &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -13140,7 +13216,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
+			let mut validation = NativeTape::new(&graph, TapeInput::Values(&prepared.samples[start..]), validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;

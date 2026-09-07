@@ -205,6 +205,33 @@ fn stable_bundle(path: &std::path::Path) -> Vec<u8> {
 	kept.into_bytes()
 }
 
+/// The token id path must answer exactly as the value path does for the same
+/// ids, and a batch of sequences must answer one row each, so a caller never has
+/// to encode a token as a real number to reach an embedding.
+fn check_id_path(case: &Case, bundle: &std::path::Path) {
+	if !case.shape.starts_with("embed") {
+		return;
+	}
+	let ids = (0..case.columns).map(|column| ((column * 37 + 11) % VOCABULARY) as u32).collect::<Vec<_>>();
+	let values = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+	let expected = recipe.infer(bundle, &values);
+	let answers = recipe.infer_ids(bundle, &[ids.as_slice(), ids.as_slice()]);
+	assert_eq!(answers.len(), 2, "{}: the id batch answered {} rows", case.name, answers.len());
+	for (row, answer) in answers.iter().enumerate() {
+		assert_eq!(answer.len(), expected.len(), "{}: id row {row} answered {} values, the value path answered {}", case.name, answer.len(), expected.len());
+		for (index, (left, right)) in answer.iter().zip(&expected).enumerate() {
+			assert_eq!(
+				left.to_bits(),
+				right.to_bits(),
+				"{}: id row {row} value {index} is {left:016x}, the value path gives {right:016x}",
+				case.name,
+				left = left.to_bits(),
+				right = right.to_bits()
+			);
+		}
+	}
+}
+
 fn run(case: &Case) -> Evidence {
 	let bundle = std::env::temp_dir().join(format!("recipe-determinism-{}-{}.ogdl", case.name, std::process::id()));
 	let data = recipe.data(dataset(case.rows, case.columns, case.shape.starts_with("embed")).to_string_lossy().as_ref()).target("y");
@@ -220,6 +247,7 @@ fn run(case: &Case) -> Evidence {
 	} else {
 		configure(case.precision).save(&bundle).run(&build(case), &data)
 	};
+	check_id_path(case, &bundle);
 	// Predictions are compared in reported order: a backend that assigned a
 	// prediction to the wrong row would fail even if the multiset matched.
 	let predictions = report.predictions().iter().map(|value| value.to_bits()).collect::<Vec<_>>();
