@@ -103,10 +103,10 @@ tar -I zstd -xf "$work/arch.tar.zst" -C "$arch_root" --strip-components=1 --no-s
 cp /etc/resolv.conf "$arch_root/etc/resolv.conf"
 for mount_name in proc sys dev; do
 	mkdir -p "$arch_root/$mount_name"
-	mount --rbind "/$mount_name" "$arch_root/$mount_name"
+	sudo -n mount --rbind "/$mount_name" "$arch_root/$mount_name"
 done
 for library in $(ldconfig -p | awk '/libcuda\.so/ {print $NF}'); do
-	install -D "$library" "$arch_root$library"
+	sudo -n install -D "$library" "$arch_root$library"
 done
 
 mkdir -p "$arch_root/work"
@@ -137,7 +137,7 @@ RECIPE_EVIDENCE=/work/evidence/suite.json \
 INNER
 chmod +x "$arch_root/root/run.sh"
 
-if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" chroot "$arch_root" /bin/bash /root/run.sh; then
+if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" sudo -n chroot "$arch_root" /bin/bash /root/run.sh; then
 	echo "the Camber worker command failed or reached its hard timeout" >&2
 	exit 1
 fi
