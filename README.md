@@ -59,6 +59,11 @@ weights:
 	conv(filters, kernel)
 	attn(heads)
 	perc(width)
+	dconv(kernel)
+	delta(heads, kernel)[.keys(heads, width)][.values(width)][.out(width)]
+	attn(heads)[.kv(heads)][.head(width)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)[.budget(tokens)][.score(rms|l2, dims)]][.gate()]
+	embed(vocab, width)
+	ple(&table)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
