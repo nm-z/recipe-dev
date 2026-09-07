@@ -51,6 +51,8 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
+	attn(heads)
+	attn(q, k, v) // n heads
 	perc(width)
 	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
 	attn([q, k, v]) // query, key and value head counts
