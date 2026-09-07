@@ -4000,11 +4000,25 @@ mod gguf {
 				let (_, block, stride, _) = layout(kind)?;
 				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
 				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
-				let bytes = usize::try_from(elements / block as u64 * stride as u64).map_err(|_| RecipeError::new(format!("tensor {name} exceeds the address space")))?;
+				// The block product is bounded rather than wrapped: a wrapped extent
+				// lands back inside the mapping and the range check below accepts it,
+				// so a tensor claiming more bytes than the address space holds would
+				// be read as a short, and possibly empty, one.
+				let bytes = (elements / block as u64)
+					.checked_mul(stride as u64)
+					.and_then(|bytes| usize::try_from(bytes).ok())
+					.ok_or_else(|| RecipeError::new(format!("tensor {name} byte extent exceeds the address space")))?;
 				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
 				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
 			}
-			let data = usize::try_from((reader.at as u64).div_ceil(alignment) * alignment).map_err(|_| RecipeError::new("GGUF data offset exceeds the address space"))?;
+			// Rounding the header up to the alignment is bounded for the same reason.
+			let data = u64::try_from(reader.at)
+				.ok()
+				.and_then(|at| at.checked_add(alignment - 1))
+				.and_then(|offset| offset.checked_div(alignment))
+				.and_then(|blocks| blocks.checked_mul(alignment))
+				.and_then(|offset| usize::try_from(offset).ok())
+				.ok_or_else(|| RecipeError::new("GGUF data offset exceeds the address space"))?;
 			for tensor in &tensors {
 				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
 				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
