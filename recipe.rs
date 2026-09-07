@@ -4113,8 +4113,11 @@ mod bundle {
 			Operation::Product(left, right) => {
 				// The two branches take the two argument slots, each a residual list,
 				// so this nests exactly as far as `residual` and `moe` already do.
+				// A residual list is `;`-joined and each part carries its own commas
+				// (`layer,4`), so the two branches are separated by a colon: the one
+				// character neither a residual part nor a block field uses.
 				let parts = |branch: &Vec<Residual>| branch.iter().map(residual_text).collect::<Vec<_>>().join(";");
-				format!("product,{},{}", parts(left), parts(right))
+				format!("product,{}:{}", parts(left), parts(right))
 			}
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
@@ -4152,7 +4155,7 @@ mod bundle {
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
 			}
 			"product" => {
-				let (left, right) = rest.split_once(',').ok_or_else(|| RecipeError::new("product is missing a branch"))?;
+				let (left, right) = rest.split_once(':').ok_or_else(|| RecipeError::new("product is missing a branch"))?;
 				let branch = |text: &str| text.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>();
 				Ok(Operation::Product(branch(left)?, branch(right)?))
 			}
