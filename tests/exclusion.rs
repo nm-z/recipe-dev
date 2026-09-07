@@ -79,8 +79,10 @@ fn a_biasless_layer_saves_fewer_parameters() {
 fn a_biasless_convolution_saves_fewer_parameters() {
 	let with = saved_parameters("conv-with", &recipe.model().conv(4, 3).relu().layer(1).loss(mse));
 	let without = saved_parameters("conv-without", &recipe.model().no(bias).conv(4, 3).relu().layer(1).loss(mse));
-	// conv(4, 3) drops 4 and the closing layer(1) drops 1.
-	assert_eq!(with - without, 5, "expected 5 fewer parameters, {with} became {without}");
+	// conv(4, 3) drops 4 and layer(1) drops 1. The sixth is the output
+	// convolution compile appends to a model whose output still has a length,
+	// which is a weighted block like any other and drops its bias too.
+	assert_eq!(with - without, 4 + 1 + 1, "expected 6 fewer parameters, {with} became {without}");
 }
 
 /// A recurrent gate carries its own bias per gate, which is the case the
@@ -89,8 +91,9 @@ fn a_biasless_convolution_saves_fewer_parameters() {
 fn biasless_recurrent_gates_save_fewer_parameters() {
 	let with = saved_parameters("gru-with", &recipe.model().conv(2, 2).gru(5).relu().layer(1).loss(mse));
 	let without = saved_parameters("gru-without", &recipe.model().no(bias).conv(2, 2).gru(5).relu().layer(1).loss(mse));
-	// gru(5) has three gates of five channels, conv(2, 2) drops 2, layer(1) drops 1.
-	assert_eq!(with - without, 3 * 5 + 2 + 1, "expected 18 fewer parameters, {with} became {without}");
+	// gru(5) has three gates of five channels, conv(2, 2) drops 2, layer(1) drops
+	// 1, and the appended output convolution drops 1.
+	assert_eq!(with - without, 3 * 5 + 2 + 1 + 1, "expected 19 fewer parameters, {with} became {without}");
 }
 
 /// The exclusion reaches a nested branch, because the lowering reads it from the
