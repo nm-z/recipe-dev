@@ -56,8 +56,8 @@ fn panic_text(result: std::thread::Result<()>) -> String {
 #[test]
 fn a_factor_of_one_matches_unscaled_rope() {
 	let path = dataset();
-	let plain = evidence(&recipe.model().conv(4, 3).attn(2).rope(neox, 4, 10000.0).relu().layer(1).loss(mse), "plain", &path);
-	let unity = evidence(&recipe.model().conv(4, 3).attn(2).rope(neox, 4, 10000.0).yarn(1.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse), "unity", &path);
+	let plain = evidence(&recipe.model().conv(8, 3).attn(2).rope(neox, 4, 10000.0).relu().layer(1).loss(mse), "plain", &path);
+	let unity = evidence(&recipe.model().conv(8, 3).attn(2).rope(neox, 4, 10000.0).yarn(1.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse), "unity", &path);
 	assert_eq!(plain, unity, "a yarn factor of one changed the model");
 	let _ = std::fs::remove_file(path);
 }
@@ -67,8 +67,8 @@ fn a_factor_of_one_matches_unscaled_rope() {
 #[test]
 fn an_extension_factor_changes_the_result() {
 	let path = dataset();
-	let plain = evidence(&recipe.model().conv(4, 3).attn(2).rope(neox, 4, 10000.0).relu().layer(1).loss(mse), "plain2", &path);
-	let scaled = evidence(&recipe.model().conv(4, 3).attn(2).rope(neox, 4, 10000.0).yarn(4.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse), "scaled", &path);
+	let plain = evidence(&recipe.model().conv(8, 3).attn(2).rope(neox, 4, 10000.0).relu().layer(1).loss(mse), "plain2", &path);
+	let scaled = evidence(&recipe.model().conv(8, 3).attn(2).rope(neox, 4, 10000.0).yarn(4.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse), "scaled", &path);
 	assert_ne!(plain.2, scaled.2, "a yarn factor of four produced the unscaled predictions");
 	assert!(f64::from_bits(scaled.1) < f64::from_bits(scaled.0), "the scaled model did not train");
 	let _ = std::fs::remove_file(path);
@@ -81,7 +81,7 @@ fn the_scaling_survives_the_bundle() {
 	let path = dataset();
 	let bundle = std::env::temp_dir().join(format!("recipe-yarn-{}-bundle.ogdl", std::process::id()));
 	let data = recipe.data(path.to_string_lossy().as_ref()).target("y");
-	let model = recipe.model().conv(4, 3).attn(2).rope(neox, 4, 10000.0).yarn(4.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse);
+	let model = recipe.model().conv(8, 3).attn(2).rope(neox, 4, 10000.0).yarn(4.0, 8192, 32.0, 1.0).relu().layer(1).loss(mse);
 	recipe.train().fp(64).seed(21).lr(0.01).epochs(20).stop(0.0).save(&bundle).run(&model, &data);
 
 	let saved = std::fs::read_to_string(&bundle).unwrap();
