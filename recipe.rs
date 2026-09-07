@@ -4110,6 +4110,12 @@ mod bundle {
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Product(left, right) => {
+				// The two branches take the two argument slots, each a residual list,
+				// so this nests exactly as far as `residual` and `moe` already do.
+				let parts = |branch: &Vec<Residual>| branch.iter().map(residual_text).collect::<Vec<_>>().join(";");
+				format!("product,{},{}", parts(left), parts(right))
+			}
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 		}
@@ -4144,6 +4150,11 @@ mod bundle {
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+			}
+			"product" => {
+				let (left, right) = rest.split_once(',').ok_or_else(|| RecipeError::new("product is missing a branch"))?;
+				let branch = |text: &str| text.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>();
+				Ok(Operation::Product(branch(left)?, branch(right)?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -4838,6 +4849,9 @@ enum Operation {
 	Lstm(usize),
 	Residual(Vec<Residual>),
 	Moe(usize, Vec<Residual>),
+	/// Two branches evaluated from the same incoming activation, multiplied
+	/// elementwise. Built by `left * right` rather than by a named constructor.
+	Product(Vec<Residual>, Vec<Residual>),
 	Perceptron(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6300,6 +6314,7 @@ impl Operation {
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
 			Self::Moe(..) => "moe",
+			Self::Product(..) => "product",
 			Self::Perceptron(_) => "perc",
 		}
 	}
@@ -6334,6 +6349,47 @@ impl BlockNormalization {
 			Self::Rms => "rms",
 			Self::L2 => "l2",
 		}
+	}
+}
+/// The branch form of a model, for composition. A branch is the operations and
+/// activations of its blocks in order; a block carrying normalization, a
+/// quantization profile or query-and-key normalization is not a branch, because
+/// a product combines two activations rather than two whole training stages.
+fn model_branch(model: &Model, side: &str) -> Vec<Residual> {
+	let mut parts = Vec::new();
+	for block in &model.blocks {
+		assert!(block.normalization.is_none(), "the {side} of a product carries normalization, which a product branch cannot");
+		assert!(block.qk.is_none(), "the {side} of a product carries query and key normalization, which a product branch cannot");
+		assert!(block.quantization == 0, "the {side} of a product carries a quantization, which a product branch cannot");
+		match &block.operation {
+			Operation::Layer(width) | Operation::Perceptron(width) => parts.push(Residual::Layer(*width)),
+			Operation::Conv(filters, kernel) => parts.push(Residual::Conv(*filters, *kernel)),
+			other => panic!("the {side} of a product is a {} block, and a product branch is layers, convolutions and activations", other.name()),
+		}
+		if block.activation != Activation::Linear {
+			parts.push(Residual::Activation(block.activation));
+		}
+	}
+	assert!(!parts.is_empty(), "the {side} of a product has no blocks");
+	parts
+}
+/// `left * right` evaluates both models from the same incoming activation and
+/// multiplies their outputs elementwise. Each branch keeps its own weights.
+/// Scalar multiplication is the separate `.scale(factor)` activation.
+impl std::ops::Mul for Model {
+	type Output = Self;
+	fn mul(self, right: Self) -> Self {
+		let (left_parts, right_parts) = (model_branch(&self, "left"), model_branch(&right, "right"));
+		let mut model = self;
+		model.blocks = vec![Block {
+			operation: Operation::Product(left_parts, right_parts),
+			activation: Activation::Linear,
+			normalization: None,
+			qk: None,
+			quantization: 0,
+			profile: false,
+		}];
+		model
 	}
 }
 macro_rules! activations { ($(fn $method:ident = $activation:ident;)+) => {$(impl Model { pub fn $method(&self) -> Self {
@@ -6741,6 +6797,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Product(left, right) => lower_product(graph, left, right, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -7115,6 +7172,33 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, skip, &[], program)
+}
+/// Two branches from one incoming activation, multiplied elementwise. Each
+/// branch keeps its own weights; the scalar product's derivative sends
+/// `right * dy` to the left branch and `left * dy` to the right, so both input
+/// gradient contributions reach the shared source without anything extra here.
+fn lower_product(graph: &mut Graph, left: &[Residual], right: &[Residual], config: Config) -> Result<()> {
+	require(!left.is_empty() && !right.is_empty(), "a product branch must contain an operation")?;
+	let (source, input) = (graph.source, graph.output);
+	let run = |graph: &mut Graph, parts: &[Residual]| -> Result<()> {
+		for part in parts {
+			match part {
+				Residual::Layer(width) => lower_project(graph, *width)?,
+				Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
+				Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
+			}
+		}
+		Ok(())
+	};
+	run(graph, left)?;
+	let (first, shape) = (graph.source, graph.output);
+	reset(graph, source, input);
+	run(graph, right)?;
+	require(
+		graph.output.channels == shape.channels && graph.output.length == shape.length,
+		format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length),
+	)?;
+	binary(graph, first, graph.source, shape, ScalarOpcode::Multiply).map(|_| ())
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);

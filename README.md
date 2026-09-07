@@ -61,6 +61,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	left * right
 
 feature reduction:
 	pool(size)
@@ -77,6 +78,20 @@ estimators:
 	svm()
 	bayes()
 ```
+`left * right` evaluates two models from the same incoming activation and
+multiplies their outputs elementwise, which is how a gated feed-forward is
+written:
+
+```rust
+let gate = recipe.model().layer(width).gelu();
+let up = recipe.model().layer(width);
+let gated = gate * up;
+```
+
+Each branch keeps its own weights and both receive gradient. A branch is layers,
+convolutions and activations. Scalar multiplication is the `scale(factor)`
+activation, not this.
+
 Feature generation is banned.
 
 ## 15 activations
