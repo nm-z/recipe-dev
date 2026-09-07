@@ -3352,7 +3352,7 @@ impl NativeModelIr {
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
 						ir.push_str(&format!("{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
-						if node.second >= 0 {
+						if pointers.second != pointers.source {
 							let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, &format!("{prefix}.first.owned")));
 							ir.push_str(&format!(
@@ -3714,12 +3714,14 @@ impl NativeModelIr {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &format!("{prefix}.source")));
 		}
-		let second = if plan.node.second >= 0 {
-			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "values", self.layout.values[second], &format!("{prefix}.second")));
-			format!("%{prefix}.second")
-		} else {
-			source.clone()
+		let second = match plan.node.second {
+			index if index >= 0 => {
+				let index = usize::try_from(index).map_err(|_| RecipeError::new("native second node is invalid"))?;
+				ir.push_str(&ptr_gep(backend, "values", self.layout.values[index], &format!("{prefix}.second")));
+				format!("%{prefix}.second")
+			}
+			-1 => "%samples".to_owned(),
+			_ => source.clone(),
 		};
 		let value = format!("%{prefix}.value");
 		let context = format!("%{prefix}.context");
@@ -3738,12 +3740,14 @@ impl NativeModelIr {
 		} else {
 			"%input_adjoint".to_owned()
 		};
-		let second_adjoint = if reverse && plan.node.second >= 0 {
-			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second adjoint node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[second], &format!("{prefix}.second.adjoint")));
-			format!("%{prefix}.second.adjoint")
-		} else {
-			source_adjoint.clone()
+		let second_adjoint = match plan.node.second {
+			index if reverse && index >= 0 => {
+				let index = usize::try_from(index).map_err(|_| RecipeError::new("native second adjoint node is invalid"))?;
+				ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[index], &format!("{prefix}.second.adjoint")));
+				format!("%{prefix}.second.adjoint")
+			}
+			-1 => "%input_adjoint".to_owned(),
+			_ => source_adjoint.clone(),
 		};
 		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
 	}
@@ -10149,8 +10153,8 @@ fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
-	graph.nodes[start..].iter().flat_map(|node| [(node.source, 1), (node.second, 0)]).any(|(index, first)| match usize::try_from(index) {
-		Ok(from) => from + first < start,
+	graph.nodes[start..].iter().flat_map(|node| [node.source, node.second]).any(|index| match usize::try_from(index) {
+		Ok(from) => from + 1 < start,
 		Err(_) => index == -1 && start != 0,
 	})
 }
@@ -10178,6 +10182,8 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 		taken += 1;
 	}
 	require(taken != 0, "model has no block")?;
+	let resident = part_bytes(&graph_part(graph, first, graph.nodes.len())?, precision)? as u64;
+	require(resident <= free, format!("device {} has {free} bytes available for its {taken}-block tail, which needs {resident} bytes", devices[split.len()].name))?;
 	split.push(taken);
 	Ok(split)
 }
@@ -10812,7 +10818,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let program_base = graph.programs.len();
 	for node in &mut part.nodes {
 		node.source = if node.source < 0 { source } else { node.source + node_base };
-		if node.second >= 0 {
+		if node.second == -1 {
+			node.second = source;
+		} else if node.second >= 0 {
 			node.second += node_base
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
