@@ -7238,10 +7238,11 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[index] = ((state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale;
 			}
 		}
-		if node.op == Primitive::Contraction {
+		let biased = node.argument[2] == 0.0;
+		if node.op == Primitive::Contraction && biased {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
-		if node.op == Primitive::Scan {
+		if node.op == Primitive::Scan && biased {
 			let channels = node.output.channels;
 			let input_matrix = node.input.channels * channels;
 			let state_matrix = channels * channels;
