@@ -932,13 +932,14 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local
 ; completes over the original context are one multiply and the kernel carries no
 ; literal that a narrower precision cannot spell.
 %rotations = call double @recipe.mul(double %yarn.context, double %frequency.raw)
+; The builder requires the fast boundary to exceed the slow one, so the span is
+; strictly positive and needs no guard here. A guard would need an epsilon, and
+; a literal this kernel cannot spell in every precision is what LLVM rejects.
 %ramp.span = call double @recipe.sub(double %yarn.fast, double %yarn.slow)
 %ramp.offset = call double @recipe.sub(double %rotations, double %yarn.slow)
-%ramp.span.zero = call i1 @recipe.ogt(double 0.000000000001, double %ramp.span)
 %ramp.raw = call double @recipe.div(double %ramp.offset, double %ramp.span)
-%ramp.safe = select i1 %ramp.span.zero, double 1.0, double %ramp.raw
-%ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.safe)
-%ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.safe
+%ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.raw)
+%ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.raw
 %ramp.high = call i1 @recipe.ogt(double %ramp.clamped.low, double 1.0)
 %ramp = select i1 %ramp.high, double 1.0, double %ramp.clamped.low
 %interpolated = call double @recipe.div(double %frequency.raw, double %yarn.factor)
