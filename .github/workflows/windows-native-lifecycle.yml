@@ -1,0 +1,186 @@
+name: Windows native lifecycle
+
+on:
+  pull_request:
+  push:
+    branches:
+      - minimal
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native-lifecycle:
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build the native release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+
+          $checkoutCommit = git rev-parse HEAD
+          if ($checkoutCommit -ne $env:GITHUB_SHA) {
+            throw "checked-out commit $checkoutCommit does not match GITHUB_SHA $env:GITHUB_SHA"
+          }
+          if (git status --porcelain) {
+            throw "the native checkout is not clean"
+          }
+
+          $clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
+          $linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+          if (!(Test-Path -LiteralPath $clang -PathType Leaf)) {
+            throw "native clang is absent: $clang"
+          }
+          if (!(Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "native linker is absent: $linker"
+          }
+
+          Write-Host "commit=$checkoutCommit"
+          cargo --version
+          rustc --version
+          & $clang --version
+          & $linker --version
+          cargo build --locked --release --lib --bin recipe
+          if ($LASTEXITCODE -ne 0) {
+            throw "native release build failed with exit code $LASTEXITCODE"
+          }
+
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $bytes = [IO.File]::ReadAllBytes($recipe)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+            throw "recipe.exe is not a PE executable"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $recipe).Hash
+          Write-Host "recipe.exe size=$($bytes.Length) sha256=$hash magic=MZ"
+
+      - name: Run the cold-cache public CPU lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          $env:RECIPE_FORCE_CPU = "1"
+
+          function Read-FiniteEvidence([string] $Path, [int] $MinimumValues) {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            $doubleBytes = [BitConverter]::GetBytes([double] 0).Length
+            if ($bytes.Length % $doubleBytes -ne 0) {
+              throw "evidence length $($bytes.Length) is not a sequence of f64 values"
+            }
+            $count = [int] ($bytes.Length / $doubleBytes)
+            if ($count -lt $MinimumValues) {
+              throw "evidence contains $count values, expected at least $MinimumValues"
+            }
+            $values = [double[]]::new($count)
+            for ($index = 0; $index -lt $count; $index++) {
+              $value = [BitConverter]::ToDouble($bytes, $index * $doubleBytes)
+              if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+                throw "evidence value $index is not finite"
+              }
+              $values[$index] = $value
+            }
+            return $values
+          }
+
+          $state = Join-Path $env:RUNNER_TEMP "recipe-windows-native-lifecycle"
+          if (Test-Path -LiteralPath $state) {
+            throw "lifecycle state already exists: $state"
+          }
+          New-Item -ItemType Directory -Path $state | Out-Null
+          $profile = Join-Path $state "profile"
+          New-Item -ItemType Directory -Path $profile | Out-Null
+
+          $rustupHome = (rustup show home).Trim()
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $rustupHome -PathType Container)) {
+            throw "rustup home is unavailable: $rustupHome"
+          }
+          $env:RUSTUP_HOME = $rustupHome
+          $env:USERPROFILE = $profile
+          $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE = Join-Path $state "model.ogdl"
+          $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
+
+          $nativeCache = Join-Path $profile ".cache\recipe\native"
+          if (Test-Path -LiteralPath $nativeCache) {
+            throw "native cache is not cold: $nativeCache"
+          }
+
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE ".github\windows-native\lifecycle.rs"
+
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "train"
+          Write-Host "RECIPE_FORCE_CPU=1 RECIPE_WINDOWS_LIFECYCLE_PHASE=train `"$recipe`" `"$source`""
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public training invocation failed with exit code $LASTEXITCODE"
+          }
+          $train = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          if (!(Test-Path -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE -PathType Leaf)) {
+            throw "training did not save the model bundle"
+          }
+          $trainedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($trainedBundle.Length -eq 0) {
+            throw "training saved an empty model bundle"
+          }
+          $trainedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $trainedBundle.FullName).Hash
+          $trainFinalBits = [BitConverter]::DoubleToInt64Bits($train[1])
+          Write-Host "train initial=$($train[0]) final=$($train[1]) final_bits=$([Convert]::ToString($trainFinalBits, 16)) predictions=$($train.Count - 2)"
+          Write-Host "trained bundle size=$($trainedBundle.Length) sha256=$trainedHash"
+
+          $artifacts = @(Get-ChildItem -LiteralPath $nativeCache -Recurse -Filter artifact.dll -File)
+          if ($artifacts.Count -eq 0) {
+            throw "cold-cache training produced no native CPU artifact"
+          }
+          foreach ($artifact in $artifacts) {
+            $bytes = [IO.File]::ReadAllBytes($artifact.FullName)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "native artifact is not a PE DLL: $($artifact.FullName)"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash
+            Write-Host "native artifact path=$($artifact.FullName) size=$($bytes.Length) sha256=$hash magic=MZ"
+          }
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "resume"
+          Write-Host "RECIPE_FORCE_CPU=1 RECIPE_WINDOWS_LIFECYCLE_PHASE=resume `"$recipe`" `"$source`""
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public resume invocation failed with exit code $LASTEXITCODE"
+          }
+          $resume = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          $resumeInitialBits = [BitConverter]::DoubleToInt64Bits($resume[0])
+          if ($resumeInitialBits -ne $trainFinalBits) {
+            throw "resume initial loss does not match the saved training state"
+          }
+          $resumedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($resumedBundle.Length -eq 0) {
+            throw "resume saved an empty model bundle"
+          }
+          $resumedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resumedBundle.FullName).Hash
+          Write-Host "resume initial=$($resume[0]) final=$($resume[1]) initial_bits=$([Convert]::ToString($resumeInitialBits, 16)) predictions=$($resume.Count - 2)"
+          Write-Host "resumed bundle size=$($resumedBundle.Length) sha256=$resumedHash"
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "infer"
+          Write-Host "RECIPE_FORCE_CPU=1 RECIPE_WINDOWS_LIFECYCLE_PHASE=infer `"$recipe`" `"$source`""
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public inference invocation failed with exit code $LASTEXITCODE"
+          }
+          $inference = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 1)
+          $inferredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE).Hash
+          if ($inferredHash -ne $resumedHash) {
+            throw "public inference mutated the saved model bundle"
+          }
+          Write-Host "inference values=$($inference.Count) first=$($inference[0]) bundle_sha256=$inferredHash"
+
+          if (git status --porcelain --untracked-files=no) {
+            throw "the public lifecycle changed tracked checkout files"
+          }
+          Write-Host "PASS commit=$env:GITHUB_SHA native_build=PE train=finite save=present resume=saved_state infer=finite"
