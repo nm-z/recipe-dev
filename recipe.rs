@@ -6753,11 +6753,15 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	}
 	Ok(())
 }
-fn sequential_operation(operation: &Operation) -> bool {
+/// Whether a block convolves or pools, looking inside the branches a composite
+/// block carries. Attention is deliberately absent: a convolution needs the
+/// sequence axis wherever it sits, while attention takes it only as the leading
+/// block of a model whose data already has one.
+fn convolutional_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) => true,
+		Operation::Conv(..) | Operation::Pool(..) => true,
 		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
-		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| convolutional_operation(&block.operation)),
 		_ => false,
 	}
 }
@@ -6767,8 +6771,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	// A sequential block anywhere in the model needs the sequence axis, including inside a hyper branch.
-	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual,
+	// mixture, or hyper branch. Attention takes it only when it leads a model whose data has one.
+	let convolutional = model.blocks.iter().any(|block| convolutional_operation(&block.operation));
+	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
