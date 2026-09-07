@@ -64,10 +64,10 @@ jobs:
           for attempt in 1 2 3 4 5 6; do
             git fetch --quiet --force origin "refs/pull/${PR_NUMBER}/merge:refs/candidate" || true
             if git rev-parse --verify --quiet refs/candidate >/dev/null; then
-              parents="$(git rev-list --parents -n 1 refs/candidate)"
-              case " $parents " in
-                *" $HEAD_SHA "*) merged="yes"; break ;;
-              esac
+              if git cat-file -p refs/candidate | grep -Fqx "parent $HEAD_SHA"; then
+                merged="yes"
+                break
+              fi
             fi
             echo "attempt $attempt: the merge ref does not yet incorporate $HEAD_SHA"
             sleep 10
