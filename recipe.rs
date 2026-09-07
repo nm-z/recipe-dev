@@ -482,6 +482,7 @@ mod program_ir {
 		pub row: &'a str,
 		pub features: usize,
 		pub weights: &'a str,
+		pub context: &'a str,
 		pub parameters: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
@@ -501,6 +502,7 @@ mod program_ir {
 
 	/// Emit a predictor without a runtime stack, local array, or opcode switch.
 	/// Stores and loads are resolved at compile time into SSA values.
+	#[rustfmt::skip]
 	pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorContext<'_>) -> Result<PredictorForward, EmitError> {
 		let instructions = parse_predictor(code)?;
 		let mut output = String::new();
@@ -615,73 +617,42 @@ mod program_ir {
 					let p = format!("{}.nearest.{sequence}", context.prefix);
 					sequence += 1;
 					let (zero, maximum) = ((context.literal)(0.0, ty), (context.literal)(f64::MAX, ty));
-					// Row loop head: induction variable plus the k best (distance, target) pairs as phis.
-					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
-					let _ = writeln!(output, "%{p}.i = phi i32 [ 0, %{p}.entry ], [ %{p}.i.next, %{p}.latch ]");
-					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}.new, %{p}.latch ]");
-						let _ = writeln!(output, "%{p}.t{slot} = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.t{slot}.new, %{p}.latch ]");
+					if maximum == zero {
+						let result = format!("%{p}.result");
+						let _ = writeln!(output, "{result} = call {ty} @recipe.div({ty} {zero}, {ty} {count})", count = (context.literal)(count as f64, ty));
+						stack.push(result);
+						continue;
 					}
-					let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.i, {rows}\nbr i1 %{p}.more, label %{p}.distance, label %{p}.done");
-					// Squared distance between the query row and stored row i, accumulated per feature.
-					let _ = writeln!(output, "{p}.distance:\nbr label %{p}.d.head\n{p}.d.head:");
-					let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.distance ], [ %{p}.j.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.distance ], [ %{p}.acc.next, %{p}.d.body ]");
-					let _ = writeln!(output, "%{p}.d.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.d.more, label %{p}.d.body, label %{p}.d.done", features = context.features);
-					let _ = writeln!(output, "{p}.d.body:");
-					let _ = writeln!(
-						output,
-						"%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}",
-						row = context.row,
-						features = context.features,
-						input = context.input
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.w.base = mul i32 %{p}.i, {features}\n%{p}.w.index = add i32 %{p}.w.base, %{p}.j\n%{p}.w.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.w.index\n%{p}.w = load {ty}, {ptr} %{p}.w.ptr, align {align}",
-						features = context.features,
-						weights = context.weights
-					);
-					let _ = writeln!(
-						output,
-						"%{p}.diff = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.w)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.diff, {ty} %{p}.diff)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.square)"
-					);
-					let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.d.head\n{p}.d.done:");
-					let candidate_distance = if exclude {
-						let _ = writeln!(output, "%{p}.self = icmp eq i32 %{p}.i, {row}\n%{p}.candidate = select i1 %{p}.self, {ty} {maximum}, {ty} %{p}.acc", row = context.row);
-						format!("%{p}.candidate")
-					} else {
-						format!("%{p}.acc")
-					};
-					let _ = writeln!(
-						output,
-						"%{p}.target.index = add i32 {base}, %{p}.i\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}",
-						base = rows * context.features,
-						weights = context.weights
-					);
-					// Bubble the candidate through the k slots. A displaced entry precedes every later
-					// equal-distance slot because rows are visited in ascending index order.
-					let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
-					let mut carry_precedes = "false".to_owned();
+					let (node_slots, node_stride) = super::nearest_index_shape(rows, context.features).ok_or(EmitError::InvalidOperand { kind: "nearest index size", value: rows as f64 })?;
+					let permutation = node_slots.checked_mul(node_stride).ok_or(EmitError::InvalidOperand { kind: "nearest index size", value: rows as f64 })?;
+					let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.tree\n{p}.tree:\n%{p}.node = phi i32 [ 0, %{p}.entry ], [ %{p}.internal.next, %{p}.internal.done ], [ %{p}.parent, %{p}.leaf.done ]\n%{p}.previous = phi i32 [ -1, %{p}.entry ], [ %{p}.node, %{p}.internal.done ], [ %{p}.node, %{p}.leaf.done ]");
 					for slot in 0..count {
-						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.d{slot}, {ty} {carry_distance})");
-						let _ = writeln!(output, "%{p}.tie{slot} = and i1 %{p}.equal{slot}, {carry_precedes}");
-						let _ = writeln!(output, "%{p}.swap{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}");
-						let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
-						let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
-						let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
-						let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
-						let _ = writeln!(output, "%{p}.carry.precedes{slot} = or i1 {carry_precedes}, %{p}.swap{slot}");
+						let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}, %{p}.internal.done ], [ %{p}.leaf.d{slot}, %{p}.leaf.done ]");
+						let _ = writeln!(output, "%{p}.r{slot} = phi i32 [ -1, %{p}.entry ], [ %{p}.r{slot}, %{p}.internal.done ], [ %{p}.leaf.r{slot}, %{p}.leaf.done ]");
+					}
+					let _ = writeln!(output, "%{p}.active = icmp ne i32 %{p}.node, -1\nbr i1 %{p}.active, label %{p}.load, label %{p}.done\n{p}.load:\n%{p}.node.base = mul i32 %{p}.node, {stride}", stride = node_stride);
+					for (field, name) in ["minimum", "first", "second", "dimension", "parent"].into_iter().enumerate() {
+						let _ = writeln!(output, "%{p}.{name}.index = add i32 %{p}.node.base, {field}\n%{p}.{name}.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.{name}.index\n%{p}.{name} = load i32, {ptr} %{p}.{name}.ptr, align 4", context = context.context);
+					}
+					let _ = writeln!(output, "%{p}.is.leaf = icmp uge i32 %{p}.dimension, -2\nbr i1 %{p}.is.leaf, label %{p}.leaf.entry, label %{p}.internal\n{p}.internal:\n%{p}.left = add i32 %{p}.node, 1\n%{p}.query.base = mul i32 {row}, {features}\n%{p}.query.index = add i32 %{p}.query.base, %{p}.dimension\n%{p}.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.query.index\n%{p}.query = load {ty}, {ptr} %{p}.query.ptr, align {align}\n%{p}.threshold.base = mul i32 %{p}.first, {features}\n%{p}.threshold.index = add i32 %{p}.threshold.base, %{p}.dimension\n%{p}.threshold.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.threshold.index\n%{p}.threshold = load {ty}, {ptr} %{p}.threshold.ptr, align {align}\n%{p}.right.first = call i1 @recipe.ogt({ty} %{p}.query, {ty} %{p}.threshold)\n%{p}.near = select i1 %{p}.right.first, i32 %{p}.second, i32 %{p}.left\n%{p}.far = select i1 %{p}.right.first, i32 %{p}.left, i32 %{p}.second\n%{p}.entering = icmp eq i32 %{p}.previous, %{p}.parent\nbr i1 %{p}.entering, label %{p}.internal.near, label %{p}.internal.returned\n{p}.internal.near:\nbr label %{p}.internal.done\n{p}.internal.returned:\n%{p}.from.near = icmp eq i32 %{p}.previous, %{p}.near\nbr i1 %{p}.from.near, label %{p}.bound.entry, label %{p}.internal.parent\n{p}.internal.parent:\nbr label %{p}.internal.done\n{p}.bound.entry:\n%{p}.far.base = mul i32 %{p}.far, {stride}\n%{p}.far.minimum.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.far.base\n%{p}.far.minimum = load i32, {ptr} %{p}.far.minimum.ptr, align 4\nbr label %{p}.bound.head\n{p}.bound.head:\n%{p}.bound.feature = phi i32 [ 0, %{p}.bound.entry ], [ %{p}.bound.feature.next, %{p}.bound.body ]\n%{p}.bound.distance = phi {ty} [ {zero}, %{p}.bound.entry ], [ %{p}.bound.distance.next, %{p}.bound.body ]\n%{p}.bound.farther = call i1 @recipe.ogt({ty} %{p}.bound.distance, {ty} %{p}.d{last})\n%{p}.bound.same = call i1 @recipe.oeq({ty} %{p}.bound.distance, {ty} %{p}.d{last})\n%{p}.bound.later = icmp ugt i32 %{p}.far.minimum, %{p}.r{last}\n%{p}.bound.tie = and i1 %{p}.bound.same, %{p}.bound.later\n%{p}.bound.bounded = or i1 %{p}.bound.farther, %{p}.bound.tie\n%{p}.bound.full = icmp ne i32 %{p}.r{last}, -1\n%{p}.bound.prune = and i1 %{p}.bound.full, %{p}.bound.bounded\n%{p}.bound.more.raw = icmp ult i32 %{p}.bound.feature, {features}\n%{p}.bound.keep = xor i1 %{p}.bound.prune, true\n%{p}.bound.more = and i1 %{p}.bound.more.raw, %{p}.bound.keep\nbr i1 %{p}.bound.more, label %{p}.bound.body, label %{p}.bound.done\n{p}.bound.body:\n%{p}.bound.query.base = mul i32 {row}, {features}\n%{p}.bound.query.index = add i32 %{p}.bound.query.base, %{p}.bound.feature\n%{p}.bound.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.bound.query.index\n%{p}.bound.query = load {ty}, {ptr} %{p}.bound.query.ptr, align {align}\n%{p}.lower.position = add i32 %{p}.far.base, {fields}\n%{p}.lower.index = add i32 %{p}.lower.position, %{p}.bound.feature\n%{p}.lower.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.lower.index\n%{p}.lower.row = load i32, {ptr} %{p}.lower.ptr, align 4\n%{p}.upper.position = add i32 %{p}.lower.position, {features}\n%{p}.upper.index = add i32 %{p}.upper.position, %{p}.bound.feature\n%{p}.upper.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.upper.index\n%{p}.upper.row = load i32, {ptr} %{p}.upper.ptr, align 4\n%{p}.lower.base = mul i32 %{p}.lower.row, {features}\n%{p}.lower.weight.index = add i32 %{p}.lower.base, %{p}.bound.feature\n%{p}.lower.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.lower.weight.index\n%{p}.lower = load {ty}, {ptr} %{p}.lower.weight.ptr, align {align}\n%{p}.upper.base = mul i32 %{p}.upper.row, {features}\n%{p}.upper.weight.index = add i32 %{p}.upper.base, %{p}.bound.feature\n%{p}.upper.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.upper.weight.index\n%{p}.upper = load {ty}, {ptr} %{p}.upper.weight.ptr, align {align}\n%{p}.below = call i1 @recipe.olt({ty} %{p}.bound.query, {ty} %{p}.lower)\n%{p}.above = call i1 @recipe.ogt({ty} %{p}.bound.query, {ty} %{p}.upper)\n%{p}.closest.lower = select i1 %{p}.below, {ty} %{p}.lower, {ty} %{p}.bound.query\n%{p}.closest = select i1 %{p}.above, {ty} %{p}.upper, {ty} %{p}.closest.lower\n%{p}.bound.difference = call {ty} @recipe.sub({ty} %{p}.bound.query, {ty} %{p}.closest)\n%{p}.bound.square = call {ty} @recipe.mul({ty} %{p}.bound.difference, {ty} %{p}.bound.difference)\n%{p}.bound.distance.next = call {ty} @recipe.add({ty} %{p}.bound.distance, {ty} %{p}.bound.square)\n%{p}.bound.feature.next = add i32 %{p}.bound.feature, 1\nbr label %{p}.bound.head\n{p}.bound.done:\n%{p}.farther = call i1 @recipe.ogt({ty} %{p}.bound.distance, {ty} %{p}.d{last})\n%{p}.same.gap = call i1 @recipe.oeq({ty} %{p}.bound.distance, {ty} %{p}.d{last})\n%{p}.later.row = icmp ugt i32 %{p}.far.minimum, %{p}.r{last}\n%{p}.tie.prune = and i1 %{p}.same.gap, %{p}.later.row\n%{p}.bounded = or i1 %{p}.farther, %{p}.tie.prune\n%{p}.full = icmp ne i32 %{p}.r{last}, -1\n%{p}.prune = and i1 %{p}.full, %{p}.bounded\n%{p}.visit.far = xor i1 %{p}.prune, true\n%{p}.returned.next = select i1 %{p}.visit.far, i32 %{p}.far, i32 %{p}.parent\nbr label %{p}.internal.done\n{p}.internal.done:\n%{p}.internal.next = phi i32 [ %{p}.near, %{p}.internal.near ], [ %{p}.parent, %{p}.internal.parent ], [ %{p}.returned.next, %{p}.bound.done ]\nbr label %{p}.tree", row = context.row, features = context.features, input = context.input, weights = context.weights, context = context.context, fields = super::NEAREST_NODE_FIELDS, stride = node_stride, last = count - 1);
+					let _ = writeln!(output, "{p}.leaf.entry:\nbr label %{p}.leaf.head\n{p}.leaf.head:\n%{p}.leaf.i = phi i32 [ %{p}.first, %{p}.leaf.entry ], [ %{p}.leaf.i.next, %{p}.leaf.latch ]");
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.leaf.d{slot} = phi {ty} [ %{p}.d{slot}, %{p}.leaf.entry ], [ %{p}.leaf.d{slot}.new, %{p}.leaf.latch ]\n%{p}.leaf.r{slot} = phi i32 [ %{p}.r{slot}, %{p}.leaf.entry ], [ %{p}.leaf.r{slot}.new, %{p}.leaf.latch ]");
+					}
+					let allowed = if exclude { format!("xor i1 %{p}.self, true") } else { "icmp eq i1 false, false".to_owned() };
+					let _ = writeln!(output, "%{p}.leaf.identical = icmp eq i32 %{p}.dimension, -2\n%{p}.leaf.cap.raw = add i32 %{p}.first, {cap}\n%{p}.leaf.cap.before = icmp ult i32 %{p}.leaf.cap.raw, %{p}.second\n%{p}.leaf.cap = select i1 %{p}.leaf.cap.before, i32 %{p}.leaf.cap.raw, i32 %{p}.second\n%{p}.leaf.end = select i1 %{p}.leaf.identical, i32 %{p}.leaf.cap, i32 %{p}.second\n%{p}.leaf.more = icmp ult i32 %{p}.leaf.i, %{p}.leaf.end\nbr i1 %{p}.leaf.more, label %{p}.leaf.distance, label %{p}.leaf.done\n{p}.leaf.distance:\n%{p}.candidate.position = add i32 %{p}.leaf.i, {permutation}\n%{p}.candidate.ptr = getelementptr inbounds i32, {ptr} {context}, i32 %{p}.candidate.position\n%{p}.candidate = load i32, {ptr} %{p}.candidate.ptr, align 4\nbr label %{p}.distance.head\n{p}.distance.head:\n%{p}.feature = phi i32 [ 0, %{p}.leaf.distance ], [ %{p}.feature.next, %{p}.distance.body ]\n%{p}.distance = phi {ty} [ {zero}, %{p}.leaf.distance ], [ %{p}.distance.next, %{p}.distance.body ]\n%{p}.distance.farther = call i1 @recipe.ogt({ty} %{p}.distance, {ty} %{p}.d{last})\n%{p}.distance.same = call i1 @recipe.oeq({ty} %{p}.distance, {ty} %{p}.d{last})\n%{p}.distance.later = icmp ugt i32 %{p}.candidate, %{p}.r{last}\n%{p}.distance.tie = and i1 %{p}.distance.same, %{p}.distance.later\n%{p}.distance.bounded = or i1 %{p}.distance.farther, %{p}.distance.tie\n%{p}.distance.full = icmp ne i32 %{p}.r{last}, -1\n%{p}.distance.prune = and i1 %{p}.distance.full, %{p}.distance.bounded\n%{p}.feature.more.raw = icmp ult i32 %{p}.feature, {features}\n%{p}.distance.keep = xor i1 %{p}.distance.prune, true\n%{p}.feature.more = and i1 %{p}.feature.more.raw, %{p}.distance.keep\nbr i1 %{p}.feature.more, label %{p}.distance.body, label %{p}.distance.done\n{p}.distance.body:\n%{p}.leaf.query.base = mul i32 {row}, {features}\n%{p}.leaf.query.index = add i32 %{p}.leaf.query.base, %{p}.feature\n%{p}.leaf.query.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.leaf.query.index\n%{p}.leaf.query = load {ty}, {ptr} %{p}.leaf.query.ptr, align {align}\n%{p}.candidate.base = mul i32 %{p}.candidate, {features}\n%{p}.candidate.index = add i32 %{p}.candidate.base, %{p}.feature\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.candidate.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}\n%{p}.difference = call {ty} @recipe.sub({ty} %{p}.leaf.query, {ty} %{p}.weight)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.difference, {ty} %{p}.difference)\n%{p}.distance.next = call {ty} @recipe.add({ty} %{p}.distance, {ty} %{p}.square)\n%{p}.feature.next = add i32 %{p}.feature, 1\nbr label %{p}.distance.head\n{p}.distance.done:\n%{p}.finite = call i1 @recipe.olt({ty} %{p}.distance, {ty} {maximum})\n%{p}.self = icmp eq i32 %{p}.candidate, {row}\n%{p}.not.self = {allowed}\n%{p}.candidate.valid = and i1 %{p}.finite, %{p}.not.self", permutation = permutation, context = context.context, features = context.features, row = context.row, input = context.input, weights = context.weights, last = count - 1, cap = count + usize::from(exclude));
+					let (mut carry_distance, mut carry_row) = (format!("%{p}.distance"), format!("%{p}.candidate"));
+					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.leaf.d{slot}, {ty} {carry_distance})\n%{p}.row.before{slot} = icmp ult i32 {carry_row}, %{p}.leaf.r{slot}\n%{p}.tie{slot} = and i1 %{p}.equal{slot}, %{p}.row.before{slot}\n%{p}.ordered{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}\n%{p}.swap{slot} = and i1 %{p}.candidate.valid, %{p}.ordered{slot}\n%{p}.leaf.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.leaf.d{slot}\n%{p}.leaf.r{slot}.new = select i1 %{p}.swap{slot}, i32 {carry_row}, i32 %{p}.leaf.r{slot}\n%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.leaf.d{slot}, {ty} {carry_distance}\n%{p}.carry.r{slot} = select i1 %{p}.swap{slot}, i32 %{p}.leaf.r{slot}, i32 {carry_row}");
 						carry_distance = format!("%{p}.carry.d{slot}");
-						carry_target = format!("%{p}.carry.t{slot}");
-						carry_precedes = format!("%{p}.carry.precedes{slot}");
+						carry_row = format!("%{p}.carry.r{slot}");
 					}
-					let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
-					let mut sum = zero;
+					let _ = writeln!(output, "br label %{p}.leaf.latch\n{p}.leaf.latch:\n%{p}.leaf.i.next = add i32 %{p}.leaf.i, 1\nbr label %{p}.leaf.head\n{p}.leaf.done:\nbr label %{p}.tree\n{p}.done:");
+					let mut sum = zero.clone();
 					for slot in 0..count {
+						let _ = writeln!(output, "%{p}.present{slot} = icmp ne i32 %{p}.r{slot}, -1\n%{p}.safe{slot} = select i1 %{p}.present{slot}, i32 %{p}.r{slot}, i32 0\n%{p}.target.index{slot} = add i32 {base}, %{p}.safe{slot}\n%{p}.target.ptr{slot} = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index{slot}\n%{p}.target.raw{slot} = load {ty}, {ptr} %{p}.target.ptr{slot}, align {align}\n%{p}.target{slot} = select i1 %{p}.present{slot}, {ty} %{p}.target.raw{slot}, {ty} {zero}", base = rows * context.features, weights = context.weights);
 						let name = format!("%{p}.sum{slot}");
-						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.t{slot})");
+						let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.target{slot})");
 						sum = name;
 					}
 					let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
@@ -821,6 +792,17 @@ mod program_ir {
 		Rms,
 		/// Stored batch statistics used by evaluation and inference.
 		Evaluation,
+		/// Row L2 statistics use layer-shaped groups with a zero mean, no item
+		/// average, and an epsilon floor on the norm.
+		L2,
+	}
+
+	impl NormalizeMode {
+		/// Layer-shaped modes group one row position; the group holds `width`
+		/// channels, so a row of `channels` splits into `channels / width` heads.
+		pub fn per_row(self) -> bool {
+			matches!(self, Self::Layer | Self::Rms | Self::L2)
+		}
 	}
 
 	#[derive(Clone, Copy)]
@@ -833,13 +815,82 @@ mod program_ir {
 		pub rows: &'a str,
 		pub channels: usize,
 		pub length: usize,
+		/// Channels per group in the per-row modes.
+		pub width: usize,
+		/// Channels the per-row modes normalize; the rest pass through.
+		pub span: usize,
+		/// The per-channel scale applied after normalization, when the node carries one.
+		pub weight: Option<&'a str>,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
+	}
+
+	impl NormalizeContext<'_> {
+		fn shape(&self) -> GroupShape<'_> {
+			GroupShape { mode: self.mode, channels: self.channels, length: self.length, width: self.width, span: self.span, rows: self.rows }
+		}
 	}
 
 	pub struct NormalizeFragment {
 		pub code: String,
 		pub value: String,
+	}
+
+	#[derive(Clone, Copy)]
+	struct GroupShape<'a> {
+		mode: NormalizeMode,
+		channels: usize,
+		length: usize,
+		width: usize,
+		span: usize,
+		rows: &'a str,
+	}
+
+	struct GroupIndex {
+		group: String,
+		groups: String,
+		channel: String,
+		/// The predicate that holds where the element normalizes, when a channel of
+		/// the row passes through instead.
+		inside: Option<String>,
+	}
+
+	/// Names the statistics group of one element. A per-row mode splits the leading
+	/// `span` channels into groups of `width`, so one attention head owns one group;
+	/// a channel past the span has no group and clamps to the first one.
+	fn emit_group_index(code: &mut String, prefix: &str, shape: GroupShape<'_>, element: &str) -> GroupIndex {
+		let (channels, length, elements) = (shape.channels, shape.length, shape.channels * shape.length);
+		let (row, local, position) = (format!("%{prefix}.row"), format!("%{prefix}.local"), format!("%{prefix}.position"));
+		let (group, groups, channel) = (format!("%{prefix}.group"), format!("%{prefix}.groups"), format!("%{prefix}.channel"));
+		let _ = writeln!(code, "{row} = udiv i32 {element}, {elements}");
+		let _ = writeln!(code, "{local} = urem i32 {element}, {elements}");
+		let _ = writeln!(code, "{position} = urem i32 {local}, {length}");
+		let _ = writeln!(code, "{channel} = udiv i32 {local}, {length}");
+		if !shape.mode.per_row() {
+			let _ = writeln!(code, "{group} = add i32 {channel}, 0");
+			let _ = writeln!(code, "{groups} = add i32 0, {channels}");
+			return GroupIndex { group, groups, channel, inside: None };
+		}
+		let (span, width) = (shape.span, shape.width);
+		let inside = (span < channels).then(|| format!("%{prefix}.inside"));
+		let head = format!("%{prefix}.head");
+		match &inside {
+			Some(inside) => {
+				let _ = writeln!(code, "{inside} = icmp ult i32 {channel}, {span}");
+				let _ = writeln!(code, "%{prefix}.head.whole = udiv i32 {channel}, {width}");
+				let _ = writeln!(code, "{head} = select i1 {inside}, i32 %{prefix}.head.whole, i32 0");
+			}
+			None => {
+				let _ = writeln!(code, "{head} = udiv i32 {channel}, {width}");
+			}
+		}
+		let plane = length * (span / width);
+		let _ = writeln!(code, "%{prefix}.head.base = mul i32 {head}, {length}");
+		let _ = writeln!(code, "%{prefix}.row.base = mul i32 {row}, {plane}");
+		let _ = writeln!(code, "%{prefix}.row.group = add i32 %{prefix}.row.base, %{prefix}.head.base");
+		let _ = writeln!(code, "{group} = add i32 %{prefix}.row.group, {position}");
+		let _ = writeln!(code, "{groups} = mul i32 {rows}, {plane}", rows = shape.rows);
+		GroupIndex { group, groups, channel, inside }
 	}
 
 	/// Emit one normalized element from the fixed statistics arena. The arena is
@@ -848,37 +899,16 @@ mod program_ir {
 	/// pass before this fragment; evaluation and inference reuse the stored arena.
 	pub fn emit_normalize(context: NormalizeContext<'_>, element: &str) -> NormalizeFragment {
 		let mut output = String::new();
-		let elements = context.channels * context.length;
-		let length = context.length;
-		let local = format!("%{}.normalize.local", context.prefix);
-		let row = format!("%{}.normalize.row", context.prefix);
-		let position = format!("%{}.normalize.position", context.prefix);
-		let group = format!("%{}.normalize.group", context.prefix);
-		let groups = format!("%{}.normalize.groups", context.prefix);
-		let scale_index = format!("%{}.normalize.scale.index", context.prefix);
-		let mean_pointer = format!("%{}.normalize.mean.ptr", context.prefix);
-		let scale_pointer = format!("%{}.normalize.scale.ptr", context.prefix);
-		let mean = format!("%{}.normalize.mean", context.prefix);
-		let scale = format!("%{}.normalize.scale", context.prefix);
-		let centered = format!("%{}.normalize.centered", context.prefix);
-		let value = format!("%{}.normalize.value", context.prefix);
-		let _ = writeln!(output, "{row} = udiv i32 {element}, {elements}");
-		let _ = writeln!(output, "{local} = urem i32 {element}, {elements}");
-		let _ = writeln!(output, "{position} = urem i32 {local}, {length}");
-		match context.mode {
-			NormalizeMode::Batch | NormalizeMode::Evaluation => {
-				let channel = format!("%{}.normalize.channel", context.prefix);
-				let _ = writeln!(output, "{channel} = udiv i32 {local}, {length}");
-				let _ = writeln!(output, "{group} = add i32 {channel}, 0");
-				let _ = writeln!(output, "{groups} = add i32 0, {channels}", channels = context.channels);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let row_base = format!("%{}.normalize.layer.row.base", context.prefix);
-				let _ = writeln!(output, "{row_base} = mul i32 {row}, {length}");
-				let _ = writeln!(output, "{group} = add i32 {row_base}, {position}");
-				let _ = writeln!(output, "{groups} = mul i32 {rows}, {length}", rows = context.rows);
-			}
-		}
+		let prefix = format!("{}.normalize", context.prefix);
+		let index = emit_group_index(&mut output, &prefix, context.shape(), element);
+		let (group, groups) = (&index.group, &index.groups);
+		let scale_index = format!("%{prefix}.scale.index");
+		let mean_pointer = format!("%{prefix}.mean.ptr");
+		let scale_pointer = format!("%{prefix}.scale.ptr");
+		let mean = format!("%{prefix}.mean");
+		let scale = format!("%{prefix}.scale");
+		let centered = format!("%{prefix}.centered");
+		let value = format!("%{prefix}.value");
 		let _ = writeln!(output, "{scale_index} = add i32 {groups}, {group}");
 		let _ = writeln!(
 			output,
@@ -912,7 +942,33 @@ mod program_ir {
 		);
 		let _ = writeln!(output, "{centered} = call {ty} @recipe.sub({ty} {source}, {ty} {mean})", ty = context.value_type, source = context.source_value);
 		let _ = writeln!(output, "{value} = call {ty} @recipe.mul({ty} {centered}, {ty} {scale})", ty = context.value_type);
-		NormalizeFragment { code: output, value }
+		let value = match context.weight {
+			None => value,
+			Some(weight) => {
+				let weight_pointer = format!("%{prefix}.weight.ptr");
+				let weight_value = format!("%{prefix}.weight");
+				let scaled = format!("%{prefix}.scaled");
+				let column = weight_column(&mut output, &prefix, &index);
+				let _ = writeln!(output, "{weight_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i32 {column}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ =
+					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul({ty} {value}, {ty} {weight_value})", ty = context.value_type);
+				scaled
+			}
+		};
+		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
+		let passed = format!("%{prefix}.passed");
+		let _ = writeln!(output, "{passed} = select i1 {inside}, {ty} {value}, {ty} {source}", ty = context.value_type, source = context.source_value);
+		NormalizeFragment { code: output, value: passed }
+	}
+
+	/// The scale column of one element. Only the normalized span carries a scale, so
+	/// a passing channel reads the first column and drops the product.
+	fn weight_column(code: &mut String, prefix: &str, index: &GroupIndex) -> String {
+		let Some(inside) = &index.inside else { return index.channel.clone() };
+		let column = format!("%{prefix}.weight.channel");
+		let _ = writeln!(code, "{column} = select i1 {inside}, i32 {channel}, i32 0", channel = index.channel);
+		column
 	}
 
 	#[derive(Clone, Copy)]
@@ -926,8 +982,22 @@ mod program_ir {
 		pub rows: &'a str,
 		pub channels: usize,
 		pub length: usize,
+		/// Channels per group in the per-row modes.
+		pub width: usize,
+		/// Channels the per-row modes normalize; the rest pass through.
+		pub span: usize,
+		/// The per-channel scale the forward pass applied, when the node carries one.
+		pub weight: Option<&'a str>,
+		/// The node input, which a weighted node re-normalizes in reverse.
+		pub source: &'a str,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
+	}
+
+	impl NormalizeReverseContext<'_> {
+		fn shape(&self) -> GroupShape<'_> {
+			GroupShape { mode: self.mode, channels: self.channels, length: self.length, width: self.width, span: self.span, rows: self.rows }
+		}
 	}
 
 	pub struct NormalizeReverseFragment {
@@ -946,14 +1016,15 @@ mod program_ir {
 		let group = format!("%{prefix}.group");
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
+		let heads = context.span / context.width;
 		match context.mode {
 			NormalizeMode::Batch => {
 				let _ = writeln!(code, "{groups} = add i32 0, {}", context.channels);
 				let _ = writeln!(code, "{items} = mul i32 {}, {}", context.rows, context.length);
 			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let _ = writeln!(code, "{groups} = mul i32 {}, {}", context.rows, context.length);
-				let _ = writeln!(code, "{items} = add i32 0, {}", context.channels);
+			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
+				let _ = writeln!(code, "{groups} = mul i32 {}, {}", context.rows, context.length * heads);
+				let _ = writeln!(code, "{items} = add i32 0, {}", context.width);
 			}
 			NormalizeMode::Evaluation => return code,
 		}
@@ -983,11 +1054,15 @@ mod program_ir {
 				let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
 				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 {group}, {}", context.length);
 			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let _ = writeln!(code, "%{prefix}.row = udiv i32 {group}, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.position = urem i32 {group}, {}", context.length);
+			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
+				let _ = writeln!(code, "%{prefix}.row = udiv i32 {group}, {}", context.length * heads);
+				let _ = writeln!(code, "%{prefix}.row.local = urem i32 {group}, {}", context.length * heads);
+				let _ = writeln!(code, "%{prefix}.head = udiv i32 %{prefix}.row.local, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.position = urem i32 %{prefix}.row.local, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.head.base = mul i32 %{prefix}.head, {}", context.width);
+				let _ = writeln!(code, "%{prefix}.channel = add i32 %{prefix}.head.base, %{prefix}.p");
 				let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
-				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 %{prefix}.p, {}", context.length);
+				let _ = writeln!(code, "%{prefix}.channel.base = mul i32 %{prefix}.channel, {}", context.length);
 			}
 			NormalizeMode::Evaluation => unreachable!(),
 		}
@@ -1003,9 +1078,56 @@ mod program_ir {
 		);
 		let _ = writeln!(code, "%{prefix}.delta.model = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 		let _ = writeln!(code, "%{prefix}.output.model = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-		let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model({ty} %{prefix}.delta.model)", state = context.state_type, ty = context.value_type);
-		let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model({ty} %{prefix}.output.model)", state = context.state_type, ty = context.value_type);
-		if context.mode == NormalizeMode::Rms {
+		// A weighted node stored `weight * normalized`, so the reverse formula takes
+		// the delta scaled by the weight and re-normalizes the input for the projection.
+		let (delta_model, output_model) = match context.weight {
+			Some(weight) => {
+				let _ = writeln!(code, "%{prefix}.scale.index = add i32 {groups}, {group}");
+				let _ = writeln!(
+					code,
+					"%{prefix}.scale.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.scale.index",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					context_ptr = context.context
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.scale = load {ty}, {ptrty} %{prefix}.scale.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.source.ptr = getelementptr inbounds {ty}, {ptrty} {source}, i32 %{prefix}.index",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					source = context.source
+				);
+				let _ = writeln!(
+					code,
+					"%{prefix}.source.model = load {ty}, {ptrty} %{prefix}.source.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(code, "%{prefix}.normalized = call {ty} @recipe.mul({ty} %{prefix}.source.model, {ty} %{prefix}.scale)", ty = context.value_type);
+				let _ = writeln!(code, "%{prefix}.weight.ptr = getelementptr inbounds {ty}, {ptrty} {weight}, i32 %{prefix}.channel", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(
+					code,
+					"%{prefix}.weight = load {ty}, {ptrty} %{prefix}.weight.ptr, align {align}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					align = context.alignment
+				);
+				let _ = writeln!(code, "%{prefix}.delta.weighted = call {ty} @recipe.mul({ty} %{prefix}.delta.model, {ty} %{prefix}.weight)", ty = context.value_type);
+				(format!("%{prefix}.delta.weighted"), format!("%{prefix}.normalized"))
+			}
+			None => (format!("%{prefix}.delta.model"), format!("%{prefix}.output.model")),
+		};
+		let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model({ty} {delta_model})", state = context.state_type, ty = context.value_type);
+		let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model({ty} {output_model})", state = context.state_type, ty = context.value_type);
+		if matches!(context.mode, NormalizeMode::Rms | NormalizeMode::L2) {
 			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} {zero})", ty = context.state_type, zero = context.state_zero);
 		} else {
 			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.state_type);
@@ -1017,7 +1139,11 @@ mod program_ir {
 		let _ = writeln!(code, "{prefix}.store:");
 		let _ = writeln!(code, "%{prefix}.items.value = call {ty} @recipe.state.from.u32(i32 {items})", ty = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.mean = call {ty} @recipe.state.div({ty} %{prefix}.sum, {ty} %{prefix}.items.value)", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div({ty} %{prefix}.projected, {ty} %{prefix}.items.value)", ty = context.state_type);
+		// An L2 group scales by its norm rather than its root mean square, so its
+		// reverse projection is the whole sum over the group.
+		let projected_divisor = if context.mode == NormalizeMode::L2 { "one" } else { "items.value" };
+		let _ = writeln!(code, "%{prefix}.one = call {ty} @recipe.state.from.u32(i32 1)", ty = context.state_type);
+		let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div({ty} %{prefix}.projected, {ty} %{prefix}.{projected_divisor})", ty = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.model = call {ty} @recipe.model.from.state({state} %{prefix}.sum.mean)", ty = context.value_type, state = context.state_type);
 		let _ = writeln!(code, "%{prefix}.projected.model = call {ty} @recipe.model.from.state({state} %{prefix}.projected.mean)", ty = context.value_type, state = context.state_type);
 		let _ = writeln!(code, "%{prefix}.sum.base = mul i32 {groups}, 2");
@@ -1060,41 +1186,21 @@ mod program_ir {
 	/// uses stored scale directly because its stats are not differentiated.
 	pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &str, delta: &str, output_value: &str) -> NormalizeReverseFragment {
 		let mut code = String::new();
-		let elements = context.channels * context.length;
-		let length = context.length;
-		let row = format!("%{}.normalize.reverse.row", context.prefix);
-		let local = format!("%{}.normalize.reverse.local", context.prefix);
-		let position = format!("%{}.normalize.reverse.position", context.prefix);
-		let group = format!("%{}.normalize.reverse.group", context.prefix);
-		let groups = format!("%{}.normalize.reverse.groups", context.prefix);
-		let scale_index = format!("%{}.normalize.reverse.scale.index", context.prefix);
-		let sum_base = format!("%{}.normalize.reverse.sum.base", context.prefix);
-		let projected_base = format!("%{}.normalize.reverse.projected.base", context.prefix);
-		let sum_index = format!("%{}.normalize.reverse.sum.index", context.prefix);
-		let projected_index = format!("%{}.normalize.reverse.projected.index", context.prefix);
-		let scale_pointer = format!("%{}.normalize.reverse.scale.ptr", context.prefix);
-		let sum_pointer = format!("%{}.normalize.reverse.sum.ptr", context.prefix);
-		let projected_pointer = format!("%{}.normalize.reverse.projected.ptr", context.prefix);
-		let scale = format!("%{}.normalize.reverse.scale", context.prefix);
-		let sum = format!("%{}.normalize.reverse.sum", context.prefix);
-		let projected = format!("%{}.normalize.reverse.projected", context.prefix);
-		let _ = writeln!(code, "{row} = udiv i32 {element}, {elements}");
-		let _ = writeln!(code, "{local} = urem i32 {element}, {elements}");
-		let _ = writeln!(code, "{position} = urem i32 {local}, {length}");
-		match context.mode {
-			NormalizeMode::Batch | NormalizeMode::Evaluation => {
-				let channel = format!("%{}.normalize.reverse.channel", context.prefix);
-				let _ = writeln!(code, "{channel} = udiv i32 {local}, {length}");
-				let _ = writeln!(code, "{group} = add i32 {channel}, 0");
-				let _ = writeln!(code, "{groups} = add i32 0, {channels}", channels = context.channels);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms => {
-				let row_base = format!("%{}.normalize.reverse.row.base", context.prefix);
-				let _ = writeln!(code, "{row_base} = mul i32 {row}, {length}");
-				let _ = writeln!(code, "{group} = add i32 {row_base}, {position}");
-				let _ = writeln!(code, "{groups} = mul i32 {rows}, {length}", rows = context.rows);
-			}
-		}
+		let prefix = format!("{}.normalize.reverse", context.prefix);
+		let index = emit_group_index(&mut code, &prefix, context.shape(), element);
+		let (group, groups) = (&index.group, &index.groups);
+		let passing = delta;
+		let scale_index = format!("%{prefix}.scale.index");
+		let sum_base = format!("%{prefix}.sum.base");
+		let projected_base = format!("%{prefix}.projected.base");
+		let sum_index = format!("%{prefix}.sum.index");
+		let projected_index = format!("%{prefix}.projected.index");
+		let scale_pointer = format!("%{prefix}.scale.ptr");
+		let sum_pointer = format!("%{prefix}.sum.ptr");
+		let projected_pointer = format!("%{prefix}.projected.ptr");
+		let scale = format!("%{prefix}.scale");
+		let sum = format!("%{prefix}.sum");
+		let projected = format!("%{prefix}.projected");
 		let _ = writeln!(code, "{scale_index} = add i32 {groups}, {group}");
 		let _ = writeln!(code, "{sum_base} = mul i32 {groups}, 2");
 		let _ = writeln!(code, "{projected_base} = mul i32 {groups}, 3");
@@ -1130,15 +1236,46 @@ mod program_ir {
 		}
 		let _ = writeln!(code, "{sum} = load {ty}, {ptrty} {sum_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
 		let _ = writeln!(code, "{projected} = load {ty}, {ptrty} {projected_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-		let output_projection = format!("%{}.normalize.reverse.output.projection", context.prefix);
-		let centered = format!("%{}.normalize.reverse.centered", context.prefix);
-		let numerator = format!("%{}.normalize.reverse.numerator", context.prefix);
-		let contribution = format!("%{}.normalize.reverse.contribution", context.prefix);
+		let output_projection = format!("%{prefix}.output.projection");
+		let centered = format!("%{prefix}.centered");
+		let numerator = format!("%{prefix}.numerator");
+		let contribution = format!("%{prefix}.contribution");
+		// A weighted node stored `weight * normalized`: the formula takes the delta
+		// scaled by the weight and the re-normalized input.
+		let (delta, output_value) = match context.weight {
+			Some(weight) => {
+				let source_pointer = format!("%{prefix}.source.ptr");
+				let source_value = format!("%{prefix}.source");
+				let normalized = format!("%{prefix}.normalized");
+				let weight_pointer = format!("%{prefix}.weight.ptr");
+				let weight_value = format!("%{prefix}.weight");
+				let weighted = format!("%{prefix}.delta.weighted");
+				let _ = writeln!(
+					code,
+					"{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {element}",
+					ty = context.value_type,
+					ptrty = context.pointer_type,
+					source = context.source
+				);
+				let _ = writeln!(code, "{source_value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{normalized} = call {ty} @recipe.mul({ty} {source_value}, {ty} {scale})", ty = context.value_type);
+				let column = weight_column(&mut code, &prefix, &index);
+				let _ = writeln!(code, "{weight_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i32 {column}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
+				let _ = writeln!(code, "{weighted} = call {ty} @recipe.mul({ty} {delta}, {ty} {weight_value})", ty = context.value_type);
+				(weighted, normalized)
+			}
+			None => (delta.to_owned(), output_value.to_owned()),
+		};
 		let _ = writeln!(code, "{output_projection} = call {ty} @recipe.mul({ty} {output_value}, {ty} {projected})", ty = context.value_type);
 		let _ = writeln!(code, "{centered} = call {ty} @recipe.sub({ty} {delta}, {ty} {sum})", ty = context.value_type);
 		let _ = writeln!(code, "{numerator} = call {ty} @recipe.sub({ty} {centered}, {ty} {output_projection})", ty = context.value_type);
 		let _ = writeln!(code, "{contribution} = call {ty} @recipe.mul({ty} {scale}, {ty} {numerator})", ty = context.value_type);
-		NormalizeReverseFragment { code, contribution }
+		// A channel outside the span keeps its own adjoint, so the delta passes through.
+		let Some(inside) = &index.inside else { return NormalizeReverseFragment { code, contribution } };
+		let passed = format!("%{prefix}.passed");
+		let _ = writeln!(code, "{passed} = select i1 {inside}, {ty} {contribution}, {ty} {passing}", ty = context.value_type);
+		NormalizeReverseFragment { code, contribution: passed }
 	}
 }
 
@@ -1173,7 +1310,7 @@ impl BackendTarget {
 
 	fn artifact_extension(&self) -> &'static str {
 		match self {
-			Self::Cpu { .. } => "so",
+			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
 			Self::Nvidia { .. } => "ptx",
 		}
@@ -1242,8 +1379,9 @@ fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
 fn native_cpu_target() -> Result<BackendTarget> {
 	let compiler = native_cpu_compiler()?;
 	let target = option_env!("RECIPE_CPU_TARGET").ok_or_else(|| RecipeError::new("CPU native target is unavailable"))?;
+	let null = option_env!("RECIPE_NULL_DEVICE").ok_or_else(|| RecipeError::new("CPU null device is unavailable"))?;
 	let output = Command::new(compiler)
-		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", "/dev/null", "-o", "/dev/null"])
+		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", null, "-o", null])
 		.output()
 		.map_err(|error| RecipeError::new(format!("cannot query CPU native target: {error}")))?;
 	require(output.status.success(), format!("CPU native target query failed: {}", String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no compiler diagnostic")))?;
@@ -1286,7 +1424,7 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
@@ -1335,7 +1473,7 @@ impl NativeLayout {
 			contexts.push(context_offset);
 			adjoints.push(adjoint_offset);
 			value_offset = checked_add(value_offset, graph_rows_buffer(node.output, rows, element)?, "model value arena")?;
-			context_offset = checked_add(context_offset, node_context(node, rows, element)?, "model context arena")?;
+			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision)?, "model context arena")?;
 			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
 		}
 		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
@@ -1521,7 +1659,7 @@ fn barrier(backend: Backend) -> &'static str {
 
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
 	let pointer = pointer_type(backend);
-	format!("%{name} = getelementptr i8, {pointer} %{base}, i32 {offset}\n")
+	format!("%{name} = getelementptr i8, {pointer} %{base}, i64 {offset}\n")
 }
 
 mod quantized {
@@ -2478,6 +2616,7 @@ impl NativeModelIr {
 							row: &row,
 							features: node.input.elements(),
 							weights: &pointers.weights,
+							context: &pointers.context,
 							parameters: node.parameters,
 							prefix: &prefix,
 							literal: &literal,
@@ -2671,7 +2810,8 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize");
-					if mode != program_ir::NormalizeMode::Evaluation && (training || matches!(mode, program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms)) {
+					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
+					if mode != program_ir::NormalizeMode::Evaluation && (training || mode.per_row()) {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
@@ -2693,6 +2833,9 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
 								mode,
 								prefix: &prefix,
 							},
@@ -2715,6 +2858,7 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize.reverse");
+					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
 					if mode != program_ir::NormalizeMode::Evaluation {
 						let stats_prefix = format!("{prefix}.stats");
 						let state_zero = native_literal(self.precision.state, self.precision.state_type, 0.0);
@@ -2729,6 +2873,10 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
+								source: &pointers.source,
 								mode,
 								prefix: &stats_prefix,
 							},
@@ -2755,6 +2903,10 @@ impl NativeModelIr {
 								rows: "%rows",
 								channels: node.output.channels,
 								length: node.output.length,
+								width: normalize_width(node),
+								span: normalize_span(node),
+								weight,
+								source: &pointers.source,
 								mode,
 								prefix: &prefix,
 							},
@@ -2768,6 +2920,69 @@ impl NativeModelIr {
 						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, &format!("{prefix}.owned")));
 					})?;
 					ir.push_str(barrier(backend));
+					if node.parameters != 0 {
+						// The weight gradient is one column per channel summed over every
+						// row and position: each partition accumulates its own contiguous
+						// run into its own scratch row, and one owner folds the rows in order.
+						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let (columns, offset) = (narrow(node.parameters, "normalization weight columns")?, narrow(node.offset, "normalization weight offset")?);
+						let statistics = narrow(checked_mul(4, normalize_groups(node, self.rows)?, "normalization statistics")?, "normalization statistics")?;
+						let scratch = format!("%{prefix}.scratch");
+						let zero = native_literal(self.precision.model, ty, 0.0);
+						ir.push_str(&format!("{scratch} = getelementptr inbounds {ty}, {pointer} {context}, i32 {statistics}\n", context = pointers.context));
+						let name = "normalize.weight";
+						let row = format!("%n{index}.{name}.partition.row");
+						let weight_prefix = format!("{prefix}.weight");
+						emit_partitioned_loop(
+							&mut ir,
+							index,
+							name,
+							PartitionedLoop { count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							|ir, p| {
+								let source_pointer = format!("%{weight_prefix}.source.ptr");
+								let source_value = format!("%{weight_prefix}.source.value");
+								let delta_pointer = format!("%{weight_prefix}.delta.ptr");
+								let delta_value = format!("%{weight_prefix}.delta.value");
+								ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n", source = pointers.source, delta = pointers.delta, align = alignment(ty)));
+								// The forward fragment without its weight is the normalized input.
+								let fragment = program_ir::emit_normalize(
+									program_ir::NormalizeContext {
+										value_type: ty,
+										pointer_type: pointer,
+										alignment: alignment(ty),
+										source_value: &source_value,
+										context: &pointers.context,
+										rows: "%rows",
+										channels: node.output.channels,
+										length: node.output.length,
+										width: normalize_width(node),
+										span: normalize_span(node),
+										weight: None,
+										mode,
+										prefix: &weight_prefix,
+									},
+									p,
+								);
+								ir.push_str(&fragment.code);
+								// The partitions span the row capacity; rows past `%rows` hold stale
+								// values and contribute nothing, and neither does a channel outside
+								// the normalized span, which owns no scale column.
+								let live = if normalize_span(node) < node.output.channels {
+									format!(
+										"%{weight_prefix}.live.row = icmp ult i32 %{weight_prefix}.normalize.row, %rows\n%{weight_prefix}.live = and i1 %{weight_prefix}.live.row, %{weight_prefix}.normalize.inside\n"
+									)
+								} else {
+									format!("%{weight_prefix}.live = icmp ult i32 %{weight_prefix}.normalize.row, %rows\n")
+								};
+								ir.push_str(&format!("%{weight_prefix}.product = call {ty} @recipe.mul({ty} {delta_value}, {ty} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {ty} %{weight_prefix}.product, {ty} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i32 %{weight_prefix}.normalize.channel, i32 0\n%{weight_prefix}.column = add i32 {row}, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {ty}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {ty} @recipe.add({ty} %{weight_prefix}.column.value, {ty} %{weight_prefix}.contribution)\nstore {ty} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = fragment.value, align = alignment(ty)));
+							},
+						)?;
+						ir.push_str(barrier(backend));
+						ir.push_str(&format!(
+							"call void @reduce_rows({pointer} {scratch}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n"
+						));
+						ir.push_str(barrier(backend));
+					}
 				}
 			}
 		}
@@ -2794,18 +3009,21 @@ impl NativeModelIr {
 		let epsilon = native_literal(self.precision.state, state_ty, node.argument[1]);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
+		let width = i32::try_from(normalize_width(node)).map_err(|_| RecipeError::new("normalization width exceeds i32"))?;
+		let span = i32::try_from(normalize_span(node)).map_err(|_| RecipeError::new("normalization span exceeds i32"))?;
+		let heads = span / width;
 		match mode {
 			program_ir::NormalizeMode::Batch => {
 				ir.push_str(&format!("{items} = mul i32 %rows, {length}\n", length = length));
 			}
-			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => {
-				ir.push_str(&format!("{groups} = mul i32 %rows, {length}\n{items} = add i32 0, {channels}\n", length = length, channels = channels));
+			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+				ir.push_str(&format!("{groups} = mul i32 %rows, {}\n{items} = add i32 0, {width}\n", length * heads));
 			}
 			program_ir::NormalizeMode::Evaluation => return Ok(ir),
 		}
 		let group_limit = match mode {
 			program_ir::NormalizeMode::Batch => channels.to_string(),
-			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => groups.clone(),
+			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => groups.clone(),
 			program_ir::NormalizeMode::Evaluation => unreachable!(),
 		};
 		let group = format!("%{prefix}.group");
@@ -2820,8 +3038,12 @@ impl NativeModelIr {
 				program_ir::NormalizeMode::Batch => {
 					code.push_str(&format!("{row} = udiv i32 {p}, {length}\n{position} = urem i32 {p}, {length}\n{row_base} = mul i32 {row}, {elements}\n{channel_base} = mul i32 {group}, {length}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", p = p, length = length, elements = elements, group = group));
 				}
-				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => {
-					code.push_str(&format!("{row} = udiv i32 {group}, {length}\n{position} = urem i32 {group}, {length}\n{row_base} = mul i32 {row}, {elements}\n{channel_base} = mul i32 {p}, {length}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", p = p, length = length, elements = elements, group = group));
+				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+					let row_local = format!("%{prefix}.{phase}.row.local");
+					let head = format!("%{prefix}.{phase}.head");
+					let head_base = format!("%{prefix}.{phase}.head.base");
+					let channel = format!("%{prefix}.{phase}.channel");
+					code.push_str(&format!("{row} = udiv i32 {group}, {span}\n{row_local} = urem i32 {group}, {span}\n{head} = udiv i32 {row_local}, {length}\n{position} = urem i32 {row_local}, {length}\n{head_base} = mul i32 {head}, {width}\n{channel} = add i32 {head_base}, {p}\n{channel_base} = mul i32 {channel}, {length}\n{row_base} = mul i32 {row}, {elements}\n{local} = add i32 {channel_base}, {position}\n{value_index} = add i32 {row_base}, {local}\n", span = length * heads));
 				}
 				program_ir::NormalizeMode::Evaluation => unreachable!(),
 			}
@@ -2831,9 +3053,21 @@ impl NativeModelIr {
 		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n%{prefix}.mean.next = add i32 %{prefix}.mean.p, 1\nbr label %{prefix}.mean.loop\n{prefix}.variance.loop:\n%{prefix}.variance.p = phi i32 [ 0, %{prefix}.mean.loop ], [ %{prefix}.variance.next, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, %{prefix}.mean.loop ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n%{prefix}.items.value = call {state_ty} @recipe.state.from.u32(i32 {items})\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.variance.more = icmp ult i32 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label %{prefix}.store\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty)));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, align = alignment(ty)));
-		let difference = if mode == program_ir::NormalizeMode::Rms { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
-		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, epsilon = epsilon, one = one, group = group, group_limit = group_limit));
-		let stored_mean = if mode == program_ir::NormalizeMode::Rms { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
+		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
+		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
+		// L2 divides by the norm itself, floored at epsilon, instead of the root of
+		// the epsilon-shifted mean square.
+		let scale_code = if mode == program_ir::NormalizeMode::L2 {
+			format!(
+				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.variance.sum)\n%{prefix}.floored = call i1 @recipe.state.ogt({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n"
+			)
+		} else {
+			format!(
+				"%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n"
+			)
+		};
+		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, one = one, group = group, group_limit = group_limit));
+		let stored_mean = if zero_mean { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
 		ir.push_str(&format!("store {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n%{prefix}.group.next = add i32 {group}, %threads\nbr label %{prefix}.group.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, stored_mean = stored_mean, align = alignment(ty), group = group));
 		Ok(ir)
 	}
@@ -2944,17 +3178,9 @@ impl NativeModelIr {
 		}
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let mut ir = format!(
-			"define {kernel}void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
+			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
 			kernel = kernel,
 			pointer = pointer,
 			thread = thread
@@ -2972,7 +3198,7 @@ impl NativeModelIr {
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
 			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
-			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i32 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
+			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 			ir.push_str(barrier(backend));
 			predecessor = format!("{prefix}.done");
 		}
@@ -3004,15 +3230,7 @@ impl NativeModelIr {
 		let state_ty = self.precision.state_type;
 		let model_align = alignment(model_ty);
 		let state_align = alignment(state_ty);
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
@@ -3025,7 +3243,14 @@ impl NativeModelIr {
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
+		let forward_entry_args = format!("{forward_args}, i32 %training");
+		if loss.is_some() {
+			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+		} else {
+			body.push_str(&format!(
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+			));
+		}
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
@@ -3033,7 +3258,7 @@ impl NativeModelIr {
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
-			body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
@@ -3048,7 +3273,11 @@ impl NativeModelIr {
 			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
 		}
 		ir.push_str(&body);
-		Ok(prune_internal_definitions(ir))
+		let mut ir = prune_internal_definitions(ir);
+		if matches!(backend, Backend::Cpu) {
+			ir.push_str(native_cpu_setting("module-suffix")?);
+		}
+		Ok(ir)
 	}
 
 	fn emit_loss_and_seed(
@@ -3061,7 +3290,7 @@ impl NativeModelIr {
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i32 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
 		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
@@ -3096,7 +3325,7 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
 		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
@@ -3181,7 +3410,35 @@ fn normalize_mode(value: f64) -> Result<program_ir::NormalizeMode> {
 		1 => Ok(program_ir::NormalizeMode::Layer),
 		2 => Ok(program_ir::NormalizeMode::Rms),
 		3 => Ok(program_ir::NormalizeMode::Evaluation),
+		4 => Ok(program_ir::NormalizeMode::L2),
 		_ => Err(RecipeError::new("normalization mode is unsupported")),
+	}
+}
+
+/// Channels per normalization group: the node's declared width, or the whole row.
+fn normalize_width(node: &Node) -> usize {
+	if node.argument[2] == 0.0 { node.output.channels } else { node.argument[2] as usize }
+}
+
+/// Channels the node normalizes: its declared span, or the whole row. Attention
+/// normalizes the leading query and key planes and passes the value plane through.
+fn normalize_span(node: &Node) -> usize {
+	if node.argument[3] == 0.0 { node.output.channels } else { node.argument[3] as usize }
+}
+
+/// The statistics arena holds four values per group for either group shape.
+fn normalize_groups(node: &Node, rows: usize) -> Result<usize> {
+	match normalize_mode(node.argument[0])? {
+		// Batch statistics and saved evaluation statistics are one group per
+		// channel, independent of the number of rows and positions.
+		program_ir::NormalizeMode::Batch | program_ir::NormalizeMode::Evaluation => Ok(node.output.channels),
+		// Layer, RMS, and L2 statistics are one group per row, position, and
+		// normalized head. The q/k form can therefore have more groups than the
+		// residual channel count without restoring batch's old max allocation.
+		program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+			let heads = normalize_span(node) / normalize_width(node);
+			checked_mul(checked_mul(rows, node.output.length, "row groups")?, heads, "head groups")
+		}
 	}
 }
 
@@ -3348,11 +3605,18 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.t = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.advance, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.t, {partitions}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
 	ir.push_str(&format!("%{prefix}.t.plus = add i32 %{prefix}.t, 1\n%{prefix}.first.short = icmp ult i32 %{prefix}.t, {extra}\n%{prefix}.first.extra = select i1 %{prefix}.first.short, i32 %{prefix}.t, i32 {extra}\n%{prefix}.first.whole = mul i32 %{prefix}.t, {whole}\n%{prefix}.first = add i32 %{prefix}.first.whole, %{prefix}.first.extra\n"));
 	ir.push_str(&format!("%{prefix}.limit.short = icmp ult i32 %{prefix}.t.plus, {extra}\n%{prefix}.limit.extra = select i1 %{prefix}.limit.short, i32 %{prefix}.t.plus, i32 {extra}\n%{prefix}.limit.whole = mul i32 %{prefix}.t.plus, {whole}\n%{prefix}.limit = add i32 %{prefix}.limit.whole, %{prefix}.limit.extra\n"));
-	ir.push_str(&format!(
-		"%{prefix}.row = mul i32 %{prefix}.t, {columns}\nbr label %{prefix}.inner\n{prefix}.inner:\n%{prefix}.p = phi i32 [ %{prefix}.first, %{prefix}.body ], [ %{prefix}.p.next, %{prefix}.fold ]\n"
-	));
+	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
+	// A body with no fixed sums accumulates into its partition's scratch row at
+	// `%{prefix}.row`, so the row starts at zero and keeps what the body left.
+	let entry = if gradients.is_empty() {
+		ir.push_str(&format!("br label %{prefix}.zero\n{prefix}.zero:\n%{prefix}.zero.c = phi i32 [ 0, %{prefix}.body ], [ %{prefix}.zero.next, %{prefix}.zero.step ]\n%{prefix}.zero.more = icmp ult i32 %{prefix}.zero.c, {columns}\nbr i1 %{prefix}.zero.more, label %{prefix}.zero.step, label %{prefix}.zeroed\n{prefix}.zero.step:\n%{prefix}.zero.index = add i32 %{prefix}.row, %{prefix}.zero.c\n%{prefix}.zero.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.zero.index\nstore {ty} {zero}, {pointer} %{prefix}.zero.ptr, align {align}\n%{prefix}.zero.next = add i32 %{prefix}.zero.c, 1\nbr label %{prefix}.zero\n{prefix}.zeroed:\n"));
+		"zeroed"
+	} else {
+		"body"
+	};
+	ir.push_str(&format!("br label %{prefix}.inner\n{prefix}.inner:\n%{prefix}.p = phi i32 [ %{prefix}.first, %{prefix}.{entry} ], [ %{prefix}.p.next, %{prefix}.fold ]\n"));
 	for (parameter, _) in gradients {
-		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.body ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
+		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.{entry} ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
 	}
 	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
 	body(ir, &format!("%{prefix}.p"));
@@ -3363,7 +3627,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("%{prefix}.p.next = add i32 %{prefix}.p, 1\nbr label %{prefix}.inner\n{prefix}.store:\n"));
 	// Every column of the row is written, including the parameters this program
 	// never touches, so the fold below never reads an uninitialised slot.
-	for column in 0..columns {
+	for column in 0..if gradients.is_empty() { 0 } else { columns } {
 		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
 		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
 	}
@@ -3394,15 +3658,18 @@ impl Drop for NativeTemporaryFiles {
 	}
 }
 
+fn home_directory() -> Result<PathBuf> {
+	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).ok_or_else(|| RecipeError::new("home directory is absent"))
+}
+
 fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	require(!key.is_empty() && key != "." && key != ".." && !key.contains('/') && !key.contains('\\'), "native artifact key is not a single path component")?;
-	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-	Ok(PathBuf::from(home).join(".cache").join("recipe").join("native").join(key))
+	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v2".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
+	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -3472,6 +3739,27 @@ fn native_cpu_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_CPU_COMPILER").ok_or_else(|| RecipeError::new("CPU native compiler is unavailable"))
 }
 
+fn native_cpu_setting(name: &str) -> Result<&'static str> {
+	match name {
+		"linker" => option_env!("RECIPE_CPU_LINKER"),
+		"linker-driver" => option_env!("RECIPE_CPU_LINKER_DRIVER"),
+		"library-flags" => option_env!("RECIPE_CPU_LIBRARY_FLAGS"),
+		"link-flags" => option_env!("RECIPE_CPU_LINK_FLAGS"),
+		"entry-linkage" => option_env!("RECIPE_CPU_ENTRY_LINKAGE"),
+		"module-suffix" => option_env!("RECIPE_CPU_MODULE_SUFFIX"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("CPU native {name} is unavailable")))
+}
+
+fn native_entry(backend: Backend) -> Result<(&'static str, &'static str)> {
+	Ok(match backend {
+		Backend::Cpu => (native_cpu_setting("entry-linkage")?, "call i32 @recipe.cpu.thread.id()"),
+		Backend::Amd => ("protected amdgpu_kernel", "call i32 @global_id()"),
+		Backend::Nvidia => ("protected ptx_kernel", "call i32 @global_id()"),
+	})
+}
+
 fn native_amd_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_HSA_COMPILER").ok_or_else(|| RecipeError::new("AMD native compiler is unavailable"))
 }
@@ -3490,11 +3778,21 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 		.ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn native_nvidia_device_library() -> Result<&'static str> {
+	option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))
+}
+
+fn native_nvidia_ptx_version() -> Result<&'static str> {
+	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
+}
+
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
 			let (target, compiler_identity, _, _) = cpu_identity(target)?;
+			let linker = Path::new(native_cpu_setting("linker")?);
+			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", target, "-march=native"]);
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
@@ -3503,7 +3801,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
-			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command
+				.args(["-x", "ir", "-O2"])
+				.args(native_cpu_setting("library-flags")?.split_whitespace())
+				.arg(format!("-B{}", linker_directory.display()))
+				.arg(format!("-fuse-ld={}", native_cpu_setting("linker-driver")?))
+				.args(["-shared"])
+				.args(native_cpu_setting("link-flags")?.split_whitespace())
+				.args(["-o"])
+				.arg(output)
+				.arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
@@ -3523,22 +3830,17 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
-			let device = option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))?;
-			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
-			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
-			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"])
+			let device = native_nvidia_device_library()?;
+			let ptx_version = native_nvidia_ptx_version()?;
+			let mut command = Command::new(compiler);
+			command
+				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"])
-				.arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?)
+				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
+				.arg(source)
 				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(bitcode);
-			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
-			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
-			let mut llc = Command::new(generator);
-			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
-			native_command(llc, "NVIDIA PTX generator", key)?;
+				.arg(output);
+			native_command(command, "NVIDIA LLVM IR compiler", key)?;
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -3580,8 +3882,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
-		let bitcode = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.bc")));
-		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(bitcode.iter().cloned()).collect() };
+		let temporary = NativeTemporaryFiles { paths: vec![source.clone(), output.clone()] };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?;
 		debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
@@ -3591,7 +3892,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
@@ -3643,7 +3944,13 @@ impl FloatLayout {
 							exponent += 1
 						}
 						let stored_exponent = exponent + self.bias() as i64;
-						if stored_exponent >= exponent_limit as i64 { sign | exponent_limit << self.man } else { sign | (stored_exponent as u64) << self.man | mantissa }
+						// A finite value above the format's range saturates to its largest finite
+						// magnitude. Encoding infinity makes an in-range sample nonfinite instead.
+						if stored_exponent >= exponent_limit as i64 {
+							sign | (exponent_limit - 1) << self.man | (mantissa_limit - 1)
+						} else {
+							sign | (stored_exponent as u64) << self.man | mantissa
+						}
 					}
 				}
 			}
@@ -4202,22 +4509,38 @@ mod bundle {
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
-	fn block_text(block: &Block) -> String {
-		format!("{}|{}|{}|{}|{}", operation_text(&block.operation), block.activation as u8, block.normalization.map_or(0, |value| value as u8 + 1), block.quantization, u8::from(block.profile))
+	fn normalization_text(normalization: Option<BlockNormalization>) -> u8 {
+		normalization.map_or(0, |value| value as u8 + 1)
 	}
-	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
-		require(fields.len() == 5, "semantic model block has the wrong width")?;
-		let normalization = match value_at::<u8>(Some(fields[2]), "block normalization")? {
+	fn normalization(field: Option<&str>, role: &str) -> Result<Option<BlockNormalization>> {
+		Ok(match value_at::<u8>(field, role)? {
 			0 => None,
 			1 => Some(BlockNormalization::Batch),
 			2 => Some(BlockNormalization::Layer),
+			3 => Some(BlockNormalization::Rms),
+			4 => Some(BlockNormalization::L2),
 			_ => return Err(RecipeError::new("invalid block normalization")),
-		};
+		})
+	}
+	fn block_text(block: &Block) -> String {
+		format!(
+			"{}|{}|{}|{}|{}|{}",
+			operation_text(&block.operation),
+			block.activation as u8,
+			normalization_text(block.normalization),
+			block.quantization,
+			u8::from(block.profile),
+			normalization_text(block.qk)
+		)
+	}
+	fn block(value: &str) -> Result<Block> {
+		let fields = value.split('|').collect::<Vec<_>>();
+		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(fields[0])?,
 			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization,
+			normalization: normalization(Some(fields[2]), "block normalization")?,
+			qk: normalization(Some(fields[5]), "block query and key normalization")?,
 			quantization: value_at(Some(fields[3]), "block quantization")?,
 			profile: bool_value(fields[4], "block quantization profile")?,
 		})
@@ -4723,10 +5046,14 @@ mod bundle {
 		Ok(result)
 	}
 }
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	error::Error,
-	ffi::c_void,
+	ffi::{OsStr, c_void},
 	fmt, fs,
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
@@ -4748,12 +5075,32 @@ const DEBUG_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recipe.log");
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
-extern "C" fn interrupt(_: i32) {
+fn record_interrupt() {
 	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
 		let message = b"\ninterrupt received, finishing checkpoint\n";
 		unsafe {
 			write(2, message.as_ptr().cast(), message.len());
 		}
+	}
+}
+#[cfg(unix)]
+extern "C" fn interrupt(_: i32) {
+	record_interrupt()
+}
+#[cfg(windows)]
+unsafe extern "system" fn interrupt(event: u32) -> i32 {
+	if event != CTRL_C_EVENT {
+		return 0;
+	}
+	record_interrupt();
+	1
+}
+fn register_interrupt() -> usize {
+	unsafe {
+		#[cfg(unix)]
+		return signal(SIGINT, interrupt);
+		#[cfg(windows)]
+		return SetConsoleCtrlHandler(Some(interrupt), 1) as usize;
 	}
 }
 fn debug(message: &str) -> Result<()> {
@@ -4877,9 +5224,24 @@ pub enum Activation {
 pub enum BlockNormalization {
 	Batch,
 	Layer,
+	/// Root mean square over the row with one trainable scale per channel.
+	Rms,
+	/// The row divided by its Euclidean norm, floored at the normalization epsilon.
+	L2,
 }
-/// The normalization selectors with a declared identity: the batch marker and the layer
-/// residual constructor. Any other selector is rejected instead of guessing a mode.
+impl BlockNormalization {
+	/// The mode argument of the normalization node; evaluation holds 3.
+	const fn mode(self) -> f64 {
+		match self {
+			Self::Batch => 0.0,
+			Self::Layer => 1.0,
+			Self::Rms => 2.0,
+			Self::L2 => 4.0,
+		}
+	}
+}
+/// The normalization selectors with a declared identity: the batch, rms, and l2 markers
+/// and the layer residual constructor. Any other selector is rejected instead of guessing a mode.
 pub trait NormalizationSelector {
 	fn normalization(self) -> BlockNormalization;
 }
@@ -4888,11 +5250,21 @@ impl NormalizationSelector for Batch {
 		BlockNormalization::Batch
 	}
 }
+impl NormalizationSelector for Rms {
+	fn normalization(self) -> BlockNormalization {
+		BlockNormalization::Rms
+	}
+}
+impl NormalizationSelector for L2 {
+	fn normalization(self) -> BlockNormalization {
+		BlockNormalization::L2
+	}
+}
 impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
 		match self(0) {
 			Residual::Layer(_) => BlockNormalization::Layer,
-			_ => panic!("normalization selector must be batch or layer"),
+			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
@@ -4911,6 +5283,8 @@ struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
+	/// The per-head normalization of the attention queries and keys.
+	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
 }
@@ -4929,6 +5303,7 @@ impl Model {
 			operation,
 			activation: Activation::Linear,
 			normalization: None,
+			qk: None,
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
 		});
@@ -4972,6 +5347,21 @@ impl Model {
 		block.normalization = Some(normalization.normalization());
 		model
 	}
+	/// Normalizes each attention head's query and key rows after the projection.
+	/// The value rows keep their projected magnitudes.
+	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("query and key normalization requires a preceding block"));
+		let normalization = normalization.normalization();
+		if !matches!(block.operation, Operation::Attention(_)) {
+			panic!("query and key normalization requires an attention block");
+		}
+		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
+			panic!("query and key normalization must be rms or l2");
+		}
+		block.qk = Some(normalization);
+		model
+	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
 		let mut model = self.clone();
 		model.loss = loss;
@@ -5013,10 +5403,13 @@ impl Model {
 				if selected.1 && block.activation != Activation::Linear {
 					names.push(block.activation.name().to_owned())
 				}
-				if selected.2
-					&& let Some(name) = block.normalization.map(BlockNormalization::name)
-				{
-					names.push(name.to_owned())
+				if selected.2 {
+					if let Some(name) = block.qk.map(BlockNormalization::name) {
+						names.push(format!("qk-{name}"))
+					}
+					if let Some(name) = block.normalization.map(BlockNormalization::name) {
+						names.push(name.to_owned())
+					}
 				}
 				if selected.3 && block.quantization != 0 {
 					names.push(quantization(block.quantization))
@@ -5876,6 +6269,22 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 	}
 	Ok(weights)
 }
+/// Encodes each `block`-wide slice of the weights on the configured CPU workers and
+/// concatenates the encoded blocks in index order. A trailing partial slice pads with
+/// zeros. Block formats carry no codebook.
+fn encode_blocks(weights: &[f64], block: usize, encode: impl Fn(usize, &[f32], &mut Vec<u8>) + Sync) -> Result<(Vec<u8>, Vec<f64>)> {
+	let blocks = parallel_map(weights.len().div_ceil(block), |chunk| {
+		let values = block_values(weights, chunk, block);
+		let mut data = Vec::new();
+		encode(chunk, &values, &mut data);
+		data
+	})?;
+	Ok((blocks.concat(), Vec::new()))
+}
+/// Reads the `chunk`-th `block`-wide slice as single precision, padding past the end with zeros.
+fn block_values(values: &[f64], chunk: usize, block: usize) -> Vec<f32> {
+	(0..block).map(|index| values.get(chunk * block + index).copied().unwrap_or(0.0) as f32).collect()
+}
 impl Integer for StorageFormat {
 	fn bits(self) -> u8 {
 		self.0 as u8
@@ -5884,11 +6293,9 @@ impl Integer for StorageFormat {
 		let quantizer = self.spec().ok_or_else(|| self.unavailable())?.codec.quantization().quantizer;
 		if let Quantizer::Scalar { bits, variant } = quantizer {
 			let block = 32;
-			let mut data = Vec::new();
-			for values in weights.chunks(block) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
-				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, block, |_, values, data| {
+				let (minimum, maximum) = values.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(*value), high.max(*value)));
+				let extreme = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let scale = match (bits, variant) {
 					(8, _) => extreme.abs() / 127.0,
 					(_, 0) => extreme / -(1_i32 << (bits - 1)) as f32,
@@ -5896,17 +6303,17 @@ impl Integer for StorageFormat {
 					_ => unreachable!(),
 				};
 				let inverse = if scale == 0.0 { 0.0 } else { scale.recip() };
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				if variant == 1 && bits != 8 {
-					put_half(&mut data, minimum)
+					put_half(data, minimum)
 				}
 				let (mut low, mut high) = ([0_u8; 32], [0_u8; 4]);
 				let mut sum = 0_i32;
 				for index in 0..block {
 					let shifted = match (bits, variant) {
-						(8, _) => (value(index) * inverse).round() + 128.0,
-						(_, 0) => value(index) * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
-						(_, 1) => (value(index) - minimum) * inverse + 0.5,
+						(8, _) => (values[index] * inverse).round() + 128.0,
+						(_, 0) => values[index] * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
+						(_, 1) => (values[index] - minimum) * inverse + 0.5,
 						_ => unreachable!(),
 					};
 					let code = shifted.max(0.0).min(f32::from((1_u16 << bits) - 1)) as u8;
@@ -5925,7 +6332,7 @@ impl Integer for StorageFormat {
 					data.extend(high)
 				}
 				if bits == 8 && variant == 1 {
-					put_half(&mut data, scale * sum as f32)
+					put_half(data, scale * sum as f32)
 				}
 				data.extend_from_slice(
 					&low[..match bits {
@@ -5934,13 +6341,10 @@ impl Integer for StorageFormat {
 						_ => unreachable!(),
 					}],
 				);
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q2K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut scales, mut minima) = ([0_u8; 256], [0.0_f32; 16], [0.0_f32; 16]);
 				for block in 0..16 {
 					let weights = values[block * 16..block * 16 + 16].iter().map(|value| value.abs()).collect::<Vec<_>>();
@@ -5969,15 +6373,12 @@ impl Integer for StorageFormat {
 				}
 				data.extend(packed_scales);
 				data.extend(packed);
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+				put_half(data, minimum);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q3K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -6021,20 +6422,16 @@ impl Integer for StorageFormat {
 				data.extend(high);
 				data.extend(low);
 				data.extend(scales);
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if let Quantizer::Q45K { bits } = quantizer {
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			let data = parallel_map(chunks.len(), |chunk| {
-				let values = (0..256).map(|index| chunks[chunk].get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let mut data = Vec::new();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
 				for block in 0..8 {
 					let slice = &values[block * 32..block * 32 + 32];
-					let rms = (slice.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
-					let weights = slice.iter().map(|value| rms + value.abs()).collect::<Vec<_>>();
+					let magnitude = (slice.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
+					let weights = slice.iter().map(|value| magnitude + value.abs()).collect::<Vec<_>>();
 					let (levels, range) = if bits == 4 { (15, (-1.0, 0.1, 20)) } else { (31, (-0.5, 0.1, 15)) };
 					(block_scales[block], minima[block]) = qkx2(slice, &weights, levels, range, false, &mut codes[block * 32..block * 32 + 32]);
 				}
@@ -6070,21 +6467,17 @@ impl Integer for StorageFormat {
 						high[offset] |= (codes[group + offset] >> 4) << (group / 32) | (codes[group + offset + 32] >> 4) << (group / 32 + 1)
 					}
 				}
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
+				put_half(data, scale);
+				put_half(data, minimum);
 				data.extend(metadata);
 				if bits == 5 {
 					data.extend(high)
 				}
 				data.extend(packed);
-				data
-			})?;
-			return Ok((data.concat(), Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q6K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -6119,25 +6512,21 @@ impl Integer for StorageFormat {
 				data.extend(low);
 				data.extend(high);
 				data.extend(scales.map(|value| value as u8));
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q8K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, 256, |_, values, data| {
+				let maximum = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum };
 				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
 				data.extend(scale.to_le_bytes());
-				let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				let codes = values.iter().map(|value| qround(inverse * value).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
 				data.extend(codes.iter().map(|code| *code as u8));
 				for block in codes.chunks(16) {
 					data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes())
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Nf4) {
 			const NF4: [f64; 16] = [
@@ -6173,21 +6562,16 @@ impl Integer for StorageFormat {
 			return Ok((data, metadata));
 		}
 		if matches!(quantizer, Quantizer::Iq4Nl) {
-			let mut data = Vec::new();
-			for values in weights.chunks(32) {
-				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let (scale, codes) = iq4_fit(&values, -1);
-				put_half(&mut data, scale);
+			return encode_blocks(weights, 32, |_, values, data| {
+				let (scale, codes) = iq4_fit(values, -1);
+				put_half(data, scale);
 				for index in 0..16 {
 					data.push(codes[index] | codes[index + 16] << 4)
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Iq4Xs) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..8 {
@@ -6213,7 +6597,7 @@ impl Integer for StorageFormat {
 						codes[block * 32 + offset] = iq4_code(values[block * 32 + offset] * inverse)
 					}
 				}
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				data.extend(high.to_le_bytes());
 				data.extend(low);
 				for block in 0..8 {
@@ -6221,40 +6605,38 @@ impl Integer for StorageFormat {
 						data.push(codes[block * 32 + offset] | codes[block * 32 + offset + 16] << 4)
 					}
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
+		let weighted = |chunk: usize| block_values(importance, chunk, 256);
 		if matches!(quantizer, Quantizer::Iq2Xxs) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XXS requires trained importance weights",
 			)?;
-			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_xxs(values, &weighted(chunk))));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: true, xs: true }) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XS requires trained importance weights",
 			)?;
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_16(values, Some(&weighted(chunk)), true)));
 		}
 		if let Quantizer::Iq1 { medium } = quantizer {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				format!("GGML IQ1_{} requires trained importance weights", if medium { "M" } else { "S" }),
 			)?;
-			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), medium), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq1(values, &weighted(chunk), medium)));
 		}
 		if matches!(quantizer, Quantizer::Iq3Xxs) {
-			let weights = weights.iter().map(|value| *value as f32).collect::<Vec<_>>();
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			return Ok((parallel_map(chunks.len(), |chunk| iq3_xxs(chunks[chunk]))?.concat(), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_xxs(values)));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: false, xs: false }) {
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq2_16(values, None, false)));
 		}
 		if matches!(quantizer, Quantizer::Iq3S) {
-			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_s(values)));
 		}
 		Err(self.unavailable())
 	}
@@ -6342,6 +6724,8 @@ impl BlockNormalization {
 		match self {
 			Self::Batch => "bnorm",
 			Self::Layer => "lnorm",
+			Self::Rms => "rms",
+			Self::L2 => "l2",
 		}
 	}
 }
@@ -6412,6 +6796,12 @@ pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
 #[derive(Clone, Copy, Debug)]
 pub struct Batch;
+pub const rms: Rms = Rms;
+#[derive(Clone, Copy, Debug)]
+pub struct Rms;
+pub const l2: L2 = L2;
+#[derive(Clone, Copy, Debug)]
+pub struct L2;
 impl LossFunction {
 	const fn name(self) -> &'static str {
 		match self.0 {
@@ -6479,7 +6869,7 @@ impl Recipe {
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
 			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
-			tape.forward()?;
+			tape.forward(ForwardMode::Inference)?;
 			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
@@ -6525,7 +6915,7 @@ fn contract_gguf(model: &Gguf, name: &str, expert: Option<usize>, input: &[f64],
 	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
 	graph.stored[index] = Some(stored);
 	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
-	tape.forward()?;
+	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6678,7 +7068,13 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..)) || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
+	let convolutional = model.blocks.iter().any(|block| match &block.operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
+		_ => false,
+	});
+	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
@@ -6781,7 +7177,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads)?,
+		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -6789,6 +7185,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
+			graph.refresh_storage(config)?;
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
@@ -6796,14 +7193,14 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		lower_activation(graph, block.activation, config)?;
 	}
 	if let Some(normalization) = block.normalization {
-		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
-		push_node(graph, Primitive::Normalize, graph.output, 0, arguments(normalization as u8 as f64, epsilon), -2)?;
+		let channels = graph.output.channels;
+		lower_normalize(graph, normalization, channels, channels)?;
 	}
 	if block.quantization != 0 {
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
-			if node.op != Primitive::Predictor && node.parameters != 0 {
+			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.parameters != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
@@ -6990,13 +7387,30 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
+fn lower_attention(graph: &mut Graph, heads: usize, qk: Option<BlockNormalization>) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
 	let input = graph.output;
 	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
 	let width = input.channels / heads;
+	if let Some(normalization) = qk {
+		// The projection lays the queries and keys out ahead of the values, so the
+		// normalized span stops at the value plane and each head owns one group.
+		lower_normalize(graph, normalization, width, checked_mul(input.channels, 2, "attention query and key span")?)?;
+	}
 	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
 	lower_project(graph, input.channels)
+}
+/// Pushes a normalization over the graph output. A per-row mode splits the leading
+/// `span` channels into groups of `width`; the rest pass through untouched.
+fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	// RMS carries one trainable scale per normalized channel, starting at identity.
+	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	let output = graph.output;
+	push_node(graph, Primitive::Normalize, output, parameters, [normalization.mode(), epsilon, width as f64, span as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let offset = graph.parameters.len() - parameters;
+	graph.parameters[offset..].fill(1.0);
+	Ok(())
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -7168,7 +7582,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
+		let inputs = graph_inputs(graph, &data.samples, rows, gpu, config.precision)?;
 		let prepared = Prepared {
 			samples: inputs.clone(),
 			targets: targets[..rows].to_vec(),
@@ -7185,8 +7599,17 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			fitted: Vec::new(),
 		};
 		let fitted = estimator.fit(&prepared, rows, config)?;
-		let targets = predict_rows(&fitted, &inputs, input.elements())?;
-		(fitted.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		// The surrogate exists to carry this block's adjoint into its input, so a prefix
+		// whose parameters are all frozen never reads the weights a fit would produce.
+		let surrogate = if graph.frozen.contains(&0) {
+			let targets = predict_rows(&fitted, &inputs, input.elements())?;
+			fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+		} else {
+			let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+			untrained.frozen.fill(1);
+			untrained
+		};
+		(fitted.program, surrogate)
 	};
 	reset(graph, source, input);
 	push_predictor(graph, predictor)?;
@@ -7200,7 +7623,8 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
 	for node in &graph.nodes {
-		if node.op == Primitive::Elementwise {
+		// Scalar programs and normalizations set their own initial parameters.
+		if matches!(node.op, Primitive::Elementwise | Primitive::Normalize) {
 			continue;
 		}
 		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
@@ -7396,20 +7820,20 @@ fn count(name: &str, text: &str) -> Result<usize> {
 }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
-	// Every selected target column is an output, in the order the user declared them.
-	let outputs = if data.autoregressive {
-		vec!["char-id".to_owned()]
-	} else if data.target.is_empty() {
-		vec!["target".to_owned()]
-	} else {
-		data.target.clone()
-	};
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
 	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
+	// Every selected target column is an output, in the order the user declared them.
+	let outputs = if data.autoregressive {
+		vec!["char-id".to_owned()]
+	} else if data.target.is_empty() {
+		vec!["target".to_owned()]
+	} else {
+		schema.iter().filter(|(kind, _)| kind == "target").map(|(_, name)| name.clone()).collect()
+	};
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
@@ -7438,6 +7862,13 @@ struct NativeTape {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
+#[derive(Clone, Copy)]
+#[repr(i32)]
+enum ForwardMode {
+	Inference,
+	Training,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum EpochOperation {
 	Full,
@@ -7453,7 +7884,19 @@ impl EpochOperation {
 		matches!(self, Self::Full | Self::Optimizer)
 	}
 }
-
+fn native_context_values(graph: &Graph, layout: &NativeLayout, weights: &Buffer, precision: Compute) -> Result<Vec<u8>> {
+	let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+	let nearest = graph.nodes.iter().map(|node| nearest_layout(node, &graph.programs)).collect::<Result<Vec<_>>>()?;
+	if precision.pack(f64::MAX) == precision.pack(0.0) || nearest.iter().all(Option::is_none) {
+		return Ok(contexts);
+	}
+	let effective = weights.download_float(graph.parameters.len(), precision)?;
+	for (index, (node, nearest)) in graph.nodes.iter().zip(nearest).enumerate() {
+		let Some((features, rows, bytes)) = nearest else { continue };
+		NearestIndex::build(&effective[node.offset..node.offset + rows * features], features, rows).write(&mut contexts[layout.contexts[index]..layout.contexts[index] + bytes]);
+	}
+	Ok(contexts)
+}
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
@@ -7498,7 +7941,7 @@ impl NativeTape {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
@@ -7518,11 +7961,12 @@ impl NativeTape {
 			capacity: rows,
 		})
 	}
-	fn forward(&mut self) -> Result<()> {
+	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
+		let mode = mode as i32;
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -7835,9 +8279,14 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		gpu.synchronize()?;
 		Ok(started.elapsed().as_secs_f64())
 	};
+	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
-	let overhead = timed(&mut tape, false)?;
-	let epoch = timed(&mut tape, true)?;
+	timed(&mut tape, false)?;
+	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
+	for _ in 0..config.surrogate_epochs {
+		overhead = overhead.min(timed(&mut tape, false)?);
+		epoch = epoch.min(timed(&mut tape, true)?);
+	}
 	let gradient = epoch - overhead;
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
@@ -7942,7 +8391,7 @@ impl DeviceTape {
 		Ok(Self { shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
-		self.shards.iter_mut().try_for_each(NativeTape::forward)
+		self.shards.iter_mut().try_for_each(|tape| tape.forward(ForwardMode::Inference))
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let mut predictions = Vec::new();
@@ -8077,7 +8526,27 @@ fn structural(value: f64) -> Result<i32> {
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
 }
-fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
+const NEAREST_LEAF_ROWS: usize = 16;
+const NEAREST_NODE_FIELDS: usize = 5;
+fn nearest_rows(parameters: usize, features: usize) -> Option<usize> {
+	features.checked_add(1).and_then(|width| parameters.checked_div(width).filter(|rows| *rows != 0 && *rows * width == parameters))
+}
+#[rustfmt::skip]
+fn nearest_index_shape(rows: usize, features: usize) -> Option<(usize, usize)> { Some((rows.div_ceil(NEAREST_LEAF_ROWS).checked_next_power_of_two()?.checked_mul(2)?.checked_sub(1)?, features.checked_mul(2)?.checked_add(NEAREST_NODE_FIELDS)?)) }
+#[rustfmt::skip]
+fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize, usize)>> {
+	if node.op != Primitive::Predictor { return Ok(None) }
+	let end = node.program_offset.checked_add(checked_mul(node.program_count, 2, "predictor program")?).ok_or_else(|| RecipeError::new("predictor program range overflows"))?;
+	let program = programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("predictor program range is invalid"))?;
+	if !program.chunks_exact(2).any(|instruction| instruction[0] == PredictorOpcode::Nearest as i32 as f64) { return Ok(None) }
+	let table_rows = nearest_rows(node.parameters, node.input.elements()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
+	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
+}
+fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
+	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
+		return Ok(bytes);
+	}
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -8094,13 +8563,17 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// Four statistic planes over the group count the emitted kernel walks:
+		// batch and evaluation groups are channels; layer, RMS, and L2 groups
+		// are row positions, multiplied by their normalized head count.
 		Primitive::Normalize => {
-			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
-			checked_mul(4, groups, "normalization context")?
+			let statistics = checked_mul(4, normalize_groups(node, rows)?, "normalization context")?;
+			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
+			checked_add(statistics, partials, "normalization")?
 		}
 		_ => 1,
 	};
-	checked_mul(elements.max(1), element, "context bytes")
+	checked_mul(elements.max(1), precision.bytes(), "context bytes")
 }
 fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
@@ -8173,6 +8646,7 @@ impl Drop for Buffer {
 }
 #[derive(Clone, Copy)]
 struct Kernel {
+	#[cfg(any(amd, nvidia))]
 	object: u64,
 	shared: u32,
 	element: u8,
@@ -8187,7 +8661,7 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
@@ -8203,7 +8677,6 @@ enum NativeCpuEpoch {
 	F8(NativeEpochF8),
 }
 
-#[cfg(unix)]
 struct NativeCpuProgram {
 	_library: Library,
 	thread: NativeCpuThread,
@@ -8280,7 +8753,6 @@ impl Drop for NativeCudaProgram {
 }
 
 enum NativeBackend {
-	#[cfg(unix)]
 	Cpu(NativeCpuProgram),
 	#[cfg(amd)]
 	Amd(NativeHsaProgram),
@@ -8335,6 +8807,7 @@ fn native_artifact_contract(artifact: &NativeArtifact) -> Result<()> {
 impl Kernel {
 	const fn remote(shared: u32, element: u8, layout: &'static [u8]) -> Self {
 		Self {
+			#[cfg(any(amd, nvidia))]
 			object: 0,
 			shared,
 			element,
@@ -8553,39 +9026,43 @@ struct HsaPacket {
 }
 #[cfg(nvidia)]
 type NvQuery = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
-#[cfg(any(unix, all(nvidia, windows)))]
 struct Library(usize);
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Library {
-	fn open(name: &str) -> Result<Self> {
-		let name = format!("{name}\0");
-		let handle = unsafe { dlopen(name.as_ptr().cast(), 2) };
-		require(!handle.is_null(), format!("cannot load {name:?}"))?;
+	fn open(name: impl AsRef<OsStr>) -> Result<Self> {
+		let name = name.as_ref();
+		let handle = unsafe { native_library(name) };
+		require(!handle.is_null(), format!("cannot load {:?}", name.to_string_lossy()))?;
 		Ok(Self(handle as usize))
 	}
 	fn function<F: Copy>(&self, name: &[u8]) -> Result<F> {
-		let pointer = unsafe { dlsym(self.0 as Ptr, name.as_ptr().cast()) };
+		let pointer = unsafe {
+			#[cfg(unix)]
+			{
+				dlsym(self.0 as Ptr, name.as_ptr().cast())
+			}
+			#[cfg(windows)]
+			{
+				GetProcAddress(self.0 as Ptr, name.as_ptr().cast())
+			}
+		};
 		require(!pointer.is_null(), format!("runtime symbol {:?} is absent", name))?;
 		Ok(unsafe { std::mem::transmute_copy(&pointer) })
 	}
 }
 
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Drop for Library {
 	fn drop(&mut self) {
 		unsafe {
 			#[cfg(unix)]
 			dlclose(self.0 as Ptr);
-			#[cfg(all(nvidia, windows))]
+			#[cfg(windows)]
 			FreeLibrary(self.0 as Ptr);
 		}
 	}
 }
 
-#[cfg(unix)]
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
-	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
-	let library = Library::open(path)?;
+	let library = Library::open(&artifact.path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
@@ -8741,10 +9218,12 @@ impl Gpu {
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
 		let mut owned = 1_u32;
-		for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-			let k_lanes = (block / output_lanes).max(2);
-			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+		if block > 1 {
+			for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
+				let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+				let k_lanes = (block / output_lanes).max(2);
+				owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+			}
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
@@ -8917,26 +9396,33 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
+/// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
+/// `None` selects the whole machine, so an unnamed run still sees every device.
+fn device_selection() -> Result<Option<Vec<String>>> {
+	let Ok(selection) = std::env::var("RECIPE_DEVICE") else { return Ok(None) };
+	let prefix = format!("{}:", local_host()?);
+	Ok(Some(selection.split(',').map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_owned()).collect()))
+}
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
 			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
 				return cpu_device().map(|gpu| vec![gpu]);
 			}
+			let selection = device_selection()?;
 			let mut found = Vec::new();
 			let mut errors = Vec::new();
-			for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
-				match load() {
+			for load in [load_amd as fn(Option<&[String]>) -> Result<Vec<Gpu>>, load_nvidia] {
+				match load(selection.as_deref()) {
 					Ok(mut devices) => found.append(&mut devices),
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() {
-				if cfg!(any(amd, nvidia)) {
-					return Err(RecipeError::new(errors.join("; ")));
-				}
+			if found.is_empty() && !cfg!(any(amd, nvidia)) {
 				found.push(cpu_device()?);
 			}
+			// A selection names devices on other hosts too, so an empty local list is not an error.
+			require(!found.is_empty() || selection.is_some(), errors.join("; "))?;
 			Ok(found)
 		})
 		.as_ref()
@@ -8951,11 +9437,19 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
+#[cfg(unix)]
 fn local_host() -> Result<String> {
 	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	require(output.status.success(), "cannot read hostname")?;
 	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
+}
+#[cfg(windows)]
+fn local_host() -> Result<String> {
+	let mut words = [0_u16; 256];
+	let mut length = words.len() as u32;
+	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
+	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
@@ -9254,12 +9748,40 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 	unsafe { *arguments[index].cast::<T>() }
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
 }
 
-#[cfg(unix)]
+macro_rules! launch_native_cpu_epoch {
+	($function:expr, $arguments:expr) => {
+		($function)(
+			native_cpu_pointer($arguments, 0),
+			native_cpu_pointer($arguments, 1),
+			native_cpu_pointer($arguments, 2),
+			native_cpu_pointer($arguments, 3),
+			native_cpu_pointer($arguments, 4),
+			native_cpu_pointer($arguments, 5),
+			native_cpu_pointer($arguments, 6),
+			native_cpu_pointer($arguments, 7),
+			native_cpu_pointer($arguments, 8),
+			native_cpu_pointer($arguments, 9),
+			native_cpu_pointer($arguments, 10),
+			native_cpu_pointer($arguments, 11),
+			native_cpu_value($arguments, 12),
+			native_cpu_value($arguments, 13),
+			native_cpu_value($arguments, 14),
+			native_cpu_value($arguments, 15),
+			native_cpu_value($arguments, 16),
+			native_cpu_value($arguments, 17),
+			native_cpu_value($arguments, 18),
+			native_cpu_value($arguments, 19),
+			native_cpu_value($arguments, 20),
+			native_cpu_value($arguments, 21),
+			native_cpu_value($arguments, 22),
+		)
+	};
+}
+
 unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
@@ -9272,45 +9794,16 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 					native_cpu_pointer(arguments, 3),
 					native_cpu_value(arguments, 4),
 					native_cpu_value(arguments, 5),
+					native_cpu_value(arguments, 6),
 				);
 			}
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
-				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-				macro_rules! launch {
-					($function:expr) => {
-						$function(
-							pointers[0],
-							pointers[1],
-							pointers[2],
-							pointers[3],
-							pointers[4],
-							pointers[5],
-							pointers[6],
-							pointers[7],
-							pointers[8],
-							pointers[9],
-							pointers[10],
-							pointers[11],
-							native_cpu_value(arguments, 12),
-							native_cpu_value(arguments, 13),
-							native_cpu_value(arguments, 14),
-							native_cpu_value(arguments, 15),
-							native_cpu_value(arguments, 16),
-							native_cpu_value(arguments, 17),
-							native_cpu_value(arguments, 18),
-							native_cpu_value(arguments, 19),
-							native_cpu_value(arguments, 20),
-							native_cpu_value(arguments, 21),
-							native_cpu_value(arguments, 22),
-						)
-					};
-				}
 				match epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
-					NativeCpuEpoch::F64(function) => launch!(function),
-					NativeCpuEpoch::F32(function) => launch!(function),
-					NativeCpuEpoch::F16(function) => launch!(function),
-					NativeCpuEpoch::F8(function) => launch!(function),
+					NativeCpuEpoch::F64(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F32(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F16(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F8(function) => launch_native_cpu_epoch!(function, arguments),
 				}
 			}
 			NativeEntry::ModelLoad => {
@@ -9323,7 +9816,6 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 	}
 }
 
-#[cfg(unix)]
 unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
 	require(threads != 0, "native CPU worker count is empty")?;
 	let slots = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
@@ -9359,18 +9851,12 @@ impl NativeProgram {
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
-				#[cfg(unix)]
-				{
-					let cpu = load_native_cpu(&artifact)?;
-					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
-					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
-					let model_load =
-						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
-					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
-				}
-				#[cfg(not(unix))]
-				return Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"));
+				let cpu = load_native_cpu(&artifact)?;
+				let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+				let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+				let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
+				let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+				(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
@@ -9484,11 +9970,13 @@ impl NativeProgram {
 /// Dispatches one loaded entrypoint on the device that loaded it. The caller
 /// holds the device dispatch lock and has already validated the argument list
 /// and shared-memory budget.
-unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, shared: u32) -> Result<()> {
+unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, _shared: u32) -> Result<()> {
+	#[cfg(any(amd, nvidia))]
 	let block = dispatch.geometry.block;
+	#[cfg(not(any(amd, nvidia)))]
+	let _ = (threads, dynamic, _shared);
 	unsafe {
 		match (backend, &gpu.driver) {
-			#[cfg(unix)]
 			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
@@ -9543,7 +10031,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					grid_y: 1,
 					grid_z: 1,
 					private: dispatch.kernel.private,
-					group: shared,
+					group: _shared,
 					object: dispatch.kernel.object,
 					kernarg,
 					reserved1: 0,
@@ -9591,7 +10079,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 	}
 }
 
-fn load_amd() -> Result<Vec<Gpu>> {
+fn load_amd(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
 	#[cfg(amd)]
@@ -9607,7 +10095,12 @@ fn load_amd() -> Result<Vec<Gpu>> {
 		check(iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
 		check(iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent")?;
 		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?;
-		gpu.found.into_iter().enumerate().map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index)).collect()
+		gpu.found
+			.into_iter()
+			.enumerate()
+			.filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("amd{index}"))))
+			.map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index))
+			.collect()
 	}
 }
 #[cfg(amd)]
@@ -9686,7 +10179,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
-fn load_nvidia() -> Result<Vec<Gpu>> {
+fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	#[cfg(not(nvidia))]
 	return Err(RecipeError::new("NVIDIA support is not compiled into this build"));
 	#[cfg(nvidia)]
@@ -9701,7 +10194,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const REGISTERS_PER_SM: i32 = 82;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
-		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
+		let runtime = std::sync::Arc::new(Library::open(env!("RECIPE_NV_RUNTIME"))?);
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
@@ -9772,17 +10265,17 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				dispatch: Mutex::new(()),
 			})
 		};
-		let mut found = Vec::new();
+		let mut discrete = Vec::new();
 		for ordinal in 0..count {
 			let (mut gpu, mut integrated) = (0, 0);
 			check(get_device(&mut gpu, ordinal), "device enumeration")?;
 			check(attribute(&mut integrated, INTEGRATED, gpu), "device probe")?;
 			if integrated == 0 {
-				found.push(load_device(gpu, found.len())?)
+				discrete.push(gpu)
 			}
 		}
-		require(!found.is_empty(), "Nvidia has no discrete GPU")?;
-		Ok(found)
+		require(!discrete.is_empty(), "Nvidia has no discrete GPU")?;
+		discrete.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
@@ -9798,15 +10291,12 @@ struct WorkerProgram {
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
-	let probe = device(Some(name)).and_then(|gpu| {
-		let (backend, wave) = match &gpu.driver {
-			#[cfg(amd)]
-			Driver::Hsa(driver) => (1_u8, driver.wave),
-			#[cfg(nvidia)]
-			Driver::Cuda(driver) => (2_u8, driver.wave),
-			_ => return Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
-		};
-		Ok((gpu, backend, wave))
+	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		#[cfg(amd)]
+		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
+		_ => Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
 	});
 	let (gpu, backend, wave) = match probe {
 		Ok(probe) => probe,
@@ -9874,6 +10364,8 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
+				#[cfg(not(any(amd, nvidia)))]
+				let _ = (waves, element, training, epoch_layout, has_storage);
 				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
@@ -9927,7 +10419,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 		wire.flush()?;
 	}
 }
-#[cfg(all(unix, not(windows)))]
+#[cfg(unix)]
 #[link(name = "dl")]
 unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
@@ -9936,22 +10428,32 @@ unsafe extern "C" {
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
-	unsafe { LoadLibraryA(name) }
+#[cfg(unix)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let mut name = name.as_bytes().to_vec();
+	name.push(0);
+	unsafe { dlopen(name.as_ptr().cast(), 2) }
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr {
-	unsafe { GetProcAddress(handle, name) }
+#[cfg(windows)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let name = name.encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	unsafe { LoadLibraryW(name.as_ptr()) }
 }
-#[cfg(all(nvidia, windows))]
+#[cfg(windows)]
+const CTRL_C_EVENT: u32 = 0;
+#[cfg(windows)]
+const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-	fn LoadLibraryA(name: *const std::ffi::c_char) -> Ptr;
+	fn LoadLibraryW(name: *const u16) -> Ptr;
 	fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn FreeLibrary(handle: Ptr) -> i32;
+	fn GetComputerNameExW(format: i32, name: *mut u16, length: *mut u32) -> i32;
+	fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
 }
 unsafe extern "C" {
+	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
@@ -9959,17 +10461,22 @@ unsafe extern "C" {
 fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
 }
+#[rustfmt::skip]
+fn nearest_bounds_distance(query: &[f64], samples: &[f64], bounds: &[u32]) -> f64 {
+	let features = query.len(); query.iter().enumerate().map(|(feature, &value)| {
+		let (lower, upper) = (samples[bounds[feature] as usize * features + feature], samples[bounds[features + feature] as usize * features + feature]); (value - if value < lower { lower } else if value > upper { upper } else { value }).powi(2)
+	}).sum()
+}
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 	state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY))
 }
-fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
+fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
-	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
-	tape.forward()?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
+	tape.forward(ForwardMode::Training)?;
 	tape.predictions()
 }
 fn surrogate_model(hidden: usize) -> Model {
@@ -10005,78 +10512,75 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	graph.frozen.fill(1);
 	Ok(graph)
 }
-#[derive(Clone)]
-struct NearestNode {
-	minimum: u32,
-	start: u32,
-	end: u32,
-	split: Option<(usize, f64, Box<NearestNode>, Box<NearestNode>)>,
-}
+const NEAREST_IDENTICAL_LEAF: u32 = u32::MAX - 1;
 #[derive(Clone)]
 struct NearestIndex {
 	features: usize,
 	permutation: Vec<u32>,
-	root: NearestNode,
+	nodes: Vec<u32>,
 }
 impl NearestIndex {
 	fn build(samples: &[f64], features: usize, rows: usize) -> Self {
-		let mut permutation = (0..rows as u32).collect::<Vec<_>>();
-		let root = Self::partition(samples, features, &mut permutation, 0);
-		Self { features, permutation, root }
+		let (mut permutation, mut nodes) = ((0..rows as u32).collect::<Vec<_>>(), Vec::new());
+		Self::partition(samples, features, &mut permutation, 0, u32::MAX, &mut nodes);
+		Self { features, permutation, nodes }
 	}
-	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32) -> NearestNode {
-		let minimum = permutation.iter().copied().min().unwrap_or(0);
-		let end = start + permutation.len() as u32;
-		if permutation.len() <= 16 {
-			return NearestNode { minimum, start, end, split: None };
+	fn write(&self, target: &mut [u8]) {
+		let permutation = target.len() / size_of::<u32>() - self.permutation.len();
+		for (position, value) in self.nodes.iter().copied().enumerate().chain(self.permutation.iter().copied().enumerate().map(|(position, row)| (permutation + position, row))) {
+			target[position * size_of::<u32>()..(position + 1) * size_of::<u32>()].copy_from_slice(&value.to_le_bytes())
 		}
-		let mut widest = (f64::NEG_INFINITY, 0);
+	}
+	#[rustfmt::skip]
+	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32, parent: u32, nodes: &mut Vec<u32>) -> u32 {
+		let stride = features * 2 + NEAREST_NODE_FIELDS; let (base, index) = (nodes.len(), (nodes.len() / stride) as u32);
+		nodes.extend([permutation.iter().copied().min().unwrap_or(0), start, start + permutation.len() as u32, u32::MAX, parent]); nodes.resize(base + stride, 0);
+		let (mut widest, mut dimension) = (f64::NEG_INFINITY, 0);
 		for feature in 0..features {
-			let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+			let (mut lower, mut upper) = (permutation[0], permutation[0]);
 			for &row in permutation.iter() {
 				let value = samples[row as usize * features + feature];
-				(low, high) = (low.min(value), high.max(value));
+				if value.total_cmp(&samples[lower as usize * features + feature]).is_lt() { lower = row }
+				if value.total_cmp(&samples[upper as usize * features + feature]).is_gt() { upper = row }
 			}
-			widest = if high - low > widest.0 { (high - low, feature) } else { widest };
+			(nodes[base + NEAREST_NODE_FIELDS + feature], nodes[base + NEAREST_NODE_FIELDS + features + feature]) = (lower, upper);
+			let range = samples[upper as usize * features + feature] - samples[lower as usize * features + feature];
+			if range > widest { (widest, dimension) = (range, feature) }
 		}
-		let (dimension, middle) = (widest.1, permutation.len() / 2);
-		permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
-		let threshold = samples[permutation[middle] as usize * features + dimension];
-		let (left, right) = permutation.split_at_mut(middle);
-		let left = Box::new(Self::partition(samples, features, left, start));
-		let right = Box::new(Self::partition(samples, features, right, start + middle as u32));
-		NearestNode { minimum, start, end, split: Some((dimension, threshold, left, right)) }
+		if widest == 0.0 {
+			permutation.sort_unstable(); nodes[base + 3] = NEAREST_IDENTICAL_LEAF
+		} else if permutation.len() > NEAREST_LEAF_ROWS {
+			let middle = permutation.len() / 2;
+			permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
+			let pivot = permutation[middle];
+			let (left, right) = permutation.split_at_mut(middle);
+			Self::partition(samples, features, left, start, index, nodes); let right = Self::partition(samples, features, right, start + middle as u32, index, nodes);
+			nodes[base + 1..base + 4].copy_from_slice(&[pivot, right, dimension as u32]);
+		}
+		index
 	}
-	fn nearest(&self, node: &NearestNode, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
-		let Some((dimension, threshold, left, right)) = &node.split else {
-			for &candidate in &self.permutation[node.start as usize..node.end as usize] {
-				if exclude && candidate as usize == row {
-					continue;
-				}
-				let base = candidate as usize * self.features;
-				let measured = distance(query, &samples[base..base + self.features]);
-				let keeps = best.len() < count || best.last().is_some_and(|&(kept, index)| measured < kept || (measured == kept && candidate < index));
-				if measured < f64::MAX && keeps {
-					let position = best.iter().position(|&(kept, index)| kept > measured || (kept == measured && index > candidate)).unwrap_or(best.len());
-					best.insert(position, (measured, candidate));
-					best.truncate(count);
+	#[rustfmt::skip]
+	fn nearest(&self, index: usize, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
+		let stride = self.features * 2 + NEAREST_NODE_FIELDS; let (first, second, dimension) = (self.nodes[index * stride + 1], self.nodes[index * stride + 2], self.nodes[index * stride + 3]);
+		if dimension >= NEAREST_IDENTICAL_LEAF {
+			let end = if dimension == NEAREST_IDENTICAL_LEAF { (second as usize).min(first as usize + count + usize::from(exclude)) } else { second as usize };
+			for &candidate in &self.permutation[first as usize..end] {
+				if exclude && candidate as usize == row { continue }
+				let base = candidate as usize * query.len();
+				let measured = distance(query, &samples[base..base + query.len()]);
+				let position = best.partition_point(|&(kept, index)| kept < measured || (kept == measured && index < candidate));
+				if measured < f64::MAX && position < count {
+					best.insert(position, (measured, candidate)); best.truncate(count)
 				}
 			}
 			return;
-		};
-		// On an equal coordinate the left child holds the lower row indices, so it is
-		// searched first to settle tie-breaks before the far bound is consulted.
-		let (near, far) = if query[*dimension] <= *threshold { (left, right) } else { (right, left) };
+		}
+		let (dimension, threshold, left, right) = (dimension as usize, samples[first as usize * query.len() + dimension as usize], index + 1, second as usize);
+		let (near, far) = if query[dimension] <= threshold { (left, right) } else { (right, left) };
 		self.nearest(near, samples, query, row, count, exclude, best);
-		// The squared split coordinate gap lower-bounds every far-side distance, so the
-		// far subtree is skipped only when no far row can displace or tie a kept one.
-		if best.len() == count {
-			if let Some(&(kept, index)) = best.last() {
-				let gap = (query[*dimension] - threshold).powi(2);
-				if gap > kept || (gap == kept && far.minimum > index) {
-					return;
-				}
-			}
+		if best.len() == count && let Some(&(kept, index)) = best.last() {
+			let gap = nearest_bounds_distance(query, samples, &self.nodes[far * stride + NEAREST_NODE_FIELDS..far * stride + NEAREST_NODE_FIELDS + 2 * self.features]);
+			if gap > kept || (gap == kept && self.nodes[far * stride] > index) { return }
 		}
 		self.nearest(far, samples, query, row, count, exclude, best);
 	}
@@ -10142,21 +10646,11 @@ impl PredictorProgram {
 					let count = instruction[1].abs() as usize;
 					let exclude = instruction[1] < 0.0;
 					let features = query.len();
-					let rows = self
-						.table
-						.len()
-						.checked_div(features + 1)
-						.filter(|rows| rows * (features + 1) == self.table.len())
-						.ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+					let rows = nearest_rows(self.table.len(), features).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 					let (samples, targets) = self.table.split_at(rows * features);
-					// An index is built beside the table it searches and neither is replaced afterwards, so a
-					// program that carries an absent or differently shaped index rebuilds from the table it holds
-					// now rather than answering from one that never saw these values.
-					let rebuilt =
-						self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
-					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
+					let index = self.nearest.as_ref().ok_or_else(|| RecipeError::new("nearest index is absent"))?;
 					let mut best = Vec::with_capacity(count);
-					index.nearest(&index.root, samples, query, row, count, exclude, &mut best);
+					index.nearest(0, samples, query, row, count, exclude, &mut best);
 					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
 				}
 				value if value == PredictorOpcode::Affine as i32 => {
@@ -10368,22 +10862,35 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
+	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
+		let partials = parallel_map(blocks, |block| {
+			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
+			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
+			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
+				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let error = prediction - target;
+				let direction = if error > config.svm_epsilon {
+					1.0
+				} else if error < -config.svm_epsilon {
+					-1.0
+				} else {
+					0.0
+				};
+				bias_partial += direction / rows as f64;
+				for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut partial) {
+					*value_gradient += direction * (value - mean) * scale / rows as f64
+				}
+			}
+			(bias_partial, partial)
+		})?;
 		let mut gradient = weights.iter().map(|weight| config.svm_regularization * weight).collect::<Vec<_>>();
 		let mut bias_gradient = 0.0;
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
-			let error = prediction - target;
-			let direction = if error > config.svm_epsilon {
-				1.0
-			} else if error < -config.svm_epsilon {
-				-1.0
-			} else {
-				0.0
-			};
-			bias_gradient += direction / rows as f64;
-			for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut gradient) {
-				*value_gradient += direction * (value - mean) * scale / rows as f64
+		for (bias_partial, partial) in partials {
+			bias_gradient += bias_partial;
+			for (value_gradient, partial) in gradient.iter_mut().zip(partial) {
+				*value_gradient += partial
 			}
 		}
 		bias -= config.svm_rate * bias_gradient;
@@ -10429,72 +10936,82 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config) -> Res
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::fitted(program.finish()?, move |sample| forest.iter().fold(0.0, |sum, tree| sum + tree_predict(tree, sample)) / trees as f64))
 }
-fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Result<Vec<f64>> {
-	let width = values.len();
-	require(matrix.len() == width * width && width != 0, "linear system shape is invalid")?;
-	for column in 0..width {
-		let pivot = (column..width)
-			.max_by(|left, right| matrix[*left * width + column].abs().total_cmp(&matrix[*right * width + column].abs()))
-			.ok_or_else(|| RecipeError::new("linear system has no pivot"))?;
-		require(matrix[pivot * width + column].abs() > epsilon, "linear system is singular")?;
-		for entry in 0..width {
-			matrix.swap(column * width + entry, pivot * width + entry)
-		}
-		values.swap(column, pivot);
-		let scale = matrix[column * width + column];
-		for entry in column..width {
-			matrix[column * width + entry] /= scale
-		}
-		values[column] /= scale;
+/// Solves the ridge system in the smaller of feature space and row space.
+fn solve_bayes(samples: &[f64], targets: &[f64], means: &[f64], target_mean: f64, config: Config) -> Result<Vec<f64>> {
+	let (rows, features) = (targets.len(), means.len());
+	require(rows != 0 && features != 0 && samples.len() == checked_mul(rows, features, "Bayes sample matrix")?, "Bayes system shape is invalid")?;
+	let dual = rows < features;
+	let (width, terms) = if dual { (rows, features) } else { (features, rows) };
+	let mut matrix = vec![0.0; checked_mul(width, width, "Bayes system matrix")?];
+	let mut values = vec![0.0; width];
+	// The covariance is symmetric, so only its lower triangle accumulates. Row space
+	// reads a pair of sample rows in order, and feature space centers one sample at a time.
+	if dual {
 		for row in 0..width {
-			if row == column {
-				continue;
+			for column in 0..row + 1 {
+				matrix[row * width + column] = (0..terms).map(|term| (samples[row * features + term] - means[term]) * (samples[column * features + term] - means[term])).sum()
 			}
-			let factor = matrix[row * width + column];
-			for entry in column..width {
-				matrix[row * width + entry] -= factor * matrix[column * width + entry]
+		}
+		for (value, target) in values.iter_mut().zip(targets) {
+			*value = target - target_mean
+		}
+	} else {
+		let mut centered = vec![0.0; width];
+		for (sample, target) in samples.chunks_exact(features).zip(targets) {
+			for (entry, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(means)) {
+				*entry = value - mean
 			}
-			values[row] -= factor * values[column];
+			let response = target - target_mean;
+			for row in 0..width {
+				values[row] += centered[row] * response;
+				for column in 0..row + 1 {
+					matrix[row * width + column] += centered[row] * centered[column]
+				}
+			}
 		}
 	}
-	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
+	// The noise variance is invariant, so it divides each accumulated sum once.
+	for row in 0..width {
+		values[row] /= config.bayes_noise_variance;
+		for column in 0..row + 1 {
+			matrix[row * width + column] /= config.bayes_noise_variance
+		}
+		matrix[row * width + row] += config.bayes_prior_precision
+	}
+	// Ridge regularization makes the system positive definite, so factor only its lower triangle.
+	for row in 0..width {
+		for column in 0..row + 1 {
+			let value = matrix[row * width + column] - (0..column).map(|inner| matrix[row * width + inner] * matrix[column * width + inner]).sum::<f64>();
+			if row == column {
+				require(value > config.bayes_variance_epsilon, "Bayes system is not positive definite")?;
+				matrix[row * width + column] = value.sqrt()
+			} else {
+				matrix[row * width + column] = value / matrix[column * width + column]
+			}
+		}
+	}
+	for row in 0..width {
+		values[row] = (values[row] - (0..row).map(|column| matrix[row * width + column] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	for row in (0..width).rev() {
+		values[row] = (values[row] - (row + 1..width).map(|column| matrix[column * width + row] * values[column]).sum::<f64>()) / matrix[row * width + row]
+	}
+	let weights =
+		if dual { (0..features).map(|feature| samples.chunks_exact(features).zip(&values).map(|(sample, value)| (sample[feature] - means[feature]) * value).sum()).collect() } else { values };
+	require(weights.iter().all(|value| value.is_finite()), "Bayes system produced a nonfinite solution").map(|_| weights)
 }
 fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
-		let mut means = vec![0.0; data.features];
+		let samples = &data.samples[..rows * data.features];
 		let target_mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-		for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
+		let mut means = vec![0.0; data.features];
+		for sample in samples.chunks_exact(data.features) {
 			for (mean, value) in means.iter_mut().zip(sample) {
 				*mean += value / rows as f64
 			}
 		}
-		// The covariance is symmetric and the noise variance is invariant, so only
-		// the upper triangle accumulates and the noise divides each sum once.
-		let mut matrix = vec![0.0; data.features * data.features];
-		let mut values = vec![0.0; data.features];
-		let mut centered = vec![0.0; data.features];
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			for (centered, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(&means)) {
-				*centered = value - mean
-			}
-			for left in 0..data.features {
-				values[left] += centered[left] * (target - target_mean);
-				for right in left..data.features {
-					matrix[left * data.features + right] += centered[left] * centered[right]
-				}
-			}
-		}
-		for left in 0..data.features {
-			values[left] /= config.bayes_noise_variance;
-			for right in left..data.features {
-				let entry = matrix[left * data.features + right] / config.bayes_noise_variance;
-				matrix[left * data.features + right] = entry;
-				matrix[right * data.features + left] = entry;
-			}
-			matrix[left * data.features + left] += config.bayes_prior_precision
-		}
-		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
+		let weights = solve_bayes(samples, &data.targets[..rows], &means, target_mean, config)?;
 		let mut table = vec![1.0; 2 * data.features];
 		table[..data.features].copy_from_slice(&means);
 		table.extend(weights);
@@ -10604,32 +11121,38 @@ fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result
 	Ok(Predictor::fitted(boosted_predictor(base, &trees, config.boost_rate)?, move |sample| trees.iter().fold(base, |value, tree| value + config.boost_rate * tree_predict(tree, sample))))
 }
 struct LightNode {
-	rows: Vec<usize>,
+	candidate: Option<(f64, usize, f64, Vec<usize>, Vec<usize>)>,
 	value: f64,
 	split: Option<(usize, f64, usize, usize)>,
 }
-fn lightgbm_split(samples: &[f64], residuals: &[f64], features: usize, rows: &[usize], bins: usize, minimum: usize) -> Option<(f64, usize, f64, Vec<usize>, Vec<usize>)> {
+/// Grows a leaf and the best split of its rows. Residuals stay fixed while a
+/// tree grows, so every later round reads this split instead of rescanning the
+/// leaf it already scanned.
+fn light_node(columns: &[Vec<f64>], residuals: &[f64], residual_squares: &[f64], rows: Vec<usize>, config: Config) -> Result<LightNode> {
+	let candidate = lightgbm_split(columns, residuals, residual_squares, &rows, config.lightgbm_bins, config.tree_min_rows)?;
+	Ok(LightNode { candidate, value: tree_mean(&rows, residuals), split: None })
+}
+fn lightgbm_split(columns: &[Vec<f64>], residuals: &[f64], residual_squares: &[f64], rows: &[usize], bins: usize, minimum: usize) -> Result<Option<(f64, usize, f64, Vec<usize>, Vec<usize>)>> {
 	let total = rows.iter().map(|&row| residuals[row]).sum::<f64>();
-	let square = rows.iter().map(|&row| residuals[row].powi(2)).sum::<f64>();
+	let square = rows.iter().map(|&row| residual_squares[row]).sum::<f64>();
 	let parent = square - total * total / rows.len() as f64;
-	let mut best = None;
-	for feature in 0..features {
-		let minimum_value = rows.iter().map(|&row| samples[row * features + feature]).fold(f64::INFINITY, f64::min);
-		let maximum_value = rows.iter().map(|&row| samples[row * features + feature]).fold(f64::NEG_INFINITY, f64::max);
+	let best = parallel_map(columns.len(), |feature| {
+		let column = &columns[feature];
+		let (minimum_value, maximum_value) = rows.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), &row| (f64::min(low, column[row]), f64::max(high, column[row])));
 		if minimum_value >= maximum_value {
-			continue;
+			return None;
 		}
 		let width = (maximum_value - minimum_value) / bins as f64;
 		let mut counts = vec![0_usize; bins];
 		let mut sums = vec![0.0; bins];
 		let mut squares = vec![0.0; bins];
 		for &row in rows {
-			let bin = (((samples[row * features + feature] - minimum_value) / width).floor() as usize).min(bins - 1);
+			let bin = (((column[row] - minimum_value) / width) as usize).min(bins - 1);
 			counts[bin] += 1;
 			sums[bin] += residuals[row];
-			squares[bin] += residuals[row].powi(2);
+			squares[bin] += residual_squares[row];
 		}
-		let (mut left_count, mut left_sum, mut left_square) = (0, 0.0, 0.0);
+		let (mut left_count, mut left_sum, mut left_square, mut best) = (0, 0.0, 0.0, None);
 		for bin in 0..bins - 1 {
 			left_count += counts[bin];
 			left_sum += sums[bin];
@@ -10642,15 +11165,20 @@ fn lightgbm_split(samples: &[f64], residuals: &[f64], features: usize, rows: &[u
 			let right_square = square - left_square;
 			let gain = parent - (left_square - left_sum * left_sum / left_count as f64) - (right_square - right_sum * right_sum / right_count as f64);
 			let threshold = minimum_value + width * (bin + 1) as f64;
-			if gain > 0.0 && best.as_ref().is_none_or(|value: &(f64, usize, f64)| gain > value.0) {
-				best = Some((gain, feature, threshold))
+			if gain > 0.0 && best.as_ref().is_none_or(|value: &(f64, f64)| gain > value.0) {
+				best = Some((gain, threshold))
 			}
 		}
-	}
-	best.map(|(gain, feature, threshold)| {
-		let (left, right) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
+		best
+	})?
+	.into_iter()
+	.enumerate()
+	.filter_map(|(feature, best)| best.map(|(gain, threshold)| (gain, feature, threshold)))
+	.reduce(|best, candidate| if candidate.0 > best.0 { candidate } else { best });
+	Ok(best.map(|(gain, feature, threshold)| {
+		let (left, right) = rows.iter().copied().partition(|&row| columns[feature][row] < threshold);
 		(gain, feature, threshold, left, right)
-	})
+	}))
 }
 fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 	match nodes[index].split {
@@ -10664,22 +11192,21 @@ fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config) -> Resul
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut trees = Vec::with_capacity(config.boost_iterations);
+	// One scan reads one feature of every row, so the rows are transposed once
+	// into a column per feature instead of striding across every sample.
+	let columns = parallel_map(data.features, |feature| data.samples[..rows * data.features].iter().skip(feature).step_by(data.features).copied().collect::<Vec<_>>())?;
 	for _ in 0..config.boost_iterations {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
-		let indices = (0..rows).collect::<Vec<_>>();
-		let mut nodes = vec![LightNode { value: tree_mean(&indices, &residuals), rows: indices, split: None }];
+		let residual_squares = residuals.iter().map(|residual| residual * residual).collect::<Vec<_>>();
+		let mut nodes = vec![light_node(&columns, &residuals, &residual_squares, (0..rows).collect(), config)?];
 		for _ in 1..config.lightgbm_leaves {
-			let selected = nodes
-				.iter()
-				.enumerate()
-				.filter(|(_, node)| node.split.is_none())
-				.filter_map(|(index, node)| lightgbm_split(&data.samples, &residuals, data.features, &node.rows, config.lightgbm_bins, config.tree_min_rows).map(|split| (index, split)))
-				.max_by(|left, right| left.1.0.total_cmp(&right.1.0));
-			let Some((index, (_, feature, threshold, left, right))) = selected else { break };
+			let selected = nodes.iter().enumerate().filter_map(|(index, node)| node.candidate.as_ref().map(|candidate| (index, candidate.0))).max_by(|left, right| left.1.total_cmp(&right.1));
+			let Some((index, _)) = selected else { break };
+			let Some((_, feature, threshold, left, right)) = nodes[index].candidate.take() else { break };
 			let left_index = nodes.len();
-			nodes.push(LightNode { value: tree_mean(&left, &residuals), rows: left, split: None });
+			nodes.push(light_node(&columns, &residuals, &residual_squares, left, config)?);
 			let right_index = nodes.len();
-			nodes.push(LightNode { value: tree_mean(&right, &residuals), rows: right, split: None });
+			nodes.push(light_node(&columns, &residuals, &residual_squares, right, config)?);
 			nodes[index].split = Some((feature, threshold, left_index, right_index));
 		}
 		let tree = materialize_lightgbm(&nodes, 0);
@@ -10724,19 +11251,25 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 }
 fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Result<Option<(usize, f64)>> {
 	let Some(groups) = 1_usize.checked_shl((level + 1) as u32) else { return Ok(None) };
+	// Every candidate of every feature rescans the same rows in the same order
+	// against the same group divisors, so the scan reads both in sequence
+	// instead of gathering a permuted row and widening a count on each step.
+	let ordered = permutation.iter().map(|&row| (residuals[row], codes[row])).collect::<Vec<_>>();
+	let divisors = (0..=permutation.len()).map(|count| count as f64 + prior).collect::<Vec<_>>();
 	// Each feature's candidate scan is independent; the reduction keeps the first
 	// strict minimum in feature order, matching the sequential scan.
 	Ok(parallel_map(borders.len(), |feature| {
 		let candidates = &borders[feature];
+		let bins = permutation.iter().map(|&row| candidates.bins[row]).collect::<Vec<_>>();
 		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
 			counts.fill(0);
 			sums.fill(0.0);
 			let mut error = 0.0;
-			for &row in permutation {
-				let group = codes[row] | usize::from(candidates.bins[row] <= index) << level;
-				error += (residuals[row] - sums[group] / (counts[group] as f64 + prior)).powi(2);
-				sums[group] += residuals[row];
+			for (&(residual, code), &bin) in ordered.iter().zip(&bins) {
+				let group = code | usize::from(bin <= index) << level;
+				error += (residual - sums[group] / divisors[counts[group]]).powi(2);
+				sums[group] += residual;
 				counts[group] += 1;
 			}
 			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, f64)| error < value.0) {
@@ -11246,6 +11779,8 @@ struct Prepared {
 struct Table {
 	name: String,
 	headers: Vec<String>,
+	/// Whether the source names the headers; a headerless table takes positional names instead.
+	declared: bool,
 	rows: Vec<Vec<String>>,
 	/// Row-major image values are channel-major when each image row is one channel.
 	attention: Option<Shape>,
@@ -11279,30 +11814,15 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
-	for source in sources {
-		collect_files(&resolve_path(source)?, &mut paths)?;
-	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// Preserve container-relative paths while recursively loading folders and archives.
 	let mut files = Vec::new();
-	for path in &paths {
-		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
-				files.push((path.join(entry), contents));
-			}
-		} else {
-			files.push((path.clone(), bytes));
-		}
+	for source in sources {
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+		collect_files(&path, None, &mut files)?;
 	}
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files.dedup_by(|left, right| left.0 == right.0);
+	let paths = files.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
@@ -11433,13 +11953,15 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			}
 			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
 	}
 	if aligned {
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	// Only a declared column overrides the directory names; the positional names a headerless
+	// sample takes name its one field by convention rather than carrying a label.
+	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
 		return Ok(None);
 	}
 	let mut builder = SampleTableBuilder::new(target.clone());
@@ -11477,7 +11999,7 @@ impl SampleTableBuilder {
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
+		Ok(Table { name, headers: self.headers, declared: true, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
@@ -11850,7 +12372,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		require(data.tests.is_empty(), "autoregressive test data is unsupported")?;
 		return prepare_autoregression(data, &tables);
 	}
-	let mut selected = Vec::new();
+	let (mut selected, mut target_names) = (Vec::new(), Vec::new());
 	for name in &data.target {
 		let mut matches = Vec::new();
 		for (table, value) in tables.iter().enumerate() {
@@ -11864,9 +12386,11 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			let grouped = !matches.is_empty()
 				&& matches.iter().all(|(table, column)| tables[*table].headers[*column].rsplit_once('.').is_some_and(|(base, suffix)| base == name && suffix.parse::<usize>().is_ok()));
 			require(grouped, format!("target {name:?} must identify exactly one feature or a numbered group"))?;
+			target_names.extend(matches.iter().map(|(table, column)| tables[*table].headers[*column].clone()));
 			selected.extend(matches);
 			continue;
 		}
+		target_names.push(name.clone());
 		selected.push(matches[0]);
 	}
 	let table_index = selected.first().map_or(0, |target| target.0);
@@ -11956,7 +12480,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let schema = columns
 		.iter()
 		.map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1])))
-		.chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target)))
+		.chain(target_names.into_iter().map(|target| ("target".to_owned(), target)))
 		.collect();
 	finish_prepared(data, samples, targets, target_width, source_rows, features, shapes, target_categorical, schema)
 }
@@ -12070,25 +12594,43 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
 	if components.next().is_some_and(|component| component.as_os_str() == "~") {
-		let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-		return Ok(PathBuf::from(home).join(components.as_path()));
+		return Ok(home_directory()?.join(components.as_path()));
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
-	if metadata.is_file() {
-		files.push(path.to_owned());
+/// Every leaf file a container holds, to any depth: a folder contributes its
+/// entries and an archive its members, both anchored at the container's path.
+fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	let bytes = match member {
+		Some(bytes) => bytes,
+		None => {
+			let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+			if !metadata.is_file() {
+				let mut children = fs::read_dir(path)
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+					.collect::<std::io::Result<Vec<_>>>()
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				children.sort_by_key(fs::DirEntry::path);
+				for child in children {
+					collect_files(&child.path(), None, files)?;
+				}
+				return Ok(());
+			}
+			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		}
+	};
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+			let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+				&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
+			if metadata {
+				continue;
+			}
+			collect_files(&path.join(entry), Some(contents), files)?;
+		}
 		return Ok(());
 	}
-	let mut children = fs::read_dir(path)
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
-		.collect::<std::io::Result<Vec<_>>>()
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	children.sort_by_key(fs::DirEntry::path);
-	for child in children {
-		collect_files(&child.path(), files)?;
-	}
+	files.push((path.to_owned(), bytes));
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> {
@@ -12173,7 +12715,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
+	Ok(vec![Table { name: "data".to_owned(), headers, declared: true, rows, attention: None }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -12191,7 +12733,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), declared: true, rows: Vec::new(), attention: None };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
@@ -12210,7 +12752,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 		}
 	}
 	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows, attention: None }])
+	Ok(vec![Table { name, headers, declared: true, rows, attention: None }])
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -12283,7 +12825,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, rows, attention: None });
+		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -12724,7 +13266,7 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
-/// The stored entries of a ZIP archive, resolved through the central directory.
+/// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
 	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -12738,16 +13280,17 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let mut entries = Vec::new();
 	for _ in 0..count {
 		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
-		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
-		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let (method, compressed, name_length, extra, comment) = (read16(offset + 10), read32(offset + 20), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, compressed) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, compressed.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
 		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
 		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec())
 			.map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
 		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
 		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
 		let start = local + 30 + local_name + local_extra;
-		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
-		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		require(matches!(method, 0 | 8), format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let stored = bytes.get(start..start + compressed).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?;
+		let contents = if method == 8 { inflate(stored)? } else { stored.to_vec() };
 		if !name.ends_with('/') {
 			entries.push((name, contents));
 		}
@@ -12816,7 +13359,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, rows: table_rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows: table_rows, attention: None })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -13039,7 +13582,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows, attention: None })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -13064,7 +13607,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, rows, attention: None }, blank))
+	Ok((Table { name, headers, declared: !headerless, rows, attention: None }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
@@ -13334,7 +13877,7 @@ impl Train {
 		self
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
-		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
+		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);
@@ -13449,7 +13992,7 @@ impl Train {
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
-				validation.forward()?;
+				validation.forward(ForwardMode::Inference)?;
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
 				raw_outputs.push(raw[0]);
@@ -13472,7 +14015,7 @@ impl Train {
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
-			validation.forward()?;
+			validation.forward(ForwardMode::Inference)?;
 			let raw = validation.predictions()?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
