@@ -93,7 +93,7 @@ fn a_declared_width_frees_the_residual_width_from_the_head_count() {
 /// once. This is the geometry the derived width cannot reach.
 #[test]
 fn an_untied_geometry_trains() {
-	let model = recipe.model().attn(6).width(8).kv(2).qk(rms).rope(4, 10000.0).gate().relu().layer(1).loss(mse);
+	let model = recipe.model().attn(6).width(8).kv(2).qk(rms).rope(neox, 4, 10000.0).gate().relu().layer(1).loss(mse);
 	let (initial, final_loss, predictions) = evidence(&model);
 	assert_eq!(predictions.len(), ROWS, "expected one prediction per row");
 	assert!(f64::from_bits(final_loss) < f64::from_bits(initial), "loss did not fall: {} to {}", f64::from_bits(initial), f64::from_bits(final_loss));

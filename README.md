@@ -51,7 +51,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
+	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.index(heads, width, block, keep)][.gate()]
 	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
@@ -95,6 +95,11 @@ prelu cos   exp      log    ln     huber  tan
 .norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
 ```
 
+`.rope(layout, dimensions, base)` rotates the first `dimensions` channels of
+every query and key head by their position. The layout states the pairing: `neox`
+pairs channel `i` with channel `i + dimensions / 2`. A model states it so the
+same weights cannot silently run under a different pairing.
+
 `.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
 over its head-width slice, leaving the values untouched:
 
@@ -115,7 +120,7 @@ of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies
 attention output by a sigmoid of its own projection of the block input.
 
 ```rust
-.attn(8).width(64).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
+.attn(8).width(64).kv(2).qk(rms).rope(neox, 32, 10000.0).index(2, 16, 32, 4).gate()
 ```
 
 ## compute precisions
