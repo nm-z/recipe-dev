@@ -824,6 +824,8 @@ fn main() -> BuildResult<()> {
 		local_chunks: positive("contraction-local-chunks")?,
 	};
 	for (key, environment) in [
+		("device-admission-timeout-ms", "RECIPE_ADMISSION_TIMEOUT_MS"),
+		("device-admission-poll-ms", "RECIPE_ADMISSION_POLL_MS"),
 		("epochs", "RECIPE_TRAIN_EPOCHS"),
 		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),
 		("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"),

@@ -32,6 +32,11 @@ attention-query-tile = 24
 topology-probe-bytes = 4194304
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
 cpu-worker-threads = 0
+# One run at a time holds a local accelerator. A second run naming it waits this
+# long before giving up, polling at the interval below. The CPU is not leased:
+# it is shared by design and cpu-worker-threads already divides it.
+device-admission-timeout-ms = 600000
+device-admission-poll-ms = 200
 # Toolchain values are keyed by target operating system. A value beginning with
 # `$` names the installer-provided environment variable that contains its root.
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
