@@ -55,6 +55,22 @@ jobs:
             echo "checkout $candidate_sha does not match the candidate $expected" >&2
             exit 1
           fi
+          # GitHub's merge_commit_sha can lag the head it is supposed to
+          # incorporate. A candidate that does not contain the current head
+          # would let every cell agree on stale code, so it fails closed here
+          # and the event that advanced the PR supersedes this run.
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$head_sha" ]; then
+            parents="$(git rev-list --parents -n 1 HEAD)"
+            case " $parents " in
+              *" $head_sha "*) echo "candidate merges head $head_sha" ;;
+              *)
+                echo "candidate $candidate_sha does not merge the current head $head_sha" >&2
+                echo "parents: $parents" >&2
+                exit 1
+                ;;
+            esac
+          fi
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           echo "candidate $candidate_sha (event=${{ github.event_name }})"
 
