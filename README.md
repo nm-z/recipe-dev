@@ -51,12 +51,12 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	dconv(kernel)
-	delta(heads, kernel)
-	delta((heads, d_k, d_v), kernel)
 	attn(heads)
 	attn(q, k, v) // n heads
 	perc(width)
+	dconv(kernel)
+	delta(heads, kernel)
+	delta((heads, d_k, d_v), kernel)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
