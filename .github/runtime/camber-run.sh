@@ -99,7 +99,7 @@ release="$(curl -fsSL https://geo.mirror.pkgbuild.com/iso/ | grep -oE '[0-9]{4}\
 [ -n "$release" ] || { echo "no Arch bootstrap release found" >&2; exit 1; }
 echo "using Arch bootstrap release $release"
 curl -fsSL "https://geo.mirror.pkgbuild.com/iso/$release/archlinux-bootstrap-x86_64.tar.zst" -o "$work/arch.tar.zst"
-tar -I zstd -xf "$work/arch.tar.zst" -C "$arch_root" --strip-components=1
+tar -I zstd -xf "$work/arch.tar.zst" -C "$arch_root" --strip-components=1 --no-same-owner --no-same-permissions
 cp /etc/resolv.conf "$arch_root/etc/resolv.conf"
 for mount_name in proc sys dev; do
 	mkdir -p "$arch_root/$mount_name"
