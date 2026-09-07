@@ -63,12 +63,14 @@ recipe --device nv0 --device nv1 --device cpu model.rs
 ```rust
 let placed = recipe.place("model.ogdl", &[]);
 let prediction = placed.infer(&input);
+let generation = placed.decode(&prompt_ids, &mut sampler, &[eos], 64);
+placed.serve("127.0.0.1:8080", 64);
 placed.split();
 placed.resident_bytes();
 placed.moved_bytes();
 ```
 
-Inference blocks across the selected devices. An empty split is measured: each block joins the current device while its parameters and carried state fit that device's free memory, and starts the next device when they do not. A block no remaining device can hold is reported, so a measured placement never plans an allocation its device cannot take. Every named device takes a nonempty range, so a device too small to hold even one block is reported rather than passed over. The CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run.
+Inference blocks across the selected devices. An empty split is measured: each block joins the current device while its parameters and carried state fit that device's free memory, and starts the next device when they do not. A block no remaining device can hold is reported, so a measured placement never plans an allocation its device cannot take. Every named device takes a nonempty range, so a device too small to hold even one block is reported rather than passed over. The CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range keeps its own tape on its device for the life of the placement and the stream hops between them, so the output equals a single-device run. A placement decodes and serves as `recipe` does, and carries the state of every block across the steps: a step writes the one position the new id reaches into the first range, runs each range over that window, and hops only that window's rows. `recipe.decode` and `recipe.serve` are the one-device case, the model placed as one range on the primary device. `resident_bytes` reports what each device's tapes hold, weights, input row and the arenas that keep their state, and `moved_bytes` the per-token hop.
 
 ## files
 
