@@ -25,8 +25,10 @@ fn model() -> Model {
 
 /// Rows whose targets are a smooth function of the features, so three epochs
 /// move the weights off their seed without needing the model to be any good.
-fn dataset() -> PathBuf {
-	let directory = std::env::temp_dir().join(format!("recipe-decode-{}", std::process::id()));
+/// Each test writes its own directory: the suite runs tests in parallel and
+/// they would otherwise write and read one path at once.
+fn dataset(name: &str) -> PathBuf {
+	let directory = std::env::temp_dir().join(format!("recipe-decode-{}-{name}", std::process::id()));
 	std::fs::create_dir_all(&directory).unwrap();
 	let mut text = String::new();
 	for column in 0..COLUMNS {
@@ -58,7 +60,7 @@ fn dataset() -> PathBuf {
 /// Each test trains its own bundle: the suite runs tests in parallel and they
 /// would otherwise write one path at once.
 fn bundle(name: &str) -> PathBuf {
-	let directory = dataset();
+	let directory = dataset(name);
 	let path = std::env::temp_dir().join(format!("recipe-decode-{}-{name}.ogdl", std::process::id()));
 	let names = (0..TARGETS).map(|target| format!("y{target}")).collect::<Vec<_>>();
 	// Normalized on purpose. The tape uploads the raw ids, so the tail a decode

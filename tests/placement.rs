@@ -23,8 +23,10 @@ fn model() -> Model {
 	recipe.model().conv(4, 3).relu().attn(2).relu().gru(4).relu().pool(2).relu().layer(TARGETS).loss(mse)
 }
 
-fn dataset() -> PathBuf {
-	let directory = std::env::temp_dir().join(format!("recipe-placement-{}", std::process::id()));
+/// Each test writes its own directory: the suite runs tests in parallel and
+/// they would otherwise write and read one path at once.
+fn dataset(name: &str) -> PathBuf {
+	let directory = std::env::temp_dir().join(format!("recipe-placement-{}-{name}", std::process::id()));
 	std::fs::create_dir_all(&directory).unwrap();
 	let mut text = String::new();
 	for column in 0..COLUMNS {
@@ -54,7 +56,7 @@ fn dataset() -> PathBuf {
 }
 
 fn bundle(name: &str) -> PathBuf {
-	let directory = dataset();
+	let directory = dataset(name);
 	let path = std::env::temp_dir().join(format!("recipe-placement-{}-{name}.ogdl", std::process::id()));
 	let names = (0..TARGETS).map(|target| format!("y{target}")).collect::<Vec<_>>();
 	let data = recipe.data(directory.to_str().unwrap()).target(names.as_slice()).norm(z_score);
