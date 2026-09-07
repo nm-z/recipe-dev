@@ -79,11 +79,20 @@ estimators:
 ```
 Feature generation is banned.
 
-## 15 activations
+## 16 activations
 
 ```
 relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
+scale(factor)
+```
+
+`scale(factor)` multiplies every value the preceding block produces by one
+constant. It owns no weights and preserves the shape, so it states embedding
+scaling or logit softcapping directly:
+
+```rust
+.layer(width).scale(1.0 / softcapping)
 ```
 
 ## 4 normalizations
