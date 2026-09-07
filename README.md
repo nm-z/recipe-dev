@@ -51,7 +51,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.index(heads, width, block, keep)][.gate()]
+	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.yarn(factor, og_ctx, b_fast, b_slow)][.index(heads, width, block, keep)][.gate()]
 	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
@@ -99,6 +99,16 @@ prelu cos   exp      log    ln     huber  tan
 every query and key head by their position. The layout states the pairing: `neox`
 pairs channel `i` with channel `i + dimensions / 2`. A model states it so the
 same weights cannot silently run under a different pairing.
+
+`.yarn(factor, og_ctx, b_fast, b_slow)` follows a `rope` and scales its
+frequencies for an extended context: `factor` is the extension ratio, `og_ctx`
+the original training context, and the blend runs between the fast and slow
+rotation boundaries. It owns no weights and is invalid without a preceding
+`rope`.
+
+```rust
+.attn(32).rope(neox, 128, 10000.0).yarn(4.0, 8192, 64.0, 1.0)
+```
 
 `.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
 over its head-width slice, leaving the values untouched:

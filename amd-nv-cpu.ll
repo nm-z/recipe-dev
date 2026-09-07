@@ -908,7 +908,7 @@ store i64 %maximum.index.wide, ptr addrspace(1) %context.ptr, align 8 ret void }
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
 define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length,
-i32 %head.width, i32 %dims, i32 %rotated, double %base, i1 %reverse ) #1 { entry: %per.row = mul i32 %channels, %length
+i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.factor, double %yarn.context, double %yarn.fast, double %yarn.slow, i1 %reverse ) #1 { entry: %per.row = mul i32 %channels, %length
 %within = urem i32 %p, %per.row %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %local = urem i32 %channel, %head.width %half = udiv i32 %dims, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %p
@@ -923,7 +923,29 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local
 %two.index = mul i32 %index, 2 %two.index.value = call double @recipe.from.u32(i32 %two.index)
 %dims.value = call double @recipe.from.u32(i32 %dims) %ratio = call double @recipe.div(double %two.index.value, double %dims.value)
 %log.base = call double @recipe.log(double %base) %exponent.positive = call double @recipe.mul(double %ratio, double %log.base)
-%exponent = call double @recipe.neg(double %exponent.positive) %frequency = call double @recipe.exp(double %exponent)
+%exponent = call double @recipe.neg(double %exponent.positive) %frequency.raw = call double @recipe.exp(double %exponent)
+; A dimension completes %rotations turns over the original context. The ramp runs
+; from the fast boundary, where the frequency is kept, to the slow boundary,
+; where it is divided by the extension factor; between them the two are blended.
+%yarn.on = call i1 @recipe.ogt(double %yarn.factor, double 1.0)
+%tau = call double @recipe.mul(double 6.283185307179586, double 1.0)
+%wavelength = call double @recipe.div(double %tau, double %frequency.raw)
+%rotations = call double @recipe.div(double %yarn.context, double %wavelength)
+%ramp.span = call double @recipe.sub(double %yarn.fast, double %yarn.slow)
+%ramp.offset = call double @recipe.sub(double %rotations, double %yarn.slow)
+%ramp.span.zero = call i1 @recipe.ogt(double 0.000000000001, double %ramp.span)
+%ramp.raw = call double @recipe.div(double %ramp.offset, double %ramp.span)
+%ramp.safe = select i1 %ramp.span.zero, double 1.0, double %ramp.raw
+%ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.safe)
+%ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.safe
+%ramp.high = call i1 @recipe.ogt(double %ramp.clamped.low, double 1.0)
+%ramp = select i1 %ramp.high, double 1.0, double %ramp.clamped.low
+%interpolated = call double @recipe.div(double %frequency.raw, double %yarn.factor)
+%extrapolated.part = call double @recipe.mul(double %ramp, double %frequency.raw)
+%ramp.inverse = call double @recipe.sub(double 1.0, double %ramp)
+%interpolated.part = call double @recipe.mul(double %ramp.inverse, double %interpolated)
+%blended = call double @recipe.add(double %extrapolated.part, double %interpolated.part)
+%frequency = select i1 %yarn.on, double %blended, double %frequency.raw
 %position.value = call double @recipe.from.u32(i32 %position) %angle = call double @recipe.mul(double %position.value, double %frequency)
 %cos = call double @recipe.cos(double %angle) %sin = call double @recipe.sin(double %angle) %sin.negative = call double @recipe.neg(double %sin)
 %sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)

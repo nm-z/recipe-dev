@@ -2517,8 +2517,12 @@ impl NativeModelIr {
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
 					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
 						ir.push_str(&format!(
-							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
+							factor = native_literal(self.precision.model, ty, node.argument[5]),
+							context = native_literal(self.precision.model, ty, node.argument[6]),
+							fast = native_literal(self.precision.model, ty, node.argument[7]),
+							slow = native_literal(self.precision.model, ty, node.argument[8]),
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -4165,9 +4169,13 @@ mod bundle {
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
 				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let yarn = attention
+					.yarn
+					.map(|(factor, context, fast, slow)| format!(",{},{context},{},{}", f64::from_bits(factor), f64::from_bits(fast), f64::from_bits(slow)))
+					.unwrap_or_default();
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
-				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout}{width}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout}{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4221,11 +4229,22 @@ mod bundle {
 					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
 				};
 				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
+				// The four yarn values follow the head width, all four or none.
+				let yarn = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+					(Some(factor), Some(context), Some(fast), Some(slow)) => Some((
+						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+						value_at(Some(context), "yarn original context")?,
+						value_at::<f64>(Some(fast), "yarn fast boundary")?.to_bits(),
+						value_at::<f64>(Some(slow), "yarn slow boundary")?.to_bits(),
+					)),
+					_ => None,
+				};
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
 					kv,
 					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
+					yarn,
 					index: (index.block != 0).then_some(index),
 					gate,
 				}))
@@ -4967,12 +4986,16 @@ struct AttentionBlock {
 	kv: usize,
 	/// The rotary layout, the rotated channel count, and the base as its bits.
 	rope: Option<(RopeLayout, usize, u64)>,
+	/// YaRN frequency scaling of the rotary above: the context extension factor,
+	/// the original training context, and the fast and slow rotation boundaries,
+	/// the three real values held as their bits.
+	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, width: None, kv: heads, rope: None, index: None, gate: false }
+		Self { heads, width: None, kv: heads, rope: None, yarn: None, index: None, gate: false }
 	}
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5158,6 +5181,19 @@ impl Model {
 	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
 		let layout = layout.layout();
 		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
+	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
+	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	pub fn yarn(&self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
+			assert!(og_ctx != 0, "yarn original context must be positive");
+			assert!(b_fast.is_finite() && b_slow.is_finite(), "yarn boundaries must be finite, received {b_fast} and {b_slow}");
+			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
+			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
+		})
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
@@ -7141,7 +7177,7 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, width, kv, rope, index, gate } = attention;
+	let AttentionBlock { heads, width, kv, rope, yarn, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
 	// A declared head width stands on its own; a derived one is still the residual
 	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
@@ -7187,7 +7223,11 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		// The kernel pairs %local with %local +/- %half, which is the NeoX pairing,
 		// so the layout is carried for the record and for a future second layout
 		// rather than to switch anything here.
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), 0.0, 0.0, 0.0, 0.0], -2)?;
+		// A zero factor is no scaling, which is what a model without yarn carries.
+		let (factor, context, fast, slow) = yarn.map_or((0.0, 0.0, 0.0, 0.0), |(factor, context, fast, slow)| {
+			(f64::from_bits(factor), context as f64, f64::from_bits(fast), f64::from_bits(slow))
+		});
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), factor, context, fast, slow], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
