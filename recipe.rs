@@ -1300,8 +1300,8 @@ const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
+const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888844888888844";
+const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
@@ -2417,6 +2417,35 @@ mod quantized {
 }
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
 
+/// The parameter runs the optimizer owns: every maximal run of unfrozen
+/// parameters, as the parameter it starts at, its length, and the optimizer
+/// slot its first parameter takes. Optimizer state covers these slots alone, so
+/// a frozen weight has none.
+fn trainable_runs(frozen: &[u8], parameters: usize) -> Vec<(usize, usize, usize)> {
+	if frozen.is_empty() {
+		return if parameters == 0 { Vec::new() } else { vec![(0, parameters, 0)] };
+	}
+	let (mut runs, mut open, mut slot) = (Vec::new(), None, 0);
+	for index in 0..parameters {
+		match (frozen.get(index).is_some_and(|&value| value == 0), open) {
+			(true, None) => open = Some(index),
+			(false, Some(start)) => {
+				runs.push((start, index - start, slot));
+				slot += index - start;
+				open = None
+			}
+			_ => {}
+		}
+	}
+	if let Some(start) = open {
+		runs.push((start, parameters - start, slot))
+	}
+	runs
+}
+/// The parameters the optimizer owns, which is every unfrozen parameter.
+fn trainable_parameters(frozen: &[u8], parameters: usize) -> usize {
+	if frozen.is_empty() { parameters } else { frozen.iter().take(parameters).filter(|&&value| value == 0).count() }
+}
 impl NativeModelIr {
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
@@ -3139,7 +3168,7 @@ impl NativeModelIr {
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
-				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
+				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
 			body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
@@ -3211,39 +3240,51 @@ impl NativeModelIr {
 	}
 
 	fn emit_adamw(&self, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize) -> Result<String> {
-		let parameters = i32::try_from(self.graph.parameters.len()).map_err(|_| RecipeError::new("native parameter count exceeds i32"))?;
 		let one = native_literal(state_precision, state_ty, 1.0);
-		let mut ir = String::new();
-		ir.push_str(&format!("optimizer.entry:\n%optimizer.base = add i32 0, %tid\nbr label %optimizer.loop\noptimizer.loop:\n%optimizer.p = phi i32 [ %optimizer.base, %optimizer.entry ], [ %optimizer.next, %optimizer.advance ]\n%optimizer.more = icmp ult i32 %optimizer.p, {parameters}\nbr i1 %optimizer.more, label %optimizer.step, label %optimizer.done\noptimizer.step:\n"));
-		ir.push_str(&format!("%optimizer.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %optimizer.p\n%optimizer.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %optimizer.p\n%optimizer.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %optimizer.p\n%optimizer.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %optimizer.p\n%optimizer.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %optimizer.p\n"));
-		ir.push_str(&format!("%optimizer.frozen.value = load i8, {pointer} %optimizer.frozen.ptr, align 1\n%optimizer.is.frozen = icmp ne i8 %optimizer.frozen.value, 0\nbr i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update\noptimizer.update:\n"));
-		ir.push_str(&format!("%optimizer.gradient.model = load {model_ty}, {pointer} %optimizer.gradient.ptr, align {model_align}\n%optimizer.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.gradient.model)\n%optimizer.moment.old = load {state_ty}, {pointer} %optimizer.moment.ptr, align {state_align}\n%optimizer.variance.old = load {state_ty}, {pointer} %optimizer.variance.ptr, align {state_align}\n%optimizer.weight.model = load {model_ty}, {pointer} %optimizer.weight.ptr, align {model_align}\n%optimizer.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.weight.model)\n"));
-		append_binary(&mut ir, state_ty, "optimizer.one.beta1", "sub", &one, "%beta1");
-		append_binary(&mut ir, state_ty, "optimizer.one.beta2", "sub", &one, "%beta2");
-		append_binary(&mut ir, state_ty, "optimizer.moment.part", "mul", "%beta1", "%optimizer.moment.old");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.part", "mul", "%optimizer.one.beta1", "%optimizer.gradient.value");
-		append_binary(&mut ir, state_ty, "optimizer.moment.new", "add", "%optimizer.moment.part", "%optimizer.gradient.part");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.square", "mul", "%optimizer.gradient.value", "%optimizer.gradient.value");
-		append_binary(&mut ir, state_ty, "optimizer.variance.part", "mul", "%beta2", "%optimizer.variance.old");
-		append_binary(&mut ir, state_ty, "optimizer.gradient.variance", "mul", "%optimizer.one.beta2", "%optimizer.gradient.square");
-		append_binary(&mut ir, state_ty, "optimizer.variance.new", "add", "%optimizer.variance.part", "%optimizer.gradient.variance");
-		ir.push_str(&format!(
-			"store {state_ty} %optimizer.moment.new, {pointer} %optimizer.moment.ptr, align {state_align}\nstore {state_ty} %optimizer.variance.new, {pointer} %optimizer.variance.ptr, align {state_align}\n"
-		));
-		append_binary(&mut ir, state_ty, "optimizer.m.correct", "sub", &one, "%beta1.power");
-		append_binary(&mut ir, state_ty, "optimizer.v.correct", "sub", &one, "%beta2.power");
-		append_binary(&mut ir, state_ty, "optimizer.m.hat", "div", "%optimizer.moment.new", "%optimizer.m.correct");
-		append_binary(&mut ir, state_ty, "optimizer.v.hat", "div", "%optimizer.variance.new", "%optimizer.v.correct");
-		ir.push_str(&format!("%optimizer.root = call {state_ty} @recipe.state.sqrt({state_ty} %optimizer.v.hat)\n"));
-		append_binary(&mut ir, state_ty, "optimizer.denominator", "add", "%optimizer.root", "%epsilon");
-		append_binary(&mut ir, state_ty, "optimizer.direction", "div", "%optimizer.m.hat", "%optimizer.denominator");
-		append_binary(&mut ir, state_ty, "optimizer.decay", "mul", "%decay", "%optimizer.weight.value");
-		append_binary(&mut ir, state_ty, "optimizer.total", "add", "%optimizer.direction", "%optimizer.decay");
-		append_binary(&mut ir, state_ty, "optimizer.change", "mul", "%rate", "%optimizer.total");
-		append_binary(&mut ir, state_ty, "optimizer.next.state", "sub", "%optimizer.weight.value", "%optimizer.change");
-		ir.push_str(&format!("%optimizer.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %optimizer.next.state)\nstore {model_ty} %optimizer.next.weight, {pointer} %optimizer.weight.ptr, align {model_align}\nbr label %optimizer.advance\noptimizer.advance:\n%optimizer.next = add i32 %optimizer.p, %threads\nbr label %optimizer.loop\noptimizer.done:\n"));
+		let runs = trainable_runs(&self.graph.frozen, self.graph.parameters.len());
+		let mut ir = String::from("optimizer.entry:\n");
+		let mut previous = String::from("optimizer.entry");
+		for (run, &(start, length, slot)) in runs.iter().enumerate() {
+			let length = i32::try_from(length).map_err(|_| RecipeError::new("native trainable run length exceeds i32"))?;
+			let start = i32::try_from(start).map_err(|_| RecipeError::new("native trainable run start exceeds i32"))?;
+			let slot = i32::try_from(slot).map_err(|_| RecipeError::new("native optimizer slot exceeds i32"))?;
+			let this = format!("optimizer.r{run}");
+			ir.push_str(&format!("br label %{this}.loop\n{this}.loop:\n%{this}.p = phi i32 [ %tid, %{previous} ], [ %{this}.next, %{this}.advance ]\n%{this}.more = icmp ult i32 %{this}.p, {length}\nbr i1 %{this}.more, label %{this}.step, label %{this}.done\n{this}.step:\n"));
+			// The run is contiguous in both spaces, so the weight it updates and
+			// the optimizer slot carrying its moments are each one offset away.
+			ir.push_str(&format!("%{this}.param = add i32 %{this}.p, {start}\n%{this}.slot = add i32 %{this}.p, {slot}\n"));
+			ir.push_str(&format!("%{this}.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %{this}.param\n%{this}.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %{this}.slot\n%{this}.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %{this}.slot\n%{this}.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %{this}.param\n"));
+			ir.push_str(&format!("%{this}.gradient.model = load {model_ty}, {pointer} %{this}.gradient.ptr, align {model_align}\n%{this}.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %{this}.gradient.model)\n%{this}.moment.old = load {state_ty}, {pointer} %{this}.moment.ptr, align {state_align}\n%{this}.variance.old = load {state_ty}, {pointer} %{this}.variance.ptr, align {state_align}\n%{this}.weight.model = load {model_ty}, {pointer} %{this}.weight.ptr, align {model_align}\n%{this}.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %{this}.weight.model)\n"));
+			append_binary(&mut ir, state_ty, &format!("{this}.one.beta1"), "sub", &one, "%beta1");
+			append_binary(&mut ir, state_ty, &format!("{this}.one.beta2"), "sub", &one, "%beta2");
+			append_binary(&mut ir, state_ty, &format!("{this}.moment.part"), "mul", "%beta1", &format!("%{this}.moment.old"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.part"), "mul", &format!("%{this}.one.beta1"), &format!("%{this}.gradient.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.moment.new"), "add", &format!("%{this}.moment.part"), &format!("%{this}.gradient.part"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.square"), "mul", &format!("%{this}.gradient.value"), &format!("%{this}.gradient.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.variance.part"), "mul", "%beta2", &format!("%{this}.variance.old"));
+			append_binary(&mut ir, state_ty, &format!("{this}.gradient.variance"), "mul", &format!("%{this}.one.beta2"), &format!("%{this}.gradient.square"));
+			append_binary(&mut ir, state_ty, &format!("{this}.variance.new"), "add", &format!("%{this}.variance.part"), &format!("%{this}.gradient.variance"));
+			ir.push_str(&format!(
+				"store {state_ty} %{this}.moment.new, {pointer} %{this}.moment.ptr, align {state_align}\nstore {state_ty} %{this}.variance.new, {pointer} %{this}.variance.ptr, align {state_align}\n"
+			));
+			append_binary(&mut ir, state_ty, &format!("{this}.m.correct"), "sub", &one, "%beta1.power");
+			append_binary(&mut ir, state_ty, &format!("{this}.v.correct"), "sub", &one, "%beta2.power");
+			append_binary(&mut ir, state_ty, &format!("{this}.m.hat"), "div", &format!("%{this}.moment.new"), &format!("%{this}.m.correct"));
+			append_binary(&mut ir, state_ty, &format!("{this}.v.hat"), "div", &format!("%{this}.variance.new"), &format!("%{this}.v.correct"));
+			ir.push_str(&format!("%{this}.root = call {state_ty} @recipe.state.sqrt({state_ty} %{this}.v.hat)\n"));
+			append_binary(&mut ir, state_ty, &format!("{this}.denominator"), "add", &format!("%{this}.root"), "%epsilon");
+			append_binary(&mut ir, state_ty, &format!("{this}.direction"), "div", &format!("%{this}.m.hat"), &format!("%{this}.denominator"));
+			append_binary(&mut ir, state_ty, &format!("{this}.decay"), "mul", "%decay", &format!("%{this}.weight.value"));
+			append_binary(&mut ir, state_ty, &format!("{this}.total"), "add", &format!("%{this}.direction"), &format!("%{this}.decay"));
+			append_binary(&mut ir, state_ty, &format!("{this}.change"), "mul", "%rate", &format!("%{this}.total"));
+			append_binary(&mut ir, state_ty, &format!("{this}.next.state"), "sub", &format!("%{this}.weight.value"), &format!("%{this}.change"));
+			ir.push_str(&format!("%{this}.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %{this}.next.state)\nstore {model_ty} %{this}.next.weight, {pointer} %{this}.weight.ptr, align {model_align}\nbr label %{this}.advance\n{this}.advance:\n%{this}.next = add i32 %{this}.p, %threads\nbr label %{this}.loop\n{this}.done:\n"));
+			previous = format!("{this}.done");
+		}
+		ir.push_str("br label %optimizer.done\noptimizer.done:\n");
 		Ok(ir)
 	}
+
 	fn emit_clear_bytes(&self, backend: Backend, base: &str, bytes: usize, label: &str, from: &str) -> Result<String> {
 		let count = i64::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i64")))?;
 		let pointer = pointer_type(backend);
@@ -4136,8 +4177,11 @@ mod bundle {
 			)?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
 			require(self.frozen.len() == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
+			// Optimizer state covers the trainable parameters alone, so a frozen
+			// weight contributes none to a saved model.
+			let trainable = trainable_parameters(&self.frozen, self.frozen.len());
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
-				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
+				require(values.is_empty() || values.len() == trainable, format!("semantic model {name} are incomplete"))?;
 			}
 			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
 			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
@@ -7150,7 +7194,6 @@ struct NativeTape {
 	input_adjoint: Buffer,
 	targets: Buffer,
 	weights: Buffer,
-	frozen: Buffer,
 	moments: Buffer,
 	variances: Buffer,
 	gradient: Buffer,
@@ -7158,6 +7201,7 @@ struct NativeTape {
 	best_loss: [f64; 4],
 	rows: u32,
 	parameters: usize,
+	trainable: usize,
 	step: u32,
 	output: usize,
 	capacity: usize,
@@ -7190,14 +7234,16 @@ impl NativeTape {
 		let inference = loss.is_none();
 		let program = gpu.native_program(graph, rows, precision, loss)?;
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
-		let zeros = vec![0.0; parameters.max(1)];
 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
-		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
-		require(graph.state.variances.is_empty() || graph.state.variances.len() == parameters, "saved optimizer variances have the wrong shape")?;
 		require(graph.frozen.is_empty() || graph.frozen.len() == parameters, "frozen parameters have the wrong shape")?;
-		let moments = if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() };
-		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
-		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
+		// A frozen weight has no optimizer state, so the moments and variances
+		// cover the trainable parameters alone.
+		let trainable = trainable_parameters(&graph.frozen, parameters);
+		require(graph.state.moments.is_empty() || graph.state.moments.len() == trainable, "saved optimizer moments have the wrong shape")?;
+		require(graph.state.variances.is_empty() || graph.state.variances.len() == trainable, "saved optimizer variances have the wrong shape")?;
+		let optimizer_zeros = vec![0.0; trainable.max(1)];
+		let moments = if graph.state.moments.is_empty() { optimizer_zeros.clone() } else { graph.state.moments.clone() };
+		let variances = if graph.state.variances.is_empty() { optimizer_zeros } else { graph.state.variances.clone() };
 		let batch_normalizations =
 			graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
 		let best_loss = if graph.state.best_loss.is_empty() {
@@ -7231,7 +7277,6 @@ impl NativeTape {
 			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
-			frozen: Buffer::upload(gpu, &frozen)?,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
@@ -7239,6 +7284,7 @@ impl NativeTape {
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
+			trainable,
 			step,
 			output,
 			capacity: rows,
@@ -7293,7 +7339,6 @@ impl NativeTape {
 			self.samples.pointer,
 			self.targets.pointer,
 			self.weights.pointer,
-			self.frozen.pointer,
 			self.moments.pointer,
 			self.variances.pointer,
 			self.gradient.pointer,
@@ -7358,7 +7403,7 @@ impl NativeTape {
 		self.weights.write_float_bytes(0, weights, self.precision.model)
 	}
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
+		Ok((self.weights()?, self.moments.download_float(self.trainable, self.precision.state)?, self.variances.download_float(self.trainable, self.precision.state)?))
 	}
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		let (weights, moments, variances) = self.optimizer_state()?;
@@ -7914,10 +7959,10 @@ struct Dispatch {
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32, i32);
+type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
+type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
+type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
+type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32, i32);
 
 #[derive(Clone, Copy)]
 enum NativeCpuEpoch {
@@ -9000,7 +9045,7 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 			}
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
-				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
+				let pointers = (0..11).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
 				macro_rules! launch {
 					($function:expr) => {
 						$function(
@@ -9015,7 +9060,7 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 							pointers[8],
 							pointers[9],
 							pointers[10],
-							pointers[11],
+							native_cpu_value(arguments, 11),
 							native_cpu_value(arguments, 12),
 							native_cpu_value(arguments, 13),
 							native_cpu_value(arguments, 14),
@@ -9026,7 +9071,6 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 							native_cpu_value(arguments, 19),
 							native_cpu_value(arguments, 20),
 							native_cpu_value(arguments, 21),
-							native_cpu_value(arguments, 22),
 						)
 					};
 				}
