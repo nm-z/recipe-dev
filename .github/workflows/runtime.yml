@@ -204,6 +204,16 @@ jobs:
     env:
       CELL: recipe/linux-cpu
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          # Dispatch runs are always controlled by minimal. Pull requests keep
+          # the existing merge-ref behavior while the controller has its own
+          # directory.
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Install the Arch toolchain
         run: |
           set -euo pipefail
@@ -221,8 +231,9 @@ jobs:
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE"
-          echo "snapshot verified and extracted sha256=$actual"
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
 
       - name: Record the toolchain
         id: toolchain
@@ -241,26 +252,29 @@ jobs:
       - name: Build the library and CLI
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
           cargo build --release --lib --bin recipe
           file target/release/recipe
 
       - name: Execute the runtime suite on the CPU backend
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
           mkdir -p evidence work
           # RECIPE_FORCE_CPU is Recipe's unconditional CPU selection: it short
           # circuits device discovery before any AMD or NVIDIA probe runs.
           RECIPE_FORCE_CPU=1 \
-          RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
+          RECIPE_SUITE_ROOT="$GITHUB_WORKSPACE/controller/.github/runtime" \
           RECIPE_SUITE_WORK="$PWD/work" \
           RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
-            ./target/release/recipe .github/runtime/suite.rs 2>&1 | tee evidence/run.log
+            ./target/release/recipe "$GITHUB_WORKSPACE/controller/.github/runtime/suite.rs" 2>&1 | tee evidence/run.log
           grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
 
       - name: Assert the CPU backend actually executed
         id: device
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
           # Recipe prints the route it selected; this is the fallback detector.
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
@@ -326,6 +340,13 @@ jobs:
       CELL: recipe/linux-gpu
       CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Download the immutable snapshot
         uses: actions/download-artifact@v4
         with:
@@ -337,8 +358,9 @@ jobs:
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE"
-          echo "snapshot verified sha256=$actual"
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
 
       - name: Require the Camber control credential
         run: |
@@ -361,18 +383,19 @@ jobs:
         id: camber
         run: |
           set -euo pipefail
-          bash .github/runtime/camber-run.sh
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
 
       - name: Terminate the Camber job
         if: always()
         run: |
           set -euo pipefail
           if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
-            bash .github/runtime/camber-terminate.sh "$(cat camber-job-id)"
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
           else
             echo "no Camber job to terminate"
           fi
@@ -420,6 +443,13 @@ jobs:
     env:
       CELL: recipe/windows-cpu
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Download the immutable source snapshot
         uses: actions/download-artifact@v4
         with:
@@ -433,7 +463,9 @@ jobs:
           $archive = Join-Path $env:GITHUB_WORKSPACE "snapshot\recipe-source.tar.gz"
           $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
           if ($actual -ne "${{ needs.candidate.outputs.snapshot_sha256 }}".ToLower()) { throw "snapshot checksum mismatch: $actual" }
-          tar.exe -xzf $archive -C $env:GITHUB_WORKSPACE
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          New-Item -ItemType Directory -Force -Path $candidate | Out-Null
+          tar.exe -xzf $archive -C $candidate
           $clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
           $linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
           if (![IO.File]::Exists($clang)) { throw "native clang is absent: $clang" }
@@ -449,9 +481,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $env:CUDA_PATH = $null
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          Push-Location $candidate
           cargo build --locked --release --lib --bin recipe
-          if ($LASTEXITCODE -ne 0) { throw "native release build failed with exit code $LASTEXITCODE" }
-          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
+          $buildExit = $LASTEXITCODE
+          Pop-Location
+          if ($buildExit -ne 0) { throw "native release build failed with exit code $buildExit" }
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
           $bytes = [IO.File]::ReadAllBytes($recipe)
           if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "recipe.exe is not a PE executable" }
           "recipe.exe size=$($bytes.Length) sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $recipe).Hash) magic=MZ"
@@ -462,12 +498,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:CUDA_PATH = $null
           New-Item -ItemType Directory -Force -Path evidence, work | Out-Null
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
           $env:RECIPE_FORCE_CPU = "1"
-          $env:RECIPE_SUITE_ROOT = Join-Path $env:GITHUB_WORKSPACE ".github\runtime"
-          $env:RECIPE_SUITE_WORK = Join-Path $env:GITHUB_WORKSPACE "work"
+          $env:RECIPE_SUITE_ROOT = Join-Path $env:GITHUB_WORKSPACE "controller\.github\runtime"
+          $env:RECIPE_SUITE_WORK = Join-Path $candidate "work"
           $env:RECIPE_EVIDENCE = Join-Path $env:GITHUB_WORKSPACE "evidence\suite.json"
-          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
-          $source = Join-Path $env:GITHUB_WORKSPACE ".github\runtime\suite.rs"
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE "controller\.github\runtime\suite.rs"
           # A native failure must not be masked by a later successful command.
           & $recipe $source 2>&1 | Tee-Object -FilePath evidence\run.log
           if ($LASTEXITCODE -ne 0) { throw "the runtime suite failed with exit code $LASTEXITCODE" }
@@ -492,13 +529,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:CUDA_PATH = $null
           $env:RECIPE_FORCE_CPU = "1"
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
           $state = Join-Path $env:RUNNER_TEMP "recipe-windows-cpu-lifecycle"
           Remove-Item -Recurse -Force -LiteralPath $state -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $state | Out-Null
           $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE = Join-Path $state "model.ogdl"
           $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
-          $recipe = Join-Path $env:GITHUB_WORKSPACE "target\release\recipe.exe"
-          $source = Join-Path $env:GITHUB_WORKSPACE ".github\windows-native\lifecycle.rs"
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
+          $source = Join-Path $candidate ".github\windows-native\lifecycle.rs"
           foreach ($phase in @("train", "resume", "infer")) {
             $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = $phase
             & $recipe $source
@@ -561,6 +599,13 @@ jobs:
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Download the immutable snapshot
         uses: actions/download-artifact@v4
         with:
@@ -572,8 +617,9 @@ jobs:
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE"
-          echo "snapshot verified and extracted sha256=$actual"
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
 
       - name: Require the Azure federation
         run: |
@@ -602,11 +648,12 @@ jobs:
       - name: Provision, execute and collect the Windows GPU worker
         run: |
           set -euo pipefail
-          bash .github/runtime/azure-run.sh
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
         env:
           CANDIDATE_SHA: ${{ needs.candidate.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.candidate.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
 
@@ -615,10 +662,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${AZURE_CLIENT_ID:-}" ]; then
-            bash .github/runtime/azure-cleanup.sh || echo "cleanup reported a problem"
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-cleanup.sh"
           else
             echo "no Azure resources to clean up"
           fi
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
 
       - name: Write the cell evidence
         if: always()
@@ -661,6 +711,13 @@ jobs:
     env:
       CELL: recipe/macos-cpu
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Download the immutable source snapshot
         uses: actions/download-artifact@v4
         with:
@@ -673,7 +730,8 @@ jobs:
           set -euo pipefail
           actual="$(shasum -a 256 snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           [ "$(uname -m)" = "arm64" ] || { echo "this cell requires an ARM64 runner, got $(uname -m)" >&2; exit 1; }
           # Discover the real paths rather than assuming Linux locations.
           clang_path="$(xcrun --find clang)"
@@ -690,24 +748,27 @@ jobs:
           set -euo pipefail
           # Cargo.toml declares /usr/bin/clang and /usr/bin/ld for macos, which
           # are the Xcode shims present on this image.
+          cd "$GITHUB_WORKSPACE/candidate"
           cargo build --release --lib --bin recipe
           file target/release/recipe
 
       - name: Execute the runtime suite on the CPU backend
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
           mkdir -p evidence work
           RECIPE_FORCE_CPU=1 \
-          RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
+          RECIPE_SUITE_ROOT="$GITHUB_WORKSPACE/controller/.github/runtime" \
           RECIPE_SUITE_WORK="$PWD/work" \
           RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
-            ./target/release/recipe .github/runtime/suite.rs 2>&1 | tee evidence/run.log
+            ./target/release/recipe "$GITHUB_WORKSPACE/controller/.github/runtime/suite.rs" 2>&1 | tee evidence/run.log
           grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
 
       - name: Assert the CPU backend actually executed
         id: device
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
           # A Metal device being present must not turn this cell into a GPU cell.
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
@@ -772,6 +833,13 @@ jobs:
     env:
       CELL: recipe/macos-gpu
     steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
+          persist-credentials: false
+
       - name: Download the immutable source snapshot
         uses: actions/download-artifact@v4
         with:
@@ -783,15 +851,16 @@ jobs:
           set -euo pipefail
           actual="$(shasum -a 256 snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.candidate.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE"
-          echo "snapshot verified and extracted sha256=$actual"
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
 
       - name: Probe the Metal device
         id: metal
         run: |
           set -euo pipefail
           mkdir -p evidence
-          bash .github/runtime/metal-probe.sh | tee evidence/metal.log
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/metal-probe.sh" | tee evidence/metal.log
           name="$(grep -m1 '^metal device name=' evidence/metal.log | sed 's/^metal device name=//')"
           echo "device=$name" >> "$GITHUB_OUTPUT"
 
@@ -801,7 +870,7 @@ jobs:
           # Recipe selects a GPU through load_amd (HSA) or load_nvidia (CUDA).
           # Neither can drive a Metal device, and the crate contains no Metal
           # code path, so there is nothing for this cell to execute yet.
-          if grep -rqi 'metal' recipe.rs build.rs cli.rs; then
+          if grep -rqi 'metal' "$GITHUB_WORKSPACE/candidate/recipe.rs" "$GITHUB_WORKSPACE/candidate/build.rs" "$GITHUB_WORKSPACE/candidate/cli.rs"; then
             echo "a Metal path now exists in the crate; this guard needs replacing with the real run" >&2
             exit 1
           fi
@@ -879,17 +948,18 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out the aggregate
-        # The default ref is enough: the aggregate only needs its own source,
-        # and it judges the cells against the candidate SHA the candidate job
-        # resolved, never against whatever this checkout happens to be.
+        # Dispatch runs use the minimal controller; pull requests retain their
+        # merge ref while the aggregate still has its own checkout directory.
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'minimal' || github.sha }}
+          path: controller
           persist-credentials: false
 
       - name: Compile the aggregate
         run: |
           set -euo pipefail
-          rustc --edition=2024 -O .github/runtime/gate.rs -o gate
+          rustc --edition=2024 -O controller/.github/runtime/gate.rs -o gate
 
       - name: Run the aggregate's decision-table self-check
         run: ./gate --self-check

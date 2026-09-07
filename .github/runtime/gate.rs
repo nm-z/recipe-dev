@@ -141,12 +141,46 @@ fn decide(results: &BTreeMap<String, String>, evidence: &BTreeMap<String, Result
 }
 
 fn read_results(document: &str) -> BTreeMap<String, String> {
-	// The workflow writes {"recipe/linux-cpu":"success",...}.
+	// The workflow writes {"recipe/linux-cpu":"success",...}. Parse every
+	// top-level pair so an unexpected cell cannot disappear before `decide`.
 	let mut results = BTreeMap::new();
-	for cell in EXPECTED {
-		if let Some(value) = field(document, cell) {
-			results.insert(cell.to_owned(), value);
+	let mut cursor = 0;
+	while cursor < document.len() {
+		let Some(relative_start) = document[cursor..].find('"') else { break };
+		let start = cursor + relative_start;
+		let mut end = start + 1;
+		let mut escaped = false;
+		while end < document.len() {
+			let byte = document.as_bytes()[end];
+			if byte == b'"' && !escaped { break }
+			escaped = byte == b'\\' && !escaped;
+			if byte != b'\\' { escaped = false; }
+			end += 1;
 		}
+		if end >= document.len() { break }
+		let key = &document[start + 1..end];
+		let Some(relative_colon) = document[end + 1..].find(':') else { break };
+		let value_start = end + 1 + relative_colon + 1;
+		let value_start = value_start + document[value_start..].len() - document[value_start..].trim_start().len();
+		if value_start >= document.len() { break }
+		let (value, next) = if document.as_bytes()[value_start] == b'"' {
+			let mut value_end = value_start + 1;
+			let mut value_escaped = false;
+			while value_end < document.len() {
+				let byte = document.as_bytes()[value_end];
+				if byte == b'"' && !value_escaped { break }
+				value_escaped = byte == b'\\' && !value_escaped;
+				if byte != b'\\' { value_escaped = false; }
+				value_end += 1;
+			}
+			if value_end >= document.len() { break }
+			(document[value_start + 1..value_end].to_owned(), value_end + 1)
+		} else {
+			let value_end = document[value_start..].find([',', '}', '\n']).map_or(document.len(), |relative| value_start + relative);
+			(document[value_start..value_end].trim().to_owned(), value_end)
+		};
+		results.insert(key.to_owned(), value);
+		cursor = next;
 	}
 	results
 }
@@ -231,6 +265,10 @@ fn healthy() -> (BTreeMap<String, String>, BTreeMap<String, Result<Evidence, Str
 
 fn self_check() {
 	let mut failures: Vec<String> = Vec::new();
+	let parsed = read_results(r#"{"recipe/linux-cpu":"success","recipe/freebsd-cpu":"success"}"#);
+	if !parsed.contains_key("recipe/freebsd-cpu") {
+		failures.push("unknown result disappeared during parsing".to_owned());
+	}
 	let cases: Vec<(&str, Box<dyn Fn(&mut BTreeMap<String, String>, &mut BTreeMap<String, Result<Evidence, String>>)>, bool)> = vec![
 		("all six succeed", Box::new(|_: &mut _, _: &mut _| {}), true),
 		("a cell failed", Box::new(|results: &mut BTreeMap<String, String>, _: &mut _| {

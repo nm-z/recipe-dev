@@ -1,6 +1,7 @@
 param(
 	[Parameter(Mandatory = $true)] [string] $candidateSha,
-	[Parameter(Mandatory = $true)] [string] $snapshotSha256
+	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256
 )
 
 # Runs inside the Windows GPU worker, invoked through managed Run Command. It
@@ -34,6 +35,16 @@ try {
 	Write-Output "snapshot verified sha256=$actual"
 	Invoke-Native "tar.exe" @("-xzf", $archive, "-C", $work) "snapshot extraction"
 
+	$runtimeArchive = Join-Path $root "runtime-suite.tar.gz"
+	$runtime = Join-Path $root "trusted-runtime"
+	[IO.File]::WriteAllBytes($runtimeArchive, [Convert]::FromBase64String((Get-Content -Raw -LiteralPath (Join-Path $root "runtime-suite.b64"))))
+	$runtimeActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $runtimeArchive).Hash.ToLower()
+	if ($runtimeActual -ne $runtimeSuiteSha256.ToLower()) { throw "trusted runtime checksum mismatch: $runtimeActual != $runtimeSuiteSha256" }
+	if ([IO.Directory]::Exists($runtime)) { Remove-Item -Recurse -Force -LiteralPath $runtime }
+	New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+	Invoke-Native "tar.exe" @("-xzf", $runtimeArchive, "-C", $runtime) "trusted runtime extraction"
+	Write-Output "trusted runtime verified sha256=$runtimeActual"
+
 	Write-Output "== guest: GPU and driver =="
 	$smi = "C:\Windows\System32\nvidia-smi.exe"
 	if (![IO.File]::Exists($smi)) { throw "nvidia-smi is absent: the GPU driver extension did not install" }
@@ -58,12 +69,12 @@ try {
 
 	Write-Output "== guest: executing the suite on nv0 =="
 	New-Item -ItemType Directory -Force -Path (Join-Path $work "evidence"), (Join-Path $work "gpu-work") | Out-Null
-	$env:RECIPE_SUITE_ROOT = Join-Path $work ".github\runtime"
+	$env:RECIPE_SUITE_ROOT = $runtime
 	$env:RECIPE_SUITE_WORK = Join-Path $work "gpu-work"
 	$env:RECIPE_EVIDENCE = Join-Path $work "evidence\suite.json"
 	# --device nv0 hard-errors when the device is absent; a build carrying the
 	# nvidia cfg does not add a CPU device, so there is no silent fallback.
-	& (Join-Path $work "target\release\recipe.exe") "--device" "nv0" ".github\runtime\suite.rs" 2>&1 | Tee-Object -FilePath (Join-Path $work "run.log")
+	& (Join-Path $work "target\release\recipe.exe") "--device" "nv0" (Join-Path $runtime "suite.rs") 2>&1 | Tee-Object -FilePath (Join-Path $work "run.log")
 	if ($LASTEXITCODE -ne 0) { throw "the runtime suite failed with exit code $LASTEXITCODE" }
 	Pop-Location
 

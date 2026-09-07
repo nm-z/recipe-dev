@@ -9,6 +9,7 @@ set -euo pipefail
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${SNAPSHOT:?SNAPSHOT is required}"
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
+: "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
 
 QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
@@ -54,6 +55,9 @@ if [ "$actual_sha256" != "$SNAPSHOT_SHA256" ]; then
 	echo "snapshot checksum mismatch before upload: $actual_sha256 != $SNAPSHOT_SHA256" >&2
 	exit 1
 fi
+[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
+[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
+tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
 
 request_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-${CANDIDATE_SHA:0:12}"
 stash_root="stash://${username}/recipe-runtime/${request_key}"
@@ -103,6 +107,8 @@ done
 
 mkdir -p "$arch_root/work"
 tar -xzf "$archive" -C "$arch_root/work"
+mkdir -p "$arch_root/work/.github/runtime"
+tar -xzf "$root/trusted-runtime.tar.gz" -C "$arch_root/work/.github/runtime"
 
 cat > "$arch_root/root/run.sh" <<'INNER'
 #!/usr/bin/env bash
@@ -148,6 +154,7 @@ chmod +x worker.sh
 
 echo "== uploading the archive and worker to Stash =="
 camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
+camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
 
 echo "== creating the Camber L4 job =="

@@ -16,6 +16,7 @@ set -euo pipefail
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_ATTEMPT:?RUN_ATTEMPT is required}"
+: "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
 LOCATION="${AZURE_LOCATION:-eastus}"
@@ -53,10 +54,19 @@ JSON
 fi
 
 cleanup_on_exit() {
+	local primary_status="$1"
+	local cleanup_status=0
 	echo "== releasing the worker =="
-	az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true || echo "delete reported a problem"
+	if ! az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true; then
+		echo "worker deletion reported a problem" >&2
+		cleanup_status=1
+	fi
+	if [ "$primary_status" -ne 0 ]; then
+		return "$primary_status"
+	fi
+	return "$cleanup_status"
 }
-trap cleanup_on_exit EXIT
+trap 'status=$?; set +e; cleanup_on_exit "$status"; cleanup_status=$?; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; else exit "$cleanup_status"; fi' EXIT
 
 echo "== provisioning the isolated worker =="
 az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
@@ -87,29 +97,44 @@ echo "driver extension installed"
 echo "== transferring the immutable snapshot =="
 # The snapshot travels as base64 through the Run Command payload, so the guest
 # never needs network credentials or a clone of the newest commit.
+[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
+[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
+tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
+runtime_sha256="$(sha256sum trusted-runtime.tar.gz | cut -d' ' -f1)"
 base64 -w0 "$SNAPSHOT" > snapshot.b64
-split -b 60000 snapshot.b64 chunk-
-chunks=(chunk-*)
-echo "snapshot split into ${#chunks[@]} chunks"
+split -b 60000 snapshot.b64 snapshot-chunk-
+snapshot_chunks=(snapshot-chunk-*)
+base64 -w0 trusted-runtime.tar.gz > runtime-suite.b64
+split -b 60000 runtime-suite.b64 runtime-suite-chunk-
+runtime_chunks=(runtime-suite-chunk-*)
+echo "snapshot split into ${#snapshot_chunks[@]} chunks; trusted runtime split into ${#runtime_chunks[@]} chunks"
 
 az vm run-command invoke \
 	--resource-group "$GROUP" --name "$WORKER" \
 	--command-id RunPowerShellScript \
-	--scripts 'New-Item -ItemType Directory -Force -Path C:\recipe | Out-Null; Remove-Item -Force C:\recipe\snapshot.b64 -ErrorAction SilentlyContinue; "staged"' \
+	--scripts 'New-Item -ItemType Directory -Force -Path C:\recipe | Out-Null; Remove-Item -Force C:\recipe\snapshot.b64,C:\recipe\runtime-suite.b64 -ErrorAction SilentlyContinue; "staged"' \
 	--only-show-errors -o none
 
-for chunk in "${chunks[@]}"; do
+for chunk in "${snapshot_chunks[@]}"; do
 	az vm run-command invoke \
 		--resource-group "$GROUP" --name "$WORKER" \
 		--command-id RunPowerShellScript \
 		--scripts "Add-Content -Path C:\\recipe\\snapshot.b64 -Value '$(cat "$chunk")' -NoNewline" \
 		--only-show-errors -o none
 done
+for chunk in "${runtime_chunks[@]}"; do
+	az vm run-command invoke \
+		--resource-group "$GROUP" --name "$WORKER" \
+		--command-id RunPowerShellScript \
+		--scripts "Add-Content -Path C:\\recipe\\runtime-suite.b64 -Value '$(cat "$chunk")' -NoNewline" \
+		--only-show-errors -o none
+done
 
 echo "== executing the native Windows GPU suite in the guest =="
-guest_script="$(python3 - <<'PY'
-import json, pathlib
-script = pathlib.Path(".github/runtime/azure-guest.ps1").read_text()
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+guest_script="$(python3 - "$script_dir/azure-guest.ps1" <<'PY'
+import json, pathlib, sys
+script = pathlib.Path(sys.argv[1]).read_text()
 print(json.dumps(script))
 PY
 )"
@@ -123,7 +148,7 @@ az vm run-command invoke \
 	--resource-group "$GROUP" --name "$WORKER" \
 	--command-id RunPowerShellScript \
 	--scripts "@guest.ps1" \
-	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" \
+	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" \
 	--only-show-errors -o json > evidence/azure-runcommand.json
 elapsed=$(( $(date +%s) - started ))
 echo "run command returned after ${elapsed}s"
