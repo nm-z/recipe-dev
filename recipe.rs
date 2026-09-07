@@ -3744,17 +3744,20 @@ struct DeltaShape {
 }
 
 fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
-	let (heads, width) = (integer_argument(node.argument[0], "delta heads")?, integer_argument(node.argument[1], "delta width")?);
-	let chunk = integer_argument(node.argument[2], "delta chunk")?;
-	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(width as usize, width as usize, "delta state")?);
+	let heads = integer_argument(node.argument[0], "delta heads")?;
+	let (keys, values) = (integer_argument(node.argument[1], "delta key width")?, integer_argument(node.argument[2], "delta value width")?);
+	let chunk = integer_argument(node.argument[3], "delta chunk")?;
+	// The state maps a key channel to a value channel, so it is keys by values
+	// and its row stride is the value extent.
+	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(keys as usize, values as usize, "delta state")?);
 	let chunks = node.output.length.div_ceil(chunk as usize);
 	let spans = checked_add(chunks, checked_add(chunk as usize, 2, "delta live states")?, "delta state spans")?;
 	let partials = narrow(
-		checked_mul(pairs, checked_add(checked_mul(spans, state, "delta state span")?, checked_mul(2, width as usize, "delta vectors")?, "delta pair span")?, "delta partials")?,
+		checked_mul(pairs, checked_add(checked_mul(spans, state, "delta state span")?, checked_mul(2, values as usize, "delta vectors")?, "delta pair span")?, "delta partials")?,
 		"delta partials",
 	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
-	Ok(DeltaShape { pairs, heads, partials, arguments: format!("i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
+	Ok(DeltaShape { pairs, heads, partials, arguments: format!("i32 {heads}, i32 {keys}, i32 {values}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
 }
 
 static NATIVE_ARTIFACT_SERIAL: AtomicUsize = AtomicUsize::new(0);
@@ -4226,7 +4229,12 @@ mod bundle {
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
-			Operation::Delta(heads, kernel) => format!("delta,{heads},{kernel}"),
+			Operation::Delta(heads, state, kernel) => {
+				// The extents are written only when they were declared, so a block
+				// that took the square default serializes to the text it always did.
+				let extents = state.map(|(keys, values)| format!(",{keys},{values}")).unwrap_or_default();
+				format!("delta,{heads},{kernel}{extents}")
+			}
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4262,7 +4270,16 @@ mod bundle {
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
-			"delta" => Ok(Operation::Delta(value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?)),
+			"delta" => {
+				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
+				// A record written before the extents could be declared has two fields
+				// and carries the square state, which is what it meant when it was saved.
+				let state = match (fields.next(), fields.next()) {
+					(Some(keys), Some(values)) => Some((value_at(Some(keys), "delta key width")?, value_at(Some(values), "delta value width")?)),
+					_ => None,
+				};
+				Ok(Operation::Delta(heads, state, kernel))
+			}
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -4957,7 +4974,7 @@ enum Operation {
 	Moe(usize, Vec<Residual>),
 	Perceptron(usize),
 	Dconv(usize),
-	Delta(usize, usize),
+	Delta(usize, Option<(usize, usize)>, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -5001,6 +5018,22 @@ impl BlockNormalization {
 }
 /// The normalization selectors with a declared identity: the batch, rms, and l2 markers
 /// and the layer residual constructor. Any other selector is rejected instead of guessing a mode.
+/// The delta-rule geometries: a head count alone derives a square per-head state
+/// from the residual width, and a triple states the head count and the two state
+/// extents. Any other selector is rejected instead of guessing a shape.
+pub trait DeltaSelector {
+	fn geometry(self) -> (usize, Option<(usize, usize)>);
+}
+impl DeltaSelector for usize {
+	fn geometry(self) -> (usize, Option<(usize, usize)>) {
+		(self, None)
+	}
+}
+impl DeltaSelector for (usize, usize, usize) {
+	fn geometry(self) -> (usize, Option<(usize, usize)>) {
+		(self.0, Some((self.1, self.2)))
+	}
+}
 pub trait NormalizationSelector {
 	fn normalization(self) -> BlockNormalization;
 }
@@ -5094,8 +5127,15 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
-	fn dconv(kernel: usize) = Operation::Dconv(kernel);
-	fn delta(heads: usize, kernel: usize) = Operation::Delta(heads, kernel); }
+	fn dconv(kernel: usize) = Operation::Dconv(kernel); }
+	/// A gated delta rule of `heads` heads over a causal depthwise convolution of
+	/// `kernel` positions. `heads` alone carries the square per-head state the
+	/// residual width divides into; `(heads, d_k, d_v)` states the two extents, so
+	/// the state is `d_k` by `d_v` and neither is tied to the residual width.
+	pub fn delta(&self, geometry: impl DeltaSelector, kernel: usize) -> Self {
+		let (heads, state) = geometry.geometry();
+		self.push(Operation::Delta(heads, state, kernel))
+	}
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -6866,7 +6906,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
-		Operation::Delta(heads, kernel) => lower_delta(graph, *heads, *kernel, config)?,
+		Operation::Delta(heads, state, kernel) => lower_delta(graph, *heads, *state, *kernel, config)?,
 		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -7083,30 +7123,47 @@ fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
 	require(kernel != 0, "depthwise convolution kernel must be positive")?;
 	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
 }
-/// A gated delta rule carries one `width` by `width` state per head. One projection
+/// A gated delta rule carries one `keys` by `values` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
 /// recurrence reads one value per head. The queries and keys take a per-head unit
 /// length, the output a per-head root mean square and the gate built from a third
 /// projection, and the output projection closes the block.
-fn lower_delta(graph: &mut Graph, heads: usize, kernel: usize, config: Config) -> Result<()> {
-	require(heads != 0 && graph.output.channels % heads == 0, "delta head partition is invalid")?;
+///
+/// Without a declared geometry the two extents are both `channels / heads`, which
+/// is the square state this block has always carried, so every expression below
+/// is the one it emitted before the extents could differ.
+fn lower_delta(graph: &mut Graph, heads: usize, state: Option<(usize, usize)>, kernel: usize, config: Config) -> Result<()> {
+	require(heads != 0, "delta head partition is invalid")?;
+	require(state.is_some() || graph.output.channels % heads == 0, "delta head partition is invalid")?;
 	let (source, input) = (graph.source, graph.output);
-	let (channels, width) = (input.channels, input.channels / heads);
+	let channels = input.channels;
+	let (keys, values) = match state {
+		Some((keys, values)) => {
+			require(keys != 0 && values != 0, "delta state extents must be positive")?;
+			(keys, values)
+		}
+		None => (channels / heads, channels / heads),
+	};
+	// The projection carries a query and a key plane of `keys` channels per head
+	// and a value plane of `values`, so it is three equal planes only when the two
+	// extents agree.
+	let (key_plane, value_plane) = (checked_mul(heads, keys, "delta key plane")?, checked_mul(heads, values, "delta value plane")?);
+	let projection = checked_add(checked_mul(2, key_plane, "delta query and key planes")?, value_plane, "delta projection width")?;
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
 	let gates = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, checked_mul(3, channels, "delta projection width")?)?;
+	lower_project(graph, projection)?;
 	lower_dconv(graph, kernel)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, width, checked_mul(2, channels, "delta query and key span")?)?;
-	push_node(graph, Primitive::Delta, input, heads, [heads as f64, width as f64, chunk as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], gates)?;
-	lower_normalize(graph, BlockNormalization::Rms, width, channels)?;
+	lower_normalize(graph, BlockNormalization::L2, keys, checked_mul(2, key_plane, "delta query and key span")?)?;
+	push_node(graph, Primitive::Delta, Shape { channels: value_plane, length: input.length }, heads, [heads as f64, keys as f64, values as f64, chunk as f64, 0.0, 0.0, 0.0, 0.0, 0.0], gates)?;
+	lower_normalize(graph, BlockNormalization::Rms, values, value_plane)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, channels)?;
+	lower_project(graph, value_plane)?;
 	let (gate, shape) = activation(graph, graph.source, graph.output, Activation::Sigmoid, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, channels)
@@ -8300,10 +8357,11 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// the chunk the reverse pass replays, the state adjoint, the readout error
 		// and key weight vectors, and one decay partial.
 		Primitive::Delta => {
-			let (heads, width) = (node.argument[0] as usize, node.argument[1] as usize);
-			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(width, width, "delta state")?);
+			let heads = node.argument[0] as usize;
+			let (keys, values) = (node.argument[1] as usize, node.argument[2] as usize);
+			let (chunk, state) = ((node.argument[3] as usize).max(1), checked_mul(keys, values, "delta state")?);
 			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
-			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
+			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, values, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
 			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),

@@ -72,6 +72,8 @@ const CASES: &[Case] = &[
 	Case { name: "deep-int4", shape: "deep", precision: "int4", rows: 131, columns: 17 },
 	Case { name: "dconv", shape: "dconv", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "delta", shape: "delta", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "delta-rectangular", shape: "delta-rectangular", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "delta-narrow-value", shape: "delta-narrow-value", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter", shape: "prelu", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "scalar-parameter-bf16", shape: "prelu", precision: "bf16", rows: 131, columns: 17 },
 	Case { name: "transcendental-tanh", shape: "tanh", precision: "fp32", rows: 131, columns: 17 },
@@ -117,6 +119,11 @@ fn build(case: &Case) -> Model {
 		"attention-qk-l2" => recipe.model().pool(1).layer(4).attn(2).qk(l2).relu().layer(1).loss(mse),
 		"dconv" => recipe.model().conv(4, 3).dconv(4).relu().layer(1).loss(mse),
 		"delta" => recipe.model().conv(4, 3).delta(2, 4).relu().layer(1).loss(mse),
+		// A value extent wider than the key extent, and a head count that does not
+		// divide the stream the convolution leaves: neither is expressible with the
+		// square state the residual width derives.
+		"delta-rectangular" => recipe.model().conv(4, 3).delta((3, 5, 7), 4).relu().layer(1).loss(mse),
+		"delta-narrow-value" => recipe.model().conv(4, 3).delta((2, 6, 3), 4).relu().layer(1).loss(mse),
 		"gru" => recipe.model().gru(6).relu().layer(1).loss(mse),
 		"lstm" => recipe.model().lstm(6).relu().layer(1).loss(mse),
 		"pool" => recipe.model().conv(4, 3).relu().pool(2).relu().layer(1).loss(mse),
