@@ -70,7 +70,7 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
+	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)[.budget(tokens)][.score(rms|l2, dims)]][.gate()]
 	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
@@ -129,12 +129,29 @@ and the residual width must divide by the head count, with it a head is `d` wide
 whatever the residual width is, and the block projects `heads * d` back to the
 residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
-`.index(heads, width, block, keep)` adds a side projection that scores every group
-of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
+`.index(heads, width, block, keep)` adds a side projection of the block input, its
+own weighted node, that scores every group of `block` keys and keeps the best `keep`
+blocks per query. A block's representative is the mean of the indexer keys the query
+can see, so a query in the middle of a block scores the block's causal prefix, and a
+score is the plain dot product of an indexer query head with that mean. Without
+`.score` every indexer head normalizes to unit length first; `.score(rms|l2, dims)`
+gives the indexer its trained geometry instead: every indexer query and key head
+normalizes with its own trained scale, and its leading `dims` channels rotate at the
+block's `rope` base, before scoring. A GGUF plan therefore names the indexer
+projection as its own entry, in its own layout, after the query-key scales, and the
+`.score(rms, ..)` scales after it. `.budget(tokens)` states the admission as a token
+count, the way a checkpoint's `attention.indexer.top_k` does, and keeps the blocks
+that cover it; a budget that covers the sequence is dense attention. `.gate()` multiplies the
 attention output by a sigmoid of its own projection of the block input.
+
+Under `recipe.decode` the indexer is state like the keys and values: the context
+arena keeps one running sum of indexer keys per block, a step adds its one key
+to the block it lands in and scores only its own query, and the selection equals the
+whole-sequence selection of the same prefix.
 
 ```rust
 .attn(8).width(64).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
+.attn(8).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).budget(128).score(rms, 16).gate()
 ```
 
 ## compute precisions
