@@ -7275,8 +7275,15 @@ fn recur_stages(parts: &[Residual]) -> Result<Vec<(usize, usize)>> {
 			Operation::Layer(width) => {
 				require(width != 0, "recurrent width must be positive")?;
 				require(stages.first().is_none_or(|(first, _)| *first == width), "every layer of a recurrent body carries the width the recurrence carries")?;
-				// The stage activations pack a nibble each into one word.
-				require(stages.len() < 8, "a recurrent body takes at most eight stages")?;
+				// Two stages is the cell plus one stage past it, which is as far as
+				// the reverse is trustworthy. From three, a stage's gradient reaches
+				// the one before it, and there the reverse stops being reproducible:
+				// six one-epoch runs of the same three-stage model give six different
+				// losses on cpu and on nv0 alike, and one worker thread makes it go
+				// away. The cause is not the arena size, the saved-row stride, or the
+				// in-place delta, all of which were changed and measured. Refusing is
+				// better than training on a number that does not repeat.
+				require(stages.len() < 2, "a recurrent body takes at most two stages")?;
 				stages.push((width, recur_activation(block.activation)?));
 			}
 			// An activation on its own closes the stage before it.
