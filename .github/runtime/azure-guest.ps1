@@ -34,6 +34,36 @@ function Install-Toolchain {
 	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+	Write-Output "== guest: installing the Visual C++ build environment =="
+	$vsInstaller = Join-Path $bootstrap "vs_BuildTools-17.14.39.exe"
+	Invoke-Download `
+		"https://download.visualstudio.microsoft.com/download/pr/fa619120-9c0e-47e6-bfe0-3ee96fb671b2/236367b68ba9a51708263ab10a1c85546cc4a8eca78b365168811d19c4fb2f29/vs_BuildTools.exe" `
+		$vsInstaller `
+		"236367b68ba9a51708263ab10a1c85546cc4a8eca78b365168811d19c4fb2f29"
+	$vsRoot = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+	& $vsInstaller `
+		"--quiet" `
+		"--wait" `
+		"--norestart" `
+		"--nocache" `
+		"--installPath" `
+		$vsRoot `
+		"--add" `
+		"Microsoft.VisualStudio.Workload.VCTools" `
+		"--add" `
+		"Microsoft.VisualStudio.Component.VC.Tools.x86.x64" `
+		"--add" `
+		"Microsoft.VisualStudio.Component.Windows10SDK.20348" `
+		"--includeRecommended"
+	$vsExit = $LASTEXITCODE
+	if (($vsExit -ne 0) -and ($vsExit -ne 3010)) { throw "Visual C++ build environment installation failed with exit code $vsExit" }
+	$vsDevCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
+	if (![IO.File]::Exists($vsDevCmd)) { throw "Visual C++ developer command file is absent: $vsDevCmd" }
+	$vcTools = Join-Path $vsRoot "VC\Tools\MSVC"
+	if (![IO.Directory]::Exists($vcTools)) { throw "MSVC tool directory is absent: $vcTools" }
+	$sdkHeader = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\um\windows.h"
+	if (![IO.File]::Exists($sdkHeader)) { throw "Windows SDK header is absent: $sdkHeader" }
+
 	Write-Output "== guest: installing Rust toolchain =="
 	$rustup = Join-Path $bootstrap "rustup-init.exe"
 	Invoke-WebRequest -UseBasicParsing -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile $rustup
@@ -85,7 +115,30 @@ function Install-Toolchain {
 	Invoke-Native "rustc" @("--version") "rustc"
 	Invoke-Native "cargo" @("--version") "cargo"
 	Invoke-Native $nvcc @("--version") "nvcc"
-	Write-Output "toolchain ready clang=$clang linker=$linker cuda=$cudaRoot"
+	Write-Output "toolchain ready clang=$clang linker=$linker cuda=$cudaRoot vs=$vsRoot"
+}
+
+function Enter-VsDeveloperEnvironment {
+	param([string] $VsRoot)
+	$vsDevCmd = Join-Path $VsRoot "Common7\Tools\VsDevCmd.bat"
+	if (![IO.File]::Exists($vsDevCmd)) { throw "Visual C++ developer command file is absent: $vsDevCmd" }
+	Write-Output "== guest: entering the Visual C++ developer environment =="
+	$environment = & cmd.exe /d /s /c "call `"$vsDevCmd`" -arch=amd64 -host_arch=amd64 && set" 2>&1
+	if ($LASTEXITCODE -ne 0) { throw "Visual C++ developer environment failed with exit code $LASTEXITCODE" }
+	foreach ($line in $environment) {
+		$entry = [string]$line
+		$separator = $entry.IndexOf("=")
+		if ($separator -le 0) { continue }
+		$name = $entry.Substring(0, $separator)
+		$value = $entry.Substring($separator + 1)
+		[Environment]::SetEnvironmentVariable($name, $value, [EnvironmentVariableTarget]::Process)
+	}
+	$env:Path = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Process)
+	foreach ($tool in @("cl.exe", "link.exe", "lib.exe", "rc.exe")) {
+		if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is absent after entering the Visual C++ developer environment" }
+	}
+	& cl.exe /Bv 2>&1 | Select-Object -First 3
+	if ($LASTEXITCODE -ne 0) { throw "cl.exe failed after entering the Visual C++ developer environment with exit code $LASTEXITCODE" }
 }
 
 try {
@@ -121,6 +174,8 @@ try {
 	if ($gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $gpu" }
 
 	Install-Toolchain -Root $root
+	$vsRoot = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+	Enter-VsDeveloperEnvironment -VsRoot $vsRoot
 	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
 
 	Write-Output "== guest: building with the NVIDIA backend =="
