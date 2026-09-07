@@ -6533,7 +6533,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			let tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward(ForwardMode::Inference)?;
 			tape.predictions()
@@ -6642,14 +6642,19 @@ impl Recipe {
 	/// position the decode has already settled. The decode ends at a `stop` id,
 	/// after `budget` ids, or when the ids fill the model's sequence.
 	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		try_decode(path, prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		one_device_placement(path.as_ref()).and_then(|placed| placed.try_decode(prompt, sampler, stop, budget, |_| Ok(()))).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP and return. A request names its prompt
 	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
 	/// and the answer sends each id as its own chunk as the decode reaches it.
 	pub fn serve(&self, path: impl AsRef<Path>, address: &str, requests: usize) {
-		try_serve(&path, address, requests).unwrap_or_else(|error| panic!("{error}"));
+		one_device_placement(path.as_ref()).and_then(|placed| try_serve(&placed, address, requests)).unwrap_or_else(|error| panic!("{error}"));
 	}
+}
+/// The whole model as one range on the primary device: the placement a decode
+/// that names no split runs on, so one implementation serves both.
+fn one_device_placement(path: &Path) -> Result<Placed> {
+	place_model(path, &[], &[selected_gpu()?])
 }
 fn request_field<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 	query.split('&').find_map(|pair| pair.strip_prefix(name)?.strip_prefix('=')).filter(|value| !value.is_empty())
@@ -6661,12 +6666,12 @@ fn request_ids(query: &str, name: &str) -> Result<Vec<u32>> {
 	request_field(query, name)
 		.map_or_else(|| Ok(Vec::new()), |value| value.split(',').map(|id| id.parse().map_err(|_| RecipeError::new(format!("request {name} holds {id:?}, which is not an id")))).collect())
 }
-fn try_serve(path: &impl AsRef<Path>, address: &str, requests: usize) -> Result<()> {
+fn try_serve(placed: &Placed, address: &str, requests: usize) -> Result<()> {
 	use std::io::Write as _;
 	let listener = std::net::TcpListener::bind(address).map_err(|error| RecipeError::new(format!("cannot serve decode on {address}: {error}")))?;
 	for _ in 0..requests {
 		let mut stream = listener.accept().map_err(|error| RecipeError::new(format!("cannot accept a decode request: {error}")))?.0;
-		if let Err(error) = serve_decode(path, &mut stream) {
+		if let Err(error) = serve_decode(placed, &mut stream) {
 			let body = error.to_string();
 			let answer = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
 			stream.write_all(answer.as_bytes()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))?;
@@ -6674,7 +6679,7 @@ fn try_serve(path: &impl AsRef<Path>, address: &str, requests: usize) -> Result<
 	}
 	Ok(())
 }
-fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Result<()> {
+fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()> {
 	use std::io::{Read as _, Write as _};
 	let mut head = Vec::new();
 	let mut byte = [0_u8; 1];
@@ -6714,80 +6719,27 @@ fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Re
 		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
 	};
 	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-	try_decode(path, &prompt, &mut sampler, &stop, budget, |id| {
+	placed.try_decode(&prompt, &mut sampler, &stop, budget, |id| {
 		let chunk = format!("{id}\n");
 		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
 	})?;
 	write(stream, b"0\r\n\r\n")
-}
-fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
-	let path = resolve_path(path)?;
-	let device = selected_gpu()?;
-	let (_, graphs) = bundle::load_semantic(&path)?;
-	let stored = match graphs.as_slice() {
-		[only] => only,
-		graphs => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
-	};
-	let sequence = stored.inputs.len();
-	require(!prompt.is_empty(), "decode prompt is empty")?;
-	require(stored.input.channels == 1, "decode expects one input value per position")?;
-	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
-	let mut samples = vec![0.0; sequence];
-	for (slot, id) in samples.iter_mut().zip(prompt) {
-		*slot = f64::from(*id);
-	}
-	let graph = materialize_saved_graph(stored, &samples, device, Config::load()?)?;
-	let mut tape = NativeTape::new(&graph, &samples, &[], device, stored.precision, None)?;
-	tape.inject_bn_stats(&stored.bn_stats)?;
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-	let mut settled = 0;
-	let mut seeded = false;
-	for step in 0..=budget {
-		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let started = std::time::Instant::now();
-		let logits = bundle::infer_graphs(&graphs, &samples, |_, prepared| {
-			// The tape was uploaded from the raw id vector, so the tail the decode has
-			// not reached holds 0.0 while a whole-sequence forward of the same ids sees
-			// the prepared padding. A pool window rounds its end up and legitimately
-			// reads one unsettled position, so the first forward seeds every position
-			// and later steps write only what the new id reached.
-			let written = if seeded { settled as usize..reached as usize } else { 0..prepared.len() };
-			seeded = true;
-			for position in written {
-				tape.write_sample(position, prepared[position])?;
-			}
-			tape.forward_window(settled, reached, ForwardMode::Inference)?;
-			tape.predictions()
-		})?;
-		let seconds = started.elapsed().as_secs_f64();
-		if step == 0 {
-			generation.prefill_seconds = seconds;
-		} else {
-			generation.step_seconds.push(seconds);
-		}
-		settled = reached;
-		generation.logits = logits;
-		if step == budget {
-			break;
-		}
-		let id = sampler.sample(&generation.logits, &generation.ids);
-		emit(id)?;
-		samples[generation.ids.len()] = f64::from(id);
-		generation.ids.push(id);
-		if stop.contains(&id) {
-			break;
-		}
-	}
-	Ok(generation)
 }
 /// A saved model placed across the selected devices: contiguous block ranges,
 /// each on its own device, run in sequence with the stream moved at every hop.
 pub struct Placed {
 	graphs: Vec<bundle::SemanticGraph>,
 	split: Vec<usize>,
-	devices: &'static [&'static Gpu],
+	tapes: Vec<Vec<NativeTape>>,
 	resident: Vec<usize>,
 	moved: usize,
+}
+/// The runs of a one-row arena that positions `begin..end` of every channel
+/// occupy: the whole arena when the window spans it, else one run per channel,
+/// as a row holds each channel's positions together.
+fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
+	let (begin, end) = (begin as usize, end as usize);
+	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
 /// The saved statistics a batch normalization carries into inference, as the
 /// node index and the channels it normalizes.
@@ -6796,9 +6748,6 @@ fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
 }
 /// The values a device holds for a range of nodes: their parameters and the
 /// state their batch normalizations carry.
-fn resident_values(nodes: &[Node]) -> usize {
-	nodes.iter().map(|node| node.parameters).sum::<usize>() + carried_state(nodes).map(|(_, channels)| 2 * channels).sum::<usize>()
-}
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
@@ -6815,7 +6764,7 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 /// reported instead of placed. Every named device takes a contiguous, nonempty
 /// range, so a device that cannot hold even one block is reported rather than
 /// skipped over.
-fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
+fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
 	let mut starts = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
 		if index == 0 || node.block_index != graph.nodes[index - 1].block_index {
@@ -6825,7 +6774,9 @@ fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Resu
 	let (mut split, mut taken, mut free) = (Vec::new(), 0, devices[0].free_bytes()?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = (resident_values(&graph.nodes[start..end]) * bytes) as u64;
+		// A range holds what its tape holds: the blocks' weights, their arenas,
+		// and the input row the range's first block reads.
+		let resident = resident_bytes(graph, start..end, precision)? as u64;
 		let index = graph.nodes[start].block_index;
 		// A device that cannot hold the block hands it to the next one, and so on:
 		// a device too small to take it is passed over rather than ending the
@@ -6838,7 +6789,10 @@ fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Resu
 			split.push(taken);
 			(taken, free) = (0, devices[device + 1].free_bytes()?);
 		}
-		free -= resident;
+		if taken == 0 {
+			free = free.saturating_sub(input_row_bytes(graph, start, precision.bytes())? as u64);
+		}
+		free = free.saturating_sub(resident);
 		taken += 1;
 	}
 	require(taken != 0, "model has no block")?;
@@ -6890,53 +6844,154 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 	}
 	Ok(parts)
 }
-fn place_model(path: &Path, split: &[usize]) -> Result<Placed> {
+/// The tape of one part of a split graph on its device, holding the batch
+/// normalization statistics that follow the parts already made.
+fn range_tape(graph: &Graph, samples: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<NativeTape> {
+	let tape = NativeTape::new(graph, samples, &[], gpu, stored.precision, None)?;
+	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+	*statistics += count;
+	Ok(tape)
+}
+/// The device bytes the nodes in `range` hold: their weights, the row each
+/// output keeps, and the context that carries their state between windows.
+fn resident_bytes(graph: &Graph, range: std::ops::Range<usize>, precision: Compute) -> Result<usize> {
+	let element = precision.bytes();
+	let mut bytes = 0;
+	for index in range {
+		let node = &graph.nodes[index];
+		let weights = checked_mul(node.parameters, element, "resident weights")?;
+		for span in [align(weights, element)?, align(graph_rows_buffer(node.output, 1, element)?, element.max(8))?, align(node_context(graph, node, 1, precision)?, element.max(8))?] {
+			bytes = checked_add(bytes, span, "resident bytes")?;
+		}
+	}
+	Ok(bytes)
+}
+/// The bytes a range's own input row takes on its device: the model input for
+/// the first range, the previous node's output for any later one.
+fn input_row_bytes(graph: &Graph, start: usize, element: usize) -> Result<usize> {
+	let shape = if start == 0 { graph.input } else { graph.nodes[start - 1].output };
+	checked_mul(shape.elements(), element, "input row bytes")
+}
+/// Place a saved model over `devices`: every range gets its tape, created once
+/// on its device with the batch normalization statistics its blocks carry.
+fn place_model(path: &Path, split: &[usize], devices: &[&'static Gpu]) -> Result<Placed> {
 	let path = resolve_path(path)?;
-	let devices = selected_gpus()?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
-	let (mut split, mut resident, mut moved) = (split.to_vec(), vec![0; devices.len()], 0);
+	let (mut split, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let bytes = stored.precision.bytes();
 		if split.is_empty() {
-			split = measured_split(&graph, bytes, devices)?;
+			split = measured_split(&graph, stored.precision, devices)?;
 		}
 		let blocks = stored.model.blocks.len();
 		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
 		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
-		for (index, part) in split_graph(&graph, &split)?.iter().enumerate() {
-			resident[index] += resident_values(&part.nodes) * bytes;
+		let (mut ranges, mut statistics) = (Vec::new(), 0);
+		for (index, (part, device)) in split_graph(&graph, &split)?.iter().zip(devices).enumerate() {
+			let tape = range_tape(part, &vec![0.0; part.input.elements()], device, stored, &mut statistics)?;
+			resident[index] += tape.resident_bytes();
+			// A hop carries the stream of the positions a token reaches, one row
+			// of every output channel, not the whole sequence.
 			if index + 1 < split.len() {
-				moved += part.output.elements() * bytes;
+				moved += part.output.channels * stored.precision.bytes();
 			}
+			ranges.push(tape);
 		}
+		tapes.push(ranges);
 	}
-	Ok(Placed { graphs, split, devices, resident, moved })
+	Ok(Placed { graphs, split, tapes, resident, moved })
 }
 impl Recipe {
 	/// Place a saved model across the selected devices: `split` gives every
 	/// device, in `--device` order, the number of blocks it takes, and an empty
 	/// split is measured from the free memory of each device.
 	pub fn place(&self, path: impl AsRef<Path>, split: &[usize]) -> Placed {
-		place_model(path.as_ref(), split).unwrap_or_else(|error| panic!("{error}"))
+		place_model(path.as_ref(), split, selected_gpus().unwrap_or_else(|error| panic!("{error}"))).unwrap_or_else(|error| panic!("{error}"))
 	}
 }
 impl Placed {
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
-		bundle::infer_graphs(&self.graphs, input, |stored, samples| self.forward(stored, samples)).unwrap_or_else(|error| panic!("{error}"))
+		let mut graph = 0;
+		bundle::infer_graphs(&self.graphs, input, |_, samples| {
+			let tapes = &self.tapes[graph];
+			graph += 1;
+			self.forward_window(tapes, samples, 0, tapes.first().map_or(0, |tape| tape.positions))
+		})
+		.unwrap_or_else(|error| panic!("{error}"))
 	}
-	fn forward(&self, stored: &bundle::SemanticGraph, samples: &[f64]) -> Result<Vec<f64>> {
-		let graph = materialize_saved_graph(stored, samples, self.devices[0], Config::load()?)?;
-		let (mut stream, mut statistics) = (samples.to_vec(), 0);
-		for (part, device) in split_graph(&graph, &self.split)?.iter().zip(self.devices) {
-			let mut tape = NativeTape::new(part, &stream, &[], device, stored.precision, None)?;
-			let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
-			tape.inject_bn_stats(stored.bn_stats.get(statistics..statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
-			statistics += count;
-			tape.forward(ForwardMode::Inference)?;
-			stream = tape.predictions()?;
+	/// Autoregressive decode over the placed model, whose input is a sequence of
+	/// ids and whose output is one logit per id. The tapes hold the state of
+	/// every block for the whole decode: the prefill fills them from the prompt
+	/// and each step extends them by the one position the new id reaches, so no
+	/// step runs a position the decode has already settled. The decode ends at a
+	/// `stop` id, after `budget` ids, or when the ids fill the model's sequence.
+	pub fn decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.try_decode(prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		let (stored, tapes) = match (self.graphs.as_slice(), self.tapes.as_slice()) {
+			([only], [tapes]) => (only, tapes.as_slice()),
+			_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", self.graphs.len()))),
+		};
+		let sequence = stored.inputs.len();
+		require(!prompt.is_empty(), "decode prompt is empty")?;
+		require(stored.input.channels == 1, "decode expects one input value per position")?;
+		require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
+		let mut samples = vec![0.0; sequence];
+		for (slot, id) in samples.iter_mut().zip(prompt) {
+			*slot = f64::from(*id);
 		}
-		Ok(stream)
+		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+		let mut settled = 0;
+		for step in 0..=budget {
+			let reached = narrow(generation.ids.len(), "decode position")? as u32;
+			let started = std::time::Instant::now();
+			let logits = bundle::infer_graphs(&self.graphs, &samples, |_, prepared| self.forward_window(tapes, prepared, settled, reached))?;
+			let seconds = started.elapsed().as_secs_f64();
+			if step == 0 {
+				generation.prefill_seconds = seconds;
+			} else {
+				generation.step_seconds.push(seconds);
+			}
+			settled = reached;
+			generation.logits = logits;
+			if step == budget {
+				break;
+			}
+			let id = sampler.sample(&generation.logits, &generation.ids);
+			emit(id)?;
+			samples[generation.ids.len()] = f64::from(id);
+			generation.ids.push(id);
+			if stop.contains(&id) {
+				break;
+			}
+		}
+		Ok(generation)
+	}
+	/// Run the input positions `begin..end` through every range in order. A
+	/// window from position zero starts a new sequence. The window's rows of
+	/// `samples` enter the first range, each range writes the positions the
+	/// window reaches and keeps them as its state, and only the window's rows of
+	/// the stream hop to the next device. Returns the last range's output.
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		if begin == 0 {
+			tapes.iter().try_for_each(NativeTape::clear_values)?;
+		}
+		for (start, count) in first.input_runs(begin, end) {
+			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
+		}
+		let (mut begin, mut end) = (begin, end);
+		for (index, tape) in tapes.iter().enumerate() {
+			tape.forward_window(begin, end, ForwardMode::Inference)?;
+			let Some(next) = tapes.get(index + 1) else { break };
+			(begin, end) = tape.output_window(begin, end)?;
+			for (start, count) in window_runs(tape.output, begin, end) {
+				next.write_samples(start, &tape.output(start, count)?)?;
+			}
+		}
+		last.predictions()
 	}
 	/// The blocks each device takes, in `--device` order.
 	pub fn split(&self) -> &[usize] {
@@ -7890,7 +7945,9 @@ struct NativeTape {
 	rows: u32,
 	parameters: usize,
 	step: u32,
-	output: usize,
+	input: Shape,
+	output: Shape,
+	nodes: Vec<Node>,
 	capacity: usize,
 	positions: u32,
 }
@@ -7994,19 +8051,21 @@ impl NativeTape {
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
 			step,
-			output,
+			input: graph.input,
+			output: graph.output,
+			nodes: graph.nodes.clone(),
 			capacity: rows,
 			positions: narrow(graph_positions(graph), "native input positions")? as u32,
 		})
 	}
-	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
+	fn forward(&self, mode: ForwardMode) -> Result<()> {
 		self.forward_window(0, self.positions, mode)
 	}
 	/// Write the output positions that the input positions before `end` reach and
 	/// that the input positions before `begin` did not. The arenas keep every
 	/// earlier position, so a step reads the attention keys and values, the
 	/// recurrent state, and the convolution tail that earlier calls left.
-	fn forward_window(&mut self, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
+	fn forward_window(&self, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
@@ -8017,8 +8076,50 @@ impl NativeTape {
 		Ok(())
 	}
 	/// Replace the input value at one position.
-	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
-		self.samples.write_float_bytes(checked_mul(position, self.precision.model.bytes(), "sample offset")?, &[value], self.precision.model)
+	/// Replace a run of the input values from element `first`.
+	fn write_samples(&self, first: usize, values: &[f64]) -> Result<()> {
+		self.samples.write_float_bytes(checked_mul(first, self.precision.model.bytes(), "sample offset")?, values, self.precision.model)
+	}
+	/// The runs of the one-row input that the input positions `begin..end`
+	/// occupy: one run per channel, as an arena holds a row channel by channel.
+	fn input_runs(&self, begin: u32, end: u32) -> Vec<(usize, usize)> {
+		window_runs(self.input, begin, end)
+	}
+	/// The output positions the input positions `begin..end` reach: the window
+	/// every node derives from its source, as the emitted forward derives it,
+	/// carried to the last node.
+	fn output_window(&self, begin: u32, end: u32) -> Result<(u32, u32)> {
+		let mut windows = Vec::with_capacity(self.nodes.len());
+		for node in &self.nodes {
+			let (begin, end) = usize::try_from(node.source).map_or((begin, end), |source| windows[source]);
+			let length = narrow(node.output.length, "node length")? as u32;
+			windows.push(match node.op {
+				Primitive::Predictor => (0, length),
+				Primitive::Pool => {
+					let size = integer_argument(node.argument[0], "pool size")? as u32;
+					require(size > 0, "native pool size must be positive")?;
+					(begin / size, end.div_ceil(size).min(length))
+				}
+				Primitive::Contraction if node.argument[0] > 1.0 => {
+					let lag = integer_argument(node.argument[0], "contraction kernel")? as u32 - 1;
+					(begin.saturating_sub(lag), end.saturating_sub(lag))
+				}
+				_ => (begin, end),
+			});
+		}
+		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
+	}
+	/// Forget every value the arenas hold, so the next forward reads nothing an
+	/// earlier sequence left at a position it does not write.
+	fn clear_values(&self) -> Result<()> {
+		self.values.write_bytes(0, &vec![0_u8; self.values.bytes])
+	}
+	/// The bytes this tape holds on its device: the weights, the input row, and
+	/// the value and context arenas that keep every position's activations,
+	/// attention keys and values, recurrent state, convolution tail and batch
+	/// normalization statistics.
+	fn resident_bytes(&self) -> usize {
+		self.weights.bytes + self.samples.bytes + self.values.bytes + self.contexts.bytes
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
@@ -8039,8 +8140,13 @@ impl NativeTape {
 		Ok(stats)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		self.output(0, self.capacity * self.output.elements())
+	}
+	/// A run of `count` output values from element `first` of the output arena.
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let offset = checked_add(arena, checked_mul(first, self.precision.model.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -10569,7 +10675,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
+	let tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
 	tape.forward(ForwardMode::Training)?;
 	tape.predictions()
 }
@@ -14084,7 +14190,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
+				let validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward(ForwardMode::Inference)?;
 				let raw = validation.predictions()?;
@@ -14107,7 +14213,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
+			let validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward(ForwardMode::Inference)?;
 			let raw = validation.predictions()?;
