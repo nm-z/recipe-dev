@@ -54,6 +54,44 @@ recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
 ```
 
 `serve` answers that many decode requests over HTTP and returns. A request names its prompt in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&top_k=40&top_p=0.95&min_p=0.05&penalty=1.1&seed=7`, and each field it leaves out keeps the sampler's default. The answer is chunked and carries one id per chunk as the decode reaches it.
+## gguf
+
+```rust
+let model = recipe.gguf("model-00001-of-00004.gguf");
+model.value("general.architecture");
+model.tensors();
+model.contract("blk.0.ffn_up.weight", &input, 16);
+```
+
+Every shard of a split is opened by name and the tensor data stays mapped. A
+quantized tensor binds to the tape in its own GGML layout, so the contraction
+reads the mapped bytes through the block decoders that read saved `.ogdl` models.
+
+## ngram
+
+```rust
+let table = recipe.gguf("ngram.gguf");
+let ngram = table.ngram();
+let prediction = ngram.infer("model.ogdl", &input, &ids);
+```
+
+N-gram embeddings from a table too large for device memory. Each of `ngram.heads`
+heads hashes the current token with its previous one, and as many heads with its
+previous two, into its own row range of the mapped `[width, rows]` tensor
+`ngram.table` names, seeded by `ngram.seeds` and reset at the end-of-sequence id.
+Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
+convolves them across as many trailing positions; and the gathered vector is
+added to the stream before the block `ngram.layer` names. The gather stays on the
+host holding the table. The first `--device` runs the blocks before
+`ngram.layer` and the last runs the blocks from it on, so one name runs both
+ranges on that device and
+
+```text
+recipe --device nv0 --device cpu model.rs
+```
+
+gives the host that has the table mapped the range that reads it. A placement
+names at most two devices.
 
 ## files
 
