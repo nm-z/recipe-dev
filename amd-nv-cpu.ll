@@ -1593,8 +1593,8 @@ prepare:
 %causal = icmp ule i32 %key, %query
 br i1 %causal, label %selection, label %invalid
 selection:
-br i1 %select, label %selection.test, label %complete
-selection.test:
+br i1 %select, label %selection.chosen, label %complete
+selection.chosen:
 %kept = call i1 @attention_selected(ptr addrspace(1) %context, i32 %score.row, i32 %blocks, i32 %select.block, i32 %query, i32 %key)
 br i1 %kept, label %complete, label %invalid
 complete:
@@ -1843,8 +1843,8 @@ score.prepare:
 %score.causal = icmp ule i32 %score.key, %score.query
 br i1 %score.causal, label %score.selection, label %score.invalid
 score.selection:
-br i1 %select, label %score.selection.test, label %score.complete
-score.selection.test:
+br i1 %select, label %score.selection.chosen, label %score.complete
+score.selection.chosen:
 %score.kept = call i1 @attention_selected(ptr addrspace(1) %context, i32 %score.row.base, i32 %blocks, i32 %select.block, i32 %score.query, i32 %score.key)
 br i1 %score.kept, label %score.complete, label %score.invalid
 score.complete:
