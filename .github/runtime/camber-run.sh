@@ -91,59 +91,80 @@ if ! nvidia-smi --query-gpu=name --format=csv,noheader | awk 'BEGIN { IGNORECASE
 	exit 1
 fi
 
-echo "== worker: Arch userspace =="
-work="/tmp/recipe-camber-${CANDIDATE_SHA:0:12}-$$"
-arch_root="$work/archroot"
-mkdir -p "$arch_root"
-release="$(curl -fsSL https://geo.mirror.pkgbuild.com/iso/ | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}/' | sort -r | head -1 | tr -d '/')"
-[ -n "$release" ] || { echo "no Arch bootstrap release found" >&2; exit 1; }
-echo "using Arch bootstrap release $release"
-curl -fsSL "https://geo.mirror.pkgbuild.com/iso/$release/archlinux-bootstrap-x86_64.tar.zst" -o "$work/arch.tar.zst"
-tar -I zstd -xf "$work/arch.tar.zst" -C "$arch_root" --strip-components=1 --no-same-owner --no-same-permissions --mode='u+rwX' --exclude='etc/ca-certificates/extracted/cadir'
-cp /etc/resolv.conf "$arch_root/etc/resolv.conf"
-for mount_name in proc sys dev; do
-	mkdir -p "$arch_root/$mount_name"
-	sudo -n mount --rbind "/$mount_name" "$arch_root/$mount_name"
-done
-for library in $(ldconfig -p | awk '/libcuda\.so/ {print $NF}'); do
-	sudo -n install -D "$library" "$arch_root$library"
-done
+echo "== worker: native Ubuntu userspace =="
+work="$root/work"
+toolchains="$root/toolchains"
+rustup_home="$toolchains/rustup"
+cargo_home="$toolchains/cargo"
+llvm_version="23.1.0"
+llvm_archive="LLVM-${llvm_version}-Linux-X64.tar.xz"
+llvm_sha256="18da30f77f475688a18f7704d23f9f155ae007ed9922dbed6850a9419d9fec8c"
+llvm_root="$toolchains/LLVM-${llvm_version}-Linux-X64"
+mkdir -p "$work" "$toolchains"
+tar -xzf "$archive" -C "$work"
+mkdir -p "$work/.github/runtime"
+tar -xzf "$root/trusted-runtime.tar.gz" -C "$work/.github/runtime"
 
-mkdir -p "$arch_root/work"
-tar -xzf "$archive" -C "$arch_root/work"
-mkdir -p "$arch_root/work/.github/runtime"
-tar -xzf "$root/trusted-runtime.tar.gz" -C "$arch_root/work/.github/runtime"
+echo "== worker: install user-local Rust =="
+export RUSTUP_HOME="$rustup_home"
+export CARGO_HOME="$cargo_home"
+export PATH="$CARGO_HOME/bin:$PATH"
+curl -fsSL https://sh.rustup.rs -o "$toolchains/rustup-init.sh"
+sh "$toolchains/rustup-init.sh" -y --profile minimal --default-toolchain stable
 
-cat > "$arch_root/root/run.sh" <<'INNER'
-#!/usr/bin/env bash
-set -euo pipefail
-pacman-key --init
-pacman-key --populate archlinux
-pacman -Syu --noconfirm --needed rust clang llvm lld cuda git tar
-ldconfig
-cd /work
+echo "== worker: install user-local LLVM =="
+curl -fsSL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvm_version}/$llvm_archive" -o "$toolchains/$llvm_archive"
+printf '%s  %s\n' "$llvm_sha256" "$toolchains/$llvm_archive" | sha256sum -c -
+tar -xJf "$toolchains/$llvm_archive" -C "$toolchains"
+[ -x "$llvm_root/bin/clang" ] || { echo "user-local clang is absent" >&2; exit 1; }
+[ -x "$llvm_root/bin/ld.lld" ] || { echo "user-local ld.lld is absent" >&2; exit 1; }
+
+nvcc_path="$(command -v nvcc || true)"
+[ -n "$nvcc_path" ] || { echo "nvcc is absent from the Camber worker" >&2; exit 1; }
+nvcc_path="$(readlink -f "$nvcc_path")"
+cuda_root="$(cd "$(dirname "$nvcc_path")/.." && pwd -P)"
+cuda_device_library="$cuda_root/nvvm/libdevice/libdevice.10.bc"
+[ -f "$cuda_device_library" ] || { echo "CUDA libdevice is absent: $cuda_device_library" >&2; exit 1; }
+ldconfig -p | grep -q 'libcuda\.so\.1' || { echo "libcuda.so.1 is absent from the Camber worker" >&2; exit 1; }
+
+echo "== worker: patch extracted platform paths =="
+candidate_manifest="$work/Cargo.toml"
+[ -f "$candidate_manifest" ] || { echo "candidate Cargo.toml is absent" >&2; exit 1; }
+sed -i \
+	-e "s|cpu-compiler = { linux = \"/usr/bin/clang\"|cpu-compiler = { linux = \"$llvm_root/bin/clang\"|" \
+	-e "s|cpu-linker = { linux = \"/usr/bin/ld\"|cpu-linker = { linux = \"$llvm_root/bin/ld.lld\"|" \
+	-e 's|cpu-linker-driver = { linux = "ld"|cpu-linker-driver = { linux = "lld"|' \
+	-e "s|nvidia-compiler = { linux = \"/usr/bin/clang\"|nvidia-compiler = { linux = \"$llvm_root/bin/clang\"|" \
+	-e "s|nvidia-toolkit = { linux = \"/opt/cuda\"|nvidia-toolkit = { linux = \"$cuda_root\"|" \
+	"$candidate_manifest"
+grep -Fq "cpu-compiler = { linux = \"$llvm_root/bin/clang\"" "$candidate_manifest" || { echo "candidate CPU compiler path was not patched" >&2; exit 1; }
+grep -Fq "nvidia-compiler = { linux = \"$llvm_root/bin/clang\"" "$candidate_manifest" || { echo "candidate NVIDIA compiler path was not patched" >&2; exit 1; }
+grep -Fq "nvidia-toolkit = { linux = \"$cuda_root\"" "$candidate_manifest" || { echo "candidate CUDA root was not patched" >&2; exit 1; }
+
+cd "$work"
 echo "== worker: toolchain =="
 rustc --version
 cargo --version
-clang --version | head -1
+"$llvm_root/bin/clang" --version | head -1
+echo "CUDA root: $cuda_root"
 echo "== worker: build with the NVIDIA backend =="
-cargo build --release --lib --bin recipe
+if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" cargo build --release --lib --bin recipe; then
+	echo "the Camber worker build failed or reached its hard timeout" >&2
+	exit 1
+fi
 echo "== worker: execute the suite on nv0 =="
-mkdir -p /work/evidence /work/gpu-work
-RECIPE_SUITE_ROOT=/work/.github/runtime \
-RECIPE_SUITE_WORK=/work/gpu-work \
-RECIPE_EVIDENCE=/work/evidence/suite.json \
-  ./target/release/recipe --device nv0 .github/runtime/suite.rs 2>&1 | tee /work/run.log
-INNER
-chmod +x "$arch_root/root/run.sh"
-
-if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" sudo -n chroot "$arch_root" /bin/bash /root/run.sh; then
-	echo "the Camber worker command failed or reached its hard timeout" >&2
+mkdir -p "$work/evidence" "$work/gpu-work"
+if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" env \
+	RECIPE_SUITE_ROOT="$work/.github/runtime" \
+	RECIPE_SUITE_WORK="$work/gpu-work" \
+	RECIPE_EVIDENCE="$work/evidence/suite.json" \
+	"$work/target/release/recipe" --device nv0 "$work/.github/runtime/suite.rs" 2>&1 | tee "$work/run.log"; then
+	echo "the Camber worker suite failed or reached its hard timeout" >&2
 	exit 1
 fi
 mkdir -p "$root/evidence"
-cp -r "$arch_root/work/evidence/." "$root/evidence/"
-cp "$arch_root/work/run.log" "$root/evidence/worker-run.log"
+cp -r "$work/evidence/." "$root/evidence/"
+cp "$work/run.log" "$root/evidence/worker-run.log"
 
 route="$(awk '/^selected route / { print $3; exit }' "$root/evidence/worker-run.log")"
 device="${route##*:}"
@@ -250,7 +271,7 @@ cat > evidence/cell.json <<JSON
   "run_attempt": "${GITHUB_RUN_ATTEMPT:-unknown}",
   "provider": "camber",
   "camber_job_id": "$job_id",
-  "os": "archlinux rootfs on the Camber L4 worker",
+  "os": "Ubuntu 22.04 native userspace on the Camber L4 worker",
   "arch": "x86_64",
   "backend": "nvidia",
   "device": "$device",
