@@ -139,7 +139,7 @@ jobs:
           RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
           RECIPE_SUITE_WORK="$PWD/work" \
           RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
-            ./target/release/recipe .github/runtime/suite.rs | tee evidence/run.log
+            ./target/release/recipe .github/runtime/suite.rs 2>&1 | tee evidence/run.log
           grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
 
       - name: Assert the CPU backend actually executed
@@ -147,8 +147,15 @@ jobs:
         run: |
           set -euo pipefail
           # Recipe prints the route it selected; this is the fallback detector.
-          route="$(grep -m1 '^selected route ' evidence/run.log | awk '{print $3}')"
-          [ -n "$route" ] || { echo "no route line: the suite did not dispatch" >&2; exit 1; }
+          # One awk process rather than a pipeline, so pipefail cannot turn an
+          # early-exiting match into a step failure, and the behaviour is the
+          # same on the BSD and GNU userlands.
+          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          if [ -z "$route" ]; then
+            echo "no route line: the suite did not dispatch" >&2
+            tail -40 evidence/run.log >&2
+            exit 1
+          fi
           device="${route##*:}"
           [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
           grep -q '\.fp32 rows ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
@@ -587,7 +594,7 @@ jobs:
           RECIPE_SUITE_ROOT="$PWD/.github/runtime" \
           RECIPE_SUITE_WORK="$PWD/work" \
           RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
-            ./target/release/recipe .github/runtime/suite.rs | tee evidence/run.log
+            ./target/release/recipe .github/runtime/suite.rs 2>&1 | tee evidence/run.log
           grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
 
       - name: Assert the CPU backend actually executed
@@ -595,8 +602,15 @@ jobs:
         run: |
           set -euo pipefail
           # A Metal device being present must not turn this cell into a GPU cell.
-          route="$(grep -m1 '^selected route ' evidence/run.log | awk '{print $3}')"
-          [ -n "$route" ] || { echo "no route line: the suite did not dispatch" >&2; exit 1; }
+          # One awk process rather than a pipeline, so pipefail cannot turn an
+          # early-exiting match into a step failure, and the behaviour is the
+          # same on the BSD and GNU userlands.
+          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          if [ -z "$route" ]; then
+            echo "no route line: the suite did not dispatch" >&2
+            tail -40 evidence/run.log >&2
+            exit 1
+          fi
           device="${route##*:}"
           [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
           echo "device=$device" >> "$GITHUB_OUTPUT"

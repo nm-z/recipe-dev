@@ -105,7 +105,7 @@ mkdir -p /work/evidence /work/gpu-work
 RECIPE_SUITE_ROOT=/work/.github/runtime \
 RECIPE_SUITE_WORK=/work/gpu-work \
 RECIPE_EVIDENCE=/work/evidence/suite.json \
-  ./target/release/recipe --device nv0 .github/runtime/suite.rs | tee /work/run.log
+  ./target/release/recipe --device nv0 .github/runtime/suite.rs 2>&1 | tee /work/run.log
 INNER
 
 chroot "$arch_root" /bin/bash /root/run.sh
