@@ -4066,6 +4066,7 @@ mod bundle {
 			match character {
 				'\\' => text.push_str("\\\\"),
 				';' => text.push_str("\\s"),
+				'+' => text.push_str("\\j"),
 				',' => text.push_str("\\c"),
 				'|' => text.push_str("\\p"),
 				other => text.push(other),
@@ -4084,6 +4085,7 @@ mod bundle {
 			match characters.next() {
 				Some('\\') => text.push('\\'),
 				Some('s') => text.push(';'),
+				Some('j') => text.push('+'),
 				Some('c') => text.push(','),
 				Some('p') => text.push('|'),
 				other => return Err(RecipeError::new(format!("invalid branch escape {other:?}"))),
@@ -4092,10 +4094,13 @@ mod bundle {
 		Ok(text)
 	}
 	fn residual_text(value: &Residual) -> String {
-		escape(&block_text(&value.block))
+		escape(&value.blocks.iter().map(block_text).collect::<Vec<_>>().join("+"))
 	}
 	fn residual(value: &str) -> Result<Residual> {
-		block(&unescape(value)?).map(|block| Residual { block })
+		let text = unescape(value)?;
+		let blocks = text.split('+').map(block).collect::<Result<Vec<_>>>()?;
+		require(!blocks.is_empty(), "a model fragment holds no block")?;
+		Ok(Residual { blocks })
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -4830,32 +4835,37 @@ const CHAR_IDS: [char; 100] = [
 /// whatever the outer model sequence accepts, nested branches included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Residual {
-	block: Block,
+	blocks: Vec<Block>,
 }
 impl Residual {
 	fn of(operation: Operation) -> Self {
-		Self { block: Block { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false } }
+		Self { blocks: vec![Block { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false }] }
+	}
+	/// The block a chained selector applies to: the last one the fragment holds,
+	/// which is where the fragment's own output comes from.
+	fn last(&mut self) -> &mut Block {
+		self.blocks.last_mut().unwrap_or_else(|| panic!("a model fragment holds no block"))
 	}
 	/// The activation this step applies to its own output.
 	pub fn act(mut self, activation: Activation) -> Self {
-		self.block.activation = activation;
+		self.last().activation = activation;
 		self
 	}
 	/// The normalization this step applies to its own output.
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.block.normalization = Some(normalization.normalization());
+		self.last().normalization = Some(normalization.normalization());
 		self
 	}
 	/// The per-head normalization of an attention step's queries and keys.
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
-		if !matches!(self.block.operation, Operation::Attention(_)) {
+		if !matches!(self.last().operation, Operation::Attention(_)) {
 			panic!("query and key normalization requires an attention step");
 		}
 		let normalization = normalization.normalization();
 		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
 			panic!("query and key normalization must be rms or l2");
 		}
-		self.block.qk = Some(normalization);
+		self.last().qk = Some(normalization);
 		self
 	}
 }
@@ -4887,6 +4897,18 @@ pub fn lstm(width: usize) -> Residual {
 /// Named `normalize` because `norm` is the log metric of that name.
 pub fn normalize(normalization: impl NormalizationSelector) -> Residual {
 	Residual::of(Operation::Identity).norm(normalization)
+}
+impl From<&Model> for Residual {
+	/// Every block of the model, in order, as one step of a branch. This is what
+	/// lets a step be a model fragment rather than a single block.
+	fn from(model: &Model) -> Self {
+		Self { blocks: model.blocks.clone() }
+	}
+}
+impl From<Model> for Residual {
+	fn from(model: Model) -> Self {
+		Self { blocks: model.blocks }
+	}
 }
 /// A nested residual branch.
 pub fn res<const N: usize>(parts: [Residual; N]) -> Residual {
@@ -4990,7 +5012,7 @@ impl NormalizationSelector for L2 {
 }
 impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0).block.operation {
+		match self(0).blocks[0].operation {
 			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
@@ -6718,7 +6740,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
 	let convolutional = model.blocks.iter().any(|block| match &block.operation {
 		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.block.operation)),
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().flat_map(|part| &part.blocks).any(|block| sequenced_operation(&block.operation)),
 		_ => false,
 	});
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
@@ -7088,7 +7110,9 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 }
 fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
-	lower_block(graph, &value.block, total, data, targets, rows, gpu, config)?;
+	for block in &value.blocks {
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
 	Ok((graph.source, graph.output))
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
@@ -7190,7 +7214,7 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 fn sequenced_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.block.operation)),
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().flat_map(|part| &part.blocks).any(|block| sequenced_operation(&block.operation)),
 		_ => false,
 	}
 }
@@ -7200,7 +7224,9 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, total: usize
 	// Every step is an ordinary block, so a nested branch or mixture lowers
 	// through the same path the outer sequence takes.
 	for part in parts {
-		lower_block(graph, &part.block, total, data, targets, rows, gpu, config)?;
+		for block in &part.blocks {
+			lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+		}
 	}
 	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
 	let mut program = ScalarProgram(Vec::new());
