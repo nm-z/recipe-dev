@@ -43,7 +43,7 @@ jobs:
           awk '
             /^diff --git / { in_hunk=0; next }
             /^@@ / { in_hunk=1; next }
-            !in_hunk || /^--- / || /^\+\+\+ / || /^\\/ { next }
+            !in_hunk { next }
             /^\+/ { print substr($0, 2) }
           ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
 
