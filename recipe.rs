@@ -6886,7 +6886,7 @@ impl RatCommand {
 		let mut child = Command::new(&self.path)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
-			.stderr(Stdio::inherit())
+			.stderr(Stdio::piped())
 			.spawn()
 			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", self.path.display())))?;
 		let write = child
@@ -6896,8 +6896,11 @@ impl RatCommand {
 			.write_all(record.as_bytes())
 			.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())));
 		let output = child.wait_with_output().map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
+		if !output.status.success() || !output.stderr.is_empty() {
+			let error = if output.stderr.is_empty() { output.status.to_string() } else { String::from_utf8_lossy(&output.stderr).trim().to_owned() };
+			return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display())));
+		}
 		write?;
-		require(output.status.success(), format!("RAT evaluator {} exited with {}", self.path.display(), output.status))?;
 		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
 		let fields = stdout.split_ascii_whitespace().collect::<Vec<_>>();
 		require(fields.len() == 1, format!("RAT evaluator {} must write exactly one reward to stdout", self.path.display()))?;
@@ -14982,9 +14985,10 @@ impl Train {
 	/// its predictions in declared target order. Feature names use the loaded
 	/// schema's `table.column` names; expanded columns append a zero-based index.
 	/// Feature values use the same encoding and normalization as the proposer.
-	/// The executable writes exactly one finite reward in `[0, 1]` to stdout and may
-	/// write diagnostics to stderr. Return reward zero for a valid but unsupported
-	/// proposal. Recipe invokes the path directly without a shell.
+	/// The executable writes exactly one finite reward in `[0, 1]` to stdout.
+	/// Any stderr output or unsuccessful exit stops training, even with a score.
+	/// Return reward zero for a valid but unsupported proposal, without stderr.
+	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
 	/// Each sample's proposal is scored by the executable.
 	/// The data split selects measured proposals for surrogate fitting.
