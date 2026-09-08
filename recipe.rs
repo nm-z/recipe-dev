@@ -14009,9 +14009,13 @@ impl Train {
 		let mut rewards = evaluate(&initial_predictions)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - mean(&rewards);
-		let mut predictions = initial_predictions.clone();
 		let normalize = |values: &[f64]| values.iter().enumerate().map(|(index, value)| value / composition.scale[index % proposal_width]).collect::<Vec<_>>();
 		let mut observations = normalize(&initial_predictions);
+		let mut best_reward = mean(&rewards);
+		let mut best_predictions = initial_predictions.clone();
+		let mut best_parameters = composition.proposer.parameters.clone();
+		let mut best_bn_stats = tape.extract_bn_stats()?;
+		best_bn_stats.truncate(proposer_bn);
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -14031,23 +14035,29 @@ impl Train {
 			tape.advance()?;
 			let _ = tape.full_epoch(self.learning_rate, config)?;
 			tape.forward(None)?;
-			predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
+			let predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
 			let current = evaluate(&predictions)?;
 			observations.extend(normalize(&predictions));
 			rewards.extend_from_slice(&current);
-			let final_loss = 1.0 - mean(&current);
+			let reward = mean(&current);
+			if reward > best_reward {
+				best_reward = reward;
+				best_predictions.clone_from(&predictions);
+				best_parameters = tape.weights()?[..proposer_parameters].to_vec();
+				best_bn_stats = tape.extract_bn_stats()?;
+				best_bn_stats.truncate(proposer_bn);
+			}
+			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, run, tape.step as usize, self.epochs, final_loss, 0.0, seconds, false, false, &format!("reward {:.9}", mean(&current)))?;
+			self.print(model, run, tape.step as usize, self.epochs, final_loss, 0.0, seconds, false, false, &format!("reward {reward:.9}"))?;
 		}
-		let final_rewards = &rewards[rewards.len() - training_rows..];
-		let final_loss = 1.0 - mean(final_rewards);
+		let final_loss = 1.0 - best_reward;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
-		let mut bn_stats = tape.extract_bn_stats()?;
-		bn_stats.truncate(proposer_bn);
 		tape.capture(&mut composition.graph)?;
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
+		composition.proposer.parameters = best_parameters;
 		composition.proposer.state.training_rows = training_rows;
 		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..training_rows]);
 		composition.proposer.state.trained_samples.sort_unstable();
@@ -14056,14 +14066,14 @@ impl Train {
 			let mut proposer_model = model.clone();
 			proposer_model.downstream = None;
 			let mut stored = stored_graph(&composition.proposer, &proposer_model, data, None, config.precision, native_target_label(&gpu.native_target));
-			stored.bn_stats = bn_stats;
+			stored.bn_stats = best_bn_stats;
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
 		Ok(TrainingReport {
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions,
+			predictions: best_predictions,
 			r2: 0.0,
 			tile: selected_tile,
 			schedule,
