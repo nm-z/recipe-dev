@@ -186,6 +186,37 @@ for nsg in $orphan_nsgs; do
 	fi
 done
 
+echo "== deleting private transfer blobs =="
+if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ]; then
+	for blob in \
+		"runtime/windows/${RUN}-${ATTEMPT}/snapshot.tar.gz" \
+		"runtime/windows/${RUN}-${ATTEMPT}/runtime-suite.tar.gz"; do
+		if ! blob_exists="$(az storage blob exists \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--name "$blob" \
+			--query exists -o tsv --only-show-errors)"; then
+			echo "could not determine whether $blob exists" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ "$blob_exists" = "true" ]; then
+			echo "deleting $blob"
+			if ! az storage blob delete \
+				--auth-mode login \
+				--account-name "$AZURE_STORAGE_ACCOUNT" \
+				--container-name "$AZURE_STORAGE_CONTAINER" \
+				--name "$blob" \
+				--only-show-errors -o none; then
+				cleanup_status=1
+			fi
+		fi
+	done
+else
+	echo "storage transfer is not configured"
+fi
+
 echo "== residual resources for $WORKER =="
 residual="$(az resource list --resource-group "$GROUP" --query "[?starts_with(name,'$WORKER')].{name:name, type:type}" -o table --only-show-errors)" || {
 	echo "could not read back residual resources for $WORKER" >&2

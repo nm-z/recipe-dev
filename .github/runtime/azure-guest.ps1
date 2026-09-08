@@ -1,12 +1,14 @@
 param(
 	[Parameter(Mandatory = $true)] [string] $candidateSha,
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
-	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
+	[Parameter(Mandatory = $true)] [string] $snapshotUri,
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUri
 )
 
 # Runs inside the Windows GPU worker, invoked through managed Run Command. It
-# holds no cloud-management credential: everything it needs arrived with the
-# snapshot.
+# holds no cloud-management credential. The archive URLs are short-lived and
+# read-only.
 #
 # Every native command's exit code is checked immediately, so a later
 # successful command can never mask an earlier failing executable.
@@ -22,10 +24,14 @@ function Invoke-Native {
 
 function Invoke-Download {
 	param([string] $Uri, [string] $Destination, [string] $Sha256)
-	Write-Output "downloading $Uri"
-	Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+	Write-Output "downloading payload to $Destination"
+	try {
+		Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+	} catch {
+		throw "protected download failed for $Destination"
+	}
 	$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash.ToLowerInvariant()
-	if ($actual -ne $Sha256.ToLowerInvariant()) { throw "download checksum mismatch for ${Uri}: $actual != $Sha256" }
+	if ($actual -ne $Sha256.ToLowerInvariant()) { throw "download checksum mismatch for ${Destination}: $actual != $Sha256" }
 }
 
 function Install-Toolchain {
@@ -150,17 +156,15 @@ try {
 
 	Write-Output "== guest: verifying the snapshot =="
 	$archive = Join-Path $root "snapshot.tar.gz"
-	[IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String((Get-Content -Raw -LiteralPath (Join-Path $root "snapshot.b64"))))
+	Invoke-Download $snapshotUri $archive $snapshotSha256
 	$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
-	if ($actual -ne $snapshotSha256.ToLower()) { throw "snapshot checksum mismatch: $actual != $snapshotSha256" }
 	Write-Output "snapshot verified sha256=$actual"
 	Invoke-Native "tar.exe" @("-xzf", $archive, "-C", $work) "snapshot extraction"
 
 	$runtimeArchive = Join-Path $root "runtime-suite.tar.gz"
 	$runtime = Join-Path $root "trusted-runtime"
-	[IO.File]::WriteAllBytes($runtimeArchive, [Convert]::FromBase64String((Get-Content -Raw -LiteralPath (Join-Path $root "runtime-suite.b64"))))
+	Invoke-Download $runtimeSuiteUri $runtimeArchive $runtimeSuiteSha256
 	$runtimeActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $runtimeArchive).Hash.ToLower()
-	if ($runtimeActual -ne $runtimeSuiteSha256.ToLower()) { throw "trusted runtime checksum mismatch: $runtimeActual != $runtimeSuiteSha256" }
 	if ([IO.Directory]::Exists($runtime)) { Remove-Item -Recurse -Force -LiteralPath $runtime }
 	New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 	Invoke-Native "tar.exe" @("-xzf", $runtimeArchive, "-C", $runtime) "trusted runtime extraction"

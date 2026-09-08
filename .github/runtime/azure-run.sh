@@ -17,6 +17,8 @@ set -euo pipefail
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_ATTEMPT:?RUN_ATTEMPT is required}"
 : "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
+: "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT is required}"
+: "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER is required}"
 if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
 	echo "RUN_ID and RUN_ATTEMPT must be decimal workflow identifiers" >&2
 	exit 2
@@ -31,6 +33,9 @@ REQUIRED_CORES=4
 # One worker per run: two candidates must never share a mutable working directory.
 WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
 COMPUTER_NAME="rgpu$(printf '%s' "$WORKER" | sha256sum | cut -c1-11)"
+TRANSFER_ROOT="runtime/windows/${RUN_ID}-${RUN_ATTEMPT}"
+SNAPSHOT_BLOB="$TRANSFER_ROOT/snapshot.tar.gz"
+RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
 
 mkdir -p evidence
@@ -235,40 +240,59 @@ az vm extension set \
 echo "driver extension installed"
 
 echo "== transferring the immutable snapshot =="
-# The snapshot travels as base64 through the Run Command payload, so the guest
-# never needs network credentials or a clone of the newest commit.
+# Upload each archive once to the existing private container. The guest gets
+# only short-lived read URLs and never receives a cloud-management credential.
 [ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
 [ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
 tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
 runtime_sha256="$(sha256sum trusted-runtime.tar.gz | cut -d' ' -f1)"
-base64 -w0 "$SNAPSHOT" > snapshot.b64
-split -b 60000 snapshot.b64 snapshot-chunk-
-snapshot_chunks=(snapshot-chunk-*)
-base64 -w0 trusted-runtime.tar.gz > runtime-suite.b64
-split -b 60000 runtime-suite.b64 runtime-suite-chunk-
-runtime_chunks=(runtime-suite-chunk-*)
-echo "snapshot split into ${#snapshot_chunks[@]} chunks; trusted runtime split into ${#runtime_chunks[@]} chunks"
-
-az vm run-command invoke \
-	--resource-group "$GROUP" --name "$WORKER" \
-	--command-id RunPowerShellScript \
-	--scripts 'New-Item -ItemType Directory -Force -Path C:\recipe | Out-Null; Remove-Item -Force C:\recipe\snapshot.b64,C:\recipe\runtime-suite.b64 -ErrorAction SilentlyContinue; "staged"' \
-	--only-show-errors -o none
-
-for chunk in "${snapshot_chunks[@]}"; do
-	az vm run-command invoke \
-		--resource-group "$GROUP" --name "$WORKER" \
-		--command-id RunPowerShellScript \
-		--scripts "Add-Content -Path C:\\recipe\\snapshot.b64 -Value '$(cat "$chunk")' -NoNewline" \
-		--only-show-errors -o none
-done
-for chunk in "${runtime_chunks[@]}"; do
-	az vm run-command invoke \
-		--resource-group "$GROUP" --name "$WORKER" \
-		--command-id RunPowerShellScript \
-		--scripts "Add-Content -Path C:\\recipe\\runtime-suite.b64 -Value '$(cat "$chunk")' -NoNewline" \
-		--only-show-errors -o none
-done
+snapshot_actual="$(sha256sum "$SNAPSHOT" | cut -d' ' -f1)"
+[ "$snapshot_actual" = "$SNAPSHOT_SHA256" ] || { echo "snapshot checksum mismatch before upload" >&2; exit 1; }
+az storage blob upload \
+	--auth-mode login \
+	--account-name "$AZURE_STORAGE_ACCOUNT" \
+	--container-name "$AZURE_STORAGE_CONTAINER" \
+	--name "$SNAPSHOT_BLOB" \
+	--file "$SNAPSHOT" \
+	--overwrite false \
+	--metadata "recipe_worker=$WORKER" \
+	--only-show-errors --no-progress -o none
+az storage blob upload \
+	--auth-mode login \
+	--account-name "$AZURE_STORAGE_ACCOUNT" \
+	--container-name "$AZURE_STORAGE_CONTAINER" \
+	--name "$RUNTIME_BLOB" \
+	--file trusted-runtime.tar.gz \
+	--overwrite false \
+	--metadata "recipe_worker=$WORKER" \
+	--only-show-errors --no-progress -o none
+sas_start="$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+sas_expiry="$(date -u -d '2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+SNAPSHOT_URI="$(az storage blob generate-sas \
+	--auth-mode login --as-user --full-uri --https-only \
+	--account-name "$AZURE_STORAGE_ACCOUNT" \
+	--container-name "$AZURE_STORAGE_CONTAINER" \
+	--name "$SNAPSHOT_BLOB" \
+	--permissions r --start "$sas_start" --expiry "$sas_expiry" \
+	-o tsv --only-show-errors)"
+RUNTIME_URI="$(az storage blob generate-sas \
+	--auth-mode login --as-user --full-uri --https-only \
+	--account-name "$AZURE_STORAGE_ACCOUNT" \
+	--container-name "$AZURE_STORAGE_CONTAINER" \
+	--name "$RUNTIME_BLOB" \
+	--permissions r --start "$sas_start" --expiry "$sas_expiry" \
+	-o tsv --only-show-errors)"
+case "$SNAPSHOT_URI" in https://*\?*) ;; *) echo "snapshot read URL generation failed" >&2; exit 1 ;; esac
+case "$RUNTIME_URI" in https://*\?*) ;; *) echo "runtime read URL generation failed" >&2; exit 1 ;; esac
+if [ "$(curl --silent --fail --max-time 120 "$SNAPSHOT_URI" | sha256sum | cut -d' ' -f1)" != "$SNAPSHOT_SHA256" ]; then
+	echo "private snapshot download verification failed" >&2
+	exit 1
+fi
+if [ "$(curl --silent --fail --max-time 120 "$RUNTIME_URI" | sha256sum | cut -d' ' -f1)" != "$runtime_sha256" ]; then
+	echo "private runtime download verification failed" >&2
+	exit 1
+fi
+echo "uploaded and verified the private per-run archives"
 
 echo "== executing the native Windows GPU suite in the guest =="
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -288,7 +312,7 @@ az vm run-command invoke \
 	--resource-group "$GROUP" --name "$WORKER" \
 	--command-id RunPowerShellScript \
 	--scripts "@guest.ps1" \
-	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" \
+	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUri=$SNAPSHOT_URI" "runtimeSuiteUri=$RUNTIME_URI" \
 	--only-show-errors -o json > evidence/azure-runcommand.json
 elapsed=$(( $(date +%s) - started ))
 echo "run command returned after ${elapsed}s"
