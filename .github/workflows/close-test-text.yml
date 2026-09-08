@@ -1,8 +1,11 @@
-name: Close pull requests containing test text
+name: Pull request policy
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited, ready_for_review]
+  push:
+    branches:
+      - minimal
 
 permissions:
   contents: read
@@ -11,7 +14,7 @@ permissions:
 
 jobs:
   close:
-    if: github.event.pull_request.state == 'open'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
     steps:
       - name: Close a pull request containing test text
@@ -46,3 +49,117 @@ jobs:
           reason="Closed automatically because added content in this pull request's current diff contains the banned whole word \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
           gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
+
+  require-minimal-base:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require minimal as the pull request base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$BASE_REF" == 'minimal' ]]; then
+            exit 0
+          fi
+
+          marker='<!-- recipe-minimal-base-policy -->'
+          reason="$marker
+          Development pull requests must target \`minimal\`. This pull request targets \`$BASE_REF\`. Rebase or restack the branch as needed, then change the base. Automation does not retarget branches."
+
+          comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[] | .body // ""')"
+          if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
+            gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+          fi
+
+          printf 'Development pull requests must target minimal; found %s.\n' "$BASE_REF"
+          exit 1
+
+  draft-conflicts:
+    if: github.event_name == 'push' || github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Convert conflicting pull requests to draft
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            mapfile -t pr_numbers < <(
+              gh pr list \
+                --repo "$REPOSITORY" \
+                --state open \
+                --base minimal \
+                --limit 1000 \
+                --json number \
+                --jq '.[].number'
+            )
+          elif [[ "$EVENT_BASE_REF" == 'minimal' ]]; then
+            pr_numbers=("$EVENT_PR_NUMBER")
+          else
+            exit 0
+          fi
+
+          marker='<!-- recipe-merge-conflict-policy -->'
+          for pr_number in "${pr_numbers[@]}"; do
+            mergeable='unknown'
+            draft='false'
+
+            for attempt in 1 2 3 4 5; do
+              pull_request="$(gh api "repos/$REPOSITORY/pulls/$pr_number")"
+              state="$(jq --raw-output '.state' <<< "$pull_request")"
+              base_ref="$(jq --raw-output '.base.ref' <<< "$pull_request")"
+              draft="$(jq --raw-output '.draft' <<< "$pull_request")"
+              mergeable="$(jq --raw-output '
+                if .mergeable == null then "unknown"
+                elif .mergeable then "mergeable"
+                else "conflicting"
+                end
+              ' <<< "$pull_request")"
+
+              if [[ "$state" != 'open' || "$base_ref" != 'minimal' || "$mergeable" != 'unknown' ]]; then
+                break
+              fi
+
+              if (( attempt < 5 )); then
+                sleep $((attempt * 2))
+              fi
+            done
+
+            if [[ "$state" != 'open' || "$base_ref" != 'minimal' ]]; then
+              continue
+            fi
+
+            if [[ "$mergeable" == 'unknown' ]]; then
+              printf 'GitHub still reports mergeability as unknown for PR %s; deferring.\n' "$pr_number"
+              continue
+            fi
+
+            if [[ "$mergeable" == 'mergeable' ]]; then
+              continue
+            fi
+
+            if [[ "$draft" != 'true' ]]; then
+              gh pr ready "$pr_number" --repo "$REPOSITORY" --undo
+            fi
+
+            reason="$marker
+            GitHub currently reports conflicts with \`minimal\`. This pull request is draft until the branch is resolved. Mark it ready manually after GitHub reports it mergeable."
+            comments="$(gh api --paginate "repos/$REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '.[] | .body // ""')"
+            if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
+              gh api -X POST "repos/$REPOSITORY/issues/$pr_number/comments" -f body="$reason"
+            fi
+          done
