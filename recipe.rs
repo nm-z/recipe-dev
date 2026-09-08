@@ -10966,11 +10966,12 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					offset = start + bytes;
 				}
 				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-				let implicit_bytes = dispatch
-					.kernel
-					.kernarg
-					.checked_sub(implicit)
-					.ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?;
+				let implicit_bytes = if dispatch.kernel.kernarg == offset {
+					0
+				} else {
+					dispatch.kernel.kernarg.checked_sub(implicit)
+						.ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?
+				};
 				require(
 					matches!(implicit_bytes, 0 | HSA_IMPLICIT_ARGUMENT_BYTES) && dispatch.kernel.kernarg <= program.kernarg_size,
 					format!(
@@ -15159,7 +15160,7 @@ impl Train {
 			let samples = &samples[..rows * proposal_width];
 			let targets = &targets[..rows];
 			let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(composition.loss), None, None)?;
-			let steps = checked_mul(config.surrogate_epochs, 16, "RAT evaluator convergence steps")?;
+			let steps = checked_mul(config.surrogate_epochs, 128, "RAT evaluator convergence steps")?;
 			let mut r2 = f64::NEG_INFINITY;
 			for step in 0..steps {
 				tape.advance()?;
@@ -15290,6 +15291,10 @@ impl Train {
 		if let Some(path) = &self.save {
 			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, data, None, config.precision, native_target_label(&gpu.native_target));
 			stored.bn_stats = best_bn_stats;
+			stored.norm_mean.clone_from(&prepared.norm_mean);
+			stored.norm_scale.clone_from(&prepared.norm_scale);
+			stored.outputs.clone_from(&data.target);
+			stored.artifact = bundle::artifact_key(&composition.storage_model, &prepared.schema, config.precision, &composition.proposer, native_target_label(&gpu.native_target));
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
 		Ok(TrainingReport {
