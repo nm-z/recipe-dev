@@ -6917,7 +6917,6 @@ struct CommandRatComposition {
 	loss: LossFunction,
 	proposal: usize,
 	offset: usize,
-	proposal_bias: usize,
 }
 fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
@@ -6925,7 +6924,6 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	let mut proposer_model = model.clone();
 	proposer_model.downstream = None;
 	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
-	let proposal_bias = output_bias_offset(&proposer).ok_or_else(|| RecipeError::new("RAT requires a linear output projection"))?;
 	proposer.refresh_storage(config)?;
 	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
 	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
@@ -6937,7 +6935,7 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	append_graph(&mut graph, evaluator.clone())?;
 	graph.frozen[offset..].fill(1);
 	graph.refresh_storage(config)?;
-	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset, proposal_bias })
+	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset })
 }
 /// Scores each decision in the coordinates used to fit the bench model.
 /// Frozen projections carry the measured configuration and replace only the
@@ -14991,6 +14989,8 @@ impl Train {
 	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
 	/// Each sample's proposal is scored by the executable.
+	/// Recipe scores the initial proposals and each epoch's updated proposals once.
+	/// It does not generate additional search or validation proposals.
 	/// The data split selects measured proposals for surrogate fitting.
 	pub fn rat(mut self, command: impl AsRef<Path>) -> Self {
 		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")) });
@@ -15131,32 +15131,13 @@ impl Train {
 		let rewards = evaluate(&initial_predictions)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - mean(&rewards);
-		let observations = initial_predictions.clone();
-		let mut evaluation_samples = observations.clone();
+		let mut evaluation_samples = initial_predictions.clone();
 		let mut evaluation_targets = rewards.clone();
 		let mut best_reward = mean(&rewards);
 		let mut best_predictions = initial_predictions.clone();
 		let mut best_parameters = composition.proposer.parameters.clone();
 		let mut best_bn_stats = tape.extract_bn_stats()?;
 		best_bn_stats.truncate(proposer_bn);
-		for channel in 0..proposal_width {
-			for direction in [-0.01, 0.01] {
-				let mut probe = initial_predictions.clone();
-				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction;
-				}
-				let probe_rewards = evaluate(&probe)?;
-				let reward = mean(&probe_rewards);
-				if reward > best_reward {
-					best_reward = reward;
-					best_predictions.clone_from(&probe);
-					best_parameters.clone_from(&composition.proposer.parameters);
-					best_parameters[composition.proposal_bias + channel] += direction;
-				}
-				evaluation_samples.extend(probe.clone());
-				evaluation_targets.extend(probe_rewards);
-			}
-		}
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let fit_evaluator = |graph: &mut Graph, samples: &[f64], targets: &[f64]| -> Result<f64> {
@@ -15164,26 +15145,18 @@ impl Train {
 			let samples = &samples[..rows * proposal_width];
 			let targets = &targets[..rows];
 			let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(composition.loss), None, None)?;
-			let steps = checked_mul(config.surrogate_epochs, 128, "RAT evaluator convergence steps")?;
-			let mut r2 = f64::NEG_INFINITY;
-			for step in 0..steps {
+			for _ in 0..config.surrogate_epochs {
 				tape.advance()?;
 				tape.full_epoch(config.surrogate_rate, config)?;
-				if (step + 1) % config.surrogate_epochs == 0 {
-					tape.forward(ForwardMode::Inference)?;
-					let predictions = tape.predictions()?;
-					r2 = coefficient(targets, &predictions);
-					if r2 >= 0.99999 {
-						break;
-					}
-				}
 			}
+			tape.forward(ForwardMode::Inference)?;
+			let r2 = coefficient(targets, &tape.predictions()?);
 			tape.capture(graph)?;
 			Ok(r2)
 		};
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
 		let mut epoch_seconds = 0.0;
-		for iteration in 0..self.epochs {
+		for _ in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				return Err(RecipeError::new("interrupted"));
 			}
@@ -15207,57 +15180,12 @@ impl Train {
 				best_bn_stats = tape.extract_bn_stats()?;
 				best_bn_stats.truncate(proposer_bn);
 			}
-			let observations = predictions.clone();
-			evaluation_samples.extend_from_slice(&observations);
+			evaluation_samples.extend_from_slice(&predictions);
 			evaluation_targets.extend_from_slice(&current);
-			let channel = iteration % proposal_width;
-			let radius = 0.01 / ((iteration + 1) as f64).sqrt();
-			for direction in [-1.0, 1.0] {
-				let mut probe = predictions.clone();
-				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * radius;
-				}
-				let probe_samples = probe.clone();
-				let probe_rewards = evaluate(&probe)?;
-				let reward = mean(&probe_rewards);
-				if reward > best_reward {
-					best_reward = reward;
-					best_predictions.clone_from(&probe);
-					best_parameters = tape.weights()?[..proposer_parameters].to_vec();
-					best_parameters[composition.proposal_bias + channel] += direction * radius;
-					best_bn_stats = tape.extract_bn_stats()?;
-					best_bn_stats.truncate(proposer_bn);
-				}
-				evaluation_samples.extend(probe_samples);
-				evaluation_targets.extend(probe_rewards);
-			}
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
 			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &format!("reward {reward:.9}"))?;
-		}
-		let refinement_radius = 0.0025;
-		let refinement_center = best_predictions.clone();
-		let refinement_parameters = best_parameters.clone();
-		let refinement_bn_stats = best_bn_stats.clone();
-		for channel in 0..proposal_width {
-			for direction in [-1.0, 1.0] {
-				let mut probe = refinement_center.clone();
-				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * refinement_radius;
-				}
-				let probe_rewards = evaluate(&probe)?;
-				let reward = mean(&probe_rewards);
-				if reward > best_reward {
-					best_reward = reward;
-					best_predictions.clone_from(&probe);
-					best_parameters.clone_from(&refinement_parameters);
-					best_parameters[composition.proposal_bias + channel] += direction * refinement_radius;
-					best_bn_stats.clone_from(&refinement_bn_stats);
-				}
-				evaluation_samples.extend(probe.clone());
-				evaluation_targets.extend(probe_rewards);
-			}
 		}
 		fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
 		let score = |samples: &[f64]| -> Result<Vec<f64>> {
@@ -15267,21 +15195,8 @@ impl Train {
 		let evaluator_predictions = score(&evaluation_samples)?;
 		let fitted_rows = ((evaluation_targets.len() as f64 * data.split).floor() as usize).max(1);
 		let evaluator_r2 = coefficient(&evaluation_targets[..fitted_rows], &evaluator_predictions[..fitted_rows]);
-		let predicted_reward = mean(&score(&best_predictions.clone())?);
-		let mut validation_predictions = evaluator_predictions[fitted_rows..].to_vec();
-		let mut validation_targets = evaluation_targets[fitted_rows..].to_vec();
-		let validation_radius = refinement_radius / 2.0;
-		for channel in 0..proposal_width {
-			for direction in [-1.0, 1.0] {
-				let mut probe = best_predictions.clone();
-				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * validation_radius;
-				}
-				validation_predictions.extend(score(&probe.clone())?);
-				validation_targets.extend(evaluate(&probe)?);
-			}
-		}
-		let validation_r2 = coefficient(&validation_targets, &validation_predictions);
+		let predicted_reward = mean(&score(&best_predictions)?);
+		let validation_r2 = (fitted_rows < evaluation_targets.len()).then(|| coefficient(&evaluation_targets[fitted_rows..], &evaluator_predictions[fitted_rows..]));
 		let final_loss = 1.0 - best_reward;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
@@ -15308,7 +15223,7 @@ impl Train {
 			predictions: best_predictions,
 			r2: f64::NAN,
 			evaluator_r2: Some(evaluator_r2),
-			validation_r2: Some(validation_r2),
+			validation_r2,
 			predicted_reward: Some(predicted_reward),
 			measured_reward: Some(best_reward),
 			tile: selected_tile,
@@ -15717,7 +15632,7 @@ impl TrainingReport {
 	pub const fn evaluator_r2(&self) -> Option<f64> {
 		self.evaluator_r2
 	}
-	/// Returns R² over local RAT proposals withheld from evaluator fitting.
+	/// Returns R² over measured proposals withheld from evaluator fitting, if any.
 	pub const fn validation_r2(&self) -> Option<f64> {
 		self.validation_r2
 	}
