@@ -6874,12 +6874,13 @@ struct RatCommand {
 }
 impl RatCommand {
 	fn evaluate(&self, names: &[String], proposal: &[f64]) -> Result<f64> {
-		require(!names.is_empty(), "RAT requires at least one named target")?;
-		require(names.len() == proposal.len(), format!("RAT evaluator expected {} proposed values, received {}", names.len(), proposal.len()))?;
+		require(!names.is_empty(), "RAT requires named inputs")?;
+		require(names.len() == proposal.len(), format!("RAT evaluator expected {} values, received {}", names.len(), proposal.len()))?;
+		require(names.iter().collect::<BTreeSet<_>>().len() == names.len(), "RAT feature and target names must be distinct")?;
 		for name in names {
-			require(!name.is_empty() && !name.bytes().any(|byte| matches!(byte, b',' | b'=' | b'\r' | b'\n')), format!("RAT target name {name:?} cannot be encoded"))?;
+			require(!name.is_empty() && !name.bytes().any(|byte| matches!(byte, b',' | b'=' | b'\r' | b'\n')), format!("RAT input name {name:?} cannot be encoded"))?;
 		}
-		require(proposal.iter().all(|value| value.is_finite()), "RAT proposal contains a nonfinite value")?;
+		require(proposal.iter().all(|value| value.is_finite()), "RAT input contains a nonfinite value")?;
 		let mut record = names.iter().zip(proposal).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",");
 		record.push('\n');
 		let mut child = Command::new(&self.path)
@@ -14976,8 +14977,11 @@ impl Compute {
 }
 impl Train {
 	/// Evaluates RAT proposals with an executable. For each proposal, Recipe
-	/// writes one `name=value,...` record to stdin in declared target order. The
-	/// executable writes exactly one finite reward in `[0, 1]` to stdout and may
+	/// writes one `name=value,...` record to stdin: the sample's features, then
+	/// its predictions in declared target order. Feature names use the loaded
+	/// schema's `table.column` names; expanded columns append a zero-based index.
+	/// Feature values use the same encoding and normalization as the proposer.
+	/// The executable writes exactly one finite reward in `[0, 1]` to stdout and may
 	/// write diagnostics to stderr. Return reward zero for a valid but unsupported
 	/// proposal. Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
@@ -15085,6 +15089,16 @@ impl Train {
 		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
+		let mut input_names = Vec::new();
+		for (_, field) in prepared.schema.iter().filter(|(kind, _)| kind == "feature") {
+			let (width, name) = field.split_once(' ').ok_or_else(|| RecipeError::new("RAT feature schema has no width"))?;
+			let width = width.parse::<usize>().map_err(|_| RecipeError::new("RAT feature schema has an invalid width"))?;
+			for index in 0..width {
+				input_names.push(if width == 1 { name.to_owned() } else { format!("{name}.{index}") });
+			}
+		}
+		require(input_names.len() == prepared.features, "RAT feature names do not match the sample width")?;
+		input_names.extend_from_slice(&data.target);
 		let source_rows = training_rows;
 		let proposals = Prepared::matrix(
 			prepared.samples[..training_rows * prepared.features].to_vec(),
@@ -15104,7 +15118,10 @@ impl Train {
 		let initial_predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
 		let evaluate = |proposals: &[f64]| -> Result<Vec<f64>> {
 			require(proposals.len() == training_rows * proposal_width, "RAT proposal batch has the wrong shape")?;
-			proposals.chunks_exact(proposal_width).map(|proposal| command.evaluate(&data.target, proposal)).collect()
+			proposals.chunks_exact(proposal_width).zip(samples.chunks_exact(prepared.features)).map(|(proposal, sample)| {
+				let values = sample.iter().chain(proposal).copied().collect::<Vec<_>>();
+				command.evaluate(&input_names, &values)
+			}).collect()
 		};
 		let rewards = evaluate(&initial_predictions)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
