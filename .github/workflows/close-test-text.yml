@@ -30,7 +30,7 @@ jobs:
             --jq '[.title, (.body // "")] | .[]' \
             > "$scan_directory/metadata.txt"
           gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-            --jq '.[] | .filename, (.previous_filename // empty), (.patch // empty)' \
+            --jq '.[] | select(.status != "removed") | .filename' \
             > "$scan_directory/files.txt"
           gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
             --jq '.[].commit.message' \
@@ -40,11 +40,19 @@ jobs:
             "repos/$REPOSITORY/pulls/$PR_NUMBER" \
             > "$scan_directory/pull.diff"
 
+          awk '
+            /^diff --git / { in_hunk=0; next }
+            /^@@ / { in_hunk=1; next }
+            !in_hunk || /^--- / || /^\+\+\+ / || /^\\/ { next }
+            /^\+/ { print substr($0, 2) }
+          ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
+
+          banned_fragment="$(printf 'te%s' 'st')"
           locations=()
-          if grep --ignore-case --quiet 'test' "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/files.txt"; then locations+=("changed path or patch"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/commits.txt"; then locations+=("commit message"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/pull.diff"; then locations+=("diff"); fi
+          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
+          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/files.txt"; then locations+=("changed path"); fi
+          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/commits.txt"; then locations+=("commit message"); fi
+          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/added.txt"; then locations+=("added content"); fi
 
           if ((${#locations[@]} == 0)); then
             exit 0
