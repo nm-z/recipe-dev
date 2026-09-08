@@ -6384,7 +6384,10 @@ pub const norm: Metric = Metric(7);
 pub const tok: Metric = Metric(8);
 pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
-pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+/// All progress fields except the native tile schedule.
+pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
+/// All progress fields, including the native tile schedule.
+pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
