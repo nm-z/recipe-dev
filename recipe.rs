@@ -6467,104 +6467,34 @@ struct CommandRatComposition {
 	proposal: usize,
 	offset: usize,
 	proposal_bias: usize,
-	evaluator_bias: usize,
-	center: Vec<f64>,
-	scale: Vec<f64>,
-}
-fn same_model_graph(left: &Graph, right: &Graph) -> bool {
-	left.input == right.input
-		&& left.output == right.output
-		&& left.source == right.source
-		&& left.programs == right.programs
-		&& left.nodes.len() == right.nodes.len()
-		&& left.nodes.iter().zip(&right.nodes).all(|(left, right)| {
-			left.op == right.op
-				&& left.source == right.source
-				&& left.second == right.second
-				&& left.input == right.input
-				&& left.output == right.output
-				&& left.offset == right.offset
-				&& left.parameters == right.parameters
-				&& left.argument == right.argument
-				&& left.program_offset == right.program_offset
-				&& left.program_count == right.program_count
-		})
 }
 fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
 	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
-	require(evaluator_model.blocks.iter().all(|block| block.normalization.is_none()), "a RAT evaluator cannot contain normalization")?;
 	let mut proposer_model = model.clone();
 	proposer_model.downstream = None;
-	let means = (0..prepared.target_width)
-		.map(|channel| prepared.targets[..rows * prepared.target_width].iter().skip(channel).step_by(prepared.target_width).sum::<f64>() / rows as f64)
-		.collect::<Vec<_>>();
-	let scale = means.iter().map(|value| if value.abs() < 0.000001 { 1.0 } else { value.abs() }).collect::<Vec<_>>();
-	let normalized_targets = prepared.targets.iter().enumerate().map(|(index, value)| value / scale[index % prepared.target_width]).collect::<Vec<_>>();
-	let normalized = Prepared::matrix(prepared.samples.clone(), normalized_targets, prepared.rows, prepared.target_width)?;
-	let mut proposer = compile(&proposer_model, &normalized, &normalized.targets, rows, gpu, config, true)?;
-	if let Some(offset) = output_bias_offset(&proposer) {
-		for (channel, mean) in means.iter().enumerate() {
-			proposer.parameters[offset + channel] = mean / scale[channel];
-		}
-	}
-	let scale_offset = proposer.parameters.len();
-	lower_project(&mut proposer, prepared.target_width)?;
-	let node = proposer.nodes.last().unwrap();
-	for (channel, value) in scale.iter().enumerate() {
-		proposer.parameters[node.offset + channel * prepared.target_width + channel] = *value;
-	}
-	proposer.frozen[scale_offset..].fill(1);
-	let proposal_bias = output_bias_offset(&proposer).ok_or_else(|| RecipeError::new("RAT proposal decoder has no bias"))?;
+	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
+	// A corpus-wide objective has one shared proposal. Freeze the input
+	// coefficients so every source row receives the same learned values.
+	let first = proposer.nodes.first().ok_or_else(|| RecipeError::new("RAT requires a proposal layer"))?;
+	require(first.op == Primitive::Contraction && first.source == -1, "a shared RAT proposal must start with a linear layer")?;
+	require(proposer.nodes.iter().skip(1).all(|node| node.source >= 0 && node.second != -1), "a shared RAT proposal cannot bypass its first layer")?;
+	let end = first.offset + first.parameters - first.output.channels;
+	proposer.parameters[first.offset..end].fill(0.0);
+	proposer.frozen[first.offset..end].fill(1);
+	let proposal_bias = output_bias_offset(&proposer).ok_or_else(|| RecipeError::new("RAT requires a linear output projection"))?;
 	proposer.refresh_storage(config)?;
-	let decoder = Block { operation: Operation::Layer(prepared.target_width), activation: Activation::Linear, normalization: None, quantization: 0, profile: false };
-	let mut direct_model = proposer_model.clone();
-	direct_model.blocks.push(decoder.clone());
-	let direct_graph = compile(&direct_model, &normalized, &normalized.targets, rows, gpu, config, false)?;
-	let storage_model = if same_model_graph(&proposer, &direct_graph) {
-		direct_model
-	} else {
-		let projection = &proposer.nodes[proposer.nodes.len() - 2];
-		require(projection.op == Primitive::Contraction && projection.argument[0] >= 1.0 && projection.argument[0].fract() == 0.0, "RAT proposal output projection cannot be stored")?;
-		let mut projected_model = proposer_model.clone();
-		projected_model.blocks.push(Block {
-			operation: Operation::Conv(prepared.target_width, projection.argument[0] as usize),
-			activation: Activation::Linear,
-			normalization: None,
-			quantization: proposer_model.quantization,
-			profile: StorageFormat(proposer_model.quantization).selection().is_some(),
-		});
-		projected_model.blocks.push(decoder);
-		let projected_graph = compile(&projected_model, &normalized, &normalized.targets, rows, gpu, config, false)?;
-		require(same_model_graph(&proposer, &projected_graph), "RAT proposal output projection cannot be reconstructed")?;
-		projected_model
-	};
 	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
-	let mut evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
+	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
 	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
-	require(proposer.output == evaluator.input, format!("RAT evaluator input has {} values, but the proposal has {}", evaluator.input.elements(), proposer.output.elements()))?;
-	let calibration_offset = evaluator.parameters.len();
-	lower_project(&mut evaluator, 1)?;
-	let calibration = evaluator.nodes.last().unwrap();
-	evaluator.parameters[calibration.offset] = 1.0;
-	evaluator.frozen[calibration_offset..].fill(1);
-	let evaluator_bias = output_bias_offset(&evaluator).ok_or_else(|| RecipeError::new("RAT evaluator calibration has no bias"))?;
-	evaluator.refresh_storage(config)?;
+	require(proposer.output == evaluator.input, "RAT proposal and evaluator shapes differ")?;
 	let proposal = proposer.nodes.len() - 1;
 	let mut graph = proposer.clone();
-	let scale_offset = graph.parameters.len();
-	lower_project(&mut graph, prepared.target_width)?;
-	let node = graph.nodes.last().unwrap();
-	for (channel, value) in scale.iter().enumerate() {
-		graph.parameters[node.offset + channel * prepared.target_width + channel] = value.recip();
-		graph.parameters[node.offset + prepared.target_width * prepared.target_width + channel] = -means[channel] / value;
-	}
-	graph.frozen[scale_offset..].fill(1);
 	let offset = graph.parameters.len();
 	append_graph(&mut graph, evaluator.clone())?;
 	graph.frozen[offset..].fill(1);
 	graph.refresh_storage(config)?;
-	Ok(CommandRatComposition { graph, proposer, storage_model, evaluator, loss: evaluator_model.loss, proposal, offset, proposal_bias, evaluator_bias, center: means, scale })
+	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset, proposal_bias })
 }
 /// Scores each decision in the coordinates used to fit the bench model.
 /// Frozen projections carry the measured configuration and replace only the
@@ -11932,6 +11862,23 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 		Err(error) => Err(error.clone()),
 	}
 }
+/// Command rewards supervise the proposal. Declared outputs name unknown
+/// values and do not select labeled columns from the source tables.
+fn prepare_command_data(data: &Data) -> Result<Prepared> {
+	require(data.trial.is_none() && !data.autoregressive, "command RAT requires tabular observations")?;
+	require(!data.target.is_empty(), "command RAT requires named proposal outputs")?;
+	let mut observations = Recipe::prepared_data(data.sources.clone(), false, None);
+	observations.tests.clone_from(&data.tests);
+	observations.exclusions.clone_from(&data.exclusions);
+	observations.broadcast = data.broadcast;
+	observations.normalize = data.normalize;
+	observations.split = 1.0;
+	let mut prepared = prepare_data(&observations)?;
+	prepared.target_width = data.target.len();
+	prepared.targets.clear();
+	prepared.schema.extend(data.target.iter().cloned().map(|name| ("target".to_owned(), name)));
+	Ok(prepared)
+}
 /// One sampled workload, drawn once from the caller's generator. Every table
 /// setting names a file or column a generator does not have, so each is an
 /// error here rather than a value this quietly ignores.
@@ -13959,6 +13906,9 @@ impl Train {
 	/// executable writes exactly one finite reward in `[0, 1]` to stdout and may
 	/// write diagnostics to stderr. Return reward zero for a valid but unsupported
 	/// proposal. Recipe invokes the path directly without a shell.
+	/// Targets declare unknown output names, without labeled source columns.
+	/// One shared proposal is scored against the executable's observations.
+	/// The data split selects measured proposals for surrogate fitting.
 	pub fn rat(mut self, command: impl AsRef<Path>) -> Self {
 		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")) });
 		self
@@ -14046,7 +13996,7 @@ impl Train {
 	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport {
 		let evaluation = data.split < 1.0 || !data.tests.is_empty();
 		let report = self.execute(model, data, evaluation);
-		if evaluation {
+		if evaluation && self.rat.is_none() {
 			self.print_evaluation(model, &report)
 		}
 		report
@@ -14054,15 +14004,18 @@ impl Train {
 	fn try_run_rat(
 		&self, model: &Model, data: &Data, prepared: &Prepared, training_rows: usize, command: &RatCommand, gpu: &'static Gpu, config: Config, started: Instant,
 	) -> Result<TrainingReport> {
+		require(data.split.is_finite() && data.split > 0.0 && data.split <= 1.0, "RAT split must be greater than zero and at most one")?;
 		require(data.trial.is_none(), "a command RAT run requires tabular data")?;
 		require(!data.autoregressive, "a command RAT run requires named numeric targets")?;
 		require(self.resume.is_none(), "a command RAT run does not support .resume()")?;
-		require(training_rows == prepared.rows, "a command RAT run does not support held-out data")?;
 		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
-		let samples = &prepared.samples[..training_rows * prepared.features];
-		let mut composition = command_rat_graph(model, prepared, training_rows, gpu, config)?;
+		let source_rows = training_rows;
+		let training_rows = 1;
+		let proposals = Prepared::matrix(vec![0.0; prepared.features], vec![0.0; proposal_width], 1, proposal_width)?;
+		let samples = &proposals.samples;
+		let mut composition = command_rat_graph(model, &proposals, training_rows, gpu, config)?;
 		composition.graph.state.training_rows = training_rows;
 		composition.proposer.state.training_rows = training_rows;
 		let proposer_parameters = composition.proposer.parameters.len();
@@ -14078,17 +14031,7 @@ impl Train {
 		let rewards = evaluate(&initial_predictions)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - mean(&rewards);
-		let normalize = |values: &[f64]| {
-			values
-				.iter()
-				.enumerate()
-				.map(|(index, value)| {
-					let channel = index % proposal_width;
-					(value - composition.center[channel]) / composition.scale[channel]
-				})
-				.collect::<Vec<_>>()
-		};
-		let observations = normalize(&initial_predictions);
+		let observations = initial_predictions.clone();
 		let mut evaluation_samples = observations.clone();
 		let mut evaluation_targets = rewards.clone();
 		let mut best_reward = mean(&rewards);
@@ -14100,7 +14043,7 @@ impl Train {
 			for direction in [-0.01, 0.01] {
 				let mut probe = initial_predictions.clone();
 				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * composition.scale[channel];
+					probe[row * proposal_width + channel] += direction;
 				}
 				let probe_rewards = evaluate(&probe)?;
 				let reward = mean(&probe_rewards);
@@ -14108,17 +14051,20 @@ impl Train {
 					best_reward = reward;
 					best_predictions.clone_from(&probe);
 					best_parameters.clone_from(&composition.proposer.parameters);
-					best_parameters[composition.proposal_bias + channel] += direction * composition.scale[channel];
+					best_parameters[composition.proposal_bias + channel] += direction;
 				}
-				evaluation_samples.extend(normalize(&probe));
+				evaluation_samples.extend(probe.clone());
 				evaluation_targets.extend(probe_rewards);
 			}
 		}
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let fit_evaluator = |graph: &mut Graph, samples: &[f64], targets: &[f64]| -> Result<f64> {
+			let rows = ((targets.len() as f64 * data.split).floor() as usize).max(1);
+			let samples = &samples[..rows * proposal_width];
+			let targets = &targets[..rows];
 			let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(composition.loss), None, None)?;
-			let steps = checked_mul(checked_mul(config.surrogate_epochs, targets.len(), "RAT evaluator steps")?, 16, "RAT evaluator convergence steps")?;
+			let steps = checked_mul(config.surrogate_epochs, 16, "RAT evaluator convergence steps")?;
 			let mut r2 = f64::NEG_INFINITY;
 			for step in 0..steps {
 				tape.advance()?;
@@ -14142,7 +14088,7 @@ impl Train {
 				return Err(RecipeError::new("interrupted"));
 			}
 			let epoch_started = Instant::now();
-			fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
+			let evaluator_r2 = fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
 			tape.weights.write_float_bytes(
 				checked_mul(composition.offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?,
 				&composition.evaluator.parameters,
@@ -14161,7 +14107,7 @@ impl Train {
 				best_bn_stats = tape.extract_bn_stats()?;
 				best_bn_stats.truncate(proposer_bn);
 			}
-			let observations = normalize(&predictions);
+			let observations = predictions.clone();
 			evaluation_samples.extend_from_slice(&observations);
 			evaluation_targets.extend_from_slice(&current);
 			let channel = iteration % proposal_width;
@@ -14169,16 +14115,16 @@ impl Train {
 			for direction in [-1.0, 1.0] {
 				let mut probe = predictions.clone();
 				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * radius * composition.scale[channel];
+					probe[row * proposal_width + channel] += direction * radius;
 				}
-				let probe_samples = normalize(&probe);
+				let probe_samples = probe.clone();
 				let probe_rewards = evaluate(&probe)?;
 				let reward = mean(&probe_rewards);
 				if reward > best_reward {
 					best_reward = reward;
 					best_predictions.clone_from(&probe);
 					best_parameters = tape.weights()?[..proposer_parameters].to_vec();
-					best_parameters[composition.proposal_bias + channel] += direction * radius * composition.scale[channel];
+					best_parameters[composition.proposal_bias + channel] += direction * radius;
 					best_bn_stats = tape.extract_bn_stats()?;
 					best_bn_stats.truncate(proposer_bn);
 				}
@@ -14188,7 +14134,7 @@ impl Train {
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, run, tape.step as usize, self.epochs, final_loss, 0.0, seconds, false, false, &format!("reward {reward:.9}"))?;
+			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, false, false, &format!("reward {reward:.9}"))?;
 		}
 		let refinement_radius = 0.0025;
 		let refinement_center = best_predictions.clone();
@@ -14198,7 +14144,7 @@ impl Train {
 			for direction in [-1.0, 1.0] {
 				let mut probe = refinement_center.clone();
 				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * refinement_radius * composition.scale[channel];
+					probe[row * proposal_width + channel] += direction * refinement_radius;
 				}
 				let probe_rewards = evaluate(&probe)?;
 				let reward = mean(&probe_rewards);
@@ -14206,35 +14152,32 @@ impl Train {
 					best_reward = reward;
 					best_predictions.clone_from(&probe);
 					best_parameters.clone_from(&refinement_parameters);
-					best_parameters[composition.proposal_bias + channel] += direction * refinement_radius * composition.scale[channel];
+					best_parameters[composition.proposal_bias + channel] += direction * refinement_radius;
 					best_bn_stats.clone_from(&refinement_bn_stats);
 				}
-				evaluation_samples.extend(normalize(&probe));
+				evaluation_samples.extend(probe.clone());
 				evaluation_targets.extend(probe_rewards);
 			}
 		}
 		fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
-		let best_observations = normalize(&best_predictions);
-		let estimated_reward = mean(&graph_inputs(&composition.evaluator, &best_observations, training_rows, gpu, config.precision)?);
-		composition.evaluator.parameters[composition.evaluator_bias] += best_reward - estimated_reward;
-		composition.evaluator.refresh_storage(config)?;
 		let score = |samples: &[f64]| -> Result<Vec<f64>> {
 			require(samples.len() % proposal_width == 0, "RAT evaluator samples have the wrong shape")?;
 			graph_inputs(&composition.evaluator, samples, samples.len() / proposal_width, gpu, config.precision)
 		};
 		let evaluator_predictions = score(&evaluation_samples)?;
-		let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
-		let predicted_reward = mean(&score(&normalize(&best_predictions))?);
-		let mut validation_predictions = Vec::with_capacity(2 * proposal_width * training_rows);
-		let mut validation_targets = Vec::with_capacity(2 * proposal_width * training_rows);
+		let fitted_rows = ((evaluation_targets.len() as f64 * data.split).floor() as usize).max(1);
+		let evaluator_r2 = coefficient(&evaluation_targets[..fitted_rows], &evaluator_predictions[..fitted_rows]);
+		let predicted_reward = mean(&score(&best_predictions.clone())?);
+		let mut validation_predictions = evaluator_predictions[fitted_rows..].to_vec();
+		let mut validation_targets = evaluation_targets[fitted_rows..].to_vec();
 		let validation_radius = refinement_radius / 2.0;
 		for channel in 0..proposal_width {
 			for direction in [-1.0, 1.0] {
 				let mut probe = best_predictions.clone();
 				for row in 0..training_rows {
-					probe[row * proposal_width + channel] += direction * validation_radius * composition.scale[channel];
+					probe[row * proposal_width + channel] += direction * validation_radius;
 				}
-				validation_predictions.extend(score(&normalize(&probe))?);
+				validation_predictions.extend(score(&probe.clone())?);
 				validation_targets.extend(evaluate(&probe)?);
 			}
 		}
@@ -14246,7 +14189,7 @@ impl Train {
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
 		composition.proposer.parameters = best_parameters;
 		composition.proposer.state.training_rows = training_rows;
-		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..training_rows]);
+		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..source_rows]);
 		composition.proposer.state.trained_samples.sort_unstable();
 		composition.proposer.state.trained_samples.dedup();
 		if let Some(path) = &self.save {
@@ -14259,7 +14202,7 @@ impl Train {
 			final_loss,
 			initial_predictions,
 			predictions: best_predictions,
-			r2: 0.0,
+			r2: f64::NAN,
 			evaluator_r2: Some(evaluator_r2),
 			validation_r2: Some(validation_r2),
 			predicted_reward: Some(predicted_reward),
@@ -14274,13 +14217,17 @@ impl Train {
 	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
-		let prepared = prepare(data)?;
+		let command_data = self.rat.as_ref().map(|_| prepare_command_data(data)).transpose()?;
+		let prepared = match &command_data {
+			Some(prepared) => prepared,
+			None => prepare(data)?,
+		};
 		require(
 			data.trial.is_none() || (self.save.is_none() && self.resume.is_none()),
 			"a trial generator draws a new workload every run, so its row has no saved identity to match: .save() and .resume() are unsupported",
 		)?;
 		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
-		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
+		let training_rows = if self.rat.is_some() { prepared.source_rows } else { ((prepared.source_rows as f64) * data.split).floor() as usize };
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
 		let precision = self.precision;
 		config.precision = precision;
@@ -14648,7 +14595,7 @@ impl TrainingReport {
 	pub const fn r2(&self) -> f64 {
 		self.r2
 	}
-	/// Returns R² from the final RAT evaluator over every measured proposal.
+	/// Returns R² from the final RAT evaluator over its fitting proposals.
 	pub const fn evaluator_r2(&self) -> Option<f64> {
 		self.evaluator_r2
 	}
