@@ -10510,12 +10510,6 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
 }
-fn fit_step(graph: &mut Graph, samples: &[f64], targets: &[f64], loss: LossFunction, rate: f64, gpu: &'static Gpu, config: Config) -> Result<()> {
-	let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(loss), None, None)?;
-	tape.advance()?;
-	tape.full_epoch(rate, config)?;
-	tape.capture(graph)
-}
 fn fit_model(model: &Model, input: Shape, samples: &[f64], targets: &[f64], outputs: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	require(outputs != 0 && !targets.is_empty() && targets.len() % outputs == 0, "model fitting requires a whole target batch")?;
 	let rows = targets.len() / outputs;
@@ -14011,6 +14005,7 @@ impl Train {
 		let initial_loss = 1.0 - mean(&rewards);
 		let normalize = |values: &[f64]| values.iter().enumerate().map(|(index, value)| value / composition.scale[index % proposal_width]).collect::<Vec<_>>();
 		let mut observations = normalize(&initial_predictions);
+		let mut evaluator_tape = NativeTape::new(&composition.evaluator, &observations, &rewards, gpu, config.precision, Some(composition.loss), None, None)?;
 		let mut best_reward = mean(&rewards);
 		let mut best_predictions = initial_predictions.clone();
 		let mut best_parameters = composition.proposer.parameters.clone();
@@ -14025,8 +14020,11 @@ impl Train {
 				return Err(RecipeError::new("interrupted"));
 			}
 			let epoch_started = Instant::now();
-			fit_step(&mut composition.evaluator, &observations, &rewards, composition.loss, self.learning_rate, gpu, config)?;
-			composition.evaluator.refresh_storage(config)?;
+			evaluator_tape.samples.write_float_bytes(0, &observations, evaluator_tape.precision.model)?;
+			evaluator_tape.targets.write_float_bytes(0, &rewards, evaluator_tape.precision.model)?;
+			evaluator_tape.advance()?;
+			evaluator_tape.full_epoch(self.learning_rate, config)?;
+			evaluator_tape.capture(&mut composition.evaluator)?;
 			tape.weights.write_float_bytes(
 				checked_mul(composition.offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?,
 				&composition.evaluator.parameters,
@@ -14037,8 +14035,6 @@ impl Train {
 			tape.forward(None)?;
 			let predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
 			let current = evaluate(&predictions)?;
-			observations.extend(normalize(&predictions));
-			rewards.extend_from_slice(&current);
 			let reward = mean(&current);
 			if reward > best_reward {
 				best_reward = reward;
@@ -14047,6 +14043,8 @@ impl Train {
 				best_bn_stats = tape.extract_bn_stats()?;
 				best_bn_stats.truncate(proposer_bn);
 			}
+			observations = normalize(&predictions);
+			rewards = current;
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
