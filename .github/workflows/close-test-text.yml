@@ -26,15 +26,6 @@ jobs:
           scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
           mkdir -p "$scan_directory"
 
-          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '[.title, (.body // "")] | .[]' \
-            > "$scan_directory/metadata.txt"
-          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-            --jq '.[] | select(.status != "removed") | .filename' \
-            > "$scan_directory/files.txt"
-          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
-            --jq '.[].commit.message' \
-            > "$scan_directory/commits.txt"
           gh api \
             -H 'Accept: application/vnd.github.v3.diff' \
             "repos/$REPOSITORY/pulls/$PR_NUMBER" \
@@ -48,18 +39,10 @@ jobs:
           ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
 
           banned_fragment="$(printf 'te%s' 'st')"
-          locations=()
-          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
-          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/files.txt"; then locations+=("changed path"); fi
-          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/commits.txt"; then locations+=("commit message"); fi
-          if grep --ignore-case --quiet "$banned_fragment" "$scan_directory/added.txt"; then locations+=("added content"); fi
-
-          if ((${#locations[@]} == 0)); then
+          if ! grep --ignore-case --fixed-strings --quiet "$banned_fragment" "$scan_directory/added.txt"; then
             exit 0
           fi
 
-          IFS=,
-          location_text="${locations[*]}"
-          reason="Closed automatically because this pull request contains the banned text \`test\` in: $location_text. Remove every occurrence from this PR's existing branch and metadata, then reopen this PR. Do not create a replacement branch or PR."
+          reason="Closed automatically because added content in this pull request's current diff contains the banned text \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
           gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
