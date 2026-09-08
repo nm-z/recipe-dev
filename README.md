@@ -60,16 +60,21 @@ recipe.rs       runtime
 amd-nv-cpu.ll   kernels
 build.rs        compiler
 cli.rs          cli options
-test.rs         combo testing
 ```
 
-## 18 thingys:
+## blocks
+
+```
+frozen.packed.blck.atvn.norm.quant
+```
+
+## 18 thingys
+
 ```rust
 weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)
-	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
@@ -94,7 +99,33 @@ estimators:
 	svm()
 	bayes()
 ```
+
 Feature generation is banned.
+
+## data
+
+```rust
+data(auto)
+	.test(source)
+	.set(source)
+	.include([features])
+	.exclude([features])
+```
+
+## training
+
+```rust
+.seed(value)
+.optimizer(adamw)
+.log(metrics)
+.resume(path)
+```
+
+## losses
+
+```rust
+.loss(mse|rmse|huber|mae|bce|ce|focal)
+```
 
 ## 15 activations
 
@@ -120,6 +151,7 @@ over its head-width slice, leaving the values untouched:
 ```
 
 ## compute precisions
+
 key:<br>
 `.`       optional continue<br>
 `[...]`   optional children<br>
@@ -147,9 +179,11 @@ importance quantized:
 	.iq(2|3).(xxs|xs|s|m)
 	.iq(4).(xs|nl)
 ```
-##### **reporting:**
+
+## observability
 
 ```rust
+.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 
@@ -160,4 +194,24 @@ report.predictions();
 report.r2();
 report.tile();
 report.epoch_seconds();
+```
+
+## clanker docs
+
+### planned
+
+```rust
+.embed(vocab, width)
+.attn(q, k, v) // n heads
+.no(options)     // exclude default model behavior such as bias.
+	.no(bias)
+.recur([...])
+.scale(factor)   // multiply every value from the preceding step by one constant.
+.rope(layout, dimensions, base)
+	neox
+	yarn(factor, og_ctx, b_fast, b_slow)
+branching:
+	let gate = recipe.model().layer(width).gelu();
+	let up = recipe.model().layer(width);
+	let output = gate * up;
 ```
