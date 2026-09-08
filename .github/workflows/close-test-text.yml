@@ -52,6 +52,9 @@ jobs:
 
   require-minimal-base:
     if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    concurrency:
+      group: recipe-minimal-base-policy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Require minimal as the pull request base
@@ -83,6 +86,9 @@ jobs:
 
   draft-conflicts:
     if: github.event_name == 'push' || github.event.pull_request.state == 'open'
+    concurrency:
+      group: recipe-merge-conflict-policy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Convert conflicting pull requests to draft
