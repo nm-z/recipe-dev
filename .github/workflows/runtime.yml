@@ -60,12 +60,6 @@ jobs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
     steps:
-      - name: Check out the controller
-        uses: actions/checkout@v4
-        with:
-          path: controller
-          persist-credentials: false
-
       - name: Install the Arch toolchain
         run: |
           set -euo pipefail
@@ -74,6 +68,12 @@ jobs:
             pacman -S --noconfirm --needed azure-cli
           fi
           echo "pacman toolchain installed"
+
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
 
       - name: Resolve the candidate SHA
         id: resolve
