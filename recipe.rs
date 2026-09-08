@@ -6511,7 +6511,9 @@ pub const norm: Metric = Metric(7);
 pub const tok: Metric = Metric(8);
 pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
-pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+/// The external command's measured score, separate from the native tile schedule.
+pub const Score: Metric = Metric(11);
+pub const all: [Metric; 11] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile, Score];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -15179,7 +15181,7 @@ impl Train {
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &format!("reward {reward:.9}"))?;
+			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(reward))?;
 		}
 		fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
 		let score = |samples: &[f64]| -> Result<Vec<f64>> {
@@ -15343,7 +15345,7 @@ impl Train {
 				}
 			}
 			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule)?;
+			self.print(model, run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule, None)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
@@ -15435,7 +15437,7 @@ impl Train {
 	}
 	fn print(
 		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
-		schedule: &str,
+		schedule: &str, measured_score: Option<f64>,
 	) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
@@ -15448,7 +15450,7 @@ impl Train {
 				&self.log_metrics,
 				epochs,
 				schedule,
-				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false },
+				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false, score: measured_score },
 			),
 			live,
 			true,
@@ -15464,7 +15466,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None },
 			),
 			false,
 			true,
@@ -15496,6 +15498,10 @@ impl Train {
 				8 => continue,
 				10 if schedule.is_empty() => continue,
 				10 => format!("tile \x1b[38\x3b2\x3b135\x3b90\x3b251m{schedule}\x1b[0m"),
+				11 => match measurement.score {
+					Some(value) => format!("score \x1b[38\x3b2\x3b135\x3b90\x3b251m{value:.9}\x1b[0m"),
+					None => continue,
+				},
 				_ => unreachable!(),
 			};
 			values.push(value);
@@ -15531,7 +15537,7 @@ impl Train {
 	}
 	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now();
-		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false };
+		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false, score: None };
 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live {
@@ -15581,6 +15587,7 @@ impl Train {
 }
 #[derive(Clone, Copy)]
 struct Metrics {
+	score: Option<f64>,
 	run: u64,
 	epoch: usize,
 	loss: Option<f64>,
