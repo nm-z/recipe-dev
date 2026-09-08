@@ -13982,7 +13982,7 @@ impl Train {
 		require(data.trial.is_none(), "a command RAT run requires tabular data")?;
 		require(!data.autoregressive, "a command RAT run requires named numeric targets")?;
 		require(self.resume.is_none(), "a command RAT run does not support .resume()")?;
-		require(training_rows == prepared.rows, "a command RAT run does not support split or test data")?;
+		require(training_rows == prepared.rows, "a command RAT run does not support held-out data")?;
 		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
