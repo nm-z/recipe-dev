@@ -23,14 +23,11 @@ if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
 fi
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
-LOCATION="${AZURE_LOCATION:-eastus}"
-# Standard_NC4as_T4_v3 is the smallest T4 shape; the quota request targets it.
+# Standard_NC4as_T4_v3 is the smallest T4 shape.
 SIZE="${AZURE_VM_SIZE:-Standard_NC4as_T4_v3}"
 IMAGE="${AZURE_VM_IMAGE:-MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-core:latest}"
 FAMILY="Standard NCASv3_T4 Family"
-FAMILY_RESOURCE="standardNCASv3_T4Family"
 REQUIRED_CORES=4
-QUOTA_TARGET_CORES=16
 # One worker per run: two candidates must never share a mutable working directory.
 WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
@@ -42,16 +39,53 @@ az account show --query "{name:name, id:id, state:state}" -o json | tee evidence
 
 echo "== selecting available GPU capacity =="
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
-sku="$(az vm list-skus --location "$LOCATION" --resource-type virtualMachines --size "$SIZE" --all --query "[?name=='$SIZE']" -o json --only-show-errors)"
-if [ "$(jq 'length' <<< "$sku")" -eq 0 ] ||
-	! jq -e '[.[].restrictions[]? | select(.type == "Location")] | length == 0' <<< "$sku" >/dev/null; then
-	echo "$SIZE is unavailable to this subscription in $LOCATION" >&2
+az vm list \
+	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
+	--only-show-errors -o json | tee evidence/azure-gpu-inventory.json
+
+# Fetch the subscription-aware SKU catalog once, then check quota only in
+# regions where Azure offers this exact shape to this subscription.
+sku="$(az vm list-skus --resource-type virtualMachines --size "$SIZE" --all --query "[?name=='$SIZE']" -o json --only-show-errors)"
+mapfile -t supported_locations < <(
+	jq -r --arg size "$SIZE" '
+		.[] | select(.name == $size) as $sku
+		| $sku.locations[] as $location
+		| select([
+			$sku.restrictions[]?
+			| select(.type == "Location")
+			| select((.restrictionInfo.locations // []) | index($location))
+		] | length == 0)
+		| $location
+	' <<< "$sku" | sort -u
+)
+if [ "${#supported_locations[@]}" -eq 0 ]; then
+	echo "$SIZE is unavailable to this subscription" >&2
 	exit 1
 fi
 
+declare -a candidate_locations=()
+declare -A location_seen=()
+if [ -n "${AZURE_LOCATION:-}" ]; then
+	candidate_locations+=("$AZURE_LOCATION")
+	location_seen["$AZURE_LOCATION"]=1
+else
+	# Prefer nearby US regions, then use any other subscription-supported region.
+	for location in eastus eastus2 centralus southcentralus northcentralus westus2 westus3; do
+		candidate_locations+=("$location")
+		location_seen["$location"]=1
+	done
+	for location in "${supported_locations[@]}"; do
+		if [ -z "${location_seen[$location]:-}" ]; then
+			candidate_locations+=("$location")
+			location_seen["$location"]=1
+		fi
+	done
+fi
+
 read_quota() {
-	local usage
-	usage="$(az vm list-usage --location "$LOCATION" -o json --only-show-errors)"
+	local location="$1"
+	local usage current limit regional_current regional_limit free regional_free
+	usage="$(az vm list-usage --location "$location" -o json --only-show-errors)"
 	current="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].currentValue // 0' <<< "$usage")"
 	limit="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].limit // 0' <<< "$usage")"
 	regional_current="$(jq -r '[.[] | select(.name.value == "cores")][0].currentValue // 0' <<< "$usage")"
@@ -59,7 +93,7 @@ read_quota() {
 	free=$((limit - current))
 	regional_free=$((regional_limit - regional_current))
 	jq -n \
-		--arg location "$LOCATION" \
+		--arg location "$location" \
 		--arg family "$FAMILY" \
 		--argjson current "$current" \
 		--argjson limit "$limit" \
@@ -67,37 +101,32 @@ read_quota() {
 		--argjson regional_current "$regional_current" \
 		--argjson regional_limit "$regional_limit" \
 		--argjson regional_free "$regional_free" \
-		'{location:$location, family:$family, current:$current, limit:$limit, free:$free, regional_current:$regional_current, regional_limit:$regional_limit, regional_free:$regional_free}' \
-		| tee evidence/azure-quota.json
+		'{location:$location, family:$family, current:$current, limit:$limit, free:$free, regional_current:$regional_current, regional_limit:$regional_limit, regional_free:$regional_free}'
 }
-read_quota
 
-if [ "$free" -lt "$REQUIRED_CORES" ] && [ "$limit" -lt "$QUOTA_TARGET_CORES" ]; then
-	echo "== requesting $QUOTA_TARGET_CORES $FAMILY cores in $LOCATION =="
-	subscription_id="$(az account show --query id -o tsv)"
-	scope="/subscriptions/$subscription_id/providers/Microsoft.Compute/locations/$LOCATION"
-	az config set extension.use_dynamic_install=yes_without_prompt
-	az quota update \
-		--resource-name "$FAMILY_RESOURCE" \
-		--scope "$scope" \
-		--limit-object "value=$QUOTA_TARGET_CORES" \
-		--resource-type dedicated \
-		--only-show-errors -o json | tee evidence/azure-quota-request.json
-	for _ in $(seq 1 20); do
-		read_quota
-		if [ "$free" -ge "$REQUIRED_CORES" ]; then
-			break
-		fi
-		sleep 15
-	done
-fi
+: > evidence/azure-capacity.jsonl
+LOCATION=""
+for location in "${candidate_locations[@]}"; do
+	if ! printf '%s\n' "${supported_locations[@]}" | grep -Fqx "$location"; then
+		continue
+	fi
+	quota="$(read_quota "$location")"
+	printf '%s\n' "$quota" | tee -a evidence/azure-capacity.jsonl
+	free="$(jq -r '.free' <<< "$quota")"
+	regional_free="$(jq -r '.regional_free' <<< "$quota")"
+	if [ "$free" -ge "$REQUIRED_CORES" ] && [ "$regional_free" -ge "$REQUIRED_CORES" ]; then
+		LOCATION="$location"
+		printf '%s\n' "$quota" > evidence/azure-quota.json
+		break
+	fi
+done
 
-if [ "$free" -lt "$REQUIRED_CORES" ] || [ "$regional_free" -lt "$REQUIRED_CORES" ]; then
+if [ -z "$LOCATION" ]; then
 	cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-quota-unavailable",
-  "detail": "$LOCATION has $free unused $FAMILY cores and $regional_free unused regional cores; one $SIZE worker needs $REQUIRED_CORES of each.",
-  "resolution": "Increase $FAMILY and total regional vCPU quota in $LOCATION, then rerun this check."
+  "detail": "No subscription-supported region has $REQUIRED_CORES unused $FAMILY cores and regional cores for one $SIZE worker.",
+  "resolution": "Grant the GPU controller Microsoft.Quota/quotas/write and increase the family quota, or free an existing allocation listed in azure-gpu-inventory.json."
 }
 JSON
 	cat evidence/blocker.json
