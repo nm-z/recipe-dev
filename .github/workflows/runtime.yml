@@ -584,7 +584,7 @@ jobs:
       id-token: write
     env:
       CELL: recipe/windows-gpu
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_GPU_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
     steps:
@@ -618,8 +618,8 @@ jobs:
             cat > evidence/blocker.json <<'JSON'
           {
             "blocker": "azure-federation-absent",
-            "detail": "AZURE_CLIENT_ID, AZURE_TENANT_ID or AZURE_SUBSCRIPTION_ID is not available to this run. The Dev Essentials to Azure credit route additionally requires an explicit, human pay-as-you-go billing authorization before GPU quota can be requested, because that upgrade removes the credit spending protection.",
-            "resolution": "Verify Dev Essentials eligibility and remaining credit, obtain explicit billing authorization for the pay-as-you-go upgrade, request NCasT4_v3 quota in a region that stocks Standard_NC4as_T4_v3, then federate this repository with a narrowly scoped app registration and store the three identifiers as repository secrets."
+            "detail": "AZURE_GPU_CLIENT_ID, AZURE_TENANT_ID, or AZURE_SUBSCRIPTION_ID is unavailable to this run.",
+            "resolution": "Configure the GPU controller identity and subscription secrets for the minimal branch."
           }
           JSON
             cat evidence/blocker.json
@@ -630,7 +630,7 @@ jobs:
       - name: Authenticate to Azure with OIDC
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_GPU_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
