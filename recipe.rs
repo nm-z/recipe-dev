@@ -4342,7 +4342,7 @@ use std::{
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Command, Stdio},
 	ptr,
 	sync::{
 		Mutex, OnceLock,
@@ -6421,6 +6421,76 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.source = narrow(graph.nodes.len(), "model graph nodes")? - 1;
 	Ok(graph.source)
 }
+#[derive(Clone)]
+struct RatCommand {
+	path: PathBuf,
+}
+impl RatCommand {
+	fn evaluate(&self, names: &[String], proposal: &[f64]) -> Result<f64> {
+		require(!names.is_empty(), "RAT requires at least one named target")?;
+		require(names.len() == proposal.len(), format!("RAT evaluator expected {} proposed values, received {}", names.len(), proposal.len()))?;
+		for name in names {
+			require(!name.is_empty() && !name.bytes().any(|byte| matches!(byte, b',' | b'=' | b'\r' | b'\n')), format!("RAT target name {name:?} cannot be encoded"))?;
+		}
+		require(proposal.iter().all(|value| value.is_finite()), "RAT proposal contains a nonfinite value")?;
+		let mut record = names.iter().zip(proposal).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",");
+		record.push('\n');
+		let mut child = Command::new(&self.path)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::inherit())
+			.spawn()
+			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", self.path.display())))?;
+		let write = child
+			.stdin
+			.take()
+			.ok_or_else(|| RecipeError::new("RAT evaluator stdin is unavailable"))?
+			.write_all(record.as_bytes())
+			.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())));
+		let output = child.wait_with_output().map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
+		write?;
+		require(output.status.success(), format!("RAT evaluator {} exited with {}", self.path.display(), output.status))?;
+		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
+		let fields = stdout.split_ascii_whitespace().collect::<Vec<_>>();
+		require(fields.len() == 1, format!("RAT evaluator {} must write exactly one reward to stdout", self.path.display()))?;
+		let reward = fields[0].parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid reward: {error}", self.path.display())))?;
+		require(reward.is_finite() && (0.0..=1.0).contains(&reward), format!("RAT evaluator {} reward must be finite and between zero and one", self.path.display()))?;
+		Ok(reward)
+	}
+}
+struct CommandRatComposition {
+	graph: Graph,
+	proposer: Graph,
+	evaluator: Graph,
+	loss: LossFunction,
+	proposal: usize,
+	offset: usize,
+}
+fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
+	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
+	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
+	require(evaluator_model.blocks.iter().all(|block| block.normalization.is_none()), "a RAT evaluator cannot contain normalization")?;
+	let mut proposer_model = model.clone();
+	proposer_model.downstream = None;
+	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
+	if let Some(offset) = output_bias_offset(&proposer) {
+		for channel in 0..prepared.target_width {
+			proposer.parameters[offset + channel] = prepared.targets[..rows * prepared.target_width].iter().skip(channel).step_by(prepared.target_width).sum::<f64>() / rows as f64;
+		}
+	}
+	proposer.refresh_storage(config)?;
+	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
+	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
+	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
+	require(proposer.output == evaluator.input, format!("RAT evaluator input has {} values, but the proposal has {}", evaluator.input.elements(), proposer.output.elements()))?;
+	let proposal = proposer.nodes.len() - 1;
+	let offset = proposer.parameters.len();
+	let mut graph = proposer.clone();
+	append_graph(&mut graph, evaluator.clone())?;
+	graph.frozen[offset..].fill(1);
+	graph.refresh_storage(config)?;
+	Ok(CommandRatComposition { graph, proposer, evaluator, loss: evaluator_model.loss, proposal, offset })
+}
 /// Scores each decision in the coordinates used to fit the bench model.
 /// Frozen projections carry the measured configuration and replace only the
 /// selected knob with a differentiable, bounded proposal.
@@ -7561,6 +7631,11 @@ impl NativeTape {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
 		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
+		let offset = *self.program.artifact.layout.values.get(node).ok_or_else(|| RecipeError::new("native model has no arena for that node"))?;
+		let values = self.values.download_float_bytes(offset, width, self.precision.model)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite proposal", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config) -> Result<()> {
 		require(self.step != 0, "optimizer epoch is absent")?;
@@ -10424,6 +10499,12 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
+}
+fn fit_step(graph: &mut Graph, samples: &[f64], targets: &[f64], loss: LossFunction, rate: f64, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(loss), None, None)?;
+	tape.advance()?;
+	tape.full_epoch(rate, config)?;
+	tape.capture(graph)
 }
 fn fit_model(model: &Model, input: Shape, samples: &[f64], targets: &[f64], outputs: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	require(outputs != 0 && !targets.is_empty() && targets.len() % outputs == 0, "model fitting requires a whole target batch")?;
@@ -13708,7 +13789,7 @@ pub struct Train {
 	save: Option<PathBuf>,
 	seed: Option<usize>,
 	precision: Compute,
-	rat: Option<Knobs>,
+	rat: Option<RatCommand>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -13794,9 +13875,13 @@ impl Compute {
 	}
 }
 impl Train {
-	/// Uses an explicit RAT configuration for the supplied workload.
-	pub fn rat_config(mut self, knobs: Knobs) -> Self {
-		self.rat = Some(knobs);
+	/// Evaluates RAT proposals with an executable. For each proposal, Recipe
+	/// writes one `name=value,...` record to stdin in declared target order. The
+	/// executable writes exactly one finite reward in `[0, 1]` to stdout and may
+	/// write diagnostics to stderr. Return reward zero for a valid but unsupported
+	/// proposal. Recipe invokes the path directly without a shell.
+	pub fn rat(mut self, command: impl AsRef<Path>) -> Self {
+		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")) });
 		self
 	}
 	fn arithmetic(mut self, format: Compute) -> Self {
@@ -13887,6 +13972,96 @@ impl Train {
 		}
 		report
 	}
+	fn try_run_rat(
+		&self, model: &Model, data: &Data, prepared: &Prepared, training_rows: usize, command: &RatCommand, gpu: &'static Gpu, config: Config, started: Instant,
+	) -> Result<TrainingReport> {
+		require(data.trial.is_none(), "a command RAT run requires tabular data")?;
+		require(!data.autoregressive, "a command RAT run requires named numeric targets")?;
+		require(self.resume.is_none(), "a command RAT run does not support .resume()")?;
+		require(training_rows == prepared.rows, "a command RAT run does not support split or test data")?;
+		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
+		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
+		let proposal_width = prepared.target_width;
+		let samples = &prepared.samples[..training_rows * prepared.features];
+		let mut composition = command_rat_graph(model, prepared, training_rows, gpu, config)?;
+		composition.graph.state.training_rows = training_rows;
+		composition.proposer.state.training_rows = training_rows;
+		let proposer_parameters = composition.proposer.parameters.len();
+		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
+		let objectives = vec![1.0; training_rows];
+		let mut tape = NativeTape::new(&composition.graph, samples, &objectives, gpu, config.precision, Some(composition.loss), None, None)?;
+		tape.forward(None)?;
+		let initial_predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
+		let evaluate = |proposals: &[f64]| -> Result<Vec<f64>> {
+			require(proposals.len() == training_rows * proposal_width, "RAT proposal batch has the wrong shape")?;
+			proposals.chunks_exact(proposal_width).map(|proposal| command.evaluate(&data.target, proposal)).collect()
+		};
+		let mut rewards = evaluate(&initial_predictions)?;
+		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+		let initial_loss = 1.0 - mean(&rewards);
+		let mut predictions = initial_predictions.clone();
+		let mut observations = initial_predictions.clone();
+		let tolerance = self.stop.unwrap_or(0.0);
+		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		let mut epoch_seconds = 0.0;
+		for _ in 0..self.epochs {
+			if INTERRUPTED.load(Ordering::Acquire) {
+				return Err(RecipeError::new("interrupted"));
+			}
+			let epoch_started = Instant::now();
+			fit_step(&mut composition.evaluator, &observations, &rewards, composition.loss, self.learning_rate, gpu, config)?;
+			composition.evaluator.refresh_storage(config)?;
+			tape.weights.write_float_bytes(
+				checked_mul(composition.offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?,
+				&composition.evaluator.parameters,
+				tape.precision.model,
+			)?;
+			tape.advance()?;
+			let _ = tape.full_epoch(self.learning_rate, config)?;
+			tape.forward(None)?;
+			predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
+			let current = evaluate(&predictions)?;
+			observations.extend_from_slice(&predictions);
+			rewards.extend_from_slice(&current);
+			let final_loss = 1.0 - mean(&current);
+			let seconds = epoch_started.elapsed().as_secs_f64();
+			epoch_seconds += seconds;
+			self.print(model, run, tape.step as usize, self.epochs, final_loss, 0.0, seconds, false, false, &format!("reward {:.9}", mean(&current)))?;
+		}
+		let final_rewards = &rewards[rewards.len() - training_rows..];
+		let final_loss = 1.0 - mean(final_rewards);
+		let selected_tile = tape.tile();
+		let schedule = tape.schedule();
+		let mut bn_stats = tape.extract_bn_stats()?;
+		bn_stats.truncate(proposer_bn);
+		tape.capture(&mut composition.graph)?;
+		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
+		composition.proposer.state.training_rows = training_rows;
+		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..training_rows]);
+		composition.proposer.state.trained_samples.sort_unstable();
+		composition.proposer.state.trained_samples.dedup();
+		if let Some(path) = &self.save {
+			let mut proposer_model = model.clone();
+			proposer_model.downstream = None;
+			let mut stored = stored_graph(&composition.proposer, &proposer_model, data, None, config.precision, native_target_label(&gpu.native_target));
+			stored.bn_stats = bn_stats;
+			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
+		}
+		Ok(TrainingReport {
+			initial_loss,
+			final_loss,
+			initial_predictions,
+			predictions,
+			r2: 0.0,
+			tile: selected_tile,
+			schedule,
+			run,
+			epoch: tape.step as usize,
+			seconds: started.elapsed().as_secs_f64(),
+			epoch_seconds,
+		})
+	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
 		let prepared = prepare(data)?;
@@ -13901,6 +14076,9 @@ impl Train {
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
+		}
+		if let Some(command) = &self.rat {
+			return self.try_run_rat(model, data, prepared, training_rows, command, gpu, config, started);
 		}
 		let probability = model.loss.0 >= 4;
 		let training_values = training_rows * prepared.target_width;
@@ -13928,13 +14106,12 @@ impl Train {
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
 		require(!targets.is_empty(), "training requires targets")?;
-		let knobs = self.rat;
 		let mut rat_training = match gpu.backend {
-			Backend::Amd if knobs.is_none() => Some(RatTraining::load(&stored.graph, training_rows, gpu, config)?),
+			Backend::Amd => Some(RatTraining::load(&stored.graph, training_rows, gpu, config)?),
 			_ => None,
 		};
 		let create = |knobs| NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, Some(model.loss), knobs, None);
-		let mut tape = match &mut rat_training { Some(rat) => rat.apply(config, |knobs| create(Some(knobs)))?, None => create(knobs)? };
+		let mut tape = match &mut rat_training { Some(rat) => rat.apply(config, |knobs| create(Some(knobs)))?, None => create(None)? };
 		self.finish_dispatch(
 			if stored.bn_stats.is_empty() { tape.forward(None) } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward(None)) },
 			&mut stored,
