@@ -42,6 +42,7 @@ list_resources() {
 		disk) az disk list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		nic) az network nic list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		public-ip) az network public-ip list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
+		nsg) az network nsg list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -53,6 +54,7 @@ delete_resource() {
 		disk) az disk delete --resource-group "$GROUP" --name "$name" --yes --only-show-errors ;;
 		nic) az network nic delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
 		public-ip) az network public-ip delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
+		nsg) az network nsg delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -113,7 +115,7 @@ remove_worker() {
 		status=1
 	fi
 
-	for kind in disk nic public-ip; do
+	for kind in disk nic public-ip nsg; do
 		local resources
 		if ! resources="$(list_resources "$kind" "$name")"; then
 			status=1
@@ -158,6 +160,27 @@ for worker in $stale; do
 	if [ -n "$created" ] && [[ "$created" < "$cutoff" ]]; then
 		echo "watchdog removing stale worker $worker created $created"
 		if ! remove_worker "$worker"; then
+			cleanup_status=1
+		fi
+	fi
+done
+
+echo "== orphan NSG watchdog =="
+orphan_nsgs="$(az network nsg list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-') && ends_with(name,'NSG')].name" -o tsv --only-show-errors)" || {
+	echo "could not list runtime NSGs" >&2
+	orphan_nsgs=""
+	cleanup_status=1
+}
+for nsg in $orphan_nsgs; do
+	worker="${nsg%NSG}"
+	if ! current="$(list_vm "$worker")"; then
+		echo "could not determine whether $nsg is orphaned" >&2
+		cleanup_status=1
+		continue
+	fi
+	if [ -z "$current" ]; then
+		echo "removing orphan NSG $nsg"
+		if ! delete_resource nsg "$nsg"; then
 			cleanup_status=1
 		fi
 	fi

@@ -30,6 +30,7 @@ FAMILY="Standard NCASv3_T4 Family"
 REQUIRED_CORES=4
 # One worker per run: two candidates must never share a mutable working directory.
 WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
+COMPUTER_NAME="rgpu$(printf '%s' "$WORKER" | sha256sum | cut -c1-11)"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
 
 mkdir -p evidence
@@ -43,42 +44,6 @@ inventory="$(az vm list --show-details \
 	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
 	--only-show-errors -o json)"
 printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
-
-# The current workflow creates isolated per-run workers. Retire only the exact
-# tagged pool left by the superseded controller, including its named resources,
-# so it cannot reserve the subscription's only T4 allocation.
-retired_pool="$(jq -r '
-	[.[] | select(
-		.name == "recipe-wgpu-pool"
-		and .recipe_owner == "recipe-gateway-isc"
-		and .recipe_pool == "recipe-windows-nvidia"
-		and .recipe_worker == "recipe-wgpu-pool"
-	)]
-	| if length == 1 then .[0] else empty end
-' <<< "$inventory")"
-if [ -n "$retired_pool" ]; then
-	retired_pool_group="$(jq -r '.resource_group' <<< "$retired_pool")"
-	echo "== removing retired runtime pool recipe-wgpu-pool =="
-	az vm delete \
-		--resource-group "$retired_pool_group" \
-		--name recipe-wgpu-pool \
-		--yes \
-		--force-deletion true \
-		--only-show-errors
-	for resource in $(az network nic list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
-		az network nic delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
-	done
-	for resource in $(az disk list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
-		az disk delete --resource-group "$retired_pool_group" --name "$resource" --yes --only-show-errors
-	done
-	for resource in $(az network public-ip list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
-		az network public-ip delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
-	done
-	for resource in $(az network nsg list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
-		az network nsg delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
-	done
-	echo "retired runtime pool removed"
-fi
 
 # Fetch the subscription-aware SKU catalog once, then check quota only in
 # regions where Azure offers this exact shape to this subscription.
@@ -122,7 +87,9 @@ fi
 read_quota() {
 	local location="$1"
 	local usage current limit regional_current regional_limit free regional_free
-	usage="$(az vm list-usage --location "$location" -o json --only-show-errors)"
+	if ! usage="$(az vm list-usage --location "$location" -o json --only-show-errors)"; then
+		return 1
+	fi
 	current="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].currentValue // 0' <<< "$usage")"
 	limit="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].limit // 0' <<< "$usage")"
 	regional_current="$(jq -r '[.[] | select(.name.value == "cores")][0].currentValue // 0' <<< "$usage")"
@@ -147,7 +114,10 @@ for location in "${candidate_locations[@]}"; do
 	if ! printf '%s\n' "${supported_locations[@]}" | grep -Fqx "$location"; then
 		continue
 	fi
-	quota="$(read_quota "$location")"
+	if ! quota="$(read_quota "$location")"; then
+		echo "skipping $location because its compute usage endpoint is unavailable" >&2
+		continue
+	fi
 	printf '%s\n' "$quota" | tee -a evidence/azure-capacity.jsonl
 	free="$(jq -r '.free' <<< "$quota")"
 	regional_free="$(jq -r '.regional_free' <<< "$quota")"
@@ -241,6 +211,7 @@ az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o non
 az vm create \
 	--resource-group "$GROUP" \
 	--name "$WORKER" \
+	--computer-name "$COMPUTER_NAME" \
 	--location "$LOCATION" \
 	--image "$IMAGE" \
 	--size "$SIZE" \
