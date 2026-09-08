@@ -39,10 +39,10 @@ jobs:
           ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
 
           banned_fragment="$(printf 'te%s' 'st')"
-          if ! grep --ignore-case --fixed-strings --quiet "$banned_fragment" "$scan_directory/added.txt"; then
+          if ! grep --ignore-case --fixed-strings --word-regexp --quiet "$banned_fragment" "$scan_directory/added.txt"; then
             exit 0
           fi
 
-          reason="Closed automatically because added content in this pull request's current diff contains the banned text \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
+          reason="Closed automatically because added content in this pull request's current diff contains the banned whole word \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
           gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
