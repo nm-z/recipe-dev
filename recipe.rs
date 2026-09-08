@@ -6465,6 +6465,7 @@ struct CommandRatComposition {
 	loss: LossFunction,
 	proposal: usize,
 	offset: usize,
+	scale: Vec<f64>,
 }
 fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
@@ -6473,10 +6474,11 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	let mut proposer_model = model.clone();
 	proposer_model.downstream = None;
 	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
+	let means = (0..prepared.target_width)
+		.map(|channel| prepared.targets[..rows * prepared.target_width].iter().skip(channel).step_by(prepared.target_width).sum::<f64>() / rows as f64)
+		.collect::<Vec<_>>();
 	if let Some(offset) = output_bias_offset(&proposer) {
-		for channel in 0..prepared.target_width {
-			proposer.parameters[offset + channel] = prepared.targets[..rows * prepared.target_width].iter().skip(channel).step_by(prepared.target_width).sum::<f64>() / rows as f64;
-		}
+		proposer.parameters[offset..offset + prepared.target_width].copy_from_slice(&means);
 	}
 	proposer.refresh_storage(config)?;
 	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
@@ -6484,12 +6486,20 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
 	require(proposer.output == evaluator.input, format!("RAT evaluator input has {} values, but the proposal has {}", evaluator.input.elements(), proposer.output.elements()))?;
 	let proposal = proposer.nodes.len() - 1;
-	let offset = proposer.parameters.len();
 	let mut graph = proposer.clone();
+	let scale = means.iter().map(|value| value.abs().max(0.000001)).collect::<Vec<_>>();
+	let scale_offset = graph.parameters.len();
+	lower_project(&mut graph, prepared.target_width)?;
+	let node = graph.nodes.last().unwrap();
+	for (channel, value) in scale.iter().enumerate() {
+		graph.parameters[node.offset + channel * prepared.target_width + channel] = value.recip();
+	}
+	graph.frozen[scale_offset..].fill(1);
+	let offset = graph.parameters.len();
 	append_graph(&mut graph, evaluator.clone())?;
 	graph.frozen[offset..].fill(1);
 	graph.refresh_storage(config)?;
-	Ok(CommandRatComposition { graph, proposer, evaluator, loss: evaluator_model.loss, proposal, offset })
+	Ok(CommandRatComposition { graph, proposer, evaluator, loss: evaluator_model.loss, proposal, offset, scale })
 }
 /// Scores each decision in the coordinates used to fit the bench model.
 /// Frozen projections carry the measured configuration and replace only the
@@ -14000,7 +14010,8 @@ impl Train {
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - mean(&rewards);
 		let mut predictions = initial_predictions.clone();
-		let mut observations = initial_predictions.clone();
+		let normalize = |values: &[f64]| values.iter().enumerate().map(|(index, value)| value / composition.scale[index % proposal_width]).collect::<Vec<_>>();
+		let mut observations = normalize(&initial_predictions);
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -14022,7 +14033,7 @@ impl Train {
 			tape.forward(None)?;
 			predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
 			let current = evaluate(&predictions)?;
-			observations.extend_from_slice(&predictions);
+			observations.extend(normalize(&predictions));
 			rewards.extend_from_slice(&current);
 			let final_loss = 1.0 - mean(&current);
 			let seconds = epoch_started.elapsed().as_secs_f64();
