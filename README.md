@@ -25,6 +25,8 @@ recipe.train()
 let prediction = recipe.infer("model.ogdl", &input);
 ```
 
+Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
+
 ## devices
 
 Select the local or host-qualified device to train on with `--device`:
@@ -34,8 +36,6 @@ recipe --device amd0 model.rs
 recipe --device engi:amd0 model.rs
 ```
 
-Recipe trains one device, so `--device` is given once.
-
 `recipe --worker <device>` serves one local GPU over stdin and stdout. Recipe starts this transport entrypoint through SSH for a host-qualified selector. It is a protocol endpoint, not a model script invocation.
 
 ## RAT
@@ -44,8 +44,6 @@ AMD training tunes the supplied workload through two models. The knob model sele
 
 Run the normal entrypoint, such as `recipe --device amd0 model.rs`. There is no CSV collection phase. `Cargo.toml` defines the tuning policy and the paths for both saved models. New models bootstrap from real workload observations; initialized models continue online. Decisions and measurements go to `recipe.log`. Set `RECIPE_DEBUG=1` for additional diagnostics in that same file.
 
-The [RAT evidence](.docs/RAT-evidence.md) records the controlled VNA comparison and the pretrained state used. Performance depends on that learned state; new or subsequently updated models are not guaranteed to beat the untuned schedule.
-
 ## files
 
 ```bash
@@ -53,10 +51,16 @@ recipe.rs       runtime
 amd-nv-cpu.ll   kernels
 build.rs        compiler
 cli.rs          cli options
-test.rs         combo testing
 ```
 
-## 18 thingys:
+## blocks
+
+```
+frozen.packed.blck.atvn.norm.quant
+```
+
+## 18 thingys
+
 ```rust
 weights:
 	layer(neurons)
@@ -86,7 +90,33 @@ estimators:
 	svm()
 	bayes()
 ```
+
 Feature generation is banned.
+
+## data
+
+```rust
+data(auto)
+	.test(source)
+	.set(source)
+	.include([features])
+	.exclude([features])
+```
+
+## training
+
+```rust
+.seed(value)
+.optimizer(adamw)
+.log(metrics)
+.resume(path)
+```
+
+## losses
+
+```rust
+.loss(mse|rmse|huber|mae|bce|ce|focal)
+```
 
 ## 15 activations
 
@@ -95,7 +125,29 @@ relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
 ```
 
+## 4 normalizations
+
+```rust
+.norm(batch)   per-channel statistics over the batch
+.norm(layer)   per-row statistics over the channels
+.norm(rms)     per-row root mean square, one trainable scale per channel
+.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
+```
+
+`.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
+over its head-width slice, leaving the values untouched:
+
+```rust
+.attn(4).qk(rms)
+```
+
 ## compute precisions
+
+key:<br>
+`.`       optional continue<br>
+`[...]`   optional children<br>
+`|`       chain alternative<br>
+`(...)`   multiple children
 
 ```rust
 .fp(8|16|32|64)
@@ -104,24 +156,25 @@ prelu cos   exp      log    ln     huber  tan
 .tf(32)
 .f(exp, mantissa)
 ```
-
 ## 32 quantizations
 
 ```rust
 quantized integer:
 	.qi(4|5|8).(0|1)
 	.qi(2|6|8).k
-	.qi(3).k[.s|m|l]
-	.qi(4|5).k[.s|m]
+	.qi(3).k.[s|m|l]
+	.qi(4|5).k.[s|m]
 	.qi(4).nf
 importance quantized:
 	.iq(1).(s|m)
 	.iq(2|3).(xxs|xs|s|m)
 	.iq(4).(xs|nl)
 ```
-##### **reporting:**
+
+## observability
 
 ```rust
+.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 
@@ -132,4 +185,24 @@ report.predictions();
 report.r2();
 report.tile();
 report.epoch_seconds();
+```
+
+## clanker docs
+
+### planned
+
+```rust
+.embed(vocab, width)
+.attn(q, k, v) // n heads
+.no(options)     // exclude default model behavior such as bias.
+	.no(bias)
+.recur([...])
+.scale(factor)   // multiply every value from the preceding step by one constant.
+.rope(layout, dimensions, base)
+	neox
+	yarn(factor, og_ctx, b_fast, b_slow)
+branching:
+	let gate = recipe.model().layer(width).gelu();
+	let up = recipe.model().layer(width);
+	let output = gate * up;
 ```

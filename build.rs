@@ -279,7 +279,7 @@ fn exponential_math(arithmetic: &str, name: &str, bias: i32, maximum: i32, shift
 	let infinity = math_literal(arithmetic, f64::INFINITY);
 	let (polynomial, value) = horner_typed("exp.poly", "%r", &reciprocal_factorials(1, 1, terms), arithmetic);
 	format!(
-		"define internal {arithmetic} @{name}.pow2(i32 %k) #1 {{\nentry:\n%biased = add i32 %k, {bias}\n%low = icmp slt i32 %biased, 0\n%floor = select i1 %low, i32 0, i32 %biased\n%high = icmp sgt i32 %floor, {maximum}\n%clamped = select i1 %high, i32 {maximum}, i32 %floor\n{stored}%bits = shl {integer} %stored, {shift}\n%result = bitcast {integer} %bits to {arithmetic}\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}.scale({arithmetic} %value, i32 %k) #1 {{\nentry:\n%half = ashr i32 %k, 1\n%rest = sub i32 %k, %half\n%first = call {arithmetic} @{name}.pow2(i32 %half)\n%second = call {arithmetic} @{name}.pow2(i32 %rest)\n%scaled = fmul {arithmetic} %value, %first\n%result = fmul {arithmetic} %scaled, %second\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}({arithmetic} %x) #1 {{\nentry:\n%unordered = fcmp uno {arithmetic} %x, %x\nbr i1 %unordered, label %quiet, label %high.test\nquiet:\nret {arithmetic} %x\nhigh.test:\n%high = fcmp ogt {arithmetic} %x, {}\nbr i1 %high, label %overflow, label %low.test\noverflow:\nret {arithmetic} {infinity}\nlow.test:\n%low = fcmp olt {arithmetic} %x, {}\nbr i1 %low, label %underflow, label %reduce\nunderflow:\nret {arithmetic} 0.0\nreduce:\n%scaled = fmul {arithmetic} %x, {}\n%shifted = fadd {arithmetic} %scaled, {}\n%kf = call {arithmetic} @llvm.floor.{intrinsic}({arithmetic} %shifted)\n%k = fptosi {arithmetic} %kf to i32\n%upper = fmul {arithmetic} %kf, {}\n%partial = fsub {arithmetic} %x, %upper\n%lower = fmul {arithmetic} %kf, {}\n%r = fsub {arithmetic} %partial, %lower\n{polynomial}%body = fmul {arithmetic} %r, {value}\n%expanded = fadd {arithmetic} {}, %body\n%result = call {arithmetic} @{name}.scale({arithmetic} %expanded, i32 %k)\nret {arithmetic} %result\n}}\n",
+		"define internal {arithmetic} @{name}.pow2(i32 %k) #1 {{\nentry:\n%biased = add i32 %k, {bias}\n%low = icmp slt i32 %biased, 0\n%floor = select i1 %low, i32 0, i32 %biased\n%high = icmp sgt i32 %floor, {maximum}\n%clamped = select i1 %high, i32 {maximum}, i32 %floor\n{stored}%bits = shl {integer} %stored, {shift}\n%result = bitcast {integer} %bits to {arithmetic}\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}.scale({arithmetic} %value, i32 %k) #1 {{\nentry:\n%half = ashr i32 %k, 1\n%rest = sub i32 %k, %half\n%first = call {arithmetic} @{name}.pow2(i32 %half)\n%second = call {arithmetic} @{name}.pow2(i32 %rest)\n%scaled = fmul {arithmetic} %value, %first\n%result = fmul {arithmetic} %scaled, %second\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}({arithmetic} %x) #1 {{\nentry:\n%unordered = fcmp uno {arithmetic} %x, %x\nbr i1 %unordered, label %quiet, label %high.check\nquiet:\nret {arithmetic} %x\nhigh.check:\n%high = fcmp ogt {arithmetic} %x, {}\nbr i1 %high, label %overflow, label %low.check\noverflow:\nret {arithmetic} {infinity}\nlow.check:\n%low = fcmp olt {arithmetic} %x, {}\nbr i1 %low, label %underflow, label %reduce\nunderflow:\nret {arithmetic} 0.0\nreduce:\n%scaled = fmul {arithmetic} %x, {}\n%shifted = fadd {arithmetic} %scaled, {}\n%kf = call {arithmetic} @llvm.floor.{intrinsic}({arithmetic} %shifted)\n%k = fptosi {arithmetic} %kf to i32\n%upper = fmul {arithmetic} %kf, {}\n%partial = fsub {arithmetic} %x, %upper\n%lower = fmul {arithmetic} %kf, {}\n%r = fsub {arithmetic} %partial, %lower\n{polynomial}%body = fmul {arithmetic} %r, {value}\n%expanded = fadd {arithmetic} {}, %body\n%result = call {arithmetic} @{name}.scale({arithmetic} %expanded, i32 %k)\nret {arithmetic} %result\n}}\n",
 		math_literal(arithmetic, high),
 		math_literal(arithmetic, low),
 		math_literal(arithmetic, std::f64::consts::LOG2_E),
@@ -323,7 +323,7 @@ fn alternating_factorials(first: u32, last: u32) -> Vec<f64> {
 fn shared_math(arithmetic: &str) -> String {
 	let mut block = String::new();
 	if arithmetic != "double" {
-		block.push_str("declare double @llvm.floor.f64(double) declare double @llvm.fabs.f64(double)\n");
+		block.push_str("declare double @llvm.floor.f64(double) declare double @llvm.fabs.f64(double) declare double @llvm.fma.f64(double, double, double)\n");
 	}
 	let infinity = constant(f64::INFINITY);
 	let negative_infinity = constant(f64::NEG_INFINITY);
@@ -342,7 +342,7 @@ fn shared_math(arithmetic: &str) -> String {
 	block.push_str(&format!("define internal double @recipe.math.tanh.wide(double %x) #1 {{\nentry:\n%unordered = fcmp uno double %x, %x\nbr i1 %unordered, label %quiet, label %range\nquiet:\nret double %x\nrange:\n%absolute = call double @llvm.fabs.f64(double %x)\n%saturated = fcmp oge double %absolute, {}\nbr i1 %saturated, label %unit, label %compute\nunit:\n%negative = fcmp olt double %x, 0.0\n%signed = select i1 %negative, double -1.0, double 1.0\nret double %signed\ncompute:\n%doubled = fmul double %x, 2.0\n%u = call double @recipe.math.expm1(double %doubled)\n%denominator = fadd double %u, 2.0\n%result = fdiv double %u, %denominator\nret double %result\n}}\n", constant(20.0)));
 	let logarithm_terms = (0..12).map(|term| 1.0 / f64::from(2 * term + 1)).collect::<Vec<_>>();
 	let (logarithm, logarithm_value) = horner("log.poly", "%z", &logarithm_terms);
-	block.push_str(&format!("define internal double @recipe.math.log.wide(double %x) #1 {{\nentry:\n%unordered = fcmp uno double %x, %x\nbr i1 %unordered, label %quiet, label %sign.test\nquiet:\nret double %x\nsign.test:\n%negative = fcmp olt double %x, 0.0\nbr i1 %negative, label %invalid, label %zero.test\ninvalid:\nret double {quiet}\nzero.test:\n%zero = fcmp oeq double %x, 0.0\nbr i1 %zero, label %pole, label %infinite.test\npole:\nret double {negative_infinity}\ninfinite.test:\n%infinite = fcmp oeq double %x, {infinity}\nbr i1 %infinite, label %unbounded, label %normalize\nunbounded:\nret double {infinity}\nnormalize:\n%raw = bitcast double %x to i64\n%subnormal = icmp ult i64 %raw, 4503599627370496\n%boosted = fmul double %x, {}\n%source = select i1 %subnormal, double %boosted, double %x\n%correction = select i1 %subnormal, i32 -54, i32 0\n%bits = bitcast double %source to i64\n%field = lshr i64 %bits, 52\n%narrow = trunc i64 %field to i32\n%unbiased = sub i32 %narrow, 1023\n%exponent = add i32 %unbiased, %correction\n%fraction = and i64 %bits, 4503599627370495\n%unit = or i64 %fraction, 4607182418800017408\n%m = bitcast i64 %unit to double\n%large = fcmp ogt double %m, {}\n%halved = fmul double %m, 0.5\n%mantissa = select i1 %large, double %halved, double %m\n%bump = select i1 %large, i32 1, i32 0\n%e = add i32 %exponent, %bump\n%ef = sitofp i32 %e to double\n%numerator = fsub double %mantissa, 1.0\n%denominator = fadd double %mantissa, 1.0\n%s = fdiv double %numerator, %denominator\n%z = fmul double %s, %s\n{logarithm}%series = fmul double %s, {logarithm_value}\n%twice = fmul double %series, 2.0\n%upper = fmul double %ef, {}\n%lower = fmul double %ef, {}\n%tail = fadd double %twice, %lower\n%result = fadd double %upper, %tail\nret double %result\n}}\n",
+	block.push_str(&format!("define internal double @recipe.math.log.wide(double %x) #1 {{\nentry:\n%unordered = fcmp uno double %x, %x\nbr i1 %unordered, label %quiet, label %sign.check\nquiet:\nret double %x\nsign.check:\n%negative = fcmp olt double %x, 0.0\nbr i1 %negative, label %invalid, label %zero.check\ninvalid:\nret double {quiet}\nzero.check:\n%zero = fcmp oeq double %x, 0.0\nbr i1 %zero, label %pole, label %infinite.check\npole:\nret double {negative_infinity}\ninfinite.check:\n%infinite = fcmp oeq double %x, {infinity}\nbr i1 %infinite, label %unbounded, label %normalize\nunbounded:\nret double {infinity}\nnormalize:\n%raw = bitcast double %x to i64\n%subnormal = icmp ult i64 %raw, 4503599627370496\n%boosted = fmul double %x, {}\n%source = select i1 %subnormal, double %boosted, double %x\n%correction = select i1 %subnormal, i32 -54, i32 0\n%bits = bitcast double %source to i64\n%field = lshr i64 %bits, 52\n%narrow = trunc i64 %field to i32\n%unbiased = sub i32 %narrow, 1023\n%exponent = add i32 %unbiased, %correction\n%fraction = and i64 %bits, 4503599627370495\n%unit = or i64 %fraction, 4607182418800017408\n%m = bitcast i64 %unit to double\n%large = fcmp ogt double %m, {}\n%halved = fmul double %m, 0.5\n%mantissa = select i1 %large, double %halved, double %m\n%bump = select i1 %large, i32 1, i32 0\n%e = add i32 %exponent, %bump\n%ef = sitofp i32 %e to double\n%numerator = fsub double %mantissa, 1.0\n%denominator = fadd double %mantissa, 1.0\n%s = fdiv double %numerator, %denominator\n%z = fmul double %s, %s\n{logarithm}%series = fmul double %s, {logarithm_value}\n%twice = fmul double %series, 2.0\n%upper = fmul double %ef, {}\n%lower = fmul double %ef, {}\n%tail = fadd double %twice, %lower\n%result = fadd double %upper, %tail\nret double %result\n}}\n",
 		constant(f64::from_bits(0x4350000000000000)),
 		constant(std::f64::consts::SQRT_2),
 		constant(f64::from_bits(0x3FE62E42FEE00000)),
@@ -509,6 +509,9 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> Build
 	}
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
+/// Rounding saturates a finite value above the format's range to its largest
+/// finite magnitude. Only a genuine infinity encodes as one, so an activation
+/// that leaves the range cannot make the whole model nonfinite.
 fn custom_numeric() -> String {
 	let mut block = String::from(
 		r#"; NUMERIC BEGIN
@@ -520,8 +523,8 @@ declare double @llvm.floor.f64(double)
 declare i64 @llvm.ctlz.i64(i64, i1)
 declare double @llvm.roundeven.f64(double)
 define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: store atomic i32 %exp, ptr addrspace(3) @recipe_f_exp monotonic, align 4 store atomic i32 %man, ptr addrspace(3) @recipe_f_man monotonic, align 4 ret void }
-define internal double @recipe.f.power(i64 %exponent) #3 { entry: %high = icmp sgt i64 %exponent, 1023 br i1 %high, label %infinity, label %low.test infinity: ret double 0x7FF0000000000000 low.test: %low = icmp slt i64 %exponent, -1074 br i1 %low, label %zero, label %finite zero: ret double 0.0 finite: %normal = icmp sge i64 %exponent, -1022 br i1 %normal, label %power.normal, label %power.subnormal power.normal: %biased = add i64 %exponent, 1023 %normal.bits = shl i64 %biased, 52 %normal.result = bitcast i64 %normal.bits to double ret double %normal.result power.subnormal: %shift = add i64 %exponent, 1074 %subnormal.bits = shl i64 1, %shift %subnormal.result = bitcast i64 %subnormal.bits to double ret double %subnormal.result }
-define internal double @recipe.round(double %value) #3 { entry: %source = bitcast double %value to i64 %sign.source = lshr i64 %source, 63 %absolute.bits = and i64 %source, 9223372036854775807 %absolute = bitcast i64 %absolute.bits to double %exp.word = load atomic i32, ptr addrspace(3) @recipe_f_exp monotonic, align 4 %man.word = load atomic i32, ptr addrspace(3) @recipe_f_man monotonic, align 4 %exp = zext i32 %exp.word to i64 %man = zext i32 %man.word to i64 %total = add i64 %exp, %man %sign = shl i64 %sign.source, %total %exp.shift = sub i64 %exp, 1 %bias.one = shl i64 1, %exp.shift %bias = sub i64 %bias.one, 1 %exponent.one = shl i64 1, %exp %exponent.limit = sub i64 %exponent.one, 1 %mantissa.limit = shl i64 1, %man %nan = fcmp uno double %value, %value br i1 %nan, label %encode.nan, label %infinite.test encode.nan: %quiet.shift = sub i64 %man, 1 %quiet = shl i64 1, %quiet.shift %special.exponent = shl i64 %exponent.limit, %man %nan.base = or i64 %sign, %special.exponent %nan.bits = or i64 %nan.base, %quiet %nan.result = call double @recipe.f.decode(i64 %nan.bits) ret double %nan.result infinite.test: %infinite = fcmp oeq double %absolute, 0x7FF0000000000000 br i1 %infinite, label %encode.infinity, label %zero.test encode.infinity: %infinity.exponent = shl i64 %exponent.limit, %man %infinity.bits = or i64 %sign, %infinity.exponent %infinity.result = call double @recipe.f.decode(i64 %infinity.bits) ret double %infinity.result zero.test: %zero = fcmp oeq double %absolute, 0.0 br i1 %zero, label %encode.zero, label %finite encode.zero: %zero.bits = shl i64 %sign.source, 63 %zero.result = bitcast i64 %zero.bits to double ret double %zero.result finite: %minimum = sub i64 1, %bias %source.exponent.shifted = lshr i64 %absolute.bits, 52 %source.exponent = and i64 %source.exponent.shifted, 2047 %source.mantissa = and i64 %absolute.bits, 4503599627370495 %source.normal = icmp ne i64 %source.exponent, 0 br i1 %source.normal, label %source.normal.exponent, label %source.subnormal.exponent source.normal.exponent: %normal.unbiased = sub i64 %source.exponent, 1023 br label %source.exponent.ready source.subnormal.exponent: %leading.zeros = call i64 @llvm.ctlz.i64(i64 %source.mantissa, i1 false) %highest = sub i64 63, %leading.zeros %subnormal.unbiased = sub i64 %highest, 1074 br label %source.exponent.ready source.exponent.ready: %unbiased = phi i64 [ %normal.unbiased, %source.normal.exponent ], [ %subnormal.unbiased, %source.subnormal.exponent ] %subnormal = icmp slt i64 %unbiased, %minimum br i1 %subnormal, label %encode.subnormal, label %encode.normal encode.subnormal: %minimum.power = call double @recipe.f.power(i64 %minimum) %subnormal.ratio = fdiv double %absolute, %minimum.power %subnormal.scaled = uitofp i64 %mantissa.limit to double %subnormal.value = fmul double %subnormal.ratio, %subnormal.scaled %subnormal.rounded = call double @llvm.roundeven.f64(double %subnormal.value) %subnormal.mantissa = fptoui double %subnormal.rounded to i64 %subnormal.carry = icmp eq i64 %subnormal.mantissa, %mantissa.limit %subnormal.encoded = select i1 %subnormal.carry, i64 %mantissa.limit, i64 %subnormal.mantissa %subnormal.bits = or i64 %sign, %subnormal.encoded %subnormal.result = call double @recipe.f.decode(i64 %subnormal.bits) ret double %subnormal.result encode.normal: %power = call double @recipe.f.power(i64 %unbiased) %ratio = fdiv double %absolute, %power %fraction = fsub double %ratio, 1.0 %mantissa.scale = uitofp i64 %mantissa.limit to double %mantissa.value = fmul double %fraction, %mantissa.scale %mantissa.rounded = call double @llvm.roundeven.f64(double %mantissa.value) %mantissa.initial = fptoui double %mantissa.rounded to i64 %carry = icmp eq i64 %mantissa.initial, %mantissa.limit %carry.value = zext i1 %carry to i64 %final.unbiased = add i64 %unbiased, %carry.value %mantissa = select i1 %carry, i64 0, i64 %mantissa.initial %stored = add i64 %final.unbiased, %bias %overflow = icmp sge i64 %stored, %exponent.limit br i1 %overflow, label %encode.infinity, label %pack pack: %stored.bits = shl i64 %stored, %man %normal.base = or i64 %sign, %stored.bits %normal.bits = or i64 %normal.base, %mantissa %normal.result = call double @recipe.f.decode(i64 %normal.bits) ret double %normal.result }
+define internal double @recipe.f.power(i64 %exponent) #3 { entry: %high = icmp sgt i64 %exponent, 1023 br i1 %high, label %infinity, label %low.check infinity: ret double 0x7FF0000000000000 low.check: %low = icmp slt i64 %exponent, -1074 br i1 %low, label %zero, label %finite zero: ret double 0.0 finite: %normal = icmp sge i64 %exponent, -1022 br i1 %normal, label %power.normal, label %power.subnormal power.normal: %biased = add i64 %exponent, 1023 %normal.bits = shl i64 %biased, 52 %normal.result = bitcast i64 %normal.bits to double ret double %normal.result power.subnormal: %shift = add i64 %exponent, 1074 %subnormal.bits = shl i64 1, %shift %subnormal.result = bitcast i64 %subnormal.bits to double ret double %subnormal.result }
+define internal double @recipe.round(double %value) #3 { entry: %source = bitcast double %value to i64 %sign.source = lshr i64 %source, 63 %absolute.bits = and i64 %source, 9223372036854775807 %absolute = bitcast i64 %absolute.bits to double %exp.word = load atomic i32, ptr addrspace(3) @recipe_f_exp monotonic, align 4 %man.word = load atomic i32, ptr addrspace(3) @recipe_f_man monotonic, align 4 %exp = zext i32 %exp.word to i64 %man = zext i32 %man.word to i64 %total = add i64 %exp, %man %sign = shl i64 %sign.source, %total %exp.shift = sub i64 %exp, 1 %bias.one = shl i64 1, %exp.shift %bias = sub i64 %bias.one, 1 %exponent.one = shl i64 1, %exp %exponent.limit = sub i64 %exponent.one, 1 %mantissa.limit = shl i64 1, %man %nan = fcmp uno double %value, %value br i1 %nan, label %encode.nan, label %infinite.check encode.nan: %quiet.shift = sub i64 %man, 1 %quiet = shl i64 1, %quiet.shift %special.exponent = shl i64 %exponent.limit, %man %nan.base = or i64 %sign, %special.exponent %nan.bits = or i64 %nan.base, %quiet %nan.result = call double @recipe.f.decode(i64 %nan.bits) ret double %nan.result infinite.check: %infinite = fcmp oeq double %absolute, 0x7FF0000000000000 br i1 %infinite, label %encode.infinity, label %zero.check encode.infinity: %infinity.exponent = shl i64 %exponent.limit, %man %infinity.bits = or i64 %sign, %infinity.exponent %infinity.result = call double @recipe.f.decode(i64 %infinity.bits) ret double %infinity.result zero.check: %zero = fcmp oeq double %absolute, 0.0 br i1 %zero, label %encode.zero, label %finite encode.zero: %zero.bits = shl i64 %sign.source, 63 %zero.result = bitcast i64 %zero.bits to double ret double %zero.result finite: %minimum = sub i64 1, %bias %source.exponent.shifted = lshr i64 %absolute.bits, 52 %source.exponent = and i64 %source.exponent.shifted, 2047 %source.mantissa = and i64 %absolute.bits, 4503599627370495 %source.normal = icmp ne i64 %source.exponent, 0 br i1 %source.normal, label %source.normal.exponent, label %source.subnormal.exponent source.normal.exponent: %normal.unbiased = sub i64 %source.exponent, 1023 br label %source.exponent.ready source.subnormal.exponent: %leading.zeros = call i64 @llvm.ctlz.i64(i64 %source.mantissa, i1 false) %highest = sub i64 63, %leading.zeros %subnormal.unbiased = sub i64 %highest, 1074 br label %source.exponent.ready source.exponent.ready: %unbiased = phi i64 [ %normal.unbiased, %source.normal.exponent ], [ %subnormal.unbiased, %source.subnormal.exponent ] %subnormal = icmp slt i64 %unbiased, %minimum br i1 %subnormal, label %encode.subnormal, label %encode.normal encode.subnormal: %minimum.power = call double @recipe.f.power(i64 %minimum) %subnormal.ratio = fdiv double %absolute, %minimum.power %subnormal.scaled = uitofp i64 %mantissa.limit to double %subnormal.value = fmul double %subnormal.ratio, %subnormal.scaled %subnormal.rounded = call double @llvm.roundeven.f64(double %subnormal.value) %subnormal.mantissa = fptoui double %subnormal.rounded to i64 %subnormal.carry = icmp eq i64 %subnormal.mantissa, %mantissa.limit %subnormal.encoded = select i1 %subnormal.carry, i64 %mantissa.limit, i64 %subnormal.mantissa %subnormal.bits = or i64 %sign, %subnormal.encoded %subnormal.result = call double @recipe.f.decode(i64 %subnormal.bits) ret double %subnormal.result encode.normal: %power = call double @recipe.f.power(i64 %unbiased) %ratio = fdiv double %absolute, %power %fraction = fsub double %ratio, 1.0 %mantissa.scale = uitofp i64 %mantissa.limit to double %mantissa.value = fmul double %fraction, %mantissa.scale %mantissa.rounded = call double @llvm.roundeven.f64(double %mantissa.value) %mantissa.initial = fptoui double %mantissa.rounded to i64 %carry = icmp eq i64 %mantissa.initial, %mantissa.limit %carry.value = zext i1 %carry to i64 %final.unbiased = add i64 %unbiased, %carry.value %mantissa = select i1 %carry, i64 0, i64 %mantissa.initial %stored = add i64 %final.unbiased, %bias %overflow = icmp sge i64 %stored, %exponent.limit br i1 %overflow, label %encode.saturate, label %pack encode.saturate: %saturate.exponent = sub i64 %exponent.limit, 1 %saturate.shifted = shl i64 %saturate.exponent, %man %saturate.mantissa = sub i64 %mantissa.limit, 1 %saturate.base = or i64 %sign, %saturate.shifted %saturate.bits = or i64 %saturate.base, %saturate.mantissa %saturate.result = call double @recipe.f.decode(i64 %saturate.bits) ret double %saturate.result pack: %stored.bits = shl i64 %stored, %man %normal.base = or i64 %sign, %stored.bits %normal.bits = or i64 %normal.base, %mantissa %normal.result = call double @recipe.f.decode(i64 %normal.bits) ret double %normal.result }
 define internal double @recipe.f.decode(i64 %bits) #3 { entry: %exp.word = load atomic i32, ptr addrspace(3) @recipe_f_exp monotonic, align 4 %man.word = load atomic i32, ptr addrspace(3) @recipe_f_man monotonic, align 4 %exp = zext i32 %exp.word to i64 %man = zext i32 %man.word to i64 %total = add i64 %exp, %man %negative.bit = lshr i64 %bits, %total %negative = icmp ne i64 %negative.bit, 0 %exp.one = shl i64 1, %exp %exp.limit = sub i64 %exp.one, 1 %man.limit = shl i64 1, %man %shifted = lshr i64 %bits, %man %exponent = and i64 %shifted, %exp.limit %man.mask = sub i64 %man.limit, 1 %mantissa = and i64 %bits, %man.mask %special = icmp eq i64 %exponent, %exp.limit br i1 %special, label %decode.special, label %finite decode.special: %infinity = icmp eq i64 %mantissa, 0 %special.value = select i1 %infinity, double 0x7FF0000000000000, double 0x7FF8000000000000 br label %signed finite: %zero.exp = icmp eq i64 %exponent, 0 br i1 %zero.exp, label %decode.subnormal, label %decode.normal decode.subnormal: %zero.man = icmp eq i64 %mantissa, 0 br i1 %zero.man, label %decode.zero, label %subnormal decode.zero: br label %signed subnormal: %bias.shift = sub i64 %exp, 1 %bias.one = shl i64 1, %bias.shift %bias = sub i64 %bias.one, 1 %subnormal.exponent = sub i64 1, %bias %subnormal.power = call double @recipe.f.power(i64 %subnormal.exponent) %subnormal.man = uitofp i64 %mantissa to double %subnormal.limit = uitofp i64 %man.limit to double %subnormal.fraction = fdiv double %subnormal.man, %subnormal.limit %subnormal.value = fmul double %subnormal.power, %subnormal.fraction br label %signed decode.normal: %normal.bias.shift = sub i64 %exp, 1 %normal.bias.one = shl i64 1, %normal.bias.shift %normal.bias = sub i64 %normal.bias.one, 1 %normal.exponent = sub i64 %exponent, %normal.bias %normal.power = call double @recipe.f.power(i64 %normal.exponent) %normal.man = uitofp i64 %mantissa to double %normal.limit = uitofp i64 %man.limit to double %normal.fraction = fdiv double %normal.man, %normal.limit %normal.significand = fadd double 1.0, %normal.fraction %normal.value = fmul double %normal.power, %normal.significand br label %signed signed: %magnitude = phi double [ %special.value, %decode.special ], [ 0.0, %decode.zero ], [ %subnormal.value, %subnormal ], [ %normal.value, %decode.normal ] %negated = fneg double %magnitude %result = select i1 %negative, double %negated, double %magnitude ret double %result }
 "#,
 	);
@@ -539,8 +542,10 @@ fn custom_ir(ir: String, suffix: &str) -> BuildResult<String> {
 		.replace("@RECIPE_NUMERIC@", &custom_numeric()))
 }
 fn fp8_codec() -> &'static str {
-	r#"define internal float @recipe.decode(i8 %value) #1 { entry: %wide = zext i8 %value to i32 %sign = and i32 %wide, 128 %exponent.shifted = lshr i32 %wide, 2 %exponent = and i32 %exponent.shifted, 31 %mantissa = and i32 %wide, 3 %zero.exponent = icmp eq i32 %exponent, 0 br i1 %zero.exponent, label %subnormal, label %nonzero subnormal: %mantissa.float = uitofp i32 %mantissa to float %negative = icmp ne i32 %sign, 0 %subnormal.value = select i1 %negative, float 0xBEF0000000000000, float 0x3EF0000000000000 %scaled = fmul float %mantissa.float, %subnormal.value ret float %scaled nonzero: %special = icmp eq i32 %exponent, 31 %biased.exponent = add i32 %exponent, 112 %float.exponent = select i1 %special, i32 255, i32 %biased.exponent %float.sign = shl i32 %sign, 24 %float.exponent.bits = shl i32 %float.exponent, 23 %float.mantissa = shl i32 %mantissa, 21 %signed = or i32 %float.sign, %float.exponent.bits %bits = or i32 %signed, %float.mantissa %result = bitcast i32 %bits to float ret float %result }
-define internal i8 @recipe.encode(float %value) #1 { entry: %bits = bitcast float %value to i32 %sign.shifted = lshr i32 %bits, 24 %sign = and i32 %sign.shifted, 128 %absolute = and i32 %bits, 2147483647 %exponent.shifted = lshr i32 %absolute, 23 %exponent = and i32 %exponent.shifted, 255 %mantissa = and i32 %absolute, 8388607 %special = icmp eq i32 %exponent, 255 br i1 %special, label %encode.special, label %finite encode.special: %nan = icmp ne i32 %mantissa, 0 %special.mantissa = select i1 %nan, i32 2, i32 0 %special.base = or i32 %sign, 124 %special.bits = or i32 %special.base, %special.mantissa %special.result = trunc i32 %special.bits to i8 ret i8 %special.result finite: %zero = icmp eq i32 %exponent, 0 br i1 %zero, label %encode.zero, label %range encode.zero: %zero.result = trunc i32 %sign to i8 ret i8 %zero.result range: %unbiased = sub i32 %exponent, 127 %overflow = icmp sgt i32 %unbiased, 15 br i1 %overflow, label %encode.infinity, label %normal.test encode.infinity: %infinity.bits = or i32 %sign, 124 %infinity.result = trunc i32 %infinity.bits to i8 ret i8 %infinity.result normal.test: %normal = icmp sge i32 %unbiased, -14 br i1 %normal, label %encode.normal, label %subnormal.test encode.normal: %stored = add i32 %unbiased, 15 %top = lshr i32 %mantissa, 21 %remainder = and i32 %mantissa, 2097151 %above = icmp ugt i32 %remainder, 1048576 %tie = icmp eq i32 %remainder, 1048576 %odd.bit = and i32 %top, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %top, %increment %carry = lshr i32 %rounded, 2 %final.exponent = add i32 %stored, %carry %rounded.overflow = icmp uge i32 %final.exponent, 31 br i1 %rounded.overflow, label %encode.infinity, label %normal.pack normal.pack: %final.mantissa = and i32 %rounded, 3 %exponent.bits = shl i32 %final.exponent, 2 %normal.base = or i32 %sign, %exponent.bits %normal.bits = or i32 %normal.base, %final.mantissa %normal.result = trunc i32 %normal.bits to i8 ret i8 %normal.result subnormal.test: %too.small = icmp slt i32 %unbiased, -17 br i1 %too.small, label %encode.zero, label %encode.subnormal encode.subnormal: %significand = or i32 %mantissa, 8388608 %shift = sub i32 7, %unbiased %subnormal.top = lshr i32 %significand, %shift %one = shl i32 1, %shift %mask = sub i32 %one, 1 %subnormal.remainder = and i32 %significand, %mask %half.shift = sub i32 %shift, 1 %half = shl i32 1, %half.shift %subnormal.above = icmp ugt i32 %subnormal.remainder, %half %subnormal.tie = icmp eq i32 %subnormal.remainder, %half %subnormal.odd.bit = and i32 %subnormal.top, 1 %subnormal.odd = icmp ne i32 %subnormal.odd.bit, 0 %subnormal.tie.odd = and i1 %subnormal.tie, %subnormal.odd %subnormal.round = or i1 %subnormal.above, %subnormal.tie.odd %subnormal.increment = zext i1 %subnormal.round to i32 %subnormal.mantissa = add i32 %subnormal.top, %subnormal.increment %subnormal.bits = or i32 %sign, %subnormal.mantissa %subnormal.result = trunc i32 %subnormal.bits to i8 ret i8 %subnormal.result }"#
+	// The codec stays out of line. It is the one narrow-float body that branches,
+	// so inlining it at every arithmetic site multiplies the kernel.
+	r#"define internal float @recipe.decode(i8 %value) #3 { entry: %wide = zext i8 %value to i32 %sign = and i32 %wide, 128 %exponent.shifted = lshr i32 %wide, 2 %exponent = and i32 %exponent.shifted, 31 %mantissa = and i32 %wide, 3 %zero.exponent = icmp eq i32 %exponent, 0 br i1 %zero.exponent, label %subnormal, label %nonzero subnormal: %mantissa.float = uitofp i32 %mantissa to float %negative = icmp ne i32 %sign, 0 %subnormal.value = select i1 %negative, float 0xBEF0000000000000, float 0x3EF0000000000000 %scaled = fmul float %mantissa.float, %subnormal.value ret float %scaled nonzero: %special = icmp eq i32 %exponent, 31 %biased.exponent = add i32 %exponent, 112 %float.exponent = select i1 %special, i32 255, i32 %biased.exponent %float.sign = shl i32 %sign, 24 %float.exponent.bits = shl i32 %float.exponent, 23 %float.mantissa = shl i32 %mantissa, 21 %signed = or i32 %float.sign, %float.exponent.bits %bits = or i32 %signed, %float.mantissa %result = bitcast i32 %bits to float ret float %result }
+define internal i8 @recipe.encode(float %value) #3 { entry: %bits = bitcast float %value to i32 %sign.shifted = lshr i32 %bits, 24 %sign = and i32 %sign.shifted, 128 %absolute = and i32 %bits, 2147483647 %exponent.shifted = lshr i32 %absolute, 23 %exponent = and i32 %exponent.shifted, 255 %mantissa = and i32 %absolute, 8388607 %special = icmp eq i32 %exponent, 255 br i1 %special, label %encode.special, label %finite encode.special: %nan = icmp ne i32 %mantissa, 0 %special.mantissa = select i1 %nan, i32 2, i32 0 %special.base = or i32 %sign, 124 %special.bits = or i32 %special.base, %special.mantissa %special.result = trunc i32 %special.bits to i8 ret i8 %special.result finite: %zero = icmp eq i32 %exponent, 0 br i1 %zero, label %encode.zero, label %range encode.zero: %zero.result = trunc i32 %sign to i8 ret i8 %zero.result range: %unbiased = sub i32 %exponent, 127 %overflow = icmp sgt i32 %unbiased, 15 br i1 %overflow, label %encode.infinity, label %normal.check encode.infinity: %infinity.bits = or i32 %sign, 124 %infinity.result = trunc i32 %infinity.bits to i8 ret i8 %infinity.result normal.check: %normal = icmp sge i32 %unbiased, -14 br i1 %normal, label %encode.normal, label %subnormal.check encode.normal: %stored = add i32 %unbiased, 15 %top = lshr i32 %mantissa, 21 %remainder = and i32 %mantissa, 2097151 %above = icmp ugt i32 %remainder, 1048576 %tie = icmp eq i32 %remainder, 1048576 %odd.bit = and i32 %top, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %top, %increment %carry = lshr i32 %rounded, 2 %final.exponent = add i32 %stored, %carry %rounded.overflow = icmp uge i32 %final.exponent, 31 br i1 %rounded.overflow, label %encode.infinity, label %normal.pack normal.pack: %final.mantissa = and i32 %rounded, 3 %exponent.bits = shl i32 %final.exponent, 2 %normal.base = or i32 %sign, %exponent.bits %normal.bits = or i32 %normal.base, %final.mantissa %normal.result = trunc i32 %normal.bits to i8 ret i8 %normal.result subnormal.check: %too.small = icmp slt i32 %unbiased, -17 br i1 %too.small, label %encode.zero, label %encode.subnormal encode.subnormal: %significand = or i32 %mantissa, 8388608 %shift = sub i32 7, %unbiased %subnormal.top = lshr i32 %significand, %shift %one = shl i32 1, %shift %mask = sub i32 %one, 1 %subnormal.remainder = and i32 %significand, %mask %half.shift = sub i32 %shift, 1 %half = shl i32 1, %half.shift %subnormal.above = icmp ugt i32 %subnormal.remainder, %half %subnormal.tie = icmp eq i32 %subnormal.remainder, %half %subnormal.odd.bit = and i32 %subnormal.top, 1 %subnormal.odd = icmp ne i32 %subnormal.odd.bit, 0 %subnormal.tie.odd = and i1 %subnormal.tie, %subnormal.odd %subnormal.round = or i1 %subnormal.above, %subnormal.tie.odd %subnormal.increment = zext i1 %subnormal.round to i32 %subnormal.mantissa = add i32 %subnormal.top, %subnormal.increment %subnormal.bits = or i32 %sign, %subnormal.mantissa %subnormal.result = trunc i32 %subnormal.bits to i8 ret i8 %subnormal.result }"#
 }
 fn bf16_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i16 %value) #1 { entry: %wide = zext i16 %value to i32 %bits = shl i32 %wide, 16 %result = bitcast i32 %bits to float ret float %result }
@@ -569,7 +574,10 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 }
 fn half_ir(ir: String) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
-	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %result = fptrunc float %value to half ret half %result }";
+	// Saturate to the half range before rounding, the way the integer codec clamps
+	// to its own extremes. A plain truncation encodes every larger result as an
+	// infinity, so one overflowing activation makes the whole model nonfinite.
+	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %below = fcmp olt float %value, -65504.0 %above = fcmp ogt float %value, 65504.0 %lowered = select i1 %below, float -65504.0, float %value %clamped = select i1 %above, float 65504.0, float %lowered %result = fptrunc float %clamped to half ret half %result }";
 	let numeric = numeric_program("half", "float", codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", "@contraction_tile_f16").replace("align 8", "align 2");
 	kernel = kernel.replace("RECIPE_STATE_ALIGN", "4").replace("RECIPE_STATE", "float");
@@ -602,22 +610,85 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into())
 }
+fn configured_entry<'a>(manifest: &'a str, key: &str, os: &str) -> BuildResult<Option<&'a str>> {
+	let entries = setting(manifest, key)?.trim().strip_prefix('{').and_then(|value| value.strip_suffix('}')).ok_or_else(|| io::Error::other(format!("{key} must be a platform table")))?;
+	let Some((_, entry)) = entries.split_once(&format!(" {os} = \"")) else { return Ok(None) };
+	entry.split_once('"').map(|(value, _)| Some(value)).ok_or_else(|| io::Error::other(format!("{key} entry for {os} must be quoted")).into())
+}
+fn configured(manifest: &str, key: &str, os: &str) -> BuildResult<Option<String>> {
+	let Some(value) = configured_entry(manifest, key, os)? else { return Ok(None) };
+	let Some(reference) = value.strip_prefix('$') else { return Ok(Some(value.to_owned())) };
+	let (name, inside) = reference.split_once('/').unwrap_or((reference, ""));
+	Ok(env::var_os(name).map(PathBuf::from).map(|root| if inside.is_empty() { root } else { root.join(inside) }.to_string_lossy().into_owned()))
+}
+fn native_configuration(manifest: &str, os: &str) -> u64 {
+	let mut hash = 14695981039346656037_u64;
+	let mut update = |value: &str| {
+		for byte in (value.len() as u64).to_le_bytes().into_iter().chain(value.bytes()) {
+			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+		}
+	};
+	update(manifest);
+	update(os);
+	let marker = format!("{os} = \"$");
+	let mut variables = Vec::new();
+	for line in manifest.lines() {
+		let Some((_, reference)) = line.split_once(&marker) else { continue };
+		let name = reference.split(['/', '"']).next().unwrap_or_default();
+		if variables.contains(&name) {
+			continue;
+		}
+		variables.push(name);
+		println!("cargo:rerun-if-env-changed={name}");
+		update(name);
+		match env::var_os(name) {
+			Some(value) => {
+				update("present");
+				update(&value.to_string_lossy());
+			}
+			None => update("absent"),
+		}
+	}
+	hash
+}
+fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
+	configured(manifest, key, os)?.ok_or_else(|| io::Error::other(format!("{key} is not configured for {os}")).into())
+}
+struct NvidiaToolkit {
+	device_library: PathBuf,
+	required: bool,
+}
+fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
+	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
+	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), required: entry.starts_with('$') }))
+}
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
-	("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"),
+	(
+		"@contraction_tile = external addrspace(3) global [0 x double], align 16",
+		"@contraction_tile = internal thread_local global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16",
+	),
 	(" addrspace(3)", ""),
-	("call i64 @global_id()", "add i64 0, 0"),
+	("call i64 @global_id()", "call i64 @recipe.cpu.thread.wide()"),
 	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
-	("call i64 @recipe.group.id()", "add i64 0, 0"),
-	("call i64 @recipe.grid.groups()", "add i64 1, 0"),
+	("call i64 @recipe.group.id()", "call i64 @recipe.cpu.thread.wide()"),
+	("call i64 @recipe.grid.groups()", "add i64 %threads, 0"),
 	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
 	("call void @llvm.amdgcn.s.barrier()", ""),
 	("call void @recipe.local.barrier()", ""),
-	("call void @grid_barrier(i64 %threads)", ""),
+	("call void @grid_barrier(i64 %threads)", "call void @recipe.cpu.barrier()"),
 	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
 	("declare void @llvm.amdgcn.s.barrier()", ""),
 	("declare i64 @__ockl_steadyctr_u64()", ""),
 	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }"),
 ];
+const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
+@recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
+@recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
+define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
+define internal i64 @recipe.cpu.thread.wide() #1 { entry: %thread = call i32 @recipe.cpu.thread.id() %wide = zext i32 %thread to i64 ret i64 %wide }
+define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
 fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
@@ -666,7 +737,7 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
-fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
 	let probe = source.lines().find(|line| line.starts_with("define protected amdgpu_kernel void @recipe_wave_probe(")).ok_or_else(|| io::Error::other("AMD wave probe method is absent"))?;
 	let probe_path = out.join("recipe-amd-wave-probe.ll");
@@ -689,8 +760,10 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		}
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
-	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
 	for (key, environment) in [
+		("hsa-compiler", "RECIPE_HSA_COMPILER"),
+		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
+		("hsa-occupancy-runtime", "RECIPE_HSA_OCCUPANCY_RUNTIME"),
 		("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"),
 		("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"),
 		("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"),
@@ -698,11 +771,11 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"),
 		("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY"),
 	] {
-		println!("cargo:rustc-env={environment}={}", text(manifest, key)?);
+		println!("cargo:rustc-env={environment}={}", platform(manifest, key, os)?);
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	let ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, NVIDIA_GEOMETRY, NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
@@ -723,21 +796,28 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
-	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", text(manifest, "nvidia-compiler")?);
-	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", text(manifest, "nvidia-device-library")?);
+	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
+	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
+	println!(
+		"cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}",
+		nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?.device_library.display()
+	);
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
-	println!("cargo:rustc-env=RECIPE_NV_PTX_GENERATOR={}", text(manifest, "nvidia-ptx-generator")?);
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
 	let mut ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
-	let clang = text(manifest, "cpu-compiler")?;
-	if !Path::new(clang).exists() {
-		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
+	ir.push_str(&CPU_PARALLEL.replace("RECIPE_CPU_ENTRY_LINKAGE", &platform(manifest, "cpu-entry-linkage", os)?));
+	let clang = platform(manifest, "cpu-compiler", os)?;
+	for (key, tool) in [("cpu-compiler", &clang), ("cpu-linker", &platform(manifest, "cpu-linker", os)?)] {
+		let path = Path::new(tool);
+		if !path.is_absolute() || !path.exists() {
+			return Err(io::Error::other(format!("{key} {tool:?} is not an absolute existing path")).into());
+		}
 	}
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir)? {
@@ -754,6 +834,17 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	println!("cargo:rustc-env=RECIPE_CPU_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_CPU_COMPILER={clang}");
 	println!("cargo:rustc-env=RECIPE_CPU_TARGET={target}");
+	for (key, environment) in [
+		("null-device", "RECIPE_NULL_DEVICE"),
+		("cpu-linker", "RECIPE_CPU_LINKER"),
+		("cpu-linker-driver", "RECIPE_CPU_LINKER_DRIVER"),
+		("cpu-library-flags", "RECIPE_CPU_LIBRARY_FLAGS"),
+		("cpu-link-flags", "RECIPE_CPU_LINK_FLAGS"),
+		("cpu-entry-linkage", "RECIPE_CPU_ENTRY_LINKAGE"),
+		("cpu-module-suffix", "RECIPE_CPU_MODULE_SUFFIX"),
+	] {
+		println!("cargo:rustc-env={environment}={}", platform(manifest, key, os)?);
+	}
 	Ok(())
 }
 fn main() -> BuildResult<()> {
@@ -823,34 +914,48 @@ fn main() -> BuildResult<()> {
 		("rat-shuffles", "RECIPE_RAT_SHUFFLES"),
 		("rat-prediction-shuffles", "RECIPE_RAT_PREDICTION_SHUFFLES"),
 		("rat-observation-epochs", "RECIPE_RAT_OBSERVATION_EPOCHS"),
+		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	for (key, environment) in [
-		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
-		("hsa-occupancy-runtime", "RECIPE_HSA_OCCUPANCY_RUNTIME"),
-		("nvidia-runtime", "RECIPE_NV_RUNTIME"),
-		("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"),
-		("rat-knob-model", "RECIPE_RAT_KNOB_MODEL"),
-	] {
+	for (key, environment) in [("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"), ("rat-knob-model", "RECIPE_RAT_KNOB_MODEL")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
+	let placement = setting(&manifest, "multi-device")?;
+	println!(
+		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",
+		match placement {
+			"false" | "true" => placement,
+			"\"auto\"" => "auto",
+			value => return Err(io::Error::other(format!("multi-device must be false, true, or \"auto\", not {value}")).into()),
+		}
+	);
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
-	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
-	compile_cpu(&manifest, &out)?;
+	let os = env::var("CARGO_CFG_TARGET_OS")?;
+	println!("cargo:rustc-env=RECIPE_NATIVE_CONFIGURATION={:016x}", native_configuration(&manifest, &os));
+	let installed = |key: &str| -> BuildResult<bool> { Ok(configured(&manifest, key, &os)?.is_some_and(|path| Path::new(&path).exists())) };
+	compile_cpu(&manifest, &out, &os)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
-	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-generator")?).exists();
+	let amd = native && installed("hsa-compiler")? && installed("hsa-device-library")?;
+	let toolkit = nvidia_toolkit(&manifest, &os)?;
+	if let Some(toolkit) = &toolkit
+		&& toolkit.required
+		&& !toolkit.device_library.exists()
+	{
+		return Err(io::Error::other(format!("nvidia-toolkit is installed but its device library {} is absent", toolkit.device_library.display())).into());
+	}
+	let nvidia = native && installed("nvidia-compiler")? && toolkit.as_ref().is_some_and(|toolkit| toolkit.device_library.exists());
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out)?;
+		compile_amd(&manifest, &out, &os)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out)?;
+		compile_nvidia(&manifest, &out, &os)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");

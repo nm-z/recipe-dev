@@ -1,15 +1,14 @@
-use std::{
-	fs,
-	os::unix::process::{CommandExt, ExitStatusExt},
-	path::Path,
-	path::PathBuf,
-	process::Command,
-};
+use std::{fs, path::Path, path::PathBuf, process::Command};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 
 const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [argument | export]\n       recipe --worker <device>";
+#[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
+#[cfg(target_os = "linux")]
 const SIGTERM: usize = 15;
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
 	fn prctl(option: i32, argument: usize, third: usize, fourth: usize, fifth: usize) -> i32;
 }
@@ -75,7 +74,7 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
-	let output = directory.join(format!("recipe-script-{}", std::process::id()));
+	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc")
 		.arg("--edition=2024")
@@ -100,6 +99,7 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 	if let Some(argument) = argument {
 		command.arg(argument);
 	}
+	#[cfg(target_os = "linux")]
 	unsafe {
 		command.pre_exec(|| {
 			if prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) == 0 {
@@ -112,11 +112,17 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 	// The running child holds the inode, so unlinking now leaves nothing behind
 	// when this process is killed before it could otherwise clean up.
 	let status = command.spawn().and_then(|mut child| {
+		#[cfg(unix)]
 		fs::remove_file(&output).ok();
 		child.wait()
 	});
+	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
-	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+	#[cfg(unix)]
+	let code = status.code().unwrap_or_else(|| 128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0));
+	#[cfg(not(unix))]
+	let code = status.code().expect("Recipe script exited without a status code");
+	std::process::exit(code);
 }
 
 fn main() {
