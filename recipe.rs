@@ -14989,7 +14989,9 @@ impl Train {
 	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
 	/// Each sample's proposal is scored by the executable.
-	/// Recipe scores the initial proposals and each epoch's updated proposals once.
+	/// Recipe scores one initial sample, then updates and scores one sample per epoch.
+	/// Samples cycle through the loader's shuffled row order without a corpus-wide
+	/// scoring barrier. The final report describes the last scored sample.
 	/// It does not generate additional search or validation proposals.
 	/// The data split selects measured proposals for surrogate fitting.
 	pub fn rat(mut self, command: impl AsRef<Path>) -> Self {
@@ -15106,38 +15108,33 @@ impl Train {
 		input_names.extend_from_slice(&data.target);
 		let source_rows = training_rows;
 		let proposals = Prepared::matrix(
-			prepared.samples[..training_rows * prepared.features].to_vec(),
-			vec![0.0; checked_mul(training_rows, proposal_width, "RAT output shape")?],
-			training_rows,
+			prepared.samples[..prepared.features].to_vec(),
+			vec![0.0; proposal_width],
+			1,
 			proposal_width,
 		)?;
 		let samples = &proposals.samples;
-		let mut composition = command_rat_graph(model, &proposals, training_rows, gpu, config)?;
-		composition.graph.state.training_rows = training_rows;
-		composition.proposer.state.training_rows = training_rows;
+		let mut composition = command_rat_graph(model, &proposals, 1, gpu, config)?;
+		composition.graph.state.training_rows = 1;
+		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
-		let objectives = vec![1.0; training_rows];
+		let objectives = [1.0];
 		let mut tape = NativeTape::new(&composition.graph, samples, &objectives, gpu, config.precision, Some(composition.loss), None, None)?;
 		tape.forward(ForwardMode::Inference)?;
-		let initial_predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
-		let evaluate = |proposals: &[f64]| -> Result<Vec<f64>> {
-			require(proposals.len() == training_rows * proposal_width, "RAT proposal batch has the wrong shape")?;
-			proposals.chunks_exact(proposal_width).zip(samples.chunks_exact(prepared.features)).map(|(proposal, sample)| {
-				let values = sample.iter().chain(proposal).copied().collect::<Vec<_>>();
-				command.evaluate(&input_names, &values)
-			}).collect()
+		let initial_predictions = tape.node_values(composition.proposal, proposal_width)?;
+		let evaluate = |sample: &[f64], proposal: &[f64]| -> Result<f64> {
+			require(sample.len() == prepared.features && proposal.len() == proposal_width, "RAT sample or proposal has the wrong shape")?;
+			let values = sample.iter().chain(proposal).copied().collect::<Vec<_>>();
+			command.evaluate(&input_names, &values)
 		};
-		let rewards = evaluate(&initial_predictions)?;
+		let initial_reward = evaluate(samples, &initial_predictions)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
-		let initial_loss = 1.0 - mean(&rewards);
+		let initial_loss = 1.0 - initial_reward;
 		let mut evaluation_samples = initial_predictions.clone();
-		let mut evaluation_targets = rewards.clone();
-		let mut best_reward = mean(&rewards);
-		let mut best_predictions = initial_predictions.clone();
-		let mut best_parameters = composition.proposer.parameters.clone();
-		let mut best_bn_stats = tape.extract_bn_stats()?;
-		best_bn_stats.truncate(proposer_bn);
+		let mut evaluation_targets = vec![initial_reward];
+		let mut measured_reward = initial_reward;
+		let mut measured_predictions = initial_predictions.clone();
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let fit_evaluator = |graph: &mut Graph, samples: &[f64], targets: &[f64]| -> Result<f64> {
@@ -15156,11 +15153,14 @@ impl Train {
 		};
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
 		let mut epoch_seconds = 0.0;
-		for _ in 0..self.epochs {
+		for iteration in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				return Err(RecipeError::new("interrupted"));
 			}
 			let epoch_started = Instant::now();
+			let row = iteration % source_rows;
+			let sample = &prepared.samples[row * prepared.features..(row + 1) * prepared.features];
+			tape.samples.write_float_bytes(0, sample, tape.precision.model)?;
 			let evaluator_r2 = fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
 			tape.weights.write_float_bytes(
 				checked_mul(composition.offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?,
@@ -15170,18 +15170,12 @@ impl Train {
 			tape.advance()?;
 			let _ = tape.full_epoch(self.learning_rate, config)?;
 			tape.forward(ForwardMode::Inference)?;
-			let predictions = tape.node_values(composition.proposal, training_rows * proposal_width)?;
-			let current = evaluate(&predictions)?;
-			let reward = mean(&current);
-			if reward > best_reward {
-				best_reward = reward;
-				best_predictions.clone_from(&predictions);
-				best_parameters = tape.weights()?[..proposer_parameters].to_vec();
-				best_bn_stats = tape.extract_bn_stats()?;
-				best_bn_stats.truncate(proposer_bn);
-			}
+			let predictions = tape.node_values(composition.proposal, proposal_width)?;
+			let reward = evaluate(sample, &predictions)?;
+			measured_reward = reward;
+			measured_predictions.clone_from(&predictions);
 			evaluation_samples.extend_from_slice(&predictions);
-			evaluation_targets.extend_from_slice(&current);
+			evaluation_targets.push(reward);
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
@@ -15195,21 +15189,21 @@ impl Train {
 		let evaluator_predictions = score(&evaluation_samples)?;
 		let fitted_rows = ((evaluation_targets.len() as f64 * data.split).floor() as usize).max(1);
 		let evaluator_r2 = coefficient(&evaluation_targets[..fitted_rows], &evaluator_predictions[..fitted_rows]);
-		let predicted_reward = mean(&score(&best_predictions)?);
+		let predicted_reward = mean(&score(&measured_predictions)?);
 		let validation_r2 = (fitted_rows < evaluation_targets.len()).then(|| coefficient(&evaluation_targets[fitted_rows..], &evaluator_predictions[fitted_rows..]));
-		let final_loss = 1.0 - best_reward;
+		let final_loss = 1.0 - measured_reward;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
 		tape.capture(&mut composition.graph)?;
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
-		composition.proposer.parameters = best_parameters;
-		composition.proposer.state.training_rows = training_rows;
-		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..source_rows]);
+		composition.proposer.state.training_rows = 1;
+		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..self.epochs.max(1).min(source_rows)]);
 		composition.proposer.state.trained_samples.sort_unstable();
 		composition.proposer.state.trained_samples.dedup();
 		if let Some(path) = &self.save {
 			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, data, None, config.precision, native_target_label(&gpu.native_target));
-			stored.bn_stats = best_bn_stats;
+			stored.bn_stats = tape.extract_bn_stats()?;
+			stored.bn_stats.truncate(proposer_bn);
 			stored.norm_mean.clone_from(&prepared.norm_mean);
 			stored.norm_scale.clone_from(&prepared.norm_scale);
 			stored.outputs.clone_from(&data.target);
@@ -15220,12 +15214,12 @@ impl Train {
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions: best_predictions,
+			predictions: measured_predictions,
 			r2: f64::NAN,
 			evaluator_r2: Some(evaluator_r2),
 			validation_r2,
 			predicted_reward: Some(predicted_reward),
-			measured_reward: Some(best_reward),
+			measured_reward: Some(measured_reward),
 			tile: selected_tile,
 			schedule,
 			run,
