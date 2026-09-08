@@ -9150,9 +9150,18 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 }
 #[cfg(unix)]
 fn local_host() -> Result<String> {
-	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	require(output.status.success(), "cannot read hostname")?;
-	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	// gethostname(3) rather than the hostname(1) executable, which a minimal
+	// image need not carry: a container without it failed device selection
+	// with "cannot read hostname: No such file or directory".
+	unsafe extern "C" {
+		fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
+	}
+	let mut bytes = [0_u8; 256];
+	// The call truncates rather than failing on a long name, and POSIX leaves
+	// truncated output possibly unterminated, so the last byte stays reserved.
+	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query hostname")?;
+	let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 #[cfg(windows)]
