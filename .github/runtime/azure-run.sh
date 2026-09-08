@@ -39,9 +39,32 @@ az account show --query "{name:name, id:id, state:state}" -o json | tee evidence
 
 echo "== selecting available GPU capacity =="
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
-az vm list \
-	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
-	--only-show-errors -o json | tee evidence/azure-gpu-inventory.json
+inventory="$(az vm list --show-details \
+	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
+	--only-show-errors -o json)"
+printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
+
+# The current workflow creates isolated per-run workers. Deallocate only the
+# exact tagged pool left by the superseded controller, so it cannot reserve the
+# subscription's only T4 allocation. The VM remains available for recovery.
+retired_pool="$(jq -r '
+	[.[] | select(
+		.name == "recipe-wgpu-pool"
+		and .recipe_owner == "recipe-gateway-isc"
+		and .recipe_pool == "recipe-windows-nvidia"
+		and .recipe_worker == "recipe-wgpu-pool"
+	)]
+	| if length == 1 then .[0] else empty end
+' <<< "$inventory")"
+if [ -n "$retired_pool" ] && [ "$(jq -r '.power_state' <<< "$retired_pool")" != "VM deallocated" ]; then
+	retired_pool_group="$(jq -r '.resource_group' <<< "$retired_pool")"
+	echo "== deallocating retired runtime pool recipe-wgpu-pool =="
+	az vm deallocate \
+		--resource-group "$retired_pool_group" \
+		--name recipe-wgpu-pool \
+		--only-show-errors
+	echo "retired runtime pool deallocated"
+fi
 
 # Fetch the subscription-aware SKU catalog once, then check quota only in
 # regions where Azure offers this exact shape to this subscription.
