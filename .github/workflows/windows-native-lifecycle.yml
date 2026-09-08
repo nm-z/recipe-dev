@@ -1,4 +1,4 @@
-name: Windows native lifecycle
+name: lifecycle
 
 on:
   pull_request:
@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   windows-native-lifecycle:
+    name: win/cpu
     runs-on: windows-2025
     timeout-minutes: 20
 

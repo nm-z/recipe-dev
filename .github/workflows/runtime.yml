@@ -1,4 +1,4 @@
-name: Recipe runtime
+name: runtime
 
 # Six runtime cells plus a fail-closed aggregate. Every cell executes the same
 # checked-in suite (.github/runtime/suite.rs) against one explicitly selected
@@ -199,7 +199,7 @@ jobs:
   # 1. recipe/linux-cpu  -- Arch userspace on a GitHub runner, CPU backend.
   # ---------------------------------------------------------------------------
   linux-cpu:
-    name: recipe/linux-cpu
+    name: linux/cpu
     needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -334,7 +334,7 @@ jobs:
   # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
   # ---------------------------------------------------------------------------
   linux-gpu:
-    name: recipe/linux-gpu
+    name: linux/nv
     needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -438,7 +438,7 @@ jobs:
   #    coverage from windows-native-lifecycle.yml.
   # ---------------------------------------------------------------------------
   windows-cpu:
-    name: recipe/windows-cpu
+    name: win/cpu
     needs: candidate
     runs-on: windows-2025
     timeout-minutes: 45
@@ -590,7 +590,7 @@ jobs:
   #    GitHub OIDC and managed Run Command.
   # ---------------------------------------------------------------------------
   windows-gpu:
-    name: recipe/windows-gpu
+    name: win/nv
     needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -708,7 +708,7 @@ jobs:
   # 5. recipe/macos-cpu -- native ARM64 macOS, CPU backend.
   # ---------------------------------------------------------------------------
   macos-cpu:
-    name: recipe/macos-cpu
+    name: mac/cpu
     needs: candidate
     runs-on: macos-15
     timeout-minutes: 45
@@ -830,7 +830,7 @@ jobs:
   # 6. recipe/macos-gpu -- the paravirtual Metal device on macos-15 ARM64.
   # ---------------------------------------------------------------------------
   macos-gpu:
-    name: recipe/macos-gpu
+    name: mac/metal
     needs: candidate
     runs-on: macos-15
     timeout-minutes: 60
