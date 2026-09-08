@@ -23,39 +23,89 @@ if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
 fi
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
-LOCATION="${AZURE_LOCATION:-eastus}"
+PREFERRED_LOCATION="${AZURE_LOCATION:-eastus}"
 # Standard_NC4as_T4_v3 is the smallest T4 shape; the quota request targets it.
 SIZE="${AZURE_VM_SIZE:-Standard_NC4as_T4_v3}"
-IMAGE="${AZURE_VM_IMAGE:-Win2022AzureEdition}"
+IMAGE="${AZURE_VM_IMAGE:-MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-core:latest}"
+FAMILY="standardNCASv3_T4Family"
+REQUIRED_CORES=4
 # One worker per run: two candidates must never share a mutable working directory.
 WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
 
 mkdir -p evidence
 
-echo "== subscription and credit =="
+echo "== subscription =="
 az account show --query "{name:name, id:id, state:state}" -o json | tee evidence/azure-account.json
-# Record what is actually left, so the finite trial window is visible in the
-# evidence rather than assumed.
-az consumption budget list --query "[].{name:name, amount:amount, timeGrain:timeGrain}" -o json > evidence/azure-budgets.json || echo "no budget data available"
 
-echo "== confirming GPU quota before provisioning =="
-family="standardNCASv3_T4Family"
-usage="$(az vm list-usage --location "$LOCATION" --query "[?contains(localName, 'NCASv3_T4')].{current:currentValue, limit:limit}" -o json)"
-echo "$usage" | tee evidence/azure-quota.json
-limit="$(echo "$usage" | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["limit"] if rows else 0)')"
-if [ "${limit:-0}" -lt 4 ]; then
+echo "== selecting available GPU capacity =="
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
+quota_records="$(mktemp)"
+regions=("$PREFERRED_LOCATION" eastus2 centralus northcentralus southcentralus westus2 westus3 westus)
+LOCATION=""
+first_eligible=""
+declare -A checked_regions=()
+for region in "${regions[@]}"; do
+	if [ -n "${checked_regions[$region]:-}" ]; then
+		continue
+	fi
+	checked_regions[$region]=yes
+	sku="$(az vm list-skus --location "$region" --resource-type virtualMachines --size "$SIZE" --all --query "[?name=='$SIZE']" -o json --only-show-errors)"
+	if [ "$(jq 'length' <<< "$sku")" -eq 0 ]; then
+		continue
+	fi
+	if ! jq -e '[.[].restrictions[]? | select(.type == "Location")] | length == 0' <<< "$sku" >/dev/null; then
+		continue
+	fi
+	if [ -z "$first_eligible" ]; then
+		first_eligible="$region"
+	fi
+	usage="$(az vm list-usage --location "$region" -o json --only-show-errors)"
+	current="$(jq -r --arg family "$FAMILY" '[.[] | select(((.name.value // "") | ascii_downcase) == ($family | ascii_downcase))][0].currentValue // 0' <<< "$usage")"
+	limit="$(jq -r --arg family "$FAMILY" '[.[] | select(((.name.value // "") | ascii_downcase) == ($family | ascii_downcase))][0].limit // 0' <<< "$usage")"
+	regional_current="$(jq -r '[.[] | select(((.name.value // "") | ascii_downcase) == "cores")][0].currentValue // 0' <<< "$usage")"
+	regional_limit="$(jq -r '[.[] | select(((.name.value // "") | ascii_downcase) == "cores")][0].limit // 0' <<< "$usage")"
+	free=$((limit - current))
+	regional_free=$((regional_limit - regional_current))
+	jq -n \
+		--arg location "$region" \
+		--arg family "$FAMILY" \
+		--argjson current "$current" \
+		--argjson limit "$limit" \
+		--argjson free "$free" \
+		--argjson regional_current "$regional_current" \
+		--argjson regional_limit "$regional_limit" \
+		--argjson regional_free "$regional_free" \
+		'{location:$location, family:$family, current:$current, limit:$limit, free:$free, regional_current:$regional_current, regional_limit:$regional_limit, regional_free:$regional_free}' \
+		>> "$quota_records"
+	if [ "$free" -ge "$REQUIRED_CORES" ] && [ "$regional_free" -ge "$REQUIRED_CORES" ]; then
+		LOCATION="$region"
+		break
+	fi
+done
+jq -s . "$quota_records" | tee evidence/azure-quota.json
+rm -f "$quota_records"
+
+if [ -z "$LOCATION" ]; then
 	cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-quota-unavailable",
-  "detail": "The $family quota in $LOCATION is $limit cores, which cannot host a $SIZE worker. A new Azure account carries zero GPU quota until a quota increase is approved, and the pay-as-you-go upgrade that makes the request eligible removes the credit spending protection.",
-  "resolution": "Obtain explicit billing authorization, upgrade the credit account to pay-as-you-go, then request at least 4 cores of $family in a region that stocks $SIZE."
+  "detail": "No checked US region has $REQUIRED_CORES unused $FAMILY cores and $REQUIRED_CORES unused regional cores for one $SIZE worker.",
+  "resolution": "Increase $FAMILY and total regional vCPU quota in ${first_eligible:-a region that stocks $SIZE}, then rerun this check."
 }
 JSON
 	cat evidence/blocker.json
-	echo "recipe/windows-gpu is blocked: no GPU quota" >&2
+	echo "recipe/windows-gpu is blocked: no unused GPU quota" >&2
 	exit 1
 fi
+echo "selected $LOCATION for $SIZE"
+
+echo "== resolving the Windows image =="
+az vm image show \
+	--location "$LOCATION" \
+	--urn "$IMAGE" \
+	--query '{urn:urn, id:id, architecture:architecture, hyperVGeneration:hyperVGeneration}' \
+	--only-show-errors -o json | tee evidence/azure-image.json
 
 list_worker() {
 	az vm list \
@@ -119,6 +169,7 @@ az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o non
 az vm create \
 	--resource-group "$GROUP" \
 	--name "$WORKER" \
+	--location "$LOCATION" \
 	--image "$IMAGE" \
 	--size "$SIZE" \
 	--admin-username recipeci \
