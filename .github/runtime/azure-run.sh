@@ -44,9 +44,9 @@ inventory="$(az vm list --show-details \
 	--only-show-errors -o json)"
 printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
 
-# The current workflow creates isolated per-run workers. Deallocate only the
-# exact tagged pool left by the superseded controller, so it cannot reserve the
-# subscription's only T4 allocation. The VM remains available for recovery.
+# The current workflow creates isolated per-run workers. Retire only the exact
+# tagged pool left by the superseded controller, including its named resources,
+# so it cannot reserve the subscription's only T4 allocation.
 retired_pool="$(jq -r '
 	[.[] | select(
 		.name == "recipe-wgpu-pool"
@@ -56,14 +56,28 @@ retired_pool="$(jq -r '
 	)]
 	| if length == 1 then .[0] else empty end
 ' <<< "$inventory")"
-if [ -n "$retired_pool" ] && [ "$(jq -r '.power_state' <<< "$retired_pool")" != "VM deallocated" ]; then
+if [ -n "$retired_pool" ]; then
 	retired_pool_group="$(jq -r '.resource_group' <<< "$retired_pool")"
-	echo "== deallocating retired runtime pool recipe-wgpu-pool =="
-	az vm deallocate \
+	echo "== removing retired runtime pool recipe-wgpu-pool =="
+	az vm delete \
 		--resource-group "$retired_pool_group" \
 		--name recipe-wgpu-pool \
+		--yes \
+		--force-deletion true \
 		--only-show-errors
-	echo "retired runtime pool deallocated"
+	for resource in $(az network nic list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
+		az network nic delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
+	done
+	for resource in $(az disk list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
+		az disk delete --resource-group "$retired_pool_group" --name "$resource" --yes --only-show-errors
+	done
+	for resource in $(az network public-ip list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
+		az network public-ip delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
+	done
+	for resource in $(az network nsg list --resource-group "$retired_pool_group" --query "[?starts_with(name,'recipe-wgpu-pool')].name" -o tsv --only-show-errors); do
+		az network nsg delete --resource-group "$retired_pool_group" --name "$resource" --only-show-errors
+	done
+	echo "retired runtime pool removed"
 fi
 
 # Fetch the subscription-aware SKU catalog once, then check quota only in
