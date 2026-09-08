@@ -50,6 +50,29 @@ inventory="$(az vm list --show-details \
 	--only-show-errors -o json)"
 printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
 
+# A forced workflow cancellation can skip the always() cleanup step. Reclaim a
+# prior per-run worker only after GitHub confirms that its owning run completed.
+if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+	while IFS=$'\t' read -r prior_worker prior_group; do
+		if [[ ! "$prior_worker" =~ ^recipe-wgpu-([0-9]+)-([0-9]+)$ ]]; then
+			continue
+		fi
+		prior_run="${BASH_REMATCH[1]}"
+		prior_attempt="${BASH_REMATCH[2]}"
+		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+			echo "could not confirm the owner of prior worker $prior_worker" >&2
+			continue
+		fi
+		if [ "$prior_status" = "completed" ]; then
+			echo "== reclaiming terminal-run worker $prior_worker =="
+			AZURE_RESOURCE_GROUP="$prior_group" \
+			RUN_ID="$prior_run" \
+			RUN_ATTEMPT="$prior_attempt" \
+				bash "$TRUSTED_RUNTIME/azure-cleanup.sh"
+		fi
+	done < <(jq -r --arg current "$WORKER" '.[] | select(.name != $current) | [.name, .resource_group] | @tsv' <<< "$inventory")
+fi
+
 # Fetch the subscription-aware SKU catalog once, then check quota only in
 # regions where Azure offers this exact shape to this subscription.
 sku="$(az vm list-skus --resource-type virtualMachines --size "$SIZE" --all --query "[?name=='$SIZE']" -o json --only-show-errors)"
@@ -226,6 +249,11 @@ az vm create \
 	--nsg-rule NONE \
 	--os-disk-delete-option Delete \
 	--nic-delete-option Delete \
+	--tags \
+		"recipe-owner=recipe-runtime-ci" \
+		"recipe-worker=$WORKER" \
+		"recipe-run-id=$RUN_ID" \
+		"recipe-run-attempt=$RUN_ATTEMPT" \
 	--only-show-errors -o json > evidence/azure-vm.json
 echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with no public address"
 

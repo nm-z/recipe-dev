@@ -579,7 +579,11 @@ jobs:
     if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    concurrency:
+      group: recipe-windows-nvidia
+      cancel-in-progress: false
     permissions:
+      actions: read
       contents: read
       id-token: write
     env:
@@ -589,6 +593,7 @@ jobs:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
       AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
