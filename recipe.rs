@@ -6474,14 +6474,6 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	let mut proposer_model = model.clone();
 	proposer_model.downstream = None;
 	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
-	// A corpus-wide objective has one shared proposal. Freeze the input
-	// coefficients so every source row receives the same learned values.
-	let first = proposer.nodes.first().ok_or_else(|| RecipeError::new("RAT requires a proposal layer"))?;
-	require(first.op == Primitive::Contraction && first.source == -1, "a shared RAT proposal must start with a linear layer")?;
-	require(proposer.nodes.iter().skip(1).all(|node| node.source >= 0 && node.second != -1), "a shared RAT proposal cannot bypass its first layer")?;
-	let end = first.offset + first.parameters - first.output.channels;
-	proposer.parameters[first.offset..end].fill(0.0);
-	proposer.frozen[first.offset..end].fill(1);
 	let proposal_bias = output_bias_offset(&proposer).ok_or_else(|| RecipeError::new("RAT requires a linear output projection"))?;
 	proposer.refresh_storage(config)?;
 	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
@@ -13907,7 +13899,7 @@ impl Train {
 	/// write diagnostics to stderr. Return reward zero for a valid but unsupported
 	/// proposal. Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
-	/// One shared proposal is scored against the executable's observations.
+	/// Each sample's proposal is scored by the executable.
 	/// The data split selects measured proposals for surrogate fitting.
 	pub fn rat(mut self, command: impl AsRef<Path>) -> Self {
 		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")) });
@@ -14012,8 +14004,12 @@ impl Train {
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
 		let source_rows = training_rows;
-		let training_rows = 1;
-		let proposals = Prepared::matrix(vec![0.0; prepared.features], vec![0.0; proposal_width], 1, proposal_width)?;
+		let proposals = Prepared::matrix(
+			prepared.samples[..training_rows * prepared.features].to_vec(),
+			vec![0.0; checked_mul(training_rows, proposal_width, "RAT output shape")?],
+			training_rows,
+			proposal_width,
+		)?;
 		let samples = &proposals.samples;
 		let mut composition = command_rat_graph(model, &proposals, training_rows, gpu, config)?;
 		composition.graph.state.training_rows = training_rows;
