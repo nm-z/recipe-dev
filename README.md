@@ -29,12 +29,18 @@ Use `.include([...])` or `.exclude([...])` to select feature columns. A data sou
 
 ## devices
 
-Select one or more local or host-qualified devices by repeating `--device`:
+Use one `--device` flag with a dot-separated chain. Devices before the first host prefix belong to the machine running the command. A host prefix applies to the following devices until another host prefix appears. Commas and repeated `--device` flags are invalid.
 
 ```text
-recipe --device amd0 model.rs
-recipe --device amd0 --device archy:nv0 model.rs
+recipe run train.rs --device amd0.amd1
+recipe run train.rs --device nv0.cpu
+recipe run train.rs --device engi:amd0.cpu.archy:cpu.nv7.nv8
+recipe --device amd0.archy:nv0 run train.rs
 ```
+
+`cpu` selects the host's available logical-CPU pool, not an individual socket. Numbered CPU selectors are not supported. The `run` keyword is optional.
+
+Unqualified components shaped like device names select devices: on Engi, `nv0.lan:amd0` means Engi's `nv0` and the SSH host `lan`'s `amd0`. A hostname without `:<device>`, such as the final component in `amd0.archy`, is invalid. Missing devices or SSH hosts are errors, not fallback selections.
 
 ## files
 
@@ -43,16 +49,21 @@ recipe.rs       runtime
 amd-nv-cpu.ll   kernels
 build.rs        compiler
 cli.rs          cli options
-test.rs         combo testing
 ```
 
-## 18 thingys:
+## blocks
+
+```
+frozen.packed.blck.atvn.norm.quant
+```
+
+## 18 thingys
+
 ```rust
 weights:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads)
-	attn(q, k, v) // n heads
 	perc(width)
 	rnn(hidden)
 	gru(hidden)
@@ -78,6 +89,7 @@ estimators:
 	svm()
 	bayes()
 ```
+
 Feature generation is banned.
 
 `recur([...])` declares a body once and runs it at every sequence position, reading the position's input and the previous position's output, with one parameter set shared across the positions. The state starts at zero for each independent sequence and there is no iteration count: the input sequence length is the number of steps. Every layer of the body carries the width the recurrence carries, since the body's output is the next position's state.
@@ -97,6 +109,31 @@ A step of `res([...])` or `moe(topk, [...])` is an ordinary model fragment, so a
 ```
 
 Inside the array each step is an expression: `layer(w)`, `conv(f, k)`, `pool(n)`, `perc(w)`, `attn(h)`, `rnn(w)`, `gru(w)`, `lstm(w)`, an activation such as `gelu()`, `normalize(rms)`, `res([...])`, and `moe(topk, [...])`. A step carries its own activation, normalization and query-key normalization through `.act(..)`, `.norm(..)` and `.qk(..)`, exactly as the chained forms do on the outer sequence. The standalone normalization is spelled `normalize` because `norm` already names a log metric. The steps run in order from the incoming activation and the branch adds its last output back to that same activation, so a branch still has to return to the shape it received.
+
+## data
+
+```rust
+data(auto)
+	.test(source)
+	.set(source)
+	.include([features])
+	.exclude([features])
+```
+
+## training
+
+```rust
+.seed(value)
+.optimizer(adamw)
+.log(metrics)
+.resume(path)
+```
+
+## losses
+
+```rust
+.loss(mse|rmse|huber|mae|bce|ce|focal)
+```
 
 ## 15 activations
 
@@ -122,6 +159,7 @@ over its head-width slice, leaving the values untouched:
 ```
 
 ## compute precisions
+
 key:<br>
 `.`       optional continue<br>
 `[...]`   optional children<br>
@@ -149,9 +187,11 @@ importance quantized:
 	.iq(2|3).(xxs|xs|s|m)
 	.iq(4).(xs|nl)
 ```
-##### **reporting:**
+
+## observability
 
 ```rust
+.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 
@@ -162,4 +202,24 @@ report.predictions();
 report.r2();
 report.tile();
 report.epoch_seconds();
+```
+
+## clanker docs
+
+### planned
+
+```rust
+.embed(vocab, width)
+.attn(q, k, v) // n heads
+.no(options)     // exclude default model behavior such as bias.
+	.no(bias)
+.recur([...])
+.scale(factor)   // multiply every value from the preceding step by one constant.
+.rope(layout, dimensions, base)
+	neox
+	yarn(factor, og_ctx, b_fast, b_slow)
+branching:
+	let gate = recipe.model().layer(width).gelu();
+	let up = recipe.model().layer(width);
+	let output = gate * up;
 ```
