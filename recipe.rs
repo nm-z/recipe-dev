@@ -7083,11 +7083,15 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 }
 /// Selects which scored observations train a command RAT surrogate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RatPolicy { History, Rolling, Online, Learned }
+pub enum RatPolicy { History, Rolling, Online, Learned, Full }
 pub const history: RatPolicy = RatPolicy::History;
 pub const rolling: RatPolicy = RatPolicy::Rolling;
 pub const online: RatPolicy = RatPolicy::Online;
 pub const learned: RatPolicy = RatPolicy::Learned;
+/// Scores fresh proposals for every source row each epoch, then updates each
+/// model once. Replaces scored observations while retaining learned state.
+/// The logged score is the mean raw score of the evaluated proposals.
+pub const full: RatPolicy = RatPolicy::Full;
 impl RatPolicy {
 	fn capacity(self, data: &Data, rows: usize) -> Result<usize> {
 		if self == Self::Rolling {
@@ -7096,7 +7100,7 @@ impl RatPolicy {
 			Ok(((rows as f64 * data.split).floor() as usize).max(1))
 		} else {
 			require(!data.split_supplied, ".split() controls only the rolling RAT window")?;
-			Ok(if self == Self::Online { 1 } else { usize::MAX })
+			Ok(match self { Self::Online => 1, Self::Full => rows, _ => usize::MAX })
 		}
 	}
 }
@@ -13322,7 +13326,7 @@ fn native_matrix_path(matrix_capable: bool, shape: Tile, fragment: u32, attentio
 		&& shape.k >= fragment
 		&& attention.iter().flatten().all(|attention| attention.width % fragment == 0)
 }
-fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
+fn native_attention_shared_values(extent: Tile, include_matrix: bool) -> Result<u32> {
 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
 	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
 	let pairs = extent.m.checked_mul(extent.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
@@ -13348,7 +13352,7 @@ fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
 		.zip(query_gradient)
 		.zip(key_value_gradient)
 		.zip(matrix)
-		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
+		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if include_matrix { matrix } else { 0 }))
 		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
 }
 fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32) -> Result<Tile> {
@@ -15799,14 +15803,18 @@ impl Train {
 	/// both when fitting command scores and when differentiating the composition.
 	/// The executable writes exactly one finite real score to stdout.
 	/// Recipe applies smoothstep(max, min, current) using live score extrema; higher
-	/// scores are better. The Score log field retains the raw command score.
+	/// scores are better. The Score log field retains raw scores, averaged for full.
 	/// Any stderr output or unsuccessful exit stops training, even with a score.
 	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
 	/// Each sample's proposal is scored by the executable.
-	/// Recipe scores one initial sample, then updates and scores one sample per epoch.
-	/// Samples cycle through the loader's shuffled row order without a corpus-wide
-	/// scoring barrier. The final report describes the last scored sample.
+	/// Full predicts and scores every source row before one surrogate update and
+	/// one proposer update per epoch. It replaces prior observations and performs
+	/// no initial evaluation. Measured scores describe the evaluated batch; report
+	/// predictions include the final update without another external evaluation.
+	/// Other policies score one initial sample, then update and score one sample
+	/// per epoch in the loader's shuffled row order. Their final report describes
+	/// the last scored sample.
 	/// It does not generate additional search or validation proposals.
 	/// History fits all scored observations; rolling retains the newest
 	/// floor(source_rows * split) observations; online fits only the newest one.
@@ -15927,33 +15935,38 @@ impl Train {
 		require(input_names.len() == prepared.features, "RAT feature names do not match the sample width")?;
 		input_names.extend_from_slice(&data.target);
 		let source_rows = training_rows;
+		let full_set = command.policy == RatPolicy::Full;
+		let proposal_rows = if full_set { source_rows } else { 1 };
 		let proposals = Prepared::matrix(
 			prepared.samples[..prepared.features].to_vec(),
 			vec![0.0; proposal_width],
 			1,
 			proposal_width,
 		)?;
-		let samples = &proposals.samples;
+		let samples = if full_set { &prepared.samples[..checked_mul(source_rows, prepared.features, "RAT proposal inputs")?] } else { proposals.samples.as_slice() };
 		let mut composition = command_rat_graph(model, &proposals, 1, gpu, config)?;
 		composition.graph.state.training_rows = 1;
 		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
-		let objectives = [1.0];
+		let objectives = vec![1.0; proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, samples, &objectives, gpu, config.precision, Some(composition.loss), None, None)?;
 		tape.forward(ForwardMode::Inference)?;
-		let initial_predictions = tape.node_values(composition.proposal, proposal_width)?;
+		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
+		let initial_predictions = tape.node_values(composition.proposal, prediction_count)?;
 		let observation = |sample: &[f64], proposal: &[f64]| -> Result<Vec<f64>> {
 			require(sample.len() == prepared.features && proposal.len() == proposal_width, "RAT sample or proposal has the wrong shape")?;
 			Ok(sample.iter().chain(proposal).copied().collect())
 		};
-		let initial_observation = observation(samples, &initial_predictions)?;
 		let mut replay = RatReplay::new(observation_width, capacity, true)?;
-		let initial_reward = replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?)?;
+		let initial_reward = if full_set { f64::NAN } else {
+			let initial_observation = observation(samples, &initial_predictions)?;
+			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?)?
+		};
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
-		let initial_loss = 1.0 - initial_reward;
+		let mut initial_loss = 1.0 - initial_reward;
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
-		let retained_rows = checked_add(self.epochs, 1, "RAT observation count")?.min(capacity).max(1);
+		let retained_rows = if full_set { source_rows } else { checked_add(self.epochs, 1, "RAT observation count")?.min(capacity).max(1) };
 		fitting.reserve(retained_rows)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
 		if let Some(selector) = &mut selector { selector.ensure_actor(retained_rows, config)?; }
@@ -15969,7 +15982,17 @@ impl Train {
 			}
 			let epoch_started = Instant::now();
 			let row = iteration % source_rows;
-			let sample = &prepared.samples[row * prepared.features..(row + 1) * prepared.features];
+			let sample = if full_set { samples } else { &prepared.samples[row * prepared.features..(row + 1) * prepared.features] };
+			if full_set {
+				replay.rows.clear();
+				replay.raw.clear();
+				// All proposals precede scoring and both optimizer updates.
+				for (features, prediction) in sample.chunks_exact(prepared.features).zip(measured_predictions.chunks_exact(proposal_width)) {
+					if INTERRUPTED.load(Ordering::Acquire) { return Err(RecipeError::new("interrupted")) }
+					let observed = observation(features, prediction)?;
+					replay.observe(&observed, command.evaluate(&input_names, &observed)?)?;
+				}
+			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
 			let evaluator_r2 = if let Some(selector) = &mut selector {
 				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?
@@ -15980,12 +16003,17 @@ impl Train {
 			};
 			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
 			tape.forward(ForwardMode::Inference)?;
-			let predictions = tape.node_values(composition.proposal, proposal_width)?;
-			let observed = observation(sample, &predictions)?;
-			let measured_score = command.evaluate(&input_names, &observed)?;
-			let reward = replay.observe(&observed, measured_score)?;
+			let predictions = tape.node_values(composition.proposal, prediction_count)?;
+			let (measured_score, reward) = if full_set {
+				(replay.raw.iter().sum::<f64>() / replay.raw.len() as f64, mean(&evaluation_targets))
+			} else {
+				let observed = observation(sample, &predictions)?;
+				let raw_score = command.evaluate(&input_names, &observed)?;
+				(raw_score, replay.observe(&observed, raw_score)?)
+			};
+			if full_set && iteration == 0 { initial_loss = 1.0 - reward; }
 			measured_reward = reward;
-			measured_predictions.clone_from(&predictions);
+			measured_predictions = predictions;
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
@@ -15993,15 +16021,20 @@ impl Train {
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
 		let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-		let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
-		let predicted_reward = mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?);
+		let evaluator_r2 = (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions));
+		let predicted_reward = if evaluation_targets.is_empty() { None } else if full_set {
+			Some(mean(&evaluator_predictions))
+		} else {
+			Some(mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?))
+		};
 		let final_loss = 1.0 - measured_reward;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
 		tape.capture(&mut composition.graph)?;
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
-		composition.proposer.state.training_rows = 1;
-		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..self.epochs.max(1).min(source_rows)]);
+		composition.proposer.state.training_rows = proposal_rows;
+		let seen_rows = if full_set { if self.epochs == 0 { 0 } else { source_rows } } else { self.epochs.max(1).min(source_rows) };
+		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..seen_rows]);
 		composition.proposer.state.trained_samples.sort_unstable();
 		composition.proposer.state.trained_samples.dedup();
 		if let Some(path) = &self.save {
@@ -16020,10 +16053,10 @@ impl Train {
 			initial_predictions,
 			predictions: measured_predictions,
 			r2: f64::NAN,
-			evaluator_r2: Some(evaluator_r2),
+			evaluator_r2,
 			validation_r2: None,
-			predicted_reward: Some(predicted_reward),
-			measured_reward: Some(measured_reward),
+			predicted_reward,
+			measured_reward: measured_reward.is_finite().then_some(measured_reward),
 			tile: selected_tile,
 			schedule,
 			run,
