@@ -173,11 +173,11 @@ function Initialize-Toolchain {
 			Write-Output "llvm=install-required"
 		} else {
 			Write-Output "== guest: installing LLVM =="
-			$llvmInstaller = Join-Path $bootstrap "LLVM-18.1.8-win64.exe"
+			$llvmInstaller = Join-Path $bootstrap "LLVM-22.1.0-win64.exe"
 			Invoke-Download `
-				"https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe" `
+				"https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/LLVM-22.1.0-win64.exe" `
 				$llvmInstaller `
-				"94af030060d88cc17e9f00ef1663ebdc1126b35e16bebdfa1e807984b70abd8f"
+				"b31d5f54942e017cb878e594529723dd629cc7b54c9bf7a331e2dc01e8ea5e75"
 			$llvmProcess = Start-Process -FilePath $llvmInstaller -ArgumentList "/S" -Wait -PassThru
 			if ($llvmProcess.ExitCode -ne 0) { throw "LLVM installation failed with exit code $($llvmProcess.ExitCode)" }
 			foreach ($attempt in 1..90) {
