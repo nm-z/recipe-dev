@@ -165,25 +165,30 @@ for worker in $stale; do
 	fi
 done
 
-echo "== orphan NSG watchdog =="
-orphan_nsgs="$(az network nsg list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-') && ends_with(name,'NSG')].name" -o tsv --only-show-errors)" || {
-	echo "could not list runtime NSGs" >&2
-	orphan_nsgs=""
-	cleanup_status=1
-}
-for nsg in $orphan_nsgs; do
-	worker="${nsg%NSG}"
-	if ! current="$(list_vm "$worker")"; then
-		echo "could not determine whether $nsg is orphaned" >&2
+echo "== orphan resource watchdog =="
+for kind in nic disk public-ip nsg; do
+	resources="$(list_resources "$kind" "recipe-wgpu-")" || {
+		echo "could not list runtime $kind resources" >&2
 		cleanup_status=1
 		continue
-	fi
-	if [ -z "$current" ]; then
-		echo "removing orphan NSG $nsg"
-		if ! delete_resource nsg "$nsg"; then
-			cleanup_status=1
+	}
+	while IFS= read -r resource; do
+		if [[ ! "$resource" =~ ^(recipe-wgpu-[0-9]+-[0-9]+) ]]; then
+			continue
 		fi
-	fi
+		worker="${BASH_REMATCH[1]}"
+		if ! current="$(list_vm "$worker")"; then
+			echo "could not determine whether $resource is orphaned" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ -z "$current" ]; then
+			echo "removing orphan $kind $resource"
+			if ! delete_resource "$kind" "$resource"; then
+				cleanup_status=1
+			fi
+		fi
+	done <<< "$resources"
 done
 
 echo "== deleting private transfer blobs =="

@@ -8,7 +8,8 @@
 #
 # No cloud-management credential is ever placed in the guest environment, and
 # no inbound RDP or SSH is opened: Run Command reaches the guest through the
-# Azure control plane.
+# Azure control plane. A Standard public IP provides explicit outbound access;
+# its default NSG has no inbound allow rule.
 set -euo pipefail
 
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
@@ -245,7 +246,9 @@ az vm create \
 	--size "$SIZE" \
 	--admin-username recipeci \
 	--admin-password "$(python3 -c 'import secrets,string; print("Aa1!" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(28)))')" \
-	--public-ip-address "" \
+	--public-ip-address "$WORKER-ip" \
+	--public-ip-address-allocation static \
+	--public-ip-sku Standard \
 	--nsg-rule NONE \
 	--os-disk-delete-option Delete \
 	--nic-delete-option Delete \
@@ -255,7 +258,7 @@ az vm create \
 		"recipe-run-id=$RUN_ID" \
 		"recipe-run-attempt=$RUN_ATTEMPT" \
 	--only-show-errors -o json > evidence/azure-vm.json
-echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with no public address"
+echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with explicit outbound access and no inbound rule"
 
 echo "== installing the NVIDIA GPU driver extension =="
 az vm extension set \
