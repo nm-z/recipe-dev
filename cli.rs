@@ -2,7 +2,7 @@ use std::{fs, path::Path, path::PathBuf, process::Command};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>]... [argument | export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [argument | export]\n       recipe --worker <device>";
 #[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
 #[cfg(target_os = "linux")]
@@ -126,11 +126,9 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 }
 
 fn main() {
-	let mut arguments = std::env::args().skip(1).peekable();
-	if arguments.peek().is_some_and(|argument| argument == "run") {
-		arguments.next();
-	}
+	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
+	let mut run_seen = false;
 	while let Some(argument) = arguments.next() {
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
@@ -142,16 +140,17 @@ fn main() {
 		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if let Some(devices) = &mut device {
-				devices.push(',');
-				devices.push_str(&selected);
-			} else {
-				device = Some(selected);
-			}
+			if device.is_some() { invalid("--device may be specified only once; use a dot-separated device chain") }
+			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
 			invalid(USAGE)
+		}
+		if argument == "run" && source.is_none() {
+			if run_seen { invalid("run may be specified only once") }
+			run_seen = true;
+			continue;
 		}
 		if source.is_none() {
 			source = Some(argument);
@@ -164,13 +163,14 @@ fn main() {
 		invalid(USAGE)
 	}
 	let source = source.unwrap_or_else(|| invalid(USAGE));
+	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
 	let device = device.as_deref();
 	let source = PathBuf::from(source);
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		Some("export") if device.is_some_and(|names| names.contains(',') || names.split_once(':').map_or(names, |(_, devices)| devices).contains('.')) => invalid("export requires one device"),
+		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
 		Some("export") => export(&source, device),
 		values => run(&source, device, values),
 	}
