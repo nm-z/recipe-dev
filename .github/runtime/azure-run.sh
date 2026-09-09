@@ -353,7 +353,7 @@ invoke_guest() {
 		echo "$phase control-plane invocation failed with status $status" >&2
 		return "$status"
 	fi
-	jq -r '.value[] | "--- \(.code) ---\n\(.message // \"\")"' "$document" > "$log"
+	jq -r '.value[] | "--- \(.code) ---\n\(.message // "")"' "$document" > "$log"
 	tail -80 "$log"
 	if ! grep -Fq "$marker" "$log"; then
 		echo "$phase did not report '$marker'" >&2
