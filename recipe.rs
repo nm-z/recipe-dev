@@ -3691,7 +3691,9 @@ fn native_command(mut command: Command, role: &'static str, key: &str, deadline:
 	debug(&format!("native compiler key={key} role={role} command={command:?}"))?;
 	if let Some(deadline) = deadline { deadline.check(role)? }
 	#[cfg(unix)]
-	std::os::unix::process::CommandExt::process_group(&mut command, 0);
+	if deadline.is_some() {
+		std::os::unix::process::CommandExt::process_group(&mut command, 0);
+	}
 	#[cfg(not(unix))]
 	require(deadline.is_none(), "timed compiler cancellation requires Unix process groups")?;
 	let child = command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
@@ -11028,12 +11030,20 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 				header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
 				(driver.store)(queue.doorbell, index as i64);
 				debug(&format!("AMD dispatch submitted grid={:?} workgroup={:?} private={} shared={shared} cooperative={cooperative}", dispatch.geometry.grid, dispatch.geometry.workgroup, dispatch.kernel.private))?;
-				while (driver.wait)(driver.signal, 0, 0, if deadline.is_some() { 0 } else { u64::MAX }, 1) != 0 {
+				loop {
 					let status = driver.queue_error.load(Ordering::Acquire);
 					if status != 0 {
 						driver.reset_queue(queue_handle, cooperative)?;
 						(driver.store)(driver.signal, 0);
 						return Err(RecipeError::Queue(format!("AMD queue failed with HSA status {status:#x}")))
+					}
+					if (driver.wait)(driver.signal, 0, 0, 0, 1) == 0 {
+						break;
+					}
+					if INTERRUPTED.load(Ordering::Acquire) {
+						driver.reset_queue(queue_handle, cooperative)?;
+						(driver.store)(driver.signal, 0);
+						return Err(RecipeError::Interrupted("GPU execution"));
 					}
 					if let Some(deadline) = deadline && deadline.remaining().is_zero() {
 						driver.reset_queue(queue_handle, cooperative)?;
@@ -11165,7 +11175,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		require(sdpcu != 0 && mwvpcu % sdpcu == 0, "AMD waves per SIMD cannot be derived from waves per CU")?;
 		let mwvpsd = mwvpcu / sdpcu;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
-		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
+		let target = format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100);
 		let native_target = BackendTarget::Amd { architecture: target.clone() };
 		let mut isas = HsaHandles { found: Vec::new() };
 		check(iterate_isas(agent, collect_hsa_handle, (&mut isas as *mut HsaHandles).cast()), "ISA query")?;
@@ -11177,16 +11187,15 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			check(isa_info(*isa, 1, name.as_mut_ptr().cast()), "ISA name query")?;
 			isa_names.push(String::from_utf8(name).map_err(|error| RecipeError::new(format!("queried ISA name is not UTF-8: {error}")))?);
 		}
-		let suffix = format!("--{target}");
-		let matching = isas
+		let isa = isas
 			.found
 			.iter()
 			.copied()
 			.zip(&isa_names)
-			.filter_map(|(isa, name)| name.trim_end_matches('\0').ends_with(&suffix).then_some(isa))
-			.collect::<Vec<_>>();
-		require(matching.len() == 1, format!("AMD agent ISAs {isa_names:?} contain {} exact matches for compiler target {target}", matching.len()))?;
-		let isa = matching[0];
+			.filter(|(_, name)| name.trim_end_matches('\0').rsplit_once("--").is_some_and(|(_, processor)| processor.split(':').next() == Some(target.as_str())))
+			.min_by_key(|(_, name)| name.contains(':'))
+			.map(|(isa, _)| isa)
+			.ok_or_else(|| RecipeError::new(format!("AMD agent ISAs {isa_names:?} contain no match for compiler target {target}")))?;
 		let (probe, mut wvmd) = (Path::new(env!("RECIPE_HSA_WAVE_PROBE")), SubgroupModes(0));
 		for mode in [WaveMode::Wave32, WaveMode::Wave64] {
 			if compile_native_artifact(&native_target, &probe, Path::new("/dev/null"), "AMD wave probe", Some(mode), None).is_ok() {
@@ -15237,6 +15246,7 @@ impl Train {
 	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
+		require(self.rat.is_some() || model.downstream.is_none(), ".loss(&model) requires .rat(command)")?;
 		let command_data = self.rat.as_ref().map(|_| prepare_command_data(data)).transpose()?;
 		let prepared = match &command_data {
 			Some(prepared) => prepared,
