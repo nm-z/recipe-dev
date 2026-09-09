@@ -8984,30 +8984,33 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
-fn device_names(selection: &str) -> Result<Vec<String>> {
+/// Parses device selectors into canonical names without opening devices.
+pub fn device_names(selection: &str) -> Result<Vec<String>> {
+	require(!selection.contains(','), "commas are not valid device separators; use one dot-separated device chain")?;
 	let mut names = Vec::new();
-	for group in selection.split(',') {
-		let mut host = String::new();
-		let mut hostname = Vec::new();
-		for part in group.split('.') {
-			require(!part.is_empty(), "device selection contains an empty component")?;
-			let name = if let Some((prefix, name)) = part.split_once(':') {
-				require(!prefix.is_empty(), "device host is empty")?;
-				hostname.push(prefix);
-				host = hostname.join(".");
-				hostname.clear();
-				name
-			} else { part };
-			let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
-			if !gpu && name != "cpu" && !part.contains(':') {
-				hostname.push(part);
-				continue;
-			}
-			require(hostname.is_empty() && (gpu || name == "cpu"), format!("invalid device selector {name:?}; use cpu for the available CPU pool"))?;
-			names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
+	let mut host = String::new();
+	let mut hostname = Vec::new();
+	for part in selection.split('.') {
+		require(!part.is_empty(), "device selection contains an empty component")?;
+		let name = if let Some((prefix, name)) = part.split_once(':') {
+			require(!prefix.is_empty(), "device host is empty")?;
+			hostname.push(prefix);
+			host = hostname.join(".");
+			hostname.clear();
+			name
+		} else { part };
+		let numbered_cpu = name.strip_prefix("cpu").is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()));
+		require(!numbered_cpu, format!("invalid device {name:?}; use cpu for the available CPU pool"))?;
+		let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
+		if !gpu && name != "cpu" && !part.contains(':') {
+			hostname.push(part);
+			continue;
 		}
-		require(hostname.is_empty(), format!("invalid device or incomplete host in {group:?}"))?;
+		require(hostname.is_empty(), format!("host {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
+		require(gpu || name == "cpu", format!("invalid device selector {name:?}; expected amd<number>, nv<number>, or cpu"))?;
+		names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
 	}
+	require(hostname.is_empty(), format!("host {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
 	Ok(names)
 }
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
@@ -9080,8 +9083,8 @@ fn local_host() -> Result<String> {
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
-/// Dots chain devices under the most recent host prefix; commas start a new
-/// local group. `cpu` names the available CPU pool, not a physical socket.
+/// Dots chain devices under the most recent host prefix. Commas are invalid.
+/// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
