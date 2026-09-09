@@ -8616,7 +8616,7 @@ impl RatSearchSpace {
 				let limit = if field == RatField::Rm { self.query.M } else { self.query.N };
 				let block = self.product([RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz], field, "tpwg")?;
 				let fragment = self.selected(RatField::Rdfk).unwrap_or(1);
-				let matrix = self.rat.matrix && [self.query.M, self.query.N, self.query.K].into_iter().all(|extent| u64::from(extent) >= fragment);
+				let matrix = native_matrix_path(self.rat.matrix, Tile { m: self.query.M, n: self.query.N, k: self.query.K }, fragment as u32, &self.attention);
 				let chunk = self.selected(RatField::Rdck).unwrap_or(u64::from(self.query.K) / fragment * fragment);
 				if block == 1 || matrix || self.selected(RatField::K).unwrap_or(1) <= chunk { return range(1, u64::from(limit)) }
 				rat_values(field, (1..=u64::from(limit)).filter(|value| fits(*value))).map(Some)
@@ -10289,7 +10289,7 @@ impl Gpu {
 		let register_storage = [register_m, register_n];
 		let register_count = register_storage[0].checked_mul(register_storage[1]).ok_or_else(|| RecipeError::new("native contraction register storage overflows"))?;
 		let dispatch = knobs.map(Geometry::from_knobs).transpose()?;
-		let bias_columns = contractions.iter().flatten().map(|contraction| contraction.gradient.n.div_ceil(block)).max().unwrap_or(1);
+		let bias_columns = candidates.iter().flatten().flatten().map(|extent| extent.n.div_ceil(block)).max().unwrap_or(1);
 		let minimum_block = dispatch.map_or(block, |geometry| geometry.grid.into_iter().zip(geometry.workgroup)
 			.map(|(grid, width)| { let tail = grid % width; if tail == 0 { width } else { tail } }).product());
 		// Tile tails reduce output lanes, but partial workgroups reduce available
@@ -10843,6 +10843,9 @@ impl Hsa {
 			let forward = self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
 			let epoch = training.then(|| self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+			if training && geometry.is_some() && self.occupancy().is_none() {
+				return Err(RecipeError::Residency("tuned AMD dispatch requires HIP occupancy validation".to_owned()));
+			}
 			if training
 				&& let Some(occupancy) = self.occupancy()
 			{
@@ -12722,7 +12725,8 @@ fn native_attention_shapes(graph: &Graph) -> Result<Vec<Option<NativeAttentionSh
 }
 fn native_matrix_path(matrix_capable: bool, shape: Tile, fragment: u32, attention: &[Option<NativeAttentionShape>]) -> bool {
 	matrix_capable
-		&& fragment != 0
+		&& fragment >= 16
+		&& fragment % 16 == 0
 		&& shape.m >= fragment
 		&& shape.n >= fragment
 		&& shape.k >= fragment

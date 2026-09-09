@@ -44,9 +44,11 @@ recipe run train.rs --device amd0 --device archy:nv0
 
 ## RAT
 
-AMD training tunes the supplied workload through two models. The knob model selects a configuration from the queried device's search space. The bench model learns from measured training time and supplies gradients to the knob model. Training retains the fastest measured configuration after the configured observation budget.
+Native AMD tuning is opt-in: set `rat-enabled = true` under `[package.metadata.recipe]` in `Cargo.toml` and rebuild. The default is `false`. The knob model selects a configuration from the queried device's search space. The bench model learns from measured training time and supplies gradients to the knob model. Training retains the fastest measured configuration after the configured observation budget.
 
-Run the normal entrypoint, such as `recipe --device amd0 model.rs`. There is no CSV collection phase. `Cargo.toml` defines the tuning policy and the paths for both saved models. New models bootstrap from real workload observations; initialized models continue online. Decisions and measurements go to `recipe.log`. Set `RECIPE_DEBUG=1` for additional diagnostics in that same file.
+Run the normal entrypoint, such as `recipe run model.rs --device amd0`. When enabled, tuning publishes both models together in one atomic `<knob stem>.pair.ogdl` bundle beside the configured knob model. Valid legacy knob/bench pairs can be loaded without overwriting them. Unusable tuner state or unavailable HIP occupancy support leaves heuristic training available. Set `RECIPE_DEBUG=1` for additional diagnostics in `recipe.log`.
+
+Command RAT is separate: `.loss(&evaluator)` requires `.rat("<script>")`. It does not enable native AMD tuning or use its persisted models.
 
 ## files
 

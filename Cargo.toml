@@ -40,6 +40,7 @@ rat-enabled = false
 rat-bench-model = "~/.local/share/recipe/rat/bench.ogdl"
 rat-knob-model = "~/.local/share/recipe/rat/knob.ogdl"
 hsa-queue-packets = 256
+# Loaded only for AMD residency validation; an unavailable HIP runtime keeps heuristic scheduling usable.
 hsa-occupancy-runtime = { linux = "libamdhip64.so" }
 topology-probe-bytes = 4194304
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
