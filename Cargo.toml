@@ -47,20 +47,32 @@ gfx1101-vram-write-bytes-per-second = 411117452838
 gfx1101-pcie-host-to-device-bytes-per-second = 28569366764
 gfx1101-pcie-device-to-host-bytes-per-second = 28640691724
 gfx1101-kernel-packet-floor-seconds = 0.000002640
-cpu-compiler = "/usr/bin/clang"
-hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
-hsa-runtime = "libhsa-runtime64.so.1"
-hsa-device-library = "/opt/rocm/amdgcn/bitcode/ocml.bc"
-hsa-clock-library = "/opt/rocm/amdgcn/bitcode/ockl.bc"
-hsa-abi-library = "/opt/rocm/amdgcn/bitcode/oclc_abi_version_600.bc"
-hsa-device-library-directory = "/opt/rocm/amdgcn/bitcode"
-hsa-finite-library = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc"
-hsa-math-library = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc"
+# Zero uses every logical CPU available to the process. A positive value limits the worker count.
+cpu-worker-threads = 0
+# Toolchain values are keyed by target operating system. A value beginning with
+# `$` names the installer-provided environment variable that contains its root.
+null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
+cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
+cpu-linker = { linux = "/usr/bin/ld", macos = "/usr/bin/ld", windows = "$ProgramFiles/LLVM/bin/lld-link.exe" }
+cpu-linker-driver = { linux = "ld", macos = "ld", windows = "lld" }
+cpu-library-flags = { linux = "-fPIC", macos = "-fPIC", windows = "" }
+cpu-entry-linkage = { linux = "", macos = "", windows = "dllexport" }
+cpu-link-flags = { linux = "", macos = "", windows = "-Wl,-noimplib" }
+cpu-module-suffix = { linux = "", macos = "", windows = "@_fltused = dso_local constant i32 39029" }
+hsa-compiler = { linux = "/opt/rocm/lib/llvm/bin/clang" }
+hsa-runtime = { linux = "libhsa-runtime64.so.1" }
+hsa-device-library = { linux = "/opt/rocm/amdgcn/bitcode/ocml.bc" }
+hsa-clock-library = { linux = "/opt/rocm/amdgcn/bitcode/ockl.bc" }
+hsa-abi-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_abi_version_600.bc" }
+hsa-device-library-directory = { linux = "/opt/rocm/amdgcn/bitcode" }
+hsa-finite-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc" }
+hsa-math-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc" }
 nvidia-ptx = "ptx71"
-nvidia-compiler = "/usr/bin/clang"
-nvidia-runtime = "libcuda.so.1"
-nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
-nvidia-ptx-generator = "/usr/bin/llc"
+nvidia-compiler = { linux = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
+nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
+nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
+nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
+nvidia-ptx-generator = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc.exe" }
 
 [package.metadata.train]
 epochs = 210
@@ -94,6 +106,7 @@ surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
 random-seed = 17
+progress-refresh-hz = 240
 normalization-epsilon = 0.00001
 categorical-ratio = 0.5
 leak-slope = 0.01

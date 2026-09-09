@@ -25,21 +25,22 @@ recipe.train()
 let prediction = recipe.infer("model.ogdl", &input);
 ```
 
+Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
+
 ## devices
 
-Select one or more local or host-qualified devices by repeating `--device`:
+Use one `--device` flag with a dot-separated chain. Devices before the first host prefix belong to the machine running the command. A host prefix applies to the following devices until another host prefix appears. Commas and repeated `--device` flags are invalid.
 
 ```text
-recipe --device amd0 model.rs
-recipe --device amd0 --device archy:nv0 model.rs
-recipe --device amd0 --device archy:* model.rs
+recipe run train.rs --device amd0.amd1
+recipe run train.rs --device nv0.cpu
+recipe run train.rs --device engi:amd0.cpu.archy:cpu.nv7.nv8
+recipe --device amd0.archy:nv0 run train.rs
 ```
 
-A `host:*` selector expands into every device that host reports, so each route candidate carries a concrete `host:device` identity. Quote it when the shell would otherwise glob it.
+`cpu` selects the host's available logical-CPU pool, not an individual socket. Numbered CPU selectors are not supported. The `run` keyword is optional.
 
-Recipe measures each selected link and each device's gradient throughput before it places training rows. It keeps the tape on the primary device when the measured multi-device placement is not faster.
-
-`recipe --worker <device>` serves one local GPU over stdin and stdout, and `recipe --devices` lists this host's devices for an expanding selector. Recipe starts both transport entrypoints through SSH for a host-qualified selector. They are protocol endpoints, not model script invocations.
+Unqualified components shaped like device names select devices: on Engi, `nv0.lan:amd0` means Engi's `nv0` and the SSH host `lan`'s `amd0`. A hostname without `:<device>`, such as the final component in `amd0.archy`, is invalid. Missing devices or SSH hosts are errors, not fallback selections.
 
 ## files
 
@@ -48,10 +49,16 @@ recipe.rs       runtime
 amd-nv-cpu.ll   kernels
 build.rs        compiler
 cli.rs          cli options
-test.rs         combo testing
 ```
 
-## 18 thingys:
+## blocks
+
+```
+frozen.packed.blck.atvn.norm.quant
+```
+
+## 18 thingys
+
 ```rust
 weights:
 	layer(neurons)
@@ -81,7 +88,33 @@ estimators:
 	svm()
 	bayes()
 ```
+
 Feature generation is banned.
+
+## data
+
+```rust
+data(auto)
+	.test(source)
+	.set(source)
+	.include([features])
+	.exclude([features])
+```
+
+## training
+
+```rust
+.seed(value)
+.optimizer(adamw)
+.log(metrics)
+.resume(path)
+```
+
+## losses
+
+```rust
+.loss(mse|rmse|huber|mae|bce|ce|focal)
+```
 
 ## 15 activations
 
@@ -90,7 +123,29 @@ relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
 ```
 
+## 4 normalizations
+
+```rust
+.norm(batch)   per-channel statistics over the batch
+.norm(layer)   per-row statistics over the channels
+.norm(rms)     per-row root mean square, one trainable scale per channel
+.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
+```
+
+`.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
+over its head-width slice, leaving the values untouched:
+
+```rust
+.attn(4).qk(rms)
+```
+
 ## compute precisions
+
+key:<br>
+`.`       optional continue<br>
+`[...]`   optional children<br>
+`|`       chain alternative<br>
+`(...)`   multiple children
 
 ```rust
 .fp(8|16|32|64)
@@ -99,24 +154,25 @@ prelu cos   exp      log    ln     huber  tan
 .tf(32)
 .f(exp, mantissa)
 ```
-
 ## 32 quantizations
 
 ```rust
 quantized integer:
 	.qi(4|5|8).(0|1)
 	.qi(2|6|8).k
-	.qi(3).k[.s|m|l]
-	.qi(4|5).k[.s|m]
+	.qi(3).k.[s|m|l]
+	.qi(4|5).k.[s|m]
 	.qi(4).nf
 importance quantized:
 	.iq(1).(s|m)
 	.iq(2|3).(xxs|xs|s|m)
 	.iq(4).(xs|nl)
 ```
-##### **reporting:**
+
+## observability
 
 ```rust
+.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 
@@ -127,4 +183,24 @@ report.predictions();
 report.r2();
 report.tile();
 report.epoch_seconds();
+```
+
+## clanker docs
+
+### planned
+
+```rust
+.embed(vocab, width)
+.attn(q, k, v) // n heads
+.no(options)     // exclude default model behavior such as bias.
+	.no(bias)
+.recur([...])
+.scale(factor)   // multiply every value from the preceding step by one constant.
+.rope(layout, dimensions, base)
+	neox
+	yarn(factor, og_ctx, b_fast, b_slow)
+branching:
+	let gate = recipe.model().layer(width).gelu();
+	let up = recipe.model().layer(width);
+	let output = gate * up;
 ```

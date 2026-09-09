@@ -1,6 +1,6 @@
-use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
+use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --devices\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [export]\n       recipe --devices\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -63,7 +63,7 @@ fn run(source: &Path, device: Option<&str>) {
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
-	let output = directory.join(format!("recipe-script-{}", std::process::id()));
+	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc")
 		.arg("--edition=2024")
@@ -85,19 +85,20 @@ fn run(source: &Path, device: Option<&str>) {
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
-	// The running child holds the inode, so unlinking now leaves nothing behind
-	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| {
-		fs::remove_file(&output).ok();
-		child.wait()
-	});
+	let status = command.status();
+	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
-	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+	#[cfg(unix)]
+	let code = status.code().unwrap_or_else(|| 128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0));
+	#[cfg(not(unix))]
+	let code = status.code().expect("Recipe script exited without a status code");
+	std::process::exit(code);
 }
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
+	let mut run_seen = false;
 	while let Some(argument) = arguments.next() {
 		if argument == "--devices" {
 			let names = recipe::worker_devices().unwrap_or_else(|error| {
@@ -119,16 +120,17 @@ fn main() {
 		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if let Some(devices) = &mut device {
-				devices.push(',');
-				devices.push_str(&selected);
-			} else {
-				device = Some(selected);
-			}
+			if device.is_some() { invalid("--device may be specified only once; use a dot-separated device chain") }
+			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
 			invalid(USAGE)
+		}
+		if argument == "run" && source.is_none() {
+			if run_seen { invalid("run may be specified only once") }
+			run_seen = true;
+			continue;
 		}
 		if source.is_none() {
 			source = Some(argument);
@@ -141,6 +143,7 @@ fn main() {
 		invalid(USAGE)
 	}
 	let source = source.unwrap_or_else(|| invalid(USAGE));
+	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
 	let device = device.as_deref();
 	let source = PathBuf::from(source);
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
@@ -148,7 +151,7 @@ fn main() {
 	}
 	match operation.as_deref() {
 		None => run(&source, device),
-		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
+		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
 		Some("export") => export(&source, device),
 		Some(_) => invalid(USAGE),
 	}
