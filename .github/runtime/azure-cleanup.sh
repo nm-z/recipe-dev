@@ -42,6 +42,7 @@ list_resources() {
 		disk) az disk list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		nic) az network nic list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		public-ip) az network public-ip list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
+		nsg) az network nsg list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -53,6 +54,7 @@ delete_resource() {
 		disk) az disk delete --resource-group "$GROUP" --name "$name" --yes --only-show-errors ;;
 		nic) az network nic delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
 		public-ip) az network public-ip delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
+		nsg) az network nsg delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -113,7 +115,7 @@ remove_worker() {
 		status=1
 	fi
 
-	for kind in disk nic public-ip; do
+	for kind in disk nic public-ip nsg; do
 		local resources
 		if ! resources="$(list_resources "$kind" "$name")"; then
 			status=1
@@ -162,6 +164,101 @@ for worker in $stale; do
 		fi
 	fi
 done
+
+echo "== orphan resource watchdog =="
+for kind in nic disk public-ip nsg; do
+	resources="$(list_resources "$kind" "recipe-wgpu-")" || {
+		echo "could not list runtime $kind resources" >&2
+		cleanup_status=1
+		continue
+	}
+	while IFS= read -r resource; do
+		if [[ ! "$resource" =~ ^(recipe-wgpu-[0-9]+-[0-9]+) ]]; then
+			continue
+		fi
+		worker="${BASH_REMATCH[1]}"
+		if ! current="$(list_vm "$worker")"; then
+			echo "could not determine whether $resource is orphaned" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ -z "$current" ]; then
+			echo "removing orphan $kind $resource"
+			if ! delete_resource "$kind" "$resource"; then
+				cleanup_status=1
+			fi
+		fi
+	done <<< "$resources"
+done
+
+echo "== deleting private transfer blobs =="
+if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ]; then
+	for blob in \
+		"runtime/windows/${RUN}-${ATTEMPT}/snapshot.tar.gz" \
+		"runtime/windows/${RUN}-${ATTEMPT}/runtime-suite.tar.gz"; do
+		if ! blob_exists="$(az storage blob exists \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--name "$blob" \
+			--query exists -o tsv --only-show-errors)"; then
+			echo "could not determine whether $blob exists" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ "$blob_exists" = "true" ]; then
+			echo "deleting $blob"
+			if ! az storage blob delete \
+				--auth-mode login \
+				--account-name "$AZURE_STORAGE_ACCOUNT" \
+				--container-name "$AZURE_STORAGE_CONTAINER" \
+				--name "$blob" \
+				--only-show-errors -o none; then
+				cleanup_status=1
+			fi
+		fi
+	done
+else
+	echo "storage transfer is not configured"
+fi
+
+echo "== terminal transfer watchdog =="
+if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ] && command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+	blobs="$(az storage blob list \
+		--auth-mode login \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--prefix "runtime/windows/" \
+		--query "[].name" -o tsv --only-show-errors)" || {
+		echo "could not list prior runtime transfer blobs" >&2
+		blobs=""
+		cleanup_status=1
+	}
+	while IFS= read -r blob; do
+		if [[ ! "$blob" =~ ^runtime/windows/([0-9]+)-([0-9]+)/(snapshot\.tar\.gz|runtime-suite\.tar\.gz)$ ]]; then
+			continue
+		fi
+		prior_run="${BASH_REMATCH[1]}"
+		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+			echo "could not confirm the owner of prior transfer $blob" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ "$prior_status" = "completed" ]; then
+			echo "deleting terminal-run transfer $blob"
+			if ! az storage blob delete \
+				--auth-mode login \
+				--account-name "$AZURE_STORAGE_ACCOUNT" \
+				--container-name "$AZURE_STORAGE_CONTAINER" \
+				--name "$blob" \
+				--only-show-errors -o none; then
+				cleanup_status=1
+			fi
+		fi
+	done <<< "$blobs"
+else
+	echo "terminal transfer recovery is unavailable"
+fi
 
 echo "== residual resources for $WORKER =="
 residual="$(az resource list --resource-group "$GROUP" --query "[?starts_with(name,'$WORKER')].{name:name, type:type}" -o table --only-show-errors)" || {
