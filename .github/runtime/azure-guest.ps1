@@ -259,10 +259,10 @@ try {
 		-RedirectStandardError $runStderr
 	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
 	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
+	Write-Output $log
 	if ($runProcess.ExitCode -ne 0) { throw "the runtime suite failed with exit code $($runProcess.ExitCode)" }
 	Pop-Location
 
-	Write-Output $log
 	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
 	$route = ([regex]::Match($log, '(?m)^selected route (\S+)')).Groups[1].Value
 	if (-not $route) { throw "no route line: the suite did not dispatch" }
