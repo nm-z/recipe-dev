@@ -3213,7 +3213,7 @@ impl NativeModelIr {
 			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
 			.replace("RECIPE_REGISTER_N", &self.schedule.register_n.to_string())
 			.replace("RECIPE_REGISTER_ROWS", &register_rows.to_string())
-			.replace("RECIPE_REGISTER_COLUMNS", &register_columns.to_string())
+			.replace("RECIPE_REGISTER_COLUMNS", &self.schedule.bias_columns.to_string())
 			.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
 			.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
 			.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
@@ -7034,6 +7034,7 @@ struct RatTraining {
 	config: RatConfig,
 	models: RatModels,
 	query: Query,
+	attention: Vec<Option<NativeAttentionShape>>,
 	seed: u64,
 	choice: RatChoice,
 	best: Option<(f64, RatChoice)>,
@@ -7062,11 +7063,11 @@ fn rat_graph(model: &Model, prepared: &Prepared, gpu: &'static Gpu, config: Conf
 	let benchmark = compile(benchmark, &observations, &observations.targets, 1, gpu, config, true)?;
 	Ok(RatComposition { proposer: graph, benchmark })
 }
-fn rat_query(graph: &Graph, rows: usize, gpu: &'static Gpu) -> Result<Query> {
+fn rat_query(graph: &Graph, rows: usize, gpu: &'static Gpu) -> Result<(Query, Vec<Option<NativeAttentionShape>>)> {
 	let shapes = native_contraction_shapes(graph, rows)?;
 	let (limits, dominant) = native_contraction_bounds(&shapes)?;
 	let load = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.forward);
-	Ok(gpu.query()?.with_load([load.m, load.n, load.k]))
+	Ok((gpu.query()?.with_load([load.m, load.n, load.k]), native_attention_shapes(graph)?))
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
@@ -7859,6 +7860,11 @@ struct Tile {
 	n: u32,
 	k: u32,
 }
+#[derive(Clone, Copy, Debug)]
+struct NativeAttentionShape {
+	length: u32,
+	width: u32,
+}
 #[derive(Clone)]
 struct NativeSchedule {
 	matrix: bool,
@@ -7869,6 +7875,7 @@ struct NativeSchedule {
 	register_m: u32,
 	register_n: u32,
 	register_storage: [u32; 2],
+	bias_columns: u32,
 	fragment_k: u32,
 	chunk_k: u32,
 	k_partitions: u32,
@@ -8348,7 +8355,7 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 /// Whether one runtime extent satisfies the contraction body's structural
 /// bounds and fits within the local-memory capacity reserved for candidates.
 fn native_extent_supported(extent: Tile, limits: Tile, matrix: bool, block: u32, register_m: u32, register_n: u32, chunk: u32, ratio: u32, shared_values: u32) -> Result<bool> {
-	if extent.m == 0 || extent.n == 0 || extent.k == 0 {
+	if extent.m == 0 || extent.n == 0 || extent.k == 0 || block == 0 || register_m == 0 || register_n == 0 || chunk == 0 || ratio == 0 {
 		return Ok(false);
 	}
 	if matrix {
@@ -8356,7 +8363,7 @@ fn native_extent_supported(extent: Tile, limits: Tile, matrix: bool, block: u32,
 		require(waves != 0, "native matrix contraction has no wave")?;
 		let m = waves.checked_mul(16).ok_or_else(|| RecipeError::new("native matrix contraction M tile overflows"))?;
 		let n = (block / 2).max(32);
-		return Ok(extent.m == m && extent.n == n && extent.k % chunk == 0 && native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, true) <= u128::from(shared_values));
+		return Ok(extent.m <= m && extent.n <= n && extent.k % chunk == 0 && native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, true) <= u128::from(shared_values));
 	}
 	let (lane_m, lane_n) = (extent.m.div_ceil(register_m), extent.n.div_ceil(register_n));
 	if lane_m > block || lane_n > block || lane_m > block / lane_n {
@@ -8510,14 +8517,15 @@ fn rat_values(field: RatField, values: impl IntoIterator<Item = u64>) -> Result<
 struct RatSearchSpace {
 	query: Query,
 	rat: RatConfig,
+	attention: Vec<Option<NativeAttentionShape>>,
 	chosen: [Option<u64>; Knobs::WIDTH],
 }
 impl RatSearchSpace {
-	fn new(query: Query, rat: RatConfig) -> Result<Self> {
+	fn new(query: Query, rat: RatConfig, attention: &[Option<NativeAttentionShape>]) -> Result<Self> {
 		require(query.M != 0 && query.N != 0 && query.K != 0, "RAT load dimensions must be positive")?;
 		let mut chosen = [None; Knobs::WIDTH];
 		chosen[RatField::Gd as usize] = Some(GridDimensions::Three as u64);
-		Ok(Self { query, rat, chosen })
+		Ok(Self { query, rat, attention: attention.to_vec(), chosen })
 	}
 	fn selected(&self, field: RatField) -> Option<u64> {
 		self.chosen[field as usize]
@@ -8558,9 +8566,12 @@ impl RatSearchSpace {
 			let fragment = selected(RatField::Rdfk);
 			let chunk = chosen(RatField::Rdck).map_or(self.query.K - self.query.K % fragment, |chunk| chunk as u32);
 			let block = [RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz].into_iter().map(selected).product();
-			let matrix = self.rat.matrix && [self.query.M, self.query.N, self.query.K].into_iter().all(|extent| extent >= fragment);
 			let extent = Tile { m: selected(RatField::M), n: selected(RatField::N), k: selected(RatField::K) };
-			native_contraction_shared_values(extent, selected(RatField::Rm), selected(RatField::Rn), block, chunk, self.rat.state_ratio, matrix) * u128::from(self.rat.model_bytes) <= u128::from(self.query.lds)
+			let matrix = native_matrix_path(self.rat.matrix, Tile { m: self.query.M, n: self.query.N, k: self.query.K }, fragment, &self.attention);
+			let contraction = native_contraction_shared_values(extent, selected(RatField::Rm), selected(RatField::Rn), block, chunk, self.rat.state_ratio, matrix);
+			let attention_tiles = native_attention_knob_tiles(&self.attention, extent.m, extent.n);
+			let attention = native_attention_shared_values_for_tiles(&self.attention, &attention_tiles).unwrap_or(u32::MAX);
+			contraction.max(u128::from(attention)) * u128::from(self.rat.model_bytes) <= u128::from(self.query.lds)
 		};
 		let range = |lower: u64, mut upper: u64| {
 			if matches!(field, RatField::M | RatField::N | RatField::K | RatField::Gx | RatField::Gy | RatField::Gz) {
@@ -8825,11 +8836,11 @@ impl RatModels {
 		rat.initial_epochs = rat.initial_epochs.saturating_sub(training.step as usize);
 		Ok(Self { graph, offset, proposer, benchmark, schema, proposer_path, benchmark_path, inference, training, measurement, observations: Vec::new() })
 	}
-	fn choose(&mut self, query: Query, rat: RatConfig, seed: &mut u64, explore: bool) -> Result<RatChoice> {
+	fn choose(&mut self, query: Query, rat: RatConfig, attention: &[Option<NativeAttentionShape>], seed: &mut u64, explore: bool) -> Result<RatChoice> {
 		let mut best: Option<(f64, RatChoice)> = None;
 		for _ in 0..if explore { 1 } else { rat.prediction_shuffles } {
 			let order = shuffle_rat_fields(seed);
-			let mut space = RatSearchSpace::new(query, rat)?;
+			let mut space = RatSearchSpace::new(query, rat, attention)?;
 			let mut decisions = vec![Vec::new(); Knobs::WIDTH];
 			while let Some((field, domain)) = space.next(&order)? {
 				let input = space.decision(field, &domain);
@@ -8905,10 +8916,10 @@ impl RatTraining {
 		let benchmark = recipe.model().layer(config.surrogate_width).tanh().layer(1).exp().loss(huber);
 		let model = recipe.model().layer(config.surrogate_width).tanh().loss(&benchmark);
 		let mut models = RatModels::load(&model, &mut rat, surrogate, config)?;
-		let query = rat_query(graph, rows, gpu)?;
+		let (query, attention) = rat_query(graph, rows, gpu)?;
 		let mut seed = config.random_seed as u64;
-		let choice = models.choose(query, rat, &mut seed, rat.initial_epochs != 0)?;
-		Ok(Self { config: rat, models, query, seed, choice, best: None, updates: 0, timings: Vec::new() })
+		let choice = models.choose(query, rat, &attention, &mut seed, rat.initial_epochs != 0)?;
+		Ok(Self { config: rat, models, query, attention, seed, choice, best: None, updates: 0, timings: Vec::new() })
 	}
 	fn apply<T>(&mut self, config: Config, mut dispatch: impl FnMut(Option<Knobs>) -> Result<T>) -> Result<T> {
 		loop {
@@ -8938,7 +8949,7 @@ impl RatTraining {
 		let updated = self.models.update(self.query, &self.choice, milliseconds, self.config.learning_rate, config)?;
 		self.updates += 1;
 		if self.updates < self.config.initial_epochs + self.config.shuffles {
-			self.choice = self.models.choose(self.query, self.config, &mut self.seed, self.updates < self.config.initial_epochs)?;
+			self.choice = self.models.choose(self.query, self.config, &self.attention, &mut self.seed, self.updates < self.config.initial_epochs)?;
 		} else if let Some((_, best)) = &self.best {
 			self.choice = best.clone();
 		}
@@ -10078,16 +10089,8 @@ impl Gpu {
 			Some(knobs) => knobs.rdfk,
 			None => narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32,
 		};
-		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
-			let heads = integer_argument(node.argument[0], "attention heads")?;
-			require(heads != 0, "attention heads are empty")?;
-			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
-		})?;
-		let matrix = native_matrix_arithmetic(&self.native_target, precision)
-			&& dominant_shape.m >= fragment_k
-			&& dominant_shape.n >= fragment_k
-			&& dominant_shape.k >= fragment_k
-			&& aligned_attention;
+		let attention_shapes = native_attention_shapes(graph)?;
+		let matrix = native_matrix_path(native_matrix_arithmetic(&self.native_target, precision), dominant_shape, fragment_k, &attention_shapes);
 		let waves_per_workgroup = match knobs {
 			Some(knobs) => knobs.wpwg,
 			None if matrix => {
@@ -10172,7 +10175,12 @@ impl Gpu {
 			let mut node = Vec::new();
 			for (limits, selected) in [(shape.forward, heuristic.forward), (shape.gradient, heuristic.gradient), (shape.previous, heuristic.previous)] {
 				node.push(match knobs {
-					Some(_) => vec![selected],
+					Some(_) => {
+						if !native_extent_supported(selected, limits, matrix, block, register_m, register_n, chunk_k, ratio, shared_budget)? {
+							return Err(RecipeError::Residency(format!("RAT contraction tile {}x{}x{} is outside the native schedule bounds", selected.m, selected.n, selected.k)));
+						}
+						vec![selected]
+					}
 					None => native_valid_extents(limits, selected, matrix, block, register_m, register_n, chunk_k, ratio, shared_budget)?,
 				});
 			}
@@ -10186,17 +10194,13 @@ impl Gpu {
 			.max()
 			.unwrap_or(1);
 		let attention = match knobs {
-			Some(knobs) => graph.nodes.iter().map(|node| (node.op == Primitive::Attention).then_some(Tile { m: knobs.m, n: knobs.n, k: knobs.k })).collect(),
+			Some(knobs) => native_attention_knob_tiles(&attention_shapes, knobs.m, knobs.n),
 			None => {
 				let query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
-				native_attention_tiles(graph, shared_budget, query_tile)?
+				native_attention_tiles(&attention_shapes, shared_budget, query_tile)?
 			}
 		};
-		let attention_shared_values = attention
-			.iter()
-			.enumerate()
-			.filter_map(|(index, extent)| extent.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length)))
-			.try_fold(1_u32, |limit, values| values.map(|values| limit.max(values)))?;
+		let attention_shared_values = native_attention_shared_values_for_tiles(&attention_shapes, &attention)?;
 		let shared_values = contraction_shared_values.max(u128::from(attention_shared_values));
 		let shared_bytes = shared_values * precision.bytes() as u128;
 		if shared_bytes > u128::from(self.shared_limit) {
@@ -10204,11 +10208,14 @@ impl Gpu {
 			return Err(if knobs.is_some() { RecipeError::Residency(message) } else { RecipeError::new(message) });
 		}
 		let shared_values = shared_values as u32;
-		let register_storage = if matrix { [register_m, register_n] } else {
-			candidates.iter().flatten().flatten().fold([1, 1], |[m, n], extent| [m.max(register_m.min(extent.m)), n.max(register_n.min(extent.n))])
-		};
+		// The emitted kernels always iterate their full register vectors and use
+		// REGISTER_COUNT as the stride for every exchanged partial. Keep the
+		// storage dimensions identical to those emitted constants, including for
+		// RAT tails that are narrower than rm or rn.
+		let register_storage = [register_m, register_n];
 		let register_count = register_storage[0].checked_mul(register_storage[1]).ok_or_else(|| RecipeError::new("native contraction register storage overflows"))?;
 		let dispatch = knobs.map(Geometry::from_knobs).transpose()?;
+		let bias_columns = contractions.iter().flatten().map(|contraction| contraction.gradient.n.div_ceil(block)).max().unwrap_or(1);
 		let minimum_block = dispatch.map_or(block, |geometry| geometry.grid.into_iter().zip(geometry.workgroup)
 			.map(|(grid, width)| { let tail = grid % width; if tail == 0 { width } else { tail } }).product());
 		// Tile tails reduce output lanes, but partial workgroups reduce available
@@ -10247,6 +10254,7 @@ impl Gpu {
 			register_m,
 			register_n,
 			register_storage,
+			bias_columns,
 			fragment_k,
 			chunk_k,
 			k_partitions,
@@ -12617,6 +12625,30 @@ fn native_contraction_bounds(shapes: &[Option<NativeContractionShapes>]) -> Resu
 	}
 	Ok((limits, dominant))
 }
+fn native_attention_shapes(graph: &Graph) -> Result<Vec<Option<NativeAttentionShape>>> {
+	graph
+		.nodes
+		.iter()
+		.map(|node| {
+			if node.op != Primitive::Attention {
+				return Ok(None);
+			}
+			let heads = integer_argument(node.argument[0], "native attention heads")? as u32;
+			let channels = narrow(node.output.channels, "native attention channels")? as u32;
+			let length = narrow(node.output.length, "native attention length")? as u32;
+			require(heads != 0 && channels % heads == 0, "native attention head partition is invalid")?;
+			Ok(Some(NativeAttentionShape { length, width: channels / heads }))
+		})
+		.collect()
+}
+fn native_matrix_path(matrix_capable: bool, shape: Tile, fragment: u32, attention: &[Option<NativeAttentionShape>]) -> bool {
+	matrix_capable
+		&& fragment != 0
+		&& shape.m >= fragment
+		&& shape.n >= fragment
+		&& shape.k >= fragment
+		&& attention.iter().flatten().all(|attention| attention.width % fragment == 0)
+}
 fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
 	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
@@ -12677,20 +12709,22 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 		queries = queries.checked_sub(1).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("native attention tile does not fit the device"))?;
 	}
 }
-fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32) -> Result<Vec<Option<Tile>>> {
-	graph.nodes
+fn native_attention_tiles(attention: &[Option<NativeAttentionShape>], shared_values: u32, query_tile: u32) -> Result<Vec<Option<Tile>>> {
+	attention
 		.iter()
-		.map(|node| {
-			if node.op != Primitive::Attention {
-				return Ok(None);
-			}
-			let heads = integer_argument(node.argument[0], "native attention heads")? as u32;
-			let channels = narrow(node.output.channels, "native attention channels")? as u32;
-			let length = narrow(node.output.length, "native attention length")? as u32;
-			require(channels % heads == 0, "native attention head partition is invalid")?;
-			native_attention_tile(length, channels / heads, shared_values, query_tile).map(Some)
-		})
+		.map(|shape| shape.map(|shape| native_attention_tile(shape.length, shape.width, shared_values, query_tile)).transpose())
 		.collect()
+}
+fn native_attention_knob_tiles(attention: &[Option<NativeAttentionShape>], m: u32, n: u32) -> Vec<Option<Tile>> {
+	attention.iter().map(|shape| shape.map(|shape| Tile { m, n, k: shape.width })).collect()
+}
+fn native_attention_shared_values_for_tiles(attention: &[Option<NativeAttentionShape>], tiles: &[Option<Tile>]) -> Result<u32> {
+	attention
+		.iter()
+		.zip(tiles)
+		.filter_map(|(shape, extent)| (*shape).zip(*extent))
+		.map(|(shape, extent)| native_attention_shared_values(extent, extent.m == shape.length))
+		.try_fold(1_u32, |limit, values| values.map(|values| limit.max(values)))
 }
 fn native_tiles(total: usize, width: u32, role: &str) -> Result<usize> {
 	let width = width as usize;
@@ -12703,11 +12737,14 @@ fn native_tiles(total: usize, width: u32, role: &str) -> Result<usize> {
 /// half the workgroup holding output positions; the region is sized for that
 /// worst case. `ratio` converts state-typed partial values into model-sized
 /// elements, because the allocation is counted in model elements while the
-/// partials keep the arithmetic width.
+/// partials keep the arithmetic width. The kernel strides each published lane
+/// by the full emitted register storage, even for a tail tile, so the host
+/// reservation must use the same register dimensions rather than the tail's
+/// clipped extents.
 fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, register_n: u32, block: u32, ratio: u32) -> u128 {
 	let output_lanes = u128::from(m.div_ceil(register_m)) * u128::from(n.div_ceil(register_n));
 	let exchange_lanes = output_lanes.min(u128::from(block / 2));
-	exchange_lanes * u128::from(register_m.min(m)) * u128::from(register_n.min(n)) * u128::from(ratio)
+	exchange_lanes * u128::from(register_m) * u128::from(register_n) * u128::from(ratio)
 }
 /// The tile's local memory serves two phases in turn: the staged operands, and
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
