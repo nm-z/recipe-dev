@@ -29,12 +29,18 @@ Use `.include([...])` or `.exclude([...])` to select feature columns. A data sou
 
 ## devices
 
-Select one or more local or host-qualified devices by repeating `--device`:
+Use one `--device` flag with a dot-separated chain. Devices before the first host prefix belong to the machine running the command. A host prefix applies to the following devices until another host prefix appears. Commas and repeated `--device` flags are invalid.
 
 ```text
-recipe --device amd0 model.rs
-recipe --device amd0 --device archy:nv0 model.rs
+recipe run train.rs --device amd0.amd1
+recipe run train.rs --device nv0.cpu
+recipe run train.rs --device engi:amd0.cpu.archy:cpu.nv7.nv8
+recipe --device amd0.archy:nv0 run train.rs
 ```
+
+`cpu` selects the host's available logical-CPU pool, not an individual socket. Numbered CPU selectors are not supported. The `run` keyword is optional.
+
+Unqualified components shaped like device names select devices: on Engi, `nv0.lan:amd0` means Engi's `nv0` and the SSH host `lan`'s `amd0`. A hostname without `:<device>`, such as the final component in `amd0.archy`, is invalid. Missing devices or SSH hosts are errors, not fallback selections.
 
 ## files
 
