@@ -40,6 +40,8 @@ jobs:
           location_file="$scan_directory/added-locations.txt"
           match_file="$scan_directory/matches.txt"
           report_file="$scan_directory/matches.md"
+          : > "$added_file"
+          : > "$location_file"
 
           awk -v added_file="$added_file" \
             -v location_file="$location_file" '
@@ -106,12 +108,14 @@ jobs:
 
           escape_html() {
             sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
-              -e 's/>/\&gt;/g' -e 's/@/\&#64;/g'
+              -e 's/>/\&gt;/g' -e 's/@/\&#64;/g' -e 's/\r/\&#13;/g'
           }
           : > "$report_file"
+          mapfile -t added_lines < "$added_file"
+          mapfile -t locations < "$location_file"
           while IFS=: read -r added_index _; do
-            location="$(sed -n "${added_index}p" "$location_file" | escape_html)"
-            quote="$(sed -n "${added_index}p" "$added_file" | escape_html)"
+            location="$(printf '%s' "${locations[added_index - 1]}" | escape_html)"
+            quote="$(printf '%s' "${added_lines[added_index - 1]}" | escape_html)"
             printf -- '- <a href="%s"><code>%s</code></a>: <pre><code>%s</code></pre>\n' \
               "$files_url" "$location" "$quote" >> "$report_file"
           done < "$match_file"
@@ -121,7 +125,7 @@ jobs:
           {
             printf '## Banned whole word in added diff\n\n'
             printf 'Closed automatically because added content in this pull request\x27s current diff contains the banned whole word `%s`. Remove it from the current diff, then reopen this PR.\n\n' "$banned_fragment"
-            printf 'The scan covers only added lines in the current diff. Commit history, title, body, and file paths are not scanned.\n\n'
+            printf 'The scan covers only added lines in the current diff. Commit history, title, body, file paths, PR comments, and linked issue comments are not scanned.\n\n'
             printf 'Matches (file and current line):\n\n'
           } > "$scan_directory/comment.md"
 
