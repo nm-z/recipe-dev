@@ -6861,7 +6861,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	compile_to_shape(model, data, targets, rows, gpu, config, initialize, Shape { channels: data.target_width, length: 1 })
 }
-/// Compiles a model while retaining a caller-selected output shape. The public
+/// Compiles a model while retaining a caller-selected output shape. The default
 /// compiler path above continues to project every model to a flat target width;
 /// learned replay uses this internal form for sequence-valued selector outputs
 /// and whole-selection scores.
@@ -7066,6 +7066,247 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	graph.frozen[offset..].fill(1);
 	graph.refresh_storage(config)?;
 	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset })
+}
+
+/// A selector and a scorer are rebuilt when the number of replay observations
+/// grows. Their convolution and pooling weights do not depend on that length,
+/// so matching parameter spans and optimizer state are carried into the new
+/// graph instead of allocating a length-sized output projection or resetting
+/// the learned model.
+struct LearnedSelector {
+	graph: Graph,
+	hidden: usize,
+	precision: Compute,
+}
+struct LearnedSelectionScore {
+	graph: Graph,
+	fit: RatFit,
+	hidden: usize,
+	precision: Compute,
+}
+struct LearnedReplay {
+	width: usize,
+	gpu: &'static Gpu,
+	selector: Option<LearnedSelector>,
+	selection_score: Option<LearnedSelectionScore>,
+}
+
+impl LearnedReplay {
+	fn new(width: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
+		require(width != 0, "learned RAT observation width must be positive")?;
+		require(config.surrogate_width != 0, "learned RAT hidden width must be positive")?;
+		Ok(Self { width, gpu, selector: None, selection_score: None })
+	}
+
+	fn ensure_selector(&mut self, length: usize, config: Config) -> Result<()> {
+		let hidden = config.surrogate_width;
+		let precision = config.precision;
+		if self.selector.as_ref().is_some_and(|model| model.graph.input == Shape { channels: self.width, length } && model.graph.output == Shape { channels: 1, length } && model.hidden == hidden && model.precision == precision) {
+			return Ok(())
+		}
+		let previous = self.selector.take();
+		let shape = Shape { channels: self.width, length };
+		let data = learned_sequence_data(shape)?;
+		let model = recipe.model().conv(hidden, 1).tanh().conv(1, 1).sigmoid();
+		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length })?;
+		if let Some(previous) = previous {
+			copy_learned_state(&previous.graph, &mut graph);
+			graph.refresh_storage(config)?;
+		}
+		self.selector = Some(LearnedSelector { graph, hidden, precision });
+		Ok(())
+	}
+
+	fn ensure_selection_score(&mut self, length: usize, config: Config) -> Result<()> {
+		let hidden = config.surrogate_width;
+		let precision = config.precision;
+		let channels = checked_add(self.width, 1, "learned RAT selection channels")?;
+		if self.selection_score.as_ref().is_some_and(|model| model.graph.input == Shape { channels, length } && model.graph.output == Shape { channels: 1, length: 1 } && model.hidden == hidden && model.precision == precision) {
+			return Ok(())
+		}
+		let previous = self.selection_score.take();
+		let shape = Shape { channels, length };
+		let data = learned_sequence_data(shape)?;
+		let model = recipe.model().conv(hidden, 1).tanh().pool(length).layer(1);
+		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length: 1 })?;
+		if let Some(mut previous) = previous {
+			previous.fit.capture(&mut previous.graph)?;
+			copy_learned_state(&previous.graph, &mut graph);
+			graph.refresh_storage(config)?;
+		}
+		let fit = RatFit::new(&graph, self.gpu, mse, config)?;
+		self.selection_score = Some(LearnedSelectionScore { graph, fit, hidden, precision });
+		Ok(())
+	}
+
+	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<()> {
+		require(target.width == self.width, format!("learned RAT target width is {}, expected {}", target.width, self.width))?;
+		require(samples.len() == checked_mul(targets.len(), self.width, "learned RAT observations")?, "learned RAT observations have the wrong shape")?;
+		require(targets.iter().all(|value| value.is_finite()), "learned RAT observations contain a nonfinite score")?;
+		if targets.is_empty() {
+			require(samples.is_empty(), "learned RAT empty observations have nonempty samples")?;
+			return Ok(())
+		}
+		let length = targets.len();
+		self.ensure_selector(length, config)?;
+		self.ensure_selection_score(length, config)?;
+
+		let selector_graph = &self.selector.as_ref().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?.graph;
+		let selector_node = selector_graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
+		let selector_input = learned_channels(samples, self.width, length)?;
+		let mut composition = compose_learned_selection(selector_graph, &self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?.graph, self.width, length, config)?;
+		let selector_parameters = selector_graph.parameters.len();
+		let score_offset = composition.1;
+		let mut selector_tape = learned_selector_tape(&composition.0, selector_input.len(), self.gpu, config)?;
+		selector_tape.forward(ForwardMode::Inference)?;
+		let proposals = selector_tape.node_values(selector_node, length)?;
+		require(proposals.len() == length, "learned RAT selector emitted the wrong number of values")?;
+		let selected = proposals.iter().enumerate().filter_map(|(index, value)| (*value >= 0.5).then_some(index)).collect::<Vec<_>>();
+
+		// An empty selection is a valid outcome. RatFit deliberately performs no
+		// optimizer step for it; no fallback or rank heuristic is introduced.
+		target.fit(samples, targets, &selected, steps, rate, config)?;
+		let predictions = target.predict(samples)?;
+		require(predictions.len() == targets.len(), "learned RAT target prediction count differs from observations")?;
+		let quality = coefficient(targets, &predictions);
+		require(quality.is_finite(), "learned RAT primary surrogate R2 is not finite")?;
+
+		let score_input = learned_selection_input(samples, self.width, &proposals)?;
+		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
+		scorer.fit.fit(&score_input, &[quality], &[0], steps, rate, config)?;
+		scorer.fit.capture(&mut scorer.graph)?;
+		let teacher_weights = scorer.fit.weights()?;
+
+		// The scorer is a frozen teacher in this composition. Only selector
+		// parameters remain trainable while its output is driven toward the
+		// highest predicted whole-selection quality (the fixed target is 1.0).
+		if steps != 0 {
+			selector_tape.targets.write_float_bytes(0, &[1.0], selector_tape.precision.model)?;
+			for _ in 0..steps {
+				rat_backward(&mut selector_tape, score_offset, &teacher_weights, &selector_input, selector_rate, config)?;
+			}
+		}
+		selector_tape.capture(&mut composition.0)?;
+		let selector = self.selector.as_mut().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
+		extract_learned_selector(&composition.0, &mut selector.graph, selector_parameters);
+		selector.graph.refresh_storage(config)?;
+		Ok(())
+	}
+}
+
+fn learned_sequence_data(shape: Shape) -> Result<Prepared> {
+	let mut data = Prepared::matrix(vec![0.0; checked_mul(shape.channels, shape.length, "learned RAT sequence")?], vec![0.0], 1, 1)?;
+	data.sequence = Some((shape, shape));
+	Ok(data)
+}
+
+/// Converts row-major observations into the channel-major sequence layout used
+/// by native convolution nodes.
+fn learned_channels(samples: &[f64], width: usize, length: usize) -> Result<Vec<f64>> {
+	require(samples.len() == checked_mul(width, length, "learned RAT channel layout")?, "learned RAT channel layout is invalid")?;
+	let mut channels = vec![0.0; samples.len()];
+	for channel in 0..width {
+		for row in 0..length {
+			channels[channel * length + row] = samples[row * width + channel];
+		}
+	}
+	Ok(channels)
+}
+
+fn learned_selection_input(samples: &[f64], width: usize, selection: &[f64]) -> Result<Vec<f64>> {
+	let length = selection.len();
+	let mut input = learned_channels(samples, width, length)?;
+	input.extend_from_slice(selection);
+	Ok(input)
+}
+
+/// Copies only parameter spans whose node operation, channel geometry, and
+/// parameter count match. Sequence length is intentionally excluded because
+/// convolution and pooling parameters are independent of that axis.
+fn copy_learned_state(old: &Graph, new: &mut Graph) {
+	let mut copied = false;
+	for (old_node, new_node) in old.nodes.iter().zip(&new.nodes) {
+		if old_node.op != new_node.op || old_node.input.channels != new_node.input.channels || old_node.output.channels != new_node.output.channels || old_node.parameters != new_node.parameters {
+			continue
+		}
+		let old_end = old_node.offset + old_node.parameters;
+		let new_end = new_node.offset + new_node.parameters;
+		if old_end > old.parameters.len() || new_end > new.parameters.len() {
+			continue
+		}
+		new.parameters[new_node.offset..new_end].copy_from_slice(&old.parameters[old_node.offset..old_end]);
+		if old.state.moments.len() == old.parameters.len() {
+			if new.state.moments.len() != new.parameters.len() {
+				new.state.moments.resize(new.parameters.len(), 0.0);
+			}
+			new.state.moments[new_node.offset..new_end].copy_from_slice(&old.state.moments[old_node.offset..old_end]);
+		}
+		if old.state.variances.len() == old.parameters.len() {
+			if new.state.variances.len() != new.parameters.len() {
+				new.state.variances.resize(new.parameters.len(), 0.0);
+			}
+			new.state.variances[new_node.offset..new_end].copy_from_slice(&old.state.variances[old_node.offset..old_end]);
+		}
+		copied = true;
+	}
+	if copied {
+		new.state.epoch = old.state.epoch;
+		new.state.best_loss = old.state.best_loss.clone();
+	}
+}
+
+fn compose_learned_selection(selector: &Graph, scorer_graph: &Graph, width: usize, length: usize, config: Config) -> Result<(Graph, usize)> {
+	require(selector.input == Shape { channels: width, length }, "learned RAT selector input shape differs")?;
+	require(selector.output == Shape { channels: 1, length }, "learned RAT selector output shape differs")?;
+	require(scorer_graph.input == Shape { channels: checked_add(width, 1, "learned RAT score input")?, length }, "learned RAT selection scorer input shape differs")?;
+	require(scorer_graph.output.elements() == 1, "learned RAT selection scorer must emit one value")?;
+	let mut graph = selector.clone();
+	let selector_tail = graph.source;
+	let wide = Shape { channels: checked_add(width, 1, "learned RAT composition width")?, length };
+	let carried = embed(&mut graph, -1, selector.input, (0..width).map(Some).chain(std::iter::once(None)))?;
+	let selected = embed(&mut graph, selector_tail, selector.output, std::iter::repeat_n(None, width).chain(std::iter::once(Some(0))))?;
+	binary(&mut graph, carried, selected, wide, ScalarOpcode::Add)?;
+	let offset = graph.parameters.len();
+	append_graph(&mut graph, scorer_graph.clone())?;
+	graph.frozen[offset..].fill(1);
+	// append_graph carries nodes and parameters, but optimizer moments belong to
+	// each source model. Fill the composition's state with both spans so native
+	// tape construction keeps the selector's persistent optimizer state.
+	let mut moments = vec![0.0; graph.parameters.len()];
+	let mut variances = vec![0.0; graph.parameters.len()];
+	if selector.state.moments.len() == selector.parameters.len() {
+		moments[..selector.parameters.len()].copy_from_slice(&selector.state.moments);
+	}
+	if selector.state.variances.len() == selector.parameters.len() {
+		variances[..selector.parameters.len()].copy_from_slice(&selector.state.variances);
+	}
+	if scorer_graph.state.moments.len() == scorer_graph.parameters.len() {
+		moments[offset..offset + scorer_graph.parameters.len()].copy_from_slice(&scorer_graph.state.moments);
+	}
+	if scorer_graph.state.variances.len() == scorer_graph.parameters.len() {
+		variances[offset..offset + scorer_graph.parameters.len()].copy_from_slice(&scorer_graph.state.variances);
+	}
+	graph.state.moments = moments;
+	graph.state.variances = variances;
+	graph.state.epoch = selector.state.epoch;
+	graph.refresh_storage(config)?;
+	Ok((graph, offset))
+}
+
+fn learned_selector_tape(graph: &Graph, input: usize, gpu: &'static Gpu, config: Config) -> Result<NativeTape> {
+	require(input == graph.input.elements(), "learned RAT selector input has the wrong width")?;
+	NativeTape::new(graph, &vec![0.0; input], &[1.0], gpu, config.precision, Some(mse), None, None)
+}
+
+fn extract_learned_selector(composed: &Graph, selector: &mut Graph, parameters: usize) {
+	if composed.parameters.len() < parameters || selector.parameters.len() != parameters {
+		return;
+	}
+	selector.parameters.copy_from_slice(&composed.parameters[..parameters]);
+	selector.state.epoch = composed.state.epoch;
+	selector.state.best_loss = composed.state.best_loss.clone();
+	selector.state.moments = (composed.state.moments.len() >= parameters).then(|| composed.state.moments[..parameters].to_vec()).unwrap_or_default();
+	selector.state.variances = (composed.state.variances.len() >= parameters).then(|| composed.state.variances[..parameters].to_vec()).unwrap_or_default();
 }
 /// Scores each decision in the coordinates used to fit the bench model.
 /// Frozen projections carry the measured configuration and replace only the
