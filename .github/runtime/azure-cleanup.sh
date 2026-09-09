@@ -42,10 +42,7 @@ list_resources() {
 		disk) az disk list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		nic) az network nic list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
 		public-ip) az network public-ip list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
-<<<<<<< origin/gguf/670
-=======
 		nsg) az network nsg list --resource-group "$GROUP" --query "$query" -o tsv --only-show-errors ;;
->>>>>>> origin/minimal
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -57,10 +54,7 @@ delete_resource() {
 		disk) az disk delete --resource-group "$GROUP" --name "$name" --yes --only-show-errors ;;
 		nic) az network nic delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
 		public-ip) az network public-ip delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
-<<<<<<< origin/gguf/670
-=======
 		nsg) az network nsg delete --resource-group "$GROUP" --name "$name" --only-show-errors ;;
->>>>>>> origin/minimal
 		*) echo "unknown Azure resource kind: $kind" >&2; return 2 ;;
 	esac
 }
@@ -121,11 +115,7 @@ remove_worker() {
 		status=1
 	fi
 
-<<<<<<< origin/gguf/670
-	for kind in disk nic public-ip; do
-=======
 	for kind in disk nic public-ip nsg; do
->>>>>>> origin/minimal
 		local resources
 		if ! resources="$(list_resources "$kind" "$name")"; then
 			status=1
@@ -175,8 +165,6 @@ for worker in $stale; do
 	fi
 done
 
-<<<<<<< origin/gguf/670
-=======
 echo "== orphan resource watchdog =="
 for kind in nic disk public-ip nsg; do
 	resources="$(list_resources "$kind" "recipe-wgpu-")" || {
@@ -272,7 +260,6 @@ else
 	echo "terminal transfer recovery is unavailable"
 fi
 
->>>>>>> origin/minimal
 echo "== residual resources for $WORKER =="
 residual="$(az resource list --resource-group "$GROUP" --query "[?starts_with(name,'$WORKER')].{name:name, type:type}" -o table --only-show-errors)" || {
 	echo "could not read back residual resources for $WORKER" >&2
