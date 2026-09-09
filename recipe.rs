@@ -8957,12 +8957,38 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
+fn device_names(selection: &str) -> Result<Vec<String>> {
+	let mut names = Vec::new();
+	for group in selection.split(',') {
+		let mut host = String::new();
+		let mut hostname = Vec::new();
+		for part in group.split('.') {
+			require(!part.is_empty(), "device selection contains an empty component")?;
+			let name = if let Some((prefix, name)) = part.split_once(':') {
+				require(!prefix.is_empty(), "device host is empty")?;
+				hostname.push(prefix);
+				host = hostname.join(".");
+				hostname.clear();
+				name
+			} else { part };
+			let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
+			if !gpu && name != "cpu" && !part.contains(':') {
+				hostname.push(part);
+				continue;
+			}
+			require(hostname.is_empty() && (gpu || name == "cpu"), format!("invalid device selector {name:?}; use cpu for the available CPU pool"))?;
+			names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
+		}
+		require(hostname.is_empty(), format!("invalid device or incomplete host in {group:?}"))?;
+	}
+	Ok(names)
+}
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
 /// `None` selects the whole machine, so an unnamed run still sees every device.
 fn device_selection() -> Result<Option<Vec<String>>> {
 	let Ok(selection) = std::env::var("RECIPE_DEVICE") else { return Ok(None) };
 	let prefix = format!("{}:", local_host()?);
-	Ok(Some(selection.split(',').map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_owned()).collect()))
+	Ok(Some(device_names(&selection)?.into_iter().map(|name| name.strip_prefix(&prefix).unwrap_or(&name).to_owned()).collect()))
 }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
@@ -8991,6 +9017,10 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map_err(Clone::clone)
 }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
+	if name == Some("cpu") {
+		static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
+		return CPU.get_or_init(cpu_device).as_ref().map_err(Clone::clone);
+	}
 	let found = devices()?;
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
@@ -9022,9 +9052,10 @@ fn local_host() -> Result<String> {
 	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
-/// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
-/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
-/// a reachable host (`benji:nv0`); the first name is the primary device.
+/// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
+/// Dots chain devices under the most recent host prefix; commas start a new
+/// local group. `cpu` names the available CPU pool, not a physical socket.
+/// The first name is the primary device.
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -9033,13 +9064,19 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			let mut selected = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
 			// selection never connects to, allocates on, or executes on another.
-			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
-				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
-					Some(gpu) => gpu,
-					None => match name.split_once(':') {
-						Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
-					},
+			let names = device_names(&selection)?;
+			for name in names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }) {
+				let local_name = name.strip_prefix(&format!("{host}:")).unwrap_or(name);
+				let gpu = if local_name == "cpu" {
+					device(Some("cpu"))?
+				} else {
+					match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+						Some(gpu) => gpu,
+						None => match name.split_once(':') {
+							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
+							_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
+						},
+					}
 				};
 				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
 				selected.push(gpu);

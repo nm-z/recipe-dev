@@ -29,12 +29,16 @@ Use `.include([...])` or `.exclude([...])` to select feature columns. A data sou
 
 ## devices
 
-Select one or more local or host-qualified devices by repeating `--device`:
+Select local or host-qualified devices with a dot-separated chain or repeated `--device` flags. A host prefix applies to the following devices until another host prefix appears. Each repeated flag starts a new local group.
 
 ```text
-recipe --device amd0 model.rs
-recipe --device amd0 --device archy:nv0 model.rs
+recipe run train.rs --device amd0.amd1
+recipe run train.rs --device nv0.cpu
+recipe run train.rs --device engi:amd0.cpu.archy:cpu.nv7.nv8
+recipe run train.rs --device amd0 --device archy:nv0
 ```
+
+`cpu` selects the host's available logical-CPU pool, not an individual socket. Numbered CPU selectors are not supported. The `run` keyword is optional.
 
 ## files
 
