@@ -5851,15 +5851,15 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
 	if extreme.abs() < 1.0e-15 { return (0.0, vec![0; values.len()]) }
 	let initial = if tries > 0 { -extreme / f32::from(IQ4[0]) } else { extreme / f32::from(IQ4[0]) };
-	let score = |inverse: f32| {
+	let fit_scale = |inverse: f32| {
 		values.iter().map(|value| { let level = f32::from(IQ4[usize::from(iq4_code(value * inverse))]);
 			(value * value * level * value, value * value * level * level) }).fold((0.0, 0.0), |left, right| (left.0 + right.0, left.1 + right.1))
 	};
-	let (numerator, denominator) = score(initial.recip());
+	let (numerator, denominator) = fit_scale(initial.recip());
 	let mut scale = if denominator > 0.0 { numerator / denominator } else { 0.0 };
 	let mut best = scale * numerator;
 	for attempt in -tries..=tries {
-		let (numerator, denominator) = score((attempt as f32 + f32::from(IQ4[0])) / extreme);
+		let (numerator, denominator) = fit_scale((attempt as f32 + f32::from(IQ4[0])) / extreme);
 		if denominator > 0.0 && numerator * numerator > best * denominator { scale = numerator / denominator; best = scale * numerator }
 	}
 	let inverse = if tries > 0 && scale != 0.0 { scale.recip() } else { initial.recip() };
@@ -6621,6 +6621,8 @@ pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
 /// The external command's measured score, separate from the native tile schedule.
 pub const Score: Metric = Metric(11);
+/// Selects the raw command score in `.log(score)`.
+pub const score: Metric = Score;
 /// All progress fields except the native tile schedule.
 pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, Score];
 /// All progress fields, including the native tile schedule.
@@ -7016,10 +7018,10 @@ impl RatCommand {
 		write?;
 		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
 		let fields = stdout.split_ascii_whitespace().collect::<Vec<_>>();
-		require(fields.len() == 1, format!("RAT evaluator {} must write exactly one reward to stdout", self.path.display()))?;
-		let reward = fields[0].parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid reward: {error}", self.path.display())))?;
-		require(reward.is_finite() && (0.0..=1.0).contains(&reward), format!("RAT evaluator {} reward must be finite and between zero and one", self.path.display()))?;
-		Ok(reward)
+		require(fields.len() == 1, format!("RAT evaluator {} must write exactly one score to stdout", self.path.display()))?;
+		let measured_score = fields[0].parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
+		require(measured_score.is_finite(), format!("RAT evaluator {} score must be finite", self.path.display()))?;
+		Ok(measured_score)
 	}
 }
 struct CommandRatComposition {
@@ -7492,12 +7494,12 @@ fn rank_mask(graph: &mut Graph, scores: &[i32], selected: usize, shape: Shape, t
 }
 fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize, config: Config) -> Result<()> {
 	let mut maximum_score = scores[0];
-	for &score in &scores[1..] {
-		maximum_score = maximum(graph, maximum_score, score, shape)?;
+	for &score_node in &scores[1..] {
+		maximum_score = maximum(graph, maximum_score, score_node, shape)?;
 	}
 	let mut weighted = Vec::with_capacity(scores.len());
-	for (index, &score) in scores.iter().enumerate() {
-		let centered = binary(graph, score, maximum_score, shape, ScalarOpcode::Subtract)?;
+	for (index, &score_node) in scores.iter().enumerate() {
+		let centered = binary(graph, score_node, maximum_score, shape, ScalarOpcode::Subtract)?;
 		let exponential = activation(graph, centered, shape, Activation::Exp, config)?.0;
 		let mask = rank_mask(graph, scores, index, shape, top_k)?;
 		weighted.push(binary(graph, mask, exponential, shape, ScalarOpcode::Multiply)?);
@@ -12040,13 +12042,13 @@ impl PredictorProgram {
 					let (bases, labels) = rest.split_at(classes);
 					let mut best = (f64::MIN, labels[0]);
 					for class in 0..classes {
-						let score = query
+						let class_score = query
 							.iter()
 							.zip(&means[class * features..])
 							.zip(&scales[class * features..])
 							.fold(bases[class], |sum, ((value, mean), scale)| sum + (value - mean) * (value - mean) * scale);
-						if score > best.0 {
-							best = (score, labels[class])
+						if class_score > best.0 {
+							best = (class_score, labels[class])
 						}
 					}
 					stack.push(best.1)
@@ -15323,9 +15325,10 @@ impl Train {
 	/// Feature values use the same encoding and normalization as the proposer.
 	/// The surrogate receives those same features followed by predicted targets,
 	/// both when fitting command scores and when differentiating the composition.
-	/// The executable writes exactly one finite reward in `[0, 1]` to stdout.
+	/// The executable writes exactly one finite real score to stdout.
+	/// Recipe applies sigmoid to derive the surrogate's training reward; higher
+	/// scores are better. The Score log field retains the raw command score.
 	/// Any stderr output or unsuccessful exit stops training, even with a score.
-	/// Return reward zero for a valid but unsupported proposal, without stderr.
 	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
 	/// Each sample's proposal is scored by the executable.
@@ -15469,7 +15472,7 @@ impl Train {
 			Ok(sample.iter().chain(proposal).copied().collect())
 		};
 		let mut evaluation_samples = observation(samples, &initial_predictions)?;
-		let initial_reward = command.evaluate(&input_names, &evaluation_samples)?;
+		let initial_reward = logistic(command.evaluate(&input_names, &evaluation_samples)?);
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - initial_reward;
 		let mut evaluation_targets = vec![initial_reward];
@@ -15512,7 +15515,8 @@ impl Train {
 			tape.forward(ForwardMode::Inference)?;
 			let predictions = tape.node_values(composition.proposal, proposal_width)?;
 			let observed = observation(sample, &predictions)?;
-			let reward = command.evaluate(&input_names, &observed)?;
+			let measured_score = command.evaluate(&input_names, &observed)?;
+			let reward = logistic(measured_score);
 			measured_reward = reward;
 			measured_predictions.clone_from(&predictions);
 			evaluation_samples.extend_from_slice(&observed);
@@ -15520,17 +15524,17 @@ impl Train {
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(reward))?;
+			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(measured_score))?;
 		}
 		fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
-		let score = |samples: &[f64]| -> Result<Vec<f64>> {
+		let predict_scores = |samples: &[f64]| -> Result<Vec<f64>> {
 			require(samples.len() % observation_width == 0, "RAT evaluator samples have the wrong shape")?;
 			graph_inputs(&composition.evaluator, samples, samples.len() / observation_width, gpu, config.precision)
 		};
-		let evaluator_predictions = score(&evaluation_samples)?;
+		let evaluator_predictions = predict_scores(&evaluation_samples)?;
 		let fitted_rows = ((evaluation_targets.len() as f64 * data.split).floor() as usize).max(1);
 		let evaluator_r2 = coefficient(&evaluation_targets[..fitted_rows], &evaluator_predictions[..fitted_rows]);
-		let predicted_reward = mean(&score(&evaluation_samples[evaluation_samples.len() - observation_width..])?);
+		let predicted_reward = mean(&predict_scores(&evaluation_samples[evaluation_samples.len() - observation_width..])?);
 		let validation_r2 = (fitted_rows < evaluation_targets.len()).then(|| coefficient(&evaluation_targets[fitted_rows..], &evaluator_predictions[fitted_rows..]));
 		let final_loss = 1.0 - measured_reward;
 		let selected_tile = tape.tile();
@@ -15995,7 +15999,7 @@ impl TrainingReport {
 	pub const fn predicted_reward(&self) -> Option<f64> {
 		self.predicted_reward
 	}
-	/// Returns the measured reward for the selected proposal.
+	/// Returns sigmoid of the command's raw score for the last scored proposal.
 	pub const fn measured_reward(&self) -> Option<f64> {
 		self.measured_reward
 	}
