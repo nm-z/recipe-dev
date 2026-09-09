@@ -1323,6 +1323,7 @@ impl BackendTarget {
 				let configured = option_env!("RECIPE_CPU_TARGET").ok_or_else(|| RecipeError::new("CPU native target is unavailable"))?;
 				require(target == configured, format!("CPU target {target:?} does not match configured target {configured:?}"))?;
 				require(!compiler.is_empty() && !cpu.is_empty() && !features.is_empty(), "CPU native target identity is incomplete")?;
+				cpu_llvm_major(compiler)?;
 			}
 			Self::Amd { architecture } => {
 				let suffix = architecture.strip_prefix("gfx").unwrap_or("");
@@ -1351,6 +1352,10 @@ fn cpu_llvm_major(compiler: &str) -> Result<u32> {
 		.and_then(|major| major.parse().ok())
 		.filter(|major| *major != 0)
 		.ok_or_else(|| RecipeError::new("CPU compiler LLVM major version is absent"))
+}
+
+fn cpu_compiler_version(text: &str) -> Result<&str> {
+	text.lines().find(|line| line.contains("clang version")).map(str::trim).ok_or_else(|| RecipeError::new("CPU compiler query omitted compiler identity"))
 }
 
 fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
@@ -1393,7 +1398,7 @@ fn native_cpu_target() -> Result<BackendTarget> {
 	features.sort_unstable();
 	features.dedup();
 	require(!features.is_empty(), "CPU native target query omitted target features")?;
-	let version = text.lines().find(|line| line.contains("clang version")).map(str::trim).ok_or_else(|| RecipeError::new("CPU native target query omitted compiler identity"))?;
+	let version = cpu_compiler_version(&text).map_err(|_| RecipeError::new("CPU native target query omitted compiler identity"))?;
 	let identity = format!("target={target};compiler={compiler}@{version};cpu={cpu};features={}", features.join(","));
 	let target = BackendTarget::Cpu { target: identity };
 	target.validate()?;
@@ -3682,18 +3687,29 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
-fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
+fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
-		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v4".as_slice(),
+		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v5".as_slice(),
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
 	};
-	for part in [version, native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
+	let requirement = match target {
+		BackendTarget::Cpu { target } => {
+			let (target, _, cpu, features) = cpu_identity(target)?;
+			format!("target={target};cpu={cpu};features={features}")
+		}
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => native_target_label(target).to_owned(),
+	};
+	let producer = match target {
+		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => String::new(),
+	};
+	for part in [version, requirement.as_bytes(), producer.as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
 	}
-	format!("recipe-native-{hash:016x}")
+	Ok(format!("recipe-native-{hash:016x}"))
 }
 
 /// Run a compiler and return whatever it wrote to its diagnostic stream, which
@@ -3701,7 +3717,14 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 fn native_command(mut command: Command, role: &str, key: &str) -> Result<String> {
 	debug(&format!("native compiler key={key} role={role} command={command:?}"))?;
 	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
-	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+	let mut diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+	if !output.stdout.is_empty() {
+		if !diagnostic.is_empty() {
+			diagnostic.push('\n');
+		}
+		diagnostic.push_str(&String::from_utf8_lossy(&output.stdout));
+	}
+	let diagnostic = diagnostic.trim().to_owned();
 	if output.status.success() {
 		return Ok(diagnostic);
 	}
@@ -3758,6 +3781,17 @@ fn native_cpu_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_CPU_COMPILER").ok_or_else(|| RecipeError::new("CPU native compiler is unavailable"))
 }
 
+fn native_cpu_compiler_identity() -> Result<String> {
+	let compiler = native_cpu_compiler()?;
+	let output = Command::new(compiler).arg("--version").output().map_err(|error| RecipeError::new(format!("cannot query CPU native compiler: {error}")))?;
+	require(output.status.success(), format!("CPU native compiler query failed: {}", String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no compiler diagnostic")))?;
+	let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+	text.push_str(&String::from_utf8_lossy(&output.stdout));
+	let identity = format!("{compiler}@{}", cpu_compiler_version(&text)?);
+	cpu_llvm_major(&identity)?;
+	Ok(identity)
+}
+
 fn native_cpu_setting(name: &str) -> Result<&'static str> {
 	match name {
 		"linker" => option_env!("RECIPE_CPU_LINKER"),
@@ -3805,11 +3839,21 @@ fn native_nvidia_ptx_version() -> Result<&'static str> {
 	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
 }
 
+fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
+	let ignored = |line: &str| line.contains("ignoring feature") || line.contains("not a recognized feature") || line.contains("unknown target feature");
+	features
+		.split(',')
+		.find(|feature| diagnostic.lines().any(|line| ignored(line) && line.contains(feature)))
+		.map(str::to_owned)
+		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
+}
+
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
-			let (target, compiler_identity, cpu, features) = cpu_identity(target)?;
+			let (target, _, cpu, features) = cpu_identity(target)?;
+			let compiler_identity = native_cpu_compiler_identity()?;
 			let linker = Path::new(native_cpu_setting("linker")?);
 			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
@@ -3817,7 +3861,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			for feature in features.split(',') {
 				command.args(["-Xclang", "-target-feature", "-Xclang", feature]);
 			}
-			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
+			if cpu_llvm_major(&compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
 				command.args(["-mllvm", "-opaque-pointers=1"]);
 			}
 			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
@@ -3833,7 +3877,12 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				.args(["-o"])
 				.arg(output)
 				.arg(source);
-			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
+			let role = format!("CPU LLVM IR compiler ({compiler_identity})");
+			let diagnostic = native_command(command, &role, key)?;
+			if let Some(feature) = cpu_unsupported_feature(features, &diagnostic) {
+				return Err(RecipeError::new(format!("CPU LLVM IR compiler ignored required {feature} for remote CPU target: {diagnostic}")));
+			}
+			Ok(Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
@@ -3884,7 +3933,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	}
 	.filter(|_| model.schedule.matrix);
 	let ir = model.emit(target.backend(), matrix, loss)?;
-	let key = native_artifact_key(target, &ir);
+	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
 	let path = directory.join(format!("artifact.{}", target.artifact_extension()));
