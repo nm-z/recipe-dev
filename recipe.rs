@@ -3726,7 +3726,12 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => String::new(),
 	};
-	for part in [version, requirement.as_bytes(), producer.as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
+	let mut parts = vec![version, requirement.as_bytes()];
+	if matches!(target, BackendTarget::Cpu { .. }) {
+		parts.push(producer.as_bytes());
+	}
+	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
+	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -3865,7 +3870,7 @@ fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
 	let ignored = |line: &str| line.contains("ignoring feature") || line.contains("not a recognized feature") || line.contains("unknown target feature");
 	features
 		.split(',')
-		.find(|feature| diagnostic.lines().any(|line| ignored(line) && line.contains(feature)))
+		.find(|feature| diagnostic.lines().any(|line| ignored(line) && line.contains(&format!("'{feature}'"))))
 		.map(str::to_owned)
 		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
 }
@@ -3902,7 +3907,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let role = format!("CPU LLVM IR compiler ({compiler_identity})");
 			let diagnostic = native_command(command, &role, key)?;
 			if let Some(feature) = cpu_unsupported_feature(features, &diagnostic) {
-				return Err(RecipeError::new(format!("CPU LLVM IR compiler ignored required {feature} for remote CPU target: {diagnostic}")));
+				return Err(RecipeError::new(format!("{role} ignored required {feature} for remote CPU target: {diagnostic}")));
 			}
 			Ok(Vec::new())
 		}
@@ -9056,7 +9061,7 @@ impl Gpu {
 		}
 	}
 }
-static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+static DEVICES: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 fn cpu_worker_threads() -> Result<u32> {
 	let limit = count("CPU worker threads", env!("RECIPE_CPU_WORKER_THREADS"))?;
 	let available = std::thread::available_parallelism().map_err(|error| RecipeError::new(format!("cannot read available CPU parallelism: {error}")))?.get();
@@ -9064,6 +9069,10 @@ fn cpu_worker_threads() -> Result<u32> {
 }
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
+}
+fn shared_cpu_device() -> Result<&'static Gpu> {
+	static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
+	CPU.get_or_init(cpu_device).as_ref().map_err(Clone::clone)
 }
 /// Parses device selectors into canonical names without opening devices.
 pub fn device_names(selection: &str) -> Result<Vec<String>> {
@@ -9101,11 +9110,11 @@ fn device_selection() -> Result<Option<Vec<String>>> {
 	let prefix = format!("{}:", local_host()?);
 	Ok(Some(device_names(&selection)?.into_iter().map(|name| name.strip_prefix(&prefix).unwrap_or(&name).to_owned()).collect()))
 }
-fn devices() -> Result<&'static [Gpu]> {
+fn devices() -> Result<&'static [&'static Gpu]> {
 	DEVICES
 		.get_or_init(|| {
 			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
-				return cpu_device().map(|gpu| vec![gpu]);
+				return shared_cpu_device().map(|gpu| vec![gpu]);
 			}
 			let selection = device_selection()?;
 			let mut found = Vec::new();
@@ -9116,9 +9125,10 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
+			let mut found: Vec<&'static Gpu> = found.into_iter().map(|gpu| &*Box::leak(Box::new(gpu))).collect();
 			let selected_cpu = selection.as_deref().is_some_and(|names| names.iter().any(|name| name == "cpu"));
 			if selected_cpu || (found.is_empty() && !cfg!(any(amd, nvidia))) {
-				found.push(cpu_device()?);
+				found.push(shared_cpu_device()?);
 			}
 			// A selection names devices on other hosts too, so an empty local list is not an error.
 			require(!found.is_empty() || selection.is_some(), errors.join("; "))?;
@@ -9129,9 +9139,12 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map_err(Clone::clone)
 }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
+	if name == Some("cpu") {
+		return shared_cpu_device();
+	}
 	let found = devices()?;
 	if let Some(name) = name {
-		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
+		return found.iter().copied().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
@@ -9178,7 +9191,7 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 				let gpu = if local_name == "cpu" {
 					device(Some("cpu"))?
 				} else {
-					match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+					match devices()?.iter().copied().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
 						Some(gpu) => gpu,
 						None => match name.split_once(':') {
 							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
@@ -9221,7 +9234,8 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	let marker = "/.cache/recipe/native/remote-worker.";
 	let (prefix, suffix) = path.rsplit_once(marker).ok_or_else(|| RecipeError::new(format!("worker directory from {host} is unsafe: {path:?}")))?;
 	require(
-		!prefix.is_empty()
+		Path::new(&path).is_absolute()
+			&& !prefix.is_empty()
 			&& path.match_indices(marker).count() == 1
 			&& path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
 			&& !path.split('/').any(|component| matches!(component, "." | ".."))
