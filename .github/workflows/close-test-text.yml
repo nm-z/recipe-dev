@@ -1,0 +1,48 @@
+name: Close pull requests containing test text
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  close:
+    if: github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close a pull request containing test text
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
+          mkdir -p "$scan_directory"
+
+          gh api \
+            -H 'Accept: application/vnd.github.v3.diff' \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER" \
+            > "$scan_directory/pull.diff"
+
+          awk '
+            /^diff --git / { in_hunk=0; next }
+            /^@@ / { in_hunk=1; next }
+            !in_hunk { next }
+            /^\+/ { print substr($0, 2) }
+          ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
+
+          banned_fragment="$(printf 'te%s' 'st')"
+          if ! grep --ignore-case --fixed-strings --word-regexp --quiet "$banned_fragment" "$scan_directory/added.txt"; then
+            exit 0
+          fi
+
+          reason="Closed automatically because added content in this pull request's current diff contains the banned whole word \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
+          gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+          gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
