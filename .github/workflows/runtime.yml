@@ -1,4 +1,4 @@
-name: runtime
+name: os/device check
 
 # Every platform check executes the same checked-in suite
 # (.github/runtime/suite.rs) against one explicitly selected backend and
@@ -9,6 +9,9 @@ on:
     branches:
       - minimal
     # No path filters: a required check must never be omitted by a path rule.
+  push:
+    branches:
+      - minimal
   workflow_dispatch:
     inputs:
       request_id:
@@ -34,7 +37,7 @@ permissions:
 concurrency:
   # A superseded candidate is cancelled; the external-worker jobs clean up in
   # their own always() steps so cancellation still releases cloud resources.
-  group: recipe-runtime-${{ inputs.request_id || format('pull-{0}', github.event.pull_request.number) || github.ref }}
+  group: recipe-runtime-${{ inputs.request_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -83,6 +86,7 @@ jobs:
           INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -99,6 +103,26 @@ jobs:
             echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
             echo "candidate $candidate_sha supplied by the gateway dispatch"
             exit 0
+          fi
+          if [ "$EVENT_NAME" = "push" ]; then
+            candidate_sha="${PUSH_SHA:-}"
+            if [[ ! "$candidate_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "push SHA must be a 40-character commit SHA" >&2
+              exit 1
+            fi
+            candidate_sha="${candidate_sha,,}"
+            checkout_sha="$(git rev-parse HEAD)"
+            if [ "$checkout_sha" != "$candidate_sha" ]; then
+              echo "checked-out commit $checkout_sha does not match push SHA $candidate_sha" >&2
+              exit 1
+            fi
+            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+            echo "candidate $candidate_sha supplied by the minimal push"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "unsupported event: $EVENT_NAME" >&2
+            exit 1
           fi
           if [ -z "${HEAD_SHA:-}" ]; then
             echo "the pull request head SHA is absent" >&2
@@ -318,7 +342,7 @@ jobs:
   linux-gpu:
     name: linux/nv
     needs: linux-cpu
-    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -430,7 +454,7 @@ jobs:
       CELL: recipe/windows-cpu
     steps:
       - name: Check out the trusted controller
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           path: controller
@@ -515,23 +539,139 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:CUDA_PATH = $null
           $env:RECIPE_FORCE_CPU = "1"
+
+          function Read-FiniteEvidence([string] $Path, [int] $MinimumValues) {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            $doubleBytes = [BitConverter]::GetBytes([double] 0).Length
+            if ($bytes.Length % $doubleBytes -ne 0) {
+              throw "evidence length $($bytes.Length) is not a sequence of f64 values"
+            }
+            $count = [int] ($bytes.Length / $doubleBytes)
+            if ($count -lt $MinimumValues) {
+              throw "evidence contains $count values, expected at least $MinimumValues"
+            }
+            $values = [double[]]::new($count)
+            for ($index = 0; $index -lt $count; $index++) {
+              $value = [BitConverter]::ToDouble($bytes, $index * $doubleBytes)
+              if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+                throw "evidence value $index is not finite"
+              }
+              $values[$index] = $value
+            }
+            return $values
+          }
+
+          function Get-SourceManifest([string] $Root) {
+            $manifest = @(
+              Get-ChildItem -LiteralPath $Root -Recurse -File |
+                ForEach-Object {
+                  $relative = [IO.Path]::GetRelativePath($Root, $_.FullName)
+                  if ($relative -notmatch '^(target|work)[\\/]') {
+                    "$relative`t$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)"
+                  }
+                } |
+                Sort-Object
+            )
+            return $manifest
+          }
+
           $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
           $state = Join-Path $env:RUNNER_TEMP "recipe-windows-cpu-lifecycle"
-          Remove-Item -Recurse -Force -LiteralPath $state -ErrorAction SilentlyContinue
+          if ([IO.Directory]::Exists($state)) {
+            throw "lifecycle state already exists: $state"
+          }
           New-Item -ItemType Directory -Path $state | Out-Null
+          $profile = Join-Path $state "profile"
+          New-Item -ItemType Directory -Path $profile | Out-Null
+
+          $rustupHome = (rustup show home).Trim()
+          if ($LASTEXITCODE -ne 0 -or ![IO.Directory]::Exists($rustupHome)) {
+            throw "rustup home is unavailable: $rustupHome"
+          }
+          $env:RUSTUP_HOME = $rustupHome
+          $env:USERPROFILE = $profile
           $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE = Join-Path $state "model.ogdl"
           $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
+
+          $nativeCache = Join-Path $profile ".cache\recipe\native"
+          if ([IO.Directory]::Exists($nativeCache)) {
+            throw "native cache is not cold: $nativeCache"
+          }
+
           $recipe = Join-Path $candidate "target\release\recipe.exe"
           $source = Join-Path $candidate ".github\windows-native\lifecycle.rs"
+          $sourceBefore = @(Get-SourceManifest $candidate)
           Push-Location $candidate
-          foreach ($phase in @("train", "resume", "infer")) {
-            $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = $phase
-            & $recipe $source
-            if ($LASTEXITCODE -ne 0) { throw "lifecycle phase $phase failed with exit code $LASTEXITCODE" }
+
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "train"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public training invocation failed with exit code $LASTEXITCODE"
           }
+          $train = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          if (![IO.File]::Exists($env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE)) {
+            throw "training did not save the model bundle"
+          }
+          $trainedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($trainedBundle.Length -eq 0) {
+            throw "training saved an empty model bundle"
+          }
+          $trainedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $trainedBundle.FullName).Hash
+          $trainFinalBits = [BitConverter]::DoubleToInt64Bits($train[1])
+          "train initial=$($train[0]) final=$($train[1]) final_bits=$([Convert]::ToString($trainFinalBits, 16)) predictions=$($train.Count - 2)"
+          "trained bundle size=$($trainedBundle.Length) sha256=$trainedHash"
+
+          $artifacts = @(Get-ChildItem -LiteralPath $nativeCache -Recurse -Filter artifact.dll -File)
+          if ($artifacts.Count -eq 0) {
+            throw "cold-cache training produced no native CPU artifact"
+          }
+          foreach ($artifact in $artifacts) {
+            $bytes = [IO.File]::ReadAllBytes($artifact.FullName)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "native artifact is not a PE DLL: $($artifact.FullName)"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash
+            "native artifact path=$($artifact.FullName) size=$($bytes.Length) sha256=$hash magic=MZ"
+          }
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "resume"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public resume invocation failed with exit code $LASTEXITCODE"
+          }
+          $resume = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          $resumeInitialBits = [BitConverter]::DoubleToInt64Bits($resume[0])
+          if ($resumeInitialBits -ne $trainFinalBits) {
+            throw "resume initial loss does not match the saved training state"
+          }
+          $resumedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($resumedBundle.Length -eq 0) {
+            throw "resume saved an empty model bundle"
+          }
+          $resumedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resumedBundle.FullName).Hash
+          "resume initial=$($resume[0]) final=$($resume[1]) initial_bits=$([Convert]::ToString($resumeInitialBits, 16)) predictions=$($resume.Count - 2)"
+          "resumed bundle size=$($resumedBundle.Length) sha256=$resumedHash"
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "infer"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public inference invocation failed with exit code $LASTEXITCODE"
+          }
+          $inference = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 1)
+          $inferredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE).Hash
+          if ($inferredHash -ne $resumedHash) {
+            throw "public inference mutated the saved model bundle"
+          }
+          "inference values=$($inference.Count) first=$($inference[0]) bundle_sha256=$inferredHash"
+
           Pop-Location
-          if (![IO.File]::Exists($env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE)) { throw "the lifecycle did not save a bundle" }
-          "lifecycle train/resume/infer completed"
+          $sourceAfter = @(Get-SourceManifest $candidate)
+          if (@(Compare-Object -ReferenceObject $sourceBefore -DifferenceObject $sourceAfter).Count -ne 0) {
+            throw "the public lifecycle changed source files"
+          }
+          "PASS native_build=PE train=finite save=present resume=saved_state infer=finite source=unchanged"
 
       - name: Write the cell evidence
         if: always()
@@ -576,7 +716,7 @@ jobs:
   windows-gpu:
     name: win/nv
     needs: linux-cpu
-    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     concurrency:
@@ -702,7 +842,7 @@ jobs:
   macos-cpu:
     name: mac/cpu
     needs: linux-cpu
-    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: macos-15
     timeout-minutes: 45
     env:
