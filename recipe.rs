@@ -1429,9 +1429,9 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888484";
-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888848888888844";
-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888848444444444";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"88884844";
+const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"888888888888488888888444";
+const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"888888888888484444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"888";
 fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
 	match state_bytes {
@@ -1521,6 +1521,7 @@ pub(crate) struct NativeModelIr {
 	layout: NativeLayout,
 	precision: NativePrecision,
 	rows: usize,
+	dynamic_length: bool,
 	schedule: NativeSchedule,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
@@ -1529,6 +1530,13 @@ pub(crate) struct NativeModelIr {
 impl NativeModelIr {
 	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
+		narrow(checked_mul(rows, graph.input.elements(), "native input capacity")?, "native input capacity")?;
+		for node in &graph.nodes {
+			narrow(checked_mul(rows, node.output.elements(), "native node capacity")?, "native node capacity")?;
+		}
+		if graph.dynamic_sequence {
+			validate_dynamic_sequence_graph(graph)?;
+		}
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
 		let precision = NativePrecision::new(precision)?;
 		let mut plans = Vec::with_capacity(graph.nodes.len());
@@ -1551,7 +1559,25 @@ impl NativeModelIr {
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
+		Ok(Self { graph: graph.clone(), layout, precision, rows, dynamic_length: graph.dynamic_sequence, schedule, plans, storage_bytes })
+	}
+	fn live_length(&self, length: usize) -> String {
+		if self.dynamic_length && length == self.graph.input.length { "%length".to_owned() } else { length.to_string() }
+	}
+	fn live_elements(&self, index: usize, name: &str, shape: Shape, ir: &mut String) -> String {
+		if self.dynamic_length && shape.length == self.graph.input.length {
+			let value = format!("%n{index}.{name}.elements");
+			ir.push_str(&format!("{value} = mul i32 %length, {}\n", shape.channels));
+			value
+		} else {
+			shape.elements().to_string()
+		}
+	}
+	fn live_row_count(&self, index: usize, name: &str, shape: Shape, ir: &mut String) -> Result<String> {
+		let elements = self.live_elements(index, name, shape, ir);
+		let count = format!("%n{index}.{name}.count");
+		ir.push_str(&format!("{count} = mul i32 %rows, {elements}\n"));
+		Ok(count)
 	}
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
@@ -1563,6 +1589,32 @@ impl NativeModelIr {
 		}
 		storage
 	}
+}
+
+fn validate_dynamic_sequence_graph(graph: &Graph) -> Result<()> {
+	let capacity = graph.input.length;
+	require(capacity != 0, "dynamic sequence graph has no capacity")?;
+	let mut pooled = false;
+	for node in &graph.nodes {
+		if !pooled {
+			if node.op == Primitive::Pool {
+				require(node.input.length == capacity && node.output.length == 1, "dynamic sequence pool must reduce the live sequence")?;
+				require(integer_argument(node.argument[0], "dynamic sequence pool size")? as usize == capacity, "dynamic sequence pool size must equal its capacity")?;
+				pooled = true;
+				continue;
+			}
+			require(node.input.length == capacity && node.output.length == capacity, "dynamic sequence nodes must preserve sequence length before pooling")?;
+			match node.op {
+				Primitive::Contraction => require(matches!(integer_argument(node.argument[0], "dynamic sequence convolution kernel")?, 0 | 1), "dynamic sequence projection kernel must preserve one sequence position")?,
+				Primitive::Elementwise => {}
+				_ => return Err(RecipeError::new("dynamic sequence supports only pointwise nodes and one global pool")),
+			}
+		} else {
+			require(node.input.length == 1 && node.output.length == 1, "dynamic sequence nodes after pooling must be scalar")?;
+			require(!matches!(node.op, Primitive::Pool | Primitive::Attention | Primitive::Scan), "dynamic sequence has an unsupported node after pooling")?;
+		}
+	}
+	require(graph.output.length == capacity || pooled && graph.output.length == 1, "dynamic sequence graph output shape is invalid")
 }
 
 fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
@@ -2506,6 +2558,8 @@ impl NativeModelIr {
 		for (position, (index, plan)) in order.into_iter().enumerate() {
 			let pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
+			let input_length = self.live_length(node.input.length);
+			let output_length = self.live_length(node.output.length);
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
@@ -2517,9 +2571,9 @@ impl NativeModelIr {
 						weights = pointers.weights,
 						value = pointers.value,
 						in_channels = node.input.channels,
-						in_length = node.input.length,
+						in_length = input_length,
 						out_channels = node.output.channels,
-						out_length = node.output.length,
+						out_length = output_length,
 						kernel = integer_argument(node.argument[0], "contraction kernel")?,
 						relu = node.argument[1] == 1.0,
 						tile_m = tiles[0],
@@ -2529,9 +2583,10 @@ impl NativeModelIr {
 					ir.push_str(&call);
 				}
 				(false, Primitive::Pool) => {
-					let size = integer_argument(node.argument[0], "pool size")?;
-					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
-					emit_fixed_loop(&mut ir, index, "pool", count, |ir, p| {
+					let size = if self.dynamic_length { "%length".to_owned() } else { integer_argument(node.argument[0], "pool size")?.to_string() };
+					let count = emit_dynamic_row_count(&mut ir, index, "pool", node.output.elements())?;
+					let input_elements = self.live_elements(index, "pool.input", node.input, &mut ir);
+					emit_dynamic_loop(&mut ir, index, "pool", &count, |ir, p| {
 						ir.push_str(&format!(
 							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n",
 							pointer = pointer_type(backend),
@@ -2539,7 +2594,7 @@ impl NativeModelIr {
 							value = pointers.value,
 							context = pointers.context,
 							p = p,
-							from = node.input.elements(),
+							from = input_elements,
 							to = node.output.elements(),
 							size = size,
 							channels = node.input.channels
@@ -2556,7 +2611,7 @@ impl NativeModelIr {
 					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
 				}
 				(false, Primitive::Elementwise) => {
-					let count = checked_mul(self.rows, node.output.elements(), "scalar output count")?;
+					let count = self.live_row_count(index, "scalar", node.output, &mut ir)?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
@@ -2583,7 +2638,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "scalar", count, |ir, p| {
+					emit_dynamic_loop(&mut ir, index, "scalar", &count, |ir, p| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
@@ -2606,7 +2661,7 @@ impl NativeModelIr {
 					})?;
 				}
 				(false, Primitive::Predictor) => {
-					let count = checked_mul(self.rows, node.output.elements(), "predictor output count")?;
+					let count = emit_dynamic_row_count(&mut ir, index, "predictor", node.output.elements())?;
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2637,7 +2692,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
+					emit_dynamic_loop(&mut ir, index, "predictor", &count, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 						ir.push_str(&forward.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -2656,17 +2711,17 @@ impl NativeModelIr {
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					let tiles = self.schedule_words(index, 3, 6)?;
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = input_length, out_channels = node.output.channels, out_length = output_length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = output_length, in_channels = node.input.channels, in_length = input_length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					}
 				}
 				(true, Primitive::Pool) => {
-					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
+					let count = emit_dynamic_row_count(&mut ir, index, "pool.reverse", node.output.elements())?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.pool.reverse");
-					emit_fixed_loop(&mut ir, index, "pool.reverse", count, |ir, p| {
+					emit_dynamic_loop(&mut ir, index, "pool.reverse", &count, |ir, p| {
 						let context_pointer = format!("%{prefix}.context.ptr");
 						let context_wide = format!("%{prefix}.context.index.wide");
 						let context_index = format!("%{prefix}.context.index");
@@ -2689,7 +2744,6 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Predictor) => {}
 				(true, Primitive::Elementwise) => {
-					let count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
@@ -2777,21 +2831,25 @@ impl NativeModelIr {
 						}
 					};
 					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, scalar_body)?;
+						let count = self.live_row_count(index, "scalar.reverse", node.output, &mut ir)?;
+						emit_dynamic_loop(&mut ir, index, "scalar.reverse", &count, scalar_body)?;
 					} else {
 						// A trainable scalar is one destination shared by every element, so
 						// the summation order has to belong to the program rather than to
 						// the schedule. Each partition sums its own contiguous run of
 						// elements in ascending order into its own scratch row, and one
 						// owner then folds the rows in ascending partition order.
-						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let capacity_count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
+						let partitions = capacity_count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let count = self.live_row_count(index, "scalar.reverse", node.output, &mut ir)?;
 						emit_partitioned_loop(
 							&mut ir,
 							index,
 							"scalar.reverse",
 							PartitionedLoop {
-								count,
+								count: capacity_count,
 								partitions,
+								active_count: Some(&count),
 								columns: node.parameters,
 								value_type: ty,
 								pointer_type: pointer,
@@ -2810,7 +2868,7 @@ impl NativeModelIr {
 					}
 				}
 				(false, Primitive::Normalize) => {
-					let count = checked_mul(self.rows, node.output.elements(), "normalize output count")?;
+					let count = emit_dynamic_row_count(&mut ir, index, "normalize", node.output.elements())?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2820,7 +2878,7 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize", count, |ir, p| {
+					emit_dynamic_loop(&mut ir, index, "normalize", &count, |ir, p| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						ir.push_str(&format!(
@@ -2857,7 +2915,7 @@ impl NativeModelIr {
 					})?;
 				}
 				(true, Primitive::Normalize) => {
-					let count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
+					let count = emit_dynamic_row_count(&mut ir, index, "normalize.reverse", node.output.elements())?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2889,7 +2947,7 @@ impl NativeModelIr {
 						));
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
+					emit_dynamic_loop(&mut ir, index, "normalize.reverse", &count, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -2928,7 +2986,8 @@ impl NativeModelIr {
 						// The weight gradient is one column per channel summed over every
 						// row and position: each partition accumulates its own contiguous
 						// run into its own scratch row, and one owner folds the rows in order.
-						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let capacity_count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
+						let partitions = capacity_count.min(NATIVE_SCALAR_PARTITIONS).max(1);
 						let (columns, offset) = (narrow(node.parameters, "normalization weight columns")?, narrow(node.offset, "normalization weight offset")?);
 						let statistics = narrow(checked_mul(4, normalize_groups(node, self.rows)?, "normalization statistics")?, "normalization statistics")?;
 						let scratch = format!("%{prefix}.scratch");
@@ -2941,7 +3000,7 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							PartitionedLoop { count: capacity_count, partitions, active_count: Some(&count), columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
 							|ir, p| {
 								let source_pointer = format!("%{weight_prefix}.source.ptr");
 								let source_value = format!("%{weight_prefix}.source.value");
@@ -3253,7 +3312,8 @@ impl NativeModelIr {
 		let (kernel, thread) = native_entry(backend)?;
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
-		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads");
+		let forward_base_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads");
+		let forward_args = format!("{forward_base_args}, i32 %length");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
@@ -3263,7 +3323,10 @@ impl NativeModelIr {
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
-		let forward_entry_args = format!("{forward_args}, i32 %training");
+		// Keep the public ABI's mode before the active sequence length.  NativeTape
+		// passes rows, threads, mode, length after the four buffer pointers.  The
+		// internal body receives only the length because it does not need the mode.
+		let forward_entry_args = format!("{forward_base_args}, i32 %training, i32 %length");
 		if loss.is_some() {
 			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
@@ -3276,14 +3339,14 @@ impl NativeModelIr {
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
-				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows.arg, i64 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
+				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows.arg, i64 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer, i32 %length"
 			);
-			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%rows = add i32 0, {}\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n", self.rows));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%rows = add i32 0, %rows.arg\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
-			body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads)\n"));
+			body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads, i32 %length)\n"));
 			body.push('\n');
 			body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 			body.push_str(barrier(backend));
@@ -3303,19 +3366,18 @@ impl NativeModelIr {
 	fn emit_loss_and_seed(
 		&self, backend: Backend, loss: LossFunction, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize,
 	) -> Result<String> {
-		let output = self.graph.output.elements();
-		let items = checked_mul(self.rows, output, "native loss items")?;
 		let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
 		let prediction_offset = last.value;
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
+		let output = self.live_elements(self.plans.len(), "loss.output", self.graph.output, &mut ir);
 		let zero = native_literal(state_precision, state_ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i64 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
-		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
+		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.items.i32 = mul i32 %rows, {output}\n%loss.leader = icmp eq i64 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 %loss.items.i32)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.items.i32\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -3345,8 +3407,8 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.wide = phi i64 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.p = trunc i64 %seed.wide to i32\n%seed.more = icmp ult i64 %seed.wide, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.wide = phi i64 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.p = trunc i64 %seed.wide to i32\n%seed.more = icmp ult i32 %seed.p, %loss.items.i32\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%loss.items.i32")?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i64 %seed.wide, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
@@ -3598,6 +3660,10 @@ const NATIVE_SCALAR_PARTITIONS: usize = 4096;
 struct PartitionedLoop<'a> {
 	count: usize,
 	partitions: usize,
+	/// The live element count when the tape was compiled for a larger capacity.
+	/// The scratch arena and partition count stay capacity-sized, but partition
+	/// boundaries are calculated from this runtime value.
+	active_count: Option<&'a str>,
 	columns: usize,
 	value_type: &'a str,
 	pointer_type: &'a str,
@@ -3615,14 +3681,21 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	// The body owns the `n{index}.{name}` namespace, so every value this function
 	// introduces sits under a suffix of its own.
 	let prefix = format!("n{index}.{name}.partition");
-	let PartitionedLoop { count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	let PartitionedLoop { count, partitions, active_count, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
 	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
 	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
-	let (whole, extra) = (narrow(count / partitions, "native partition span")?, narrow(count % partitions, "native partition remainder")?);
 	let partitions = narrow(partitions, "native partition count")?;
 	let columns = narrow(columns, "native partition columns")?;
 	let align = alignment(ty);
 	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.t.wide = phi i64 [ %tid, %{prefix}.entry ], [ %{prefix}.advance, %{prefix}.step ]\n%{prefix}.t = trunc i64 %{prefix}.t.wide to i32\n%{prefix}.more = icmp ult i64 %{prefix}.t.wide, {partitions}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	let (whole, extra) = if let Some(active_count) = active_count {
+		let whole = format!("%{prefix}.whole");
+		let extra = format!("%{prefix}.extra");
+		ir.push_str(&format!("{whole} = udiv i32 {active_count}, {partitions}\n{extra} = urem i32 {active_count}, {partitions}\n"));
+		(whole, extra)
+	} else {
+		(narrow(count / usize::try_from(partitions).map_err(|_| RecipeError::new("native partition count exceeds usize"))?, "native partition span")?.to_string(), narrow(count % usize::try_from(partitions).map_err(|_| RecipeError::new("native partition count exceeds usize"))?, "native partition remainder")?.to_string())
+	};
 	ir.push_str(&format!("%{prefix}.t.plus = add i32 %{prefix}.t, 1\n%{prefix}.first.short = icmp ult i32 %{prefix}.t, {extra}\n%{prefix}.first.extra = select i1 %{prefix}.first.short, i32 %{prefix}.t, i32 {extra}\n%{prefix}.first.whole = mul i32 %{prefix}.t, {whole}\n%{prefix}.first = add i32 %{prefix}.first.whole, %{prefix}.first.extra\n"));
 	ir.push_str(&format!("%{prefix}.limit.short = icmp ult i32 %{prefix}.t.plus, {extra}\n%{prefix}.limit.extra = select i1 %{prefix}.limit.short, i32 %{prefix}.t.plus, i32 {extra}\n%{prefix}.limit.whole = mul i32 %{prefix}.t.plus, {whole}\n%{prefix}.limit = add i32 %{prefix}.limit.whole, %{prefix}.limit.extra\n"));
 	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
@@ -3655,13 +3728,23 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	Ok(())
 }
 
-fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+/// Emit a row/element loop whose upper bound is supplied by the dispatch.
+/// Native tapes are compiled for a capacity, but RAT policies can present a
+/// smaller active sample set on a later launch. The loop body must therefore
+/// compare against the runtime i32 bound instead of a capacity literal.
+fn emit_dynamic_loop(ir: &mut String, index: usize, name: &str, count: &str, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
-	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
-	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p.wide = phi i64 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.p = trunc i64 %{prefix}.p.wide to i32\n%{prefix}.more = icmp ult i64 %{prefix}.p.wide, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p.wide = phi i64 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.p = trunc i64 %{prefix}.p.wide to i32\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
 	body(ir, &format!("%{prefix}.p"));
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i64 %{prefix}.p.wide, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
+}
+
+fn emit_dynamic_row_count(ir: &mut String, index: usize, name: &str, elements: usize) -> Result<String> {
+	let elements = narrow(elements, "native dynamic row elements")?;
+	let count = format!("%n{index}.{name}.count");
+	ir.push_str(&format!("{count} = mul i32 %rows, {elements}\n"));
+	Ok(count)
 }
 
 static NATIVE_ARTIFACT_SERIAL: AtomicUsize = AtomicUsize::new(0);
@@ -6816,6 +6899,7 @@ struct Graph {
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
+	dynamic_sequence: bool,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -6831,6 +6915,7 @@ impl Graph {
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
+			dynamic_sequence: false,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -6882,6 +6967,7 @@ fn compile_to_shape(model: &Model, data: &Prepared, targets: &[f64], rows: usize
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
+	graph.dynamic_sequence = data.dynamic_sequence;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -6932,6 +7018,7 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 		norm_scale: saved.norm_scale.clone(),
 		identities: Vec::new(),
 		fitted: saved.predictors.clone(),
+		dynamic_sequence: false,
 	};
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
@@ -7096,6 +7183,14 @@ struct LearnedSelectionScore {
 	hidden: usize,
 	precision: Compute,
 }
+struct LearnedActor {
+	graph: Graph,
+	tape: NativeTape,
+	selector_node: usize,
+	selector_parameters: usize,
+	score_offset: usize,
+	capacity: usize,
+}
 struct LearnedReplay {
 	width: usize,
 	context_width: usize,
@@ -7103,26 +7198,53 @@ struct LearnedReplay {
 	range: ScoreRange,
 	selector: Option<LearnedSelector>,
 	selection_score: Option<LearnedSelectionScore>,
+	actor: Option<LearnedActor>,
 }
 
 impl LearnedReplay {
 	fn new(width: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
 		require(width != 0, "learned RAT observation width must be positive")?;
 		require(config.surrogate_width != 0, "learned RAT hidden width must be positive")?;
-		Ok(Self { width, context_width: checked_add(width, 2, "learned RAT context width")?, gpu, range: ScoreRange::default(), selector: None, selection_score: None })
+		Ok(Self { width, context_width: checked_add(width, 2, "learned RAT context width")?, gpu, range: ScoreRange::default(), selector: None, selection_score: None, actor: None })
+	}
+
+	fn ensure_actor(&mut self, length: usize, config: Config) -> Result<()> {
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		if self.actor.as_ref().is_some_and(|actor| actor.capacity >= length) {
+			return Ok(())
+		}
+		if let Some(mut actor) = self.actor.take() {
+			actor.tape.capture(&mut actor.graph)?;
+			let selector = self.selector.as_mut().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
+			extract_rat_proposer(&actor.graph, &mut selector.graph, actor.selector_parameters);
+			selector.graph.refresh_storage(config)?;
+		}
+		self.ensure_selector(length, config)?;
+		self.ensure_selection_score(length, config)?;
+		let selector = self.selector.as_ref().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
+		let scorer = self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
+		let selector_node = selector.graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
+		let selector_parameters = selector.graph.parameters.len();
+		let (graph, score_offset) = compose_scored_graph(&selector.graph, &scorer.graph, config)?;
+		let input = vec![0.0; graph.input.elements()];
+		let mut tape = NativeTape::new(&graph, &input, &[1.0], self.gpu, config.precision, Some(mse), None, None)?;
+		tape.set_length(length)?;
+		self.actor = Some(LearnedActor { graph, tape, selector_node, selector_parameters, score_offset, capacity });
+		Ok(())
 	}
 
 	fn ensure_selector(&mut self, length: usize, config: Config) -> Result<()> {
 		let hidden = config.surrogate_width;
 		let precision = config.precision;
-		if self.selector.as_ref().is_some_and(|model| model.graph.input == Shape { channels: self.context_width, length } && model.graph.output == Shape { channels: 1, length } && model.hidden == hidden && model.precision == precision) {
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		if self.selector.as_ref().is_some_and(|model| model.graph.input.channels == self.context_width && model.graph.input.length >= length && model.graph.output == Shape { channels: 1, length: model.graph.input.length } && model.hidden == hidden && model.precision == precision) {
 			return Ok(())
 		}
 		let previous = self.selector.take();
-		let shape = Shape { channels: self.context_width, length };
+		let shape = Shape { channels: self.context_width, length: capacity };
 		let data = learned_sequence_data(shape)?;
 		let model = recipe.model().conv(hidden, 1).tanh().conv(1, 1).sigmoid();
-		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length })?;
+		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length: capacity })?;
 		if let Some(previous) = previous {
 			copy_learned_state(&previous.graph, &mut graph)?;
 			graph.refresh_storage(config)?;
@@ -7135,13 +7257,14 @@ impl LearnedReplay {
 		let hidden = config.surrogate_width;
 		let precision = config.precision;
 		let channels = checked_add(self.context_width, 1, "learned RAT selection channels")?;
-		if self.selection_score.as_ref().is_some_and(|model| model.graph.input == Shape { channels, length } && model.graph.output == Shape { channels: 1, length: 1 } && model.hidden == hidden && model.precision == precision) {
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		if self.selection_score.as_ref().is_some_and(|model| model.graph.input.channels == channels && model.graph.input.length >= length && model.graph.output == Shape { channels: 1, length: 1 } && model.hidden == hidden && model.precision == precision) {
 			return Ok(())
 		}
 		let previous = self.selection_score.take();
-		let shape = Shape { channels, length };
+		let shape = Shape { channels, length: capacity };
 		let data = learned_sequence_data(shape)?;
-		let model = recipe.model().conv(hidden, 1).tanh().pool(length).layer(1);
+		let model = recipe.model().conv(hidden, 1).tanh().pool(capacity).layer(1);
 		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length: 1 })?;
 		if let Some(mut previous) = previous {
 			previous.fit.capture(&mut previous.graph)?;
@@ -7153,29 +7276,28 @@ impl LearnedReplay {
 		Ok(())
 	}
 
-	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<()> {
+	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<f64> {
 		require(target.width == self.width, format!("learned RAT target width is {}, expected {}", target.width, self.width))?;
 		require(samples.len() == checked_mul(targets.len(), self.width, "learned RAT observations")?, "learned RAT observations have the wrong shape")?;
 		require(targets.iter().all(|value| value.is_finite()), "learned RAT observations contain a nonfinite score")?;
 		if targets.is_empty() {
 			require(samples.is_empty(), "learned RAT empty observations have nonempty samples")?;
-			return Ok(())
+			return Ok(f64::NAN)
 		}
 		let length = targets.len();
-		self.ensure_selector(length, config)?;
-		self.ensure_selection_score(length, config)?;
+		self.ensure_actor(length, config)?;
 
 		let before = target.predict(samples)?;
 		require(before.iter().all(|value| value.is_finite()), "learned RAT training context is not finite")?;
 		let context = samples.chunks_exact(self.width).zip(targets).zip(&before)
 			.flat_map(|((row, target), prediction)| row.iter().copied().chain([*target, *prediction])).collect::<Vec<_>>();
-		let selector_graph = &self.selector.as_ref().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?.graph;
-		let selector_node = selector_graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
 		let selector_input = learned_channels(&context, self.context_width, length)?;
-		let mut composition = compose_scored_graph(selector_graph, &self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?.graph, config)?;
-		let selector_parameters = selector_graph.parameters.len();
-		let score_offset = composition.1;
-		let mut selector_tape = NativeTape::new(&composition.0, &selector_input, &[1.0], self.gpu, config.precision, Some(mse), None, None)?;
+		let actor = self.actor.as_mut().ok_or_else(|| RecipeError::new("learned RAT actor is absent"))?;
+		actor.tape.set_length(length)?;
+		actor.tape.samples.write_float_bytes(0, &selector_input, config.precision)?;
+		let selector_node = actor.selector_node;
+		let score_offset = actor.score_offset;
+		let selector_tape = &mut actor.tape;
 		selector_tape.forward(ForwardMode::Inference)?;
 		let proposals = selector_tape.node_values(selector_node, length)?;
 		require(proposals.len() == length && proposals.iter().all(|value| value.is_finite()), "learned RAT selector emitted invalid values")?;
@@ -7192,7 +7314,7 @@ impl LearnedReplay {
 		let normalized_quality = self.range.observe(quality)?;
 		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
 		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
-		scorer.fit.fit(&score_input, &[normalized_quality], &[0], steps, rate, config)?;
+		scorer.fit.fit_sequence(&score_input, length, normalized_quality, rate, config)?;
 		scorer.fit.capture(&mut scorer.graph)?;
 		let teacher_weights = scorer.fit.weights()?;
 
@@ -7200,19 +7322,16 @@ impl LearnedReplay {
 		// parameters remain trainable while its output is driven toward the
 		// highest predicted whole-selection quality (the fixed target is 1.0).
 		if steps != 0 {
-			rat_backward(&mut selector_tape, score_offset, &teacher_weights, &selector_input, selector_rate, config)?;
+			rat_backward(selector_tape, score_offset, &teacher_weights, &selector_input, selector_rate, config)?;
 		}
-		selector_tape.capture(&mut composition.0)?;
-		let selector = self.selector.as_mut().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
-		extract_rat_proposer(&composition.0, &mut selector.graph, selector_parameters);
-		selector.graph.refresh_storage(config)?;
-		Ok(())
+		Ok(quality)
 	}
 }
 
 fn learned_sequence_data(shape: Shape) -> Result<Prepared> {
 	let mut data = Prepared::matrix(vec![0.0; checked_mul(shape.channels, shape.length, "learned RAT sequence")?], vec![0.0], 1, 1)?;
 	data.sequence = Some((shape, shape));
+	data.dynamic_sequence = true;
 	Ok(data)
 }
 
@@ -7801,6 +7920,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			norm_scale: Vec::new(),
 			identities: Vec::new(),
 			fitted: Vec::new(),
+			dynamic_sequence: false,
 		};
 		let fitted = estimator.fit(&prepared, rows, config)?;
 		// The surrogate exists to carry this block's adjoint into its input, so a prefix
@@ -7927,38 +8047,61 @@ impl RatReplay {
 }
 
 fn rat_fit_steps(tape: &mut NativeTape, steps: usize, rate: f64, config: Config) -> Result<()> {
-	for _ in 0..steps { tape.advance()?; tape.full_epoch(rate, config)?; }
+	for _ in 0..steps { tape.advance()?; tape.epoch_launch(rate, config, EpochOperation::Full)?; }
 	Ok(())
 }
 
-struct RatFit { tape: NativeTape, width: usize }
+struct RatFit { tape: NativeTape, graph: Graph, width: usize, loss: LossFunction, config: Config }
 impl RatFit {
 	fn new(graph: &Graph, gpu: &'static Gpu, loss: LossFunction, config: Config) -> Result<Self> {
 		require(graph.output.elements() == 1, "RAT scoring model must emit one value")?;
 		let width = graph.input.elements();
-		Ok(Self { tape: NativeTape::new(graph, &vec![0.0; width], &[0.0], gpu, config.precision, Some(loss), None, None)?, width })
+		let tape = NativeTape::new(graph, &vec![0.0; width], &[0.0], gpu, config.precision, Some(loss), None, None)?;
+		Ok(Self { tape, graph: graph.clone(), width, loss, config })
+	}
+	fn reserve(&mut self, rows: usize) -> Result<()> {
+		require(rows != 0, "RAT active row count must be positive")?;
+		if rows > self.tape.capacity {
+			let capacity = rows.checked_next_power_of_two().ok_or_else(|| RecipeError::new("RAT row capacity overflows"))?;
+			self.tape.capture(&mut self.graph)?;
+			self.graph.refresh_storage(self.config)?;
+			let stats = self.tape.extract_bn_stats()?;
+			let tape = NativeTape::new(&self.graph, &vec![0.0; checked_mul(capacity, self.width, "RAT sample capacity")?], &vec![0.0; capacity], self.tape.program.gpu, self.config.precision, Some(self.loss), None, None)?;
+			tape.upload_weights(&self.graph.parameters)?;
+			tape.inject_bn_stats(&stats)?;
+			self.tape = tape;
+		}
+		self.tape.set_rows(rows)
 	}
 	fn fit(&mut self, samples: &[f64], targets: &[f64], indices: &[usize], steps: usize, rate: f64, config: Config) -> Result<Option<f64>> {
 		require(samples.len() == checked_mul(targets.len(), self.width, "RAT fitting shape")?, "RAT fitting shape is invalid")?;
 		require(indices.iter().all(|index| *index < targets.len()), "RAT selected observation is absent")?;
-		for _ in 0..steps {
-			for &index in indices {
-				self.tape.samples.write_float_bytes(0, &samples[index * self.width..(index + 1) * self.width], self.tape.precision.model)?;
-				self.tape.targets.write_float_bytes(0, &targets[index..index + 1], self.tape.precision.model)?;
-				rat_fit_steps(&mut self.tape, 1, rate, config)?;
-			}
-		}
-		if indices.is_empty() || steps == 0 { Ok(None) } else { self.tape.objective().map(Some) }
+		if indices.is_empty() || steps == 0 { return Ok(None) }
+		self.reserve(indices.len())?;
+		let selected_samples = indices.iter().flat_map(|&index| samples[index * self.width..(index + 1) * self.width].iter().copied()).collect::<Vec<_>>();
+		let selected_targets = indices.iter().map(|&index| targets[index]).collect::<Vec<_>>();
+		self.tape.samples.write_float_bytes(0, &selected_samples, self.tape.precision.model)?;
+		self.tape.targets.write_float_bytes(0, &selected_targets, self.tape.precision.model)?;
+		rat_fit_steps(&mut self.tape, steps, rate, config)?;
+		self.tape.objective().map(Some)
 	}
 	fn predict(&mut self, samples: &[f64]) -> Result<Vec<f64>> {
 		require(samples.len() % self.width == 0, "RAT prediction shape is invalid")?;
-		samples.chunks_exact(self.width).map(|row| {
-			self.tape.samples.write_float_bytes(0, row, self.tape.precision.model)?;
-			self.tape.forward(ForwardMode::Inference)?;
-			Ok(self.tape.predictions()?[0])
-		}).collect()
+		if samples.is_empty() { return Ok(Vec::new()) }
+		self.reserve(samples.len() / self.width)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.forward(ForwardMode::Inference)?;
+		self.tape.predictions()
 	}
 	fn weights(&self) -> Result<Vec<f64>> { self.tape.weights() }
+	fn fit_sequence(&mut self, samples: &[f64], length: usize, target: f64, rate: f64, config: Config) -> Result<()> {
+		require(samples.len() == checked_mul(self.graph.input.channels, length, "RAT sequence input")?, "RAT sequence input has the wrong shape")?;
+		self.tape.set_rows(1)?;
+		self.tape.set_length(length)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.targets.write_float_bytes(0, &[target], self.tape.precision.model)?;
+		rat_fit_steps(&mut self.tape, 1, rate, config)
+	}
 	fn capture(&mut self, graph: &mut Graph) -> Result<()> { self.tape.capture(graph) }
 }
 
@@ -8459,6 +8602,10 @@ struct NativeTape {
 	step: u32,
 	output: usize,
 	capacity: usize,
+	length: usize,
+	length_capacity: usize,
+	output_length: usize,
+	dynamic_sequence: bool,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -8562,7 +8709,22 @@ impl NativeTape {
 			step,
 			output,
 			capacity: rows,
+			length: graph.input.length,
+			length_capacity: graph.input.length,
+			output_length: graph.output.length,
+			dynamic_sequence: graph.dynamic_sequence,
 		})
+	}
+	fn set_rows(&mut self, rows: usize) -> Result<()> {
+		require(rows != 0 && rows <= self.capacity, "active rows must fit the native allocation")?;
+		self.rows = narrow(rows, "native active rows")? as u32;
+		Ok(())
+	}
+	fn set_length(&mut self, length: usize) -> Result<()> {
+		require(length != 0 && length <= self.length_capacity, "active sequence length must fit the native allocation")?;
+		require(length == self.length_capacity || self.dynamic_sequence, "model does not support a changing sequence length")?;
+		self.length = length;
+		Ok(())
 	}
 	fn retune(&mut self, graph: &Graph, precision: Compute, loss: Option<LossFunction>, knobs: Option<Knobs>, deadline: Option<Deadline>) -> Result<()> {
 		require(graph.parameters.len() == self.parameters && graph.output.elements() == self.output, "native retune changed model shape")?;
@@ -8580,7 +8742,8 @@ impl NativeTape {
 		let rows = self.rows;
 		let thread_count = threads;
 		let mode = mode as i32;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
+		let length = narrow(self.length, "native active length")?;
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode, length];
 		self.program.launch(NativeEntry::Forward, &mut call, None).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -8604,7 +8767,8 @@ impl NativeTape {
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		let output = if self.dynamic_sequence && self.output_length == self.length_capacity { self.output / self.output_length * self.length } else { self.output };
+		let values = self.values.download_float_bytes(offset, self.rows as usize * output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
@@ -8626,6 +8790,7 @@ impl NativeTape {
 		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.state.pack(value));
 		let run_gradient = u32::from(operation.gradient());
 		let run_optimizer = u32::from(operation.optimizer());
+		let length = narrow(self.length, "native active length")?;
 		let mut call = ptrs![
 			self.samples.pointer,
 			self.targets.pointer,
@@ -8649,7 +8814,8 @@ impl NativeTape {
 			encoded[5],
 			encoded[6],
 			run_gradient,
-			run_optimizer
+			run_optimizer,
+			length
 		];
 		debug(&format!("epoch {} {operation:?} launch", self.step))?;
 		self.program.launch(NativeEntry::Epoch, &mut call, None).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
@@ -9554,6 +9720,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		norm_scale: Vec::new(),
 		identities: Vec::new(),
 		fitted: Vec::new(),
+		dynamic_sequence: false,
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse), None, None)?;
@@ -9964,13 +10131,13 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, u64, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, u64, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, u64);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, f64, f64, f64, f64, f64, f64, f64, i32, i32);
-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, f32, f32, f32, f32, f32, f32, f32, i32, i32);
-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, i16, i16, i16, i16, i16, i16, i16, i32, i32);
-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, i8, i8, i8, i8, i8, i8, i8, i32, i32);
+type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, f64, f64, f64, f64, f64, f64, f64, i32, i32, i32);
+type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, f32, f32, f32, f32, f32, f32, f32, i32, i32, i32);
+type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, i16, i16, i16, i16, i16, i16, i16, i32, i32, i32);
+type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, u64, i8, i8, i8, i8, i8, i8, i8, i32, i32, i32);
 
 #[derive(Clone, Copy)]
 enum NativeCpuEpoch {
@@ -11372,6 +11539,7 @@ macro_rules! launch_native_cpu_epoch {
 			native_cpu_value($arguments, 20),
 			native_cpu_value($arguments, 21),
 			native_cpu_value($arguments, 22),
+			native_cpu_value($arguments, 23),
 		)
 	};
 }
@@ -11389,6 +11557,7 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 					native_cpu_value(arguments, 4),
 					native_cpu_value(arguments, 5),
 					native_cpu_value(arguments, 6),
+					native_cpu_value(arguments, 7),
 				);
 			}
 			NativeEntry::Epoch => {
@@ -13520,6 +13689,7 @@ struct Prepared {
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
 	fitted: Vec<PredictorProgram>,
+	dynamic_sequence: bool,
 }
 impl Prepared {
 	fn matrix(samples: Vec<f64>, targets: Vec<f64>, rows: usize, target_width: usize) -> Result<Self> {
@@ -13541,6 +13711,7 @@ impl Prepared {
 			norm_scale: Vec::new(),
 			identities,
 			fitted: Vec::new(),
+			dynamic_sequence: false,
 		})
 	}
 }
@@ -14355,7 +14526,7 @@ fn finish_prepared(
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	Ok(Prepared { samples, targets, target_width, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
+	Ok(Prepared { samples, targets, target_width, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new(), dynamic_sequence: false })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
 	require(fit != 0, "split must retain normalization rows")?;
@@ -15779,7 +15950,10 @@ impl Train {
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - initial_reward;
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let retained_rows = checked_add(self.epochs, 1, "RAT observation count")?.min(capacity).max(1);
+		fitting.reserve(retained_rows)?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
+		if let Some(selector) = &mut selector { selector.ensure_actor(retained_rows, config)?; }
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
 		let tolerance = self.stop.unwrap_or(0.0);
@@ -15794,13 +15968,13 @@ impl Train {
 			let row = iteration % source_rows;
 			let sample = &prepared.samples[row * prepared.features..(row + 1) * prepared.features];
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
-			if let Some(selector) = &mut selector {
-				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, config.surrogate_epochs, config.surrogate_rate, self.learning_rate, config)?;
+			let evaluator_r2 = if let Some(selector) = &mut selector {
+				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?
 			} else {
 				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
-				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, config.surrogate_epochs, config.surrogate_rate, config)?;
-			}
-			let evaluator_r2 = coefficient(&evaluation_targets, &fitting.predict(&evaluation_samples)?);
+				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
+				coefficient(&evaluation_targets, &fitting.predict(&evaluation_samples)?)
+			};
 			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
 			tape.forward(ForwardMode::Inference)?;
 			let predictions = tape.node_values(composition.proposal, proposal_width)?;
