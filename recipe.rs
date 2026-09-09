@@ -1657,6 +1657,39 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	Ok(ir)
 }
 
+/// Applies the schedule literals shared by every native module. Keeping this
+/// in one place lets small source-provided kernels use the same backend
+/// template, math helpers, and compiler cache as ordinary model graphs.
+fn native_template(backend: Backend, precision: NativePrecision, matrix: Option<NativeMatrix>, schedule: &NativeSchedule) -> Result<String> {
+	let [register_rows, register_columns] = schedule.register_storage;
+	let register_count = register_rows.checked_mul(register_columns).ok_or_else(|| RecipeError::new("native register storage overflows"))?;
+	let mut ir = backend_template(backend, precision, matrix)?
+		.replace("RECIPE_WORKGROUP_SIZE", &schedule.block.to_string())
+		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
+		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.k_partitions.to_string())
+		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
+		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
+		.replace("RECIPE_REGISTER_M", &schedule.register_m.to_string())
+		.replace("RECIPE_REGISTER_N", &schedule.register_n.to_string())
+		.replace("RECIPE_REGISTER_ROWS", &register_rows.to_string())
+		.replace("RECIPE_REGISTER_COLUMNS", &schedule.bias_columns.to_string())
+		.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
+		.replace("RECIPE_FRAGMENT_K", &schedule.fragment_k.to_string())
+		.replace("RECIPE_CHUNK_K", &schedule.chunk_k.to_string())
+		.replace("RECIPE_CHUNK_VALUES", &schedule.chunk_values.to_string())
+		.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
+		.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
+		.replace("RECIPE_GRADIENT_SCRATCH_BASE", &schedule.scratch_base.to_string());
+	if let Some(dispatch) = schedule.dispatch {
+		for (name, dimensions) in [("workgroup", dispatch.workgroup), ("grid", dispatch.grid)] {
+			for (axis, size) in ["x", "y", "z"].into_iter().zip(dimensions) {
+				ir = ir.replace(&format!("call i32 @recipe.{name}.size.{axis}()"), &format!("add i32 0, {size}"));
+			}
+		}
+	}
+	Ok(ir)
+}
+
 fn pointer_type(backend: Backend) -> &'static str {
 	if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" }
 }
@@ -3273,32 +3306,7 @@ impl NativeModelIr {
 	}
 
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
-		let [register_rows, register_columns] = self.schedule.register_storage;
-		let register_count = register_rows * register_columns;
-		let mut ir = backend_template(backend, self.precision, matrix)?
-			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
-			.replace("RECIPE_CONTRACTION_SWIZZLE_M", &self.schedule.swizzle_m.to_string())
-			.replace("RECIPE_CONTRACTION_K_PARTITIONS", &self.schedule.k_partitions.to_string())
-			.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &self.schedule.matrix_split_span.to_string())
-			.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &self.schedule.split_span.to_string())
-			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
-			.replace("RECIPE_REGISTER_N", &self.schedule.register_n.to_string())
-			.replace("RECIPE_REGISTER_ROWS", &register_rows.to_string())
-			.replace("RECIPE_REGISTER_COLUMNS", &self.schedule.bias_columns.to_string())
-			.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
-			.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
-			.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
-			.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
-			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
-			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
-			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
-		if let Some(dispatch) = self.schedule.dispatch {
-			for (name, dimensions) in [("workgroup", dispatch.workgroup), ("grid", dispatch.grid)] {
-				for (axis, size) in ["x", "y", "z"].into_iter().zip(dimensions) {
-					ir = ir.replace(&format!("call i32 @recipe.{name}.size.{axis}()"), &format!("add i32 0, {size}"));
-				}
-			}
-		}
+		let mut ir = native_template(backend, self.precision, matrix, &self.schedule)?;
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&quantized_definitions);
@@ -3821,6 +3829,9 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	if matches!(target, BackendTarget::Cpu { .. }) {
 		parts.push(producer.as_bytes());
 	}
+	if matches!(target, BackendTarget::Nvidia { .. }) {
+		parts.extend([b"--cuda-feature".as_slice(), native_nvidia_ptx_version()?.as_bytes()]);
+	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
@@ -4066,7 +4077,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
+				.arg(format!("--cuda-feature={ptx_version}"))
+				.args(["-O2", "-S", "-x", "ir"])
 				.arg(source)
 				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
 				.arg(output);
@@ -4082,20 +4094,19 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule, deadline: Option<Deadline>) -> Result<NativeArtifact> {
+fn compile_ir_artifact(
+	target: &BackendTarget,
+	ir: &str,
+	precision: NativePrecision,
+	layout: NativeLayout,
+	storage: Vec<u8>,
+	training: bool,
+	rows: usize,
+	loss: Option<LossFunction>,
+	wave_mode: Option<WaveMode>,
+	deadline: Option<Deadline>,
+) -> Result<NativeArtifact> {
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
-	let matrix = match target {
-		BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11),
-		BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12),
-		_ => None,
-	}
-	.filter(|_| model.schedule.matrix);
-	let wave_mode = model.schedule.wave_mode;
-	let mut ir = model.emit(target.backend(), matrix, loss)?;
-	if let Some(wave_mode) = wave_mode {
-		ir.insert_str(0, &format!("; recipe wave mode {}\n", wave_mode as u32));
-	}
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -4112,7 +4123,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	debug(&format!(
 		"native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}",
 		native_target_label(target).split(";features=").next().unwrap_or("unknown"),
-		model.precision.model.label(),
+		precision.model.label(),
 		loss.map_or("none", |loss| loss.name()),
 		if cached { "hit" } else { "miss" },
 		path.display()
@@ -4143,7 +4154,24 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout, precision, artifact, path, storage, training })
+}
+
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule, deadline: Option<Deadline>) -> Result<NativeArtifact> {
+	target.validate()?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
+	let matrix = match target {
+		BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11),
+		BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12),
+		_ => None,
+	}
+	.filter(|_| model.schedule.matrix);
+	let wave_mode = model.schedule.wave_mode;
+	let mut ir = model.emit(target.backend(), matrix, loss)?;
+	if let Some(wave_mode) = wave_mode {
+		ir.insert_str(0, &format!("; recipe wave mode {}\n", wave_mode as u32));
+	}
+	compile_ir_artifact(target, &ir, model.precision, model.layout.clone(), model.storage(), loss.is_some(), rows, loss, wave_mode, deadline)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6796,6 +6824,27 @@ impl Recipe {
 			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Compiles a source-provided forward kernel against Recipe's selected native
+	/// backend. The body is inserted after the native entry's `%tid` definition
+	/// and must return from the entrypoint itself. `%tid` is one worker's global
+	/// index. The body must check it against `%count` and advance by `%threads`
+	/// to process further work items. `RECIPE_PTR` is the backend pointer spelling.
+	/// All four buffers use FP64 values.
+	///
+	/// # Safety
+	/// The supplied LLVM IR must respect each buffer's allocation and the native
+	/// entrypoint ABI. Recipe cannot check the kernel's memory accesses.
+	pub unsafe fn compute(
+		&self,
+		device: &str,
+		body: &str,
+		data: &[f64],
+		constants: &[f64],
+		parameter_capacity: usize,
+		output_capacity: usize,
+	) -> Result<CompiledKernel> {
+		unsafe { compile_compute_kernel(device, body, data, constants, parameter_capacity, output_capacity) }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11227,7 +11276,7 @@ struct RemoteDirectory {
 }
 impl Drop for RemoteDirectory {
 	fn drop(&mut self) {
-		Command::new("ssh").args(["-o", "BatchMode=yes", &self.host, &format!("rm -rf -- {}", self.path)]).status().ok();
+		Command::new("ssh").args(["-o", "BatchMode=yes", &self.host, &format!("rm -rf -- {}", self.path)]).output().ok();
 	}
 }
 fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
@@ -11258,12 +11307,22 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 /// device worker over SSH, and wraps the probed device as a local `Gpu` whose
 /// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
-	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
+	static REMOTES: Mutex<Vec<(String, std::sync::Arc<Mutex<Option<&'static Gpu>>>)>> = Mutex::new(Vec::new());
 	for (kind, value) in [("host", host), ("device", device_name)] {
 		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
 	}
-	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
-	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
+	let slot = {
+		let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
+		if let Some((_, slot)) = remotes.iter().find(|(name, _)| name == canonical) {
+			slot.clone()
+		} else {
+			let slot = std::sync::Arc::new(Mutex::new(None));
+			remotes.push((canonical.to_owned(), slot.clone()));
+			slot
+		}
+	};
+	let mut remote = slot.lock().map_err(|_| RecipeError::new("remote connection is poisoned"))?;
+	if let Some(gpu) = *remote {
 		return Ok(gpu);
 	}
 	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
@@ -11272,6 +11331,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let remote_path = format!("{}/recipe", directory.path);
 	let copy = Command::new("scp")
 		.args(["-q", "-o", "BatchMode=yes"])
+		.stdin(Stdio::null())
 		.arg(&binary)
 		.arg(format!("{host}:{remote_path}"))
 		.status()
@@ -11327,7 +11387,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 		shared_limit,
 		dispatch: Mutex::new(()),
 	}));
-	remotes.push(gpu);
+	*remote = Some(gpu);
 	Ok(gpu)
 }
 #[cfg(amd)]
@@ -11726,6 +11786,169 @@ impl NativeProgram {
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
 		if let Some(deadline) = deadline { deadline.check("GPU dispatch")? }
 		unsafe { launch_backend(gpu, &self.backend, &dispatch, entry, arguments, deadline, dynamic, shared) }
+	}
+}
+
+fn compute_schedule() -> NativeSchedule {
+	NativeSchedule {
+		matrix: false,
+		wave_mode: None,
+		block: 1024,
+		tile: Tile { m: 1, n: 1, k: 1 },
+		swizzle_m: 1,
+		register_m: 1,
+		register_n: 1,
+		register_storage: [1, 1],
+		bias_columns: 1,
+		fragment_k: 1,
+		chunk_k: 1,
+		k_partitions: 1,
+		split_span: 1,
+		matrix_split_span: 1,
+		dispatch: None,
+		chunk_values: 1,
+		scratch_base: 0,
+		shared_values: 1,
+		contractions: Vec::new(),
+		attention: Vec::new(),
+	}
+}
+
+fn native_device_wave(gpu: &Gpu) -> u32 {
+	match &gpu.driver {
+		Driver::Cpu => 1,
+		#[cfg(amd)]
+		Driver::Hsa(driver) => driver.wave,
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => driver.wave,
+		Driver::Remote(remote) => remote.wave,
+	}
+}
+
+fn native_compute_wave_mode(gpu: &Gpu) -> Result<Option<WaveMode>> {
+	if gpu.backend != Backend::Amd {
+		return Ok(None)
+	}
+	match native_device_wave(gpu) {
+		32 => Ok(Some(WaveMode::Wave32)),
+		64 => Ok(Some(WaveMode::Wave64)),
+		wave => Err(RecipeError::new(format!("AMD device {} has unsupported wave size {wave}", gpu.name))),
+	}
+}
+
+fn compute_device(selection: &str) -> Result<&'static Gpu> {
+	let names = device_names(selection)?;
+	require(names.len() == 1, "compute selects exactly one device")?;
+	let canonical = &names[0];
+	let host = local_host()?;
+	let local_prefix = format!("{host}:");
+	let local_name = canonical.strip_prefix(&local_prefix).unwrap_or(canonical);
+	if local_name == "cpu" {
+		return device(Some("cpu"));
+	}
+	if let Some(gpu) = devices()?.iter().copied().find(|gpu| gpu.name == local_name || format!("{host}:{}", gpu.name) == *canonical) {
+		return Ok(gpu);
+	}
+	if let Some((remote, device_name)) = canonical.split_once(':') {
+		require(remote != host, format!("device {canonical:?} is absent"))?;
+		return connect_remote(remote, device_name, canonical);
+	}
+	Err(RecipeError::new(format!("device {canonical:?} is absent")))
+}
+
+/// A compiled source-provided forward kernel and its persistent device buffers.
+/// The wrapper intentionally exposes only the unsafe execution boundary; all
+/// backend loading, allocation, and dispatch continue through Recipe's native
+/// runtime.
+pub struct CompiledKernel {
+	program: NativeProgram,
+	data: Buffer,
+	constants: Buffer,
+	parameters: Buffer,
+	outputs: Buffer,
+	data_len: usize,
+	parameter_capacity: usize,
+	output_capacity: usize,
+}
+
+unsafe fn compile_compute_kernel(
+	device: &str,
+	body: &str,
+	data: &[f64],
+	constants: &[f64],
+	parameter_capacity: usize,
+	output_capacity: usize,
+) -> Result<CompiledKernel> {
+	require(!body.trim().is_empty(), "compute kernel body is empty")?;
+	require(!data.is_empty(), "compute kernel data is empty")?;
+	require(parameter_capacity != 0, "compute parameter capacity is zero")?;
+	require(output_capacity != 0, "compute output capacity is zero")?;
+	let gpu = compute_device(device)?;
+	let precision = NativePrecision::new(Compute::FP64)?;
+	let schedule = compute_schedule();
+	let data_len = data.len();
+	let pointer = pointer_type(gpu.backend);
+	let body = body.replace("RECIPE_PTR", pointer);
+	let (kernel, thread) = native_entry(gpu.backend)?;
+	let mut ir = native_template(gpu.backend, precision, None, &schedule)?;
+	ir.push_str(&format!(
+		"define {kernel} void @recipe_model_forward({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads, i32 %count, i32 %length) #0 {{\nentry:\n%tid = {thread}\n{body}\n}}\n",
+		kernel = kernel,
+		pointer = pointer,
+		thread = thread,
+		body = body,
+	));
+	let ir = prune_internal_definitions(ir);
+	let wave_mode = native_compute_wave_mode(gpu)?;
+	let artifact = compile_ir_artifact(
+		&gpu.native_target,
+		&ir,
+		precision,
+		NativeLayout { values: Vec::new(), contexts: Vec::new(), adjoints: Vec::new(), values_bytes: 0, contexts_bytes: 0, adjoints_bytes: 0 },
+		Vec::new(),
+		false,
+		1,
+		None,
+		wave_mode,
+		None,
+	)?;
+	let graph = Graph::new(Shape { channels: 1, length: 1 });
+	// `NativeProgram::load` takes resident waves per workgroup, while
+	// `native_device_wave` is the ISA wave width used for AMD code generation.
+	// A source-provided kernel has no tile residency requirement, so one resident
+	// wave is the conservative geometry accepted by every GPU backend.
+	let program = NativeProgram::load(gpu, artifact, &graph, schedule, 1)?;
+	let data = Buffer::upload_float(gpu, data, precision.model)?;
+	let constants = if constants.is_empty() { Buffer::upload_float(gpu, &[0.0], precision.model)? } else { Buffer::upload_float(gpu, constants, precision.model)? };
+	let parameters = Buffer::upload_float(gpu, &vec![0.0; parameter_capacity], precision.model)?;
+	let outputs = Buffer::upload_float(gpu, &vec![0.0; output_capacity], precision.model)?;
+	Ok(CompiledKernel { program, data, constants, parameters, outputs, data_len, parameter_capacity, output_capacity })
+}
+
+impl CompiledKernel {
+	/// Dispatches the kernel with `[rows, count, length]` scalar dimensions.
+	/// `%rows` and `%length` describe the immutable data matrix, `%count` is the
+	/// number of work items, and `%threads` is the selected backend's
+	/// actual dispatch width. The kernel must write `outputs` FP64 values.
+	///
+	/// # Safety
+	/// The supplied dimensions and parameters must satisfy the compiled kernel's
+	/// memory-access requirements, including initialized output bounds.
+	pub unsafe fn run(&mut self, parameters: &[f64], dimensions: [usize; 3], outputs: usize) -> Result<Vec<f64>> {
+		let [rows, count, length] = dimensions;
+		require(rows != 0 && count != 0 && length != 0, "compute dimensions must be positive")?;
+		require(checked_mul(rows, length, "compute data dimensions")? <= self.data_len, "compute data dimensions exceed the uploaded data")?;
+		require(parameters.len() <= self.parameter_capacity, "compute parameters exceed capacity")?;
+		require(outputs != 0 && outputs <= self.output_capacity, "compute outputs exceed capacity")?;
+		self.parameters.write_float_bytes(0, parameters, Compute::FP64)?;
+		let threads = self.program.dispatch(NativeEntry::Forward)?.geometry.threads()?;
+		let rows = narrow(rows, "compute rows")?;
+		let count = narrow(count, "compute work item count")?;
+		let length = narrow(length, "compute row length")?;
+		let (data, parameters, outputs_buffer, constants) = (self.data.pointer, self.parameters.pointer, self.outputs.pointer, self.constants.pointer);
+		let mut call = ptrs![data, parameters, outputs_buffer, constants, rows, threads, count, length];
+		self.program.launch(NativeEntry::Forward, &mut call, None)?;
+		self.outputs.download_float(outputs, Compute::FP64)
 	}
 }
 
