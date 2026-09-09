@@ -919,6 +919,11 @@ fn main() -> BuildResult<()> {
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
+	let rat_enabled = setting(&manifest, "rat-enabled")?;
+	if !matches!(rat_enabled, "true" | "false") {
+		return Err(io::Error::other(format!("rat-enabled must be true or false, not {rat_enabled}")).into());
+	}
+	println!("cargo:rustc-env=RECIPE_RAT_ENABLED={rat_enabled}");
 	for (key, environment) in [("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"), ("rat-knob-model", "RECIPE_RAT_KNOB_MODEL")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}

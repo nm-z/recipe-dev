@@ -7018,8 +7018,8 @@ struct RatModels {
 	proposer: bundle::StoredGraph,
 	benchmark: bundle::StoredGraph,
 	schema: DataSchema,
-	proposer_path: PathBuf,
-	benchmark_path: PathBuf,
+	pair_path: PathBuf,
+	persist_pair: bool,
 	inference: NativeTape,
 	training: NativeTape,
 	measurement: NativeTape,
@@ -7912,6 +7912,7 @@ enum MultiDevice {
 #[derive(Clone, Copy)]
 struct Config {
 	multi_device: MultiDevice,
+	rat_enabled: bool,
 	kmeans_iterations: usize,
 	svm_iterations: usize,
 	svm_rate: f64,
@@ -7953,6 +7954,11 @@ impl Config {
 				"true" => MultiDevice::Forced,
 				"auto" => MultiDevice::Auto,
 				_ => return Err(RecipeError::new("invalid multi-device policy")),
+			},
+			rat_enabled: match env!("RECIPE_RAT_ENABLED") {
+				"false" => false,
+				"true" => true,
+				_ => return Err(RecipeError::new("invalid RAT enabled policy")),
 			},
 			kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?,
 			svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?,
@@ -8781,33 +8787,57 @@ fn extract_rat_proposer(composed: &Graph, proposer: &mut Graph, proposer_paramet
 }
 fn rat_model_path(value: &str) -> Result<PathBuf> {
 	let path = resolve_path(value)?;
-	let parent = path.parent().ok_or_else(|| RecipeError::new(format!("RAT model path {} has no parent", path.display())))?;
-	fs::create_dir_all(parent).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", parent.display())))?;
+	path.parent().ok_or_else(|| RecipeError::new(format!("RAT model path {} has no parent", path.display())))?;
 	Ok(path)
+}
+fn rat_pair_path(proposer: &Path) -> Result<PathBuf> {
+	let parent = proposer.parent().ok_or_else(|| RecipeError::new(format!("RAT model path {} has no parent", proposer.display())))?;
+	let stem = proposer.file_stem().and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("RAT model path {} has no UTF-8 file stem", proposer.display())))?;
+	Ok(parent.join(format!("{stem}.pair.ogdl")))
 }
 static RAT_SURROGATE: OnceLock<Result<Gpu>> = OnceLock::new();
 fn rat_surrogate() -> Result<&'static Gpu> {
 	RAT_SURROGATE.get_or_init(cpu_device).as_ref().map_err(Clone::clone)
 }
-fn load_rat_model(path: &Path, role: &str, gpu: &'static Gpu, config: Config) -> Result<(DataSchema, bundle::StoredGraph)> {
-	let (schema, mut saved) = bundle::load_semantic(path).map_err(|error| RecipeError::new(format!("cannot load RAT {role} model {}: {error}", path.display())))?;
-	require(saved.len() == 1, format!("RAT {role} model {} contains {} graphs, expected one", path.display(), saved.len()))?;
-	let saved = saved.pop().unwrap();
-	let samples = vec![0.0; saved.input.elements()];
-	let stored = materialize_saved_graph(&saved, &samples, gpu, config)?;
+fn load_rat_models(path: &Path, roles: &[&str], gpu: &'static Gpu, config: Config) -> Result<(DataSchema, Vec<bundle::StoredGraph>)> {
+	let (schema, mut saved) = bundle::load_semantic(path).map_err(|error| RecipeError::new(format!("cannot load RAT model {}: {error}", path.display())))?;
+	require(saved.len() == roles.len(), format!("RAT model pair {} contains {} graphs, expected {}", path.display(), saved.len(), roles.len()))?;
+	let stored = saved
+		.drain(..)
+		.zip(roles)
+		.map(|(saved, role)| {
+			let samples = vec![0.0; saved.input.elements()];
+			materialize_saved_graph(&saved, &samples, gpu, config).map_err(|error| RecipeError::new(format!("cannot materialize RAT {role} model {}: {error}", path.display())))
+		})
+		.collect::<Result<Vec<_>>>()?;
 	Ok((schema, stored))
 }
 impl RatModels {
 	fn load(model: &Model, rat: &mut RatConfig, gpu: &'static Gpu, config: Config) -> Result<Self> {
 		let proposer_path = rat_model_path(rat.knob_model)?;
 		let benchmark_path = rat_model_path(rat.bench_model)?;
-		let initialized = proposer_path.exists();
-		require(initialized == benchmark_path.exists(), "RAT requires both saved models or neither saved model")?;
-		let (schema, proposer, benchmark) = if initialized {
-			let (schema, proposer) = load_rat_model(&proposer_path, "knob", gpu, config)?;
-			let (benchmark_schema, benchmark) = load_rat_model(&benchmark_path, "bench", gpu, config)?;
+		require(proposer_path != benchmark_path, "RAT knob and bench model paths must differ")?;
+		let pair_path = rat_pair_path(&proposer_path)?;
+		require(pair_path != proposer_path && pair_path != benchmark_path, "RAT pair path collides with a configured model path")?;
+		let (schema, proposer, benchmark, persist_pair) = if pair_path.exists() {
+			match load_rat_models(&pair_path, &["knob", "bench"], gpu, config) {
+				Ok((schema, mut models)) => (schema, models.remove(0), models.remove(0), true),
+				Err(error) if proposer_path.exists() && benchmark_path.exists() => {
+					log_error(&format!("saved RAT pair {} is unusable; trying legacy models: {error}", pair_path.display()));
+					let (schema, mut proposer) = load_rat_models(&proposer_path, &["knob"], gpu, config)?;
+					let (benchmark_schema, mut benchmark) = load_rat_models(&benchmark_path, &["bench"], gpu, config)?;
+					require(schema == benchmark_schema, "RAT knob and bench model schemas differ")?;
+					(schema, proposer.remove(0), benchmark.remove(0), false)
+				}
+				Err(error) => return Err(error),
+			}
+		} else if proposer_path.exists() && benchmark_path.exists() {
+			let (schema, mut proposer) = load_rat_models(&proposer_path, &["knob"], gpu, config)?;
+			let (benchmark_schema, mut benchmark) = load_rat_models(&benchmark_path, &["bench"], gpu, config)?;
 			require(schema == benchmark_schema, "RAT knob and bench model schemas differ")?;
-			(schema, proposer, benchmark)
+			(schema, proposer.remove(0), benchmark.remove(0), true)
+		} else if proposer_path.exists() || benchmark_path.exists() {
+			return Err(RecipeError::new("RAT requires both saved models or neither saved model"));
 		} else {
 			let benchmark_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT knob model requires .loss(&benchmark)"))?;
 			let prepared = Prepared::matrix(vec![0.0; RatDecision::WIDTH], vec![0.0], 1, 1)?;
@@ -8819,7 +8849,7 @@ impl RatModels {
 			let mut proposer = stored_graph(&composition.proposer, &proposer_model, &data, None, config.precision, target);
 			proposer.outputs = RatField::ALL.map(|field| field.name().to_owned()).to_vec();
 			let benchmark = stored_graph(&composition.benchmark, &benchmark_model, &data, None, config.precision, target);
-			(DataSchema::default(), proposer, benchmark)
+			(DataSchema::default(), proposer, benchmark, true)
 		};
 		require(proposer.precision == benchmark.precision, "RAT knob and bench model arithmetic formats differ")?;
 		require(proposer.graph.input == Shape { channels: RatDecision::WIDTH, length: 1 }, "RAT knob model input shape is incompatible")?;
@@ -8834,7 +8864,7 @@ impl RatModels {
 		let training = NativeTape::new(&graph, &vec![0.0; RatDecision::WIDTH * Knobs::WIDTH], &vec![0.0; Knobs::WIDTH], gpu, proposer.precision, Some(benchmark.model.loss), None, None)?;
 		let measurement = NativeTape::new(&benchmark.graph, &vec![0.0; Query::WIDTH + Knobs::WIDTH], &[0.0], gpu, benchmark.precision, Some(benchmark.model.loss), None, None)?;
 		rat.initial_epochs = rat.initial_epochs.saturating_sub(training.step as usize);
-		Ok(Self { graph, offset, proposer, benchmark, schema, proposer_path, benchmark_path, inference, training, measurement, observations: Vec::new() })
+		Ok(Self { graph, offset, proposer, benchmark, schema, pair_path, persist_pair, inference, training, measurement, observations: Vec::new() })
 	}
 	fn choose(&mut self, query: Query, rat: RatConfig, attention: &[Option<NativeAttentionShape>], seed: &mut u64, explore: bool) -> Result<RatChoice> {
 		let mut best: Option<(f64, RatChoice)> = None;
@@ -8900,17 +8930,27 @@ impl RatModels {
 		Ok((knob_loss, BenchmarkFit { loss, predicted }))
 	}
 	fn save(&mut self) -> Result<()> {
+		if !self.persist_pair {
+			return Err(RecipeError::new(format!("RAT pair {} is unusable; preserving it and keeping heuristic training", self.pair_path.display())));
+		}
 		self.training.capture(&mut self.graph)?;
 		let parameters = self.proposer.graph.parameters.len();
 		extract_rat_proposer(&self.graph, &mut self.proposer.graph, parameters);
 		self.measurement.capture(&mut self.benchmark.graph)?;
-		bundle::save_semantic(&self.proposer_path, &self.schema, std::slice::from_mut(&mut self.proposer))?;
-		bundle::save_semantic(&self.benchmark_path, &self.schema, std::slice::from_mut(&mut self.benchmark))?;
+		let parent = self.pair_path.parent().ok_or_else(|| RecipeError::new(format!("RAT pair path {} has no parent", self.pair_path.display())))?;
+		fs::create_dir_all(parent).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", parent.display())))?;
+		let mut pair = [self.proposer.clone(), self.benchmark.clone()];
+		bundle::save_semantic(&self.pair_path, &self.schema, &mut pair)?;
+		[self.proposer, self.benchmark] = pair;
 		Ok(())
 	}
 }
 impl RatTraining {
 	fn load(graph: &Graph, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
+		#[cfg(amd)]
+		if let Driver::Hsa(driver) = &gpu.driver {
+			require(driver.occupancy().is_some(), "RAT requires AMD HIP occupancy validation")?;
+		}
 		let mut rat = rat_config(gpu, config.precision)?;
 		let surrogate = rat_surrogate()?;
 		let benchmark = recipe.model().layer(config.surrogate_width).tanh().layer(1).exp().loss(huber);
@@ -8930,7 +8970,9 @@ impl RatTraining {
 					let rejected = self.choice.knobs;
 					self.learn(self.config.invalid_time_ms, false, config)?;
 					if self.updates >= self.config.initial_epochs + self.config.shuffles && self.choice.knobs == rejected {
-						self.models.save()?;
+						if let Err(error) = self.models.save() {
+							log_error(&format!("RAT tuner state was not saved; continuing with heuristic schedule: {error}"));
+						}
 						return dispatch(None)
 					}
 				}
@@ -9717,12 +9759,18 @@ impl Kernel {
 }
 #[cfg(amd)]
 #[allow(dead_code)]
+struct HipOccupancy {
+	runtime: Library,
+	device: i32,
+	processors: u32,
+	set_device: unsafe extern "C" fn(i32) -> i32,
+}
+#[cfg(amd)]
+#[allow(dead_code)]
 struct Hsa {
 	_runtime: std::sync::Arc<Library>,
-	occupancy_runtime: Library,
-	occupancy_device: i32,
-	occupancy_processors: u32,
-	set_occupancy_device: unsafe extern "C" fn(i32) -> i32,
+	occupancy_pci: std::ffi::CString,
+	occupancy: OnceLock<Option<HipOccupancy>>,
 	reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32,
 	reader_destroy: unsafe extern "C" fn(u64) -> i32,
 	executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32,
@@ -9759,6 +9807,32 @@ struct Hsa {
 extern "C" fn hsa_queue_error(status: i32, _: Ptr, data: Ptr) { unsafe { &*data.cast::<AtomicI32>() }.store(status, Ordering::Release) }
 #[cfg(amd)]
 impl Hsa {
+	fn occupancy(&self) -> Option<&HipOccupancy> {
+		self.occupancy
+			.get_or_init(|| {
+				let result = (|| -> Result<HipOccupancy> {
+					let runtime = Library::open(env!("RECIPE_HSA_OCCUPANCY_RUNTIME"))?;
+					let get_device: unsafe extern "C" fn(*mut i32, *const u8) -> i32 = runtime.function(b"hipDeviceGetByPCIBusId\0")?;
+					let attribute: unsafe extern "C" fn(*mut i32, i32, i32) -> i32 = runtime.function(b"hipDeviceGetAttribute\0")?;
+					let set_device: unsafe extern "C" fn(i32) -> i32 = runtime.function(b"hipSetDevice\0")?;
+					let (mut device, mut processors) = (0, 0);
+					driver_status(Backend::Amd, unsafe { get_device(&mut device, self.occupancy_pci.as_ptr().cast()) }, "HIP occupancy PCI device query")?;
+					driver_status(Backend::Amd, unsafe { attribute(&mut processors, HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device) }, "HIP multiprocessor query")?;
+					let processors = u32::try_from(processors).map_err(|error| RecipeError::new(format!("HIP multiprocessor count is invalid: {error}")))?;
+					let occupancy_processors = u64::from(processors) * u64::from(self.cus) / u64::from(self.query.cu.max(1));
+					let processors = u32::try_from(occupancy_processors).map_err(|error| RecipeError::new(format!("HIP occupancy processor count is invalid: {error}")))?;
+					Ok(HipOccupancy { runtime, device, processors, set_device })
+				})();
+				match result {
+					Ok(occupancy) => Some(occupancy),
+					Err(error) => {
+						log_error(&format!("AMD HIP occupancy is unavailable; using heuristic schedule: {error}"));
+						None
+					}
+				}
+			})
+			.as_ref()
+	}
 	fn create_queue(&self, cooperative: bool) -> Result<Ptr> {
 		let mut queue = ptr::null_mut();
 		self.queue_error.store(0, Ordering::Release);
@@ -10769,19 +10843,33 @@ impl Hsa {
 			let forward = self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
 			let epoch = training.then(|| self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, geometry, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-			if training {
-				driver_status(Backend::Amd, (self.set_occupancy_device)(self.occupancy_device), "HIP occupancy device selection")?;
-				let module = NativeModule::load(&self.occupancy_runtime, Backend::Amd, [b"hipModuleLoadData\0", b"hipModuleUnload\0", b"hipModuleGetFunction\0", b"hipModuleOccupancyMaxActiveBlocksPerMultiprocessor\0"], bytes)?;
-				for (dispatch, name) in [(Some(forward), NATIVE_FORWARD_SYMBOL), (epoch, NATIVE_EPOCH_SYMBOL)] {
-					let Some(dispatch) = dispatch else { continue };
-					let explicit = dispatch.kernel.arguments().last().map_or(0, |(offset, bytes)| offset + bytes).next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-					if dispatch.kernel.kernarg > explicit {
-						let resident = module.resident_groups(module.function(name)?, dispatch.geometry.block, shared_values * u32::from(element), self.occupancy_processors)?;
-						debug(&format!("AMD compiled residency\tkernel={name}\tworkgroups={}\tresident={resident}\tthreads={}\tshared={}", dispatch.geometry.groups, dispatch.geometry.block, shared_values * u32::from(element)))?;
-						if dispatch.geometry.groups > resident {
-							return Err(RecipeError::Residency(format!("cooperative kernel {name} requires {} resident workgroups; HIP reports {resident}", dispatch.geometry.groups)))
+			if training
+				&& let Some(occupancy) = self.occupancy()
+			{
+				let occupancy_check = (|| -> Result<()> {
+					driver_status(Backend::Amd, (occupancy.set_device)(occupancy.device), "HIP occupancy device selection")?;
+					let module = NativeModule::load(&occupancy.runtime, Backend::Amd, [b"hipModuleLoadData\0", b"hipModuleUnload\0", b"hipModuleGetFunction\0", b"hipModuleOccupancyMaxActiveBlocksPerMultiprocessor\0"], bytes)?;
+					for (dispatch, name) in [(Some(forward), NATIVE_FORWARD_SYMBOL), (epoch, NATIVE_EPOCH_SYMBOL)] {
+						let Some(dispatch) = dispatch else { continue };
+						let explicit = dispatch.kernel.arguments().last().map_or(0, |(offset, bytes)| offset + bytes).next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
+						if dispatch.kernel.kernarg > explicit {
+							let resident = module.resident_groups(module.function(name)?, dispatch.geometry.block, shared_values * u32::from(element), occupancy.processors)?;
+							debug(&format!("AMD compiled residency\tkernel={name}\tworkgroups={}\tresident={resident}\tthreads={}\tshared={}", dispatch.geometry.groups, dispatch.geometry.block, shared_values * u32::from(element)))?;
+							if dispatch.geometry.groups > resident {
+								return Err(RecipeError::Residency(format!("cooperative kernel {name} requires {} resident workgroups; HIP reports {resident}", dispatch.geometry.groups)))
+							}
 						}
 					}
+					Ok(())
+				})();
+				if let Err(error) = occupancy_check {
+					if matches!(&error, RecipeError::Residency(_)) {
+						return Err(error)
+					}
+					if geometry.is_some() {
+						return Err(RecipeError::Residency(format!("AMD HIP occupancy check is unavailable for tuned dispatch: {error}")))
+					}
+					log_error(&format!("AMD HIP occupancy check is unavailable; using heuristic schedule: {error}"));
 				}
 			}
 			let kernarg_size = [Some(forward), epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
@@ -11238,15 +11326,8 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			.parse::<u64>()
 			.map_err(|error| RecipeError::new(format!("invalid {used_path}: {error}")))?;
 		let free_memory = (memory as u64).checked_sub(used).ok_or_else(|| RecipeError::new("AMD used VRAM exceeds the queried VRAM pool"))?;
-		let occupancy_runtime = Library::open(env!("RECIPE_HSA_OCCUPANCY_RUNTIME"))?;
 		let pci = fs::canonicalize(Path::new(&used_path).parent().unwrap()).map_err(|error| RecipeError::new(format!("cannot resolve AMD PCI device: {error}")))?;
 		let pci = std::ffi::CString::new(pci.file_name().unwrap().as_encoded_bytes()).map_err(|error| RecipeError::new(format!("invalid AMD PCI address: {error}")))?;
-		let get_device: unsafe extern "C" fn(*mut i32, *const u8) -> i32 = occupancy_runtime.function(b"hipDeviceGetByPCIBusId\0")?;
-		let attribute: unsafe extern "C" fn(*mut i32, i32, i32) -> i32 = occupancy_runtime.function(b"hipDeviceGetAttribute\0")?;
-		let (mut occupancy_device, mut processors) = (0, 0);
-		check(get_device(&mut occupancy_device, pci.as_ptr().cast()), "HIP occupancy PCI device query")?;
-		check(attribute(&mut processors, HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, occupancy_device), "HIP multiprocessor query")?;
-		let occupancy_processors = (processors as u64 * u64::from(cus) / u64::from(available)) as u32;
 		let sd = available.checked_mul(sdpcu).ok_or_else(|| RecipeError::new("AMD SIMD count overflows"))?;
 		require(sdpcu != 0 && mwvpcu % sdpcu == 0, "AMD waves per SIMD cannot be derived from waves per CU")?;
 		let mwvpsd = mwvpcu / sdpcu;
@@ -11316,10 +11397,8 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa {
 			_runtime: runtime.clone(),
-			set_occupancy_device: occupancy_runtime.function(b"hipSetDevice\0")?,
-			occupancy_runtime,
-			occupancy_device,
-			occupancy_processors,
+			occupancy_pci: pci,
+			occupancy: OnceLock::new(),
 			reader_create: runtime.function(b"hsa_code_object_reader_create_from_memory\0")?,
 			reader_destroy: runtime.function(b"hsa_code_object_reader_destroy\0")?,
 			executable_create: runtime.function(b"hsa_executable_create_alt\0")?,
@@ -15416,12 +15495,22 @@ impl Train {
 		let mut tape = DeviceTape::new(&stored.graph, samples, targets, selected_gpus()?, config.precision, model.loss, config)?;
 		tape.print_devices()?;
 		let primary = tape.shards[0].program.gpu;
-		let mut rat_training = match primary.backend {
-			Backend::Amd if tape.shards.len() == 1 => Some(RatTraining::load(&stored.graph, training_rows, primary, config)?),
-			_ => None,
+		let mut rat_training = if config.rat_enabled && primary.backend == Backend::Amd && tape.shards.len() == 1 {
+			match RatTraining::load(&stored.graph, training_rows, primary, config) {
+				Ok(training) => Some(training),
+				Err(error) => {
+					log_error(&format!("RAT tuner unavailable; using heuristic schedule: {error}"));
+					None
+				}
+			}
+		} else {
+			None
 		};
-		if let Some(rat) = &mut rat_training {
-			rat.apply(config, |knobs| tape.shards[0].retune(&stored.graph, config.precision, Some(model.loss), knobs, None))?;
+		if let Some(rat) = &mut rat_training
+			&& let Err(error) = rat.apply(config, |knobs| tape.shards[0].retune(&stored.graph, config.precision, Some(model.loss), knobs, None))
+		{
+			log_error(&format!("RAT tuner unavailable; using heuristic schedule: {error}"));
+			rat_training = None;
 		}
 		self.finish_dispatch(
 			if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) },
@@ -15485,7 +15574,11 @@ impl Train {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
 		}
-		if let Some(rat) = &mut rat_training { rat.models.save()? }
+		if let Some(rat) = &mut rat_training
+			&& let Err(error) = rat.models.save()
+		{
+			log_error(&format!("RAT tuner state was not saved; continuing with heuristic schedule: {error}"));
+		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;

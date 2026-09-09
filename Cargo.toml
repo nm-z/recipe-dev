@@ -34,6 +34,9 @@ rat-initial-epochs = 10
 rat-shuffles = 2
 rat-prediction-shuffles = 16
 rat-observation-epochs = 8
+# Native AMD RAT tuning is disabled unless explicitly enabled for this build.
+rat-enabled = false
+# When enabled, both tuner models persist as one atomic `<knob stem>.pair.ogdl` bundle.
 rat-bench-model = "~/.local/share/recipe/rat/bench.ogdl"
 rat-knob-model = "~/.local/share/recipe/rat/knob.ogdl"
 hsa-queue-packets = 256
