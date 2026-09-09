@@ -1433,6 +1433,13 @@ const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
+fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
+	match state_bytes {
+		8 => Ok(NATIVE_EPOCH_LAYOUT_FP64),
+		4 => Ok(NATIVE_EPOCH_LAYOUT_FP32),
+		width => Err(RecipeError::new(format!("native epoch state width {width} is unsupported"))),
+	}
+}
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
 		impl NativePrecision {
@@ -3664,13 +3671,28 @@ impl Drop for NativeTemporaryFiles {
 }
 
 fn remote_native_artifact(target: &BackendTarget, bytes: &[u8]) -> Result<(PathBuf, NativeTemporaryFiles)> {
-	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
-	let path = std::env::temp_dir().join(format!("recipe-remote-native-{}-{serial}.{}", std::process::id(), target.artifact_extension()));
-	let mut file = fs::OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.open(&path)
-		.map_err(|error| RecipeError::new(format!("cannot create remote native artifact {}: {error}", path.display())))?;
+	let directory = native_artifact_directory("remote")?;
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create remote native artifact directory {}: {error}", directory.display())))?;
+	#[cfg(unix)]
+	fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+		.map_err(|error| RecipeError::new(format!("cannot secure remote native artifact directory {}: {error}", directory.display())))?;
+	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos());
+	let mut attempt = 0_u64;
+	let (path, mut file) = loop {
+		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+		let path = directory.join(format!(".recipe-remote-native-{}-{timestamp:x}-{serial:x}-{attempt:x}.{}", std::process::id(), target.artifact_extension()));
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		match options.open(&path) {
+			Ok(file) => break (path, file),
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				attempt = attempt.wrapping_add(1);
+			}
+			Err(error) => return Err(RecipeError::new(format!("cannot create remote native artifact {}: {error}", path.display()))),
+		}
+	};
 	if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
 		let _ = fs::remove_file(&path);
 		return Err(RecipeError::new(format!("cannot write remote native artifact {}: {error}", path.display())));
@@ -4758,7 +4780,10 @@ mod bundle {
 	}
 }
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::{
+	ffi::OsStrExt,
+	fs::{OpenOptionsExt, PermissionsExt},
+};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::{
@@ -4775,7 +4800,7 @@ use std::{
 		Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub static recipe: Recipe = Recipe;
 static RUN: AtomicU64 = AtomicU64::new(0);
@@ -7878,7 +7903,13 @@ fn optimizer_work(graph: &Graph) -> f64 {
 /// dispatch isolates fixed cost, and the gradient dispatch measures planned work
 /// without allocating, forwarding, training, or dispatching the placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let workers = if gpu.backend == Backend::Cpu { cpu_worker_threads()? as usize } else { 1 };
+	let workers = match &gpu.driver {
+		Driver::Cpu if gpu.backend == Backend::Cpu => cpu_worker_threads()?,
+		Driver::Remote(remote) if gpu.backend == Backend::Cpu => remote.worker_threads,
+		_ => 1,
+	};
+	let workers = usize::try_from(workers).map_err(|_| RecipeError::new("CPU worker count exceeds usize"))?;
+	require(workers != 0, "CPU worker count is empty")?;
 	let rows = checked_mul(checked_mul(config.surrogate_epochs, config.surrogate_width, "surrogate rows")?, workers, "parallel surrogate rows")?;
 	let features = config.surrogate_width;
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
@@ -8598,6 +8629,7 @@ type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
+	worker_threads: u32,
 }
 enum Driver {
 	Cpu,
@@ -9084,7 +9116,8 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() && !cfg!(any(amd, nvidia)) {
+			let selected_cpu = selection.as_deref().is_some_and(|names| names.iter().any(|name| name == "cpu"));
+			if selected_cpu || (found.is_empty() && !cfg!(any(amd, nvidia))) {
 				found.push(cpu_device()?);
 			}
 			// A selection names devices on other hosts too, so an empty local list is not an error.
@@ -9096,10 +9129,6 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map_err(Clone::clone)
 }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
-	if name == Some("cpu") {
-		static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
-		return CPU.get_or_init(cpu_device).as_ref().map_err(Clone::clone);
-	}
 	let found = devices()?;
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
@@ -9186,11 +9215,18 @@ fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
 }
 fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	let mut command = Command::new("ssh");
-	command.args(["-o", "BatchMode=yes", host, "umask 077; mktemp -d /tmp/recipe.XXXXXXXX"]);
+	command.args(["-o", "BatchMode=yes", host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
 	let output = command_output(&mut command, &format!("create a private worker directory on {host}"))?;
 	let path = String::from_utf8(output).map_err(|error| RecipeError::new(format!("worker directory from {host} is invalid: {error}")))?.trim().to_owned();
+	let marker = "/.cache/recipe/native/remote-worker.";
+	let (prefix, suffix) = path.rsplit_once(marker).ok_or_else(|| RecipeError::new(format!("worker directory from {host} is unsafe: {path:?}")))?;
 	require(
-		path.starts_with("/tmp/recipe.") && path.len() == "/tmp/recipe.".len() + 8 && path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)),
+		!prefix.is_empty()
+			&& path.match_indices(marker).count() == 1
+			&& path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+			&& !path.split('/').any(|component| matches!(component, "." | ".."))
+			&& suffix.len() == 8
+			&& suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
 		format!("worker directory from {host} is unsafe: {path:?}"),
 	)?;
 	Ok(RemoteDirectory { host: host.to_owned(), path })
@@ -9242,7 +9278,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 		3 => Backend::Cpu,
 		byte => return Err(RecipeError::new(format!("remote worker reported unknown backend {byte}"))),
 	};
-	let architecture_length = if backend == Backend::Cpu { channel.read_u32()? as usize } else { channel.read_u8()? as usize };
+	let architecture_length = usize::try_from(channel.read_u32()?).map_err(|_| RecipeError::new("remote architecture metadata length exceeds usize"))?;
 	require(architecture_length <= 4096, "remote architecture metadata is too large")?;
 	let mut architecture = vec![0_u8; architecture_length];
 	channel.read_into(&mut architecture)?;
@@ -9250,6 +9286,8 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let memory = channel.read_u64()?;
 	let shared_limit = channel.read_u32()?;
 	let wave = channel.read_u32()?;
+	let worker_threads = channel.read_u32()?;
+	require(worker_threads != 0, "remote worker thread count is empty")?;
 	drop(directory);
 	let native_target = match backend {
 		Backend::Cpu => BackendTarget::Cpu { target: architecture },
@@ -9260,7 +9298,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 		name: canonical.to_owned(),
 		backend,
 		native_target,
-		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave }),
+		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave, worker_threads }),
 		memory,
 		shared_limit,
 		dispatch: Mutex::new(()),
@@ -9537,6 +9575,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 impl NativeProgram {
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
+		native_epoch_layout(artifact.precision.state.bytes())?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
@@ -9580,7 +9619,7 @@ impl NativeProgram {
 				channel.write_u32(register_values)?;
 				channel.write_u8(element)?;
 				channel.write_u8(u8::from(artifact.training))?;
-				channel.write_u8(u8::from(artifact.precision.epoch_layout == NATIVE_EPOCH_LAYOUT_FP64))?;
+				channel.write_u8(u8::try_from(artifact.precision.state.bytes()).map_err(|_| RecipeError::new("native epoch state width exceeds wire width"))?)?;
 				channel.write_u8(u8::from(!artifact.storage.is_empty()))?;
 				channel.flush()?;
 				channel.read_status("artifact load")?;
@@ -9982,15 +10021,15 @@ struct WorkerProgram {
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
-	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
-		Driver::Cpu => Ok((gpu, 3_u8, 1)),
+	let probe: Result<(&'static Gpu, u8, u32, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		Driver::Cpu => Ok((gpu, 3_u8, 1, cpu_worker_threads()?)),
 		#[cfg(amd)]
-		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
+		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave, 1)),
 		#[cfg(nvidia)]
-		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
+		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave, 1)),
 		Driver::Remote(_) => Err(RecipeError::new(format!("device {name:?} is not a local device"))),
 	});
-	let (gpu, backend, wave) = match probe {
+	let (gpu, backend, wave, worker_threads) = match probe {
 		Ok(probe) => probe,
 		Err(error) => {
 			wire.status(&Err(error.clone()))?;
@@ -10001,15 +10040,12 @@ pub fn worker_serve(name: &str) -> Result<()> {
 	wire.status(&Ok(()))?;
 	let architecture = native_target_label(&gpu.native_target);
 	wire.write_u8(backend)?;
-	if backend == 3 {
-		wire.write_u32(u32::try_from(architecture.len()).map_err(|_| RecipeError::new("remote CPU target metadata is too long"))?)?;
-	} else {
-		wire.write_u8(architecture.len() as u8)?;
-	}
+	wire.write_u32(u32::try_from(architecture.len()).map_err(|_| RecipeError::new("remote target metadata is too long"))?)?;
 	wire.write_bytes(architecture.as_bytes())?;
 	wire.write_bytes(&gpu.memory.to_le_bytes())?;
 	wire.write_u32(gpu.shared_limit)?;
 	wire.write_u32(wave)?;
+	wire.write_u32(worker_threads)?;
 	wire.flush()?;
 	let mut program: Option<WorkerProgram> = None;
 	loop {
@@ -10059,27 +10095,31 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let register_values = wire.read_u32()?;
 				let element = wire.read_u8()?;
 				let training = wire.read_u8()? != 0;
-				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
+				let state_bytes = usize::from(wire.read_u8()?);
 				let has_storage = wire.read_u8()? != 0;
-				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match &gpu.driver {
-					Driver::Cpu => {
-						let (path, temporary) = remote_native_artifact(&gpu.native_target, &artifact)?;
-						let state_bytes = if epoch_layout == NATIVE_EPOCH_LAYOUT_FP64 { 8 } else { 4 };
-						let cpu = load_native_cpu_path(&path, state_bytes, training, has_storage)?;
-						let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
-						let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry };
-						let epoch = training.then_some(Dispatch { kernel: Kernel::remote(0, element, epoch_layout), geometry });
-						let model_load = has_storage.then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry });
-						Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load, temporary))
-					}
-					#[cfg(amd)]
-					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
-					#[cfg(nvidia)]
-					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
-					Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
+				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match native_epoch_layout(state_bytes) {
+					Err(error) => Err(error),
+					Ok(epoch_layout) => match &gpu.driver {
+						Driver::Cpu => (|| {
+							let (path, temporary) = remote_native_artifact(&gpu.native_target, &artifact)?;
+							let cpu = load_native_cpu_path(&path, state_bytes, training, has_storage)?;
+							let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+							let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry };
+							let epoch = training.then_some(Dispatch { kernel: Kernel::remote(0, element, epoch_layout), geometry });
+							let model_load = has_storage.then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+							Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load, temporary))
+						})(),
+						#[cfg(amd)]
+						Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
+							.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
+						#[cfg(nvidia)]
+						Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
+							.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
+						Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
+					},
 				};
+				#[cfg(not(any(amd, nvidia)))]
+				let _ = waves;
 				wire.status(&loaded.as_ref().map(|_| ()).map_err(Clone::clone))?;
 				if let Ok((backend, forward, epoch, model_load, temporary)) = loaded {
 					let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
