@@ -7038,12 +7038,17 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	proposer_model.downstream = None;
 	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
 	proposer.refresh_storage(config)?;
-	let observations = Prepared::matrix(vec![0.0; prepared.target_width], vec![0.0], 1, 1)?;
+	let observation_width = checked_add(prepared.features, prepared.target_width, "RAT evaluator input width")?;
+	let observations = Prepared::matrix(vec![0.0; observation_width], vec![0.0], 1, 1)?;
 	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
 	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
-	require(proposer.output == evaluator.input, "RAT proposal and evaluator shapes differ")?;
 	let proposal = proposer.nodes.len() - 1;
 	let mut graph = proposer.clone();
+	let (features, targets, tail) = (graph.input, graph.output, graph.source);
+	let carried = embed(&mut graph, -1, features, (0..prepared.features).map(Some).chain(std::iter::repeat_n(None, prepared.target_width)))?;
+	let predicted = embed(&mut graph, tail, targets, std::iter::repeat_n(None, prepared.features).chain((0..prepared.target_width).map(Some)))?;
+	binary(&mut graph, carried, predicted, Shape { channels: observation_width, length: 1 }, ScalarOpcode::Add)?;
+	require(graph.output == evaluator.input, "RAT observation and evaluator shapes differ")?;
 	let offset = graph.parameters.len();
 	append_graph(&mut graph, evaluator.clone())?;
 	graph.frozen[offset..].fill(1);
@@ -15316,6 +15321,8 @@ impl Train {
 	/// its predictions in declared target order. Feature names use the loaded
 	/// schema's `table.column` names; expanded columns append a zero-based index.
 	/// Feature values use the same encoding and normalization as the proposer.
+	/// The surrogate receives those same features followed by predicted targets,
+	/// both when fitting command scores and when differentiating the composition.
 	/// The executable writes exactly one finite reward in `[0, 1]` to stdout.
 	/// Any stderr output or unsuccessful exit stops training, even with a score.
 	/// Return reward zero for a valid but unsupported proposal, without stderr.
@@ -15429,6 +15436,7 @@ impl Train {
 		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
+		let observation_width = checked_add(prepared.features, proposal_width, "RAT evaluator input width")?;
 		let mut input_names = Vec::new();
 		for (_, field) in prepared.schema.iter().filter(|(kind, _)| kind == "feature") {
 			let (width, name) = field.split_once(' ').ok_or_else(|| RecipeError::new("RAT feature schema has no width"))?;
@@ -15456,15 +15464,14 @@ impl Train {
 		let mut tape = NativeTape::new(&composition.graph, samples, &objectives, gpu, config.precision, Some(composition.loss), None, None)?;
 		tape.forward(ForwardMode::Inference)?;
 		let initial_predictions = tape.node_values(composition.proposal, proposal_width)?;
-		let evaluate = |sample: &[f64], proposal: &[f64]| -> Result<f64> {
+		let observation = |sample: &[f64], proposal: &[f64]| -> Result<Vec<f64>> {
 			require(sample.len() == prepared.features && proposal.len() == proposal_width, "RAT sample or proposal has the wrong shape")?;
-			let values = sample.iter().chain(proposal).copied().collect::<Vec<_>>();
-			command.evaluate(&input_names, &values)
+			Ok(sample.iter().chain(proposal).copied().collect())
 		};
-		let initial_reward = evaluate(samples, &initial_predictions)?;
+		let mut evaluation_samples = observation(samples, &initial_predictions)?;
+		let initial_reward = command.evaluate(&input_names, &evaluation_samples)?;
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let initial_loss = 1.0 - initial_reward;
-		let mut evaluation_samples = initial_predictions.clone();
 		let mut evaluation_targets = vec![initial_reward];
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
@@ -15472,7 +15479,7 @@ impl Train {
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let fit_evaluator = |graph: &mut Graph, samples: &[f64], targets: &[f64]| -> Result<f64> {
 			let rows = ((targets.len() as f64 * data.split).floor() as usize).max(1);
-			let samples = &samples[..rows * proposal_width];
+			let samples = &samples[..rows * observation_width];
 			let targets = &targets[..rows];
 			let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(composition.loss), None, None)?;
 			for _ in 0..config.surrogate_epochs {
@@ -15504,10 +15511,11 @@ impl Train {
 			let _ = tape.full_epoch(self.learning_rate, config)?;
 			tape.forward(ForwardMode::Inference)?;
 			let predictions = tape.node_values(composition.proposal, proposal_width)?;
-			let reward = evaluate(sample, &predictions)?;
+			let observed = observation(sample, &predictions)?;
+			let reward = command.evaluate(&input_names, &observed)?;
 			measured_reward = reward;
 			measured_predictions.clone_from(&predictions);
-			evaluation_samples.extend_from_slice(&predictions);
+			evaluation_samples.extend_from_slice(&observed);
 			evaluation_targets.push(reward);
 			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
@@ -15516,13 +15524,13 @@ impl Train {
 		}
 		fit_evaluator(&mut composition.evaluator, &evaluation_samples, &evaluation_targets)?;
 		let score = |samples: &[f64]| -> Result<Vec<f64>> {
-			require(samples.len() % proposal_width == 0, "RAT evaluator samples have the wrong shape")?;
-			graph_inputs(&composition.evaluator, samples, samples.len() / proposal_width, gpu, config.precision)
+			require(samples.len() % observation_width == 0, "RAT evaluator samples have the wrong shape")?;
+			graph_inputs(&composition.evaluator, samples, samples.len() / observation_width, gpu, config.precision)
 		};
 		let evaluator_predictions = score(&evaluation_samples)?;
 		let fitted_rows = ((evaluation_targets.len() as f64 * data.split).floor() as usize).max(1);
 		let evaluator_r2 = coefficient(&evaluation_targets[..fitted_rows], &evaluator_predictions[..fitted_rows]);
-		let predicted_reward = mean(&score(&measured_predictions)?);
+		let predicted_reward = mean(&score(&evaluation_samples[evaluation_samples.len() - observation_width..])?);
 		let validation_r2 = (fitted_rows < evaluation_targets.len()).then(|| coefficient(&evaluation_targets[fitted_rows..], &evaluator_predictions[fitted_rows..]));
 		let final_loss = 1.0 - measured_reward;
 		let selected_tile = tape.tile();
