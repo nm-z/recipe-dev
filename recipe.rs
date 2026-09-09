@@ -3666,6 +3666,21 @@ impl Drop for NativeTemporaryFiles {
 	}
 }
 
+fn remote_native_artifact(target: &BackendTarget, bytes: &[u8]) -> Result<(PathBuf, NativeTemporaryFiles)> {
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let path = std::env::temp_dir().join(format!("recipe-remote-native-{}-{serial}.{}", std::process::id(), target.artifact_extension()));
+	let mut file = fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&path)
+		.map_err(|error| RecipeError::new(format!("cannot create remote native artifact {}: {error}", path.display())))?;
+	if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
+		let _ = fs::remove_file(&path);
+		return Err(RecipeError::new(format!("cannot write remote native artifact {}: {error}", path.display())));
+	}
+	Ok((path.clone(), NativeTemporaryFiles { paths: vec![path] }))
+}
+
 fn home_directory() -> Result<PathBuf> {
 	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).ok_or_else(|| RecipeError::new("home directory is absent"))
 }
@@ -3677,7 +3692,11 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
+	let version = match target {
+		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v4".as_slice(),
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
+	};
+	for part in [version, native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -3831,11 +3850,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
-			let (target, compiler_identity, _, _) = cpu_identity(target)?;
+			let (target, compiler_identity, cpu, features) = cpu_identity(target)?;
 			let linker = Path::new(native_cpu_setting("linker")?);
 			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", target, "-march=native"]);
+			command.args(["-target", target, "-Xclang", "-target-cpu", "-Xclang", cpu]);
+			for feature in features.split(',') {
+				command.args(["-Xclang", "-target-feature", "-Xclang", feature]);
+			}
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
 				command.args(["-mllvm", "-opaque-pointers=1"]);
 			}
@@ -9062,7 +9084,7 @@ fn optimizer_work(graph: &Graph) -> f64 {
 /// dispatch isolates fixed cost, and the gradient dispatch measures planned work
 /// without allocating, forwarding, training, or dispatching the placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let workers = if matches!(&gpu.driver, Driver::Cpu) { cpu_worker_threads()? as usize } else { 1 };
+	let workers = if gpu.backend == Backend::Cpu { cpu_worker_threads()? as usize } else { 1 };
 	let rows = checked_mul(checked_mul(config.surrogate_epochs, config.surrogate_width, "surrogate rows")?, workers, "parallel surrogate rows")?;
 	let features = config.surrogate_width;
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
@@ -9970,11 +9992,15 @@ impl Drop for Library {
 }
 
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
-	let library = Library::open(&artifact.path)?;
+	load_native_cpu_path(&artifact.path, artifact.precision.state.bytes(), artifact.training, !artifact.storage.is_empty())
+}
+
+fn load_native_cpu_path(path: &Path, state_bytes: usize, training: bool, has_storage: bool) -> Result<NativeCpuProgram> {
+	let library = Library::open(path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
-		match artifact.precision.state.bytes() {
+		match state_bytes {
 			8 => library.function::<NativeEpochF64>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F64),
 			4 => library.function::<NativeEpochF32>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F32),
 			2 => library.function::<NativeEpochF16>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F16),
@@ -9982,8 +10008,8 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 			_ => Err(RecipeError::new("native CPU precision width is invalid")),
 		}
 	};
-	let epoch = artifact.training.then(epoch).transpose()?;
-	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
+	let epoch = training.then(epoch).transpose()?;
+	let model_load = has_storage.then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
 	Ok(NativeCpuProgram { _library: library, thread, forward, epoch, model_load })
 }
 
@@ -10014,14 +10040,15 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, knobs: Option<Knobs>, deadline: Option<Deadline>) -> Result<NativeProgram> {
+		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if let Some(knobs) = knobs {
 			knobs.wpwg
-		} else if matches!(&self.driver, Driver::Cpu) {
+		} else if cpu {
 			1
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
 		};
-		let shared_values = if matches!(&self.driver, Driver::Cpu) {
+		let shared_values = if cpu {
 			narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32
 		} else {
 			self.shared_limit / precision.bytes() as u32
@@ -10384,12 +10411,38 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, free_memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
+fn device_names(selection: &str) -> Result<Vec<String>> {
+	let mut names = Vec::new();
+	for group in selection.split(',') {
+		let mut host = String::new();
+		let mut hostname = Vec::new();
+		for part in group.split('.') {
+			require(!part.is_empty(), "device selection contains an empty component")?;
+			let name = if let Some((prefix, name)) = part.split_once(':') {
+				require(!prefix.is_empty(), "device host is empty")?;
+				hostname.push(prefix);
+				host = hostname.join(".");
+				hostname.clear();
+				name
+			} else { part };
+			let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
+			if !gpu && name != "cpu" && !part.contains(':') {
+				hostname.push(part);
+				continue;
+			}
+			require(hostname.is_empty() && (gpu || name == "cpu"), format!("invalid device selector {name:?}; use cpu for the available CPU pool"))?;
+			names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
+		}
+		require(hostname.is_empty(), format!("invalid device or incomplete host in {group:?}"))?;
+	}
+	Ok(names)
+}
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
 /// `None` selects the whole machine, so an unnamed run still sees every device.
 fn device_selection() -> Result<Option<Vec<String>>> {
 	let Ok(selection) = std::env::var("RECIPE_DEVICE") else { return Ok(None) };
 	let prefix = format!("{}:", local_host()?);
-	Ok(Some(selection.split(',').map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_owned()).collect()))
+	Ok(Some(device_names(&selection)?.into_iter().map(|name| name.strip_prefix(&prefix).unwrap_or(&name).to_owned()).collect()))
 }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
@@ -10418,6 +10471,10 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map_err(Clone::clone)
 }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
+	if name == Some("cpu") {
+		static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
+		return CPU.get_or_init(cpu_device).as_ref().map_err(Clone::clone);
+	}
 	let found = devices()?;
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
@@ -10449,9 +10506,10 @@ fn local_host() -> Result<String> {
 	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
-/// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
-/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
-/// a reachable host (`benji:nv0`); the first name is the primary device.
+/// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
+/// Dots chain devices under the most recent host prefix; commas start a new
+/// local group. `cpu` names the available CPU pool, not a physical socket.
+/// The first name is the primary device.
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -10460,13 +10518,19 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			let mut selected = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
 			// selection never connects to, allocates on, or executes on another.
-			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
-				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
-					Some(gpu) => gpu,
-					None => match name.split_once(':') {
-						Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
-					},
+			let names = device_names(&selection)?;
+			for name in names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }) {
+				let local_name = name.strip_prefix(&format!("{host}:")).unwrap_or(name);
+				let gpu = if local_name == "cpu" {
+					device(Some("cpu"))?
+				} else {
+					match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+						Some(gpu) => gpu,
+						None => match name.split_once(':') {
+							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
+							_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
+						},
+					}
 				};
 				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
 				selected.push(gpu);
@@ -10550,9 +10614,12 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let backend = match channel.read_u8()? {
 		1 => Backend::Amd,
 		2 => Backend::Nvidia,
+		3 => Backend::Cpu,
 		byte => return Err(RecipeError::new(format!("remote worker reported unknown backend {byte}"))),
 	};
-	let mut architecture = vec![0_u8; channel.read_u8()? as usize];
+	let architecture_length = if backend == Backend::Cpu { channel.read_u32()? as usize } else { channel.read_u8()? as usize };
+	require(architecture_length <= 4096, "remote architecture metadata is too large")?;
+	let mut architecture = vec![0_u8; architecture_length];
 	channel.read_into(&mut architecture)?;
 	let architecture = String::from_utf8(architecture).map_err(|error| RecipeError::new(format!("remote architecture is invalid: {error}")))?;
 	let free_memory = channel.read_u64()?;
@@ -10561,8 +10628,9 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let query = if backend == Backend::Amd { Some(channel.read_query()?) } else { None };
 	drop(directory);
 	let native_target = match backend {
+		Backend::Cpu => BackendTarget::Cpu { target: architecture },
 		Backend::Amd => BackendTarget::Amd { architecture },
-		_ => BackendTarget::Nvidia { architecture },
+		Backend::Nvidia => BackendTarget::Nvidia { architecture },
 	};
 	let gpu = Box::leak(Box::new(Gpu {
 		name: canonical.to_owned(),
@@ -11369,6 +11437,7 @@ struct WorkerProgram {
 	backend: NativeBackend,
 	dispatches: [Option<Dispatch>; 3],
 	shared_values: u32,
+	_temporary: NativeTemporaryFiles,
 }
 /// Serves one local device to a remote Recipe process over stdin/stdout: the
 /// transport half of a host-qualified selection. Commands mirror the `Gpu`
@@ -11377,11 +11446,12 @@ struct WorkerProgram {
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
 	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		Driver::Cpu => Ok((gpu, 3_u8, 1)),
 		#[cfg(amd)]
 		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
 		#[cfg(nvidia)]
 		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
-		_ => Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
+		Driver::Remote(_) => Err(RecipeError::new(format!("device {name:?} is not a local device"))),
 	});
 	let (gpu, backend, wave) = match probe {
 		Ok(probe) => probe,
@@ -11393,7 +11463,12 @@ pub fn worker_serve(name: &str) -> Result<()> {
 	};
 	wire.status(&Ok(()))?;
 	let architecture = native_target_label(&gpu.native_target);
-	wire.write_bytes(&[backend, architecture.len() as u8])?;
+	wire.write_u8(backend)?;
+	if backend == 3 {
+		wire.write_u32(u32::try_from(architecture.len()).map_err(|_| RecipeError::new("remote CPU target metadata is too long"))?)?;
+	} else {
+		wire.write_u8(architecture.len() as u8)?;
+	}
 	wire.write_bytes(architecture.as_bytes())?;
 	wire.write_bytes(&gpu.free_memory.to_le_bytes())?;
 	wire.write_u32(gpu.shared_limit)?;
@@ -11452,24 +11527,32 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
-				#[cfg(not(any(amd, nvidia)))]
-				let _ = (waves, element, training, epoch_layout, has_storage);
-				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
+				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match &gpu.driver {
+					Driver::Cpu => {
+						let (path, temporary) = remote_native_artifact(&gpu.native_target, &artifact)?;
+						let state_bytes = if epoch_layout == NATIVE_EPOCH_LAYOUT_FP64 { 8 } else { 4 };
+						let cpu = load_native_cpu_path(&path, state_bytes, training, has_storage)?;
+						let geometry = Geometry::linear(cpu_worker_threads()?, 1)?;
+						let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry };
+						let epoch = training.then_some(Dispatch { kernel: Kernel::remote(0, element, epoch_layout), geometry });
+						let model_load = has_storage.then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+						Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load, temporary))
+					}
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, geometry, waves, shared_values) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
+						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
 					#[cfg(nvidia)]
 					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, geometry, waves, shared_values) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load)),
-					_ => Err(RecipeError::new("worker device driver is not native")),
+						.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
+					Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
 				};
 				wire.status(&loaded.as_ref().map(|_| ()).map_err(Clone::clone))?;
-				if let Ok((backend, forward, epoch, model_load)) = loaded {
+				if let Ok((backend, forward, epoch, model_load, temporary)) = loaded {
 					for dispatch in [Some(forward), epoch, model_load].into_iter().flatten() {
 						wire.write_u32(dispatch.kernel.shared)?;
 						wire.write_geometry(dispatch.geometry)?;
 					}
-					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values });
+					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values, _temporary: temporary });
 				}
 			}
 			REMOTE_LAUNCH => {

@@ -2,7 +2,7 @@ use std::{fs, path::Path, path::PathBuf, process::Command};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [argument | export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>]... [argument | export]\n       recipe --worker <device>";
 #[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
 #[cfg(target_os = "linux")]
@@ -126,7 +126,10 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 }
 
 fn main() {
-	let mut arguments = std::env::args().skip(1);
+	let mut arguments = std::env::args().skip(1).peekable();
+	if arguments.peek().is_some_and(|argument| argument == "run") {
+		arguments.next();
+	}
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
 		if argument == "--worker" {
@@ -139,10 +142,12 @@ fn main() {
 		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if device.is_some() {
-				invalid("recipe trains one device, so --device is given once")
+			if let Some(devices) = &mut device {
+				devices.push(',');
+				devices.push_str(&selected);
+			} else {
+				device = Some(selected);
 			}
-			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
@@ -165,6 +170,7 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
+		Some("export") if device.is_some_and(|names| names.contains(',') || names.split_once(':').map_or(names, |(_, devices)| devices).contains('.')) => invalid("export requires one device"),
 		Some("export") => export(&source, device),
 		values => run(&source, device, values),
 	}
