@@ -4855,7 +4855,7 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(amd)]
 use std::sync::atomic::AtomicI32;
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
 	error::Error,
 	ffi::{OsStr, c_void},
 	fmt, fs,
@@ -7113,8 +7113,8 @@ struct RatModels {
 	persist_pair: bool,
 	inference: NativeTape,
 	training: NativeTape,
-	measurement: NativeTape,
-	observations: Vec<(Vec<f64>, f64)>,
+	measurement: RatFit,
+	observations: RatReplay,
 }
 #[derive(Clone)]
 struct RatChoice {
@@ -7659,6 +7659,102 @@ fn require(condition: bool, message: impl Into<String>) -> Result<()> {
 }
 fn logistic(value: f64) -> f64 {
 	1.0 / (1.0 + (-value).exp())
+}
+
+/// Maps a real score into [0, 1] using the observed maximum and minimum.
+pub fn smoothstep(max: f64, min: f64, current: f64) -> f64 {
+	assert!(max.is_finite() && min.is_finite() && current.is_finite(), "smoothstep requires finite values");
+	assert!(max >= min, "smoothstep maximum is below its minimum");
+	if max == min {
+		return if current < 0.0 { 0.4 } else if current > 0.0 { 0.6 } else { 0.5 };
+	}
+	if current <= min { return 0.0 }
+	if current >= max { return 1.0 }
+	let span = max - min;
+	let fraction = if span.is_finite() { (current - min) / span } else { (current * 0.5 - min * 0.5) / (max * 0.5 - min * 0.5) };
+	(fraction * fraction * (3.0 - 2.0 * fraction)).clamp(0.0, 1.0)
+}
+
+struct ScoreRange { min: f64, max: f64 }
+impl Default for ScoreRange {
+	fn default() -> Self { Self { min: f64::INFINITY, max: f64::NEG_INFINITY } }
+}
+impl ScoreRange {
+	fn observe(&mut self, value: f64) -> Result<f64> {
+		require(value.is_finite(), "RAT score must be finite")?;
+		self.min = self.min.min(value);
+		self.max = self.max.max(value);
+		Ok(self.value(value))
+	}
+	fn value(&self, value: f64) -> f64 { smoothstep(self.max, self.min, value) }
+}
+
+struct RatReplay {
+	width: usize,
+	capacity: usize,
+	rows: VecDeque<Vec<f64>>,
+	raw: VecDeque<f64>,
+	range: ScoreRange,
+	normalize: bool,
+}
+impl RatReplay {
+	fn new(width: usize, capacity: usize, normalize: bool) -> Result<Self> {
+		require(width != 0 && capacity != 0, "RAT replay dimensions must be positive")?;
+		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new(), range: ScoreRange::default(), normalize })
+	}
+	fn observe(&mut self, input: &[f64], value: f64) -> Result<f64> {
+		require(input.len() == self.width && input.iter().all(|entry| entry.is_finite()), "RAT observation has invalid features")?;
+		let normalized = self.range.observe(value)?;
+		if self.rows.len() == self.capacity { self.rows.pop_front(); self.raw.pop_front(); }
+		self.rows.push_back(input.to_vec());
+		self.raw.push_back(value);
+		Ok(if self.normalize { normalized } else { value })
+	}
+	fn snapshot(&self) -> (Vec<f64>, Vec<f64>) {
+		(self.rows.iter().flatten().copied().collect(), self.raw.iter().map(|value| if self.normalize { self.range.value(*value) } else { *value }).collect())
+	}
+}
+
+fn rat_fit_steps(tape: &mut NativeTape, steps: usize, rate: f64, config: Config) -> Result<()> {
+	for _ in 0..steps { tape.advance()?; tape.full_epoch(rate, config)?; }
+	Ok(())
+}
+
+struct RatFit { tape: NativeTape, width: usize }
+impl RatFit {
+	fn new(graph: &Graph, gpu: &'static Gpu, loss: LossFunction, config: Config) -> Result<Self> {
+		require(graph.output.elements() == 1, "RAT scoring model must emit one value")?;
+		let width = graph.input.elements();
+		Ok(Self { tape: NativeTape::new(graph, &vec![0.0; width], &[0.0], gpu, config.precision, Some(loss), None, None)?, width })
+	}
+	fn fit(&mut self, samples: &[f64], targets: &[f64], indices: &[usize], steps: usize, rate: f64, config: Config) -> Result<Option<f64>> {
+		require(samples.len() == checked_mul(targets.len(), self.width, "RAT fitting shape")?, "RAT fitting shape is invalid")?;
+		require(indices.iter().all(|index| *index < targets.len()), "RAT selected observation is absent")?;
+		for _ in 0..steps {
+			for &index in indices {
+				self.tape.samples.write_float_bytes(0, &samples[index * self.width..(index + 1) * self.width], self.tape.precision.model)?;
+				self.tape.targets.write_float_bytes(0, &targets[index..index + 1], self.tape.precision.model)?;
+				rat_fit_steps(&mut self.tape, 1, rate, config)?;
+			}
+		}
+		if indices.is_empty() || steps == 0 { Ok(None) } else { self.tape.objective().map(Some) }
+	}
+	fn predict(&mut self, samples: &[f64]) -> Result<Vec<f64>> {
+		require(samples.len() % self.width == 0, "RAT prediction shape is invalid")?;
+		samples.chunks_exact(self.width).map(|row| {
+			self.tape.samples.write_float_bytes(0, row, self.tape.precision.model)?;
+			self.tape.forward(ForwardMode::Inference)?;
+			Ok(self.tape.predictions()?[0])
+		}).collect()
+	}
+	fn weights(&self) -> Result<Vec<f64>> { self.tape.weights() }
+	fn capture(&mut self, graph: &mut Graph) -> Result<()> { self.tape.capture(graph) }
+}
+
+fn rat_backward(tape: &mut NativeTape, offset: usize, teacher_weights: &[f64], input: &[f64], rate: f64, config: Config) -> Result<()> {
+	tape.weights.write_float_bytes(checked_mul(offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?, teacher_weights, tape.precision.model)?;
+	tape.samples.write_float_bytes(0, input, tape.precision.model)?;
+	rat_fit_steps(tape, 1, rate, config)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -8954,9 +9050,12 @@ impl RatModels {
 		install_rat_models(&mut graph, &proposer.graph, &benchmark.graph, proposer_parameters, offset)?;
 		let inference = NativeTape::new(&proposer.graph, &vec![0.0; RatDecision::WIDTH], &[], gpu, proposer.precision, None, None, None)?;
 		let training = NativeTape::new(&graph, &vec![0.0; RatDecision::WIDTH * Knobs::WIDTH], &vec![0.0; Knobs::WIDTH], gpu, proposer.precision, Some(benchmark.model.loss), None, None)?;
-		let measurement = NativeTape::new(&benchmark.graph, &vec![0.0; Query::WIDTH + Knobs::WIDTH], &[0.0], gpu, benchmark.precision, Some(benchmark.model.loss), None, None)?;
+		let mut fitting_config = config;
+		fitting_config.precision = benchmark.precision;
+		let measurement = RatFit::new(&benchmark.graph, gpu, benchmark.model.loss, fitting_config)?;
+		let observations = RatReplay::new(Query::WIDTH + Knobs::WIDTH, usize::MAX, false)?;
 		rat.initial_epochs = rat.initial_epochs.saturating_sub(training.step as usize);
-		Ok(Self { graph, offset, proposer, benchmark, schema, pair_path, persist_pair, inference, training, measurement, observations: Vec::new() })
+		Ok(Self { graph, offset, proposer, benchmark, schema, pair_path, persist_pair, inference, training, measurement, observations })
 	}
 	fn choose(&mut self, query: Query, rat: RatConfig, attention: &[Option<NativeAttentionShape>], seed: &mut u64, explore: bool) -> Result<RatChoice> {
 		let mut best: Option<(f64, RatChoice)> = None;
@@ -8988,9 +9087,7 @@ impl RatModels {
 			}
 			let decision = decisions.into_iter().flatten().collect();
 			let observation = query.values().into_iter().chain(knobs.values()).map(|value| value.ln_1p() / scale).collect::<Vec<_>>();
-			self.measurement.samples.write_float_bytes(0, &observation, self.measurement.precision.model)?;
-			self.measurement.forward(ForwardMode::Inference)?;
-			let time = self.measurement.predictions()?[0];
+			let time = self.measurement.predict(&observation)?[0];
 			if best.as_ref().is_none_or(|(minimum, _)| time < *minimum) {
 				best = Some((time, RatChoice { knobs, decision }));
 			}
@@ -9001,22 +9098,14 @@ impl RatModels {
 		config.precision = self.proposer.precision;
 		let scale = query.log_scale();
 		let observation = query.values().into_iter().chain(choice.knobs.values()).map(|value| value.ln_1p() / scale).collect::<Vec<_>>();
-		self.observations.push((observation, milliseconds.ln_1p()));
-		let mut loss = 0.0;
-		for _ in 0..config.surrogate_epochs {
-			for (observation, target) in &self.observations {
-				self.measurement.samples.write_float_bytes(0, observation, self.measurement.precision.model)?;
-				self.measurement.targets.write_float_bytes(0, &[*target], self.measurement.precision.model)?;
-				self.measurement.advance()?;
-				loss = self.measurement.full_epoch(rate, config)?;
-			}
-		}
-		let predicted = self.measurement.predictions()?[0].exp_m1();
+		self.observations.observe(&observation, milliseconds.ln_1p())?;
+		let (samples, targets) = self.observations.snapshot();
+		let indices = (0..targets.len()).collect::<Vec<_>>();
+		let loss = self.measurement.fit(&samples, &targets, &indices, config.surrogate_epochs, rate, config)?.unwrap_or(0.0);
+		let predicted = self.measurement.predict(&observation)?[0].exp_m1();
 		let weights = self.measurement.weights()?;
-		self.training.weights.write_float_bytes(self.offset * self.training.precision.model.bytes(), &weights, self.training.precision.model)?;
-		self.training.samples.write_float_bytes(0, &choice.decision, self.training.precision.model)?;
-		self.training.advance()?;
-		let knob_loss = self.training.full_epoch(rate, config)?;
+		rat_backward(&mut self.training, self.offset, &weights, &choice.decision, rate, config)?;
+		let knob_loss = self.training.objective()?;
 		let proposer = self.training.weights.download_float(self.proposer.graph.parameters.len(), self.training.precision.model)?;
 		self.inference.weights.write_float_bytes(0, &proposer, self.inference.precision.model)?;
 		Ok((knob_loss, BenchmarkFit { loss, predicted }))
@@ -11870,10 +11959,7 @@ fn fit_model(model: &Model, input: Shape, samples: &[f64], targets: &[f64], outp
 	let prepared = Prepared::matrix(samples.to_vec(), targets.to_vec(), rows, outputs)?;
 	let mut graph = compile(model, &prepared, targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(model.loss), None, None)?;
-	for _ in 0..config.surrogate_epochs {
-		tape.advance()?;
-		tape.full_epoch(config.surrogate_rate, config)?;
-	}
+	rat_fit_steps(&mut tape, config.surrogate_epochs, config.surrogate_rate, config)?;
 	tape.capture(&mut graph)?;
 	graph.frozen.fill(1);
 	Ok(graph)
