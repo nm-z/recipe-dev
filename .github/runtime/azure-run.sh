@@ -28,7 +28,7 @@ fi
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
 # Standard_NC4as_T4_v3 is the smallest T4 shape.
 SIZE="${AZURE_VM_SIZE:-Standard_NC4as_T4_v3}"
-IMAGE="${AZURE_VM_IMAGE:-MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-core:latest}"
+IMAGE="${AZURE_VM_IMAGE:-microsoft-dsvm:dsvm-win-2022:winserver-2022:25.05.10}"
 FAMILY="Standard NCASv3_T4 Family"
 REQUIRED_CORES=4
 # One worker per run: two candidates must never share a mutable working directory.
@@ -37,7 +37,8 @@ COMPUTER_NAME="rgpu$(printf '%s' "$WORKER" | sha256sum | cut -c1-11)"
 TRANSFER_ROOT="runtime/windows/${RUN_ID}-${RUN_ATTEMPT}"
 SNAPSHOT_BLOB="$TRANSFER_ROOT/snapshot.tar.gz"
 RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
-DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-3600}"
+PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
+DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-2700}"
 
 mkdir -p evidence
 
@@ -237,6 +238,7 @@ trap cleanup_on_exit EXIT
 
 echo "== provisioning the isolated worker =="
 az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
+admin_password="Aa1!$(openssl rand -hex 18)"
 az vm create \
 	--resource-group "$GROUP" \
 	--name "$WORKER" \
@@ -244,8 +246,9 @@ az vm create \
 	--location "$LOCATION" \
 	--image "$IMAGE" \
 	--size "$SIZE" \
+	--security-type Standard \
 	--admin-username recipeci \
-	--admin-password "$(python3 -c 'import secrets,string; print("Aa1!" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(28)))')" \
+	--admin-password "$admin_password" \
 	--public-ip-address "$WORKER-ip" \
 	--public-ip-address-allocation static \
 	--public-ip-sku Standard \
@@ -258,17 +261,8 @@ az vm create \
 		"recipe-run-id=$RUN_ID" \
 		"recipe-run-attempt=$RUN_ATTEMPT" \
 	--only-show-errors -o json > evidence/azure-vm.json
+unset admin_password
 echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with explicit outbound access and no inbound rule"
-
-echo "== installing the NVIDIA GPU driver extension =="
-az vm extension set \
-	--resource-group "$GROUP" \
-	--vm-name "$WORKER" \
-	--name NvidiaGpuDriverWindows \
-	--publisher Microsoft.HpcCompute \
-	--version 1.6 \
-	--only-show-errors -o none
-echo "driver extension installed"
 
 echo "== transferring the immutable snapshot =="
 # Upload each archive once to the existing private container. The guest gets
@@ -327,57 +321,59 @@ echo "uploaded and verified the private per-run archives"
 
 echo "== executing the native Windows GPU suite in the guest =="
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-guest_script="$(python3 - "$script_dir/azure-guest.ps1" <<'PY'
-import json, pathlib, sys
-script = pathlib.Path(sys.argv[1]).read_text()
-print(json.dumps(script))
-PY
-)"
-python3 - "$guest_script" <<'PY' > guest.ps1
-import json, sys
-sys.stdout.write(json.loads(sys.argv[1]))
-PY
+cp "$script_dir/azure-guest.ps1" guest.ps1
 
-started="$(date +%s)"
-az vm run-command invoke \
-	--resource-group "$GROUP" --name "$WORKER" \
-	--command-id RunPowerShellScript \
-	--scripts "@guest.ps1" \
-	--parameters "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUri=$SNAPSHOT_URI" "runtimeSuiteUri=$RUNTIME_URI" \
-	--only-show-errors -o json > evidence/azure-runcommand.json
-elapsed=$(( $(date +%s) - started ))
-echo "run command returned after ${elapsed}s"
+invoke_guest() {
+	local phase="$1"
+	local deadline="$2"
+	local marker="$3"
+	local document="evidence/azure-${phase}.json"
+	local log="evidence/${phase}.log"
+	local started status elapsed
+	started="$(date +%s)"
+	set +e
+	timeout --signal=TERM --kill-after=30s "${deadline}s" \
+		az vm run-command invoke \
+			--resource-group "$GROUP" --name "$WORKER" \
+			--command-id RunPowerShellScript \
+			--scripts "@guest.ps1" \
+			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUri=$SNAPSHOT_URI" "runtimeSuiteUri=$RUNTIME_URI" \
+			--only-show-errors -o json > "$document"
+	status=$?
+	set -e
+	elapsed=$(( $(date +%s) - started ))
+	echo "$phase command returned after ${elapsed}s with controller status $status"
+	if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+		echo "$phase exceeded its ${deadline}s controller deadline" >&2
+		return 1
+	fi
+	if [ "$status" -ne 0 ]; then
+		echo "$phase control-plane invocation failed with status $status" >&2
+		return "$status"
+	fi
+	jq -r '.value[] | "--- \(.code) ---\n\(.message // \"\")"' "$document" > "$log"
+	tail -80 "$log"
+	if ! grep -Fq "$marker" "$log"; then
+		echo "$phase did not report '$marker'" >&2
+		return 1
+	fi
+}
 
-if [ "$elapsed" -ge "$DEADLINE_SECONDS" ]; then
-	echo "the guest execution deadline of ${DEADLINE_SECONDS}s was exceeded" >&2
-	exit 1
-fi
+echo "== checking the DSVM before the build =="
+invoke_guest "preflight" "$PREFLIGHT_DEADLINE_SECONDS" "PREFLIGHT EXIT 0"
 
-# An HTTP 200 from Run Command says the control plane accepted the request. The
-# guest's own exit status is inside the message body.
-python3 - <<'PY' > evidence/guest.log
-import json, pathlib
-document = json.loads(pathlib.Path("evidence/azure-runcommand.json").read_text())
-for entry in document.get("value", []):
-	print(f"--- {entry.get('code')} ---")
-	print(entry.get("message", ""))
-PY
-tail -80 evidence/guest.log
+echo "== building and executing Recipe on the DSVM =="
+invoke_guest "execute" "$DEADLINE_SECONDS" "GUEST EXIT 0"
+cp evidence/execute.log evidence/guest.log
 
-if ! grep -q "GUEST EXIT 0" evidence/guest.log; then
-	echo "the guest process did not report a zero exit status" >&2
-	exit 1
-fi
-
-python3 - <<'PY'
-import pathlib, re, sys
-log = pathlib.Path("evidence/guest.log").read_text()
-match = re.search(r"^SUITE-EVIDENCE-BEGIN$(.*?)^SUITE-EVIDENCE-END$", log, re.S | re.M)
-if not match:
-	sys.exit("the guest returned no suite evidence")
-pathlib.Path("evidence/suite.json").write_text(match.group(1).strip())
-print("recovered suite evidence")
-PY
+awk '
+	/^SUITE-EVIDENCE-BEGIN$/ { capture = 1; next }
+	/^SUITE-EVIDENCE-END$/ { capture = 0; found = 1; next }
+	capture { print }
+	END { if (!found) exit 1 }
+' evidence/guest.log > evidence/suite.json
+[ -s evidence/suite.json ] || { echo "the guest returned no suite evidence" >&2; exit 1; }
+echo "recovered suite evidence"
 
 route="$(grep -m1 '^selected route ' evidence/guest.log | awk '{print $3}')"
 device="${route##*:}"
@@ -399,7 +395,7 @@ cat > evidence/cell.json <<JSON
   "vm_size": "$SIZE",
   "location": "$LOCATION",
   "image": "$IMAGE",
-  "os": "Windows Server 2022 Datacenter Azure Edition",
+  "os": "Windows Server 2022 Data Science Virtual Machine",
   "arch": "x86_64",
   "backend": "nvidia",
   "device": "$device",

@@ -1,4 +1,5 @@
 param(
+	[Parameter(Mandatory = $true)] [ValidateSet("preflight", "execute")] [string] $phase,
 	[Parameter(Mandatory = $true)] [string] $candidateSha,
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
@@ -34,96 +35,6 @@ function Invoke-Download {
 	if ($actual -ne $Sha256.ToLowerInvariant()) { throw "download checksum mismatch for ${Destination}: $actual != $Sha256" }
 }
 
-function Install-Toolchain {
-	param([string] $Root)
-	$bootstrap = Join-Path $Root "bootstrap"
-	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
-	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-	Write-Output "== guest: installing the Visual C++ build environment =="
-	$vsInstaller = Join-Path $bootstrap "vs_BuildTools-17.14.39.exe"
-	Invoke-Download `
-		"https://download.visualstudio.microsoft.com/download/pr/fa619120-9c0e-47e6-bfe0-3ee96fb671b2/236367b68ba9a51708263ab10a1c85546cc4a8eca78b365168811d19c4fb2f29/vs_BuildTools.exe" `
-		$vsInstaller `
-		"236367b68ba9a51708263ab10a1c85546cc4a8eca78b365168811d19c4fb2f29"
-	$vsRoot = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
-	& $vsInstaller `
-		"--quiet" `
-		"--wait" `
-		"--norestart" `
-		"--nocache" `
-		"--installPath" `
-		$vsRoot `
-		"--add" `
-		"Microsoft.VisualStudio.Workload.VCTools" `
-		"--add" `
-		"Microsoft.VisualStudio.Component.VC.Tools.x86.x64" `
-		"--add" `
-		"Microsoft.VisualStudio.Component.Windows10SDK.20348" `
-		"--includeRecommended"
-	$vsExit = $LASTEXITCODE
-	if (($vsExit -ne 0) -and ($vsExit -ne 3010)) { throw "Visual C++ build environment installation failed with exit code $vsExit" }
-	$vsDevCmd = Join-Path $vsRoot "Common7\Tools\VsDevCmd.bat"
-	if (![IO.File]::Exists($vsDevCmd)) { throw "Visual C++ developer command file is absent: $vsDevCmd" }
-	$vcTools = Join-Path $vsRoot "VC\Tools\MSVC"
-	if (![IO.Directory]::Exists($vcTools)) { throw "MSVC tool directory is absent: $vcTools" }
-	$sdkHeader = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\um\windows.h"
-	if (![IO.File]::Exists($sdkHeader)) { throw "Windows SDK header is absent: $sdkHeader" }
-
-	Write-Output "== guest: installing Rust toolchain =="
-	$rustup = Join-Path $bootstrap "rustup-init.exe"
-	Invoke-WebRequest -UseBasicParsing -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile $rustup
-	Invoke-Native $rustup @("-y", "--profile", "minimal", "--default-toolchain", "stable-x86_64-pc-windows-msvc", "--no-modify-path") "rustup installation"
-	$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-	$env:Path = "$cargoBin;$env:Path"
-
-	Write-Output "== guest: installing LLVM toolchain =="
-	$llvmInstaller = Join-Path $bootstrap "LLVM-18.1.8-win64.exe"
-	Invoke-Download `
-		"https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe" `
-		$llvmInstaller `
-		"94af030060d88cc17e9f00ef1663ebdc1126b35e16bebdfa1e807984b70abd8f"
-	Invoke-Native $llvmInstaller @("/S") "LLVM installation"
-
-	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
-	$linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
-	if (![IO.File]::Exists($clang)) { throw "native clang is absent after installation: $clang" }
-	if (![IO.File]::Exists($linker)) { throw "native linker is absent after installation: $linker" }
-
-	Write-Output "== guest: installing the CUDA device toolkit =="
-	$cudaArchive = Join-Path $bootstrap "cuda_nvcc.zip"
-	Invoke-Download `
-		"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.6.85-archive.zip" `
-		$cudaArchive `
-		"3fb9f76b87c37d02f947354be89b718ad5f2c76b6ab47995265bfa3a068a5e14"
-	$cudaStage = Join-Path $bootstrap "cuda-stage"
-	if ([IO.Directory]::Exists($cudaStage)) { Remove-Item -Recurse -Force -LiteralPath $cudaStage }
-	Expand-Archive -LiteralPath $cudaArchive -DestinationPath $cudaStage -Force
-	$cudaPayload = Join-Path $cudaStage "cuda_nvcc-windows-x86_64-12.6.85-archive"
-	$cudaRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v12.6"
-	New-Item -ItemType Directory -Force -Path $cudaRoot | Out-Null
-	Copy-Item -Recurse -Force -Path (Join-Path $cudaPayload "*") -Destination $cudaRoot
-	[Environment]::SetEnvironmentVariable("CUDA_PATH", $cudaRoot, [EnvironmentVariableTarget]::Machine)
-	$env:CUDA_PATH = $cudaRoot
-	$env:Path = "$(Join-Path $cudaRoot 'bin');$env:Path"
-	$deviceLibrary = Join-Path $cudaRoot "nvvm\libdevice\libdevice.10.bc"
-	$nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
-	if (![IO.File]::Exists($deviceLibrary)) { throw "CUDA device library is absent after installation: $deviceLibrary" }
-	if (![IO.File]::Exists($nvcc)) { throw "CUDA compiler is absent after installation: $nvcc" }
-
-	foreach ($tool in @("rustc", "cargo")) {
-		if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is absent after installation" }
-	}
-	& $clang --version | Select-Object -First 1
-	if ($LASTEXITCODE -ne 0) { throw "clang failed after installation with exit code $LASTEXITCODE" }
-	& $linker --version | Select-Object -First 1
-	if ($LASTEXITCODE -ne 0) { throw "lld-link failed after installation with exit code $LASTEXITCODE" }
-	Invoke-Native "rustc" @("--version") "rustc"
-	Invoke-Native "cargo" @("--version") "cargo"
-	Invoke-Native $nvcc @("--version") "nvcc"
-	Write-Output "toolchain ready clang=$clang linker=$linker cuda=$cudaRoot vs=$vsRoot"
-}
-
 function Enter-VsDeveloperEnvironment {
 	param([string] $VsRoot)
 	$vsDevCmd = Join-Path $VsRoot "Common7\Tools\VsDevCmd.bat"
@@ -141,14 +52,151 @@ function Enter-VsDeveloperEnvironment {
 	}
 	$env:Path = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Process)
 	foreach ($tool in @("cl.exe", "link.exe", "lib.exe", "rc.exe")) {
-		if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is absent after entering the Visual C++ developer environment" }
+		$command = Get-Command $tool -ErrorAction SilentlyContinue
+		if (-not $command) { throw "$tool is absent after entering the Visual C++ developer environment" }
+		Write-Output "$tool=$($command.Source)"
 	}
-	& cl.exe /Bv 2>&1 | Select-Object -First 3
-	if ($LASTEXITCODE -ne 0) { throw "cl.exe failed after entering the Visual C++ developer environment with exit code $LASTEXITCODE" }
+}
+
+function Resolve-VsRoot {
+	$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+	if (![IO.File]::Exists($vswhere)) { throw "Visual Studio discovery is absent: $vswhere" }
+	$roots = @(& $vswhere "-latest" "-products" "*" "-requires" "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" "-property" "installationPath")
+	if ($LASTEXITCODE -ne 0) { throw "Visual Studio discovery failed with exit code $LASTEXITCODE" }
+	$roots = @($roots | Where-Object { [IO.Directory]::Exists($_) })
+	if ($roots.Count -eq 0) { throw "the DSVM image has no Visual Studio instance with x64 C++ tools" }
+	return [string]$roots[0]
+}
+
+function Resolve-CudaRoot {
+	$candidates = [Collections.Generic.List[string]]::new()
+	foreach ($root in @(
+		$env:CUDA_PATH,
+		[Environment]::GetEnvironmentVariable("CUDA_PATH", [EnvironmentVariableTarget]::Machine)
+	)) {
+		if ($root) { $candidates.Add($root) }
+	}
+	$base = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA"
+	if ([IO.Directory]::Exists($base)) {
+		foreach ($directory in @(Get-ChildItem -LiteralPath $base -Directory | Sort-Object { [Version]($_.Name.TrimStart("v")) } -Descending)) {
+			$candidates.Add($directory.FullName)
+		}
+	}
+	$seen = @{}
+	foreach ($candidate in $candidates) {
+		$root = [IO.Path]::GetFullPath($candidate)
+		if ($seen.ContainsKey($root)) { continue }
+		$seen[$root] = $true
+		$deviceLibrary = Join-Path $root "nvvm\libdevice\libdevice.10.bc"
+		$nvcc = Join-Path $root "bin\nvcc.exe"
+		if ([IO.File]::Exists($deviceLibrary) -and [IO.File]::Exists($nvcc)) { return $root }
+	}
+	throw "the DSVM image has no complete CUDA root with nvcc and libdevice"
+}
+
+function Confirm-Gpu {
+	Write-Output "== guest: GPU and driver =="
+	$smiCandidates = @(
+		"C:\Windows\System32\nvidia-smi.exe",
+		(Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+	)
+	$script:Smi = $null
+	foreach ($candidate in $smiCandidates) {
+		if ([IO.File]::Exists($candidate)) { $script:Smi = $candidate; break }
+	}
+	if (-not $script:Smi) {
+		$command = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+		if ($command) { $script:Smi = $command.Source }
+	}
+	if (-not $script:Smi) { throw "nvidia-smi is absent from the DSVM image" }
+	$nvcuda = "C:\Windows\System32\nvcuda.dll"
+	if (![IO.File]::Exists($nvcuda)) { throw "the NVIDIA runtime library is absent: $nvcuda" }
+	Invoke-Native $script:Smi @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader") "nvidia-smi"
+	$script:Gpu = (& $script:Smi --query-gpu=name --format=csv,noheader) -join ""
+	if ($LASTEXITCODE -ne 0) { throw "GPU identity query failed with exit code $LASTEXITCODE" }
+	if ($script:Gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $script:Gpu" }
+}
+
+function Initialize-Toolchain {
+	param([string] $Root, [bool] $AllowInstall)
+	$bootstrap = Join-Path $Root "bootstrap"
+	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
+	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+	$script:VsRoot = Resolve-VsRoot
+	Enter-VsDeveloperEnvironment -VsRoot $script:VsRoot
+	$script:CudaRoot = Resolve-CudaRoot
+	$env:CUDA_PATH = $script:CudaRoot
+	$env:Path = "$(Join-Path $script:CudaRoot 'bin');$env:Path"
+
+	$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+	if ([IO.Directory]::Exists($cargoBin)) { $env:Path = "$cargoBin;$env:Path" }
+	$rustReady = $false
+	if ((Get-Command "rustc" -ErrorAction SilentlyContinue) -and (Get-Command "cargo" -ErrorAction SilentlyContinue)) {
+		$rustDetails = (& rustc -vV) -join "`n"
+		$rustReady = ($LASTEXITCODE -eq 0) -and ($rustDetails -match '(?m)^host: .*windows-msvc$')
+	}
+	if (!$rustReady) {
+		if (!$AllowInstall) {
+			Write-Output "rust=install-required"
+		} else {
+			Write-Output "== guest: installing Rust =="
+			$rustup = Join-Path $bootstrap "rustup-init.exe"
+			Invoke-Download `
+				"https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-pc-windows-msvc/rustup-init.exe" `
+				$rustup `
+				"88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0"
+			Invoke-Native $rustup @("-y", "--profile", "minimal", "--default-toolchain", "stable-x86_64-pc-windows-msvc", "--no-modify-path") "rustup installation"
+			$env:Path = "$cargoBin;$env:Path"
+			$rustReady = $true
+		}
+	}
+
+	$script:Clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
+	$script:Linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+	$llvmReady = [IO.File]::Exists($script:Clang) -and [IO.File]::Exists($script:Linker)
+	if (!$llvmReady) {
+		if (!$AllowInstall) {
+			Write-Output "llvm=install-required"
+		} else {
+			Write-Output "== guest: installing LLVM =="
+			$llvmInstaller = Join-Path $bootstrap "LLVM-18.1.8-win64.exe"
+			Invoke-Download `
+				"https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe" `
+				$llvmInstaller `
+				"94af030060d88cc17e9f00ef1663ebdc1126b35e16bebdfa1e807984b70abd8f"
+			Invoke-Native $llvmInstaller @("/S") "LLVM installation"
+			$llvmReady = $true
+		}
+	}
+
+	if ($rustReady) {
+		$rustDetails = (& rustc -vV) -join "`n"
+		if ($LASTEXITCODE -ne 0) { throw "rustc failed with exit code $LASTEXITCODE" }
+		if ($rustDetails -notmatch '(?m)^host: .*windows-msvc$') { throw "rustc is not an MSVC host: $rustDetails" }
+		Invoke-Native "cargo" @("--version") "cargo"
+	}
+	if ($llvmReady) {
+		if (![IO.File]::Exists($script:Clang)) { throw "native clang is absent: $script:Clang" }
+		if (![IO.File]::Exists($script:Linker)) { throw "native linker is absent: $script:Linker" }
+		Invoke-Native $script:Clang @("--version") "clang"
+		Invoke-Native $script:Linker @("--version") "lld-link"
+	}
+	$nvcc = Join-Path $script:CudaRoot "bin\nvcc.exe"
+	Invoke-Native $nvcc @("--version") "nvcc"
+	$state = if ($AllowInstall) { "toolchain ready" } else { "platform ready" }
+	Write-Output "$state cuda=$script:CudaRoot vs=$script:VsRoot"
 }
 
 try {
 	$root = "C:\recipe"
+	Confirm-Gpu
+	Initialize-Toolchain -Root $root -AllowInstall ($phase -eq "execute")
+	if ($phase -eq "preflight") {
+		Write-Output "PREFLIGHT EXIT 0"
+		exit 0
+	}
+
 	# One directory per candidate: two commits must never share a mutable tree.
 	$work = Join-Path $root $candidateSha
 	if ([IO.Directory]::Exists($work)) { Remove-Item -Recurse -Force -LiteralPath $work }
@@ -169,18 +217,6 @@ try {
 	New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 	Invoke-Native "tar.exe" @("-xzf", $runtimeArchive, "-C", $runtime) "trusted runtime extraction"
 	Write-Output "trusted runtime verified sha256=$runtimeActual"
-
-	Write-Output "== guest: GPU and driver =="
-	$smi = "C:\Windows\System32\nvidia-smi.exe"
-	if (![IO.File]::Exists($smi)) { throw "nvidia-smi is absent: the GPU driver extension did not install" }
-	Invoke-Native $smi @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader") "nvidia-smi"
-	$gpu = (& $smi --query-gpu=name --format=csv,noheader) -join ""
-	if ($gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $gpu" }
-
-	Install-Toolchain -Root $root
-	$vsRoot = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
-	Enter-VsDeveloperEnvironment -VsRoot $vsRoot
-	$clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
 
 	Write-Output "== guest: building with the NVIDIA backend =="
 	Push-Location $work
