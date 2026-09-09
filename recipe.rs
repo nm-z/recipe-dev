@@ -16048,8 +16048,8 @@ impl Train {
 	/// Each sample's proposal is scored by the executable.
 	/// Full predicts and scores every source row before one surrogate update and
 	/// one proposer update per epoch. It replaces prior observations and performs
-	/// no initial evaluation. Measured scores describe the evaluated batch; report
-	/// predictions include the final update without another external evaluation.
+	/// no initial evaluation. Measured scores describe the evaluated batch; the
+	/// final report scores the proposals produced by the last update once.
 	/// Other policies score one initial sample, then update and score one sample
 	/// per epoch in the loader's shuffled row order. Their final report describes
 	/// the last scored sample.
@@ -16202,7 +16202,10 @@ impl Train {
 			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
 		};
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
-		let mut initial_loss = 1.0 - initial_reward;
+		// RAT's `Loss` field reports the evaluator model's loss. The external
+		// command score is reported separately through `Score`; it is not a
+		// substitute for the evaluator's loss.
+		let mut initial_loss = f64::NAN;
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
 		let retained_rows = if full_set { source_rows } else { checked_add(self.epochs, 1, "RAT observation count")?.min(capacity).max(1) };
 		fitting.reserve(retained_rows)?;
@@ -16210,6 +16213,8 @@ impl Train {
 		if let Some(selector) = &mut selector { selector.ensure_actor(retained_rows, config)?; }
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
+		let mut last_evaluator_r2 = None;
+		let mut last_evaluator_loss = f64::NAN;
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -16231,13 +16236,17 @@ impl Train {
 				for (row, value) in observed.chunks_exact(observation_width).zip(scores) { replay.observe(row, value)?; }
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
-			let evaluator_r2 = if let Some(selector) = &mut selector {
-				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?
+			if let Some(selector) = &mut selector {
+				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?;
 			} else {
 				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
 				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
-				coefficient(&evaluation_targets, &fitting.predict(&evaluation_samples)?)
-			};
+			}
+			let evaluator_predictions = fitting.predict(&evaluation_samples)?;
+			let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
+			let evaluator_loss = model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7]);
+			last_evaluator_r2 = Some(evaluator_r2);
+			last_evaluator_loss = evaluator_loss;
 			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
 			tape.forward(ForwardMode::Inference)?;
 			let predictions = tape.node_values(composition.proposal, prediction_count)?;
@@ -16248,23 +16257,38 @@ impl Train {
 				let raw_score = command.evaluate(&input_names, &observed)?[0];
 				(raw_score, replay.observe(&observed, raw_score)?)
 			};
-			if full_set && iteration == 0 { initial_loss = 1.0 - reward; }
+			if iteration == 0 { initial_loss = evaluator_loss; }
 			measured_reward = reward;
 			measured_predictions = predictions;
-			let final_loss = 1.0 - reward;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, run, tape.step as usize, self.epochs, final_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(measured_score))?;
+			self.print(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(measured_score))?;
+		}
+		// Full evaluates the proposals that fed each update. The last update
+		// creates a fresh proposal set, so score that saved set once before
+		// returning. This keeps one evaluation per training epoch and one final
+		// evaluation, rather than evaluating both sides of every update.
+		if full_set {
+			let observed = samples.chunks_exact(prepared.features).zip(measured_predictions.chunks_exact(proposal_width))
+				.flat_map(|(features, prediction)| features.iter().chain(prediction).copied()).collect::<Vec<_>>();
+			let scores = command.evaluate(&input_names, &observed)?;
+			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) { replay.observe(row, value)?; }
+			let (_, final_targets) = replay.snapshot();
+			measured_reward = mean(&final_targets);
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
 		let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-		let evaluator_r2 = (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions));
+		let evaluator_r2 = last_evaluator_r2.or_else(|| (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions)));
 		let predicted_reward = if evaluation_targets.is_empty() { None } else if full_set {
 			Some(mean(&evaluator_predictions))
 		} else {
 			Some(mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?))
 		};
-		let final_loss = 1.0 - measured_reward;
+		let final_loss = if last_evaluator_loss.is_finite() { last_evaluator_loss } else if evaluator_r2.is_some() {
+			model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7])
+		} else {
+			f64::NAN
+		};
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
 		tape.capture(&mut composition.graph)?;
@@ -16428,7 +16452,7 @@ impl Train {
 				}
 			}
 			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule, None)?;
+			self.print(model, model.loss.name(), run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule, None)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
@@ -16523,7 +16547,7 @@ impl Train {
 		result.map(|value| (value, checkpoint))
 	}
 	fn print(
-		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
+		&self, model: &Model, loss_name: &str, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
 		schedule: &str, measured_score: Option<f64>,
 	) -> Result<()> {
 		if self.log_metrics.is_empty() {
@@ -16532,7 +16556,7 @@ impl Train {
 		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then_some(r2);
 		Self::write_progress(
 			&Self::metric_line(
-				model.loss.name(),
+				loss_name,
 				&model.description(&self.log_metrics),
 				&self.log_metrics,
 				epochs,
