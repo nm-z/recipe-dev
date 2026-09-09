@@ -7315,7 +7315,6 @@ impl LearnedReplay {
 		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
 		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
 		scorer.fit.fit_sequence(&score_input, length, normalized_quality, rate, config)?;
-		scorer.fit.capture(&mut scorer.graph)?;
 		let teacher_weights = scorer.fit.weights()?;
 
 		// The scorer is a frozen teacher in this composition. Only selector
@@ -8078,8 +8077,12 @@ impl RatFit {
 		require(indices.iter().all(|index| *index < targets.len()), "RAT selected observation is absent")?;
 		if indices.is_empty() || steps == 0 { return Ok(None) }
 		self.reserve(indices.len())?;
-		let selected_samples = indices.iter().flat_map(|&index| samples[index * self.width..(index + 1) * self.width].iter().copied()).collect::<Vec<_>>();
-		let selected_targets = indices.iter().map(|&index| targets[index]).collect::<Vec<_>>();
+		let (selected_samples, selected_targets) = if indices.iter().copied().eq(0..targets.len()) {
+			(std::borrow::Cow::Borrowed(samples), std::borrow::Cow::Borrowed(targets))
+		} else {
+			(std::borrow::Cow::Owned(indices.iter().flat_map(|&index| samples[index * self.width..(index + 1) * self.width].iter().copied()).collect::<Vec<_>>()),
+			 std::borrow::Cow::Owned(indices.iter().map(|&index| targets[index]).collect::<Vec<_>>()))
+		};
 		self.tape.samples.write_float_bytes(0, &selected_samples, self.tape.precision.model)?;
 		self.tape.targets.write_float_bytes(0, &selected_targets, self.tape.precision.model)?;
 		rat_fit_steps(&mut self.tape, steps, rate, config)?;
