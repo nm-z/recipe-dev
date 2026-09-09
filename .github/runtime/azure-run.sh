@@ -384,7 +384,7 @@ case "$device" in
 	*) echo "expected an nv device, got '$device'; CPU fallback is a failure" >&2; exit 1 ;;
 esac
 
-gpu_model="$(grep -m1 -oE 'Tesla T4|NVIDIA T4|T4' evidence/guest.log | head -1)"
+gpu_model="$(grep -m1 -oE 'Tesla T4|NVIDIA T4|T4' evidence/preflight.log)"
 cat > evidence/cell.json <<JSON
 {
   "cell": "recipe/windows-gpu",
