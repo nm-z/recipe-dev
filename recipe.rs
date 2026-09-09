@@ -7110,40 +7110,53 @@ struct RatCommand {
 	policy: RatPolicy,
 }
 impl RatCommand {
-	fn evaluate(&self, names: &[String], proposal: &[f64]) -> Result<f64> {
+	fn evaluate(&self, names: &[String], proposals: &[f64]) -> Result<Vec<f64>> {
 		require(!names.is_empty(), "RAT requires named inputs")?;
-		require(names.len() == proposal.len(), format!("RAT evaluator expected {} values, received {}", names.len(), proposal.len()))?;
+		require(!proposals.is_empty() && proposals.len() % names.len() == 0, "RAT evaluator requires complete nonempty sample records")?;
+		let rows = proposals.len() / names.len();
 		require(names.iter().collect::<BTreeSet<_>>().len() == names.len(), "RAT feature and target names must be distinct")?;
 		for name in names {
 			require(!name.is_empty() && !name.bytes().any(|byte| matches!(byte, b',' | b'=' | b'\r' | b'\n')), format!("RAT input name {name:?} cannot be encoded"))?;
 		}
-		require(proposal.iter().all(|value| value.is_finite()), "RAT input contains a nonfinite value")?;
-		let mut record = names.iter().zip(proposal).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",");
-		record.push('\n');
+		require(proposals.iter().all(|value| value.is_finite()), "RAT input contains a nonfinite value")?;
 		let mut child = Command::new(&self.path)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
 			.spawn()
 			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", self.path.display())))?;
-		let write = child
-			.stdin
-			.take()
-			.ok_or_else(|| RecipeError::new("RAT evaluator stdin is unavailable"))?
-			.write_all(record.as_bytes())
-			.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())));
-		let output = child.wait_with_output().map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
+		let input = child.stdin.take().ok_or_else(|| RecipeError::new("RAT evaluator stdin is unavailable"))?;
+		// Drain output while sending input: either side can exceed pipe capacity.
+		let (output, write) = std::thread::scope(|scope| {
+			let writer = scope.spawn(move || -> std::io::Result<()> {
+				let mut input = std::io::BufWriter::new(input);
+				for row in proposals.chunks_exact(names.len()) {
+					for (index, (name, value)) in names.iter().zip(row).enumerate() {
+						if index != 0 { input.write_all(b",")?; }
+						write!(input, "{name}={value}")?;
+					}
+					input.write_all(b"\n")?;
+				}
+				input.flush()
+			});
+			let output = child.wait_with_output();
+			(output, writer.join())
+		});
+		let output = output.map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
 		if !output.status.success() || !output.stderr.is_empty() {
 			let error = if output.stderr.is_empty() { output.status.to_string() } else { String::from_utf8_lossy(&output.stderr).trim().to_owned() };
 			return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display())));
 		}
-		write?;
+		write.map_err(|_| RecipeError::new("RAT input writer panicked"))?
+			.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())))?;
 		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
-		let fields = stdout.split_ascii_whitespace().collect::<Vec<_>>();
-		require(fields.len() == 1, format!("RAT evaluator {} must write exactly one score to stdout", self.path.display()))?;
-		let measured_score = fields[0].parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
-		require(measured_score.is_finite(), format!("RAT evaluator {} score must be finite", self.path.display()))?;
-		Ok(measured_score)
+		let scores = stdout.lines().map(|line| {
+			let value = line.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
+			require(value.is_finite(), format!("RAT evaluator {} score must be finite", self.path.display()))?;
+			Ok(value)
+		}).collect::<Result<Vec<_>>>()?;
+		require(scores.len() == rows, format!("RAT evaluator {} returned {} scores for {rows} samples", self.path.display(), scores.len()))?;
+		Ok(scores)
 	}
 }
 struct CommandRatComposition {
@@ -15794,14 +15807,16 @@ impl Compute {
 	}
 }
 impl Train {
-	/// Evaluates RAT proposals with an executable. For each proposal, Recipe
-	/// writes one `name=value,...` record to stdin: the sample's features, then
+	/// Evaluates RAT proposals with an executable. Recipe streams newline-separated
+	/// `name=value,...` records to stdin: each sample's features, then
 	/// its predictions in declared target order. Feature names use the loaded
 	/// schema's `table.column` names; expanded columns append a zero-based index.
 	/// Feature values use the same encoding and normalization as the proposer.
 	/// The surrogate receives those same features followed by predicted targets,
 	/// both when fitting command scores and when differentiating the composition.
-	/// The executable writes exactly one finite real score to stdout.
+	/// The executable writes one finite real score per stdout line, in input order.
+	/// The score count must equal the sample count. Full sends every source row
+	/// in one invocation per epoch; other policies send one row per invocation.
 	/// Recipe applies smoothstep(max, min, current) using live score extrema; higher
 	/// scores are better. The Score log field retains raw scores, averaged for full.
 	/// Any stderr output or unsuccessful exit stops training, even with a score.
@@ -15961,7 +15976,7 @@ impl Train {
 		let mut replay = RatReplay::new(observation_width, capacity, true)?;
 		let initial_reward = if full_set { f64::NAN } else {
 			let initial_observation = observation(samples, &initial_predictions)?;
-			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?)?
+			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
 		};
 		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		let mut initial_loss = 1.0 - initial_reward;
@@ -15986,12 +16001,11 @@ impl Train {
 			if full_set {
 				replay.rows.clear();
 				replay.raw.clear();
-				// All proposals precede scoring and both optimizer updates.
-				for (features, prediction) in sample.chunks_exact(prepared.features).zip(measured_predictions.chunks_exact(proposal_width)) {
-					if INTERRUPTED.load(Ordering::Acquire) { return Err(RecipeError::new("interrupted")) }
-					let observed = observation(features, prediction)?;
-					replay.observe(&observed, command.evaluate(&input_names, &observed)?)?;
-				}
+				// One invocation scores the whole set before either optimizer update.
+				let observed = sample.chunks_exact(prepared.features).zip(measured_predictions.chunks_exact(proposal_width))
+					.flat_map(|(features, prediction)| features.iter().chain(prediction).copied()).collect::<Vec<_>>();
+				let scores = command.evaluate(&input_names, &observed)?;
+				for (row, value) in observed.chunks_exact(observation_width).zip(scores) { replay.observe(row, value)?; }
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
 			let evaluator_r2 = if let Some(selector) = &mut selector {
@@ -16008,7 +16022,7 @@ impl Train {
 				(replay.raw.iter().sum::<f64>() / replay.raw.len() as f64, mean(&evaluation_targets))
 			} else {
 				let observed = observation(sample, &predictions)?;
-				let raw_score = command.evaluate(&input_names, &observed)?;
+				let raw_score = command.evaluate(&input_names, &observed)?[0];
 				(raw_score, replay.observe(&observed, raw_score)?)
 			};
 			if full_set && iteration == 0 { initial_loss = 1.0 - reward; }
