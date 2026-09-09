@@ -50,7 +50,20 @@ Native AMD tuning is opt-in: set `rat-enabled = true` under `[package.metadata.r
 
 Run the normal entrypoint, such as `recipe run model.rs --device amd0`. When enabled, tuning publishes both models together in one atomic `<knob stem>.pair.ogdl` bundle beside the configured knob model. Valid legacy knob/bench pairs can be loaded without overwriting them. Unusable tuner state or unavailable HIP occupancy support leaves heuristic training available. Set `RECIPE_DEBUG=1` for additional diagnostics in `recipe.log`.
 
-Command RAT is separate: `.loss(&evaluator)` requires `.rat("<script>")`. It does not enable native AMD tuning or use its persisted models.
+Command RAT is separate: `.loss(&evaluator)` requires `.rat(policy, "<script>")`. It does not enable native AMD tuning or use its persisted models.
+
+```rust
+recipe.train().rat(history, "./evaluate");
+recipe.train().rat(rolling, "./evaluate"); // data must specify .split(fraction)
+recipe.train().rat(online, "./evaluate");
+recipe.train().rat(learned, "./evaluate");
+```
+
+`history` fits every accumulated scored observation. `rolling` retains the newest `floor(source_rows * fraction)` observations, with a minimum capacity of one. `online` retains only the newest observation while preserving model and optimizer state. For command RAT, `.split()` controls only the rolling capacity; it does not create a holdout.
+
+`learned` predicts one continuous selection value per available observation and trains on values at least `0.5`. A second model predicts the resulting primary surrogate R² over the available observations. It uses online fitting, then stays frozen while updating the selector. Both selector models preserve their parameters as the observation count grows. An empty selection leaves the primary surrogate unchanged.
+
+Each command writes one finite raw score to stdout and no stderr. Any stderr output or unsuccessful exit stops training. `.log(score)` prints the raw score. `smoothstep(max, min, current)` derives a reward in `[0,1]` from running score extrema. Equal bounds return `0.4` for a negative current score, `0.6` for positive, and `0.5` for zero. Replay stores raw scores and applies current bounds when fitting. Native timing models retain their log-time units; all RAT paths share fitting and frozen-update machinery.
 
 ## files
 
