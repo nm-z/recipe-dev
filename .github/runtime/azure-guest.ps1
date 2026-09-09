@@ -249,11 +249,19 @@ try {
 	$env:RECIPE_EVIDENCE = Join-Path $work "evidence\suite.json"
 	# --device nv0 hard-errors when the device is absent; a build carrying the
 	# nvidia cfg does not add a CPU device, so there is no silent fallback.
-	& (Join-Path $work "target\release\recipe.exe") "--device" "nv0" (Join-Path $runtime "suite.rs") 2>&1 | Tee-Object -FilePath (Join-Path $work "run.log")
-	if ($LASTEXITCODE -ne 0) { throw "the runtime suite failed with exit code $LASTEXITCODE" }
+	$runStdout = Join-Path $work "run.stdout.log"
+	$runStderr = Join-Path $work "run.stderr.log"
+	$runProcess = Start-Process `
+		-FilePath (Join-Path $work "target\release\recipe.exe") `
+		-ArgumentList @("--device", "nv0", (Join-Path $runtime "suite.rs")) `
+		-Wait -PassThru `
+		-RedirectStandardOutput $runStdout `
+		-RedirectStandardError $runStderr
+	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
+	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
+	if ($runProcess.ExitCode -ne 0) { throw "the runtime suite failed with exit code $($runProcess.ExitCode)" }
 	Pop-Location
 
-	$log = Get-Content -Raw -LiteralPath (Join-Path $work "run.log")
 	Write-Output $log
 	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
 	$route = ([regex]::Match($log, '(?m)^selected route (\S+)')).Groups[1].Value
