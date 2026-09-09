@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>]... [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -96,7 +96,10 @@ fn run(source: &Path, device: Option<&str>) {
 }
 
 fn main() {
-	let mut arguments = std::env::args().skip(1);
+	let mut arguments = std::env::args().skip(1).peekable();
+	if arguments.peek().is_some_and(|argument| argument == "run") {
+		arguments.next();
+	}
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
 		if argument == "--worker" {
@@ -138,7 +141,7 @@ fn main() {
 	}
 	match operation.as_deref() {
 		None => run(source, device),
-		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
+		Some("export") if device.is_some_and(|names| names.contains(',') || names.split_once(':').map_or(names, |(_, devices)| devices).contains('.')) => invalid("export requires one device"),
 		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),
 	}
