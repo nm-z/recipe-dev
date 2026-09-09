@@ -222,6 +222,44 @@ else
 	echo "storage transfer is not configured"
 fi
 
+echo "== terminal transfer watchdog =="
+if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ] && command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+	blobs="$(az storage blob list \
+		--auth-mode login \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--prefix "runtime/windows/" \
+		--query "[].name" -o tsv --only-show-errors)" || {
+		echo "could not list prior runtime transfer blobs" >&2
+		blobs=""
+		cleanup_status=1
+	}
+	while IFS= read -r blob; do
+		if [[ ! "$blob" =~ ^runtime/windows/([0-9]+)-([0-9]+)/(snapshot\.tar\.gz|runtime-suite\.tar\.gz)$ ]]; then
+			continue
+		fi
+		prior_run="${BASH_REMATCH[1]}"
+		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+			echo "could not confirm the owner of prior transfer $blob" >&2
+			cleanup_status=1
+			continue
+		fi
+		if [ "$prior_status" = "completed" ]; then
+			echo "deleting terminal-run transfer $blob"
+			if ! az storage blob delete \
+				--auth-mode login \
+				--account-name "$AZURE_STORAGE_ACCOUNT" \
+				--container-name "$AZURE_STORAGE_CONTAINER" \
+				--name "$blob" \
+				--only-show-errors -o none; then
+				cleanup_status=1
+			fi
+		fi
+	done <<< "$blobs"
+else
+	echo "terminal transfer recovery is unavailable"
+fi
+
 echo "== residual resources for $WORKER =="
 residual="$(az resource list --resource-group "$GROUP" --query "[?starts_with(name,'$WORKER')].{name:name, type:type}" -o table --only-show-errors)" || {
 	echo "could not read back residual resources for $WORKER" >&2
