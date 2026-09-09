@@ -317,6 +317,8 @@ if [ "$(curl --silent --fail --max-time 120 "$RUNTIME_URI" | sha256sum | cut -d'
 	echo "private runtime download verification failed" >&2
 	exit 1
 fi
+snapshot_uri_encoded="$(printf '%s' "$SNAPSHOT_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+runtime_uri_encoded="$(printf '%s' "$RUNTIME_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 echo "uploaded and verified the private per-run archives"
 
 echo "== executing the native Windows GPU suite in the guest =="
@@ -337,7 +339,7 @@ invoke_guest() {
 			--resource-group "$GROUP" --name "$WORKER" \
 			--command-id RunPowerShellScript \
 			--scripts "@guest.ps1" \
-			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUri=$SNAPSHOT_URI" "runtimeSuiteUri=$RUNTIME_URI" \
+			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" \
 			--only-show-errors -o json > "$document"
 	status=$?
 	set -e

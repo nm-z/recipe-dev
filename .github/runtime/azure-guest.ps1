@@ -3,8 +3,8 @@ param(
 	[Parameter(Mandatory = $true)] [string] $candidateSha,
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
-	[Parameter(Mandatory = $true)] [string] $snapshotUri,
-	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUri
+	[Parameter(Mandatory = $true)] [string] $snapshotUriEncoded,
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded
 )
 
 # Runs inside the Windows GPU worker, invoked through managed Run Command. It
@@ -33,6 +33,19 @@ function Invoke-Download {
 	}
 	$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash.ToLowerInvariant()
 	if ($actual -ne $Sha256.ToLowerInvariant()) { throw "download checksum mismatch for ${Destination}: $actual != $Sha256" }
+}
+
+function Convert-EncodedUri {
+	param([string] $Encoded)
+	if ($Encoded -notmatch '^[A-Za-z0-9_-]+$') { throw "protected URL encoding contains an invalid character" }
+	$base64 = $Encoded.Replace("-", "+").Replace("_", "/")
+	switch ($base64.Length % 4) {
+		0 { }
+		2 { $base64 += "==" }
+		3 { $base64 += "=" }
+		default { throw "protected URL encoding has an invalid length" }
+	}
+	return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
 }
 
 function Enter-VsDeveloperEnvironment {
@@ -165,8 +178,13 @@ function Initialize-Toolchain {
 				"https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe" `
 				$llvmInstaller `
 				"94af030060d88cc17e9f00ef1663ebdc1126b35e16bebdfa1e807984b70abd8f"
-			Invoke-Native $llvmInstaller @("/S") "LLVM installation"
-			$llvmReady = $true
+			$llvmProcess = Start-Process -FilePath $llvmInstaller -ArgumentList "/S" -Wait -PassThru
+			if ($llvmProcess.ExitCode -ne 0) { throw "LLVM installation failed with exit code $($llvmProcess.ExitCode)" }
+			foreach ($attempt in 1..90) {
+				$llvmReady = [IO.File]::Exists($script:Clang) -and [IO.File]::Exists($script:Linker)
+				if ($llvmReady) { break }
+				Start-Sleep -Seconds 1
+			}
 		}
 	}
 
@@ -196,6 +214,8 @@ try {
 		Write-Output "PREFLIGHT EXIT 0"
 		exit 0
 	}
+	$snapshotUri = Convert-EncodedUri $snapshotUriEncoded
+	$runtimeSuiteUri = Convert-EncodedUri $runtimeSuiteUriEncoded
 
 	# One directory per candidate: two commits must never share a mutable tree.
 	$work = Join-Path $root $candidateSha
