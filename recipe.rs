@@ -6859,6 +6859,14 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	Ok(())
 }
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
+	compile_to_shape(model, data, targets, rows, gpu, config, initialize, Shape { channels: data.target_width, length: 1 })
+}
+/// Compiles a model while retaining a caller-selected output shape. The public
+/// compiler path above continues to project every model to a flat target width;
+/// learned replay uses this internal form for sequence-valued selector outputs
+/// and whole-selection scores.
+fn compile_to_shape(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool, requested: Shape) -> Result<Graph> {
+	require(requested.channels != 0 && requested.length != 0, "compiled output shape must be positive")?;
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
@@ -6882,9 +6890,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// A model whose last block already emits one value per target needs no projection; the
 	// channel and length are checked separately because a matching element count can still
 	// be the wrong shape for the projection's bias.
-	if graph.output.channels != data.target_width || graph.output.length != 1 {
-		let length = graph.output.length;
-		lower_conv(&mut graph, data.target_width, length)?;
+	if graph.output != requested {
+		require(requested.length <= graph.output.length, format!("compiled output length {} exceeds model output length {}", requested.length, graph.output.length))?;
+		let kernel = graph.output.length - requested.length + 1;
+		lower_conv(&mut graph, requested.channels, kernel)?;
 		if model.quantization != 0 {
 			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
 		}
@@ -6903,6 +6912,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
+	require(graph.output == requested, format!("compiled model output shape is {}x{}, expected {}x{}", graph.output.channels, graph.output.length, requested.channels, requested.length))?;
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, mut config: Config) -> Result<bundle::StoredGraph> {
