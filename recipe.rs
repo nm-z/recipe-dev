@@ -9871,7 +9871,7 @@ type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
-	query: Query,
+	query: Option<Query>,
 }
 enum Driver {
 	Cpu,
@@ -9998,7 +9998,7 @@ impl Gpu {
 		match &self.driver {
 			#[cfg(amd)]
 			Driver::Hsa(driver) => Ok(driver.query),
-			Driver::Remote(remote) => Ok(remote.query),
+			Driver::Remote(remote) => remote.query.ok_or_else(|| RecipeError::new(format!("device {:?} has no RAT query", self.name))),
 			_ => Err(RecipeError::new(format!("device {:?} has no RAT query", self.name))),
 		}
 	}
@@ -10556,7 +10556,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let free_memory = channel.read_u64()?;
 	let shared_limit = channel.read_u32()?;
 	let wave = channel.read_u32()?;
-	let query = channel.read_query()?;
+	let query = if backend == Backend::Amd { Some(channel.read_query()?) } else { None };
 	drop(directory);
 	let native_target = match backend {
 		Backend::Amd => BackendTarget::Amd { architecture },
@@ -11389,7 +11389,9 @@ pub fn worker_serve(name: &str) -> Result<()> {
 	wire.write_bytes(&gpu.free_memory.to_le_bytes())?;
 	wire.write_u32(gpu.shared_limit)?;
 	wire.write_u32(wave)?;
-	wire.write_query(gpu.query()?)?;
+	if backend == 1 {
+		wire.write_query(gpu.query()?)?;
+	}
 	wire.flush()?;
 	let mut program: Option<WorkerProgram> = None;
 	loop {

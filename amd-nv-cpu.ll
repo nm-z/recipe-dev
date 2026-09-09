@@ -3083,7 +3083,7 @@ br label %hidden.gradient.loop time.done: br label %time.loop row.done: %row.nex
 br label %row.loop reduce.entry: call void @grid_barrier(i64 %threads)
 call void @reduce_rows(ptr addrspace(1) %context, ptr addrspace(1) %gradient, i32 %rows, i32 %parameters, i32 %parameters, i32 %row.gradient.base, i32 %offset, i64 %threads)
 br label %projection.entry
-projection.entry: call void @grid_barrier(i32 %threads) br label %projection.loop projection.loop:
+projection.entry: call void @grid_barrier(i64 %threads) br label %projection.loop projection.loop:
 %projection.gate = phi i32 [ 0, %projection.entry ], [ %projection.next, %projection.step ]
 %projection.more = icmp ult i32 %projection.gate, %gates
 br i1 %projection.more, label %projection.step, label %exit projection.step:
