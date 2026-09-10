@@ -5245,7 +5245,9 @@ impl HeadCounts for [usize; 3] {
 struct AttentionBlock {
 	heads: usize,
 	/// The width of one query, key and value head. `None` derives it from the
-	/// residual width, which is what `attn(heads)` alone has always meant.
+	/// residual width, which is what `attn(heads)` alone has always meant. The
+	/// inferred width rounds up when the residual width is not divisible by the
+	/// query count.
 	width: Option<usize>,
 	/// The key and value head counts. They may differ, while each must divide
 	/// the query count so grouped-query/value attention has an unambiguous map.
@@ -5562,10 +5564,10 @@ impl Model {
 		model
 	}
 	/// Head width of the preceding `attn` block: the width of one query, key and
-	/// value head. Without it the width is the residual width split evenly over
-	/// the heads, so the residual width must divide by the head count; with it the
-	/// two are independent and the block projects `heads * d` back to the residual
-	/// width on the way out.
+	/// value head. Without it the width is the residual width divided upward over
+	/// the heads, so a residual width that is not divisible by the head count still
+	/// has a complete Q/K/V projection; with it the two are independent and the
+	/// block projects `heads * d` back to the residual width on the way out.
 	pub fn width(&self, d: usize) -> Self {
 		self.attention("width", |attention| attention.width = Some(d))
 	}
@@ -7663,12 +7665,6 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
 	let AttentionBlock { heads, width, keys, values, rope, yarn, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
-	// A declared head width stands on its own; a derived one is still the residual
-	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
-	require(
-		width.is_some() || graph.output.channels % heads == 0,
-		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
-	)?;
 	require(
 		keys != 0 && keys <= heads && heads % keys == 0,
 		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
@@ -7683,11 +7679,12 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			require(width != 0, "attention head width must be positive")?;
 			width
 		}
-		None => input.channels / heads,
+		None => input.channels.div_ceil(heads),
 	};
-	// The query plane the attention writes. With a derived width this is exactly
-	// `input.channels`, so every expression below is the one this code emitted
-	// before the width could be declared.
+	// The query plane the attention writes. With a divisible residual width this
+	// remains exactly `input.channels`; otherwise the rounded-up Q/K/V projection
+	// supplies the padding channels and the closing projection restores the input
+	// width.
 	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	let side = match index {

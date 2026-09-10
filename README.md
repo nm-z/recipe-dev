@@ -201,8 +201,9 @@ over its head-width slice, leaving the values untouched:
 `attn([query_heads, key_heads, value_heads])` form preserves the three head
 counts independently; each key and value count must divide the query count.
 `.width(d)` unties
-the head width from the block input: without it a head is `channels / heads` wide
-and the residual width must divide by the head count, with it a head is `d` wide
+the head width from the block input: without it a head is
+`channels.div_ceil(heads)` wide, so the Q/K/V projections also support residual
+widths that are not divisible by the query count; with it a head is `d` wide
 whatever the residual width is, and the block projects `heads * d` back to the
 residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
