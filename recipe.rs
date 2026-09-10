@@ -7580,7 +7580,7 @@ fn output_bias_offset(graph: &Graph) -> Option<usize> {
 			return (node.output == graph.output && node.argument[2] == 0.0)
 				.then_some(node.offset + node.parameters - node.output.channels);
 		}
-		if !matches!(node.op, Primitive::Elementwise | Primitive::Normalize) || node.second >= 0 || node.source < 0 {
+		if !matches!(node.op, Primitive::Elementwise | Primitive::Normalize) || node.second != -2 || node.source < 0 {
 			return None;
 		}
 		index = usize::try_from(node.source).ok()?;
