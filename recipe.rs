@@ -4028,9 +4028,6 @@ impl NativeModelIr {
 
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
 		let register_count = self.schedule.register_count;
-		let q8_0 = StorageCodec::Q8_0.quantization();
-		let q8_0_header = q8_0.stride.checked_sub(q8_0.block).ok_or_else(|| RecipeError::new("Q8_0 storage header is invalid"))?;
-		let q8_0_max = (1_u16 << (q8_0.bits - 1)) - 1;
 		let mut ir = backend_template(backend, self.precision, matrix)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
 			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
@@ -4042,11 +4039,7 @@ impl NativeModelIr {
 			.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
 			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
-			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string())
-			.replace("RECIPE_Q8_0_BLOCK", &q8_0.block.to_string())
-			.replace("RECIPE_Q8_0_STRIDE", &q8_0.stride.to_string())
-			.replace("RECIPE_Q8_0_HEADER", &q8_0_header.to_string())
-			.replace("RECIPE_Q8_0_MAX", &format!("{}.0", q8_0_max));
+			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
 		ir = strip_definition(ir, "recipe.model.decode");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
