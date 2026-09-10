@@ -54,7 +54,7 @@ cli.rs          cli options
 ## blocks
 
 ```
-frozen.packed.blck.atvn.norm.quant
+frozen.packed.blck
 ```
 
 ## 18 thingys
@@ -77,6 +77,17 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+
+	A branch step is an ordinary model step, so anything above goes inside one,
+	carrying its own activation, normalization, quantization and profile, and a
+	branch nests inside a branch:
+
+	res([layer(8), relu(), layer(8)])
+	res([norm(rms), layer(8).act(Activation::Relu), layer(8).quantize(0, 8, 0)])
+	res([res([layer(8), relu(), layer(8)]), gelu()])
+	moe(1, [layer(8), res([layer(8), relu(), layer(8)])])
+
+	norm(rms)          a normalization on its own, computing nothing before it
 
 feature reduction:
 	pool(size)
@@ -177,7 +188,7 @@ importance quantized:
 ## observability
 
 ```rust
-.log(Run|Loss|R2|Time|Epoch|blck|atvn|norm|tok|quant|tile|all)
+.log(Run|Loss|R2|Time|Epoch|blck|tile|all)
 let report = recipe.train()
 	.run(&model, &data);
 

@@ -6508,21 +6508,66 @@ mod bundle {
 		}
 	}
 
-	fn residual_text(value: &Residual) -> String {
-		match value {
-			Residual::Layer(width) => format!("layer,{width}"),
-			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
-			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+	/// One backslash per nesting level, so a fragment's steps can be whole
+	/// blocks that themselves hold fragments.
+	fn escape(value: &str) -> String {
+		let mut text = String::with_capacity(value.len());
+		for character in value.chars() {
+			if matches!(character, '\\' | ';' | '|' | ',') {
+				text.push('\\')
+			}
+			text.push(character)
 		}
+		text
 	}
-	fn residual(value: &str) -> Result<Residual> {
-		let mut fields = value.split(',');
-		match fields.next().unwrap_or("") {
-			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
-			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
-			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
-			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+	fn unescape(value: &str) -> Result<String> {
+		let mut text = String::with_capacity(value.len());
+		let mut characters = value.chars();
+		while let Some(character) = characters.next() {
+			match character {
+				'\\' => text.push(characters.next().ok_or_else(|| RecipeError::new("model record ends in an escape"))?),
+				other => text.push(other),
+			}
 		}
+		Ok(text)
+	}
+	/// Splits on the delimiters this level wrote, leaving escaped ones for the
+	/// level below. Text with no escapes splits exactly as `str::split` does,
+	/// which is what keeps older records readable.
+	fn split_escaped(value: &str, delimiter: char) -> Vec<String> {
+		let (mut parts, mut current, mut escaped) = (Vec::new(), String::new(), false);
+		for character in value.chars() {
+			if escaped {
+				(current.push(character), escaped = false).1
+			} else if character == '\\' {
+				(current.push(character), escaped = true).1
+			} else if character == delimiter {
+				parts.push(std::mem::take(&mut current))
+			} else {
+				current.push(character)
+			}
+		}
+		parts.push(current);
+		parts
+	}
+	fn residual_text(value: &Block) -> String {
+		escape(&block_text(value))
+	}
+	fn residual(value: &str) -> Result<Block> {
+		let text = unescape(value)?;
+		// A fragment step used to be one of three fixed shapes carrying no
+		// fields of its own, written without a block's six. Those records still
+		// read: only the newer form holds the block separator.
+		if !text.contains('|') {
+			let mut fields = text.split(',');
+			return match fields.next().unwrap_or("") {
+				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
+				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
+				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+			};
+		}
+		block(&text)
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -6600,6 +6645,8 @@ mod bundle {
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", *activation as u8),
+			Operation::Identity => "identity".to_owned(),
+			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -6648,17 +6695,29 @@ mod bundle {
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
-			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
-			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
-			"moe" => Ok(Operation::Moe(
-				value_at(fields.next(), "MoE experts")?,
-				value_at(fields.next(), "MoE top-k")?,
-				value_at(fields.next(), "MoE expert width")?,
-				activation(value_at(fields.next(), "MoE activation")?)?,
-				scoring(value_at(fields.next(), "MoE scoring")?)?,
-				bool_value(fields.next().unwrap_or(""), "MoE renormalization")?,
-				bool_value(fields.next().unwrap_or(""), "MoE shared expert")?,
-			)),
+			"identity" => Ok(Operation::Identity),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"moe_blocks" => {
+				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
+				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+			}
+			"moe" => {
+				let fields = rest.split(',').collect::<Vec<_>>();
+				if fields.len() >= 7 {
+					Ok(Operation::Moe(
+						value_at(fields.first().copied(), "MoE experts")?,
+						value_at(fields.get(1).copied(), "MoE top-k")?,
+						value_at(fields.get(2).copied(), "MoE expert width")?,
+						activation(value_at(fields.get(3).copied(), "MoE activation")?)?,
+						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
+						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
+						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
+					))
+				} else {
+					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
+					Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				}
+			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
@@ -6729,17 +6788,17 @@ mod bundle {
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
-		require(fields.len() == 8, "semantic model block has the wrong width")?;
+		let fields = split_escaped(value, '|');
+		require(fields.len() == 6 || fields.len() == 8, "semantic model block has the wrong width")?;
 		Ok(Block {
-			operation: operation(fields[0])?,
-			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization: normalization(Some(fields[2]), "block normalization")?,
-			qk: normalization(Some(fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(fields[3]), "block quantization")?,
-			profile: bool_value(fields[4], "block quantization profile")?,
-			frozen: bool_value(fields[6], "block frozen qualifier")?,
-			packed: bool_value(fields[7], "block packed qualifier")?,
+			operation: operation(&fields[0])?,
+			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			normalization: normalization(Some(&fields[2]), "block normalization")?,
+			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
+			quantization: value_at(Some(&fields[3]), "block quantization")?,
+			profile: bool_value(&fields[4], "block quantization profile")?,
+			frozen: fields.get(6).map_or(Ok(false), |field| bool_value(field, "block frozen qualifier"))?,
+			packed: fields.get(7).map_or(Ok(false), |field| bool_value(field, "block packed qualifier"))?,
 		})
 	}
 	fn model_text(model: &Model) -> Vec<String> {
@@ -7375,17 +7434,69 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Conv(usize, usize),
-	Activation(Activation),
+/// A step of a model, and equally a step of a fragment inside one. `res`,
+/// `moe` and the model builder all take the same thing, because a branch step
+/// is an ordinary step: it carries an operation with its activation, its
+/// normalization, its Q/K normalization, its quantization and its profile, and
+/// its operation may itself be another fragment.
+pub const fn layer(width: usize) -> Block {
+	Block::of(Operation::Layer(width))
 }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+pub const fn conv(filters: usize, kernel: usize) -> Block {
+	Block::of(Operation::Conv(filters, kernel))
 }
-pub const fn conv(filters: usize, kernel: usize) -> Residual {
-	Residual::Conv(filters, kernel)
+/// A normalization on its own, computing nothing before it.
+pub fn norm(normalization: impl NormalizationSelector) -> Block {
+	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+}
+pub fn pool(size: usize) -> Block {
+	Block::of(Operation::Pool(size))
+}
+pub fn attn(heads: usize) -> Block {
+	Block::of(Operation::Attention(AttentionBlock::new(heads)))
+}
+pub fn rnn(width: usize) -> Block {
+	Block::of(Operation::Rnn(width))
+}
+pub fn gru(width: usize) -> Block {
+	Block::of(Operation::Gru(width))
+}
+pub fn lstm(width: usize) -> Block {
+	Block::of(Operation::Lstm(width))
+}
+pub fn perc(width: usize) -> Block {
+	Block::of(Operation::Perceptron(width))
+}
+pub fn kmeans(clusters: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" }))
+}
+pub fn knn(neighbors: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" }))
+}
+pub fn svm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" }))
+}
+pub fn forest(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" }))
+}
+pub fn bayes() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" }))
+}
+pub fn cbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" }))
+}
+pub fn xgbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" }))
+}
+pub fn lgbm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" }))
+}
+/// A fragment as one step, so a branch nests inside a branch.
+pub fn res<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Residual(parts.into()))
+}
+pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
+	Block::of(Operation::MoeBlocks(top_k, experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -7522,8 +7633,9 @@ enum Operation {
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
-	Residual(Vec<Residual>),
+	Residual(Vec<Block>),
 	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
+	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(usize, usize, Vec<Block>),
@@ -7535,6 +7647,9 @@ enum Operation {
 	Norm,
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
+	/// Computes nothing. It carries a step that is only an activation or only
+	/// a normalization, so those need no operation of their own.
+	Identity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -7603,18 +7718,18 @@ impl NormalizationSelector for L2 {
 		BlockNormalization::L2
 	}
 }
-impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
+impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0) {
-			Residual::Layer(_) => BlockNormalization::Layer,
+		match self(0).operation {
+			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
-	Residual::Activation(Activation::$value) })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false } })+}; }
 pub mod atv {
-	use super::{Activation, Residual};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -7622,7 +7737,7 @@ pub mod atv {
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Block {
+pub struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
@@ -7632,6 +7747,72 @@ struct Block {
 	profile: bool,
 	frozen: bool,
 	packed: bool,
+}
+macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
+	self.act(Activation::$activation)
+})+}; }
+impl Block {
+	const fn of(operation: Operation) -> Self {
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false }
+	}
+	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
+	/// the pair `layer(8), relu()` are the same step written two ways.
+	pub fn act(mut self, activation: Activation) -> Self {
+		assert!(self.normalization.is_none(), "activation must precede normalization");
+		self.activation = activation;
+		self
+	}
+	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.normalization = Some(normalization.normalization());
+		self
+	}
+	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
+		self.qk = Some(normalization);
+		self
+	}
+	/// A step inside a fragment keeps its own storage format, exactly as a step
+	/// of the model does.
+	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
+		let format = family << 12 | variant << 8 | u16::from(bits);
+		self.quantization = format;
+		self.profile = StorageFormat(format).selection().is_some();
+		self
+	}
+	pub fn profile(mut self, profile: bool) -> Self {
+		self.profile = profile;
+		self
+	}
+	block_activations! {
+		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
+		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
+		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
+	}
+	pub fn qi(&self, bits: u8) -> BlockQi {
+		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
+		let q = |variant| self.clone().quantize(0, bits, variant);
+		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+	}
+}
+pub struct BlockQi {
+	pub q0: Block,
+	pub q1: Block,
+	pub nf: Block,
+	pub k: BlockQk,
+}
+pub struct BlockQk {
+	model: Block,
+	pub s: Block,
+	pub m: Block,
+	pub l: Block,
+}
+impl std::ops::Deref for BlockQk {
+	type Target = Block;
+	fn deref(&self) -> &Block {
+		&self.model
+	}
 }
 #[derive(Clone)]
 pub struct Model {
@@ -7708,10 +7889,13 @@ impl Model {
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
 	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
 	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
-	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
+	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
-	pub fn moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
+		self.push(Operation::MoeBlocks(top_k, experts.into()))
+	}
+	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
 	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
@@ -7889,30 +8073,27 @@ impl Model {
 		Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
-		let has = |value| metrics.iter().any(|metric| metric.0 == value);
-		let selected = (has(5), has(6), has(7), has(9));
+		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
 		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
 		self.blocks
 			.iter()
 			.take(self.blocks.len() - output)
 			.filter_map(|block| {
 				let mut names = Vec::new();
-				if selected.0 {
-					names.push(block.operation.name().to_owned())
-				}
-				if selected.1 && block.activation != Activation::Linear {
-					names.push(block.activation.name().to_owned())
-				}
-				if selected.2 {
+				if selected {
+					names.push(block.operation.name().to_owned());
+					if block.activation != Activation::Linear {
+						names.push(block.activation.name().to_owned())
+					}
 					if let Some(name) = block.qk.map(BlockNormalization::name) {
 						names.push(format!("qk-{name}"))
 					}
 					if let Some(name) = block.normalization.map(BlockNormalization::name) {
 						names.push(name.to_owned())
 					}
-				}
-				if selected.3 && block.quantization != 0 {
-					names.push(quantization(block.quantization))
+					if block.quantization != 0 {
+						names.push(quantization(block.quantization))
+					}
 				}
 				(!names.is_empty()).then(|| names.join("."))
 			})
@@ -9277,7 +9458,9 @@ impl Operation {
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
+			Self::MoeBlocks(..) => "moe",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
@@ -9290,11 +9473,12 @@ impl Operation {
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
 	fn weighted(&self) -> bool {
-		let weighted_parts = |parts: &[Residual]| parts.iter().any(|part| !matches!(part, Residual::Activation(_)));
+		let weighted_parts = |parts: &[Block]| parts.iter().any(|part| part.operation.weighted());
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) => false,
-			Self::Residual(parts) => weighted_parts(parts),
+			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
+			Self::Identity => false,
 			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			_ => true,
 		}
@@ -9357,7 +9541,7 @@ pub struct LossFunction(u8);
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
 pub struct ZScore;
-pub type Normalization = fn(usize) -> Residual;
+pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
 pub type Loss = LossFunction;
 pub const adamw: Adamw = Adamw;
@@ -9374,16 +9558,17 @@ pub const Loss: Metric = Metric(1);
 pub const R2: Metric = Metric(2);
 pub const Time: Metric = Metric(3);
 pub const Epoch: Metric = Metric(4);
+/// The whole of a block: its operation, its activation, its normalization and
+/// Q/K normalization, its tokens and its quantization. One block is one thing,
+/// so selecting parts of its description separately was a distinction the
+/// caller never wanted, and it spent four names on it -- including `norm`,
+/// which a model step wants.
 pub const blck: Metric = Metric(5);
-pub const atvn: Metric = Metric(6);
-pub const norm: Metric = Metric(7);
-pub const tok: Metric = Metric(8);
-pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
 /// All progress fields except the native tile schedule.
-pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
+pub const all: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
 /// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+pub const dev: [Metric; 7] = [Run, Time, Epoch, R2, Loss, blck, tile];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -10129,7 +10314,7 @@ impl<'a> Builder<'a> {
 				self.mapped(vec![tensor]);
 			}
 		}
-		Ok(branch.moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
 	}
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
@@ -10981,7 +11166,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) => true,
-		Operation::Residual(parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
+		Operation::Residual(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
@@ -10994,6 +11179,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
 	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
+	let sequential = sequential || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
@@ -11176,11 +11362,13 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
-		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
+		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -11693,6 +11881,11 @@ fn binary(graph: &mut Graph, first: i32, second: i32, shape: Shape, opcode: Scal
 	scalar.op(opcode, -1.0, -2.0);
 	program(graph, first, second, shape, &[], scalar)
 }
+fn constant(graph: &mut Graph, source: i32, shape: Shape, value: f64) -> Result<i32> {
+	let mut scalar = ScalarProgram(Vec::new());
+	scalar.constant(value);
+	program(graph, source, -2, shape, &[], scalar)
+}
 /// Apply `value` to `source`, or pass it through when linear, and name the result.
 fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
@@ -11709,6 +11902,76 @@ fn lower_gated(graph: &mut Graph, gate: i32, up: i32, shape: Shape, activation: 
 	}
 	let activated = graph.source;
 	binary(graph, activated, up, shape, ScalarOpcode::Multiply)
+}
+fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
+	reset(graph, source, shape);
+	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
+	Ok((graph.source, graph.output))
+}
+fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
+	let mut scalar = ScalarProgram(Vec::new());
+	let condition = scalar.op(ScalarOpcode::Greater, -1.0, -2.0);
+	scalar.choose(condition, -1.0, -2.0);
+	program(graph, first, second, shape, &[], scalar)
+}
+fn one_minus(graph: &mut Graph, source: i32, shape: Shape) -> Result<i32> {
+	let mut scalar = ScalarProgram(Vec::new());
+	let one = scalar.constant(1.0);
+	scalar.op(ScalarOpcode::Subtract, one, -1.0);
+	program(graph, source, -2, shape, &[], scalar)
+}
+fn greater_than(graph: &mut Graph, value: f64, source: i32, shape: Shape) -> Result<i32> {
+	let mut scalar = ScalarProgram(Vec::new());
+	let limit = scalar.constant(value);
+	scalar.op(ScalarOpcode::Greater, limit, -1.0);
+	program(graph, source, -2, shape, &[], scalar)
+}
+fn rank_mask(graph: &mut Graph, scores: &[i32], selected: usize, shape: Shape, top_k: usize) -> Result<i32> {
+	let mut rank = constant(graph, scores[selected], shape, 0.0)?;
+	for candidate in 0..scores.len() {
+		if candidate == selected {
+			continue;
+		}
+		let higher = binary(graph, scores[candidate], scores[selected], shape, ScalarOpcode::Greater)?;
+		let order = if candidate < selected {
+			let lower = binary(graph, scores[selected], scores[candidate], shape, ScalarOpcode::Greater)?;
+			let unequal = binary(graph, higher, lower, shape, ScalarOpcode::Add)?;
+			let tied = one_minus(graph, unequal, shape)?;
+			binary(graph, higher, tied, shape, ScalarOpcode::Add)?
+		} else {
+			higher
+		};
+		rank = binary(graph, rank, order, shape, ScalarOpcode::Add)?;
+	}
+	greater_than(graph, top_k as f64, rank, shape)
+}
+fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize, config: Config) -> Result<()> {
+	let mut maximum_score = scores[0];
+	for &score in &scores[1..] {
+		maximum_score = maximum(graph, maximum_score, score, shape)?;
+	}
+	let mut weighted = Vec::with_capacity(scores.len());
+	for (index, &score) in scores.iter().enumerate() {
+		let centered = binary(graph, score, maximum_score, shape, ScalarOpcode::Subtract)?;
+		let exponential = activation(graph, centered, shape, Activation::Exp, config)?.0;
+		let mask = rank_mask(graph, scores, index, shape, top_k)?;
+		weighted.push(binary(graph, mask, exponential, shape, ScalarOpcode::Multiply)?);
+	}
+	let mut denominator = weighted[0];
+	for &value in &weighted[1..] {
+		denominator = binary(graph, denominator, value, shape, ScalarOpcode::Add)?;
+	}
+	let mut output = None;
+	for (index, &branch) in branches.iter().enumerate() {
+		let probability = binary(graph, weighted[index], denominator, shape, ScalarOpcode::Divide)?;
+		let routed = binary(graph, probability, branch, shape, ScalarOpcode::Multiply)?;
+		output = Some(match output {
+			Some(previous) => binary(graph, previous, routed, shape, ScalarOpcode::Add)?,
+			None => routed,
+		});
+	}
+	reset(graph, output.ok_or_else(|| RecipeError::new("selection has no output"))?, shape);
+	Ok(())
 }
 /// Runs the gated feed-forward of the experts `routing` names over `input`, the
 /// graph output at `source`. `routing` is a `[experts, length]` plane of per-position
@@ -11743,7 +12006,7 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
@@ -11773,6 +12036,29 @@ fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, act
 	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
 	Ok(())
 }
+fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!experts.is_empty(), "moe requires an expert")?;
+	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
+	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
+	let mut output = None;
+	for value in experts {
+		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
+		if let Some(expected) = output {
+			require(shape == expected, "moe experts must have one output shape")?;
+		}
+		output = Some(shape);
+		branches.push(branch);
+	}
+	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
+	let mut scores = Vec::with_capacity(experts.len());
+	for _ in experts {
+		reset(graph, source, input);
+		lower_project(graph, output.channels)?;
+		require(graph.output == output, "moe router shape does not match its experts")?;
+		scores.push(graph.source);
+	}
+	select(graph, &branches, &scores, output, top_k, config)
+}
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
 	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?, checked_mul(channels, channels, "scan state matrix")?);
@@ -11780,20 +12066,34 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
 }
-fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
+fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
-	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
+	let branch = graph.source;
+	let branch_shape = graph.output;
+	if branch_shape != shape {
+		// Keep the declared branch as-is and adapt the skip path to it. A learned
+		// contraction handles channel changes; a contraction with a valid window
+		// also handles a branch that shortens the sequence. Upsampling a skip path
+		// would require a distinct operator, so refuse that genuinely unsupported
+		// connection instead of padding or truncating it silently.
+		require(branch_shape.length <= shape.length, "residual projection cannot lengthen the skip sequence")?;
+		reset(graph, skip, shape);
+		if branch_shape.length != shape.length {
+			let kernel = checked_add(shape.length - branch_shape.length, 1, "residual projection kernel")?;
+			lower_conv(graph, branch_shape.channels, kernel)?;
+		} else if branch_shape.channels != shape.channels {
+			lower_project(graph, branch_shape.channels)?;
+		}
+		require(graph.output == branch_shape, "residual projection did not match the branch")?;
+	}
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
-	push_program(graph, skip, &[], program)
+	let second = if branch_shape == shape { skip } else { branch };
+	push_program(graph, second, &[], program)
 }
 fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
@@ -12564,6 +12864,12 @@ impl NativeTape {
 		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
 		let offset = checked_add(arena, checked_mul(first, self.precision.model.bytes(), "output offset")?, "output arena offset")?;
 		let values = self.values.download_float_bytes(offset, count, self.precision.model)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
+		let index = usize::try_from(node).map_err(|_| RecipeError::new("native output source is absent"))?;
+		let offset = *self.program.artifact.layout.values.get(index).ok_or_else(|| RecipeError::new("native model output arena is absent"))?;
+		let values = self.values.download_float_bytes(offset, self.capacity * output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -15421,12 +15727,12 @@ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 }
 fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
-	if graph.nodes.is_empty() {
+	if graph.source < 0 {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let tape = NativeTape::new(graph, &samples[..input_count], &samples[..input_count], &[], gpu, precision, Some(mse))?;
 	tape.forward(ForwardMode::Training)?;
-	tape.predictions()
+	tape.predictions_at(graph.source, graph.output.elements())
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
@@ -18947,7 +19253,7 @@ impl Train {
 			graph.parameters = tape.weights()?;
 			predictions.clear();
 			let mut raw_outputs = Vec::new();
-			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+			let stream = self.log_metrics.iter().any(|metric| metric.0 == blck.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let validation = NativeTape::new(&graph, sample, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
