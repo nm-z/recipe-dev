@@ -894,14 +894,14 @@ store.test: %store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %
 %store.output.m.valid = icmp ult i32 %store.output.m.raw, %m.count %store.output.n.valid = icmp ult i32 %store.output.n.raw, %n.count %store.output.valid = and i1 %store.output.m.valid, %store.output.n.valid %store.lane.active = and i1 %method.store, %store.output.valid %store.active = and i1 %store.lane.active, %store.register.valid br i1 %store.active, label %store, label %store.next
 store: %store.channel = add i32 %n.base, %store.output.n.raw %store.m.global = add i32 %m.base, %store.output.m.raw %store.position = urem i32 %store.m.global, %out.length %store.row = udiv i32 %store.m.global, %out.length %store.output.row.base = mul i32 %store.row, %out.elements
 %store.output.channel.base = mul i32 %store.channel, %out.length %store.output.local = add i32 %store.output.channel.base, %store.position %store.output.index = add i32 %store.output.row.base, %store.output.local %store.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %store.output.index
-%store.bias.base = mul i32 %out.channels, %terms %store.bias.index = add i32 %store.bias.base, %store.channel
+%store.bias.base = mul i32 %out.channels, %terms %store.bias.index = add i32 %store.bias.base, %store.channel %store.bias.index.safe = select i1 %has.bias, i32 %store.bias.index, i32 0
 br i1 %weight.packed, label %store.bias.packed, label %store.bias.direct
 store.bias.direct:
-%store.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %store.bias.index
+%store.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %store.bias.index.safe
 %store.bias.loaded = load double, ptr addrspace(1) %store.bias.ptr, align 8
 br label %store.bias.ready
 store.bias.packed:
-%store.bias.decode.index = add i32 %weight.base, %store.bias.index
+%store.bias.decode.index = add i32 %weight.base, %store.bias.index.safe
 %store.bias.decoded = call double @recipe.model.decode(ptr addrspace(1) %weights, i32 %store.bias.decode.index, i32 %decode)
 br label %store.bias.ready
 store.bias.ready:
@@ -3389,15 +3389,14 @@ state.weight.ready:
 %state.weight = phi double [ %state.weight.loaded, %state.weight.direct ], [ %state.weight.decoded, %state.weight.packed ]
 %state.product = call double @recipe.mul(double %state.value, double %state.weight) %state.sum.next = call double @recipe.add(double %state.sum, double %state.product)
 %state.next = add nuw i32 %state.channel, 1 br label %state.sum.loop gate.activate:
-%bias.base = add i32 %gate.weight.base, %matrix.span %bias.index = add i32 %bias.base, %hidden
+%bias.base = add i32 %gate.weight.base, %matrix.span %bias.index = add i32 %bias.base, %hidden %bias.index.safe = select i1 %has.bias, i32 %bias.index, i32 0
 br i1 %weight.packed, label %gate.bias.packed, label %gate.bias.direct
 gate.bias.direct:
-%bias.index.safe = select i1 %has.bias, i32 %bias.index, i32 0
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index.safe
 %bias.loaded = load double, ptr addrspace(1) %bias.ptr, align 8
 br label %gate.bias.ready
 gate.bias.packed:
-%bias.decode.index = add i32 %weight.base, %bias.index
+%bias.decode.index = add i32 %weight.base, %bias.index.safe
 %bias.decoded = call double @recipe.model.decode(ptr addrspace(1) %weights, i32 %bias.decode.index, i32 %decode)
 br label %gate.bias.ready
 gate.bias.ready:
