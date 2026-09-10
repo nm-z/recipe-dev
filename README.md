@@ -63,7 +63,82 @@ recipe.train().rat(learned, "./evaluate");
 
 `learned` predicts one continuous selection value per available observation and trains on values at least `0.5`. A second model predicts the resulting primary surrogate R² over the available observations. It uses online fitting, then stays frozen while updating the selector. Both selector models preserve their parameters as the observation count grows. An empty selection leaves the primary surrogate unchanged.
 
-Each command writes one finite raw score to stdout and no stderr. Any stderr output or unsuccessful exit stops training. `.log(score)` prints the raw score. `smoothstep(max, min, current)` derives a reward in `[0,1]` from running score extrema. Equal bounds return `0.4` for a negative current score, `0.6` for positive, and `0.5` for zero. Replay stores raw scores and applies current bounds when fitting. Native timing models retain their log-time units; all RAT paths share fitting and frozen-update machinery.
+Replay growth changes buffer allocations, not the loaded native program. Each
+dispatch passes its active row count; arenas carry their current node offsets.
+The learned selector also passes its active sequence length. Growing either
+capacity preserves the kernels, weights, and optimizer buffers. Changing the
+model structure, arithmetic format, or an explicitly retuned schedule can still
+require a different program.
+
+Each command writes one finite raw score to stdout and no stderr. Any stderr output or unsuccessful exit stops training. `.log(score)` prints the raw score. Replay and surrogate fitting use that same raw value without automatic bounding, normalization, or sign changes. Users may transform scores in their own executable. `recipe.train().target(value)` sets the proposer's desired raw score and defaults to zero; it does not replace the evaluator's measured training targets. With MSE and `.target(0.0)`, the evaluator minimizes `(prediction - measurement)^2`, while the proposer minimizes `(prediction - 0)^2` through the frozen evaluator. Native hardware timing models retain their existing log-time units.
+
+### Stateful command RAT
+
+Use `recipe.data(auto)` with command RAT when the executable owns the state.
+No table file or data-level `.target()` declaration is needed: the executable supplies
+the state fields, action fields, and complete valid choices.
+
+```rust
+let data = recipe.data(auto);
+let evaluator = recipe.model().layer(16).tanh().loss(mse);
+let proposal = recipe.model().layer(4).loss(&evaluator);
+recipe.train().rat(history, "./evaluate.lua")
+    .target(0.0).epochs(100).log(all).run(&proposal, &data);
+```
+
+Recipe starts one process with `RECIPE_RAT_PROTOCOL=1`. Requests and replies
+are newline-delimited UTF-8. Flush each complete reply. Example interaction:
+
+```text
+Recipe: reset
+Evaluator: state position=0,remaining=8
+Evaluator: actions destination,amount
+Evaluator: choice 1,4
+Evaluator: choice 2,8
+Evaluator: ready
+Recipe: choose destination=1,amount=4
+Evaluator: state position=1,remaining=4
+Evaluator: actions destination,amount
+Evaluator: choice 2,4
+Evaluator: ready
+Recipe: choose destination=2,amount=4
+Evaluator: score 3.25
+```
+
+The `Recipe:` and `Evaluator:` prefixes illustrate direction and are not sent.
+State and action names, order, and widths remain fixed during training. Values
+and the number of valid choices may change. Names must be unique and contain
+no whitespace, comma, or equals sign. All values and scores must be finite.
+`score` terminates an episode; its meaning belongs to the executable. The
+proposer optimizes toward the configured raw target. The executable handles `reset`
+for a fresh episode and `close` for a clean exit. Stderr output, malformed
+frames, unexpected EOF, or an unsuccessful exit are errors, not low scores.
+
+The proposer emits one real preference per action field. Recipe selects the
+listed complete choice with the smallest squared distance after scaling each
+field by its current choice range. Constant fields do not contribute; ties
+follow the executable's choice order. This enforces supplied choices without
+assigning domain meaning to names or inventing constraints.
+
+Each visited state and raw proposal receives the executable's terminal score.
+There are no backend progress rewards, timing penalties, or artificial success
+scores. The existing surrogate fitter and frozen surrogate backpropagation
+are reused, with raw measured targets. One epoch fits the surrogate once and
+updates the proposer once using a retained state, then evaluates the updated
+policy through another complete episode. Thus N epochs run N+1 episodes.
+The models persist across decisions and episodes; changing the choice count
+does not recreate their weights.
+
+`history` retains all scored decisions, `online` retains the latest one, and
+`full` replaces observations with the latest episode. For stateful `rolling`,
+`.split(fraction)` sets capacity from the number of decisions in the latest
+completed episode. `learned` uses the existing learned replay selection.
+The log's score is the latest raw terminal score; loss and R² describe the
+surrogate's fitting observations, not a held-out evaluation or an optimality
+claim. `.resume()` and nondefault `.stop()` are unsupported in this mode.
+`.log(all)` and `.log(dev)` also print `choices`, the number of decisions in
+the rollout that produced that line's score, followed by `window`, the number
+of observations fitted in that update. `.log(Choices)` selects the count alone.
 
 ## files
 

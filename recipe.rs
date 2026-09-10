@@ -1476,7 +1476,10 @@ impl NativeLayout {
 		let mut values = Vec::with_capacity(graph.nodes.len());
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
-		let (mut value_offset, mut context_offset, mut adjoint_offset) = (0, 0, 0);
+		// Each arena carries node offsets and its byte size. Buffer growth updates
+		// these values without changing the compiled operations or their ABI.
+		let header = checked_mul(checked_add(graph.nodes.len(), 1, "native arena header")?, 8, "native arena header")?;
+		let (mut value_offset, mut context_offset, mut adjoint_offset) = (header, header, header);
 		for node in &graph.nodes {
 			value_offset = align(value_offset, element.max(8))?;
 			context_offset = align(context_offset, element.max(8))?;
@@ -1494,9 +1497,6 @@ impl NativeLayout {
 
 struct NodePlan {
 	node: Node,
-	value: usize,
-	context: usize,
-	adjoint: usize,
 	stored: Option<StoredWeight>,
 	storage_offset: usize,
 }
@@ -1520,7 +1520,6 @@ pub(crate) struct NativeModelIr {
 	graph: Graph,
 	layout: NativeLayout,
 	precision: NativePrecision,
-	rows: usize,
 	dynamic_length: bool,
 	schedule: NativeSchedule,
 	plans: Vec<NodePlan>,
@@ -1557,9 +1556,9 @@ impl NativeModelIr {
 			if let Some(weight) = &stored {
 				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
 			}
-			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
+			plans.push(NodePlan { node, stored, storage_offset });
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, dynamic_length: graph.dynamic_sequence, schedule, plans, storage_bytes })
+		Ok(Self { graph: graph.clone(), layout, precision, dynamic_length: graph.dynamic_sequence, schedule, plans, storage_bytes })
 	}
 	fn live_length(&self, length: usize) -> String {
 		if self.dynamic_length && length == self.graph.input.length { "%length".to_owned() } else { length.to_string() }
@@ -1757,6 +1756,13 @@ fn barrier(backend: Backend) -> &'static str {
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
 	let pointer = pointer_type(backend);
 	format!("%{name} = getelementptr i8, {pointer} %{base}, i64 {offset}\n")
+}
+fn arena_gep(backend: Backend, base: &str, index: usize, name: &str) -> String {
+	let pointer = pointer_type(backend);
+	format!("%{name}.offset.ptr = getelementptr i64, {pointer} %{base}, i64 {index}\n%{name}.offset = load i64, {pointer} %{name}.offset.ptr, align 8\n%{name} = getelementptr i8, {pointer} %{base}, i64 %{name}.offset\n")
+}
+fn arena_header(offsets: &[usize], bytes: usize) -> Vec<u8> {
+	offsets.iter().copied().chain([bytes]).flat_map(|value| (value as u64).to_le_bytes()).collect()
 }
 
 mod quantized {
@@ -2872,17 +2878,15 @@ impl NativeModelIr {
 						// the schedule. Each partition sums its own contiguous run of
 						// elements in ascending order into its own scratch row, and one
 						// owner then folds the rows in ascending partition order.
-						let capacity_count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
-						let partitions = capacity_count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let partitions = NATIVE_SCALAR_PARTITIONS;
 						let count = self.live_row_count(index, "scalar.reverse", node.output, &mut ir)?;
 						emit_partitioned_loop(
 							&mut ir,
 							index,
 							"scalar.reverse",
 							PartitionedLoop {
-								count: capacity_count,
+								count: &count,
 								partitions,
-								active_count: Some(&count),
 								columns: node.parameters,
 								value_type: ty,
 								pointer_type: pointer,
@@ -3019,10 +3023,14 @@ impl NativeModelIr {
 						// The weight gradient is one column per channel summed over every
 						// row and position: each partition accumulates its own contiguous
 						// run into its own scratch row, and one owner folds the rows in order.
-						let capacity_count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
-						let partitions = capacity_count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+						let partitions = NATIVE_SCALAR_PARTITIONS;
 						let (columns, offset) = (narrow(node.parameters, "normalization weight columns")?, narrow(node.offset, "normalization weight offset")?);
-						let statistics = narrow(checked_mul(4, normalize_groups(node, self.rows)?, "normalization statistics")?, "normalization statistics")?;
+						let per_row = normalize_mode(node.argument[0])?.per_row();
+						let statistics = narrow(checked_mul(4, normalize_groups(node, 1)?, "normalization statistics")?, "normalization statistics")?;
+						let statistics = if per_row {
+							ir.push_str(&format!("%{prefix}.statistics = mul i32 %rows, {statistics}\n"));
+							format!("%{prefix}.statistics")
+						} else { statistics.to_string() };
 						let scratch = format!("%{prefix}.scratch");
 						let zero = native_literal(self.precision.model, ty, 0.0);
 						ir.push_str(&format!("{scratch} = getelementptr inbounds {ty}, {pointer} {context}, i32 {statistics}\n", context = pointers.context));
@@ -3033,7 +3041,7 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { count: capacity_count, partitions, active_count: Some(&count), columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							PartitionedLoop { count: &count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
 							|ir, p| {
 								let source_pointer = format!("%{weight_prefix}.source.ptr");
 								let source_value = format!("%{weight_prefix}.source.value");
@@ -3060,9 +3068,7 @@ impl NativeModelIr {
 									p,
 								);
 								ir.push_str(&fragment.code);
-								// The partitions span the row capacity; rows past `%rows` hold stale
-								// values and contribute nothing, and neither does a channel outside
-								// the normalized span, which owns no scale column.
+								// Only active rows and channels in the normalized span contribute.
 								let live = if normalize_span(node) < node.output.channels {
 									format!(
 										"%{weight_prefix}.live.row = icmp ult i32 %{weight_prefix}.normalize.row, %rows\n%{weight_prefix}.live = and i1 %{weight_prefix}.live.row, %{weight_prefix}.normalize.inside\n"
@@ -3176,11 +3182,11 @@ impl NativeModelIr {
 		let source = if plan.node.source >= 0 { format!("%{prefix}.source") } else { "%samples".to_owned() };
 		if plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &format!("{prefix}.source")));
+			ir.push_str(&arena_gep(backend, "values", source, &format!("{prefix}.source")));
 		}
 		let second = if plan.node.second >= 0 {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "values", self.layout.values[second], &format!("{prefix}.second")));
+			ir.push_str(&arena_gep(backend, "values", second, &format!("{prefix}.second")));
 			format!("%{prefix}.second")
 		} else {
 			source.clone()
@@ -3189,23 +3195,23 @@ impl NativeModelIr {
 		let context = format!("%{prefix}.context");
 		let delta = format!("%{prefix}.delta");
 		let weights = format!("%{prefix}.weights");
-		ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("{prefix}.value")));
-		ir.push_str(&ptr_gep(backend, "contexts", plan.context, &format!("{prefix}.context")));
+		ir.push_str(&arena_gep(backend, "values", index, &format!("{prefix}.value")));
+		ir.push_str(&arena_gep(backend, "contexts", index, &format!("{prefix}.context")));
 		if reverse {
-			ir.push_str(&ptr_gep(backend, "adjoints", plan.adjoint, &format!("{prefix}.delta")));
+			ir.push_str(&arena_gep(backend, "adjoints", index, &format!("{prefix}.delta")));
 		}
 		let weight_bytes = checked_mul(plan.node.offset, self.precision.model.bytes(), "native parameter offset")?;
 		ir.push_str(&ptr_gep(backend, "weights", weight_bytes, &format!("{prefix}.weights")));
 		let source_adjoint = if reverse && plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source adjoint node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[source], &format!("{prefix}.source.adjoint")));
+			ir.push_str(&arena_gep(backend, "adjoints", source, &format!("{prefix}.source.adjoint")));
 			format!("%{prefix}.source.adjoint")
 		} else {
 			"%input_adjoint".to_owned()
 		};
 		let second_adjoint = if reverse && plan.node.second >= 0 {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second adjoint node is invalid"))?;
-			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[second], &format!("{prefix}.second.adjoint")));
+			ir.push_str(&arena_gep(backend, "adjoints", second, &format!("{prefix}.second.adjoint")));
 			format!("%{prefix}.second.adjoint")
 		} else {
 			source_adjoint.clone()
@@ -3345,14 +3351,16 @@ impl NativeModelIr {
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
-			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows.arg, i64 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer, i32 %length"
 			);
 			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%rows = add i32 0, %rows.arg\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
-			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
-			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
-			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
+			let header = checked_mul(self.plans.len() + 1, 8, "native arena header")?;
+			let input_elements = self.live_elements(self.plans.len(), "clear.input", self.graph.input, &mut body);
+			body.push_str(&format!("%clear.rows = zext i32 %rows to i64\n%clear.input.elements = zext i32 {input_elements} to i64\n%clear.input.count = mul i64 %clear.rows, %clear.input.elements\n%clear.input.bytes = mul i64 %clear.input.count, {}\n%clear.adjoints.end.ptr = getelementptr i64, {pointer} %adjoints, i64 {}\n%clear.adjoints.end = load i64, {pointer} %clear.adjoints.end.ptr, align 8\n", self.precision.model.bytes(), self.plans.len()));
+			body.push_str(&self.emit_clear_bytes(backend, "gradient", &gradient_bytes.to_string(), 0, "gradient", "gradient.entry")?);
+			body.push_str(&self.emit_clear_bytes(backend, "adjoints", "%clear.adjoints.end", header, "adjoints", "clear.gradient.done")?);
+			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", "%clear.input.bytes", 0, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
 			body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i64 %threads, i32 %length)\n"));
 			body.push('\n');
@@ -3374,13 +3382,12 @@ impl NativeModelIr {
 	fn emit_loss_and_seed(
 		&self, backend: Backend, loss: LossFunction, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize,
 	) -> Result<String> {
-		let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
-		let prediction_offset = last.value;
-		let adjoint_offset = last.adjoint;
+		let last = self.plans.len().checked_sub(1).ok_or_else(|| RecipeError::new("native model has no output node"))?;
 		let mut ir = String::new();
 		let output = self.live_elements(self.plans.len(), "loss.output", self.graph.output, &mut ir);
+		ir.push_str(&arena_gep(backend, "values", last, "prediction"));
 		let zero = native_literal(state_precision, state_ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.items.i32 = mul i32 %rows, {output}\n%loss.leader = icmp eq i64 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.items.i32 = mul i32 %rows, {output}\n%loss.leader = icmp eq i64 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
 		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 %loss.items.i32)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
@@ -3415,7 +3422,8 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.wide = phi i64 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.p = trunc i64 %seed.wide to i32\n%seed.more = icmp ult i32 %seed.p, %loss.items.i32\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		ir.push_str(&arena_gep(backend, "adjoints", last, "adjoint"));
+		ir.push_str(&format!("br label %seed.loop\nseed.loop:\n%seed.wide = phi i64 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.p = trunc i64 %seed.wide to i32\n%seed.more = icmp ult i32 %seed.p, %loss.items.i32\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
 		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%loss.items.i32")?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i64 %seed.wide, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
@@ -3455,12 +3463,11 @@ impl NativeModelIr {
 		ir.push_str(&format!("%optimizer.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %optimizer.next.state)\nstore {model_ty} %optimizer.next.weight, {pointer} %optimizer.weight.ptr, align {model_align}\nbr label %optimizer.advance\noptimizer.advance:\n%optimizer.next = add i64 %optimizer.wide, %threads\nbr label %optimizer.loop\noptimizer.done:\n"));
 		Ok(ir)
 	}
-	fn emit_clear_bytes(&self, backend: Backend, base: &str, bytes: usize, label: &str, from: &str) -> Result<String> {
-		let count = i64::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i64")))?;
+	fn emit_clear_bytes(&self, backend: Backend, base: &str, count: &str, start: usize, label: &str, from: &str) -> Result<String> {
 		let pointer = pointer_type(backend);
 		let prefix = format!("clear.{label}");
 		let mut ir = String::new();
-		ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i64 [ %tid, %{from} ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i64 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.ptr = getelementptr i8, {pointer} %{base}, i64 %{prefix}.p\nstore i8 0, {pointer} %{prefix}.ptr, align 1\n%{prefix}.next = add i64 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", base = base, from = from));
+		ir.push_str(&format!("%{prefix}.start = add i64 %tid, {start}\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i64 [ %{prefix}.start, %{from} ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i64 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.ptr = getelementptr i8, {pointer} %{base}, i64 %{prefix}.p\nstore i8 0, {pointer} %{prefix}.ptr, align 1\n%{prefix}.next = add i64 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", base = base, from = from));
 		Ok(ir)
 	}
 }
@@ -3666,12 +3673,8 @@ fn accumulate_owned(target: &str, value: &str, ty: &str, pointer: &str, prefix: 
 const NATIVE_SCALAR_PARTITIONS: usize = 4096;
 
 struct PartitionedLoop<'a> {
-	count: usize,
+	count: &'a str,
 	partitions: usize,
-	/// The live element count when the tape was compiled for a larger capacity.
-	/// The scratch arena and partition count stay capacity-sized, but partition
-	/// boundaries are calculated from this runtime value.
-	active_count: Option<&'a str>,
 	columns: usize,
 	value_type: &'a str,
 	pointer_type: &'a str,
@@ -3683,27 +3686,22 @@ struct PartitionedLoop<'a> {
 /// Walk `count` elements as `partitions` contiguous runs, each summed in
 /// ascending element order into its own scratch row. Partition `t` spans
 /// `[t * q + min(t, r), (t + 1) * q + min(t + 1, r))` for the quotient `q` and
-/// remainder `r` of the element count over the partition count, so both the
-/// boundaries and the number of rows are fixed by the program.
+/// remainder `r` of the element count over the partition count. The partition
+/// count stays fixed while its boundaries follow the runtime count.
 fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	// The body owns the `n{index}.{name}` namespace, so every value this function
 	// introduces sits under a suffix of its own.
 	let prefix = format!("n{index}.{name}.partition");
-	let PartitionedLoop { count, partitions, active_count, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	let PartitionedLoop { count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
 	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
 	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
 	let partitions = narrow(partitions, "native partition count")?;
 	let columns = narrow(columns, "native partition columns")?;
 	let align = alignment(ty);
 	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.t.wide = phi i64 [ %tid, %{prefix}.entry ], [ %{prefix}.advance, %{prefix}.step ]\n%{prefix}.t = trunc i64 %{prefix}.t.wide to i32\n%{prefix}.more = icmp ult i64 %{prefix}.t.wide, {partitions}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
-	let (whole, extra) = if let Some(active_count) = active_count {
-		let whole = format!("%{prefix}.whole");
-		let extra = format!("%{prefix}.extra");
-		ir.push_str(&format!("{whole} = udiv i32 {active_count}, {partitions}\n{extra} = urem i32 {active_count}, {partitions}\n"));
-		(whole, extra)
-	} else {
-		(narrow(count / usize::try_from(partitions).map_err(|_| RecipeError::new("native partition count exceeds usize"))?, "native partition span")?.to_string(), narrow(count % usize::try_from(partitions).map_err(|_| RecipeError::new("native partition count exceeds usize"))?, "native partition remainder")?.to_string())
-	};
+	let whole = format!("%{prefix}.whole");
+	let extra = format!("%{prefix}.extra");
+	ir.push_str(&format!("{whole} = udiv i32 {count}, {partitions}\n{extra} = urem i32 {count}, {partitions}\n"));
 	ir.push_str(&format!("%{prefix}.t.plus = add i32 %{prefix}.t, 1\n%{prefix}.first.short = icmp ult i32 %{prefix}.t, {extra}\n%{prefix}.first.extra = select i1 %{prefix}.first.short, i32 %{prefix}.t, i32 {extra}\n%{prefix}.first.whole = mul i32 %{prefix}.t, {whole}\n%{prefix}.first = add i32 %{prefix}.first.whole, %{prefix}.first.extra\n"));
 	ir.push_str(&format!("%{prefix}.limit.short = icmp ult i32 %{prefix}.t.plus, {extra}\n%{prefix}.limit.extra = select i1 %{prefix}.limit.short, i32 %{prefix}.t.plus, i32 {extra}\n%{prefix}.limit.whole = mul i32 %{prefix}.t.plus, {whole}\n%{prefix}.limit = add i32 %{prefix}.limit.whole, %{prefix}.limit.extra\n"));
 	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
@@ -3737,9 +3735,8 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 }
 
 /// Emit a row/element loop whose upper bound is supplied by the dispatch.
-/// Native tapes are compiled for a capacity, but RAT policies can present a
-/// smaller active sample set on a later launch. The loop body must therefore
-/// compare against the runtime i32 bound instead of a capacity literal.
+/// Allocations may grow or the active sample set may shrink on later launches.
+/// The loop body compares against the runtime bound, not allocation capacity.
 fn emit_dynamic_loop(ir: &mut String, index: usize, name: &str, count: &str, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p.wide = phi i64 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.p = trunc i64 %{prefix}.p.wide to i32\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
@@ -6735,10 +6732,14 @@ pub const tile: Metric = Metric(10);
 pub const Score: Metric = Metric(11);
 /// Selects the raw command score in `.log(score)`.
 pub const score: Metric = Score;
+/// Number of observations fitted in the epoch; RAT reports surrogate fit rows.
+pub const Window: Metric = Metric(12);
+/// Decisions requested in the rollout associated with the printed score.
+pub const Choices: Metric = Metric(13);
 /// All progress fields except the native tile schedule.
-pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, Score];
+pub const all: [Metric; 12] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, Score, Choices, Window];
 /// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 11] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile, Score];
+pub const dev: [Metric; 13] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile, Score, Choices, Window];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -6808,7 +6809,7 @@ impl Recipe {
 		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None, rat_target: None }
 	}
 }
 impl Recipe {
@@ -7208,6 +7209,166 @@ impl RatCommand {
 		Ok(scores)
 	}
 }
+enum RatEvent { Line(String), Error(String), Closed, ErrorsClosed }
+struct RatState { names: Vec<String>, values: Vec<f64>, outputs: Vec<String>, choices: Vec<Vec<f64>> }
+enum RatFrame { State(RatState), Score(f64) }
+struct RatSession {
+	child: std::process::Child,
+	input: Option<std::process::ChildStdin>,
+	events: std::sync::mpsc::Receiver<RatEvent>,
+	path: PathBuf,
+	errors_closed: bool,
+}
+impl Drop for RatSession {
+	fn drop(&mut self) { self.input.take(); self.child.kill().ok(); self.child.wait().ok(); }
+}
+fn rat_number(value: &str) -> Result<f64> {
+	let value = value.parse::<f64>().map_err(|_| RecipeError::new("RAT protocol expected a number"))?;
+	require(value.is_finite(), "RAT protocol number must be finite")?;
+	Ok(value)
+}
+fn rat_names(names: &[String]) -> Result<()> {
+	require(!names.is_empty() && names.iter().collect::<BTreeSet<_>>().len() == names.len(), "RAT protocol names must be nonempty and unique")?;
+	require(names.iter().all(|name| !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'='))), "RAT protocol names contain a separator")
+}
+impl RatSession {
+	fn open(command: &RatCommand) -> Result<Self> {
+		let mut child = Command::new(&command.path).env("RECIPE_RAT_PROTOCOL", "1")
+			.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+			.spawn().map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", command.path.display())))?;
+		let input = child.stdin.take();
+		let output = child.stdout.take().ok_or_else(|| RecipeError::new("RAT evaluator stdout is absent"))?;
+		let mut errors = child.stderr.take().ok_or_else(|| RecipeError::new("RAT evaluator stderr is absent"))?;
+		let (send, events) = std::sync::mpsc::channel();
+		let stderr_send = send.clone();
+		std::thread::spawn(move || {
+			use std::io::BufRead;
+			for line in std::io::BufReader::new(output).lines() {
+				let event = match line { Ok(line) => RatEvent::Line(line), Err(error) => RatEvent::Error(error.to_string()) };
+				if send.send(event).is_err() { return; }
+			}
+			send.send(RatEvent::Closed).ok();
+		});
+		std::thread::spawn(move || {
+			let mut bytes = [0_u8; 4096];
+			loop {
+				match std::io::Read::read(&mut errors, &mut bytes) {
+					Ok(0) => { stderr_send.send(RatEvent::ErrorsClosed).ok(); return; }
+					Ok(n) => { if stderr_send.send(RatEvent::Error(String::from_utf8_lossy(&bytes[..n]).into_owned())).is_err() { return; } }
+					Err(error) => { stderr_send.send(RatEvent::Error(error.to_string())).ok(); return; }
+				}
+			}
+		});
+		Ok(Self { child, input, events, path: command.path.clone(), errors_closed: false })
+	}
+	fn send(&mut self, line: &str) -> Result<()> {
+		let input = self.input.as_mut().ok_or_else(|| RecipeError::new("RAT evaluator input is closed"))?;
+		writeln!(input, "{line}").and_then(|_| input.flush())
+			.map_err(|error| RecipeError::new(format!("{} failed writing request: {error}", self.path.display())))
+	}
+	fn frame(&mut self) -> Result<RatFrame> {
+		let (mut names, mut values, mut outputs, mut choices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+		loop {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted while waiting for RAT evaluator")?;
+			let event = match self.events.recv_timeout(Duration::from_millis(100)) {
+				Ok(event) => event,
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+				Err(_) => return Err(RecipeError::new(format!("{} failed: evaluator streams closed", self.path.display()))),
+			};
+			let line = match event {
+				RatEvent::Line(line) => line,
+				RatEvent::Error(error) => return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display()))),
+				RatEvent::Closed => return Err(RecipeError::new(format!("{} failed: evaluator closed stdout before completing a frame", self.path.display()))),
+				RatEvent::ErrorsClosed => { self.errors_closed = true; continue; }
+			};
+			if let Some(raw_score) = line.strip_prefix("score ") {
+				require(names.is_empty() && outputs.is_empty() && choices.is_empty(), "RAT score cannot accompany an unfinished state frame")?;
+				return Ok(RatFrame::Score(rat_number(raw_score)?));
+			} else if let Some(state) = line.strip_prefix("state ") {
+				require(names.is_empty() && outputs.is_empty(), "RAT state frame is duplicated or out of order")?;
+				for field in state.split(',') {
+					let (name, value) = field.split_once('=').ok_or_else(|| RecipeError::new("RAT state requires name=value fields"))?;
+					names.push(name.to_owned()); values.push(rat_number(value)?);
+				}
+				rat_names(&names)?;
+			} else if let Some(fields) = line.strip_prefix("actions ") {
+				require(!names.is_empty() && outputs.is_empty(), "RAT actions require one preceding state")?;
+				outputs = fields.split(',').map(str::to_owned).collect();
+				rat_names(&outputs)?;
+				require(!outputs.iter().any(|name| names.contains(name)), "RAT state and action names must differ")?;
+			} else if let Some(fields) = line.strip_prefix("choice ") {
+				require(!outputs.is_empty(), "RAT choice has no action schema")?;
+				let choice = fields.split(',').map(rat_number).collect::<Result<Vec<_>>>()?;
+				require(choice.len() == outputs.len(), "RAT choice width differs from action schema")?;
+				choices.push(choice);
+			} else if line == "ready" {
+				require(!names.is_empty() && !outputs.is_empty() && !choices.is_empty(), "RAT state requires values, action names, and at least one valid choice")?;
+				return Ok(RatFrame::State(RatState { names, values, outputs, choices }));
+			} else {
+				return Err(RecipeError::new(format!("{} failed: unknown RAT protocol record {line:?}", self.path.display())));
+			}
+		}
+	}
+	fn finish(&mut self) -> Result<()> {
+		self.send("close")?;
+		self.input.take();
+		let mut output_closed = false;
+		while !output_closed || !self.errors_closed {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted while closing RAT evaluator")?;
+			match self.events.recv_timeout(Duration::from_millis(100)) {
+				Ok(RatEvent::Closed) => output_closed = true,
+				Ok(RatEvent::ErrorsClosed) => self.errors_closed = true,
+				Ok(RatEvent::Error(error)) => return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display()))),
+				Ok(RatEvent::Line(_)) => return Err(RecipeError::new("RAT evaluator wrote an extra record after its last response")),
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+				Err(_) => return Err(RecipeError::new("RAT evaluator streams closed unexpectedly")),
+			}
+		}
+		let status = self.child.wait().map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator: {error}")))?;
+		require(status.success(), format!("{} failed with {status}", self.path.display()))
+	}
+}
+impl RatState {
+	fn select(&self, proposal: &[f64]) -> Result<Vec<f64>> {
+		require(proposal.len() == self.outputs.len() && proposal.iter().all(|value| value.is_finite()), "RAT proposal shape or values are invalid")?;
+		let ranges = (0..proposal.len()).map(|column| {
+			let low = self.choices.iter().map(|row| row[column]).fold(f64::INFINITY, f64::min);
+			let high = self.choices.iter().map(|row| row[column]).fold(f64::NEG_INFINITY, f64::max);
+			(low, high)
+		}).collect::<Vec<_>>();
+		let mut best = None;
+		for choice in &self.choices {
+			let mut distance = 0.0;
+			for (column, (low, high)) in ranges.iter().copied().enumerate() {
+				if low == high { continue; }
+				let scale = low.abs().max(high.abs()).max(1.0);
+				let difference = (proposal[column] / scale - choice[column] / scale) / (high / scale - low / scale);
+				distance += difference * difference;
+			}
+			require(distance.is_finite(), "RAT candidate distance overflow")?;
+			if best.as_ref().is_none_or(|(previous, _)| distance < *previous) { best = Some((distance, choice)); }
+		}
+		Ok(best.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+	}
+}
+struct RatEpisode { observations: Vec<Vec<f64>>, score: f64, action: Vec<f64> }
+fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize) -> Result<RatEpisode> {
+	let mut state = first;
+	let mut observations = Vec::new();
+	loop {
+		require(state.names == names && state.outputs == outputs, "RAT evaluator changed state or action schema")?;
+		tape.samples.write_float_bytes(0, &state.values, tape.precision.model)?;
+		tape.forward(ForwardMode::Inference)?;
+		let proposal = tape.node_values(proposal_node, outputs.len())?;
+		let action = state.select(&proposal)?;
+		observations.push(state.values.iter().chain(&proposal).copied().collect());
+		session.send(&format!("choose {}", outputs.iter().zip(&action).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",")))?;
+		match session.frame()? {
+			RatFrame::State(next) => state = next,
+			RatFrame::Score(raw_score) => return Ok(RatEpisode { observations, score: raw_score, action }),
+		}
+	}
+}
 struct CommandRatComposition {
 	graph: Graph,
 	proposer: Graph,
@@ -7261,7 +7422,6 @@ struct LearnedReplay {
 	width: usize,
 	context_width: usize,
 	gpu: &'static Gpu,
-	range: ScoreRange,
 	selector: Option<LearnedSelector>,
 	selection_score: Option<LearnedSelectionScore>,
 	actor: Option<LearnedActor>,
@@ -7271,15 +7431,18 @@ impl LearnedReplay {
 	fn new(width: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
 		require(width != 0, "learned RAT observation width must be positive")?;
 		require(config.surrogate_width != 0, "learned RAT hidden width must be positive")?;
-		Ok(Self { width, context_width: checked_add(width, 2, "learned RAT context width")?, gpu, range: ScoreRange::default(), selector: None, selection_score: None, actor: None })
+		Ok(Self { width, context_width: checked_add(width, 2, "learned RAT context width")?, gpu, selector: None, selection_score: None, actor: None })
 	}
 
 	fn ensure_actor(&mut self, length: usize, config: Config) -> Result<()> {
-		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		// Keep the variable sequence axis distinct from post-pool scalar shapes,
+		// even when the first active sequence contains only one observation.
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?.max(2);
 		if self.actor.as_ref().is_some_and(|actor| actor.capacity >= length) {
 			return Ok(())
 		}
-		if let Some(mut actor) = self.actor.take() {
+		let mut previous = self.actor.take();
+		if let Some(actor) = previous.as_mut() {
 			actor.tape.capture(&mut actor.graph)?;
 			let selector = self.selector.as_mut().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
 			extract_rat_proposer(&actor.graph, &mut selector.graph, actor.selector_parameters);
@@ -7291,9 +7454,12 @@ impl LearnedReplay {
 		let scorer = self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
 		let selector_node = selector.graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
 		let selector_parameters = selector.graph.parameters.len();
-		let (graph, score_offset) = compose_scored_graph(&selector.graph, &scorer.graph, config)?;
-		let input = vec![0.0; graph.input.elements()];
-		let mut tape = NativeTape::new(&graph, &input, &[1.0], self.gpu, config.precision, Some(mse), None, None)?;
+		let (mut graph, score_offset) = compose_scored_graph(&selector.graph, &scorer.graph, config)?;
+		let mut tape = if let Some(mut previous) = previous {
+			copy_learned_state(&previous.graph, &mut graph)?;
+			previous.tape.reserve_sequence(&graph, length)?;
+			previous.tape
+		} else { NativeTape::new(&graph, &vec![0.0; graph.input.elements()], &[1.0], self.gpu, config.precision, Some(mse), None, None)? };
 		tape.set_length(length)?;
 		self.actor = Some(LearnedActor { graph, tape, selector_node, selector_parameters, score_offset, capacity });
 		Ok(())
@@ -7302,7 +7468,7 @@ impl LearnedReplay {
 	fn ensure_selector(&mut self, length: usize, config: Config) -> Result<()> {
 		let hidden = config.surrogate_width;
 		let precision = config.precision;
-		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?.max(2);
 		if self.selector.as_ref().is_some_and(|model| model.graph.input.channels == self.context_width && model.graph.input.length >= length && model.graph.output == Shape { channels: 1, length: model.graph.input.length } && model.hidden == hidden && model.precision == precision) {
 			return Ok(())
 		}
@@ -7323,7 +7489,7 @@ impl LearnedReplay {
 		let hidden = config.surrogate_width;
 		let precision = config.precision;
 		let channels = checked_add(self.context_width, 1, "learned RAT selection channels")?;
-		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?;
+		let capacity = length.checked_next_power_of_two().ok_or_else(|| RecipeError::new("learned RAT sequence capacity overflows"))?.max(2);
 		if self.selection_score.as_ref().is_some_and(|model| model.graph.input.channels == channels && model.graph.input.length >= length && model.graph.output == Shape { channels: 1, length: 1 } && model.hidden == hidden && model.precision == precision) {
 			return Ok(())
 		}
@@ -7332,23 +7498,26 @@ impl LearnedReplay {
 		let data = learned_sequence_data(shape)?;
 		let model = recipe.model().conv(hidden, 1).tanh().pool(capacity).layer(1);
 		let mut graph = compile_to_shape(&model, &data, &data.targets, 1, self.gpu, config, true, Shape { channels: 1, length: 1 })?;
-		if let Some(mut previous) = previous {
+		let fit = if let Some(mut previous) = previous {
 			previous.fit.capture(&mut previous.graph)?;
 			copy_learned_state(&previous.graph, &mut graph)?;
 			graph.refresh_storage(config)?;
-		}
-		let fit = RatFit::new(&graph, self.gpu, mse, config)?;
+			previous.fit.tape.reserve_sequence(&graph, length)?;
+			previous.fit.graph = graph.clone();
+			previous.fit.width = graph.input.elements();
+			previous.fit
+		} else { RatFit::new(&graph, self.gpu, mse, config)? };
 		self.selection_score = Some(LearnedSelectionScore { graph, fit, hidden, precision });
 		Ok(())
 	}
 
-	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<f64> {
+	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<(f64, usize)> {
 		require(target.width == self.width, format!("learned RAT target width is {}, expected {}", target.width, self.width))?;
 		require(samples.len() == checked_mul(targets.len(), self.width, "learned RAT observations")?, "learned RAT observations have the wrong shape")?;
 		require(targets.iter().all(|value| value.is_finite()), "learned RAT observations contain a nonfinite score")?;
 		if targets.is_empty() {
 			require(samples.is_empty(), "learned RAT empty observations have nonempty samples")?;
-			return Ok(f64::NAN)
+			return Ok((f64::NAN, 0))
 		}
 		let length = targets.len();
 		self.ensure_actor(length, config)?;
@@ -7377,10 +7546,9 @@ impl LearnedReplay {
 		let quality = coefficient(targets, &predictions);
 		require(quality.is_finite(), "learned RAT primary surrogate R2 is not finite")?;
 
-		let normalized_quality = self.range.observe(quality)?;
 		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
 		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
-		scorer.fit.fit_sequence(&score_input, length, normalized_quality, rate, config)?;
+		scorer.fit.fit_sequence(&score_input, length, quality, rate, config)?;
 		let teacher_weights = scorer.fit.weights()?;
 
 		// The scorer is a frozen teacher in this composition. Only selector
@@ -7389,7 +7557,7 @@ impl LearnedReplay {
 		if steps != 0 {
 			rat_backward(selector_tape, score_offset, &teacher_weights, &selector_input, selector_rate, config)?;
 		}
-		Ok(quality)
+		Ok((quality, if steps == 0 { 0 } else { selected.len() }))
 	}
 }
 
@@ -8071,43 +8239,27 @@ pub fn smoothstep(max: f64, min: f64, current: f64) -> f64 {
 	(fraction * fraction * (3.0 - 2.0 * fraction)).clamp(0.0, 1.0)
 }
 
-struct ScoreRange { min: f64, max: f64 }
-impl Default for ScoreRange {
-	fn default() -> Self { Self { min: f64::INFINITY, max: f64::NEG_INFINITY } }
-}
-impl ScoreRange {
-	fn observe(&mut self, value: f64) -> Result<f64> {
-		require(value.is_finite(), "RAT score must be finite")?;
-		self.min = self.min.min(value);
-		self.max = self.max.max(value);
-		Ok(self.value(value))
-	}
-	fn value(&self, value: f64) -> f64 { smoothstep(self.max, self.min, value) }
-}
-
 struct RatReplay {
 	width: usize,
 	capacity: usize,
 	rows: VecDeque<Vec<f64>>,
 	raw: VecDeque<f64>,
-	range: ScoreRange,
-	normalize: bool,
 }
 impl RatReplay {
-	fn new(width: usize, capacity: usize, normalize: bool) -> Result<Self> {
+	fn new(width: usize, capacity: usize) -> Result<Self> {
 		require(width != 0 && capacity != 0, "RAT replay dimensions must be positive")?;
-		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new(), range: ScoreRange::default(), normalize })
+		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new() })
 	}
 	fn observe(&mut self, input: &[f64], value: f64) -> Result<f64> {
 		require(input.len() == self.width && input.iter().all(|entry| entry.is_finite()), "RAT observation has invalid features")?;
-		let normalized = self.range.observe(value)?;
+		require(value.is_finite(), "RAT score must be finite")?;
 		if self.rows.len() == self.capacity { self.rows.pop_front(); self.raw.pop_front(); }
 		self.rows.push_back(input.to_vec());
 		self.raw.push_back(value);
-		Ok(if self.normalize { normalized } else { value })
+		Ok(value)
 	}
 	fn snapshot(&self) -> (Vec<f64>, Vec<f64>) {
-		(self.rows.iter().flatten().copied().collect(), self.raw.iter().map(|value| if self.normalize { self.range.value(*value) } else { *value }).collect())
+		(self.rows.iter().flatten().copied().collect(), self.raw.iter().copied().collect())
 	}
 }
 
@@ -8116,26 +8268,17 @@ fn rat_fit_steps(tape: &mut NativeTape, steps: usize, rate: f64, config: Config)
 	Ok(())
 }
 
-struct RatFit { tape: NativeTape, graph: Graph, width: usize, loss: LossFunction, config: Config }
+struct RatFit { tape: NativeTape, graph: Graph, width: usize }
 impl RatFit {
 	fn new(graph: &Graph, gpu: &'static Gpu, loss: LossFunction, config: Config) -> Result<Self> {
 		require(graph.output.elements() == 1, "RAT scoring model must emit one value")?;
 		let width = graph.input.elements();
 		let tape = NativeTape::new(graph, &vec![0.0; width], &[0.0], gpu, config.precision, Some(loss), None, None)?;
-		Ok(Self { tape, graph: graph.clone(), width, loss, config })
+		Ok(Self { tape, graph: graph.clone(), width })
 	}
 	fn reserve(&mut self, rows: usize) -> Result<()> {
 		require(rows != 0, "RAT active row count must be positive")?;
-		if rows > self.tape.capacity {
-			let capacity = rows.checked_next_power_of_two().ok_or_else(|| RecipeError::new("RAT row capacity overflows"))?;
-			self.tape.capture(&mut self.graph)?;
-			self.graph.refresh_storage(self.config)?;
-			let stats = self.tape.extract_bn_stats()?;
-			let tape = NativeTape::new(&self.graph, &vec![0.0; checked_mul(capacity, self.width, "RAT sample capacity")?], &vec![0.0; capacity], self.tape.program.gpu, self.config.precision, Some(self.loss), None, None)?;
-			tape.upload_weights(&self.graph.parameters)?;
-			tape.inject_bn_stats(&stats)?;
-			self.tape = tape;
-		}
+		self.tape.reserve_rows(&self.graph, rows)?;
 		self.tape.set_rows(rows)
 	}
 	fn fit(&mut self, samples: &[f64], targets: &[f64], indices: &[usize], steps: usize, rate: f64, config: Config) -> Result<Option<f64>> {
@@ -8702,6 +8845,8 @@ impl EpochOperation {
 }
 fn native_context_values(graph: &Graph, layout: &NativeLayout, weights: &Buffer, precision: Compute) -> Result<Vec<u8>> {
 	let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+	let header = arena_header(&layout.contexts, layout.contexts_bytes);
+	contexts[..header.len()].copy_from_slice(&header);
 	let nearest = graph.nodes.iter().map(|node| nearest_layout(node, &graph.programs)).collect::<Result<Vec<_>>>()?;
 	if precision.pack(f64::MAX) == precision.pack(0.0) || nearest.iter().all(Option::is_none) {
 		return Ok(contexts);
@@ -8759,9 +8904,9 @@ impl NativeTape {
 		Ok(Self {
 			program,
 			precision,
-			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
+			values: Buffer::arena(gpu, &layout.values, layout.values_bytes)?,
 			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
-			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
+			adjoints: Buffer::arena(gpu, &layout.adjoints, adjoints_bytes)?,
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
 			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
@@ -8783,6 +8928,52 @@ impl NativeTape {
 			output_length: graph.output.length,
 			dynamic_sequence: graph.dynamic_sequence,
 		})
+	}
+	fn reserve_rows(&mut self, graph: &Graph, rows: usize) -> Result<()> {
+		if rows <= self.capacity { return Ok(()); }
+		let capacity = rows.checked_next_power_of_two().ok_or_else(|| RecipeError::new("native row capacity overflows"))?;
+		self.reserve_buffers(graph, capacity)
+	}
+	fn reserve_sequence(&mut self, graph: &Graph, length: usize) -> Result<()> {
+		require(self.dynamic_sequence && graph.dynamic_sequence && length != 0 && length <= graph.input.length, "native sequence resize requires a dynamic graph")?;
+		let input_channels = self.samples.bytes / self.capacity / self.length_capacity / self.precision.model.bytes();
+		require(graph.input.channels == input_channels && graph.output.channels == self.output / self.output_length, "native sequence resize changed channel widths")?;
+		validate_dynamic_sequence_graph(graph)?;
+		self.reserve_buffers(graph, self.capacity)?;
+		self.length_capacity = graph.input.length;
+		self.output = graph.output.elements();
+		self.output_length = graph.output.length;
+		self.length = length;
+		Ok(())
+	}
+	fn reserve_buffers(&mut self, graph: &Graph, capacity: usize) -> Result<()> {
+		require(graph.parameters.len() == self.parameters && graph.nodes.len() == self.program.artifact.layout.values.len(), "native allocation changed model structure")?;
+		narrow(checked_mul(capacity, graph.input.elements(), "native input capacity")?, "native input capacity")?;
+		for node in &graph.nodes { narrow(checked_mul(capacity, node.output.elements(), "native node capacity")?, "native node capacity")?; }
+		let gpu = self.program.gpu;
+		let element = self.precision.model.bytes();
+		let layout = NativeLayout::for_graph(graph, capacity, self.precision.model)?;
+		let values = Buffer::arena(gpu, &layout.values, layout.values_bytes)?;
+		let contexts = Buffer::arena(gpu, &layout.contexts, layout.contexts_bytes)?;
+		let adjoints = Buffer::arena(gpu, &layout.adjoints, layout.adjoints_bytes)?;
+		let inputs = checked_mul(checked_mul(capacity, graph.input.elements(), "native input allocation")?, element, "native input bytes")?;
+		let targets = checked_mul(checked_mul(capacity, graph.output.elements(), "native target allocation")?, element, "native target bytes")?;
+		let samples = Buffer::allocate(gpu, inputs)?;
+		let input_adjoint = Buffer::allocate(gpu, inputs)?;
+		let targets = Buffer::allocate(gpu, targets)?;
+		samples.write_bytes(0, &self.samples.download::<u8>(self.samples.bytes.min(samples.bytes))?)?;
+		targets.write_bytes(0, &self.targets.download::<u8>(self.targets.bytes.min(targets.bytes))?)?;
+		let old = &self.program.artifact.layout;
+		for index in 0..graph.nodes.len() {
+			let end = old.contexts.get(index + 1).copied().unwrap_or(old.contexts_bytes);
+			let bytes = self.contexts.download_range::<u8>(old.contexts[index], end - old.contexts[index])?;
+			contexts.write_bytes(layout.contexts[index], &bytes)?;
+		}
+		self.values = values; self.contexts = contexts; self.adjoints = adjoints;
+		self.samples = samples; self.input_adjoint = input_adjoint; self.targets = targets;
+		self.program.artifact.layout = layout;
+		self.capacity = capacity;
+		Ok(())
 	}
 	fn set_rows(&mut self, rows: usize) -> Result<()> {
 		require(rows != 0 && rows <= self.capacity, "active rows must fit the native allocation")?;
@@ -9499,7 +9690,7 @@ impl RatModels {
 		let mut fitting_config = config;
 		fitting_config.precision = benchmark.precision;
 		let measurement = RatFit::new(&benchmark.graph, gpu, benchmark.model.loss, fitting_config)?;
-		let observations = RatReplay::new(Query::WIDTH + Knobs::WIDTH, usize::MAX, false)?;
+		let observations = RatReplay::new(Query::WIDTH + Knobs::WIDTH, usize::MAX)?;
 		rat.initial_epochs = rat.initial_epochs.saturating_sub(training.step as usize);
 		Ok(Self { graph, offset, proposer, benchmark, schema, pair_path, persist_pair, inference, training, measurement, observations })
 	}
@@ -10076,7 +10267,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below.
-		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
+		Primitive::Elementwise => checked_mul(NATIVE_SCALAR_PARTITIONS, node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
 		Primitive::Attention => {
 			checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?
@@ -10093,7 +10284,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// are row positions, multiplied by their normalized head count.
 		Primitive::Normalize => {
 			let statistics = checked_mul(4, normalize_groups(node, rows)?, "normalization context")?;
-			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
+			let partials = checked_mul(NATIVE_SCALAR_PARTITIONS, node.parameters, "normalization weight partials")?;
 			checked_add(statistics, partials, "normalization")?
 		}
 		_ => 1,
@@ -10109,6 +10300,14 @@ struct Buffer {
 	bytes: usize,
 }
 impl Buffer {
+	fn allocate(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
+		Ok(Self { runtime, pointer: runtime.allocate(bytes.max(1))?, bytes: bytes.max(1) })
+	}
+	fn arena(runtime: &'static Gpu, offsets: &[usize], bytes: usize) -> Result<Self> {
+		let buffer = Self::upload(runtime, &vec![0_u8; bytes])?;
+		buffer.write_bytes(0, &arena_header(offsets, bytes))?;
+		Ok(buffer)
+	}
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
 		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
@@ -13750,13 +13949,9 @@ fn native_gradient_values(parameters: usize, schedule: &NativeSchedule) -> Resul
 	let mut scratch = 0_usize;
 	for contraction in &schedule.contractions {
 		let Some(contraction) = contraction else { continue };
-		// The allocation covers either scalar or matrix partitioning. A backend
-		// using the larger span leaves the extra rows untouched.
-		let extent = contraction.gradient_shape.k as usize;
-		let splits = extent
-			.div_ceil(schedule.split_span.min(schedule.matrix_split_span) as usize)
-			.min(schedule.k_partitions as usize)
-			.max(1);
+		// Reserve the supported split count independent of the initial row count.
+		// Runtime reductions can then grow without changing this allocation.
+		let splits = schedule.k_partitions as usize;
 		let jobs = checked_mul(
 			native_tiles(contraction.gradient_shape.m as usize, contraction.gradient.m, "native split-K M tiles")?,
 			native_tiles(contraction.gradient_shape.n as usize, contraction.gradient.n, "native split-K N tiles")?,
@@ -15945,6 +16140,7 @@ pub struct Train {
 	seed: Option<usize>,
 	precision: Compute,
 	rat: Option<RatCommand>,
+	rat_target: Option<f64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -16040,8 +16236,8 @@ impl Train {
 	/// The executable writes one finite real score per stdout line, in input order.
 	/// The score count must equal the sample count. Full sends every source row
 	/// in one invocation per epoch; other policies send one row per invocation.
-	/// Recipe applies smoothstep(max, min, current) using live score extrema; higher
-	/// scores are better. The Score log field retains raw scores, averaged for full.
+	/// Scores reach the surrogate unchanged. The proposer minimizes its configured
+	/// loss against Train::target (zero by default). Score logs raw values.
 	/// Any stderr output or unsuccessful exit stops training, even with a score.
 	/// Recipe invokes the path directly without a shell.
 	/// Targets declare unknown output names, without labeled source columns.
@@ -16060,6 +16256,13 @@ impl Train {
 	/// For command RAT, .split() is required only by rolling and never creates a holdout.
 	pub fn rat(mut self, policy: RatPolicy, command: impl AsRef<Path>) -> Self {
 		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")), policy });
+		self
+	}
+	/// Desired raw command score for proposer optimization. Defaults to zero.
+	/// This does not replace the measured scores used to fit the evaluator.
+	pub fn target(mut self, value: f64) -> Self {
+		assert!(value.is_finite(), "RAT target must be finite");
+		self.rat_target = Some(value);
 		self
 	}
 	fn arithmetic(mut self, format: Compute) -> Self {
@@ -16187,7 +16390,7 @@ impl Train {
 		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
-		let objectives = vec![1.0; proposal_rows];
+		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, samples, &objectives, gpu, config.precision, Some(composition.loss), None, None)?;
 		tape.forward(ForwardMode::Inference)?;
 		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
@@ -16196,7 +16399,7 @@ impl Train {
 			require(sample.len() == prepared.features && proposal.len() == proposal_width, "RAT sample or proposal has the wrong shape")?;
 			Ok(sample.iter().chain(proposal).copied().collect())
 		};
-		let mut replay = RatReplay::new(observation_width, capacity, true)?;
+		let mut replay = RatReplay::new(observation_width, capacity)?;
 		let initial_reward = if full_set { f64::NAN } else {
 			let initial_observation = observation(samples, &initial_predictions)?;
 			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
@@ -16236,12 +16439,13 @@ impl Train {
 				for (row, value) in observed.chunks_exact(observation_width).zip(scores) { replay.observe(row, value)?; }
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
-			if let Some(selector) = &mut selector {
-				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?;
+			let fitted_rows = if let Some(selector) = &mut selector {
+				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
 			} else {
 				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
 				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
-			}
+				indices.len()
+			};
 			let evaluator_predictions = fitting.predict(&evaluation_samples)?;
 			let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
 			let evaluator_loss = model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7]);
@@ -16262,7 +16466,7 @@ impl Train {
 			measured_predictions = predictions;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			self.print(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(measured_score))?;
+			self.print(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(measured_score), Some(fitted_rows), Some(proposal_rows))?;
 		}
 		// Full evaluates the proposals that fed each update. The last update
 		// creates a fresh proposal set, so score that saved set once before
@@ -16326,9 +16530,102 @@ impl Train {
 			epoch_seconds,
 		})
 	}
+
+	fn try_run_stateful_rat(&self, model: &Model, data: &Data, command: &RatCommand, started: Instant) -> Result<TrainingReport> {
+		require(data.sources.is_empty() && data.tests.is_empty() && data.target.is_empty() && data.trial.is_none()
+			&& matches!(data.features, FeatureSelection::All) && !data.normalize && !data.broadcast,
+			"stateful RAT takes its state and action schema from the evaluator; data selectors and normalization are unsupported")?;
+		require(self.resume.is_none(), "stateful RAT does not support resume")?;
+		require(self.stop.is_none_or(|value| value == 1.0), "stateful RAT terminates episodes using evaluator scores, not .stop()")?;
+		require(self.epochs != 0, "stateful RAT requires at least one update")?;
+		command.policy.capacity(data, 1)?;
+		let mut session = RatSession::open(command)?;
+		session.send("reset")?;
+		let first = match session.frame()? {
+			RatFrame::State(state) => state,
+			RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT requires an initial decision state")),
+		};
+		let names = first.names.clone();
+		let outputs = first.outputs.clone();
+		let mut prepared = Prepared::matrix(first.values.clone(), vec![0.0; outputs.len()], 1, outputs.len())?;
+		prepared.schema = names.iter().map(|name| ("feature".to_owned(), format!("1 {name}")))
+			.chain(outputs.iter().map(|name| ("target".to_owned(), name.clone()))).collect();
+		let gpu = selected_gpu()?;
+		let mut config = Config::load()?;
+		config.precision = self.precision;
+		if let Some(seed) = self.seed { config.random_seed = seed; }
+		let mut composition = command_rat_graph(model, &prepared, 1, gpu, config)?;
+		let proposer_parameters = composition.proposer.parameters.len();
+		let mut tape = NativeTape::new(&composition.graph, &first.values, &[self.rat_target.unwrap_or(0.0)], gpu, config.precision, Some(composition.loss), None, None)?;
+		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let width = names.len() + outputs.len();
+		let mut replay = RatReplay::new(width, usize::MAX)?;
+		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
+		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+		let initial_predictions = episode.action.clone();
+		let (mut initial_loss, mut final_loss, mut evaluator_r2, mut epoch_seconds) = (f64::NAN, f64::NAN, f64::NAN, 0.0);
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		for iteration in 0..self.epochs {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during stateful RAT training")?;
+			let epoch_started = Instant::now();
+			replay.capacity = command.policy.capacity(data, episode.observations.len())?;
+			if command.policy == RatPolicy::Full { replay.rows.clear(); replay.raw.clear(); }
+			while replay.rows.len() > replay.capacity { replay.rows.pop_front(); replay.raw.pop_front(); }
+			for observation in &episode.observations { replay.observe(observation, episode.score)?; }
+			let (samples, targets) = replay.snapshot();
+			let fitted_rows = if let Some(selector) = &mut selector {
+				selector.ensure_actor(targets.len(), config)?;
+				selector.fit_selected(&mut fitting, &samples, &targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
+			} else {
+				fitting.fit(&samples, &targets, &(0..targets.len()).collect::<Vec<_>>(), 1, config.surrogate_rate, config)?;
+				targets.len()
+			};
+			let predictions = fitting.predict(&samples)?;
+			final_loss = model_loss(&predictions, &targets, composition.loss, config.activation[7]);
+			evaluator_r2 = coefficient(&targets, &predictions);
+			if iteration == 0 { initial_loss = final_loss; }
+			// One proposer update uses a retained decision state. All labels are
+			// the evaluator's terminal score, never a fabricated intermediate score.
+			let row = iteration % targets.len();
+			rat_backward(&mut tape, composition.offset, &fitting.weights()?, &samples[row*width..row*width+names.len()], self.learning_rate, config)?;
+			session.send("reset")?;
+			let first = match session.frame()? {
+				RatFrame::State(state) => state,
+				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
+			};
+			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			let seconds = epoch_started.elapsed().as_secs_f64();
+			epoch_seconds += seconds;
+			self.print(model, composition.loss.name(), run, iteration+1, self.epochs, final_loss, evaluator_r2, seconds, None, false, &tape.schedule(), Some(episode.score), Some(fitted_rows), Some(episode.observations.len()))?;
+		}
+		session.finish()?;
+		let reward = episode.score;
+		let final_observation = episode.observations.last().ok_or_else(|| RecipeError::new("stateful RAT episode has no decisions"))?;
+		let predicted_reward = fitting.predict(final_observation)?[0];
+		tape.capture(&mut composition.graph)?;
+		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
+		if let Some(path) = &self.save {
+			let saved_data = Recipe::prepared_data(Vec::new(), false, None);
+			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, &saved_data, None, config.precision, native_target_label(&gpu.native_target));
+			stored.outputs = outputs;
+			stored.bn_stats = tape.extract_bn_stats()?;
+			let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2*node.output.channels)).sum::<usize>();
+			stored.bn_stats.truncate(proposer_bn);
+			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
+		}
+		Ok(TrainingReport {
+			initial_loss, final_loss, initial_predictions, predictions: episode.action, r2: f64::NAN,
+			evaluator_r2: Some(evaluator_r2), validation_r2: None, predicted_reward: Some(predicted_reward), measured_reward: Some(reward),
+			tile: tape.tile(), schedule: tape.schedule(), run, epoch: self.epochs, seconds: started.elapsed().as_secs_f64(), epoch_seconds,
+		})
+	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
 		require(self.rat.is_some() || model.downstream.is_none(), ".loss(&model) requires .rat(policy, command)")?;
+		require(self.rat.is_some() || self.rat_target.is_none(), "Train::target requires command RAT")?;
+		if let Some(command) = &self.rat {
+			if data.autoregressive && data.sources.is_empty() { return self.try_run_stateful_rat(model, data, command, started); }
+		}
 		let command_data = self.rat.as_ref().map(|_| prepare_command_data(data)).transpose()?;
 		let prepared = match &command_data {
 			Some(prepared) => prepared,
@@ -16452,7 +16749,7 @@ impl Train {
 				}
 			}
 			epoch_seconds += seconds;
-			self.print(model, model.loss.name(), run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule, None)?;
+			self.print(model, model.loss.name(), run, epoch, self.epochs, loss, coefficient(targets, &predictions), seconds, checkpoint, live, &schedule, None, Some(training_rows), None)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
@@ -16548,7 +16845,7 @@ impl Train {
 	}
 	fn print(
 		&self, model: &Model, loss_name: &str, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
-		schedule: &str, measured_score: Option<f64>,
+		schedule: &str, measured_score: Option<f64>, fitted_rows: Option<usize>, decision_count: Option<usize>,
 	) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
@@ -16561,7 +16858,7 @@ impl Train {
 				&self.log_metrics,
 				epochs,
 				schedule,
-				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false, score: measured_score },
+				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false, score: measured_score, window: fitted_rows, choices: decision_count },
 			),
 			live,
 			true,
@@ -16577,7 +16874,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
 			),
 			false,
 			true,
@@ -16613,6 +16910,7 @@ impl Train {
 					Some(value) => format!("score \x1b[38\x3b2\x3b135\x3b90\x3b251m{value:.9}\x1b[0m"),
 					None => continue,
 				},
+				12 | 13 => continue,
 				_ => unreachable!(),
 			};
 			values.push(value);
@@ -16623,6 +16921,12 @@ impl Train {
 				CheckpointStatus::Kept => "kept",
 			}
 			.to_owned())
+		}
+		if metrics.iter().any(|metric| metric.0 == Choices.0) {
+			if let Some(count) = measurement.choices { values.push(format!("choices {count}")); }
+		}
+		if metrics.iter().any(|metric| metric.0 == Window.0) {
+			if let Some(count) = measurement.window { values.push(format!("window {count}")); }
 		}
 		values.join("  ")
 	}
@@ -16648,7 +16952,7 @@ impl Train {
 	}
 	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now();
-		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false, score: None };
+		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false, score: None, window: None, choices: None };
 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live {
@@ -16699,6 +17003,8 @@ impl Train {
 #[derive(Clone, Copy)]
 struct Metrics {
 	score: Option<f64>,
+	window: Option<usize>,
+	choices: Option<usize>,
 	run: u64,
 	epoch: usize,
 	loss: Option<f64>,
@@ -16748,11 +17054,11 @@ impl TrainingReport {
 	pub const fn validation_r2(&self) -> Option<f64> {
 		self.validation_r2
 	}
-	/// Returns the evaluator model's predicted reward for the selected proposal.
+	/// Returns the evaluator's predicted raw command score.
 	pub const fn predicted_reward(&self) -> Option<f64> {
 		self.predicted_reward
 	}
-	/// Returns the live smoothstep reward for the last scored proposal.
+	/// Returns the raw command score for the last scored proposal.
 	pub const fn measured_reward(&self) -> Option<f64> {
 		self.measured_reward
 	}
@@ -16800,8 +17106,9 @@ fn predicted_char(prediction: f64) -> Result<char> {
 	Ok(CHAR_IDS[id])
 }
 fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
-	let mean = targets.iter().sum::<f64>() / targets.len() as f64;
+	let origin = targets.first().copied().unwrap_or(0.0);
+	let mean = targets.iter().map(|target| target - origin).sum::<f64>() / targets.len() as f64;
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
-	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
+	let total = targets.iter().map(|target| ((target - origin) - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
