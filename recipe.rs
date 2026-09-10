@@ -4625,8 +4625,8 @@ mod bundle {
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
-			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
-			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
+			let estimators = model.blocks.iter().map(estimator_count).sum::<usize>();
+			require(self.predictors.len() == estimators * output.elements(), "semantic model fitted estimator programs are incomplete")?;
 			Ok(SemanticGraph {
 				model,
 				precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?,
@@ -7250,8 +7250,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if initialize {
 		initialize_graph(&mut graph, config);
 		if let Some(offset) = output_bias_offset(&graph) {
-			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-			graph.parameters[offset] = mean;
+			for (channel, mean) in target_means(&data.targets, data.target_width, rows).into_iter().enumerate() {
+				graph.parameters[offset + channel] = mean;
+			}
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
@@ -7558,8 +7559,32 @@ fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f6
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((mscale, low, high))
 }
+// An unlabelled target component is absent, not zero, so its output bias is
+// seeded from only the rows that provide that component.
+fn target_means(targets: &[f64], width: usize, rows: usize) -> Vec<f64> {
+	(0..width)
+		.map(|channel| {
+			let values = targets[..rows * width].iter().skip(channel).step_by(width).filter(|value| value.is_finite());
+			let count = values.clone().count();
+			values.sum::<f64>() / count as f64
+		})
+		.collect()
+}
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).filter(|node| node.argument[2] == 0.0).map(|node| node.offset + node.parameters - node.output.channels)
+	// Only walk the single-source activation/normalization chain from the actual
+	// output source. A contraction in an earlier branch is not an output bias.
+	let mut index = usize::try_from(graph.source).ok()?;
+	loop {
+		let node = graph.nodes.get(index)?;
+		if node.op == Primitive::Contraction {
+			return (node.output == graph.output && node.argument[2] == 0.0)
+				.then_some(node.offset + node.parameters - node.output.channels);
+		}
+		if !matches!(node.op, Primitive::Elementwise | Primitive::Normalize) || node.second >= 0 || node.source < 0 {
+			return None;
+		}
+		index = usize::try_from(node.source).ok()?;
+	}
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
@@ -7791,6 +7816,16 @@ fn sequenced_operation(operation: &Operation) -> bool {
 		_ => false,
 	}
 }
+/// Counts estimator blocks at every nesting level. Saved predictor programs are
+/// stored once for each estimator and output target channel, so this count must
+/// follow the same recursive lowering order as residual and mixture branches.
+fn estimator_count(block: &Block) -> usize {
+	match &block.operation {
+		Operation::Estimator(_) => 1,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().map(estimator_count).sum(),
+		_ => 0,
+	}
+}
 fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
@@ -7822,65 +7857,107 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, d
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
-	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
-	let (predictor, surrogate) = if let Some(program) = restored {
-		let blank = Prepared {
-			samples: vec![0.0; input.elements()],
-			targets: vec![0.0],
-			target_width: 1,
-			rows: 1,
-			source_rows: 1,
-			features: input.elements(),
-			schema: DataSchema::default(),
-			sequence: None,
-			target_categorical: false,
-			norm_mean: Vec::new(),
-			norm_scale: Vec::new(),
-			identities: Vec::new(),
-			fitted: Vec::new(),
-		};
-		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
-		surrogate.frozen.fill(1);
-		(program, surrogate)
-	} else {
+	let width = data.target_width;
+	let scalar = Shape { channels: 1, length: 1 };
+	let base = graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count();
+	let restored = (0..width).map(|channel| data.fitted.get(base + channel).cloned()).collect::<Vec<_>>();
+	let inputs = if restored.iter().any(Option::is_none) {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, rows, gpu, config.precision)?;
-		let prepared = Prepared {
-			samples: inputs.clone(),
-			targets: targets[..rows].to_vec(),
-			target_width: 1,
-			rows,
-			source_rows: rows,
-			features: input.elements(),
-			schema: DataSchema::default(),
-			sequence: None,
-			target_categorical: data.target_categorical,
-			norm_mean: Vec::new(),
-			norm_scale: Vec::new(),
-			identities: Vec::new(),
-			fitted: Vec::new(),
-		};
-		let fitted = estimator.fit(&prepared, rows, config)?;
-		// The surrogate exists to carry this block's adjoint into its input, so a prefix
-		// whose parameters are all frozen never reads the weights a fit would produce.
-		let surrogate = if graph.frozen.contains(&0) {
-			let targets = predict_rows(&fitted, &inputs, input.elements())?;
-			fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
-		} else {
-			let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
-			untrained.frozen.fill(1);
-			untrained
-		};
-		(fitted.program, surrogate)
+		graph_inputs(graph, &data.samples, rows, gpu, config.precision)?
+	} else {
+		Vec::new()
 	};
-	reset(graph, source, input);
-	push_predictor(graph, predictor)?;
-	let real = graph.source;
-	reset(graph, source, input);
-	let surrogate = append_graph(graph, surrogate)?;
-	let mut rat = ScalarProgram(Vec::new());
-	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
-	program(graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat).map(drop)
+	let mut accumulated = None;
+	for (channel, fitted) in restored.into_iter().enumerate() {
+		let (predictor, surrogate) = if let Some(program) = fitted {
+			let blank = Prepared {
+				samples: vec![0.0; input.elements()],
+				targets: vec![0.0],
+				target_width: 1,
+				rows: 1,
+				source_rows: 1,
+				features: input.elements(),
+				schema: DataSchema::default(),
+				sequence: None,
+				target_categorical: false,
+				norm_mean: Vec::new(),
+				norm_scale: Vec::new(),
+				identities: Vec::new(),
+				fitted: Vec::new(),
+			};
+			let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
+			surrogate.frozen.fill(1);
+			(program, surrogate)
+		} else {
+			let column_targets = (0..rows).map(|row| targets[row * width + channel]).collect::<Vec<_>>();
+			let prepared = Prepared {
+				samples: inputs.clone(),
+				targets: column_targets,
+				target_width: 1,
+				rows,
+				source_rows: rows,
+				features: input.elements(),
+				schema: DataSchema::default(),
+				sequence: None,
+				target_categorical: data.target_categorical,
+				norm_mean: Vec::new(),
+				norm_scale: Vec::new(),
+				identities: Vec::new(),
+				fitted: Vec::new(),
+			};
+			let fitted = estimator.fit(&prepared, rows, config)?;
+			// A fully frozen prefix cannot use the fitted outputs for a surrogate
+			// update, so retain the existing no-fit path in that case.
+			let surrogate = if graph.frozen.contains(&0) {
+				let targets = predict_rows(&fitted, &inputs, input.elements())?;
+				fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+			} else {
+				let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+				untrained.frozen.fill(1);
+				untrained
+			};
+			(fitted.program, surrogate)
+		};
+		reset(graph, source, input);
+		push_predictor(graph, predictor)?;
+		let real = graph.source;
+		reset(graph, source, input);
+		let surrogate = append_graph(graph, surrogate)?;
+		let mut rat = ScalarProgram(Vec::new());
+		rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
+		let estimate = program(graph, real, surrogate, scalar, &[], rat)?;
+		if width == 1 {
+			return Ok(());
+		}
+		reset(graph, estimate, scalar);
+		place_estimator_channel(graph, channel, width)?;
+		let branch = graph.source;
+		accumulated = Some(match accumulated {
+			Some(previous) => binary(graph, previous, branch, Shape { channels: width, length: 1 }, ScalarOpcode::Add)?,
+			None => branch,
+		});
+	}
+	let accumulated = accumulated.ok_or_else(|| RecipeError::new("estimator has no target"))?;
+	reset(graph, accumulated, Shape { channels: width, length: 1 });
+	Ok(())
+}
+/// Routes one scalar estimator channel into a target-width vector without adding
+/// a bias. The route is frozen, so it cannot become an accidental output bias.
+fn place_estimator_channel(graph: &mut Graph, channel: usize, width: usize) -> Result<()> {
+	require(channel < width, "estimator target channel is out of range")?;
+	require(graph.output.elements() == 1, "estimator output is not scalar")?;
+	let input = graph.output;
+	let matrix = checked_mul(input.channels, width, "estimator channel matrix")?;
+	let output = Shape { channels: width, length: input.length };
+	push_node(graph, Primitive::Contraction, output, matrix, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("estimator channel projection is absent"))?;
+	let (offset, parameters) = (node.offset, node.parameters);
+	graph.parameters[offset..offset + parameters].fill(0.0);
+	for input_channel in 0..input.channels {
+		graph.parameters[offset + channel * input.channels + input_channel] = 1.0;
+	}
+	graph.frozen[offset..offset + parameters].fill(1);
+	Ok(())
 }
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
