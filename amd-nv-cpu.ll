@@ -773,9 +773,6 @@ ret void
 }
 ; The model compiler replaces this with one arm per packed node.
 define internal double @recipe.model.decode(ptr addrspace(1) %matrix, i64 %index, i32 %node) #1 { entry: unreachable }
-; The model compiler identifies packed Q8_0 nodes so contractions consume their
-; block representation directly instead of expanding every weight scalar.
-define internal i1 @recipe.model.q8_0(i32 %node) #1 { entry: unreachable }
 ; One weight of a node-relative span: a dense node loads it, a packed node decodes it.
 define internal double @recipe.model.weight(ptr addrspace(1) %weights, i64 %index, i32 %decode) #1 { entry:
 %packed = icmp ne i32 %decode, 0 br i1 %packed, label %decoded, label %direct
@@ -906,9 +903,6 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 ; A packed node passes a nonzero decoder selector and keeps its weights in the stored
 ; representation, so every weight read decodes one element instead of loading one.
 %weight.packed = icmp ne i32 %decode, 0 %weight.dense = xor i1 %weight.packed, true
-%weight.q8_0.raw = call i1 @recipe.model.q8_0(i32 %decode)
-%weight.project = icmp eq i32 %kernel, 0
-%weight.q8_0 = and i1 %weight.q8_0.raw, %weight.project
 ; The running sums live in the arithmetic type for the whole K extent and are
 ; rounded to the model type once, at the store. Staging the operands in tiles
 ; therefore cannot move a rounding point.
@@ -942,10 +936,7 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %sum.init = phi i32 [ 0, %job.step ], [ %sum.init.next, %sum.init.step ] %sum.init.more = icmp ult i32 %sum.init, RECIPE_REGISTER_COUNT br i1 %sum.init.more, label %sum.init.step, label %sum.init.done
 sum.init.step: %sum.init.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %sum.init store RECIPE_STATE %state.zero, ptr addrspace(5) %sum.init.ptr, align RECIPE_STATE_ALIGN %sum.init.next = add i32 %sum.init, 1 br label %sum.init.loop
 sum.init.done:
-br i1 %weight.q8_0, label %q8_0, label %tile.loop
-q8_0:
-call void @contraction_q8_0_accumulate(ptr addrspace(5) %sums, ptr addrspace(1) %input, ptr addrspace(1) %weights, i1 %lane.active, i32 %lid, i32 %m.lanes, i32 %m.base, i32 %n.base, i32 %m.count, i32 %n.count, i32 %out.begin, i32 %out.span, i32 %in.channels, i32 %in.length, i64 %weight.base)
-br label %store.loop
+br label %tile.loop
 tile.loop:
 %term.base = phi i32 [ 0, %sum.init.done ], [ %term.next, %tile.done ] %term.base.wide = zext i32 %term.base to i64 %k.remaining = sub i32 %terms, %term.base %k.partial = icmp ult i32 %k.remaining, %k.tile %k.count = select i1 %k.partial, i32 %k.remaining, i32 %k.tile
 %a.project = icmp eq i32 %span, 1
@@ -1027,7 +1018,7 @@ br label %accumulate.done
 accumulate.done:
 call void @recipe.local.barrier()
 %term.next = add i32 %term.base, %k.count %term.more = icmp ult i32 %term.next, %terms br i1 %term.more, label %tile.done, label %store.loop tile.done: br label %tile.loop store.loop:
-%store.register = phi i32 [ 0, %accumulate.done ], [ 0, %q8_0 ], [ %store.register.next, %store.next ] %store.more = icmp ult i32 %store.register, RECIPE_REGISTER_COUNT br i1 %store.more, label %store.check, label %job.done
+%store.register = phi i32 [ 0, %accumulate.done ], [ %store.register.next, %store.next ] %store.more = icmp ult i32 %store.register, RECIPE_REGISTER_COUNT br i1 %store.more, label %store.check, label %job.done
 store.check: %store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %store.register, i32 %m.lanes) %store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %store.register, i32 %m.lanes) %store.register.valid = call i1 @contraction_output_register_valid(i32 %store.register)
 %store.output.m.valid = icmp ult i32 %store.output.m.raw, %m.count %store.output.n.valid = icmp ult i32 %store.output.n.raw, %n.count %store.output.valid = and i1 %store.output.m.valid, %store.output.n.valid %store.lane.active = and i1 %method.store, %store.output.valid %store.active = and i1 %store.lane.active, %store.register.valid br i1 %store.active, label %store, label %store.next
 store: %store.channel = add i32 %n.base, %store.output.n.raw %store.m.global = add i32 %m.base, %store.output.m.raw %store.m.global.wide = zext i32 %store.m.global to i64 %store.span.wide = zext i32 %out.span to i64 %store.row.wide = udiv i64 %store.m.global.wide, %store.span.wide %store.position.local.wide = urem i64 %store.m.global.wide, %store.span.wide %store.begin.wide = zext i32 %out.begin to i64 %store.position.wide = add i64 %store.position.local.wide, %store.begin.wide %store.output.row.base = mul i64 %store.row.wide, %out.elements.wide

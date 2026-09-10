@@ -3974,14 +3974,11 @@ impl NativeModelIr {
 	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
-		let (mut arms, mut bodies, mut q8_0_arms) = (String::new(), String::new(), String::new());
+		let (mut arms, mut bodies) = (String::new(), String::new());
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
-			if spec.codec == StorageCodec::Q8_0 && plan.node.op == Primitive::Contraction && plan.node.input.channels % spec.block == 0 {
-				q8_0_arms.push_str(&format!("i32 {}, label %q8_0.yes\n", index + 1));
-			}
 			let (name, block) = match format.native {
 				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
 				_ => (format.name.to_owned(), spec.block),
@@ -3992,9 +3989,7 @@ impl NativeModelIr {
 				"decode.n{index}:\n%decode.n{index}.value = call {ty} @recipe_model_quantized_{name}({pointer} %matrix, i64 0, i64 %index, i64 {columns})\nret {ty} %decode.n{index}.value\n"
 			));
 		}
-		Ok(format!(
-			"define internal {ty} @recipe.model.decode({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\ndefine internal i1 @recipe.model.q8_0(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q8_0.no [\n{q8_0_arms}]\nq8_0.yes:\nret i1 true\nq8_0.no:\nret i1 false\n}}\n"
-		))
+		Ok(format!("define internal {ty} @recipe.model.decode({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"))
 	}
 
 	fn emit_model_load(&self, backend: Backend) -> Result<String> {
@@ -4053,7 +4048,6 @@ impl NativeModelIr {
 			.replace("RECIPE_Q8_0_HEADER", &q8_0_header.to_string())
 			.replace("RECIPE_Q8_0_MAX", &format!("{}.0", q8_0_max));
 		ir = strip_definition(ir, "recipe.model.decode");
-		ir = strip_definition(ir, "recipe.model.q8_0");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let model_load = self.emit_model_load(backend)?;
