@@ -3019,7 +3019,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode} )\n", decode = plan.decode(index), pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i1 {bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode} )\n", decode = plan.decode(index), pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, bias = node.argument[2] == 0.0, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -3401,7 +3401,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -6824,10 +6824,10 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization, epsilon, frozen: false, packed: false })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, epsilon, exclusions, frozen: false, packed: false })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -6909,7 +6909,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.epsilon.to_bits() == b.epsilon.to_bits() && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.epsilon.to_bits() == b.epsilon.to_bits() && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -6939,6 +6939,7 @@ mod bundle {
 		loss: Option<u8>,
 		quantization: Option<u16>,
 		epsilon: Option<f64>,
+		exclusions: u8,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -6971,6 +6972,7 @@ mod bundle {
 				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
 				// A bundle saved before models carried an epsilon was lowered with the Cargo default.
 				parts.epsilon.map_or_else(default_epsilon, Ok)?,
+				parts.exclusions,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -7061,12 +7063,19 @@ mod bundle {
 			match kind {
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(matches!(fields.len(), 2 | 3), "semantic model header has the wrong width")?;
+					require((2..=4).contains(&fields.len()), "semantic model header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
+					let (epsilon, exclusions) = match fields.get(2) {
+						None => (None, 0),
+						Some(field) if field.contains('.') || field.contains('e') || field.contains('E') => (Some(number("semantic model epsilon", field)?), 0),
+						Some(field) => (None, value_at(Some(*field), "semantic model exclusions")?),
+					};
+					let exclusions = fields.get(3).map_or(Ok(exclusions), |field| value_at(Some(*field), "semantic model exclusions"))?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
-						epsilon: fields.get(2).map(|field| number("semantic model epsilon", field)).transpose()?,
+						epsilon,
+						exclusions,
 						..ModelParts::default()
 					});
 				}
@@ -7150,7 +7159,7 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {} {}", semantic.model.loss.0, semantic.model.quantization, semantic.model.epsilon));
+			field(&mut document, "model", &format!("{} {} {} {}", semantic.model.loss.0, semantic.model.quantization, semantic.model.epsilon, semantic.model.exclusions));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -7242,7 +7251,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};epsilon:{};blocks:{};", model.loss.0, model.quantization, model.epsilon.to_bits(), model_text(model).join("/")));
+		feed(&format!("loss:{};quant:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.quantization, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -7874,7 +7883,23 @@ pub struct Model {
 	epsilon: f64,
 	frozen: bool,
 	packed: bool,
+	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
+	exclusions: u8,
 }
+/// A default a model excludes through `.no(option)`. Every future exclusion adds
+/// a marker here rather than a negative boolean on a block constructor.
+pub trait Exclusion {
+	fn mask(self) -> u8;
+}
+pub struct Bias;
+/// The bias of every weighted block: layers, attention projections, convolutions
+/// and recurrent gates.
+pub const bias: Bias = Bias;
+impl Exclusion for Bias {
+	fn mask(self) -> u8 {
+		1
+	}
+	}
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
 impl Model {
@@ -7909,6 +7934,13 @@ impl Model {
 	pub fn packed(&self) -> Self {
 		let mut model = self.clone();
 		model.packed = true;
+		model
+	}
+	/// Excludes a default from this model. The exclusion applies to every weighted
+	/// block and every nested branch beneath it, and travels with the saved model.
+	pub fn no(&self, option: impl Exclusion) -> Self {
+		let mut model = self.clone();
+		model.exclusions |= option.mask();
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
@@ -9698,7 +9730,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0, epsilon: default_epsilon().unwrap_or_else(|error| panic!("{error}")), frozen: false, packed: false }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, epsilon: default_epsilon().unwrap_or_else(|error| panic!("{error}")), frozen: false, packed: false, exclusions: 0 }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -11196,6 +11228,9 @@ struct Graph {
 	/// Bound values by node, written into their spans once every lowering has
 	/// set its own initial parameters.
 	bound_values: Vec<(usize, Vec<f64>)>,
+	/// Whether a weighted block allocates its bias. Set once from the model, so
+	/// every lowering below sees it without threading a flag through each one.
+	bias: bool,
 	/// The model's normalization epsilon, which every lowered normalization reads.
 	epsilon: f64,
 }
@@ -11220,6 +11255,7 @@ impl Graph {
 			block_packed: false,
 			bound: None,
 			bound_values: Vec::new(),
+			bias: true,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -11278,6 +11314,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
+	// Set once. Every lowering below reads it from the graph, so a nested branch
+	// inside a residual, a mixture or a product excludes the bias too.
+	graph.bias = model.exclusions & bias.mask() == 0;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -11728,7 +11767,7 @@ fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 fn lower_contraction(graph: &mut Graph, channels: usize, bias: bool) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
 	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
-	let bias = contraction_bias(graph, matrix, channels, bias)?;
+	let bias = contraction_bias(graph, matrix, channels, bias && graph.bias)?;
 	let parameters = if bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, bias), -2)
@@ -11737,7 +11776,7 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
 	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
-	let bias = contraction_bias(graph, matrix, filters, true)?;
+	let bias = contraction_bias(graph, matrix, filters, graph.bias)?;
 	let parameters = if bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(kernel, bias), -2)
@@ -12163,9 +12202,10 @@ fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: u
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
 	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?, checked_mul(channels, channels, "scan state matrix")?);
-	let stride = checked_add(checked_add(input, state, "scan gate")?, channels, "scan bias")?;
+	let matrices = checked_add(input, state, "scan gate")?;
+	let stride = if graph.bias { checked_add(matrices, channels, "scan bias")? } else { matrices };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
+	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, [gates as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
@@ -12375,7 +12415,8 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[index] = next_weight(&mut state, scale);
 			}
 		}
-		if node.op == Primitive::Contraction && node.argument[2] == 0.0 {
+		let biased = node.argument[2] == 0.0;
+		if node.op == Primitive::Contraction && biased {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
 		// Depthwise taps open at the identity: the current position keeps its value
@@ -12388,7 +12429,7 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[node.offset + channel * kernel + kernel - 1] = 1.0;
 			}
 		}
-		if node.op == Primitive::Scan {
+		if node.op == Primitive::Scan && biased {
 			let channels = node.output.channels;
 			let input_matrix = node.input.channels * channels;
 			let state_matrix = channels * channels;
@@ -16245,7 +16286,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
-	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	let mut intercept = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
 	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
@@ -16253,7 +16294,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
 			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
 			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
-				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let prediction = intercept + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
 				let error = prediction - target;
 				let direction = if error > config.svm_epsilon {
 					1.0
@@ -16277,7 +16318,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		intercept -= config.svm_rate * bias_gradient;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
 			*weight -= config.svm_rate * gradient
 		}
@@ -16291,7 +16332,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	table.extend(inverse);
 	table.extend(weights);
 	let mut program = PredictorBuilder::new();
-	program.constant(bias);
+	program.constant(intercept);
 	program.affine(table);
 	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))

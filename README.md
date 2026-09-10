@@ -183,6 +183,18 @@ over its head-width slice, leaving the values untouched:
 .attn(4).qk(rms)
 ```
 
+## exclusions
+
+```rust
+recipe.model().no(bias).layer(64).relu().layer(1)
+```
+
+`.no(option)` declares a default the model excludes. `.no(bias)` removes the
+bias from every weighted block beneath it — layers, attention projections,
+convolutions and recurrent gates — and from every nested branch. Excluded
+tensors are not allocated, initialized, trained, saved or loaded, and the
+exclusion travels with the saved model.
+
 ## compute precisions
 
 key:<br>

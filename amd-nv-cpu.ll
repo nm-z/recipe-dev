@@ -4177,14 +4177,16 @@ exit:
 ret void
 }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
-ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %time.begin, i32 %time.span, i32 %gates,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+	ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %time.begin, i32 %time.span, i32 %gates,
+	i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %time.limit = add i32 %time.begin, %time.span
 %weight.packed = icmp ne i32 %decode, 0
 %in.channels.wide = zext i32 %in.channels to i64 %out.channels.wide = zext i32 %out.channels to i64 %length.wide = zext i32 %length to i64 %rows.wide = zext i32 %rows to i64 %weight.base.wide = add i64 %weight.base, 0
 %in.elements = mul i32 %in.channels, %length %in.elements.wide = mul i64 %in.channels.wide, %length.wide %out.elements = mul i32 %out.channels, %length %out.elements.wide = mul i64 %out.channels.wide, %length.wide %input.matrix = mul i32 %in.channels, %out.channels %input.matrix.wide = mul i64 %in.channels.wide, %out.channels.wide
 %state.matrix = mul i32 %out.channels, %out.channels %state.matrix.wide = mul i64 %out.channels.wide, %out.channels.wide %matrix.span = add i32 %input.matrix, %state.matrix %matrix.span.wide = add i64 %input.matrix.wide, %state.matrix.wide
-%gate.stride = add i32 %matrix.span, %out.channels %gate.stride.wide = add i64 %matrix.span.wide, %out.channels.wide %gate.batch = mul i32 %rows, %out.elements %gate.batch.wide = mul i64 %rows.wide, %out.elements.wide
+	%bias.span = select i1 %has.bias, i32 %out.channels, i32 0
+	%bias.span.wide = select i1 %has.bias, i64 %out.channels.wide, i64 0
+	%gate.stride = add i32 %matrix.span, %bias.span %gate.stride.wide = add i64 %matrix.span.wide, %bias.span.wide %gate.batch = mul i32 %rows, %out.elements %gate.batch.wide = mul i64 %rows.wide, %out.elements.wide
 br label %precompute.loop precompute.loop:
 %precompute.gate = phi i32 [ 0, %entry ], [ %precompute.next, %precompute.step ]
 %precompute.more = icmp ult i32 %precompute.gate, %gates
@@ -4246,7 +4248,7 @@ state.weight.ready:
 %state.weight = phi double [ %state.weight.loaded, %state.weight.direct ], [ %state.weight.decoded, %state.weight.packed ]
 %state.product = call double @recipe.mul(double %state.value, double %state.weight) %state.sum.next = call double @recipe.add(double %state.sum, double %state.product)
 %state.next = add nuw i32 %state.channel, 1 br label %state.sum.loop gate.activate:
-%bias.base = add i64 %gate.weight.base, %matrix.span.wide %bias.hidden = zext i32 %hidden to i64 %bias.index = add i64 %bias.base, %bias.hidden
+	%bias.base = add i64 %gate.weight.base, %matrix.span.wide %bias.hidden = zext i32 %hidden to i64 %bias.index = add i64 %bias.base, %bias.hidden
 br i1 %weight.packed, label %gate.bias.packed, label %gate.bias.direct
 gate.bias.direct:
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %bias.index
@@ -4257,8 +4259,9 @@ gate.bias.packed:
 %bias.decoded = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %bias.decode.index, i32 %decode)
 br label %gate.bias.ready
 gate.bias.ready:
-%bias = phi double [ %bias.loaded, %gate.bias.direct ], [ %bias.decoded, %gate.bias.packed ]
-%linear = call double @recipe.add(double %state.sum, double %bias)
+	%bias = phi double [ %bias.loaded, %gate.bias.direct ], [ %bias.decoded, %gate.bias.packed ]
+	%bias.value = select i1 %has.bias, double %bias, double 0.0
+	%linear = call double @recipe.add(double %state.sum, double %bias.value)
 %rnn = icmp eq i32 %gates, 1 %last.gate = sub i32 %gates, 1 %candidate = icmp eq i32 %gate, %last.gate
 %use.tanh = or i1 %rnn, %candidate %tanh.value = call double @recipe.tanh(double %linear)
 %sigmoid.value = call double @sigmoid(double %linear)
@@ -4601,15 +4604,17 @@ previous.store.next: %previous.store.register.next = add i32 %previous.store.reg
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
-i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset,
+i32 %length, i32 %out.channels, i32 %gates, i1 %has.bias, i32 %parameters, i32 %offset,
 i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
-%tid = call i32 @llvm.amdgcn.workitem.id.x() %scan.in.channels.wide = zext i32 %in.channels to i64 %scan.length.wide = zext i32 %length to i64 %scan.out.channels.wide = zext i32 %out.channels to i64 %scan.rows.wide = zext i32 %rows to i64 %scan.gates.wide = zext i32 %gates to i64 %scan.parameters.wide = zext i32 %parameters to i64 %in.elements = mul i32 %in.channels, %length %scan.in.elements.wide = mul i64 %scan.in.channels.wide, %scan.length.wide
+	%tid = call i32 @llvm.amdgcn.workitem.id.x() %scan.in.channels.wide = zext i32 %in.channels to i64 %scan.length.wide = zext i32 %length to i64 %scan.out.channels.wide = zext i32 %out.channels to i64 %scan.rows.wide = zext i32 %rows to i64 %scan.gates.wide = zext i32 %gates to i64 %scan.parameters.wide = zext i32 %parameters to i64 %in.elements = mul i32 %in.channels, %length %scan.in.elements.wide = mul i64 %scan.in.channels.wide, %scan.length.wide
 %out.elements = mul i32 %out.channels, %length %scan.out.elements.wide = mul i64 %scan.out.channels.wide, %scan.length.wide %batch = mul i32 %rows, %out.elements %scan.batch.wide = mul i64 %scan.rows.wide, %scan.out.elements.wide
 %gate.stride.0 = mul i32 %in.channels, %out.channels %scan.gate.stride.0.wide = mul i64 %scan.in.channels.wide, %scan.out.channels.wide %state.matrix = mul i32 %out.channels, %out.channels %scan.state.matrix.wide = mul i64 %scan.out.channels.wide, %scan.out.channels.wide
-%gate.stride.1 = add i32 %gate.stride.0, %state.matrix %scan.gate.stride.1.wide = add i64 %scan.gate.stride.0.wide, %scan.state.matrix.wide %gate.stride = add i32 %gate.stride.1, %out.channels %scan.gate.stride.wide = add i64 %scan.gate.stride.1.wide, %scan.out.channels.wide
+%gate.stride.1 = add i32 %gate.stride.0, %state.matrix %scan.gate.stride.1.wide = add i64 %scan.gate.stride.0.wide, %scan.state.matrix.wide
 %delta.base.factor = add i32 %gates, 1 %scan.delta.base.factor.wide = add i64 %scan.gates.wide, 1 %delta.base = mul i32 %delta.base.factor, %batch %scan.delta.base.wide = mul i64 %scan.delta.base.factor.wide, %scan.batch.wide %gate2.batch = mul i32 %batch, 2 %scan.gate2.batch.wide = mul i64 %scan.batch.wide, 2
 %row.gradient.factor = mul i32 %gates, 2 %scan.row.gradient.factor.wide = mul i64 %scan.gates.wide, 2 %row.gradient.factor.1 = add i32 %row.gradient.factor, 1 %scan.row.gradient.factor.1.wide = add i64 %scan.row.gradient.factor.wide, 1
 %row.gradient.base = mul i32 %row.gradient.factor.1, %batch %scan.row.gradient.base.wide = mul i64 %scan.row.gradient.factor.1.wide, %scan.batch.wide %rnn = icmp eq i32 %gates, 1
+	%reverse.bias.span = select i1 %has.bias, i32 %out.channels, i32 0 %reverse.bias.span.wide = select i1 %has.bias, i64 %scan.out.channels.wide, i64 0
+	%gate.stride = add i32 %gate.stride.1, %reverse.bias.span %scan.gate.stride.wide = add i64 %scan.gate.stride.1.wide, %reverse.bias.span.wide
 %gru = icmp eq i32 %gates, 3 %lstm = icmp eq i32 %gates, 4 %simple = or i1 %rnn, %gru
 %supported = or i1 %simple, %lstm br i1 %supported, label %row.loop, label %invalid row.loop:
 %row = phi i32 [ %tid, %entry ], [ %row.next, %row.done ]
