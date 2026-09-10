@@ -7143,13 +7143,19 @@ pub const learned: RatPolicy = RatPolicy::Learned;
 /// The logged score is the mean raw score of the evaluated proposals.
 pub const full: RatPolicy = RatPolicy::Full;
 impl RatPolicy {
-	fn capacity(self, data: &Data, rows: usize) -> Result<usize> {
+	fn validate(self, data: &Data) -> Result<()> {
 		if self == Self::Rolling {
 			require(data.split_supplied, ".rat(rolling, command) requires .split(fraction)")?;
-			require(data.split.is_finite() && data.split > 0.0 && data.split <= 1.0, "RAT window fraction must be greater than zero and at most one")?;
+			require(data.split.is_finite() && data.split > 0.0 && data.split <= 1.0, "RAT window fraction must be greater than zero and at most one")
+		} else {
+			require(!data.split_supplied, ".split() controls only the rolling RAT window")
+		}
+	}
+	fn capacity(self, data: &Data, rows: usize) -> Result<usize> {
+		self.validate(data)?;
+		if self == Self::Rolling {
 			Ok(((rows as f64 * data.split).floor() as usize).max(1))
 		} else {
-			require(!data.split_supplied, ".split() controls only the rolling RAT window")?;
 			Ok(match self { Self::Online => 1, Self::Full => rows, _ => usize::MAX })
 		}
 	}
@@ -16624,6 +16630,7 @@ impl Train {
 		require(self.rat.is_some() || model.downstream.is_none(), ".loss(&model) requires .rat(policy, command)")?;
 		require(self.rat.is_some() || self.rat_target.is_none(), "Train::target requires command RAT")?;
 		if let Some(command) = &self.rat {
+			command.policy.validate(data)?;
 			if data.autoregressive && data.sources.is_empty() { return self.try_run_stateful_rat(model, data, command, started); }
 		}
 		let command_data = self.rat.as_ref().map(|_| prepare_command_data(data)).transpose()?;
