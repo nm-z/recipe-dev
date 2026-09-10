@@ -140,7 +140,9 @@ fn main() {
 		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if device.is_some() { invalid("--device may be specified only once; use a dot-separated device chain") }
+			if device.is_some() {
+				invalid("--device may be specified only once; use a dot-separated device chain")
+			}
 			device = Some(selected);
 			continue;
 		}
@@ -148,7 +150,9 @@ fn main() {
 			invalid(USAGE)
 		}
 		if argument == "run" && source.is_none() {
-			if run_seen { invalid("run may be specified only once") }
+			if run_seen {
+				invalid("run may be specified only once")
+			}
 			run_seen = true;
 			continue;
 		}

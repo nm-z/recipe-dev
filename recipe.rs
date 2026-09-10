@@ -1578,16 +1578,16 @@ impl NativeModelIr {
 		ir.push_str(&format!("{count} = mul i32 %rows, {elements}\n"));
 		Ok(count)
 	}
-	fn storage(&self) -> Vec<u8> {
-		let mut storage = Vec::with_capacity(self.storage_bytes);
-		for plan in &self.plans {
-			if let Some(weight) = &plan.stored {
-				storage.resize(plan.storage_offset, 0);
-				storage.extend_from_slice(&weight.bytes);
-			}
-		}
-		storage
+}
+
+/// Packs the stored weights into the arena the model-load kernel indexes.
+fn graph_storage(graph: &Graph) -> Result<Vec<u8>> {
+	let mut storage = Vec::new();
+	for weight in graph.stored.iter().flatten() {
+		storage.resize(align(storage.len(), alignment("float"))?, 0);
+		storage.extend_from_slice(&weight.bytes);
 	}
+	Ok(storage)
 }
 
 fn validate_dynamic_sequence_graph(graph: &Graph) -> Result<()> {
@@ -2622,6 +2622,30 @@ impl NativeModelIr {
 					);
 					ir.push_str(&call);
 				}
+				(reverse, Primitive::Rope) => {
+					let loop_name = if reverse { "rope.reverse" } else { "rope" };
+					let count = self.live_row_count(index, loop_name, node.output, &mut ir)?;
+					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
+					let ty = self.precision.model_type;
+					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					emit_dynamic_loop(&mut ir, index, loop_name, &count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							pointer = pointer_type(backend),
+							factor = native_literal(self.precision.model, ty, node.argument[5]),
+							mscale = native_literal(self.precision.model, ty, node.argument[4]),
+							context = native_literal(self.precision.model, ty, node.argument[6]),
+							fast = native_literal(self.precision.model, ty, node.argument[7]),
+							slow = native_literal(self.precision.model, ty, node.argument[8]),
+							channels = node.output.channels,
+							length = node.output.length,
+							head_width = node.argument[2],
+							dims = node.argument[0],
+							rotated = node.argument[3]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = if self.dynamic_length { "%length".to_owned() } else { integer_argument(node.argument[0], "pool size")?.to_string() };
 					let count = emit_dynamic_row_count(&mut ir, index, "pool", node.output.elements())?;
@@ -2644,7 +2668,26 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					let blocks = attention_blocks(node);
+					if blocks != 0 {
+						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
+						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
+						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
+						let count = emit_dynamic_row_count(&mut ir, index, "index", blocks)?;
+						emit_dynamic_loop(&mut ir, index, "index", &count, |ir, p| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+						let count = emit_dynamic_row_count(&mut ir, index, "select", node.output.length)?;
+						emit_dynamic_loop(&mut ir, index, "select", &count, |ir, p| {
+							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+					}
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
 					let tiles = self.schedule_words(index, 0, 3)?;
@@ -2776,7 +2819,20 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(barrier(backend));
+					if attention_blocks(node) != 0 {
+						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
+						let count = emit_dynamic_row_count(&mut ir, index, "index.reverse", node.output.length)?;
+						emit_dynamic_loop(&mut ir, index, "index.reverse", &count, |ir, p| {
+							ir.push_str(&format!(
+								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
+							));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule_words(index, 3, 6)?;
@@ -3493,6 +3549,19 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
+/// The selector arguments every attention kernel takes after its tiling.
+fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+	Ok(format!(
+		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		kv = integer_argument(node.argument[1], "attention key-value heads")?,
+		index_heads = integer_argument(node.argument[5], "indexer heads")?,
+		index_width = integer_argument(node.argument[6], "indexer width")?,
+		block = integer_argument(node.argument[3], "indexer block")?,
+		gate = node.argument[2] != 0.0,
+		ty = precision.model_type,
+		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+	))
+}
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
 		"double" => type_literal(ty, value),
@@ -4169,7 +4238,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	if let Some(wave_mode) = wave_mode {
 		ir.insert_str(0, &format!("; recipe wave mode {}\n", wave_mode as u32));
 	}
-	compile_ir_artifact(target, &ir, model.precision, model.layout.clone(), model.storage(), loss.is_some(), rows, loss, wave_mode, deadline)
+	compile_ir_artifact(target, &ir, model.precision, model.layout.clone(), graph_storage(&model.graph)?, loss.is_some(), rows, loss, wave_mode, deadline)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4409,23 +4478,23 @@ mod bundle {
 			Activation::Scale(factor)
 		} else {
 			match value {
-			0 => Ok(Activation::Linear),
-			1 => Ok(Activation::Cos),
-			2 => Ok(Activation::Exp),
-			3 => Ok(Activation::Log),
-			4 => Ok(Activation::Ln),
-			5 => Ok(Activation::Huber),
-			6 => Ok(Activation::Tan),
-			7 => Ok(Activation::Relu),
-			8 => Ok(Activation::Leak),
-			9 => Ok(Activation::Sigmoid),
-			10 => Ok(Activation::Tanh),
-			11 => Ok(Activation::Selu),
-			12 => Ok(Activation::Gelu),
-			13 => Ok(Activation::Silu),
-			14 => Ok(Activation::Elu),
-			15 => Ok(Activation::Prelu),
-			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
+				0 => Ok(Activation::Linear),
+				1 => Ok(Activation::Cos),
+				2 => Ok(Activation::Exp),
+				3 => Ok(Activation::Log),
+				4 => Ok(Activation::Ln),
+				5 => Ok(Activation::Huber),
+				6 => Ok(Activation::Tan),
+				7 => Ok(Activation::Relu),
+				8 => Ok(Activation::Leak),
+				9 => Ok(Activation::Sigmoid),
+				10 => Ok(Activation::Tanh),
+				11 => Ok(Activation::Selu),
+				12 => Ok(Activation::Gelu),
+				13 => Ok(Activation::Silu),
+				14 => Ok(Activation::Elu),
+				15 => Ok(Activation::Prelu),
+				_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
 		require(fields.next().is_none(), "activation has trailing fields")?;
@@ -4437,7 +4506,18 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Attention(attention) => {
+				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let yarn = attention
+					.yarn
+					.map(|(factor, context, fast, slow)| format!(",{},{context},{},{}", f64::from_bits(factor), f64::from_bits(fast), f64::from_bits(slow)))
+					.unwrap_or_default();
+				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+				// A zero width is the explicit absent-width marker. Keeping this field
+				// present lets the following YaRN fields be parsed unambiguously.
+				let width = attention.width.unwrap_or(0);
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout},{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
@@ -4469,7 +4549,49 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
-			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"attn" => {
+				let heads = value_at(fields.next(), "attention heads")?;
+				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
+				let base = value_at::<f64>(fields.next(), "rotary base")?;
+				let index = Indexer {
+					heads: value_at(fields.next(), "indexer heads")?,
+					width: value_at(fields.next(), "indexer width")?,
+					block: value_at(fields.next(), "indexer block")?,
+					keep: value_at(fields.next(), "indexer blocks kept")?,
+				};
+				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
+				// A bundle written before the width could be declared has nine fields
+				// and derives its width, which is what it meant when it was saved.
+				// The layout precedes the optional head width, and a record written
+				// before rotary layouts were stated carries neither.
+				let layout = fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(0);
+				let layout = match layout {
+					0 | 1 => RopeLayout::Neox,
+					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
+				};
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.filter(|width| *width != 0);
+				// The four yarn values follow the head width, all four or none.
+				let yarn = match fields.next() {
+					None => None,
+					Some(factor) => Some((
+						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+						value_at(fields.next(), "yarn original context")?,
+						value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
+						value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
+					)),
+				};
+				require(fields.next().is_none(), "attention record has extra fields")?;
+				Ok(Operation::Attention(AttentionBlock {
+					heads,
+					width,
+					kv,
+					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
+					yarn,
+					index: (index.block != 0).then_some(index),
+					gate,
+				}))
+			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
@@ -4477,7 +4599,10 @@ mod bundle {
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				Ok(Operation::Moe(
+					value_at(Some(top_k), "MoE top-k")?,
+					split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -5189,6 +5314,33 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// How a rotary embedding pairs the channels it rotates. Stated by the model so
+/// the same weights cannot silently run under a different pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+	/// The first half of the rotated channels pairs with the second half.
+	Neox,
+}
+impl RopeLayout {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Neox => 1,
+		}
+	}
+}
+/// The rotary layouts with a declared identity. Any other selector is rejected
+/// rather than guessing a pairing.
+pub trait RopeSelector {
+	fn layout(self) -> RopeLayout;
+}
+pub struct Neox;
+/// The NeoX pairing: channel `i` rotates with channel `i + dimensions / 2`.
+pub const neox: Neox = Neox;
+impl RopeSelector for Neox {
+	fn layout(self) -> RopeLayout {
+		RopeLayout::Neox
+	}
+}
 /// A step of a model, and equally a step of a fragment inside one. `res`,
 /// `moe` and the model builder all take the same thing, because a branch step
 /// is an ordinary step: it carries an operation with its activation, its
@@ -5208,7 +5360,7 @@ pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
 }
 pub fn attn(heads: usize) -> Block {
-	Block::of(Operation::Attention(heads))
+	Block::of(Operation::Attention(AttentionBlock::new(heads)))
 }
 pub fn rnn(width: usize) -> Block {
 	Block::of(Operation::Rnn(width))
@@ -5268,13 +5420,46 @@ impl PartialEq for Estimator {
 	}
 }
 impl Eq for Estimator {}
+/// Indexer that scores every key block and keeps the best `keep` blocks per
+/// query. `heads` query projections and one shared key projection, both
+/// `width` wide, compress `block` keys into one block score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indexer {
+	heads: usize,
+	width: usize,
+	block: usize,
+	keep: usize,
+}
+/// One attention block: query heads, key-value heads, and the rotary, indexer
+/// and output gate selectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionBlock {
+	heads: usize,
+	/// The width of one query, key and value head. `None` derives it from the
+	/// residual width, which is what `attn(heads)` alone has always meant.
+	width: Option<usize>,
+	kv: usize,
+	/// The rotary layout, the rotated channel count, and the base as its bits.
+	rope: Option<(RopeLayout, usize, u64)>,
+	/// YaRN frequency scaling of the rotary above: the context extension factor,
+	/// the original training context, and the fast and slow rotation boundaries,
+	/// the three real values held as their bits.
+	yarn: Option<(u64, usize, u64, u64)>,
+	index: Option<Indexer>,
+	gate: bool,
+}
+impl AttentionBlock {
+	fn new(heads: usize) -> Self {
+		Self { heads, width: None, kv: heads, rope: None, yarn: None, index: None, gate: false }
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Attention(usize),
+	Attention(AttentionBlock),
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
@@ -5550,7 +5735,7 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(heads);
+	fn attn(heads: usize) = Operation::Attention(AttentionBlock::new(heads));
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -5560,6 +5745,59 @@ impl Model {
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		match &mut block.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		model
+	}
+	/// Head width of the preceding `attn` block: the width of one query, key and
+	/// value head. Without it the width is the residual width split evenly over
+	/// the heads, so the residual width must divide by the head count; with it the
+	/// two are independent and the block projects `heads * d` back to the residual
+	/// width on the way out.
+	pub fn width(&self, d: usize) -> Self {
+		self.attention("width", |attention| attention.width = Some(d))
+	}
+	/// Key-value heads of the preceding `attn` block. Each key-value head serves
+	/// `heads / kv` query heads.
+	pub fn kv(&self, heads: usize) -> Self {
+		self.attention("kv", |attention| attention.kv = heads)
+	}
+	/// Rotary position embedding on the preceding `attn` block: the first `dims`
+	/// channels of every query and key head rotate by their position at
+	/// frequencies `base^(-2i/dims)`.
+	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
+	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
+	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	pub fn yarn(&self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
+			assert!(og_ctx != 0, "yarn original context must be positive");
+			assert!(b_fast.is_finite() && b_slow.is_finite() && b_slow > 0.0, "yarn boundaries must be finite and positive, received {b_fast} and {b_slow}");
+			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
+			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
+		})
+	}
+	/// Sparse key selection on the preceding `attn` block. `heads` query
+	/// projections and one key projection, each `width` wide, score every group
+	/// of `block` keys, and each query attends to its best `keep` blocks.
+	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+	}
+	/// Sigmoid gate on the output of the preceding `attn` block, from its own
+	/// projection of the block input.
+	pub fn gate(&self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -6880,7 +7118,7 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Attention(_) => "attn",
+			Self::Attention(..) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
@@ -7121,6 +7359,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Rope = 11,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -7158,6 +7397,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Rope => "Rope",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -7996,7 +8236,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
+		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -8225,31 +8465,106 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, [kernel as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
+/// The integer correction range and attention magnitude used by the reference
+/// YaRN construction. The range is derived from rotations over the original
+/// context, then truncated exactly as the reference implementation does.
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
+	require(fast.is_finite() && slow.is_finite() && slow > 0.0 && fast > slow, "yarn beta values must be finite, positive, and ordered")?;
+	let correction = |value: f64| -> Result<f64> {
+		let denominator = value * std::f64::consts::TAU;
+		let correction = dims as f64 * (context as f64 / denominator).ln() / (2.0 * base.ln());
+		require(correction.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(correction)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f64);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if low == high { high + 0.001 } else { high };
+	let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((mscale, low, high))
+}
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph
-		.nodes
-		.iter()
-		.rev()
-		.find(|node| node.op == Primitive::Contraction)
-		.filter(|node| node.argument[2] == 0.0)
-		.map(|node| node.offset + node.parameters - node.output.channels)
+	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).filter(|node| node.argument[2] == 0.0).map(|node| node.offset + node.parameters - node.output.channels)
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize, qk: Option<BlockNormalization>) -> Result<()> {
-	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
+/// Lowers one attention block into its projection, the optional query and key
+/// normalization and rotary nodes, the attention node and the output
+/// projection. The projection carries the query, key and value planes, then
+/// the indexer planes, then the gate plane.
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
+	let AttentionBlock { heads, width, kv, rope, yarn, index, gate } = attention;
+	require(heads != 0, "attention head partition is invalid")?;
+	// A declared head width stands on its own; a derived one is still the residual
+	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
+	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
+	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let input = graph.output;
-	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
-	let width = input.channels / heads;
+	let width = match width {
+		Some(width) => {
+			require(width != 0, "attention head width must be positive")?;
+			width
+		}
+		None => input.channels / heads,
+	};
+	// The query plane the attention writes. With a derived width this is exactly
+	// `input.channels`, so every expression below is the one this code emitted
+	// before the width could be declared.
+	let inner = checked_mul(heads, width, "attention query plane")?;
+	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let side = match index {
+		Some(index) => {
+			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
+			require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
+			checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?
+		}
+		None => 0,
+	};
+	// Every kernel defines the gate plane as the query plane
+	// (`%gate.plane = select i1 %gate, i32 %from, i32 0`), so it sizes from the
+	// query plane and not from the residual width. With a declared width those
+	// two differ, and using the residual width here would shift %row.stride and
+	// silently corrupt the indexer reads and the gate gradient store.
+	let gated = if gate { inner } else { 0 };
+	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
-		lower_normalize(graph, normalization, width, checked_mul(input.channels, 2, "attention query and key span")?)?;
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
 	}
-	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
+	if let Some((layout, dims, base)) = rope {
+		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
+		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
+		// The kernel currently implements the declared NeoX pairing. Keep the
+		// selector in the model record, but do not silently invent another layout.
+		match layout {
+			RopeLayout::Neox => {}
+		}
+		let (mscale, factor, context, low, high) = match yarn {
+			None => (1.0, 0.0, 0.0, 0.0, 1.0),
+			Some((factor, context, fast, slow)) => {
+				let factor = f64::from_bits(factor);
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
+			}
+		};
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
+	}
+	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
+	// shape, so declaring the width is a matter of pushing the query plane here
+	// rather than the block input. The closing projection maps it back to the
+	// residual width.
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
@@ -8263,6 +8578,11 @@ fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: 
 	let offset = graph.parameters.len() - parameters;
 	graph.parameters[offset..].fill(1.0);
 	Ok(())
+}
+/// Key blocks the indexer scores for a sequence of `length` positions.
+fn attention_blocks(node: &Node) -> usize {
+	let block = node.argument[3] as usize;
+	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -8919,6 +9239,7 @@ struct Tile {
 struct NativeAttentionShape {
 	length: u32,
 	width: u32,
+	matrix: bool,
 }
 #[derive(Clone)]
 struct NativeSchedule {
@@ -9230,6 +9551,37 @@ impl NativeTape {
 			dynamic_sequence: graph.dynamic_sequence,
 		})
 	}
+	/// Forwards the rows from `first` onward through the trained program. Each
+	/// launch carries its own row count, so the last short batch reads only the
+	/// rows it was given and the compiled tile shapes stay as they trained.
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+		let input = graph.input.elements();
+		require(input != 0 && samples.len() % input == 0, format!("evaluation samples must be a multiple of {input} values"))?;
+		let rows = samples.len() / input;
+		require(first <= rows, format!("evaluation start row {first} exceeds {rows} rows"))?;
+		let saved_rows = self.rows;
+		let result = (|| {
+			self.upload_weights(&graph.parameters)?;
+			// Holdout evaluation must use the trained effective weights. The graph's
+			// stored bytes are the last quantized checkpoint and would overwrite those
+			// weights if model-load ran here.
+			let evaluation_sample_count = checked_mul(self.capacity, input, "native evaluation sample allocation")?;
+			let evaluation_samples = Buffer::upload_float(self.program.gpu, &vec![0.0; evaluation_sample_count], self.precision.model)?;
+			let mut predictions = Vec::new();
+			let mut row = first;
+			while row < rows {
+				let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
+				self.rows = narrow(end - row, "native evaluation rows")? as u32;
+				evaluation_samples.write_float_bytes(0, &samples[row * input..end * input], self.precision.model)?;
+				self.forward_with_samples(evaluation_samples.pointer, ForwardMode::Inference)?;
+				predictions.extend_from_slice(&self.predictions()?);
+				row = end;
+			}
+			Ok(predictions)
+		})();
+		self.rows = saved_rows;
+		result
+	}
 	fn reserve_rows(&mut self, graph: &Graph, rows: usize) -> Result<()> {
 		if rows <= self.capacity { return Ok(()); }
 		let capacity = rows.checked_next_power_of_two().ok_or_else(|| RecipeError::new("native row capacity overflows"))?;
@@ -9299,12 +9651,15 @@ impl NativeTape {
 		Ok(())
 	}
 	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
+		self.forward_with_samples(self.samples.pointer, mode)
+	}
+	fn forward_with_samples(&mut self, samples: u64, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.dispatch(NativeEntry::Forward)?.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let mode = mode as i32;
 		let length = narrow(self.length, "native active length")?;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode, length];
+		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode, length];
 		self.program.launch(NativeEntry::Forward, &mut call, None).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -10422,6 +10777,9 @@ impl DeviceTape {
 		}
 		Ok(predictions)
 	}
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+		self.shards[0].evaluate(graph, samples, first)
+	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		if self.shards.len() > 1 {
 			return require(stats.is_empty(), "batch normalization statistics cannot place across devices");
@@ -10575,8 +10933,17 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// minimum allocation below.
 		Primitive::Elementwise => checked_mul(NATIVE_SCALAR_PARTITIONS, node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		// Softmax statistics, then the indexer block representatives, then one
+		// row of block scores and one admission flag per block per query, then
+		// one block score gradient per attention head per query.
 		Primitive::Attention => {
-			checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?
+			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let blocks = attention_blocks(node);
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
+			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
+			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -11651,7 +12018,9 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 			host = hostname.join(".");
 			hostname.clear();
 			name
-		} else { part };
+		} else {
+			part
+		};
 		let numbered_cpu = name.strip_prefix("cpu").is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()));
 		require(!numbered_cpu, format!("invalid device {name:?}; use cpu for the available CPU pool"))?;
 		let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
@@ -14059,7 +14428,8 @@ fn native_attention_shapes(graph: &Graph) -> Result<Vec<Option<NativeAttentionSh
 			let channels = narrow(node.output.channels, "native attention channels")? as u32;
 			let length = narrow(node.output.length, "native attention length")? as u32;
 			require(heads != 0 && channels % heads == 0, "native attention head partition is invalid")?;
-			Ok(Some(NativeAttentionShape { length, width: channels / heads }))
+			let matrix = node.argument[1] == node.argument[0] && node.argument[2] == 0.0 && node.argument[3] == 0.0;
+			Ok(Some(NativeAttentionShape { length, width: channels / heads, matrix }))
 		})
 		.collect()
 }
@@ -14070,7 +14440,7 @@ fn native_matrix_path(matrix_capable: bool, shape: Tile, fragment: u32, attentio
 		&& shape.m >= fragment
 		&& shape.n >= fragment
 		&& shape.k >= fragment
-		&& attention.iter().flatten().all(|attention| attention.width % fragment == 0)
+		&& attention.iter().flatten().all(|attention| attention.matrix && attention.width % fragment == 0)
 }
 fn native_attention_shared_values(extent: Tile, include_matrix: bool) -> Result<u32> {
 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
@@ -14642,7 +15012,7 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			// like "scan-0000" reaches the row as its bytes.
 			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
 			if dropped.len() == table.headers.len() {
-				continue
+				continue;
 			}
 			for column in dropped.into_iter().rev() {
 				table.headers.remove(column);
@@ -17199,11 +17569,8 @@ impl Train {
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-				let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None, None, None)?;
-			validation.inject_bn_stats(&stored.bn_stats)?;
-			validation.forward(ForwardMode::Inference)?;
-			let raw = validation.predictions()?;
+			let validation_targets = &target_values[training_values..];
+			let raw = tape.evaluate(&graph, &prepared.samples, training_rows)?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
 		}
