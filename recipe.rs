@@ -7607,7 +7607,11 @@ fn copy_learned_state(old: &Graph, new: &mut Graph) -> Result<()> {
 }
 
 fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, config: Config) -> Result<(Graph, usize)> {
-	let (features, targets) = (proposer.input, proposer.output);
+	let (features, targets) = if scorer_graph.input.length == 1 {
+		(Shape { channels: proposer.input.elements(), length: 1 }, Shape { channels: proposer.output.elements(), length: 1 })
+	} else {
+		(proposer.input, proposer.output)
+	};
 	require(features.length == targets.length, "RAT feature and proposal lengths differ")?;
 	let wide = Shape { channels: checked_add(features.channels, targets.channels, "RAT composition width")?, length: features.length };
 	require(scorer_graph.input == wide && scorer_graph.output.elements() == 1, "RAT score model has an incompatible shape")?;
