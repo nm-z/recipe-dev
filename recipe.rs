@@ -8770,39 +8770,6 @@ fn recur_activation(activation: Activation) -> Result<usize> {
 		other => Err(RecipeError::new(format!("a recurrent body's activation must be linear, relu, tanh or sigmoid, not {}", other.name()))),
 	}
 }
-/// The stages a recurrent body declares, as a width and the activation that
-/// closes each one. The first stage is the recurrent cell; later stages are
-/// ordinary per-position projections and may have independent widths.
-fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
-	require(!parts.is_empty(), "a recurrence must contain an operation")?;
-	let mut stages: Vec<(usize, usize)> = Vec::new();
-	for block in parts {
-		require(block.normalization.is_none(), "a recurrent body step cannot carry its own normalization yet")?;
-		require(block.qk.is_none(), "a recurrent body step cannot carry a query-key normalization")?;
-		require(block.quantization == 0, "a recurrent body step cannot carry its own quantization yet")?;
-		match block.operation {
-			Operation::Layer(width) => {
-				require(width != 0, "recurrent width must be positive")?;
-				stages.push((width, recur_activation(block.activation)?));
-			}
-			// An activation on its own closes the stage before it.
-			Operation::Identity => {
-				let last = stages.last_mut().ok_or_else(|| RecipeError::new("a recurrent body must open with a layer"))?;
-				require(last.1 == 0, "a recurrent body stage declares one activation")?;
-				last.1 = recur_activation(block.activation)?;
-			}
-			ref other => {
-				return Err(RecipeError::new(format!(
-					"a recurrent body holds layers and activations; {} inside a recurrence needs the body emitter, tracked separately",
-					other.name()
-				)));
-			}
-		}
-	}
-	require(!stages.is_empty(), "a recurrent body must contain a layer")?;
-	require(stages.last().is_some_and(|last| last.0 == stages[0].0), "a recurrent body's final stage must match its recurrent state width")?;
-	Ok(stages)
-}
 /// A recurrence over the sequence. The first stage is the recurrent cell, which
 /// reads the position's input and the previous position's output; every further
 /// stage transforms that state in place before it is carried forward.
