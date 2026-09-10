@@ -29,6 +29,9 @@ contraction-swizzle-m-tiles = 4
 contraction-resident-waves-per-workgroup = 2
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
+# Positions per delta rule chunk. One commits the carried state every step, which
+# is the decode schedule; the value never changes the result.
+delta-chunk = 8
 topology-probe-bytes = 4194304
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
 cpu-worker-threads = 0

@@ -2545,6 +2545,38 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Dconv) => {
+					let count = checked_mul(self.rows, node.output.elements(), "depthwise count")?;
+					emit_fixed_loop(&mut ir, index, "dconv", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							weights = pointers.weights,
+							value = pointers.value,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Delta) => {
+					let shape = delta_shape(node, self.rows)?;
+					emit_fixed_loop(&mut ir, index, "delta", shape.pairs, |ir, p| {
+						ir.push_str(&format!(
+							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							second = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							context = pointers.context,
+							arguments = shape.arguments
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					emit_row_loop(&mut ir, index, "pool", node.output.elements(), |ir, p| {
@@ -2695,6 +2727,65 @@ impl NativeModelIr {
 					if composed_previous {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Dconv) => {
+					let count = checked_mul(self.rows, node.output.elements(), "depthwise reverse count")?;
+					emit_fixed_loop(&mut ir, index, "dconv.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							pointer = pointer_type(backend),
+							weights = pointers.weights,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", node.parameters, |ir, p| {
+						ir.push_str(&format!(
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							delta = pointers.delta,
+							channels = node.output.channels,
+							length = node.output.length,
+							kernel = node.argument[0],
+							offset = node.offset
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Delta) => {
+					let shape = delta_shape(node, self.rows)?;
+					let reverse_pairs = checked_mul(self.rows, shape.key_heads as usize, "delta reverse pairs")?;
+					emit_fixed_loop(&mut ir, index, "delta.reverse", reverse_pairs, |ir, p| {
+						ir.push_str(&format!(
+							"call void @delta_reverse_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i32 {p}, {arguments} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							second = pointers.second,
+							weights = pointers.weights,
+							context = pointers.context,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							gate = pointers.second_adjoint,
+							arguments = shape.arguments
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", node.parameters, |ir, p| {
+						ir.push_str(&format!(
+							"call void @delta_reverse_decay_body( {pointer} {context}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							context = pointers.context,
+							heads = shape.heads,
+							partials = shape.partials,
+							offset = node.offset
+						));
+					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
@@ -3716,6 +3807,48 @@ fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut 
 	Ok(())
 }
 
+/// Emits a grid-stride loop over a count that already includes the launch rows.
+/// Delta and depthwise primitives use this form because their pair and tap counts
+/// are computed from the compiled row count before emission.
+fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+	let prefix = format!("n{index}.{name}");
+	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	body(ir, &format!("%{prefix}.p"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
+
+/// The delta rule arguments both directions share, and the context offset of the
+/// per-pair decay partials that follow every other region.
+struct DeltaShape {
+	pairs: usize,
+	heads: i32,
+	key_heads: i32,
+	partials: i32,
+	arguments: String,
+}
+
+fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
+	let heads = integer_argument(node.argument[0], "delta heads")?;
+	let (keys, values) = (integer_argument(node.argument[1], "delta key width")?, integer_argument(node.argument[2], "delta value width")?);
+	let declared_key_heads = integer_argument(node.argument[4], "delta key heads")?;
+	let key_heads = if declared_key_heads == 0 { heads } else { declared_key_heads };
+	require(key_heads != 0 && heads % key_heads == 0, "delta key head partition is invalid")?;
+	let chunk = integer_argument(node.argument[3], "delta chunk")?;
+	// The state maps a key channel to a value channel, so it is keys by values
+	// and its row stride is the value extent.
+	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(keys as usize, values as usize, "delta state")?);
+	let chunks = node.output.length.div_ceil(chunk as usize);
+	let spans = checked_add(chunks, checked_add(chunk as usize, 2, "delta live states")?, "delta state spans")?;
+	let partials = narrow(
+		checked_mul(pairs, checked_add(checked_mul(spans, state, "delta state span")?, checked_mul(2, values as usize, "delta vectors")?, "delta pair span")?, "delta partials")?,
+		"delta partials",
+	)?;
+	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
+	Ok(DeltaShape { pairs, heads, key_heads, partials, arguments: format!("i32 {key_heads}, i32 {keys}, i32 {heads}, i32 {values}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
+}
+
 static NATIVE_ARTIFACT_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 struct NativeTemporaryFiles {
@@ -4321,6 +4454,13 @@ mod bundle {
 		require(fields.next().is_none(), "activation has trailing fields")?;
 		Ok(activation)
 	}
+	fn delta_gate(value: u8) -> Result<DeltaGate> {
+		match value {
+			0 => Ok(DeltaGate::Sigmoid),
+			1 => Ok(DeltaGate::Silu),
+			_ => Err(RecipeError::new(format!("invalid delta output gate {value}"))),
+		}
+	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
 			Operation::Layer(width) => format!("layer,{width}"),
@@ -4346,6 +4486,23 @@ mod bundle {
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Identity => "identity".to_owned(),
+			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
+			Operation::Delta(heads, state, kernel, key_heads, gate) => {
+				// The extents are written only when they were declared, so a block
+				// that took the square default serializes to the text it always did.
+				// A grouped geometry carries the key-head count before its two widths
+				// and always writes the gate byte, making old two-width records
+				// unambiguous. A non-default gate on the historical geometry appends
+				// only its byte.
+				let extents = match (state, key_heads) {
+					(Some((keys, values)), 0) => format!(",{keys},{values}"),
+					(Some((keys, values)), key_heads) => format!(",{key_heads},{keys},{values},{}", *gate as u8),
+					(None, 0) => String::new(),
+					(None, key_heads) => format!(",{key_heads},0,0,{}", *gate as u8),
+				};
+				let gate = if *key_heads == 0 && *gate != DeltaGate::Sigmoid { format!(",{}", *gate as u8) } else { String::new() };
+				format!("delta,{heads},{kernel}{extents}{gate}")
+			}
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4426,6 +4583,28 @@ mod bundle {
 				))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
+			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
+			"delta" => {
+				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
+				let rest = fields.collect::<Vec<_>>();
+				// A record written before independent key heads had two extent fields.
+				// Three fields are the old geometry plus a gate byte; four are the
+				// grouped geometry `(key heads, key width, value width, gate)`.
+				let (state, key_heads, gate) = match rest.as_slice() {
+					[] => (None, 0, DeltaGate::Sigmoid),
+					[keys, values] => (Some((value_at(Some(keys), "delta key width")?, value_at(Some(values), "delta value width")?)), 0, DeltaGate::Sigmoid),
+					[keys, values, gate] => {
+						(Some((value_at(Some(keys), "delta key width")?, value_at(Some(values), "delta value width")?)), 0, delta_gate(value_at(Some(gate), "delta output gate")?)?)
+					}
+					[key_heads, keys, values, gate] => (
+						Some((value_at(Some(keys), "delta key width")?, value_at(Some(values), "delta value width")?)),
+						value_at(Some(key_heads), "delta key heads")?,
+						delta_gate(value_at(Some(gate), "delta output gate")?)?,
+					),
+					_ => return Err(RecipeError::new("delta operation has the wrong field count")),
+				};
+				Ok(Operation::Delta(heads, state, kernel, key_heads, gate))
+			}
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -4969,6 +5148,26 @@ mod bundle {
 		}
 		Ok(result)
 	}
+	#[cfg(test)]
+	mod delta_serialization_tests {
+		use super::*;
+
+		#[test]
+		fn delta_records_round_trip_old_and_grouped_forms() {
+			let old = Operation::Delta(4, Some((3, 5)), 1, 0, DeltaGate::Sigmoid);
+			let old_text = operation_text(&old);
+			assert_eq!(old_text, "delta,4,1,3,5");
+			assert_eq!(operation(&old_text).unwrap(), old);
+			let grouped_default = Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Sigmoid);
+			let grouped_default_text = operation_text(&grouped_default);
+			assert_eq!(grouped_default_text, "delta,4,1,2,3,5,0");
+			assert_eq!(operation(&grouped_default_text).unwrap(), grouped_default);
+			let grouped = Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Silu);
+			let grouped_text = operation_text(&grouped);
+			assert_eq!(grouped_text, "delta,4,1,2,3,5,1");
+			assert_eq!(operation(&grouped_text).unwrap(), grouped);
+		}
+	}
 }
 #[cfg(unix)]
 use std::os::unix::{
@@ -5237,9 +5436,14 @@ enum Operation {
 	Residual(Vec<Block>),
 	Moe(usize, Vec<Block>),
 	Perceptron(usize),
-	/// Computes nothing. It carries a step that is only an activation or only
-	/// a normalization, so those need no operation of their own.
-	Identity,
+		/// Computes nothing. It carries a step that is only an activation or only
+		/// a normalization, so those need no operation of their own.
+		Identity,
+		Dconv(usize),
+	/// Value heads, optional (key width, value width), kernel, key heads, and
+	/// the output-gate activation. A zero key-head count preserves the
+	/// historical one-to-one geometry.
+		Delta(usize, Option<(usize, usize)>, usize, usize, DeltaGate),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -5289,6 +5493,14 @@ impl Activation {
 		}
 	}
 }
+/// Output gate used by a delta-rule block. The decay and write gates remain
+/// sigmoid gates; this selector controls only the final per-value-channel gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeltaGate {
+	Sigmoid,
+	Silu,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
 	Batch,
@@ -5311,6 +5523,42 @@ impl BlockNormalization {
 }
 /// The normalization selectors with a declared identity: the batch, rms, and l2 markers
 /// and the layer residual constructor. Any other selector is rejected instead of guessing a mode.
+/// The delta-rule geometries: a head count alone derives a square per-head state
+/// from the residual width, and a triple states the head count and the two state
+/// extents. Any other selector is rejected instead of guessing a shape.
+pub trait DeltaSelector {
+	fn geometry(self) -> (usize, Option<(usize, usize)>);
+}
+impl DeltaSelector for usize {
+	fn geometry(self) -> (usize, Option<(usize, usize)>) {
+		(self, None)
+	}
+}
+impl DeltaSelector for (usize, usize, usize) {
+	fn geometry(self) -> (usize, Option<(usize, usize)>) {
+		(self.0, Some((self.1, self.2)))
+	}
+}
+/// A grouped-query delta geometry: `(key heads, key width, value heads, value width)`.
+/// Each key head serves `value heads / key heads` value heads.
+pub trait DeltaGeometrySelector {
+	fn geometry(self) -> (usize, Option<(usize, usize)>, usize);
+}
+impl DeltaGeometrySelector for usize {
+	fn geometry(self) -> (usize, Option<(usize, usize)>, usize) {
+		(self, None, 0)
+	}
+}
+impl DeltaGeometrySelector for (usize, usize, usize) {
+	fn geometry(self) -> (usize, Option<(usize, usize)>, usize) {
+		(self.0, Some((self.1, self.2)), 0)
+	}
+}
+impl DeltaGeometrySelector for (usize, usize, usize, usize) {
+	fn geometry(self) -> (usize, Option<(usize, usize)>, usize) {
+		(self.2, Some((self.1, self.3)), self.0)
+	}
+}
 pub trait NormalizationSelector {
 	fn normalization(self) -> BlockNormalization;
 }
@@ -5496,7 +5744,30 @@ impl Model {
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
-	fn perc(width: usize) = Operation::Perceptron(width); }
+	fn perc(width: usize) = Operation::Perceptron(width);
+	fn dconv(kernel: usize) = Operation::Dconv(kernel); }
+	/// A gated delta rule over a causal depthwise convolution of `kernel`
+	/// positions. `heads` carries the historical square state; `(heads, d_k,
+	/// d_v)` keeps the historical head count with a rectangular state; and
+	/// `(k_heads, d_k, v_heads, d_v)` shares each key head across a group of
+	/// value heads.
+	pub fn delta(&self, geometry: impl DeltaGeometrySelector, kernel: usize) -> Self {
+		let (heads, state, key_heads) = geometry.geometry();
+		self.push(Operation::Delta(heads, state, kernel, key_heads, DeltaGate::Sigmoid))
+	}
+	/// Selects the final per-value-channel output gate of the preceding delta
+	/// block. Sigmoid is the default and preserves existing models.
+	pub fn delta_gate(&self, gate: DeltaGate) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta gate requires a preceding delta block"));
+		match &mut block.operation {
+			Operation::Delta(_, _, _, _, current) => {
+				*current = gate;
+				model
+			}
+			_ => panic!("delta gate requires a preceding delta block"),
+		}
+	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -6874,6 +7145,8 @@ impl Operation {
 			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
+			Self::Dconv(_) => "dconv",
+			Self::Delta(..) => "delta",
 		}
 	}
 }
@@ -7082,6 +7355,8 @@ enum Primitive {
 	Normalize = 8,
 	Predictor = 9,
 	Rope = 11,
+	Dconv = 17,
+	Delta = 18,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -7120,6 +7395,8 @@ impl Node {
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
 			Primitive::Rope => "Rope",
+			Primitive::Dconv => "Dconv",
+			Primitive::Delta => "Delta",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -7219,7 +7496,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
 	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch at any depth.
 	let convolutional = model.blocks.iter().any(|block| sequenced_operation(&block.operation));
-	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	// A leading depthwise convolution or delta block walks the positions itself,
+	// so it takes the sequence axis whether or not anything convolves.
+	let scanning = matches!(model.blocks[0].operation, Operation::Dconv(..) | Operation::Delta(..));
+	let sequential = convolutional || scanning || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
@@ -7325,6 +7605,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
+		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
+		Operation::Delta(heads, state, kernel, key_heads, gate) => lower_delta(graph, *heads, *state, *kernel, *key_heads, *gate, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -7561,10 +7843,69 @@ fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f6
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
 	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).filter(|node| node.argument[2] == 0.0).map(|node| node.offset + node.parameters - node.output.channels)
 }
-fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
+	fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
+}
+/// A causal depthwise convolution keeps the shape: every channel mixes its own
+/// last `kernel` positions with one tap each, left-padded with zeros.
+fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
+	require(kernel != 0, "depthwise convolution kernel must be positive")?;
+	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
+}
+/// A gated delta rule carries one `keys` by `values` state per head. One projection
+/// feeds the causal depthwise convolution over the concatenated query, key and value
+/// stream, a second carries the decay and write gate pre-activations, and the
+/// recurrence reads one value per head. The queries and keys take a per-head unit
+/// length, the output a per-head root mean square and the gate built from a third
+/// projection, and the output projection closes the block.
+///
+/// Without a declared geometry the two extents are both `channels / heads`, which
+/// is the square state this block has always carried, so every expression below is
+/// the one it emitted before the extents could differ.
+fn lower_delta(graph: &mut Graph, heads: usize, state: Option<(usize, usize)>, kernel: usize, declared_key_heads: usize, gate: DeltaGate, config: Config) -> Result<()> {
+	require(heads != 0, "delta head partition is invalid")?;
+	require(state.is_some() || graph.output.channels % heads == 0, "delta head partition is invalid")?;
+	let (source, input) = (graph.source, graph.output);
+	let channels = input.channels;
+	let key_heads = if declared_key_heads == 0 { heads } else { declared_key_heads };
+	require(key_heads != 0 && heads % key_heads == 0, "delta key head partition is invalid")?;
+	let (keys, values) = match state {
+		Some((keys, values)) => {
+			require(keys != 0 && values != 0, "delta state extents must be positive")?;
+			(keys, values)
+		}
+		None => (channels / heads, channels / heads),
+	};
+	let (key_plane, value_plane) = (checked_mul(key_heads, keys, "delta key plane")?, checked_mul(heads, values, "delta value plane")?);
+	let projection = checked_add(checked_mul(2, key_plane, "delta query and key planes")?, value_plane, "delta projection width")?;
+	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
+	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
+	let gates = graph.source;
+	reset(graph, source, input);
+	lower_project(graph, projection)?;
+	lower_dconv(graph, kernel)?;
+	lower_normalize(graph, BlockNormalization::L2, keys, checked_mul(2, key_plane, "delta query and key span")?)?;
+	push_node(
+		graph,
+		Primitive::Delta,
+		Shape { channels: value_plane, length: input.length },
+		heads,
+		[heads as f64, keys as f64, values as f64, chunk as f64, key_heads as f64, 0.0, 0.0, 0.0, 0.0],
+		gates,
+	)?;
+	lower_normalize(graph, BlockNormalization::Rms, values, value_plane)?;
+	let normalized = graph.source;
+	reset(graph, source, input);
+	lower_project(graph, value_plane)?;
+	let selected_activation = match gate {
+		DeltaGate::Sigmoid => Activation::Sigmoid,
+		DeltaGate::Silu => Activation::Silu,
+	};
+	let (gate, shape) = activation(graph, graph.source, graph.output, selected_activation, config)?;
+	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
+	lower_project(graph, channels)
 }
 /// Lowers one attention block into its projection, the optional query and key
 /// normalization and rotary nodes, the attention node and the output
@@ -7576,7 +7917,6 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	// A declared head width stands on its own; a derived one is still the residual
 	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
 	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
-	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let input = graph.output;
 	let width = match width {
 		Some(width) => {
@@ -7786,7 +8126,7 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 /// Whether an operation reads along the sequence, itself or through a branch.
 fn sequenced_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Dconv(..) | Operation::Delta(..) => true,
 		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
 		_ => false,
 	}
@@ -7901,7 +8241,17 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		if node.op == Primitive::Contraction && biased {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
-		if node.op == Primitive::Scan && biased {
+		// Depthwise taps open at the identity: the current position keeps its value
+		// and the earlier taps start at zero, so the stream the convolution mixes
+		// reaches the next node with the magnitude it arrived with.
+		if node.op == Primitive::Dconv {
+			let kernel = node.argument[0] as usize;
+			graph.parameters[node.offset..node.offset + node.parameters].fill(0.0);
+			for channel in 0..node.output.channels {
+				graph.parameters[node.offset + channel * kernel + kernel - 1] = 1.0;
+			}
+		}
+		if node.op == Primitive::Scan {
 			let channels = node.output.channels;
 			let input_matrix = node.input.channels * channels;
 			let state_matrix = channels * channels;
@@ -8886,6 +9236,17 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
+		}
+		// One thread owns one row and head: the chunk entry states, the live state,
+		// the chunk the reverse pass replays, the state adjoint, the readout error
+		// and key weight vectors, and one decay partial.
+		Primitive::Delta => {
+			let heads = node.argument[0] as usize;
+			let (keys, values) = (node.argument[1] as usize, node.argument[2] as usize);
+			let (chunk, state) = ((node.argument[3] as usize).max(1), checked_mul(keys, values, "delta state")?);
+			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
+			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, values, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
+			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
 		// Four statistic planes over the group count the emitted kernel walks:
@@ -14804,4 +15165,35 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+#[cfg(test)]
+mod delta_geometry_tests {
+	use super::*;
+
+	#[test]
+	fn old_and_grouped_geometry_selectors_are_distinct() {
+		assert_eq!(<usize as DeltaGeometrySelector>::geometry(4), (4, None, 0));
+		assert_eq!(<(usize, usize, usize) as DeltaGeometrySelector>::geometry((4, 3, 5)), (4, Some((3, 5)), 0));
+		assert_eq!(<(usize, usize, usize, usize) as DeltaGeometrySelector>::geometry((2, 3, 4, 5)), (4, Some((3, 5)), 2));
+	}
+
+	#[test]
+	fn grouped_delta_preserves_default_gate_and_accepts_silu_gate() {
+		let runtime = Recipe;
+		let default_model = runtime.model().layer(8).delta((2, 3, 4, 5), 1);
+		assert!(matches!(default_model.blocks[1].operation, Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Sigmoid)));
+		let silu_model = default_model.delta_gate(DeltaGate::Silu);
+		assert!(matches!(silu_model.blocks[1].operation, Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Silu)));
+	}
+
+	#[test]
+	fn grouped_delta_lowers_distinct_planes_and_gate() {
+		let mut graph = Graph::new(Shape { channels: 8, length: 4 });
+		lower_delta(&mut graph, 4, Some((3, 5)), 1, 2, DeltaGate::Silu, Config::load().unwrap()).unwrap();
+		let node = graph.nodes.iter().find(|node| node.op == Primitive::Delta).unwrap();
+		assert_eq!(node.output.channels, 20);
+		assert_eq!(node.argument[0..5], [4.0, 3.0, 5.0, 8.0, 2.0]);
+		assert_eq!(graph.output.channels, 8);
+	}
 }
