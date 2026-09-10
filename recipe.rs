@@ -11389,8 +11389,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
-	let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-	if tables.len() > 1 && tables.iter().any(|table| table.rows.len() != rows) {
+	if tables.len() > 1 {
 		tables = align_samples(tables)?
 	}
 	Ok((tables, paths))
