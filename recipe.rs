@@ -2604,8 +2604,9 @@ impl NativeModelIr {
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let tiles = self.schedule_words(index, 0, 3)?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n",
 						pointer = pointer_type(backend),
+						has_bias = node.argument[2] == 0.0,
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
@@ -2647,7 +2648,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let tiles = self.schedule_words(index, 0, 3)?;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i64 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
 				}
 				(false, Primitive::Elementwise) => {
 					let count = self.live_row_count(index, "scalar", node.output, &mut ir)?;
@@ -2750,7 +2751,7 @@ impl NativeModelIr {
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					let tiles = self.schedule_words(index, 3, 6)?;
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = input_length, out_channels = node.output.channels, out_length = output_length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = input_length, out_channels = node.output.channels, out_length = output_length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					if composed_previous {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = output_length, in_channels = node.input.channels, in_length = input_length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					}
@@ -2779,7 +2780,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule_words(index, 3, 6)?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i64 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 				}
 				(true, Primitive::Predictor) => {}
 				(true, Primitive::Elementwise) => {
@@ -4378,7 +4379,7 @@ mod bundle {
 			return match fields.next().unwrap_or("") {
 				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
 				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
 				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
 			};
 		}
@@ -4390,8 +4391,24 @@ mod bundle {
 	{
 		value.ok_or_else(|| RecipeError::new(format!("{role} is absent")))?.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
 	}
-	fn activation(value: u8) -> Result<Activation> {
-		match value {
+	/// The saved form of an activation: its code, and for a parameterized one the
+	/// values after it. Every other field of the block record is one token, so the
+	/// values ride inside this one rather than widening the record.
+	fn activation_text(activation: Activation) -> String {
+		match activation {
+			Activation::Scale(factor) => format!("{},{factor}", activation.code()),
+			_ => activation.code().to_string(),
+		}
+	}
+	fn activation(text: &str) -> Result<Activation> {
+		let mut fields = text.split(',');
+		let value: u8 = value_at(fields.next(), "activation code")?;
+		let activation = if value == 16 {
+			let factor = value_at::<u64>(fields.next(), "scale factor")?;
+			require(f64::from_bits(factor).is_finite(), "scale factor must be finite")?;
+			Activation::Scale(factor)
+		} else {
+			match value {
 			0 => Ok(Activation::Linear),
 			1 => Ok(Activation::Cos),
 			2 => Ok(Activation::Exp),
@@ -4409,7 +4426,10 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
-		}
+			}?
+		};
+		require(fields.next().is_none(), "activation has trailing fields")?;
+		Ok(activation)
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
@@ -4480,7 +4500,7 @@ mod bundle {
 		format!(
 			"{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
-			block.activation as u8,
+			activation_text(block.activation),
 			normalization_text(block.normalization),
 			block.quantization,
 			u8::from(block.profile),
@@ -4492,7 +4512,7 @@ mod bundle {
 		require(matches!(fields.len(), 5 | 6), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
-			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			activation: activation(&fields[1])?,
 			normalization: normalization(Some(&fields[2]), "block normalization")?,
 			qk: if fields.len() == 6 { normalization(Some(&fields[5]), "block query and key normalization")? } else { None },
 			quantization: value_at(Some(&fields[3]), "block quantization")?,
@@ -4502,10 +4522,10 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization, downstream: None })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, downstream: None, exclusions })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4586,7 +4606,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -4615,6 +4635,7 @@ mod bundle {
 	struct ModelParts {
 		loss: Option<u8>,
 		quantization: Option<u16>,
+		exclusions: u8,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -4645,6 +4666,7 @@ mod bundle {
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
 				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				parts.exclusions,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -4727,11 +4749,12 @@ mod bundle {
 			match kind {
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(fields.len() == 2, "semantic model header has the wrong width")?;
+					require(matches!(fields.len(), 2 | 3), "semantic model header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						exclusions: fields.get(2).map(|value| value_at(Some(*value), "semantic model exclusions")).transpose()?.unwrap_or(0),
 						..ModelParts::default()
 					});
 				}
@@ -4815,7 +4838,8 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {}", semantic.model.loss.0, semantic.model.quantization));
+			let exclusions = if semantic.model.exclusions == 0 { String::new() } else { format!(" {}", semantic.model.exclusions) };
+			field(&mut document, "model", &format!("{} {}{exclusions}", semantic.model.loss.0, semantic.model.quantization));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -4907,7 +4931,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};blocks:{};", model.loss.0, model.quantization, model_text(model).join("/")));
+		feed(&format!("loss:{};quant:{};no:{};blocks:{};", model.loss.0, model.quantization, model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -5145,7 +5169,6 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
-	broadcast: bool,
 	normalize: bool,
 	split: f64,
 	split_supplied: bool,
@@ -5281,6 +5304,34 @@ pub enum Activation {
 	Silu,
 	Elu,
 	Prelu,
+	/// Multiplies every value by one constant, held as its bit pattern so the
+	/// activation stays comparable. Owns no weights and preserves shape.
+	Scale(u64),
+}
+impl Activation {
+	/// The saved code of the activation. A parameterized activation writes its
+	/// values after the code, so this is not a cast.
+	const fn code(self) -> u8 {
+		match self {
+			Self::Linear => 0,
+			Self::Cos => 1,
+			Self::Exp => 2,
+			Self::Log => 3,
+			Self::Ln => 4,
+			Self::Huber => 5,
+			Self::Tan => 6,
+			Self::Relu => 7,
+			Self::Leak => 8,
+			Self::Sigmoid => 9,
+			Self::Tanh => 10,
+			Self::Selu => 11,
+			Self::Gelu => 12,
+			Self::Silu => 13,
+			Self::Elu => 14,
+			Self::Prelu => 15,
+			Self::Scale(_) => 16,
+		}
+	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -5397,6 +5448,10 @@ impl Block {
 		let q = |variant| self.clone().quantize(0, bits, variant);
 		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
+	pub fn scale(self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.act(Activation::Scale(factor.to_bits()))
+	}
 }
 pub struct BlockQi {
 	pub q0: Block,
@@ -5422,6 +5477,7 @@ pub struct Model {
 	loss: LossFunction,
 	quantization: u16,
 	downstream: Option<Box<Model>>,
+	exclusions: u8,
 }
 pub enum ModelLoss<'a> {
 	Function(LossFunction),
@@ -5437,6 +5493,20 @@ impl<'a> From<&'a Model> for ModelLoss<'a> {
 		Self::Model(model)
 	}
 }
+/// A default a model excludes through `.no(option)`. Every future exclusion adds
+/// a marker here rather than a negative boolean on a block constructor.
+pub trait Exclusion {
+	fn mask(self) -> u8;
+}
+pub struct Bias;
+/// The bias of every weighted block: layers, attention projections, convolutions
+/// and recurrent gates.
+pub const bias: Bias = Bias;
+impl Exclusion for Bias {
+	fn mask(self) -> u8 {
+		1
+	}
+}
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
 impl Model {
@@ -5450,6 +5520,13 @@ impl Model {
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
 		});
+		model
+	}
+	/// Excludes a default from this model. The exclusion applies to every weighted
+	/// block and every nested branch beneath it, and travels with the saved model.
+	pub fn no(&self, option: impl Exclusion) -> Self {
+		let mut model = self.clone();
+		model.exclusions |= option.mask();
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
@@ -6833,6 +6910,7 @@ impl Activation {
 			Self::Silu => "silu",
 			Self::Elu => "elu",
 			Self::Prelu => "prelu",
+			Self::Scale(_) => "scale",
 		}
 	}
 }
@@ -6864,6 +6942,14 @@ fn gelu = Gelu;
 fn silu = Silu;
 fn elu = Elu;
 fn prelu = Prelu; }
+impl Model {
+	/// Multiplies every value the preceding block produces by `factor`. Owns no
+	/// weights, preserves shape, and stores the factor with the model.
+	pub fn scale(&self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.activate(Activation::Scale(factor.to_bits()))
+	}
+}
 pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
@@ -6964,7 +7050,7 @@ impl LossFunction {
 }
 impl Recipe {
 	fn prepared_data(sources: Vec<String>, autoregressive: bool, trial: Option<Trial>) -> Data {
-		Data { sources, tests: Vec::new(), autoregressive, target: Vec::new(), features: FeatureSelection::All, broadcast: false, normalize: false, split: 1.0, split_supplied: false, trial, prepared: OnceLock::new() }
+		Data { sources, tests: Vec::new(), autoregressive, target: Vec::new(), features: FeatureSelection::All, normalize: false, split: 1.0, split_supplied: false, trial, prepared: OnceLock::new() }
 	}
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
 		match sources.into_source() {
@@ -6973,7 +7059,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None, exclusions: 0 }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None, rat_target: None }
@@ -7117,6 +7203,9 @@ struct Graph {
 	block_index: usize,
 	block_kind: &'static str,
 	dynamic_sequence: bool,
+	/// Whether a weighted block allocates its bias. Set once from the model, so
+	/// every lowering below sees it without threading a flag through each one.
+	bias: bool,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -7133,6 +7222,7 @@ impl Graph {
 			block_index: 0,
 			block_kind: "",
 			dynamic_sequence: false,
+			bias: true,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -7181,6 +7271,9 @@ fn compile_to_shape(model: &Model, data: &Prepared, targets: &[f64], rows: usize
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	graph.dynamic_sequence = data.dynamic_sequence;
+	// Set once. Every lowering below reads it from the graph, so a nested branch
+	// inside a residual, a mixture or a product excludes the bias too.
+	graph.bias = model.exclusions & bias.mask() == 0;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -8105,6 +8198,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
+		Activation::Scale(factor) => {
+			let factor = f64::from_bits(factor);
+			require(factor.is_finite(), "scale factor must be finite")?;
+			let factor = constant(&mut program, factor);
+			program.op(ScalarOpcode::Multiply, factor, x)
+		}
 		Activation::Linear => unreachable!(),
 	};
 	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
@@ -8113,18 +8212,27 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 }
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let (parameters, output) = (checked_add(checked_mul(graph.output.channels, channels, "projection matrix")?, channels, "projection bias")?, Shape { channels, length: graph.output.length });
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2)
+	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
+	let output = Shape { channels, length: graph.output.length };
+	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
-	let parameters = checked_add(checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?, filters, "conv bias")?;
+	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, [kernel as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels)
+	graph
+		.nodes
+		.iter()
+		.rev()
+		.find(|node| node.op == Primitive::Contraction)
+		.filter(|node| node.argument[2] == 0.0)
+		.map(|node| node.offset + node.parameters - node.output.channels)
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
@@ -8278,9 +8386,10 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
 	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?, checked_mul(channels, channels, "scan state matrix")?);
-	let stride = checked_add(checked_add(input, state, "scan gate")?, channels, "scan bias")?;
+	let matrices = checked_add(input, state, "scan gate")?;
+	let stride = if graph.bias { checked_add(matrices, channels, "scan bias")? } else { matrices };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
+	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, [gates as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 /// Whether an operation reads along the sequence, itself or through a branch.
 fn sequenced_operation(operation: &Operation) -> bool {
@@ -8383,10 +8492,11 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[index] = ((state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale;
 			}
 		}
-		if node.op == Primitive::Contraction {
+		let biased = node.argument[2] == 0.0;
+		if node.op == Primitive::Contraction && biased {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
-		if node.op == Primitive::Scan {
+		if node.op == Primitive::Scan && biased {
 			let channels = node.output.channels;
 			let input_matrix = node.input.channels * channels;
 			let state_matrix = channels * channels;
@@ -13334,7 +13444,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
-	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	let mut intercept = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
 	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
@@ -13342,7 +13452,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
 			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
 			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
-				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let prediction = intercept + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
 				let error = prediction - target;
 				let direction = if error > config.svm_epsilon {
 					1.0
@@ -13366,7 +13476,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		intercept -= config.svm_rate * bias_gradient;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
 			*weight -= config.svm_rate * gradient
 		}
@@ -13380,7 +13490,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	table.extend(inverse);
 	table.extend(weights);
 	let mut program = PredictorBuilder::new();
-	program.constant(bias);
+	program.constant(intercept);
 	program.affine(table);
 	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
@@ -14298,10 +14408,6 @@ impl Data {
 		self.sources.push(source.into());
 		self
 	}
-	pub const fn broadcast(mut self) -> Self {
-		self.broadcast = true;
-		self
-	}
 	pub const fn norm(mut self, _: ZScore) -> Self {
 		self.normalize = true;
 		self
@@ -14382,7 +14488,6 @@ fn prepare_command_data(data: &Data) -> Result<Prepared> {
 	let mut observations = Recipe::prepared_data(data.sources.clone(), false, None);
 	observations.tests.clone_from(&data.tests);
 	observations.features.clone_from(&data.features);
-	observations.broadcast = data.broadcast;
 	observations.normalize = data.normalize;
 	observations.split = 1.0;
 	let mut prepared = prepare_data(&observations)?;
@@ -14399,7 +14504,6 @@ fn prepare_trial(data: &Data, trial: &Trial) -> Result<Prepared> {
 	require(data.tests.is_empty(), "a trial generator supplies its own workloads and cannot select a held-out file")?;
 	require(data.target.is_empty(), "a trial generator's values are the workload, so .target() has no column to name")?;
 	require(matches!(data.features, FeatureSelection::All), "a trial generator supplies its workload without feature selectors")?;
-	require(!data.broadcast, "a trial generator draws one row, so .broadcast() has no tables to align")?;
 	// One row's variance is zero, so normalizing would divide the workload out
 	// to exactly zero instead of scaling it.
 	require(!data.normalize, "a trial generator's workload must reach the benchmark unscaled, so .norm() is unsupported")?;
@@ -14453,20 +14557,126 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
 	if tables.len() > 1 {
-		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
-		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
-		if data.broadcast {
-			for table in &mut tables {
-				let count = table.rows.len();
-				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-				if count != rows {
-					table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
+		tables = align_samples(tables)?
+	}
+	Ok((tables, paths))
+}
+/// Align feature sources by logical sample count. A lone table's rows are its
+/// samples. Sibling tables that share a schema are whole-table samples, one per
+/// file, only when another table records exactly their file names in one of its
+/// columns: that column is what identifies them as one source, and what orders
+/// them against the rows naming them. Sharing a schema is not itself an
+/// association, so an unrecorded group is read as row-level partitions of one
+/// source and its rows join instead. No order is ever taken from the path.
+fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
+	let mut sources = Vec::<Vec<Table>>::new();
+	for table in tables {
+		match sources.iter_mut().find(|source| source[0].headers == table.headers) {
+			Some(source) => source.push(table),
+			None => sources.push(vec![table]),
+		}
+	}
+	// Every column of a lone table is a candidate record of file names: the stems
+	// it holds, in that table's own row order.
+	let mut recorded = Vec::new();
+	for source in &sources {
+		let [table] = source.as_slice() else { continue };
+		for column in 0..table.headers.len() {
+			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, table.rows.iter().map(stem).collect::<Vec<_>>()))
+		}
+	}
+	// The recorded order of each group, when exactly one reading exists. Two
+	// columns naming the same files in different orders leave the association
+	// ambiguous, and files sharing a name cannot be ordered by name at all.
+	let mut orders = Vec::new();
+	// The (table, column) pairs that turned out to name files.
+	let mut references = BTreeSet::new();
+	for source in &sources {
+		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		let mut found: Option<(&String, &String, &Vec<String>)> = None;
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, column, order) in &recorded {
+				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
+					continue;
+				}
+				// A column that resolves a group's files is that group's identity, not
+				// one of the row values the caller selected. Every column that reads as
+				// the record is one, including a second column that agrees with the
+				// first, so none of them is left to be encoded as a feature.
+				references.insert((table.clone(), *column));
+				match found {
+					Some((first, first_header, first_order)) => require(
+						first_order == order,
+						format!("{first:?} column {first_header:?} and {table:?} column {header:?} record the same {} file names in different orders", names.len()),
+					)?,
+					None => found = Some((table, header, order)),
 				}
 			}
 		}
+		orders.push(found.map(|(_, _, order)| order.clone()));
 	}
-	Ok((tables, paths))
+	// A recorded group contributes one sample per file. An unrecorded group is one
+	// source whose partitions each contribute their own rows.
+	let count = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[table] => table.rows.len(),
+		_ if order.is_some() => source.len(),
+		_ => source.iter().map(|table| table.rows.len()).sum(),
+	};
+	let samples = sources.iter().zip(&orders).map(|(source, order)| count(source, order)).max().unwrap_or(0);
+	// How a source was read is what a count mismatch is usually about, so the
+	// report says it rather than leaving the reader to infer the rule.
+	let reading = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[_] => "its rows".to_owned(),
+		_ if order.is_some() => format!("one sample per file across {} files", source.len()),
+		_ => format!("the joined rows of {} partitions, because no column records their file names", source.len()),
+	};
+	let mut aligned = Vec::new();
+	for (mut source, order) in sources.into_iter().zip(orders) {
+		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples as {}, expected {samples}", source[0].name, count(&source, &order), reading(&source, &order)))?;
+		if let [_] = source.as_slice() {
+			let mut table = source.remove(0);
+			// Drop the columns that resolved a group's files. They identified the
+			// samples; encoding a file name as numbers alongside the values it points
+			// at feeds the model the label of a vector it already has, and a stem
+			// like "scan-0000" reaches the row as its bytes.
+			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
+			if dropped.len() == table.headers.len() {
+				continue
+			}
+			for column in dropped.into_iter().rev() {
+				table.headers.remove(column);
+				for row in &mut table.rows {
+					if column < row.len() {
+						row.remove(column);
+					}
+				}
+			}
+			aligned.push(table);
+			continue;
+		}
+		let declared = source[0].declared;
+		let Some(order) = order else {
+			// Partitions of one source: every table's rows are samples of the same shape.
+			let headers = source[0].headers.clone();
+			let rows = source.into_iter().flat_map(|table| table.rows).collect::<Vec<_>>();
+			aligned.push(Table { name: "data".to_owned(), headers, declared, rows, attention: None });
+			continue;
+		};
+		source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()));
+		let rows = source[0].rows.len();
+		let mut headers = Vec::new();
+		for row in 1..=rows {
+			headers.extend(source[0].headers.iter().map(|header| if rows == 1 { header.clone() } else { format!("{header}.{row}") }))
+		}
+		let mut values = Vec::with_capacity(source.len());
+		for table in source {
+			require(table.rows.len() == rows, format!("sample {:?} expected {rows} rows, received {}", table.name, table.rows.len()))?;
+			values.push(table.rows.into_iter().flatten().collect())
+		}
+		aligned.push(Table { name: "data".to_owned(), headers, declared, rows: values, attention: None })
+	}
+	Ok(aligned)
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -15272,22 +15482,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 			})
 	};
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
-		let mut tables = Vec::new();
-		for mut group in groups.into_values() {
-			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
-			if group.iter().any(|table| table.headers != group[0].headers) {
-				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-				for table in &mut group {
-					let count = table.rows.len();
-					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-					if count != rows {
-						table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
-					}
-				}
-			}
-			tables.extend(group);
-		}
-		return Ok(tables);
+		return Ok(groups.into_values().flatten().collect());
 	}
 	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
 	require(!groups.is_empty(), "data source contains no usable captures")?;
@@ -16741,7 +16936,7 @@ impl Train {
 
 	fn try_run_stateful_rat(&self, model: &Model, data: &Data, command: &RatCommand, started: Instant) -> Result<TrainingReport> {
 		require(data.sources.is_empty() && data.tests.is_empty() && data.target.is_empty() && data.trial.is_none()
-			&& matches!(data.features, FeatureSelection::All) && !data.normalize && !data.broadcast,
+			&& matches!(data.features, FeatureSelection::All) && !data.normalize,
 			"stateful RAT takes its state and action schema from the evaluator; data selectors and normalization are unsupported")?;
 		require(self.resume.is_none(), "stateful RAT does not support resume")?;
 		require(self.stop.is_none_or(|value| value == 1.0), "stateful RAT terminates episodes using evaluator scores, not .stop()")?;
