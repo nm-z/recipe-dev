@@ -7377,6 +7377,27 @@ fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: us
 	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
+/// Adapt one branch to the canonical shape selected by the first MoE expert.
+/// A contraction learns channel mixing; a valid convolution also reduces a
+/// longer sequence to the requested length. Sequence expansion has no existing
+/// Recipe primitive, so it is rejected explicitly instead of padding or
+/// dropping the expert.
+fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape) -> Result<i32> {
+	if from == target {
+		reset(graph, source, from);
+		return Ok(source);
+	}
+	require(from.length >= target.length, "MoE expert projection cannot lengthen the sequence")?;
+	reset(graph, source, from);
+	if from.length != target.length {
+		let kernel = checked_add(from.length - target.length, 1, "MoE expert projection kernel")?;
+		lower_conv(graph, target.channels, kernel)?;
+	} else if from.channels != target.channels {
+		lower_project(graph, target.channels)?;
+	}
+	require(graph.output == target, "MoE expert projection did not match the canonical shape")?;
+	Ok(graph.source)
+}
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
 	let mut scalar = ScalarProgram(Vec::new());
 	let condition = scalar.op(ScalarOpcode::Greater, -1.0, -2.0);
@@ -7449,19 +7470,16 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 	let mut output = None;
 	for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
-		if let Some(expected) = output {
-			require(shape == expected, "moe experts must have one output shape")?;
-		}
-		output = Some(shape);
+		let canonical = output.unwrap_or(shape);
+		let branch = project_moe_shape(graph, branch, shape, canonical)?;
+		output = Some(canonical);
 		branches.push(branch);
 	}
 	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
 	let mut scores = Vec::with_capacity(experts.len());
 	for _ in experts {
-		reset(graph, source, input);
-		lower_project(graph, output.channels)?;
-		require(graph.output == output, "moe router shape does not match its experts")?;
-		scores.push(graph.source);
+		let router = project_moe_shape(graph, source, input, output)?;
+		scores.push(router);
 	}
 	select(graph, &branches, &scores, output, top_k, config)
 }
