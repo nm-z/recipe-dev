@@ -4209,7 +4209,6 @@ mod bundle {
 			return match fields.next().unwrap_or("") {
 				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
 				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-<<<<<<< HEAD
 				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
 				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
 			};
@@ -4338,7 +4337,6 @@ mod bundle {
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
-<<<<<<< HEAD
 			activation: activation(&fields[1])?,
 			normalization: normalization(Some(&fields[2]), "block normalization")?,
 			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
@@ -5222,7 +5220,6 @@ impl Block {
 		let q = |variant| self.clone().quantize(0, bits, variant);
 		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
-<<<<<<< HEAD
 	pub fn scale(self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.act(Activation::Scale(factor.to_bits()))
