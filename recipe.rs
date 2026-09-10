@@ -6400,6 +6400,24 @@ mod ngram {
 		pub fn bytes(&self) -> usize {
 			self.hash.heads() * (self.table.bytes / self.rows) * self.taps.len().max(1)
 		}
+		/// The devices for the blocks before `ngram.layer` and from that layer on.
+		/// One selected device runs both ranges; two selected devices place the
+		/// table-consuming range on the second device.
+		fn placed(&self) -> Result<(&'static Gpu, &'static Gpu)> {
+			let devices = selected_gpus()?;
+			let named = match std::env::var("RECIPE_DEVICE") {
+				Ok(selection) => device_names(&selection)?.len(),
+				Err(_) => 1,
+			};
+			require(named <= 2, format!("an n-gram placement names the device before block {} and the device from it on, so at most two; {named} are selected", self.layer))?;
+			require(devices.len() == named, format!("an n-gram placement of {named} devices needs multi-device; the selection resolved to {}", devices.len()))?;
+			Ok((devices[0], devices[devices.len() - 1]))
+		}
+		/// The resolved devices for the two n-gram inference ranges, in order.
+		pub fn placement(&self) -> Vec<String> {
+			let (before, from) = self.placed().unwrap_or_else(|error| panic!("{error}"));
+			vec![before.name.clone(), from.name.clone()]
+		}
 		/// The mapped table: its name, its rows, and the bytes of one row.
 		pub fn table(&self) -> (&str, usize, usize) {
 			(&self.table.name, self.rows, self.table.bytes / self.rows)
@@ -6447,28 +6465,28 @@ mod ngram {
 			Ok(injected)
 		}
 		/// Inference with the gathered vector added to the stream: the blocks before
-		/// `ngram.layer` run on the selected device, the gather and the addition on
-		/// the host that holds the table, and the blocks from it on the device again.
+		/// `ngram.layer` run on the first selected device, the gather and the addition
+		/// stay on the host that holds the table, and the remaining blocks run on the last.
 		pub fn infer(&self, path: impl AsRef<Path>, input: &[f64], ids: &[u32]) -> Vec<f64> {
 			self.decode(path.as_ref(), input, ids).unwrap_or_else(|error| panic!("{error}"))
 		}
 		fn decode(&self, path: &Path, input: &[f64], ids: &[u32]) -> Result<Vec<f64>> {
 			let path = resolve_path(path)?;
-			let device = selected_gpu()?;
+			let (before, from) = self.placed()?;
 			let injected = self.inject(ids)?;
 			bundle::run_infer(&path, input, |stored, samples| {
-				let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
+				let graph = materialize_saved_graph(stored, samples, before, Config::load()?)?;
 				let (head, tail) = split_at_block(&graph, self.layer)?;
 				let mut statistics = 0;
 				let mut stream = match &head {
-					Some(head) => forward_part(head, samples, samples, device, stored, &mut statistics)?,
+					Some(head) => forward_part(head, samples, samples, before, stored, &mut statistics)?,
 					None => samples.to_vec(),
 				};
 				require(stream.len() == injected.len(), format!("block {} takes {} values, the n-gram table gathers {}", self.layer, stream.len(), injected.len()))?;
 				for (value, added) in stream.iter_mut().zip(&injected) {
 					*value += added;
 				}
-				forward_part(&tail, &stream, samples, device, stored, &mut statistics)
+				forward_part(&tail, &stream, samples, from, stored, &mut statistics)
 			})
 		}
 	}
@@ -6651,7 +6669,7 @@ mod bundle {
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", *activation as u8, *scoring as u8, u8::from(*renormalize), u8::from(*shared))
+				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
 			}
 			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
@@ -6659,11 +6677,11 @@ mod bundle {
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
 				"delta,{},{},{},{},{},{},{},{}",
-				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation as u8, delta.output_activation as u8
+					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Norm => "norm".to_owned(),
-			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", *activation as u8),
+			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 		}
@@ -6692,7 +6710,10 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let heads = value_at(fields.next(), "attention heads")?;
-				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let Some(kv) = fields.next() else {
+					return Ok(Operation::Attention(AttentionBlock::new(heads)));
+				};
+				let kv = value_at(Some(kv), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
 				let mut index = Indexer {
@@ -6728,7 +6749,7 @@ mod bundle {
 						value_at(fields.first().copied(), "MoE experts")?,
 						value_at(fields.get(1).copied(), "MoE top-k")?,
 						value_at(fields.get(2).copied(), "MoE expert width")?,
-						activation(value_at(fields.get(3).copied(), "MoE activation")?)?,
+						activation(fields.get(3).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
 						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
 						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
 						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
@@ -6764,8 +6785,8 @@ mod bundle {
 				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
 				// Older bundles always used a linear convolution and sigmoid output gate.
 				// Keep those defaults when the optional activation selectors are absent.
-				let conv_activation = fields.next().map(|field| value_at(Some(field), "delta convolution activation").and_then(activation)).transpose()?.unwrap_or(Activation::Linear);
-				let output_activation = fields.next().map(|field| value_at(Some(field), "delta output activation").and_then(activation)).transpose()?.unwrap_or(Activation::Sigmoid);
+				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
+				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
 				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
 			}
 			"ple" => {
@@ -6777,7 +6798,7 @@ mod bundle {
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
 			"norm" => Ok(Operation::Norm),
-			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(value_at(fields.next(), "gated feed-forward activation")?)?)),
+			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -8022,6 +8043,10 @@ impl Model {
 	/// same width before the output projection returns to the stream.
 	pub fn head(&self, width: usize) -> Self {
 		self.attention("head", |attention| attention.width = width)
+	}
+	/// Compatibility spelling for the public attention head-width selector.
+	pub fn width(&self, width: usize) -> Self {
+		self.head(width)
 	}
 	/// Key and query heads of the preceding `delta` block, at `width` each. Every
 	/// key head serves `heads / count` value heads.
@@ -10364,9 +10389,9 @@ impl<'a> Builder<'a> {
 		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
-		if let Some(bias) = self.optional(&name("ssm_dt.bias")) {
-			require(bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", bias.name, bias.elements()))?;
-			gates.push(Plane::Mapped(bias));
+		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
+			require(decay_bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", decay_bias.name, decay_bias.elements()))?;
+			gates.push(Plane::Mapped(decay_bias));
 			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
@@ -10853,6 +10878,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_packed: false,
 		bound: None,
 		bound_values: Vec::new(),
+		bias: graph.bias,
 		epsilon: graph.epsilon,
 	})
 }
@@ -11732,12 +11758,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 /// matrix binds no bias row, a sum one output row larger binds the trailing row
 /// as the bias of a node that owns one, and any other sum is rejected here,
 /// before anything runs, naming the views, the node and the accepted spans.
-fn contraction_bias(graph: &Graph, matrix: usize, width: usize, bias: bool) -> Result<bool> {
+fn contraction_bias(graph: &Graph, matrix: usize, width: usize, has_bias: bool) -> Result<bool> {
 	let biased = checked_add(matrix, width, "contraction bias")?;
 	match graph.bound.as_ref().and_then(std::collections::VecDeque::front) {
-		None => Ok(bias),
+		None => Ok(has_bias),
 		Some(bound) if bound.elements == matrix => Ok(false),
-		Some(bound) if bias && bound.elements == biased => Ok(true),
+		Some(bound) if has_bias && bound.elements == biased => Ok(true),
 		Some(bound) => Err(RecipeError::new(format!(
 			"{} hold {} values; block {} {} node {} contracts {} inputs onto {width} outputs and takes {matrix} values{}",
 			bound.names,
@@ -11746,7 +11772,7 @@ fn contraction_bias(graph: &Graph, matrix: usize, width: usize, bias: bool) -> R
 			graph.block_kind,
 			graph.nodes.len(),
 			matrix / width,
-			if bias { format!(" without a bias row or {biased} with one") } else { String::new() }
+			if has_bias { format!(" without a bias row or {biased} with one") } else { String::new() }
 		))),
 	}
 }
@@ -11754,8 +11780,8 @@ fn contraction_bias(graph: &Graph, matrix: usize, width: usize, bias: bool) -> R
 /// the fused ReLU flag, which activation lowering sets; and whether the node
 /// carries no bias row, which the kernels read to skip the bias term and which
 /// `output_bias_offset` follows.
-fn contraction_arguments(kernel: usize, bias: bool) -> [f64; 9] {
-	[kernel as f64, 0.0, f64::from(u8::from(!bias)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+fn contraction_arguments(kernel: usize, has_bias: bool) -> [f64; 9] {
+	[kernel as f64, 0.0, f64::from(u8::from(!has_bias)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 /// A projection of the graph output onto `channels`, with a bias row unless the
 /// weight it binds to carries none, so its parameter span is then the matrix.
@@ -11764,22 +11790,22 @@ fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 }
 /// A contraction of the graph output onto `channels` whose lowering owns a bias
 /// row when `bias` is set; a gate lowered without one spans the matrix alone.
-fn lower_contraction(graph: &mut Graph, channels: usize, bias: bool) -> Result<()> {
+fn lower_contraction(graph: &mut Graph, channels: usize, has_bias: bool) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
 	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
-	let bias = contraction_bias(graph, matrix, channels, bias && graph.bias)?;
-	let parameters = if bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
+	let has_bias = contraction_bias(graph, matrix, channels, has_bias && graph.bias)?;
+	let parameters = if has_bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, bias), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, has_bias), -2)
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
 	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
-	let bias = contraction_bias(graph, matrix, filters, graph.bias)?;
-	let parameters = if bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
+	let has_bias = contraction_bias(graph, matrix, filters, graph.bias)?;
+	let parameters = if has_bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(kernel, bias), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(kernel, has_bias), -2)
 }
 /// The bias row of the last contraction that carries one.
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
@@ -13346,13 +13372,37 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
+/// Computes a positive row share for every device without allowing a malformed
+/// or non-finite work value to underflow the remaining-row calculation.
+fn route_counts(route: &[usize], links: &[Link], rows: usize, policy: MultiDevice) -> Result<Vec<usize>> {
+	require(!route.is_empty() && route.len() <= rows, "route row capacity is invalid")?;
+	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
+	require(total.is_finite() && total > 0.0, "route work is invalid")?;
+	let remaining = rows - route.len();
+	let mut counts = vec![1_usize; route.len()];
+	let mut remainders = Vec::with_capacity(route.len());
+	for (index, device) in route.iter().enumerate() {
+		let work = if policy == MultiDevice::Auto { 1.0 } else { links[*device].work };
+		let exact = remaining as f64 * work / total;
+		require(exact.is_finite() && (0.0..=remaining as f64).contains(&exact), "route share is invalid")?;
+		let base = exact.floor() as usize;
+		counts[index] += base;
+		remainders.push((exact - base as f64, index));
+	}
+	let assigned = counts.iter().sum::<usize>();
+	let left = rows.checked_sub(assigned).ok_or_else(|| RecipeError::new("route shares exceed the available rows"))?;
+	remainders.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+	require(left <= remainders.len(), "route shares leave too many rows")?;
+	for &(_, index) in remainders.iter().take(left) {
+		counts[index] += 1;
+	}
+	Ok(counts)
+}
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
 fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
-	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
-	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
-	counts[0] += rows - counts.iter().sum::<usize>();
+	let counts = route_counts(route, links, rows, policy)?;
 	let (gradient_to_host, weights_from_host) = (
 		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
 		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
