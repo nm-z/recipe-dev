@@ -27,6 +27,29 @@ let prediction = recipe.infer("model.ogdl", &input);
 
 Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
 
+## samples
+
+A caller selects sources, features and targets. Where the samples begin and end
+is read from the source, not declared.
+
+A lone table's rows are its samples. When a folder holds a group of sibling
+tables and another table has a column recording their file names, that group is
+one sample per file, and the recording column is what both identifies and orders
+them — no order is ever taken from the path. A column used that way is identity
+and not a feature, so the file name never reaches the model as a value.
+
+```
+scans/
+	meta.csv        scan,temperature,y      3001 lines: a header and 3000 rows
+	scan-0000.csv   magnitude,phase         one sample
+	...             (2999 more)
+```
+
+That is 3,000 samples. Each one is the whole vector of the scan its row names
+plus the row's own selected values. Sources that disagree on the sample count
+are refused, saying how each was read; nothing is cycled or repeated to make the
+counts match.
+
 ## devices
 
 Use one `--device` flag with a dot-separated chain. Devices before the first host prefix belong to the machine running the command. A host prefix applies to the following devices until another host prefix appears. Commas and repeated `--device` flags are invalid.
@@ -139,12 +162,17 @@ data(auto)
 .loss(mse|rmse|huber|mae|bce|ce|focal)
 ```
 
-## 15 activations
+## 16 activations
 
 ```
 relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
+scale(factor)
 ```
+
+`scale(factor)` multiplies every value the preceding block produces by one
+finite constant. It owns no weights and preserves the shape, so it states an
+explicit scalar rescaling directly.
 
 ## 4 normalizations
 
@@ -161,6 +189,18 @@ over its head-width slice, leaving the values untouched:
 ```rust
 .attn(4).qk(rms)
 ```
+
+## exclusions
+
+```rust
+recipe.model().no(bias).layer(64).relu().layer(1)
+```
+
+`.no(option)` declares a default the model excludes. `.no(bias)` removes the
+bias from every weighted block beneath it — layers, attention projections,
+convolutions and recurrent gates — and from every nested branch. Excluded
+tensors are not allocated, initialized, trained, saved or loaded, and the
+exclusion travels with the saved model.
 
 ## compute precisions
 
