@@ -6597,10 +6597,75 @@ pub struct Placed {
 fn carried_state(nodes: &[Node]) -> impl Iterator<Item = (usize, usize)> + '_ {
 	nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels)))
 }
-/// The values a device holds for a range of nodes: their parameters and the
-/// state their batch normalizations carry.
-fn resident_values(nodes: &[Node]) -> usize {
-	nodes.iter().map(|node| node.parameters).sum::<usize>() + carried_state(nodes).map(|(_, channels)| 2 * channels).sum::<usize>()
+/// Build the independent graph that one placed device receives for a contiguous
+/// range of nodes. The placement walk uses the same graph shape as `split_graph`
+/// so its memory estimate includes rebased node offsets and the range's input.
+fn graph_range(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
+	require(start < end && end <= graph.nodes.len(), "graph range is empty or out of bounds")?;
+	let base = graph.nodes[start].offset;
+	let last = &graph.nodes[end - 1];
+	let parameters = last.offset.checked_add(last.parameters).ok_or_else(|| RecipeError::new("graph parameter range overflows"))?;
+	let rebase = |index: i32| {
+		if index >= start as i32 {
+			index - start as i32
+		} else if index == -2 {
+			-2
+		} else {
+			-1
+		}
+	};
+	let nodes = graph.nodes[start..end].iter().map(|node| Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() }).collect();
+	Ok(Graph {
+		nodes,
+		parameters: graph.parameters.get(base..parameters).ok_or_else(|| RecipeError::new("graph parameter range is invalid"))?.to_vec(),
+		frozen: graph.frozen.get(base..parameters).ok_or_else(|| RecipeError::new("graph frozen range is invalid"))?.to_vec(),
+		programs: graph.programs.clone(),
+		stored: graph.stored.get(start..end).ok_or_else(|| RecipeError::new("graph storage range is invalid"))?.to_vec(),
+		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
+		output: last.output,
+		source: (end - start) as i32 - 1,
+		state: TrainingState::default(),
+		block_index: last.block_index,
+		block_kind: last.block_kind,
+	})
+}
+/// The peak device bytes for one inference tape. This includes the model,
+/// carried batch-normalization state, native value/context arenas, sample and
+/// target buffers, and the small state buffers that `NativeTape::new` retains.
+/// Quantized model-load storage is included in the separate load peak because
+/// that temporary buffer overlaps only the weights allocation.
+fn resident_bytes(graph: &Graph, precision: Compute) -> Result<usize> {
+	let native = NativePrecision::new(precision)?;
+	let layout = NativeLayout::for_graph(graph, 1, precision)?;
+	let model_bytes = native.model.bytes();
+	let state_bytes = native.state.bytes();
+	let parameters = checked_mul(graph.parameters.len().max(1), model_bytes, "placement weights")?;
+	let samples = checked_mul(graph.input.elements(), model_bytes, "placement samples")?.max(1);
+	let targets = model_bytes;
+	let mut persistent = 0;
+	for bytes in [
+		layout.values_bytes.max(1),
+		layout.contexts_bytes.max(1),
+		1, // inference adjoints
+		samples,
+		1, // inference input adjoint
+		targets,
+		parameters,
+		1,           // frozen flags
+		state_bytes, // moments
+		state_bytes, // variances
+		1,           // gradient
+		state_bytes, // metrics
+	] {
+		persistent = checked_add(persistent, bytes, "placement inference memory")?;
+	}
+	let mut storage = 0;
+	for weight in graph.stored.iter().flatten() {
+		storage = align(storage, alignment("float"))?;
+		storage = checked_add(storage, weight.bytes.len(), "placement model-load storage")?;
+	}
+	let load = checked_add(parameters, storage, "placement model-load memory")?;
+	Ok(persistent.max(load))
 }
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
@@ -6618,7 +6683,7 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 /// reported instead of placed. Every named device takes a contiguous, nonempty
 /// range, so a device that cannot hold even one block is reported rather than
 /// skipped over.
-fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
+fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
 	let mut starts = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
 		if index == 0 || node.block_index != graph.nodes[index - 1].block_index {
@@ -6628,7 +6693,7 @@ fn measured_split(graph: &Graph, bytes: usize, devices: &[&'static Gpu]) -> Resu
 	let (mut split, mut taken, mut free) = (Vec::new(), 0, devices[0].free_bytes()?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = (resident_values(&graph.nodes[start..end]) * bytes) as u64;
+		let resident = resident_bytes(&graph_range(graph, start, end)?, precision)? as u64;
 		let index = graph.nodes[start].block_index;
 		// A device that cannot hold the block hands it to the next one, and so on:
 		// a device too small to take it is passed over rather than ending the
@@ -6657,38 +6722,9 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 		let end = if device + 1 == split.len() { graph.nodes.len() } else { graph.nodes.iter().position(|node| node.block_index >= first_block).unwrap_or(graph.nodes.len()) };
 		require(end > start, format!("device {device} takes no blocks"))?;
 		require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
-		let base = graph.nodes[start].offset;
-		let rebase = |index: i32| {
-			if index >= start as i32 {
-				index - start as i32
-			} else if index == -2 {
-				-2
-			} else {
-				-1
-			}
-		};
-		let nodes = graph.nodes[start..end]
-			.iter()
-			.map(|node| {
-				require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-				Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
-			})
-			.collect::<Result<Vec<_>>>()?;
-		let last = &graph.nodes[end - 1];
-		let parameters = last.offset + last.parameters;
-		parts.push(Graph {
-			nodes,
-			parameters: graph.parameters[base..parameters].to_vec(),
-			frozen: graph.frozen[base..parameters].to_vec(),
-			programs: graph.programs.clone(),
-			stored: graph.stored[start..end].to_vec(),
-			input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
-			output: last.output,
-			source: (end - start) as i32 - 1,
-			state: TrainingState::default(),
-			block_index: last.block_index,
-			block_kind: last.block_kind,
-		});
+		let part = graph_range(graph, start, end)?;
+		require(!part.nodes.iter().any(|node| node.op == Primitive::Predictor), "estimator blocks cannot be placed across devices")?;
+		parts.push(part);
 		start = end;
 	}
 	Ok(parts)
@@ -6700,17 +6736,17 @@ fn place_model(path: &Path, split: &[usize]) -> Result<Placed> {
 	let (mut split, mut resident, mut moved) = (split.to_vec(), vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let bytes = stored.precision.bytes();
+		let precision = stored.precision;
 		if split.is_empty() {
-			split = measured_split(&graph, bytes, devices)?;
+			split = measured_split(&graph, precision, devices)?;
 		}
 		let blocks = stored.model.blocks.len();
 		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
 		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
 		for (index, part) in split_graph(&graph, &split)?.iter().enumerate() {
-			resident[index] += resident_values(&part.nodes) * bytes;
+			resident[index] += resident_bytes(part, precision)?;
 			if index + 1 < split.len() {
-				moved += part.output.elements() * bytes;
+				moved += part.output.elements() * precision.bytes();
 			}
 		}
 	}
@@ -6745,7 +6781,8 @@ impl Placed {
 	pub fn split(&self) -> &[usize] {
 		&self.split
 	}
-	/// Parameter and carried state bytes each device holds, in the model precision.
+	/// Peak inference-tape bytes each device holds, including model, state,
+	/// arenas, and buffers, in the model precision.
 	pub fn resident_bytes(&self) -> &[usize] {
 		&self.resident
 	}
@@ -8139,10 +8176,31 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
-fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
-	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
-	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
-	counts[0] += rows - counts.iter().sum::<usize>();
+fn route_counts(route: &[usize], links: &[Link], rows: usize) -> Result<Vec<usize>> {
+	require(!route.is_empty() && route.len() <= rows, "route row capacity is invalid")?;
+	let total = route.iter().map(|device| links[*device].work).sum::<f64>();
+	require(total.is_finite() && total > 0.0, "route work is invalid")?;
+	let remaining = rows - route.len();
+	let mut counts = vec![1_usize; route.len()];
+	let mut remainders = Vec::with_capacity(route.len());
+	for (index, device) in route.iter().enumerate() {
+		let exact = remaining as f64 * links[*device].work / total;
+		require(exact.is_finite() && exact >= 0.0, "route share is invalid")?;
+		let base = exact.floor() as usize;
+		counts[index] += base;
+		remainders.push((exact - base as f64, index));
+	}
+	let assigned = counts.iter().sum::<usize>();
+	let left = rows.checked_sub(assigned).ok_or_else(|| RecipeError::new("route shares exceed the available rows"))?;
+	remainders.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+	require(left <= remainders.len(), "route shares leave too many rows")?;
+	for &(_, index) in remainders.iter().take(left) {
+		counts[index] += 1;
+	}
+	Ok(counts)
+}
+fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction) -> Result<(Vec<usize>, Placement)> {
+	let counts = route_counts(route, links, rows)?;
 	let (gradient_to_host, weights_from_host) = (
 		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
 		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
@@ -8195,7 +8253,7 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
 		// The fastest device leads the route and applies the one update.
 		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
-		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
+		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss)?;
 		let [computation, transfers, synchronization, movement] = placement.predicted;
 		eprintln!(
 			"route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}",
