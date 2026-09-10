@@ -5220,6 +5220,10 @@ impl Block {
 		let q = |variant| self.clone().quantize(0, bits, variant);
 		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
+	pub fn scale(self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.act(Activation::Scale(factor.to_bits()))
+	}
 }
 pub struct BlockQi {
 	pub q0: Block,
