@@ -4201,7 +4201,10 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let heads = value_at(fields.next(), "attention heads")?;
-				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let Some(kv) = fields.next() else {
+					return Ok(Operation::Attention(AttentionBlock::new(heads)));
+				};
+				let kv = value_at(Some(kv), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
 				let index = Indexer {
