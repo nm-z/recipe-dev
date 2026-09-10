@@ -1501,6 +1501,26 @@ struct NodePlan {
 	storage_offset: usize,
 }
 
+/// The per-position arenas owned by a user-declared recurrent body.  Body
+/// nodes remain ordinary graph nodes so their parameters and save format stay
+/// unchanged, while these offsets provide a position-local tape for the scan
+/// emitter.
+struct RecurBodyLayout {
+	base: usize,
+	cell: usize,
+	cell_values: usize,
+	values: usize,
+	value_stride: usize,
+	adjoints: usize,
+	adjoint_stride: usize,
+	temporary_gradient: usize,
+	temporary_gradient_len: usize,
+	cell_delta: usize,
+	value_offsets: Vec<usize>,
+	adjoint_offsets: Vec<usize>,
+	gradient_offsets: Vec<usize>,
+}
+
 #[derive(Clone, Copy)]
 enum NativeMatrix {
 	Gfx11,
@@ -2497,6 +2517,13 @@ impl NativeModelIr {
 			self.plans.iter().enumerate().collect::<Vec<_>>()
 		};
 		for (index, plan) in order {
+			// Recurrent body nodes are emitted by the scan's uniform position loop.
+			// They are still plans so their parameters, storage, and adjoints remain
+			// part of the graph, but executing them here would run the body once
+			// outside the recurrence and race the position-local tape.
+			if plan.node.block_kind == "recur_body" {
+				continue;
+			}
 			let pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
 			match (reverse, node.op) {
@@ -2589,7 +2616,14 @@ impl NativeModelIr {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
 					let (coded, cell) = self.cell_activation(node)?;
 					let (stages, stage_base) = (integer_argument(node.argument[1], "recurrent stages")?, self.stage_base(node)?);
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base} )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base));
+					let (cell_channels, widths, _, _, max_width) = self.recurrent_stage_metadata(node)?.map_or((node.output.channels, Vec::new(), Vec::new(), Vec::new(), 0), |metadata| metadata);
+					let stage_scratch = self.recurrent_stage_scratch(node)?.map_or(0, |(offset, _)| offset);
+					let metadata = if widths.is_empty() { ("null".to_owned(), "null".to_owned(), "null".to_owned()) } else { (format!("@recipe_recur_{index}_widths"), format!("@recipe_recur_{index}_saved"), format!("@recipe_recur_{index}_weights")) };
+					if self.recurrent_body_layout(index, node)?.is_some() {
+						ir.push_str(&format!("call void @recipe_recur_scan_forward_{index}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {cell_channels}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, cell_channels = node.output.channels, has_bias = node.argument[2] == 0.0, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					} else {
+						ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {cell_channels}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base}, ptr {stage_widths}, ptr {stage_saved}, ptr {stage_weights}, i32 {stage_scratch}, i32 {max_width} )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, cell_channels = cell_channels, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base, stage_widths = metadata.0, stage_saved = metadata.1, stage_weights = metadata.2, stage_scratch = stage_scratch, max_width = max_width));
+					}
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2737,7 +2771,17 @@ impl NativeModelIr {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
 					let (coded, cell) = self.cell_activation(node)?;
 					let (stages, stage_base) = (integer_argument(node.argument[1], "recurrent stages")?, self.stage_base(node)?);
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base));
+					if let Some(layout) = self.recurrent_body_layout(index, node)? {
+						let pointer = pointer_type(backend);
+						let ty = self.precision.model_type;
+						let cell_delta = format!("%n{index}.cell.delta");
+						ir.push_str(&format!("{cell_delta} = getelementptr inbounds {ty}, {pointer} {context}, i32 {offset}\n", offset = layout.cell_delta, context = pointers.context));
+						ir.push_str(&format!("call void @recipe_recur_body_reverse_{index}( {pointer} {weights}, {pointer} {context}, {pointer} {value}, {pointer} {delta}, {pointer} {cell_delta}, {pointer} %gradient, i32 %rows, i32 %threads, i32 {length} )\n", pointer = pointer, weights = pointers.weights, context = pointers.context, value = pointers.value, delta = pointers.delta, cell_delta = cell_delta, length = node.output.length));
+						ir.push_str(barrier(backend));
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {cell_delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 0, i32 {stage_base} )\n", pointer = pointer, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, cell_delta = cell_delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k, coded = coded, cell = cell, stage_base = stage_base));
+						} else {
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell}, i32 {stages}, i32 {stage_base} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k, coded = coded, cell = cell, stages = stages, stage_base = stage_base));
+					}
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -3065,10 +3109,832 @@ impl NativeModelIr {
 		let codes = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("recurrent stage activations are absent"))?;
 		let mut packed = 0;
 		for (stage, code) in codes.chunks_exact(3).enumerate() {
-			let code = integer_argument(code[0], "recurrent stage activation")? as usize;
+			let code = integer_argument(code[1], "recurrent stage activation")? as usize;
 			packed |= code << (4 * stage);
 		}
 		Ok((true, packed))
+	}
+	/// Widths and offsets for the user-declared stages after the recurrent cell.
+	/// The offsets are expressed in channels and parameter elements; the native
+	/// emitter expands them to row-major addresses for the active batch.
+	fn recurrent_stage_metadata(&self, node: &Node) -> Result<Option<(usize, Vec<usize>, Vec<usize>, Vec<usize>, usize)>> {
+		if node.op != Primitive::Scan || node.program_count == 0 {
+			return Ok(None);
+		}
+		let codes = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("recurrent stage metadata is absent"))?;
+		let mut declared = Vec::with_capacity(node.program_count);
+		for code in codes.chunks_exact(3) {
+			let width = usize::try_from(integer_argument(code[0], "recurrent stage width")?).map_err(|_| RecipeError::new("recurrent stage width is invalid"))?;
+			require(width != 0, "recurrent stage width must be positive")?;
+			declared.push(width);
+		}
+		let cell_width = declared[0];
+		let widths = declared.into_iter().skip(1).collect::<Vec<_>>();
+		if widths.is_empty() {
+			return Ok(Some((cell_width, widths, Vec::new(), Vec::new(), 0)));
+		}
+		let mut saved = Vec::with_capacity(widths.len());
+		let mut weights = Vec::with_capacity(widths.len());
+		let mut saved_channels = cell_width;
+		let mut weight_offset = checked_add(checked_mul(node.input.channels, cell_width, "recurrent cell input matrix")?, checked_mul(cell_width, cell_width, "recurrent cell state matrix")?, "recurrent cell")?;
+		weight_offset = checked_add(weight_offset, cell_width, "recurrent cell bias")?;
+		for (stage, &width) in widths.iter().enumerate() {
+			saved.push(saved_channels);
+			weights.push(weight_offset);
+			saved_channels = checked_add(saved_channels, width, "recurrent stage context")?;
+			if let Some(&next) = widths.get(stage + 1) {
+				weight_offset = checked_add(checked_add(checked_mul(width, next, "recurrent stage matrix")?, next, "recurrent stage bias")?, weight_offset, "recurrent stage offset")?;
+			}
+		}
+		let max_width = widths.iter().copied().max().unwrap_or(0);
+		Ok(Some((cell_width, widths, saved, weights, max_width)))
+	}
+	fn recurrent_stage_scratch(&self, node: &Node) -> Result<Option<(usize, usize)>> {
+		let Some((cell_width, widths, _, _, max_width)) = self.recurrent_stage_metadata(node)? else { return Ok(None) };
+		if widths.is_empty() {
+			return Ok(Some((self.stage_base(node)?, 0)));
+		}
+		let row_stride = checked_mul(self.rows, node.output.length, "recurrent stage rows")?;
+		let saved_channels = widths.into_iter().try_fold(cell_width, |sum, width| checked_add(sum, width, "recurrent stage context"))?;
+		let scratch = checked_add(self.stage_base(node)?, checked_mul(saved_channels, row_stride, "recurrent stage context")?, "recurrent stage scratch")?;
+		Ok(Some((scratch, max_width)))
+	}
+	fn recurrent_body_layout(&self, index: usize, node: &Node) -> Result<Option<RecurBodyLayout>> {
+		if node.op != Primitive::Scan || node.argument[5] != 1.0 {
+			return Ok(None);
+		}
+		let start = usize::try_from(integer_argument(node.argument[3], "recurrent body start")?).map_err(|_| RecipeError::new("recurrent body start is invalid"))?;
+		let count = usize::try_from(integer_argument(node.argument[4], "recurrent body count")?).map_err(|_| RecipeError::new("recurrent body count is invalid"))?;
+		let end = start.checked_add(count).ok_or_else(|| RecipeError::new("recurrent body range overflows"))?;
+		require(start == index + 1 && count != 0 && end <= self.plans.len(), "recurrent body range is invalid")?;
+		require(node.output.length != 0, "recurrent body sequence is empty")?;
+		let base = self.stage_base(node)?;
+		let cell = checked_mul(self.rows, node.output.channels, "recurrent body cell scratch")?;
+		let mut value_stride = 0usize;
+		let mut value_offsets = Vec::with_capacity(count);
+		let mut gradient_offsets = Vec::with_capacity(count);
+		let mut temporary_gradient_len = 0usize;
+		for plan in &self.plans[start..end] {
+			require(plan.node.output.length == 1, format!("{} must preserve one position in a recurrent body", plan.node.identity(start)))?;
+			value_offsets.push(value_stride);
+			value_stride = checked_add(value_stride, checked_mul(self.rows, plan.node.output.elements(), "recurrent body value tape")?, "recurrent body value tape")?;
+			gradient_offsets.push(temporary_gradient_len);
+			temporary_gradient_len = checked_add(temporary_gradient_len, plan.node.parameters, "recurrent body temporary gradient")?;
+		}
+		let cell_values = checked_add(base, cell, "recurrent body cell tape")?;
+		let values = checked_add(cell_values, checked_mul(cell, node.output.length, "recurrent body cell tape")?, "recurrent body value tape")?;
+		let values_total = checked_mul(value_stride, node.output.length, "recurrent body value tape")?;
+		let adjoints = checked_add(values, values_total, "recurrent body adjoint tape")?;
+		let adjoints_total = checked_mul(value_stride, node.output.length, "recurrent body adjoint tape")?;
+		let temporary_gradient = checked_add(adjoints, adjoints_total, "recurrent body temporary gradient")?;
+		let cell_delta = checked_add(temporary_gradient, temporary_gradient_len, "recurrent body cell adjoint")?;
+		let adjoint_offsets = value_offsets.clone();
+		let _ = checked_add(cell_delta, checked_mul(self.rows, node.output.elements(), "recurrent body cell adjoint")?, "recurrent body context")?;
+		Ok(Some(RecurBodyLayout { base, cell, cell_values, values, value_stride, adjoints, adjoint_stride: value_stride, temporary_gradient, temporary_gradient_len, cell_delta, value_offsets, adjoint_offsets, gradient_offsets }))
+	}
+	fn emit_recurrent_stage_metadata(&self) -> Result<String> {
+		let mut ir = String::new();
+		for (index, plan) in self.plans.iter().enumerate() {
+			let Some((cell_width, widths, saved, weights, _)) = self.recurrent_stage_metadata(&plan.node)? else { continue };
+			if widths.is_empty() { continue; }
+			let values = |values: &[usize]| values.iter().map(|value| format!("i32 {value}")).collect::<Vec<_>>().join(", ");
+			let mut declared = Vec::with_capacity(widths.len() + 1);
+			declared.push(cell_width);
+			declared.extend_from_slice(&widths);
+			ir.push_str(&format!("@recipe_recur_{index}_widths = private unnamed_addr constant [{} x i32] [{}]\n", declared.len(), values(&declared)));
+			ir.push_str(&format!("@recipe_recur_{index}_saved = private unnamed_addr constant [{} x i32] [{}]\n", saved.len(), values(&saved)));
+			ir.push_str(&format!("@recipe_recur_{index}_weights = private unnamed_addr constant [{} x i32] [{}]\n", weights.len(), values(&weights)));
+		}
+		Ok(ir)
+	}
+	fn emit_recurrent_body_forward(&self, backend: Backend, index: usize, node: &Node, layout: &RecurBodyLayout) -> Result<String> {
+		use std::fmt::Write as _;
+		let pointer = pointer_type(backend);
+		let ty = self.precision.model_type;
+		let align = alignment(ty);
+		let (_, thread) = native_entry(backend)?;
+		let start = usize::try_from(integer_argument(node.argument[3], "recurrent body start")?).map_err(|_| RecipeError::new("recurrent body start is invalid"))?;
+		let count = usize::try_from(integer_argument(node.argument[4], "recurrent body count")?).map_err(|_| RecipeError::new("recurrent body count is invalid"))?;
+		let cell_width = node.output.channels;
+		let length = node.output.length;
+		let cell_elements = checked_mul(cell_width, length, "recurrent cell elements")?;
+		let mut ir = String::new();
+		let body_name = format!("recipe_recur_body_forward_{index}");
+		writeln!(ir, "define internal void @{body_name}( {pointer} %weights, {pointer} %context, {pointer} %cell, {pointer} %output, i32 %rows, i32 %threads, i32 %time, i32 %length ) #3 {{")?;
+		writeln!(ir, "entry:")?;
+		writeln!(ir, "%tid = {thread}")?;
+		writeln!(ir, "%time.offset = mul i32 %time, {}", layout.value_stride)?;
+		writeln!(ir, "%time.base = add i32 {}, %time.offset", layout.values)?;
+		writeln!(ir, "%cell.width = add i32 0, {cell_width}")?;
+		writeln!(ir, "%cell.time.offset = mul i32 %time, {cell}", cell = layout.cell)?;
+		writeln!(ir, "%cell.time.base = add i32 {offset}, %cell.time.offset", offset = layout.cell_values)?;
+		writeln!(ir, "%cell.time.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %cell.time.base")?;
+		writeln!(ir, "br label %recur{index}.cell.copy.row.loop")?;
+		writeln!(ir, "recur{index}.cell.copy.row.loop:")?;
+		writeln!(ir, "%recur{index}.cell.copy.row = phi i32 [ %tid, %entry ], [ %recur{index}.cell.copy.row.next, %recur{index}.cell.copy.row.step ]")?;
+		writeln!(ir, "%recur{index}.cell.copy.row.more = icmp ult i32 %recur{index}.cell.copy.row, %rows")?;
+		writeln!(ir, "br i1 %recur{index}.cell.copy.row.more, label %recur{index}.cell.copy.body, label %recur{index}.cell.copy.done")?;
+		writeln!(ir, "recur{index}.cell.copy.body:")?;
+		writeln!(ir, "%recur{index}.cell.copy.row.base = mul i32 %recur{index}.cell.copy.row, {cell_width}")?;
+		writeln!(ir, "br label %recur{index}.cell.copy.c.loop")?;
+		writeln!(ir, "recur{index}.cell.copy.c.loop:")?;
+		writeln!(ir, "%recur{index}.cell.copy.c = phi i32 [ 0, %recur{index}.cell.copy.body ], [ %recur{index}.cell.copy.c.next, %recur{index}.cell.copy.c.step ]")?;
+		writeln!(ir, "%recur{index}.cell.copy.c.more = icmp ult i32 %recur{index}.cell.copy.c, {cell_width}")?;
+		writeln!(ir, "br i1 %recur{index}.cell.copy.c.more, label %recur{index}.cell.copy.c.step, label %recur{index}.cell.copy.row.step")?;
+		writeln!(ir, "recur{index}.cell.copy.c.step:")?;
+		writeln!(ir, "%recur{index}.cell.copy.src.index = add i32 %recur{index}.cell.copy.row.base, %recur{index}.cell.copy.c")?;
+		writeln!(ir, "%recur{index}.cell.copy.src = getelementptr inbounds {ty}, {pointer} %cell, i32 %recur{index}.cell.copy.src.index")?;
+		writeln!(ir, "%recur{index}.cell.copy.value = load {ty}, {pointer} %recur{index}.cell.copy.src, align {align}")?;
+		writeln!(ir, "%recur{index}.cell.copy.dst.index = add i32 %recur{index}.cell.copy.row.base, %recur{index}.cell.copy.c")?;
+		writeln!(ir, "%recur{index}.cell.copy.dst = getelementptr inbounds {ty}, {pointer} %cell.time.ptr, i32 %recur{index}.cell.copy.dst.index")?;
+		writeln!(ir, "store {ty} %recur{index}.cell.copy.value, {pointer} %recur{index}.cell.copy.dst, align {align}")?;
+		writeln!(ir, "%recur{index}.cell.copy.c.next = add i32 %recur{index}.cell.copy.c, 1")?;
+		writeln!(ir, "br label %recur{index}.cell.copy.c.loop")?;
+		writeln!(ir, "recur{index}.cell.copy.row.step:")?;
+		writeln!(ir, "%recur{index}.cell.copy.row.next = add i32 %recur{index}.cell.copy.row, %threads")?;
+		writeln!(ir, "br label %recur{index}.cell.copy.row.loop")?;
+		writeln!(ir, "recur{index}.cell.copy.done:")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		let mut source_defs = String::new();
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate() {
+			let node_index = start + relative;
+			let name = format!("body{node_index}");
+			writeln!(source_defs, "%{name}.value.offset = add i32 %time.base, {}", layout.value_offsets[relative])?;
+			writeln!(source_defs, "%{name}.value.base = getelementptr inbounds {ty}, {pointer} %context, i32 %{name}.value.offset")?;
+			writeln!(source_defs, "%{name}.weights = getelementptr inbounds {ty}, {pointer} %weights, i32 {}", plan.node.offset)?;
+			for (label, source) in [("source", plan.node.source), ("second", plan.node.second)] {
+				if source == index as i32 || source == -1 {
+					writeln!(source_defs, "%{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %cell, i32 0")?;
+				} else if source >= start as i32 && source < (start + count) as i32 {
+					let source_rel = usize::try_from(source).unwrap() - start;
+					writeln!(source_defs, "%{name}.{label}.offset = add i32 %time.base, {}", layout.value_offsets[source_rel])?;
+					writeln!(source_defs, "%{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %context, i32 %{name}.{label}.offset")?;
+				}
+			}
+		}
+		ir.push_str(&source_defs);
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate() {
+			let node_index = start + relative;
+			let node = &plan.node;
+			let name = format!("body{node_index}");
+			let output_elements = node.output.elements();
+			let source_elements = node.input.elements();
+			let source = if node.source == index as i32 || node.source == -1 { "%cell".to_owned() } else { format!("%{name}.source.base") };
+			let second = if node.second >= start as i32 && node.second < (start + count) as i32 {
+				format!("%{name}.second.base")
+			} else if node.second == index as i32 || node.second == -1 {
+				"%cell".to_owned()
+			} else {
+				source.clone()
+			};
+			writeln!(ir, "br label %{name}.row.loop")?;
+			writeln!(ir, "{name}.row.loop:")?;
+			writeln!(ir, "%{name}.row = phi i32 [ %tid, %{} ], [ %{name}.row.next, %{name}.row.done ]", if relative == 0 { format!("recur{index}.cell.copy.done") } else { format!("body{previous}.done", previous = start + relative - 1) })?;
+			writeln!(ir, "%{name}.row.more = icmp ult i32 %{name}.row, %rows")?;
+			writeln!(ir, "br i1 %{name}.row.more, label %{name}.body, label %{name}.done")?;
+			writeln!(ir, "{name}.body:")?;
+			match node.op {
+				Primitive::Contraction => {
+					require(node.input.length == 1 && node.output.length == 1, format!("{} recurrent body contraction must preserve one position", node.identity(node_index)))?;
+					let kernel = integer_argument(node.argument[0], "recurrent body kernel")?;
+					let span = if kernel == 0 { 1 } else { usize::try_from(kernel).map_err(|_| RecipeError::new("recurrent body kernel is invalid"))? };
+					let terms = checked_mul(node.input.channels, span, "recurrent body contraction terms")?;
+					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
+					writeln!(ir, "br label %{name}.c.loop")?;
+					writeln!(ir, "{name}.c.loop:")?;
+					writeln!(ir, "%{name}.c = phi i32 [ 0, %{name}.body ], [ %{name}.c.next, %{name}.c.store ]")?;
+					writeln!(ir, "%{name}.c.more = icmp ult i32 %{name}.c, {}", node.output.channels)?;
+					writeln!(ir, "br i1 %{name}.c.more, label %{name}.k.loop, label %{name}.row.done")?;
+					writeln!(ir, "{name}.k.loop:")?;
+					writeln!(ir, "%{name}.k = phi i32 [ 0, %{name}.c.loop ], [ %{name}.k.next, %{name}.k.step ]")?;
+					writeln!(ir, "%{name}.acc = phi {ty} [ {zero}, %{name}.c.loop ], [ %{name}.acc.next, %{name}.k.step ]", zero = native_literal(self.precision.model, ty, 0.0))?;
+					writeln!(ir, "%{name}.k.more = icmp ult i32 %{name}.k, {terms}")?;
+					writeln!(ir, "br i1 %{name}.k.more, label %{name}.k.step, label %{name}.c.store")?;
+					writeln!(ir, "{name}.k.step:")?;
+					writeln!(ir, "%{name}.src.index = add i32 %{name}.row.base, %{name}.k")?;
+					writeln!(ir, "%{name}.src.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{name}.src.index")?;
+					writeln!(ir, "%{name}.src = load {ty}, {pointer} %{name}.src.ptr, align {align}")?;
+					writeln!(ir, "%{name}.weight.offset = mul i32 %{name}.k, {}", node.output.channels)?;
+					writeln!(ir, "%{name}.weight.local = add i32 %{name}.weight.offset, %{name}.c")?;
+					writeln!(ir, "%{name}.weight.ptr = getelementptr inbounds {ty}, {pointer} %{name}.weights, i32 %{name}.weight.local")?;
+					writeln!(ir, "%{name}.weight = load {ty}, {pointer} %{name}.weight.ptr, align {align}")?;
+					writeln!(ir, "%{name}.term = call {ty} @recipe.mul({ty} %{name}.src, {ty} %{name}.weight)")?;
+					writeln!(ir, "%{name}.acc.next = call {ty} @recipe.add({ty} %{name}.acc, {ty} %{name}.term)")?;
+					writeln!(ir, "%{name}.k.next = add i32 %{name}.k, 1")?;
+					writeln!(ir, "br label %{name}.k.loop")?;
+					writeln!(ir, "{name}.c.store:")?;
+					writeln!(ir, "%{name}.matrix = mul i32 {terms}, {}", node.output.channels)?;
+					writeln!(ir, "%{name}.bias.index = add i32 %{name}.matrix, %{name}.c")?;
+					writeln!(ir, "%{name}.bias.safe = select i1 {}, i32 %{name}.bias.index, i32 0", node.argument[2] == 0.0)?;
+					writeln!(ir, "%{name}.bias.ptr = getelementptr inbounds {ty}, {pointer} %{name}.weights, i32 %{name}.bias.safe")?;
+					writeln!(ir, "%{name}.bias.loaded = load {ty}, {pointer} %{name}.bias.ptr, align {align}")?;
+					writeln!(ir, "%{name}.biased = call {ty} @recipe.add({ty} %{name}.acc, {ty} %{name}.bias.loaded)")?;
+					writeln!(ir, "%{name}.raw = select i1 {}, {ty} %{name}.biased, {ty} %{name}.acc", node.argument[2] == 0.0)?;
+					writeln!(ir, "%{name}.positive = call i1 @recipe.ogt({ty} %{name}.raw, {ty} {zero})", zero = native_literal(self.precision.model, ty, 0.0))?;
+					writeln!(ir, "%{name}.relu = select i1 {}, {ty} %{name}.raw, {ty} {zero}", node.argument[1] == 1.0, zero = native_literal(self.precision.model, ty, 0.0))?;
+					writeln!(ir, "%{name}.result = select i1 {}, {ty} %{name}.relu, {ty} %{name}.raw", node.argument[1] == 1.0)?;
+					writeln!(ir, "%{name}.out.index = add i32 %{name}.row.base, %{name}.c")?;
+					writeln!(ir, "%{name}.out.ptr = getelementptr inbounds {ty}, {pointer} %{name}.value.base, i32 %{name}.out.index")?;
+					writeln!(ir, "store {ty} %{name}.result, {pointer} %{name}.out.ptr, align {align}")?;
+					writeln!(ir, "%{name}.c.next = add i32 %{name}.c, 1")?;
+					writeln!(ir, "br label %{name}.c.loop")?;
+				}
+				Primitive::Elementwise => {
+					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
+					let prefix = format!("recur{index}.body{node_index}");
+					let first = format!("%{prefix}.first");
+					let second_value = format!("%{prefix}.second");
+					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
+					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
+					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
+					writeln!(ir, "br label %{name}.p.loop")?;
+					writeln!(ir, "{name}.p.loop:")?;
+					writeln!(ir, "%{name}.p = phi i32 [ 0, %{name}.body ], [ %{name}.p.next, %{name}.p.step ]")?;
+					writeln!(ir, "%{name}.p.more = icmp ult i32 %{name}.p, {output_elements}")?;
+					writeln!(ir, "br i1 %{name}.p.more, label %{name}.p.step, label %{name}.row.done")?;
+					writeln!(ir, "{name}.p.step:")?;
+					writeln!(ir, "%{name}.first.index = add i32 %{name}.row.base, %{name}.p")?;
+					writeln!(ir, "%{name}.first.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{name}.first.index")?;
+					writeln!(ir, "{first} = load {ty}, {pointer} %{name}.first.ptr, align {align}")?;
+					if second != source {
+						writeln!(ir, "%{name}.second.index = add i32 %{name}.row.base, %{name}.p")?;
+						writeln!(ir, "%{name}.second.ptr = getelementptr inbounds {ty}, {pointer} {second}, i32 %{name}.second.index")?;
+						writeln!(ir, "{second_value} = load {ty}, {pointer} %{name}.second.ptr, align {align}")?;
+					}
+						ir.push_str(&forward.code);
+						writeln!(ir, "%{name}.out.index = add i32 %{name}.row.base, %{name}.p")?;
+						writeln!(ir, "%{name}.out.ptr = getelementptr inbounds {ty}, {pointer} %{name}.value.base, i32 %{name}.out.index")?;
+						writeln!(ir, "store {ty} {}, {pointer} %{name}.out.ptr, align {align}", forward.value)?;
+					writeln!(ir, "%{name}.p.next = add i32 %{name}.p, 1")?;
+					writeln!(ir, "br label %{name}.p.loop")?;
+				}
+				_ => return Err(RecipeError::new(format!("{} is not supported in a recurrent body emitter", node.identity(node_index)))),
+			}
+			writeln!(ir, "{name}.row.done:")?;
+			writeln!(ir, "%{name}.row.next = add i32 %{name}.row, %threads")?;
+			writeln!(ir, "br label %{name}.row.loop")?;
+			writeln!(ir, "{name}.done:")?;
+			ir.push_str(barrier(backend));
+			ir.push('\n');
+		}
+		let final_relative = count - 1;
+		let final_name = format!("body{}", start + final_relative);
+		writeln!(ir, "br label %recur{index}.final.row.loop")?;
+		writeln!(ir, "recur{index}.final.row.loop:")?;
+		writeln!(ir, "%recur{index}.final.row = phi i32 [ %tid, %body{last}.done ], [ %recur{index}.final.row.next, %recur{index}.final.row.step ]", last = start + final_relative)?;
+		writeln!(ir, "%recur{index}.final.row.more = icmp ult i32 %recur{index}.final.row, %rows")?;
+		writeln!(ir, "br i1 %recur{index}.final.row.more, label %recur{index}.final.row.body, label %recur{index}.final.done")?;
+		writeln!(ir, "recur{index}.final.row.body:")?;
+		writeln!(ir, "%recur{index}.final.row.base = mul i32 %recur{index}.final.row, {cell_width}")?;
+		writeln!(ir, "br label %recur{index}.final.c.loop")?;
+		writeln!(ir, "recur{index}.final.c.loop:")?;
+		writeln!(ir, "%recur{index}.final.c = phi i32 [ 0, %recur{index}.final.row.body ], [ %recur{index}.final.c.next, %recur{index}.final.c.step ]")?;
+		writeln!(ir, "%recur{index}.final.c.more = icmp ult i32 %recur{index}.final.c, {cell_width}")?;
+		writeln!(ir, "br i1 %recur{index}.final.c.more, label %recur{index}.final.c.step, label %recur{index}.final.row.step")?;
+		writeln!(ir, "recur{index}.final.c.step:")?;
+		writeln!(ir, "%recur{index}.final.src.index = add i32 %recur{index}.final.row.base, %recur{index}.final.c")?;
+		writeln!(ir, "%recur{index}.final.src.ptr = getelementptr inbounds {ty}, {pointer} %{final_name}.value.base, i32 %recur{index}.final.src.index")?;
+		writeln!(ir, "%recur{index}.final.src = load {ty}, {pointer} %recur{index}.final.src.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.final.dst.channel = mul i32 %recur{index}.final.c, %length")?;
+		writeln!(ir, "%recur{index}.final.dst.local = add i32 %recur{index}.final.dst.channel, %time")?;
+		writeln!(ir, "%recur{index}.final.dst.row = mul i32 %recur{index}.final.row, {cell_elements}")?;
+		writeln!(ir, "%recur{index}.final.dst.index = add i32 %recur{index}.final.dst.row, %recur{index}.final.dst.local")?;
+		writeln!(ir, "%recur{index}.final.dst.ptr = getelementptr inbounds {ty}, {pointer} %output, i32 %recur{index}.final.dst.index")?;
+		writeln!(ir, "store {ty} %recur{index}.final.src, {pointer} %recur{index}.final.dst.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.final.c.next = add i32 %recur{index}.final.c, 1")?;
+		writeln!(ir, "br label %recur{index}.final.c.loop")?;
+		writeln!(ir, "recur{index}.final.row.step:")?;
+		writeln!(ir, "%recur{index}.final.row.next = add i32 %recur{index}.final.row, %threads")?;
+		writeln!(ir, "br label %recur{index}.final.row.loop")?;
+		writeln!(ir, "recur{index}.final.done:")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		writeln!(ir, "ret void\n}}")?;
+		Ok(ir)
+	}
+	fn emit_recurrent_scan_forward(&self, backend: Backend, index: usize, node: &Node, layout: &RecurBodyLayout) -> Result<String> {
+		use std::fmt::Write as _;
+		let pointer = pointer_type(backend);
+		let ty = self.precision.model_type;
+		let align = alignment(ty);
+		let (_, thread) = native_entry(backend)?;
+		let input_channels = node.input.channels;
+		let cell_channels = node.output.channels;
+		let input_length = node.input.length;
+		let cell_elements = checked_mul(cell_channels, input_length, "recurrent cell elements")?;
+		let input_matrix = checked_mul(input_channels, cell_channels, "recurrent input matrix")?;
+		let state_matrix = checked_mul(cell_channels, cell_channels, "recurrent state matrix")?;
+		let (_, packed) = self.cell_activation(node)?;
+		let activation = packed & 15;
+		let zero = native_literal(self.precision.model, ty, 0.0);
+		let mut ir = String::new();
+		// Keep both input dimensions in the helper ABI.  The call site passes
+		// channels and sequence length separately; omitting channels here shifts
+		// every argument and made the old generic path use the channel count as
+		// the sequence length.
+		writeln!(ir, "define internal void @recipe_recur_scan_forward_{index}( {pointer} %input, {pointer} %weights, {pointer} %output, {pointer} %context, i32 %rows, i32 %in.channels, i32 %in.length, i32 %cell.channels, i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #3 {{")?;
+		writeln!(ir, "entry:")?;
+		writeln!(ir, "%tid = {thread}")?;
+		writeln!(ir, "%cell.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 {}", layout.base)?;
+		writeln!(ir, "br label %recur{index}.time.loop")?;
+		writeln!(ir, "recur{index}.time.loop:")?;
+		writeln!(ir, "%recur{index}.time = phi i32 [ 0, %entry ], [ %recur{index}.time.next, %recur{index}.body.done ]")?;
+		writeln!(ir, "%recur{index}.time.more = icmp ult i32 %recur{index}.time, %in.length")?;
+		writeln!(ir, "br i1 %recur{index}.time.more, label %recur{index}.row.loop, label %recur{index}.done")?;
+		writeln!(ir, "recur{index}.row.loop:")?;
+		writeln!(ir, "%recur{index}.row = phi i32 [ %tid, %recur{index}.time.loop ], [ %recur{index}.row.next.id, %recur{index}.row.next ]")?;
+		writeln!(ir, "%recur{index}.row.more = icmp ult i32 %recur{index}.row, %rows")?;
+		writeln!(ir, "br i1 %recur{index}.row.more, label %recur{index}.row.body, label %recur{index}.rows.done")?;
+		writeln!(ir, "recur{index}.row.body:")?;
+		writeln!(ir, "%recur{index}.row.base = mul i32 %recur{index}.row, {cell_elements}")?;
+		writeln!(ir, "%recur{index}.cell.row.base = mul i32 %recur{index}.row, {cell_channels}")?;
+		let input_elements = checked_mul(input_channels, input_length, "recurrent input elements")?;
+		writeln!(ir, "%recur{index}.input.row.base = mul i32 %recur{index}.row, {input_elements}")?;
+		writeln!(ir, "br label %recur{index}.c.loop")?;
+		writeln!(ir, "recur{index}.c.loop:")?;
+		writeln!(ir, "%recur{index}.c = phi i32 [ 0, %recur{index}.row.body ], [ %recur{index}.c.next, %recur{index}.c.store ]")?;
+		writeln!(ir, "%recur{index}.c.more = icmp ult i32 %recur{index}.c, {cell_channels}")?;
+		writeln!(ir, "br i1 %recur{index}.c.more, label %recur{index}.sum.loop, label %recur{index}.row.next")?;
+		writeln!(ir, "recur{index}.sum.loop:")?;
+		writeln!(ir, "%recur{index}.h = phi i32 [ 0, %recur{index}.c.loop ], [ %recur{index}.h.input.next, %recur{index}.input.step ], [ %recur{index}.h.state.next, %recur{index}.state.step ]")?;
+		writeln!(ir, "%recur{index}.sum = phi {ty} [ {zero}, %recur{index}.c.loop ], [ %recur{index}.sum.input.next, %recur{index}.input.step ], [ %recur{index}.sum.state.next, %recur{index}.state.step ]")?;
+		let terms = input_channels.checked_add(cell_channels).ok_or_else(|| RecipeError::new("recurrent cell terms overflow"))?;
+		writeln!(ir, "%recur{index}.h.more = icmp ult i32 %recur{index}.h, {terms}")?;
+		writeln!(ir, "br i1 %recur{index}.h.more, label %recur{index}.sum.step, label %recur{index}.c.store")?;
+		writeln!(ir, "recur{index}.sum.step:")?;
+		writeln!(ir, "%recur{index}.is.input = icmp ult i32 %recur{index}.h, {input_channels}")?;
+		writeln!(ir, "br i1 %recur{index}.is.input, label %recur{index}.input.step, label %recur{index}.state.step")?;
+		writeln!(ir, "recur{index}.input.step:")?;
+		writeln!(ir, "%recur{index}.input.channel = mul i32 %recur{index}.h, %in.length")?;
+		writeln!(ir, "%recur{index}.input.local = add i32 %recur{index}.input.channel, %recur{index}.time")?;
+		writeln!(ir, "%recur{index}.input.index = add i32 %recur{index}.input.row.base, %recur{index}.input.local")?;
+		writeln!(ir, "%recur{index}.input.ptr = getelementptr inbounds {ty}, {pointer} %input, i32 %recur{index}.input.index")?;
+		writeln!(ir, "%recur{index}.input = load {ty}, {pointer} %recur{index}.input.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.input.weight.row = mul i32 %recur{index}.h, {cell_channels}")?;
+		writeln!(ir, "%recur{index}.input.weight.local = add i32 %recur{index}.input.weight.row, %recur{index}.c")?;
+		writeln!(ir, "%recur{index}.input.weight.ptr = getelementptr inbounds {ty}, {pointer} %weights, i32 %recur{index}.input.weight.local")?;
+		writeln!(ir, "%recur{index}.input.weight = load {ty}, {pointer} %recur{index}.input.weight.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.input.term = call {ty} @recipe.mul({ty} %recur{index}.input, {ty} %recur{index}.input.weight)")?;
+		writeln!(ir, "%recur{index}.sum.input.next = call {ty} @recipe.add({ty} %recur{index}.sum, {ty} %recur{index}.input.term)")?;
+		writeln!(ir, "%recur{index}.h.input.next = add i32 %recur{index}.h, 1")?;
+		writeln!(ir, "br label %recur{index}.sum.loop")?;
+		writeln!(ir, "recur{index}.state.step:")?;
+		writeln!(ir, "%recur{index}.state.h = sub i32 %recur{index}.h, {input_channels}")?;
+		writeln!(ir, "%recur{index}.previous.time = sub i32 %recur{index}.time, 1")?;
+		writeln!(ir, "%recur{index}.has.previous = icmp ne i32 %recur{index}.time, 0")?;
+		writeln!(ir, "%recur{index}.previous.safe = select i1 %recur{index}.has.previous, i32 %recur{index}.previous.time, i32 0")?;
+		writeln!(ir, "%recur{index}.previous.channel = mul i32 %recur{index}.state.h, %in.length")?;
+		writeln!(ir, "%recur{index}.previous.local = add i32 %recur{index}.previous.channel, %recur{index}.previous.safe")?;
+		writeln!(ir, "%recur{index}.previous.index = add i32 %recur{index}.row.base, %recur{index}.previous.local")?;
+		writeln!(ir, "%recur{index}.previous.ptr = getelementptr inbounds {ty}, {pointer} %output, i32 %recur{index}.previous.index")?;
+		writeln!(ir, "%recur{index}.previous.loaded = load {ty}, {pointer} %recur{index}.previous.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.previous = select i1 %recur{index}.has.previous, {ty} %recur{index}.previous.loaded, {ty} {zero}")?;
+		writeln!(ir, "%recur{index}.state.weight.row = mul i32 %recur{index}.state.h, {cell_channels}")?;
+		writeln!(ir, "%recur{index}.state.weight.local = add i32 %recur{index}.state.weight.row, %recur{index}.c")?;
+		writeln!(ir, "%recur{index}.state.weight.index = add i32 {input_matrix}, %recur{index}.state.weight.local")?;
+		writeln!(ir, "%recur{index}.state.weight.ptr = getelementptr inbounds {ty}, {pointer} %weights, i32 %recur{index}.state.weight.index")?;
+		writeln!(ir, "%recur{index}.state.weight = load {ty}, {pointer} %recur{index}.state.weight.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.state.term = call {ty} @recipe.mul({ty} %recur{index}.previous, {ty} %recur{index}.state.weight)")?;
+		writeln!(ir, "%recur{index}.sum.state.next = call {ty} @recipe.add({ty} %recur{index}.sum, {ty} %recur{index}.state.term)")?;
+		writeln!(ir, "%recur{index}.h.state.next = add i32 %recur{index}.h, 1")?;
+		writeln!(ir, "br label %recur{index}.sum.loop")?;
+		writeln!(ir, "recur{index}.c.store:")?;
+		writeln!(ir, "%recur{index}.bias.index = add i32 {input_matrix_plus_state}, %recur{index}.c", input_matrix_plus_state = input_matrix + state_matrix)?;
+		writeln!(ir, "%recur{index}.bias.safe = select i1 %has.bias, i32 %recur{index}.bias.index, i32 0")?;
+		writeln!(ir, "%recur{index}.bias.ptr = getelementptr inbounds {ty}, {pointer} %weights, i32 %recur{index}.bias.safe")?;
+		writeln!(ir, "%recur{index}.bias.loaded = load {ty}, {pointer} %recur{index}.bias.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.biased = call {ty} @recipe.add({ty} %recur{index}.sum, {ty} %recur{index}.bias.loaded)")?;
+		writeln!(ir, "%recur{index}.linear = select i1 %has.bias, {ty} %recur{index}.biased, {ty} %recur{index}.sum")?;
+		let value = match activation {
+			0 => "%recur{index}.linear".to_owned(),
+			1 => {
+				writeln!(ir, "%recur{index}.positive = call i1 @recipe.ogt({ty} %recur{index}.linear, {ty} {zero})")?;
+				format!("%recur{index}.relu")
+			}
+			2 => {
+				writeln!(ir, "%recur{index}.tanh = call {ty} @recipe.tanh({ty} %recur{index}.linear)")?;
+				format!("%recur{index}.tanh")
+			}
+			3 => {
+				writeln!(ir, "%recur{index}.sigmoid = call {ty} @sigmoid({ty} %recur{index}.linear)")?;
+				format!("%recur{index}.sigmoid")
+			}
+			other => return Err(RecipeError::new(format!("recurrent cell activation code {other} is invalid"))),
+		};
+		if activation == 1 {
+			writeln!(ir, "%recur{index}.relu = select i1 %recur{index}.positive, {ty} %recur{index}.linear, {ty} {zero}")?;
+		}
+		writeln!(ir, "%recur{index}.cell.index = add i32 %recur{index}.cell.row.base, %recur{index}.c")?;
+		writeln!(ir, "%recur{index}.cell.out = getelementptr inbounds {ty}, {pointer} %cell.ptr, i32 %recur{index}.cell.index")?;
+		writeln!(ir, "store {ty} {value}, {pointer} %recur{index}.cell.out, align {align}")?;
+		writeln!(ir, "%recur{index}.c.next = add i32 %recur{index}.c, 1")?;
+		writeln!(ir, "br label %recur{index}.c.loop")?;
+		writeln!(ir, "recur{index}.row.next:")?;
+		writeln!(ir, "%recur{index}.row.next.id = add i32 %recur{index}.row, %threads")?;
+		writeln!(ir, "br label %recur{index}.row.loop")?;
+		writeln!(ir, "recur{index}.rows.done:")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		writeln!(ir, "call void @recipe_recur_body_forward_{index}( {pointer} %weights, {pointer} %context, {pointer} %cell.ptr, {pointer} %output, i32 %rows, i32 %threads, i32 %recur{index}.time, i32 %in.length )")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		writeln!(ir, "%recur{index}.time.next = add i32 %recur{index}.time, 1")?;
+		writeln!(ir, "br label %recur{index}.body.done")?;
+		writeln!(ir, "recur{index}.body.done:")?;
+		writeln!(ir, "br label %recur{index}.time.loop")?;
+		writeln!(ir, "recur{index}.done:")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		writeln!(ir, "ret void\n}}")?;
+		Ok(ir)
+	}
+	fn emit_recurrent_body_reverse(&self, backend: Backend, index: usize, node: &Node, layout: &RecurBodyLayout) -> Result<String> {
+		use std::fmt::Write as _;
+		let pointer = pointer_type(backend);
+		let ty = self.precision.model_type;
+		let align = alignment(ty);
+		let (_, thread) = native_entry(backend)?;
+		let start = usize::try_from(integer_argument(node.argument[3], "recurrent body start")?).map_err(|_| RecipeError::new("recurrent body start is invalid"))?;
+		let count = usize::try_from(integer_argument(node.argument[4], "recurrent body count")?).map_err(|_| RecipeError::new("recurrent body count is invalid"))?;
+		let cell_width = node.output.channels;
+		let length = node.output.length;
+		let cell_elements = checked_mul(cell_width, length, "recurrent cell elements")?;
+		let mut ir = String::new();
+		let zero = native_literal(self.precision.model, ty, 0.0);
+		writeln!(ir, "define internal void @recipe_recur_body_reverse_{index}( {pointer} %weights, {pointer} %context, {pointer} %output, {pointer} %delta, {pointer} %cell.delta, {pointer} %gradient, i32 %rows, i32 %threads, i32 %length ) #3 {{")?;
+		writeln!(ir, "entry:")?;
+		writeln!(ir, "%tid = {thread}")?;
+		writeln!(ir, "%owner = icmp eq i32 %tid, 0")?;
+		writeln!(ir, "br i1 %owner, label %owner.entry, label %owner.skip")?;
+		writeln!(ir, "owner.entry:")?;
+		writeln!(ir, "%length.minus.one = sub i32 %length, 1")?;
+		// The temporary body gradient is shared only by the owner lane. It is
+		// cleared before the first position and accumulated across every
+		// position before being merged into the model gradient arena.
+		if layout.temporary_gradient_len != 0 {
+			writeln!(ir, "br label %recur{index}.gradient.clear.loop")?;
+			writeln!(ir, "recur{index}.gradient.clear.loop:")?;
+			writeln!(ir, "%recur{index}.gradient.clear = phi i32 [ 0, %owner.entry ], [ %recur{index}.gradient.clear.next, %recur{index}.gradient.clear.step ]")?;
+			writeln!(ir, "%recur{index}.gradient.clear.more = icmp ult i32 %recur{index}.gradient.clear, {}", layout.temporary_gradient_len)?;
+			writeln!(ir, "br i1 %recur{index}.gradient.clear.more, label %recur{index}.gradient.clear.step, label %recur{index}.time.loop")?;
+			writeln!(ir, "recur{index}.gradient.clear.step:")?;
+			writeln!(ir, "%recur{index}.gradient.clear.offset = add i32 {temp}, %recur{index}.gradient.clear", temp = layout.temporary_gradient)?;
+			writeln!(ir, "%recur{index}.gradient.clear.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.gradient.clear.offset")?;
+			writeln!(ir, "store {ty} {zero}, {pointer} %recur{index}.gradient.clear.ptr, align {align}")?;
+			writeln!(ir, "%recur{index}.gradient.clear.next = add i32 %recur{index}.gradient.clear, 1")?;
+			writeln!(ir, "br label %recur{index}.gradient.clear.loop")?;
+		} else {
+			writeln!(ir, "br label %recur{index}.time.loop")?;
+		}
+		writeln!(ir, "recur{index}.time.loop:")?;
+		writeln!(ir, "%recur{index}.time = phi i32 [ %length.minus.one, %recur{index}.gradient.clear.loop ], [ %recur{index}.time.next, %recur{index}.time.done ]")?;
+		writeln!(ir, "%recur{index}.time.more = icmp sge i32 %recur{index}.time, 0")?;
+		writeln!(ir, "br i1 %recur{index}.time.more, label %recur{index}.time.body, label %recur{index}.owner.done")?;
+		writeln!(ir, "recur{index}.time.body:")?;
+		writeln!(ir, "%recur{index}.value.time.offset = mul i32 %recur{index}.time, {}", layout.value_stride)?;
+		writeln!(ir, "%recur{index}.value.time = add i32 {}, %recur{index}.value.time.offset", layout.values)?;
+		writeln!(ir, "%recur{index}.adjoint.time.offset = mul i32 %recur{index}.time, {}", layout.adjoint_stride)?;
+		writeln!(ir, "%recur{index}.adjoint.time = add i32 {}, %recur{index}.adjoint.time.offset", layout.adjoints)?;
+		writeln!(ir, "%recur{index}.cell.value.time = mul i32 %recur{index}.time, {}", layout.cell)?;
+		writeln!(ir, "%recur{index}.cell.value.offset = add i32 {}, %recur{index}.cell.value.time", layout.cell_values)?;
+		writeln!(ir, "%recur{index}.cell.value.base = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.cell.value.offset")?;
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate() {
+			let node_index = start + relative;
+			let name = format!("body{node_index}");
+			writeln!(ir, "%recur{index}.{name}.value.offset = add i32 %recur{index}.value.time, {}", layout.value_offsets[relative])?;
+			writeln!(ir, "%recur{index}.{name}.value.base = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.{name}.value.offset")?;
+			writeln!(ir, "%recur{index}.{name}.weights = getelementptr inbounds {ty}, {pointer} %weights, i32 {}", plan.node.offset)?;
+			for (label, source) in [("source", plan.node.source), ("second", plan.node.second)] {
+				if source == index as i32 || source == -1 {
+					writeln!(ir, "%recur{index}.{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %recur{index}.cell.value.base, i32 0")?;
+				} else if source >= start as i32 && source < (start + count) as i32 {
+					let source_rel = usize::try_from(source).map_err(|_| RecipeError::new("recurrent body source is invalid"))? - start;
+					writeln!(ir, "%recur{index}.{name}.{label}.offset = add i32 %recur{index}.value.time, {}", layout.value_offsets[source_rel])?;
+					writeln!(ir, "%recur{index}.{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.{name}.{label}.offset")?;
+				}
+			}
+		}
+		// Clear the cell-output adjoint for this position before any body node
+		// contributes to it.
+		writeln!(ir, "br label %recur{index}.cell.clear.row.loop")?;
+		writeln!(ir, "recur{index}.cell.clear.row.loop:")?;
+		writeln!(ir, "%recur{index}.cell.clear.row = phi i32 [ 0, %recur{index}.time.body ], [ %recur{index}.cell.clear.row.next, %recur{index}.cell.clear.row.step ]")?;
+		writeln!(ir, "%recur{index}.cell.clear.row.more = icmp ult i32 %recur{index}.cell.clear.row, %rows")?;
+		writeln!(ir, "br i1 %recur{index}.cell.clear.row.more, label %recur{index}.cell.clear.c.loop, label %recur{index}.body.clear.entry")?;
+		writeln!(ir, "recur{index}.cell.clear.c.loop:")?;
+		writeln!(ir, "%recur{index}.cell.clear.c = phi i32 [ 0, %recur{index}.cell.clear.row.loop ], [ %recur{index}.cell.clear.c.next, %recur{index}.cell.clear.c.step ]")?;
+		writeln!(ir, "%recur{index}.cell.clear.c.more = icmp ult i32 %recur{index}.cell.clear.c, {cell_width}")?;
+		writeln!(ir, "br i1 %recur{index}.cell.clear.c.more, label %recur{index}.cell.clear.c.step, label %recur{index}.cell.clear.row.step")?;
+		writeln!(ir, "recur{index}.cell.clear.c.step:")?;
+		writeln!(ir, "%recur{index}.cell.clear.row.base = mul i32 %recur{index}.cell.clear.row, {cell_elements}")?;
+		writeln!(ir, "%recur{index}.cell.clear.channel = mul i32 %recur{index}.cell.clear.c, %length")?;
+		writeln!(ir, "%recur{index}.cell.clear.local = add i32 %recur{index}.cell.clear.channel, %recur{index}.time")?;
+		writeln!(ir, "%recur{index}.cell.clear.index = add i32 %recur{index}.cell.clear.row.base, %recur{index}.cell.clear.local")?;
+		writeln!(ir, "%recur{index}.cell.clear.ptr = getelementptr inbounds {ty}, {pointer} %cell.delta, i32 %recur{index}.cell.clear.index")?;
+		writeln!(ir, "store {ty} {zero}, {pointer} %recur{index}.cell.clear.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.cell.clear.c.next = add i32 %recur{index}.cell.clear.c, 1")?;
+		writeln!(ir, "br label %recur{index}.cell.clear.c.loop")?;
+		writeln!(ir, "recur{index}.cell.clear.row.step:")?;
+		writeln!(ir, "%recur{index}.cell.clear.row.next = add i32 %recur{index}.cell.clear.row, 1")?;
+		writeln!(ir, "br label %recur{index}.cell.clear.row.loop")?;
+		// Clear each body node's adjoint slice for this position. The reverse
+		// pass then adds contributions from later nodes in a deterministic order.
+		writeln!(ir, "recur{index}.body.clear.entry:")?;
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate() {
+			let node_index = start + relative;
+			let elements = plan.node.output.elements();
+			let clear_predecessor = if relative == 0 { format!("recur{index}.body.clear.entry") } else { format!("recur{index}.clear{}.done", node_index - 1) };
+			writeln!(ir, "br label %recur{index}.clear{node_index}.loop")?;
+			writeln!(ir, "recur{index}.clear{node_index}.loop:")?;
+			writeln!(ir, "%recur{index}.clear{node_index} = phi i32 [ 0, %{clear_predecessor} ], [ %recur{index}.clear{node_index}.next, %recur{index}.clear{node_index}.step ]")?;
+			writeln!(ir, "%recur{index}.clear{node_index}.more = icmp ult i32 %recur{index}.clear{node_index}, {}", checked_mul(self.rows, elements, "recurrent body adjoint clear")?)?;
+			writeln!(ir, "br i1 %recur{index}.clear{node_index}.more, label %recur{index}.clear{node_index}.step, label %recur{index}.clear{node_index}.done")?;
+			writeln!(ir, "recur{index}.clear{node_index}.step:")?;
+			writeln!(ir, "%recur{index}.clear{node_index}.offset = add i32 %recur{index}.adjoint.time, {}", layout.adjoint_offsets[relative])?;
+			writeln!(ir, "%recur{index}.clear{node_index}.position = add i32 %recur{index}.clear{node_index}.offset, %recur{index}.clear{node_index}")?;
+			writeln!(ir, "%recur{index}.clear{node_index}.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.clear{node_index}.position")?;
+			writeln!(ir, "store {ty} {zero}, {pointer} %recur{index}.clear{node_index}.ptr, align {align}")?;
+			writeln!(ir, "%recur{index}.clear{node_index}.next = add i32 %recur{index}.clear{node_index}, 1")?;
+			writeln!(ir, "br label %recur{index}.clear{node_index}.loop")?;
+			writeln!(ir, "recur{index}.clear{node_index}.done:")?;
+		}
+		// The final node receives the scan's output adjoint as its body output
+		// adjoint. Every other body adjoint starts at zero and is populated by
+		// reversing a later node.
+		let final_index = start + count - 1;
+		let final_node_ref = &self.plans[final_index].node;
+		writeln!(ir, "br label %recur{index}.seed.row.loop")?;
+		writeln!(ir, "recur{index}.seed.row.loop:")?;
+		writeln!(ir, "%recur{index}.seed.row = phi i32 [ 0, %recur{index}.clear{final_index}.done ], [ %recur{index}.seed.row.next, %recur{index}.seed.row.step ]")?;
+		writeln!(ir, "%recur{index}.seed.row.more = icmp ult i32 %recur{index}.seed.row, %rows")?;
+		writeln!(ir, "br i1 %recur{index}.seed.row.more, label %recur{index}.seed.c.loop, label %recur{index}.reverse.entry")?;
+		writeln!(ir, "recur{index}.seed.c.loop:")?;
+		writeln!(ir, "%recur{index}.seed.c = phi i32 [ 0, %recur{index}.seed.row.loop ], [ %recur{index}.seed.c.next, %recur{index}.seed.c.step ]")?;
+		writeln!(ir, "%recur{index}.seed.c.more = icmp ult i32 %recur{index}.seed.c, {}", final_node_ref.output.channels)?;
+		writeln!(ir, "br i1 %recur{index}.seed.c.more, label %recur{index}.seed.c.step, label %recur{index}.seed.row.step")?;
+		writeln!(ir, "recur{index}.seed.c.step:")?;
+		writeln!(ir, "%recur{index}.seed.row.base = mul i32 %recur{index}.seed.row, {cell_width}")?;
+		writeln!(ir, "%recur{index}.seed.src.index = add i32 %recur{index}.seed.row.base, %recur{index}.seed.c")?;
+		writeln!(ir, "%recur{index}.seed.src.time = mul i32 %recur{index}.seed.c, %length")?;
+		writeln!(ir, "%recur{index}.seed.src.local = add i32 %recur{index}.seed.src.time, %recur{index}.time")?;
+		writeln!(ir, "%recur{index}.seed.src.index.full = add i32 %recur{index}.seed.row.base, %recur{index}.seed.src.local")?;
+		writeln!(ir, "%recur{index}.seed.src.ptr = getelementptr inbounds {ty}, {pointer} %delta, i32 %recur{index}.seed.src.index.full")?;
+		writeln!(ir, "%recur{index}.seed.src = load {ty}, {pointer} %recur{index}.seed.src.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.seed.dst.row.base = mul i32 %recur{index}.seed.row, {cell_width}")?;
+		writeln!(ir, "%recur{index}.seed.dst.index = add i32 %recur{index}.adjoint.time, {}", layout.adjoint_offsets[final_index - start])?;
+		writeln!(ir, "%recur{index}.seed.dst.local = add i32 %recur{index}.seed.dst.index, %recur{index}.seed.dst.row.base")?;
+		writeln!(ir, "%recur{index}.seed.dst.local.full = add i32 %recur{index}.seed.dst.local, %recur{index}.seed.c")?;
+		writeln!(ir, "%recur{index}.seed.dst.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.seed.dst.local.full")?;
+		writeln!(ir, "store {ty} %recur{index}.seed.src, {pointer} %recur{index}.seed.dst.ptr, align {align}")?;
+		writeln!(ir, "%recur{index}.seed.c.next = add i32 %recur{index}.seed.c, 1")?;
+		writeln!(ir, "br label %recur{index}.seed.c.loop")?;
+		writeln!(ir, "recur{index}.seed.row.step:")?;
+		writeln!(ir, "%recur{index}.seed.row.next = add i32 %recur{index}.seed.row, 1")?;
+		writeln!(ir, "br label %recur{index}.seed.row.loop")?;
+		writeln!(ir, "recur{index}.reverse.entry:")?;
+		// Reverse the lowered body graph. Contractions are expanded directly so
+		// source adjoints and temporary parameter gradients are accumulated in
+		// the same order as the forward tape. Scalar programs reuse the existing
+		// compile-time reverse emitter.
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate().rev() {
+			let node_index = start + relative;
+			let node = &plan.node;
+			let elements = node.output.elements();
+			let source_elements = node.input.elements();
+			writeln!(ir, "br label %recur{index}.reverse{node_index}.row.loop")?;
+			writeln!(ir, "recur{index}.reverse{node_index}.row.loop:")?;
+			let reverse_predecessor = if relative == count - 1 { format!("recur{index}.reverse.entry") } else { format!("recur{index}.reverse{}.done", node_index + 1) };
+			writeln!(ir, "%recur{index}.reverse{node_index}.row = phi i32 [ 0, %{reverse_predecessor} ], [ %recur{index}.reverse{node_index}.row.next, %recur{index}.reverse{node_index}.row.step ]")?;
+			writeln!(ir, "%recur{index}.reverse{node_index}.row.more = icmp ult i32 %recur{index}.reverse{node_index}.row, %rows")?;
+			writeln!(ir, "br i1 %recur{index}.reverse{node_index}.row.more, label %recur{index}.reverse{node_index}.row.body, label %recur{index}.reverse{node_index}.done")?;
+			writeln!(ir, "recur{index}.reverse{node_index}.row.body:")?;
+			match node.op {
+				Primitive::Contraction => {
+					require(node.input.length == 1 && node.output.length == 1, format!("{} recurrent body contraction must preserve one position", node.identity(node_index)))?;
+					let kernel = integer_argument(node.argument[0], "recurrent body kernel")?;
+					let span = if kernel == 0 { 1 } else { usize::try_from(kernel).map_err(|_| RecipeError::new("recurrent body kernel is invalid"))? };
+					require(span == 1, "recurrent body convolution requires one-position input")?;
+					let terms = node.input.channels;
+					writeln!(ir, "%recur{index}.reverse{node_index}.row.base = mul i32 %recur{index}.reverse{node_index}.row, {source_elements}")?;
+					writeln!(ir, "br label %recur{index}.reverse{node_index}.c.loop")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.c.loop:")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.c = phi i32 [ 0, %recur{index}.reverse{node_index}.row.body ], [ %recur{index}.reverse{node_index}.c.next, %recur{index}.reverse{node_index}.k.done ]")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.c.more = icmp ult i32 %recur{index}.reverse{node_index}.c, {}", node.output.channels)?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.index = add i32 %recur{index}.reverse{node_index}.row.base, %recur{index}.reverse{node_index}.c")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.adjoint.offset = add i32 %recur{index}.adjoint.time, {}", layout.adjoint_offsets[relative])?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.adjoint.full = add i32 %recur{index}.reverse{node_index}.output.adjoint.offset, %recur{index}.reverse{node_index}.output.index")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.adjoint.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.output.adjoint.full")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.adjoint = load {ty}, {pointer} %recur{index}.reverse{node_index}.output.adjoint.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.offset = add i32 %recur{index}.value.time, {}", layout.value_offsets[relative])?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.full = add i32 %recur{index}.reverse{node_index}.output.offset, %recur{index}.reverse{node_index}.output.index")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.output.full")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.output = load {ty}, {pointer} %recur{index}.reverse{node_index}.output.ptr, align {align}")?;
+					if node.argument[1] == 1.0 {
+						writeln!(ir, "%recur{index}.reverse{node_index}.positive = call i1 @recipe.ogt({ty} %recur{index}.reverse{node_index}.output, {ty} {zero})")?;
+					}
+					if node.argument[1] == 1.0 {
+						writeln!(ir, "%recur{index}.reverse{node_index}.relu.adjoint = select i1 %recur{index}.reverse{node_index}.positive, {ty} %recur{index}.reverse{node_index}.output.adjoint, {ty} {zero}")?;
+					} else {
+						writeln!(ir, "%recur{index}.reverse{node_index}.relu.adjoint = call {ty} @recipe.add({ty} %recur{index}.reverse{node_index}.output.adjoint, {ty} {zero})")?;
+					}
+					writeln!(ir, "br i1 %recur{index}.reverse{node_index}.c.more, label %recur{index}.reverse{node_index}.k.loop, label %recur{index}.reverse{node_index}.row.step")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.k.loop:")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.k = phi i32 [ 0, %recur{index}.reverse{node_index}.c.loop ], [ %recur{index}.reverse{node_index}.k.next, %recur{index}.reverse{node_index}.k.step ]")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.k.more = icmp ult i32 %recur{index}.reverse{node_index}.k, {terms}")?;
+					writeln!(ir, "br i1 %recur{index}.reverse{node_index}.k.more, label %recur{index}.reverse{node_index}.k.step, label %recur{index}.reverse{node_index}.k.done")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.k.step:")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.weight.offset = mul i32 %recur{index}.reverse{node_index}.k, {}", node.output.channels)?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.weight.local = add i32 %recur{index}.reverse{node_index}.weight.offset, %recur{index}.reverse{node_index}.c")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.weight.ptr = getelementptr inbounds {ty}, {pointer} %recur{index}.body{node_index}.weights, i32 %recur{index}.reverse{node_index}.weight.local")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.weight = load {ty}, {pointer} %recur{index}.reverse{node_index}.weight.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.incoming = call {ty} @recipe.mul({ty} %recur{index}.reverse{node_index}.relu.adjoint, {ty} %recur{index}.reverse{node_index}.weight)")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.source.index = add i32 %recur{index}.reverse{node_index}.row.base, %recur{index}.reverse{node_index}.k")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.source.ptr = getelementptr inbounds {ty}, {pointer} %recur{index}.body{node_index}.source.base, i32 %recur{index}.reverse{node_index}.source.index")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.source = load {ty}, {pointer} %recur{index}.reverse{node_index}.source.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient = mul i32 %recur{index}.reverse{node_index}.k, {}", node.output.channels)?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.local = add i32 %recur{index}.reverse{node_index}.gradient, %recur{index}.reverse{node_index}.c")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.offset = add i32 {}, {}", layout.temporary_gradient, layout.gradient_offsets[relative])?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.full = add i32 %recur{index}.reverse{node_index}.gradient.offset, %recur{index}.reverse{node_index}.gradient.local")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.gradient.full")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.old = load {ty}, {pointer} %recur{index}.reverse{node_index}.gradient.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.term = call {ty} @recipe.mul({ty} %recur{index}.reverse{node_index}.relu.adjoint, {ty} %recur{index}.reverse{node_index}.source)")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.gradient.new = call {ty} @recipe.add({ty} %recur{index}.reverse{node_index}.gradient.old, {ty} %recur{index}.reverse{node_index}.gradient.term)")?;
+					writeln!(ir, "store {ty} %recur{index}.reverse{node_index}.gradient.new, {pointer} %recur{index}.reverse{node_index}.gradient.ptr, align {align}")?;
+						let source_adjoint_pointer = if node.source == index as i32 || node.source == -1 { "%cell.delta".to_owned() } else { format!("%recur{index}.reverse{node_index}.source.adjoint") };
+						if node.source == index as i32 || node.source == -1 {
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.row = mul i32 %recur{index}.reverse{node_index}.row, {cell_elements}")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.channel = mul i32 %recur{index}.reverse{node_index}.k, %length")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.local = add i32 %recur{index}.reverse{node_index}.source.adjoint.channel, %recur{index}.time")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.index = add i32 %recur{index}.reverse{node_index}.source.adjoint.row, %recur{index}.reverse{node_index}.source.adjoint.local")?;
+					} else {
+						let base = layout.adjoint_offsets[usize::try_from(node.source).map_err(|_| RecipeError::new("recurrent body source is invalid"))? - start];
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.base = add i32 %recur{index}.adjoint.time, {base}")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.index = add i32 %recur{index}.reverse{node_index}.source.adjoint.base, %recur{index}.reverse{node_index}.source.index")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.source.adjoint.index")?;
+					}
+						if node.source == index as i32 || node.source == -1 {
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.ptr = getelementptr inbounds {ty}, {pointer} {source_adjoint_pointer}, i32 %recur{index}.reverse{node_index}.source.adjoint.index")?;
+					} else {
+						writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.ptr = getelementptr inbounds {ty}, {pointer} {source_adjoint_pointer}, i32 0")?;
+					}
+					writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.old = load {ty}, {pointer} %recur{index}.reverse{node_index}.source.adjoint.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.source.adjoint.new = call {ty} @recipe.add({ty} %recur{index}.reverse{node_index}.source.adjoint.old, {ty} %recur{index}.reverse{node_index}.incoming)")?;
+					writeln!(ir, "store {ty} %recur{index}.reverse{node_index}.source.adjoint.new, {pointer} %recur{index}.reverse{node_index}.source.adjoint.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.k.next = add i32 %recur{index}.reverse{node_index}.k, 1")?;
+					writeln!(ir, "br label %recur{index}.reverse{node_index}.k.loop")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.k.done:")?;
+					// Bias gradient is the output adjoint, once per output channel.
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.index = add i32 {}, %recur{index}.reverse{node_index}.c", terms * node.output.channels)?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.offset = add i32 {}, {}", layout.temporary_gradient, layout.gradient_offsets[relative])?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.full = add i32 %recur{index}.reverse{node_index}.bias.offset, %recur{index}.reverse{node_index}.bias.index")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.bias.full")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.old = load {ty}, {pointer} %recur{index}.reverse{node_index}.bias.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.value = select i1 {}, {ty} %recur{index}.reverse{node_index}.relu.adjoint, {ty} {zero}", node.argument[2] == 0.0, zero = zero)?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.bias.new = call {ty} @recipe.add({ty} %recur{index}.reverse{node_index}.bias.old, {ty} %recur{index}.reverse{node_index}.bias.value)")?;
+					writeln!(ir, "store {ty} %recur{index}.reverse{node_index}.bias.new, {pointer} %recur{index}.reverse{node_index}.bias.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.c.next = add i32 %recur{index}.reverse{node_index}.c, 1")?;
+					writeln!(ir, "br label %recur{index}.reverse{node_index}.c.loop")?;
+				}
+				Primitive::Elementwise => {
+					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
+					let prefix = format!("recur{index}.reverse.body{node_index}");
+					let first = format!("%{prefix}.first");
+					let second_value = format!("%{prefix}.second");
+						// `-1` is the body input, while `-2` means that a second
+						// operand is absent.  Preserve that distinction when replaying
+						// scalar operations in reverse.
+						let source_same = node.second == -2 || node.second == node.source;
+					let second_operand = if source_same { first.as_str() } else { second_value.as_str() };
+					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar reverse program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar reverse program range overflows"))?;
+					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar reverse program range is invalid"))?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.row.base = mul i32 %recur{index}.reverse{node_index}.row, {source_elements}")?;
+					writeln!(ir, "br label %recur{index}.reverse{node_index}.p.loop")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.p.loop:")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.p = phi i32 [ 0, %recur{index}.reverse{node_index}.row.body ], [ %recur{index}.reverse{node_index}.p.next, %recur{index}.reverse{node_index}.p.step ]")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.p.more = icmp ult i32 %recur{index}.reverse{node_index}.p, {elements}")?;
+					writeln!(ir, "br i1 %recur{index}.reverse{node_index}.p.more, label %recur{index}.reverse{node_index}.p.step, label %recur{index}.reverse{node_index}.row.step")?;
+					writeln!(ir, "recur{index}.reverse{node_index}.p.step:")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.adjoint.offset = add i32 %recur{index}.adjoint.time, {}", layout.adjoint_offsets[relative])?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.adjoint.index = add i32 %recur{index}.reverse{node_index}.adjoint.offset, %recur{index}.reverse{node_index}.row.base")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.adjoint.full = add i32 %recur{index}.reverse{node_index}.adjoint.index, %recur{index}.reverse{node_index}.p")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.adjoint.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.adjoint.full")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.incoming = load {ty}, {pointer} %recur{index}.reverse{node_index}.adjoint.ptr, align {align}")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.first.index = add i32 %recur{index}.reverse{node_index}.row.base, %recur{index}.reverse{node_index}.p")?;
+					writeln!(ir, "%recur{index}.reverse{node_index}.first.ptr = getelementptr inbounds {ty}, {pointer} %recur{index}.body{node_index}.source.base, i32 %recur{index}.reverse{node_index}.first.index")?;
+					writeln!(ir, "{first} = load {ty}, {pointer} %recur{index}.reverse{node_index}.first.ptr, align {align}")?;
+					if !source_same {
+						writeln!(ir, "%recur{index}.reverse{node_index}.second.ptr = getelementptr inbounds {ty}, {pointer} %recur{index}.body{node_index}.second.base, i32 %recur{index}.reverse{node_index}.first.index")?;
+						writeln!(ir, "{second_value} = load {ty}, {pointer} %recur{index}.reverse{node_index}.second.ptr, align {align}")?;
+					}
+					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
+					let scalar_context = program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, prefix: &prefix, literal: &literal };
+					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
+					ir.push_str(&forward.code);
+					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming")).map_err(|error| RecipeError::new(error.to_string()))?;
+					ir.push_str(&reverse.code);
+					let destination = |source: i32, which: &str, value: &str, ir: &mut String| -> Result<()> {
+						let pointer_name = format!("%recur{index}.reverse{node_index}.{which}.dst");
+							if source == index as i32 || source == -1 {
+							writeln!(ir, "{pointer_name}.row = mul i32 %recur{index}.reverse{node_index}.row, {cell_elements}")?;
+							writeln!(ir, "{pointer_name}.channel = mul i32 %recur{index}.reverse{node_index}.p, %length")?;
+							writeln!(ir, "{pointer_name}.local = add i32 {pointer_name}.channel, %recur{index}.time")?;
+							writeln!(ir, "{pointer_name}.index = add i32 {pointer_name}.row, {pointer_name}.local")?;
+							writeln!(ir, "{pointer_name}.ptr = getelementptr inbounds {ty}, {pointer} %cell.delta, i32 {pointer_name}.index")?;
+						} else {
+							let base = layout.adjoint_offsets[usize::try_from(source).map_err(|_| RecipeError::new("recurrent body source is invalid"))? - start];
+							writeln!(ir, "{pointer_name}.base = add i32 %recur{index}.adjoint.time, {base}")?;
+							writeln!(ir, "{pointer_name}.row = add i32 {pointer_name}.base, %recur{index}.reverse{node_index}.row.base")?;
+							writeln!(ir, "{pointer_name}.index = add i32 {pointer_name}.row, %recur{index}.reverse{node_index}.p")?;
+							writeln!(ir, "{pointer_name}.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 {pointer_name}.index")?;
+						}
+						writeln!(ir, "{pointer_name}.old = load {ty}, {pointer} {pointer_name}.ptr, align {align}")?;
+						writeln!(ir, "{pointer_name}.new = call {ty} @recipe.add({ty} {pointer_name}.old, {ty} {value})")?;
+						writeln!(ir, "store {ty} {pointer_name}.new, {pointer} {pointer_name}.ptr, align {align}")?;
+						Ok(())
+					};
+					if source_same {
+						let combined = format!("%recur{index}.reverse{node_index}.combined");
+						writeln!(ir, "{combined} = call {ty} @recipe.add({ty} {}, {ty} {})", reverse.first_adjoint, reverse.second_adjoint)?;
+						destination(node.source, "source", &combined, &mut ir)?;
+					} else {
+						destination(node.source, "first", &reverse.first_adjoint, &mut ir)?;
+							if node.second == -1 || (node.second >= start as i32 && node.second < (start + count) as i32) {
+							destination(node.second, "second", &reverse.second_adjoint, &mut ir)?;
+						}
+					}
+					for (parameter, value) in reverse.parameter_adjoint {
+						writeln!(ir, "%recur{index}.reverse{node_index}.parameter{parameter}.offset = add i32 {temp}, {}", layout.gradient_offsets[relative] + parameter, temp = layout.temporary_gradient)?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.parameter{parameter}.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.reverse{node_index}.parameter{parameter}.offset")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.parameter{parameter}.old = load {ty}, {pointer} %recur{index}.reverse{node_index}.parameter{parameter}.ptr, align {align}")?;
+						writeln!(ir, "%recur{index}.reverse{node_index}.parameter{parameter}.new = call {ty} @recipe.add({ty} %recur{index}.reverse{node_index}.parameter{parameter}.old, {ty} {value})")?;
+						writeln!(ir, "store {ty} %recur{index}.reverse{node_index}.parameter{parameter}.new, {pointer} %recur{index}.reverse{node_index}.parameter{parameter}.ptr, align {align}")?;
+					}
+					writeln!(ir, "%recur{index}.reverse{node_index}.p.next = add i32 %recur{index}.reverse{node_index}.p, 1")?;
+					writeln!(ir, "br label %recur{index}.reverse{node_index}.p.loop")?;
+				}
+				_ => return Err(RecipeError::new(format!("{} is not supported in a recurrent body reverse emitter", node.identity(node_index)))),
+			}
+			writeln!(ir, "recur{index}.reverse{node_index}.row.step:")?;
+			writeln!(ir, "%recur{index}.reverse{node_index}.row.next = add i32 %recur{index}.reverse{node_index}.row, 1")?;
+			writeln!(ir, "br label %recur{index}.reverse{node_index}.row.loop")?;
+			writeln!(ir, "recur{index}.reverse{node_index}.done:")?;
+		}
+		writeln!(ir, "br label %recur{index}.time.done")?;
+		writeln!(ir, "recur{index}.time.done:")?;
+		writeln!(ir, "%recur{index}.time.next = sub i32 %recur{index}.time, 1")?;
+		writeln!(ir, "br label %recur{index}.time.loop")?;
+		writeln!(ir, "recur{index}.owner.done:")?;
+		// Merge the temporary body gradients into their actual graph parameter
+		// ranges only after every sequence position has been reversed.
+		writeln!(ir, "br label %recur{index}.gradient.merge.entry")?;
+		writeln!(ir, "recur{index}.gradient.merge.entry:")?;
+		let mut predecessor = format!("recur{index}.gradient.merge.entry");
+		for (relative, plan) in self.plans[start..start + count].iter().enumerate() {
+			if plan.node.parameters == 0 { continue; }
+			let node_index = start + relative;
+			let name = format!("recur{index}.gradient.merge{node_index}");
+			writeln!(ir, "br label %{name}.loop")?;
+			writeln!(ir, "{name}.loop:")?;
+			writeln!(ir, "%{name} = phi i32 [ 0, %{predecessor} ], [ %{name}.next, %{name}.step ]")?;
+			writeln!(ir, "%{name}.more = icmp ult i32 %{name}, {}", plan.node.parameters)?;
+			writeln!(ir, "br i1 %{name}.more, label %{name}.step, label %{name}.done")?;
+			writeln!(ir, "{name}.step:")?;
+			writeln!(ir, "%{name}.temp.offset = add i32 {}, %{name}", layout.temporary_gradient + layout.gradient_offsets[relative])?;
+			writeln!(ir, "%{name}.temp.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %{name}.temp.offset")?;
+			writeln!(ir, "%{name}.global.offset = add i32 {}, %{name}", plan.node.offset)?;
+			writeln!(ir, "%{name}.global.ptr = getelementptr inbounds {ty}, {pointer} %gradient, i32 %{name}.global.offset")?;
+			writeln!(ir, "%{name}.temp = load {ty}, {pointer} %{name}.temp.ptr, align {align}")?;
+			writeln!(ir, "%{name}.global = load {ty}, {pointer} %{name}.global.ptr, align {align}")?;
+			writeln!(ir, "%{name}.value = call {ty} @recipe.add({ty} %{name}.temp, {ty} %{name}.global)")?;
+			writeln!(ir, "store {ty} %{name}.value, {pointer} %{name}.global.ptr, align {align}")?;
+			writeln!(ir, "%{name}.next = add i32 %{name}, 1")?;
+			writeln!(ir, "br label %{name}.loop")?;
+			writeln!(ir, "{name}.done:")?;
+			predecessor = format!("{name}.done");
+		}
+		writeln!(ir, "br label %recur{index}.gradient.merge.done")?;
+		writeln!(ir, "recur{index}.gradient.merge.done:")?;
+		writeln!(ir, "br label %recur{index}.sync")?;
+		writeln!(ir, "owner.skip:")?;
+		writeln!(ir, "br label %recur{index}.sync")?;
+		writeln!(ir, "recur{index}.sync:")?;
+		ir.push_str(barrier(backend));
+		ir.push('\n');
+		writeln!(ir, "ret void\n}}")?;
+		Ok(ir)
+	}
+	fn emit_recurrent_body_functions(&self, backend: Backend) -> Result<String> {
+		let mut ir = String::new();
+		for (index, plan) in self.plans.iter().enumerate() {
+			let Some(layout) = self.recurrent_body_layout(index, &plan.node)? else { continue };
+			ir.push_str(&self.emit_recurrent_scan_forward(backend, index, &plan.node, &layout)?);
+			ir.push_str(&self.emit_recurrent_body_forward(backend, index, &plan.node, &layout)?);
+			ir.push_str(&self.emit_recurrent_body_reverse(backend, index, &plan.node, &layout)?);
+		}
+		Ok(ir)
 	}
 	/// Where a recurrent node's saved stage rows begin: after the gate states,
 	/// the per-row gradients and the scan's own scratch, which is the order
@@ -3309,6 +4175,8 @@ impl NativeModelIr {
 			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
+		ir.push_str(&self.emit_recurrent_stage_metadata()?);
+		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
@@ -5075,6 +5943,11 @@ fn debug(message: &str) -> Result<()> {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
+impl From<std::fmt::Error> for RecipeError {
+	fn from(_: std::fmt::Error) -> Self {
+		Self("cannot format native recurrent body IR".to_owned())
+	}
+}
 impl RecipeError {
 	fn new(message: impl Into<String>) -> Self {
 		Self(message.into())
@@ -7380,7 +8253,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
-		Operation::Recur(parts) => lower_recur(graph, parts)?,
+		Operation::Recur(parts) => lower_recur(graph, parts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
@@ -7839,8 +8712,8 @@ fn recur_activation(activation: Activation) -> Result<usize> {
 	}
 }
 /// The stages a recurrent body declares, as a width and the activation that
-/// closes each one. Every stage carries the same width because the body's
-/// output is the next position's state, and the state enters the first stage.
+/// closes each one. The first stage is the recurrent cell; later stages are
+/// ordinary per-position projections and may have independent widths.
 fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
 	require(!parts.is_empty(), "a recurrence must contain an operation")?;
 	let mut stages: Vec<(usize, usize)> = Vec::new();
@@ -7851,16 +8724,6 @@ fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
 		match block.operation {
 			Operation::Layer(width) => {
 				require(width != 0, "recurrent width must be positive")?;
-				require(stages.first().is_none_or(|(first, _)| *first == width), "every layer of a recurrent body carries the width the recurrence carries")?;
-				// Two stages is the cell plus one stage past it, which is as far as
-				// the reverse is trustworthy. From three, a stage's gradient reaches
-				// the one before it, and there the reverse stops being reproducible:
-				// six one-epoch runs of the same three-stage model give six different
-				// losses on cpu and on nv0 alike, and one worker thread makes it go
-				// away. The cause is not the arena size, the saved-row stride, or the
-				// in-place delta, all of which were changed and measured. Refusing is
-				// better than training on a number that does not repeat.
-				require(stages.len() < 2, "a recurrent body takes at most two stages")?;
 				stages.push((width, recur_activation(block.activation)?));
 			}
 			// An activation on its own closes the stage before it.
@@ -7878,29 +8741,79 @@ fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
 		}
 	}
 	require(!stages.is_empty(), "a recurrent body must contain a layer")?;
+	require(stages.last().is_some_and(|last| last.0 == stages[0].0), "a recurrent body's final stage must match its recurrent state width")?;
 	Ok(stages)
 }
 /// A recurrence over the sequence. The first stage is the recurrent cell, which
 /// reads the position's input and the previous position's output; every further
 /// stage transforms that state in place before it is carried forward.
-fn lower_recur(graph: &mut Graph, parts: &[Block]) -> Result<()> {
-	let stages = recur_stages(parts)?;
-	let width = stages[0].0;
-	let extra = stages.len() - 1;
-	let cell = checked_add(checked_add(checked_mul(graph.output.channels, width, "recurrent input matrix")?, checked_mul(width, width, "recurrent state matrix")?, "recurrent cell")?, width, "recurrent bias")?;
-	let stage = checked_add(checked_mul(width, width, "recurrent stage matrix")?, width, "recurrent stage bias")?;
-	let parameters = checked_add(cell, checked_mul(extra, stage, "recurrent stages")?, "recurrent parameters")?;
-	// The program store is validated and read in entries of three, so a stage
-	// spends one slot on its activation and leaves the other two at zero.
-	let program_offset = graph.programs.len();
-	for (_, activation) in &stages {
-		graph.programs.extend([*activation as f64, 0.0, 0.0]);
+fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!parts.is_empty(), "a recurrence must contain an operation")?;
+	let first = &parts[0];
+	let width = match first.operation {
+		Operation::Layer(width) => width,
+		ref other => return Err(RecipeError::new(format!("a recurrent body must open with a layer, not {}", other.name()))),
+	};
+	require(width != 0, "recurrent width must be positive")?;
+	let mut cell_activation = recur_activation(first.activation)?;
+	let mut body_start = 1;
+	if let Some(block) = parts.get(1)
+		&& matches!(block.operation, Operation::Identity)
+	{
+		require(cell_activation == 0, "a recurrent cell stage declares one activation")?;
+		cell_activation = recur_activation(block.activation)?;
+		body_start = 2;
 	}
+	// The program record carries the cell width and activation. Body operations
+	// are lowered as ordinary graph nodes below the scan and run once per
+	// sequence position by the generated ScanBody emitter.
+	let program_offset = graph.programs.len();
+	graph.programs.extend([width as f64, cell_activation as f64, 0.0]);
+	let cell = checked_add(
+		checked_add(checked_mul(graph.output.channels, width, "recurrent input matrix")?, checked_mul(width, width, "recurrent state matrix")?, "recurrent cell")?,
+		width,
+		"recurrent bias",
+	)?;
 	let output = Shape { channels: width, length: graph.output.length };
-	push_node(graph, Primitive::Scan, output, parameters, [1.0, extra as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
-	let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("recurrent node is absent"))?;
-	node.program_offset = program_offset;
-	node.program_count = stages.len();
+	let scan_index = graph.nodes.len();
+	push_node(graph, Primitive::Scan, output, cell, [1.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	{
+		let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("recurrent node is absent"))?;
+		node.program_offset = program_offset;
+		node.program_count = 1;
+		// `argument[5]` marks the generic body path.  `argument[1]` remains the
+		// body-node count for graph inspection, but the legacy fixed-width scan
+		// emitter must not interpret that count as staged cell projections.
+		node.argument[5] = 1.0;
+	}
+	if body_start < parts.len() {
+		let mut body = Graph::new(Shape { channels: width, length: 1 });
+		body.bias = graph.bias;
+		for (index, block) in parts[body_start..].iter().enumerate() {
+			body.block_index = index;
+			body.block_kind = "recur_body";
+			lower_block(&mut body, block, parts.len(), data, targets, rows, gpu, config)?;
+		}
+		require(body.output.length == 1, "a recurrent body must preserve one position")?;
+		if body.output.channels != width {
+			lower_project(&mut body, width)?;
+		}
+		for node in &mut body.nodes {
+			node.block_kind = "recur_body";
+			require(node.argument[8] == 0.0, "recurrent body quantization is not emitted yet")?;
+		}
+		let body_count = body.nodes.len();
+		require(body_count != 0, "a recurrent body has no lowered operation")?;
+		let body_start_index = scan_index + 1;
+		append_graph(graph, body)?;
+		let scan_output = graph.nodes[scan_index].output;
+		let node = graph.nodes.get_mut(scan_index).ok_or_else(|| RecipeError::new("recurrent node is absent"))?;
+		node.argument[1] = body_count as f64;
+		node.argument[3] = body_start_index as f64;
+		node.argument[4] = body_count as f64;
+		graph.output = scan_output;
+		graph.source = scan_index as i32;
+	}
 	Ok(())
 }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
@@ -8479,7 +9392,8 @@ impl NativeTape {
 	}
 	fn full_epoch(&mut self, rate: f64, config: Config) -> Result<f64> {
 		self.epoch_launch(rate, config, EpochOperation::Full)?;
-		self.objective()
+		let objective = self.objective()?;
+		Ok(objective)
 	}
 	/// Computes this shard's loss and reduced parameter gradient without
 	/// changing optimizer state or model weights.
@@ -8987,9 +9901,49 @@ fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize,
 	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
 	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
 }
+/// Returns the context arena size, in model elements, for a generic recurrent
+/// body. The first part is the ordinary scan state arena; the remainder is a
+/// cell scratch row, a value/adjoint tape for every position, a temporary body
+/// gradient vector, and the cell-output adjoint tape consumed by the legacy
+/// recurrent reverse kernel.
+fn recurrent_body_elements(graph: &Graph, node: &Node, rows: usize) -> Result<Option<usize>> {
+	if node.op != Primitive::Scan || node.argument[5] != 1.0 {
+		return Ok(None);
+	}
+	let start = usize::try_from(integer_argument(node.argument[3], "recurrent body start")?).map_err(|_| RecipeError::new("recurrent body start is invalid"))?;
+	let count = usize::try_from(integer_argument(node.argument[4], "recurrent body count")?).map_err(|_| RecipeError::new("recurrent body count is invalid"))?;
+	let end = start.checked_add(count).ok_or_else(|| RecipeError::new("recurrent body range overflows"))?;
+	require(count != 0 && end <= graph.nodes.len(), "recurrent body range is invalid")?;
+	let state_count = checked_mul(rows, node.output.elements(), "scan batch")?;
+	let states = checked_mul(2 * (node.argument[0] as usize) + 1, state_count, "scan states")?;
+	let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
+	let scan_scratch = checked_mul(2, checked_mul(rows, node.output.channels, "scan scratch")?, "scan scratch")?;
+	let scan_tail = checked_add(gradients, scan_scratch, "scan")?;
+	let scan_base = checked_add(states, scan_tail, "scan")?;
+	let cell = checked_mul(rows, node.output.channels, "recurrent body cell scratch")?;
+	let mut value_stride = 0usize;
+	let mut body_gradient = 0usize;
+	for body in &graph.nodes[start..end] {
+		require(body.output.length == 1, "recurrent body operations must preserve one position")?;
+		value_stride = checked_add(value_stride, checked_mul(rows, body.output.elements(), "recurrent body value tape")?, "recurrent body value tape")?;
+		body_gradient = checked_add(body_gradient, body.parameters, "recurrent body gradient tape")?;
+	}
+	let cell_values = checked_add(scan_base, cell, "recurrent body cell tape")?;
+	let values = checked_add(cell_values, checked_mul(cell, node.output.length, "recurrent body cell tape")?, "recurrent body value tape")?;
+	let values_total = checked_mul(value_stride, node.output.length, "recurrent body value tape")?;
+	let adjoints = checked_add(values, values_total, "recurrent body adjoint tape")?;
+	let adjoints_total = checked_mul(value_stride, node.output.length, "recurrent body adjoint tape")?;
+	let temporary_gradient = checked_add(adjoints, adjoints_total, "recurrent body temporary gradient")?;
+	let cell_delta = checked_add(temporary_gradient, body_gradient, "recurrent body cell adjoint")?;
+	let total = checked_add(cell_delta, checked_mul(rows, node.output.elements(), "recurrent body cell adjoint")?, "recurrent body context")?;
+	Ok(Some(total.max(1)))
+}
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
 	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
 		return Ok(bytes);
+	}
+	if let Some(elements) = recurrent_body_elements(graph, node, rows)? {
+		return checked_mul(elements, precision.bytes(), "recurrent body context bytes");
 	}
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
@@ -9013,11 +9967,21 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
-			// Every stage past the cell saves the activation it produced at each
-			// position, and the reverse needs one more row of the same shape to
-			// hold a stage's pre-activation gradient while it forms the next one.
 			let stages = node.argument[1] as usize;
-			let staged = checked_mul(if stages == 0 { 0 } else { stages + 1 }, state_count, "recurrent stage states")?;
+			let staged = if stages == 0 {
+				0
+			} else {
+				let end = node.program_offset.checked_add(checked_mul(node.program_count, 3, "recurrent stage program")?).ok_or_else(|| RecipeError::new("recurrent stage program range overflows"))?;
+				let programs = graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent stage program range is invalid"))?;
+				let (saved, max_width) = programs.chunks_exact(3).map(|record| integer_argument(record[0], "recurrent stage width").map(|width| width as usize)).try_fold((0usize, 0usize), |(sum, max), width| {
+					let width = width?;
+					Ok::<_, RecipeError>((checked_add(sum, width, "recurrent stage states")?, max.max(width)))
+				})?;
+				let cell_width = usize::try_from(integer_argument(programs.chunks_exact(3).next().ok_or_else(|| RecipeError::new("recurrent cell width is absent"))?[0], "recurrent cell width")?).map_err(|_| RecipeError::new("recurrent cell width is invalid"))?;
+				let row_stride = checked_mul(rows, node.output.length, "recurrent stage rows")?;
+				let saved = checked_add(saved, cell_width, "recurrent stage states")?;
+				checked_add(checked_mul(saved, row_stride, "recurrent stage states")?, checked_mul(3, checked_mul(max_width.max(cell_width), row_stride, "recurrent stage scratch")?, "recurrent stage scratch")?, "recurrent stage states")?
+			};
 			checked_add(staged, checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?, "recurrent context")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
@@ -11988,7 +12952,7 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 			dimensions
 				.map(|(forward, gradient, previous, parameters)| {
 					let extent =
-						|(m, n, k), role| Ok(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
+						|(m, n, k), role| Ok::<Tile, RecipeError>(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
 					Ok(NativeContractionShapes {
 						forward: extent(forward, "native forward contraction")?,
 						gradient: extent(gradient, "native gradient contraction")?,
@@ -14241,7 +15205,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 		let (rows, blank) = records(bytes, delimiter)?;
 		let width = rows.first().map_or(0, Vec::len);
 		let rectangle = if rows.iter().all(|row| row.len() == width) { width } else { 0 };
-		Ok(if rectangle >= widest.0 { (rectangle, rows, blank) } else { widest })
+		Ok::<(usize, Vec<Vec<String>>, usize), RecipeError>(if rectangle >= widest.0 { (rectangle, rows, blank) } else { widest })
 	})?;
 	require(!rows.is_empty(), format!("dataset {} is empty", path.display()))?;
 	let first = rows.remove(0);

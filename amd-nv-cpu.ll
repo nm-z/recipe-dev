@@ -3298,29 +3298,27 @@ ret void
 ; its activation applied, and the result saved where the reverse reads it. The
 ; last stage's result is the position's output. A stage never writes the buffer
 ; it reads, so no channel sees a value this position already replaced.
-define internal void @recur_stage_forward_body( ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %row, i32 %time, i32 %length, i32 %channels, i32 %base, i32 %stage, i32 %activation, i32 %saved, i32 %batch, i1 %last ) #1 { entry:
-%elements = mul i32 %channels, %length %row.base = mul i32 %row, %elements
-%first = icmp eq i32 %stage, 0 %previous = sub i32 %stage, 1 %previous.raw = mul i32 %previous, %batch
-%previous.safe = select i1 %first, i32 0, i32 %previous.raw %previous.offset = add i32 %saved, %previous.safe
-%stage.raw = mul i32 %stage, %batch %stage.offset = add i32 %saved, %stage.raw
-%matrix = mul i32 %channels, %channels %bias.base = add i32 %base, %matrix
+define internal void @recur_stage_forward_body( ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %cell.output, ptr addrspace(1) %context, i32 %row, i32 %time, i32 %length, i32 %input.channels, i32 %output.channels, i32 %base, i32 %activation, i32 %previous, i32 %stage.offset, i1 %first, i1 %last ) #1 { entry:
+%input.elements = mul i32 %input.channels, %length %output.elements = mul i32 %output.channels, %length
+%input.row.base = mul i32 %row, %input.elements %output.row.base = mul i32 %row, %output.elements
+%matrix = mul i32 %input.channels, %output.channels %bias.base = add i32 %base, %matrix
 br label %out.loop
 out.loop: %c = phi i32 [ 0, %entry ], [ %c.next, %out.store ]
-%c.more = icmp ult i32 %c, %channels br i1 %c.more, label %sum.entry, label %done
+%c.more = icmp ult i32 %c, %output.channels br i1 %c.more, label %sum.entry, label %done
 sum.entry: %bias.index = add i32 %bias.base, %c
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
 %bias = load double, ptr addrspace(1) %bias.ptr, align 8 br label %sum.loop
 sum.loop: %j = phi i32 [ 0, %sum.entry ], [ %j.next, %sum.step ]
 %acc = phi double [ %bias, %sum.entry ], [ %acc.next, %sum.step ]
-%j.more = icmp ult i32 %j, %channels br i1 %j.more, label %sum.step, label %activate
-sum.step: %src.channel = mul i32 %j, %length %src.local = add i32 %src.channel, %time %src.index = add i32 %row.base, %src.local
-%src.saved.index = add i32 %previous.offset, %src.index
-%src.out.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %src.index
+%j.more = icmp ult i32 %j, %input.channels br i1 %j.more, label %sum.step, label %activate
+sum.step: %src.channel = mul i32 %j, %length %src.local = add i32 %src.channel, %time %src.index = add i32 %input.row.base, %src.local
+%src.saved.index = add i32 %previous, %src.index
+%src.out.ptr = getelementptr inbounds double, ptr addrspace(1) %cell.output, i32 %src.index
 %src.saved.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %src.saved.index
 %src.out = load double, ptr addrspace(1) %src.out.ptr, align 8
 %src.saved = load double, ptr addrspace(1) %src.saved.ptr, align 8
 %src = select i1 %first, double %src.out, double %src.saved
-%weight.row = mul i32 %j, %channels %weight.local = add i32 %weight.row, %c %weight.index = add i32 %base, %weight.local
+%weight.row = mul i32 %j, %output.channels %weight.local = add i32 %weight.row, %c %weight.index = add i32 %base, %weight.local
 %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
 %weight = load double, ptr addrspace(1) %weight.ptr, align 8
 %product = call double @recipe.mul(double %weight, double %src) %acc.next = call double @recipe.add(double %acc, double %product)
@@ -3332,15 +3330,15 @@ activate: %is.relu = icmp eq i32 %activation, 1 %is.tanh = icmp eq i32 %activati
 %pick.b = select i1 %is.tanh, double %tanh.value, double %pick.a
 %value = select i1 %is.sigmoid, double %sigmoid.value, double %pick.b
 br label %out.store
-out.store: %dst.channel = mul i32 %c, %length %dst.local = add i32 %dst.channel, %time %dst.index = add i32 %row.base, %dst.local
+out.store: %dst.channel = mul i32 %c, %length %dst.local = add i32 %dst.channel, %time %dst.index = add i32 %output.row.base, %dst.local
 %dst.saved = add i32 %stage.offset, %dst.index
 %dst.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dst.saved
 store double %value, ptr addrspace(1) %dst.ptr, align 8
 %c.next = add nuw i32 %c, 1 br label %out.loop
 done: br i1 %last, label %copy.loop, label %exit
 copy.loop: %k = phi i32 [ 0, %done ], [ %k.next, %copy.step ]
-%k.more = icmp ult i32 %k, %channels br i1 %k.more, label %copy.step, label %exit
-copy.step: %copy.channel = mul i32 %k, %length %copy.local = add i32 %copy.channel, %time %copy.index = add i32 %row.base, %copy.local
+%k.more = icmp ult i32 %k, %output.channels br i1 %k.more, label %copy.step, label %exit
+copy.step: %copy.channel = mul i32 %k, %length %copy.local = add i32 %copy.channel, %time %copy.index = add i32 %output.row.base, %copy.local
 %copy.saved = add i32 %stage.offset, %copy.index
 %copy.src = getelementptr inbounds double, ptr addrspace(1) %context, i32 %copy.saved
 %copy.value = load double, ptr addrspace(1) %copy.src, align 8
@@ -3349,14 +3347,15 @@ store double %copy.value, ptr addrspace(1) %copy.dst, align 8
 %k.next = add nuw i32 %k, 1 br label %copy.loop
 exit: ret void }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
-ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates, i1 %has.bias,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i1 %coded, i32 %activations, i32 %stages, i32 %stage.base ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %cell.channels, i32 %out.channels, i32 %gates, i1 %has.bias,
+i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i1 %coded, i32 %activations, i32 %stages, i32 %stage.base,
+ptr %stage.widths, ptr %stage.saved, ptr %stage.weights, i32 %stage.scratch, i32 %stage.max.width ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %cell.activation = and i32 %activations, 15
 %in.elements = mul i32 %in.channels, %length
-%out.elements = mul i32 %out.channels, %length %input.matrix = mul i32 %in.channels, %out.channels
-%state.matrix = mul i32 %out.channels, %out.channels %matrix.span = add i32 %input.matrix, %state.matrix
-%bias.span = select i1 %has.bias, i32 %out.channels, i32 0
-%gate.stride = add i32 %matrix.span, %bias.span %gate.batch = mul i32 %rows, %out.elements
+%out.elements = mul i32 %out.channels, %length %cell.elements = mul i32 %cell.channels, %length %input.matrix = mul i32 %in.channels, %cell.channels
+%state.matrix = mul i32 %cell.channels, %cell.channels %matrix.span = add i32 %input.matrix, %state.matrix
+%bias.span = select i1 %has.bias, i32 %cell.channels, i32 0
+%gate.stride = add i32 %matrix.span, %bias.span %gate.batch = mul i32 %rows, %cell.elements
 br label %precompute.loop precompute.loop:
 %precompute.gate = phi i32 [ 0, %entry ], [ %precompute.next, %precompute.step ]
 %precompute.more = icmp ult i32 %precompute.gate, %gates
@@ -3367,19 +3366,21 @@ br i1 %precompute.more, label %precompute.step, label %precompute.done precomput
 %precompute.context = getelementptr inbounds double, ptr addrspace(1) %context, i32 %precompute.context.offset
 call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %precompute.weights,
 ptr addrspace(1) %precompute.context, ptr addrspace(1) %input,
-i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels,
+i32 %rows, i32 %in.channels, i32 %length, i32 %cell.channels,
 i32 %length, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 %precompute.next = add i32 %precompute.gate, 1 br label %precompute.loop precompute.done:
 call void @grid_barrier(i32 %threads) br label %row.loop row.loop:
 %row = phi i32 [ %tid, %precompute.done ], [ %row.next, %time.done ] %row.more = icmp ult i32 %row, %rows
 br i1 %row.more, label %time.loop, label %exit time.loop: %time = phi i32 [ 0, %row.loop ], [ %time.next, %stage.done ]
-%previous.exists = icmp ne i32 %time, 0 %output.row.base = mul i32 %row, %out.elements
+%previous.exists = icmp ne i32 %time, 0 %output.row.base = mul i32 %row, %out.elements %cell.row.base = mul i32 %row, %cell.elements
+%cell.output.context = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stage.base
+%has.stages = icmp ne i32 %stages, 0 %cell.output = select i1 %has.stages, ptr addrspace(1) %cell.output.context, ptr addrspace(1) %output
 %time.more = icmp ult i32 %time, %length br i1 %time.more, label %gate.loop, label %time.done gate.loop:
 %gate = phi i32 [ 0, %time.loop ], [ %gate.next, %hidden.done ] %gate.more = icmp ult i32 %gate, %gates
 br i1 %gate.more, label %hidden.loop, label %output.loop hidden.loop:
 %hidden = phi i32 [ 0, %gate.loop ], [ %hidden.next, %gate.store ] %gate.weight.base = mul i32 %gate, %gate.stride
-%hidden.more = icmp ult i32 %hidden, %out.channels br i1 %hidden.more, label %input.load, label %hidden.done
+%hidden.more = icmp ult i32 %hidden, %cell.channels br i1 %hidden.more, label %input.load, label %hidden.done
 input.load: %input.gate.base = mul i32 %gate, %gate.batch %input.hidden.base = mul i32 %hidden, %length
 %input.local = add i32 %input.hidden.base, %time %input.row.local = add i32 %output.row.base, %input.local
 %input.index = add i32 %input.gate.base, %input.row.local
@@ -3387,7 +3388,7 @@ input.load: %input.gate.base = mul i32 %gate, %gate.batch %input.hidden.base = m
 %input.sum = load double, ptr addrspace(1) %input.ptr, align 8 br label %state.sum.loop state.sum.loop:
 %state.channel = phi i32 [ 0, %input.load ], [ %state.next, %state.sum.step ]
 %state.sum = phi double [ %input.sum, %input.load ], [ %state.sum.next, %state.sum.step ]
-%state.more = icmp ult i32 %state.channel, %out.channels br i1 %state.more, label %state.sum.step, label %gate.activate
+%state.more = icmp ult i32 %state.channel, %cell.channels br i1 %state.more, label %state.sum.step, label %gate.activate
 state.sum.step: %previous.time = sub i32 %time, 1 %previous.safe = select i1 %previous.exists, i32 %previous.time, i32 0
 %state.channel.base = mul i32 %state.channel, %length %previous.local = add i32 %state.channel.base, %previous.safe
 %previous.index = add i32 %output.row.base, %previous.local
@@ -3400,7 +3401,7 @@ state.sum.step: %previous.time = sub i32 %time, 1 %previous.safe = select i1 %pr
 %reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.base
 %reset = load double, ptr addrspace(1) %reset.ptr, align 8 %reset.state = call double @recipe.mul(double %reset, double %previous)
 %state.value = select i1 %reset.candidate, double %reset.state, double %previous
-%state.weight.base = add i32 %gate.weight.base, %input.matrix %state.weight.row = mul i32 %state.channel, %out.channels
+%state.weight.base = add i32 %gate.weight.base, %input.matrix %state.weight.row = mul i32 %state.channel, %cell.channels
 %state.weight.local = add i32 %state.weight.row, %hidden
 %state.weight.index = add i32 %state.weight.base, %state.weight.local
 %state.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %state.weight.index
@@ -3431,7 +3432,7 @@ state.sum.step: %previous.time = sub i32 %time, 1 %previous.safe = select i1 %pr
 store double %gate.value, ptr addrspace(1) %gate.ptr, align 8 %hidden.next = add nuw i32 %hidden, 1
 br label %hidden.loop hidden.done: %gate.next = add nuw i32 %gate, 1 br label %gate.loop output.loop:
 %output.hidden = phi i32 [ 0, %gate.loop ], [ %output.next, %output.store ]
-%output.more = icmp ult i32 %output.hidden, %out.channels br i1 %output.more, label %output.step, label %output.done
+%output.more = icmp ult i32 %output.hidden, %cell.channels br i1 %output.more, label %output.step, label %output.done
 output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local = add i32 %output.hidden.base, %time
 %output.index = add i32 %output.row.base, %output.local
 %gate0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %output.index
@@ -3449,7 +3450,7 @@ output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local
 %gate3 = load double, ptr addrspace(1) %gate3.ptr, align 8 %output.previous.time = sub i32 %time, 1
 %output.previous.safe = select i1 %previous.exists, i32 %output.previous.time, i32 0
 %output.previous.local = add i32 %output.hidden.base, %output.previous.safe
-%output.previous.index = add i32 %output.row.base, %output.previous.local
+%output.previous.index = add i32 %cell.row.base, %output.previous.local
 %output.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.previous.index
 %output.previous.loaded = load double, ptr addrspace(1) %output.previous.ptr, align 8
 %output.previous = select i1 %previous.exists, double %output.previous.loaded, double 0.0
@@ -3474,10 +3475,24 @@ stage.loop: %stage = phi i32 [ 0, %output.done ], [ %stage.next, %stage.body ]
 %stage.more = icmp ult i32 %stage, %stages br i1 %stage.more, label %stage.body, label %stage.done
 stage.body: %stage.shift.raw = add i32 %stage, 1 %stage.shift = mul i32 %stage.shift.raw, 4
 %stage.code.raw = lshr i32 %activations, %stage.shift %stage.code = and i32 %stage.code.raw, 15
-%stage.matrix = mul i32 %out.channels, %out.channels %stage.stride = add i32 %stage.matrix, %out.channels
-%stage.span = mul i32 %stage, %stage.stride %stage.weight.base = add i32 %gate.stride, %stage.span
+%stage.zero = icmp eq i32 %stage, 0
+%stage.width.index = add i32 %stage, 1
+%stage.width.ptr = getelementptr [0 x i32], ptr %stage.widths, i32 0, i32 %stage.width.index
+%stage.width = load i32, ptr %stage.width.ptr, align 4
+%stage.previous = sub i32 %stage, 1 %stage.previous.safe = select i1 %stage.zero, i32 0, i32 %stage.previous
+%stage.input.ptr = getelementptr [0 x i32], ptr %stage.widths, i32 0, i32 %stage
+%stage.input = load i32, ptr %stage.input.ptr, align 4
+%stage.saved.ptr = getelementptr [0 x i32], ptr %stage.saved, i32 0, i32 %stage
+%stage.saved.channels = load i32, ptr %stage.saved.ptr, align 4
+%stage.previous.saved.ptr = getelementptr [0 x i32], ptr %stage.saved, i32 0, i32 %stage.previous.safe
+%stage.previous.saved.channels = load i32, ptr %stage.previous.saved.ptr, align 4
+%stage.weight.ptr = getelementptr [0 x i32], ptr %stage.weights, i32 0, i32 %stage
+%stage.weight.offset = load i32, ptr %stage.weight.ptr, align 4
+%stage.saved.row = mul i32 %stage.saved.channels, %length %stage.saved.rows = mul i32 %stage.saved.row, %rows %stage.saved.offset = add i32 %stage.base, %stage.saved.rows
+%stage.previous.row = mul i32 %stage.previous.saved.channels, %length %stage.previous.rows = mul i32 %stage.previous.row, %rows %stage.previous.offset = add i32 %stage.base, %stage.previous.rows
+%stage.weight.base = add i32 %gate.stride, %stage.weight.offset
 %stage.last = sub i32 %stages, 1 %stage.is.last = icmp eq i32 %stage, %stage.last
-call void @recur_stage_forward_body( ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %row, i32 %time, i32 %length, i32 %out.channels, i32 %stage.weight.base, i32 %stage, i32 %stage.code, i32 %stage.base, i32 %gate.batch, i1 %stage.is.last )
+call void @recur_stage_forward_body( ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %cell.output, ptr addrspace(1) %context, i32 %row, i32 %time, i32 %length, i32 %stage.input, i32 %stage.width, i32 %stage.weight.base, i32 %stage.code, i32 %stage.previous.offset, i32 %stage.saved.offset, i1 %stage.zero, i1 %stage.is.last )
 %stage.next = add nuw i32 %stage, 1 br label %stage.loop
 stage.done: %time.next = add nuw i32 %time, 1 br label %time.loop time.done:
 %row.next = add i32 %row, %threads br label %row.loop exit: ret void }
