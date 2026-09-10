@@ -4237,23 +4237,23 @@ mod bundle {
 			Activation::Scale(factor)
 		} else {
 			match value {
-			0 => Ok(Activation::Linear),
-			1 => Ok(Activation::Cos),
-			2 => Ok(Activation::Exp),
-			3 => Ok(Activation::Log),
-			4 => Ok(Activation::Ln),
-			5 => Ok(Activation::Huber),
-			6 => Ok(Activation::Tan),
-			7 => Ok(Activation::Relu),
-			8 => Ok(Activation::Leak),
-			9 => Ok(Activation::Sigmoid),
-			10 => Ok(Activation::Tanh),
-			11 => Ok(Activation::Selu),
-			12 => Ok(Activation::Gelu),
-			13 => Ok(Activation::Silu),
-			14 => Ok(Activation::Elu),
-			15 => Ok(Activation::Prelu),
-			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
+				0 => Ok(Activation::Linear),
+				1 => Ok(Activation::Cos),
+				2 => Ok(Activation::Exp),
+				3 => Ok(Activation::Log),
+				4 => Ok(Activation::Ln),
+				5 => Ok(Activation::Huber),
+				6 => Ok(Activation::Tan),
+				7 => Ok(Activation::Relu),
+				8 => Ok(Activation::Leak),
+				9 => Ok(Activation::Sigmoid),
+				10 => Ok(Activation::Tanh),
+				11 => Ok(Activation::Selu),
+				12 => Ok(Activation::Gelu),
+				13 => Ok(Activation::Silu),
+				14 => Ok(Activation::Elu),
+				15 => Ok(Activation::Prelu),
+				_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
 		require(fields.next().is_none(), "activation has trailing fields")?;
@@ -7308,13 +7308,7 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	push_node(graph, Primitive::Contraction, output, parameters, [kernel as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph
-		.nodes
-		.iter()
-		.rev()
-		.find(|node| node.op == Primitive::Contraction)
-		.filter(|node| node.argument[2] == 0.0)
-		.map(|node| node.offset + node.parameters - node.output.channels)
+	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).filter(|node| node.argument[2] == 0.0).map(|node| node.offset + node.parameters - node.output.channels)
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
@@ -12023,7 +12017,7 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			// like "scan-0000" reaches the row as its bytes.
 			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
 			if dropped.len() == table.headers.len() {
-				continue
+				continue;
 			}
 			for column in dropped.into_iter().rev() {
 				table.headers.remove(column);
