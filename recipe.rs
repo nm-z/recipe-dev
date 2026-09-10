@@ -11915,12 +11915,19 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 	}
 	// Every column of a lone table is a candidate record of file names: the stems
 	// it holds, in that table's own row order.
+	let known_names = sources.iter().filter(|source| source.len() > 1).flat_map(|source| source.iter().map(|table| table.name.as_str())).collect::<BTreeSet<_>>();
 	let mut recorded = Vec::new();
 	for source in &sources {
 		let [table] = source.as_slice() else { continue };
 		for column in 0..table.headers.len() {
-			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
-			recorded.push((table.name.clone(), table.headers[column].clone(), column, table.rows.iter().map(stem).collect::<Vec<_>>()))
+			let values = table.rows.iter().map(|row| row.get(column).cloned().unwrap_or_default()).collect::<Vec<_>>();
+			let stem = |value: &String| Path::new(value).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			let path_like = values.iter().any(|value| {
+				Path::new(value).extension().and_then(|extension| extension.to_str()).is_some_and(|extension| is_table(extension) || is_archive(extension) || is_image(extension) || is_document(extension))
+					|| value.contains('/')
+					|| value.contains('\\')
+			});
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, values.iter().map(stem).collect::<Vec<_>>(), path_like))
 		}
 	}
 	// The recorded order of each group, when exactly one reading exists. Two
@@ -11933,7 +11940,7 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
 		let mut found: Option<(&String, &String, &Vec<String>)> = None;
 		if source.len() > 1 && names.len() == source.len() {
-			for (table, header, column, order) in &recorded {
+			for (table, header, column, order, _) in &recorded {
 				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
 					continue;
 				}
@@ -11952,6 +11959,11 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			}
 		}
 		orders.push(found.map(|(_, _, order)| order.clone()));
+	}
+	for (table, header, column, order, path_like) in &recorded {
+		if !references.contains(&(table.clone(), *column)) && (*path_like || order.iter().any(|name| known_names.contains(name.as_str()))) {
+			return Err(RecipeError::new(format!("table {table:?} column {header:?} contains unresolved file references")));
+		}
 	}
 	// A recorded group contributes one sample per file. An unrecorded group is one
 	// source whose partitions each contribute their own rows.
