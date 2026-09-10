@@ -9652,19 +9652,19 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 				let mut selected = Vec::new();
 				for name in selected_names {
 					let local_name = name.strip_prefix(&local_prefix).unwrap_or(name);
-				let gpu = if local_name == "cpu" {
-					device(Some("cpu"))?
-				} else {
-					match devices()?.iter().copied().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
-						Some(gpu) => gpu,
-						None => match name.split_once(':') {
-							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-							_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
-						},
-					}
-				};
-				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
-				selected.push(gpu);
+					let gpu = if local_name == "cpu" {
+						device(Some("cpu"))?
+					} else {
+						match devices()?.iter().copied().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+							Some(gpu) => gpu,
+							None => match name.split_once(':') {
+								Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
+								_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
+							},
+						}
+					};
+					require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
+					selected.push(gpu);
 				}
 				require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
 				Ok(selected)
