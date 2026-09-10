@@ -5141,6 +5141,7 @@ impl Block {
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
 	pub fn act(mut self, activation: Activation) -> Self {
+		assert!(self.normalization.is_none(), "activation must precede normalization");
 		self.activation = activation;
 		self
 	}
