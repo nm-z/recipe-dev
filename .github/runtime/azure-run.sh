@@ -159,7 +159,7 @@ JSON
 			--container-name "$AZURE_STORAGE_CONTAINER" \
 			--blob-name "$ADMISSION_BLOB" \
 			--lease-duration "$ADMISSION_LEASE_SECONDS" \
-			--query leaseId -o tsv --only-show-errors 2>"$lease_error_file")" && [ -n "$admission_lease_id" ]; then
+			-o tsv --only-show-errors 2>"$lease_error_file")" && [ -n "$admission_lease_id" ]; then
 			admission_renew_pid=""
 			renew_admission &
 			admission_renew_pid=$!
