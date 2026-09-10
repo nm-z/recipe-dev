@@ -7077,7 +7077,7 @@ impl Operation {
 	}
 	fn weighted(&self) -> bool {
 		match self {
-			Self::Pool(_) | Self::Estimator(_) | Self::Identity => false,
+			Self::Pool(_) | Self::Identity => false,
 			Self::Residual(parts) | Self::Moe(_, parts) => parts.iter().any(Block::weighted),
 			_ => true,
 		}
