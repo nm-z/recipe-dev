@@ -133,7 +133,13 @@ Feature generation is banned.
 .recur([layer(width), relu()])
 ```
 
-`recur([layer(w), tanh()])` is the cell `rnn(w)` runs, bit for bit; the body form lets the cell name a different activation, which `rnn` cannot. A body of more than one stage, and a body holding `res`/`moe`, are refused with a message rather than silently reduced.
+`recur([layer(w), tanh()])` is the cell `rnn(w)` runs, bit for bit; the body form lets the cell name a different activation, which `rnn` cannot. A two-stage body is also emitted inline:
+
+```rust
+.recur([layer(width), relu(), layer(width), tanh()])
+```
+
+The staged emitter currently accepts at most two layers and reports a named error for a third. Nested `res` or `moe` bodies remain represented as ordinary `Block` values but are rejected by the recurrent-cell validator until their emitted reverse path is covered.
 
 A step of `res([...])` or `moe(topk, [...])` is an ordinary model fragment, so a branch takes whatever the outer sequence takes: a normalization, an attention, a recurrent block, a nested `res` or `moe`, at any depth.
 
