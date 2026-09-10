@@ -86,7 +86,7 @@ frozen.packed.blck
 weights:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads)
+	attn(heads) or attn([query_heads, key_heads, value_heads])
 	perc(width)
 	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.yarn(factor, og_ctx, b_fast, b_slow)][.index(heads, width, block, keep)][.gate()]
 	rnn(hidden)
@@ -197,9 +197,13 @@ over its head-width slice, leaving the values untouched:
 
 ## sparse attention
 
-`attn(heads)` builds one query, key and value plane per head. `.width(d)` unties
-the head width from the block input: without it a head is `channels / heads` wide
-and the residual width must divide by the head count, with it a head is `d` wide
+`attn(heads)` builds one query, key and value plane per head. The explicit
+`attn([query_heads, key_heads, value_heads])` form preserves the three head
+counts independently; each key and value count must divide the query count.
+`.width(d)` unties
+the head width from the block input: without it a head is
+`channels.div_ceil(heads)` wide, so the Q/K/V projections also support residual
+widths that are not divisible by the query count; with it a head is `d` wide
 whatever the residual width is, and the block projects `heads * d` back to the
 residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
