@@ -940,11 +940,16 @@ define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr ad
 %product = call double @recipe.mul(double %value, double %incoming) %sum.next = call double @recipe.add(double %sum, double %product) %step.next = add i32 %step.index, 1 br label %loop
 done: %gradient.index = add i32 %offset, %p %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index store double %sum, ptr addrspace(1) %gradient.ptr, align 8 ret void }
 ; log(1 + exp(x)) taken on the negative side so a large x cannot overflow.
-define internal double @softplus(double %x) #1 { entry: %magnitude = call double @recipe.abs(double %x)
-%negative = call double @recipe.neg(double %magnitude) %exponential = call double @recipe.exp(double %negative)
-%shifted = call double @recipe.add(double 1.0, double %exponential) %tail = call double @recipe.log(double %shifted)
-%positive = fcmp ogt double %x, 0.0 %linear = select i1 %positive, double %x, double 0.0
-%value = call double @recipe.add(double %linear, double %tail) ret double %value }
+; Decode the model value into the state arithmetic type before the comparison
+; and transcendental operations. Encoded FP8/BF16/INT model values are integer
+; storage, so comparing the model type directly would emit invalid integer fcmp.
+define internal double @softplus(double %x) #1 { entry: %wide = call RECIPE_STATE @recipe.state.from.model(double %x)
+%one = call RECIPE_STATE @recipe.state.from.u1(i1 true) %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%magnitude = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %wide)
+%negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %magnitude) %exponential = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %negative)
+%shifted = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %one, RECIPE_STATE %exponential) %tail = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %shifted)
+%positive = call i1 @recipe.state.ogt(RECIPE_STATE %wide, RECIPE_STATE %zero) %linear = select i1 %positive, RECIPE_STATE %wide, RECIPE_STATE %zero
+%value = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %linear, RECIPE_STATE %tail) %result = call double @recipe.model.from.state(RECIPE_STATE %value) ret double %result }
 ; One position of the gated delta rule for one head. The state at %work.base is
 ; read and written in place: S <- decay * S + write * k' (v - k S), and the
 ; output o = q S is stored when %store is set. Every sum walks the head in
