@@ -127,12 +127,17 @@ data(auto)
 .loss(mse|rmse|huber|mae|bce|ce|focal)
 ```
 
-## 15 activations
+## 16 activations
 
 ```
 relu  leak  sigmoid  tanh   selu   gelu   silu   elu
 prelu cos   exp      log    ln     huber  tan
+scale(factor)
 ```
+
+`scale(factor)` multiplies every value the preceding block produces by one
+finite constant. It owns no weights and preserves the shape, so it states an
+explicit scalar rescaling directly.
 
 ## 4 normalizations
 

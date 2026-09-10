@@ -4209,7 +4209,7 @@ mod bundle {
 			return match fields.next().unwrap_or("") {
 				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
 				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
 				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
 			};
 		}
@@ -4221,8 +4221,24 @@ mod bundle {
 	{
 		value.ok_or_else(|| RecipeError::new(format!("{role} is absent")))?.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
 	}
-	fn activation(value: u8) -> Result<Activation> {
-		match value {
+	/// The saved form of an activation: its code, and for a parameterized one the
+	/// values after it. Every other field of the block record is one token, so the
+	/// values ride inside this one rather than widening the record.
+	fn activation_text(activation: Activation) -> String {
+		match activation {
+			Activation::Scale(factor) => format!("{},{factor}", activation.code()),
+			_ => activation.code().to_string(),
+		}
+	}
+	fn activation(text: &str) -> Result<Activation> {
+		let mut fields = text.split(',');
+		let value: u8 = value_at(fields.next(), "activation code")?;
+		let activation = if value == 16 {
+			let factor = value_at::<u64>(fields.next(), "scale factor")?;
+			require(f64::from_bits(factor).is_finite(), "scale factor must be finite")?;
+			Activation::Scale(factor)
+		} else {
+			match value {
 			0 => Ok(Activation::Linear),
 			1 => Ok(Activation::Cos),
 			2 => Ok(Activation::Exp),
@@ -4240,7 +4256,10 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
-		}
+			}?
+		};
+		require(fields.next().is_none(), "activation has trailing fields")?;
+		Ok(activation)
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
@@ -4311,7 +4330,7 @@ mod bundle {
 		format!(
 			"{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
-			block.activation as u8,
+			activation_text(block.activation),
 			normalization_text(block.normalization),
 			block.quantization,
 			u8::from(block.profile),
@@ -4323,7 +4342,7 @@ mod bundle {
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
-			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			activation: activation(&fields[1])?,
 			normalization: normalization(Some(&fields[2]), "block normalization")?,
 			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
 			quantization: value_at(Some(&fields[3]), "block quantization")?,
@@ -5062,6 +5081,34 @@ pub enum Activation {
 	Silu,
 	Elu,
 	Prelu,
+	/// Multiplies every value by one constant, held as its bit pattern so the
+	/// activation stays comparable. Owns no weights and preserves shape.
+	Scale(u64),
+}
+impl Activation {
+	/// The saved code of the activation. A parameterized activation writes its
+	/// values after the code, so this is not a cast.
+	const fn code(self) -> u8 {
+		match self {
+			Self::Linear => 0,
+			Self::Cos => 1,
+			Self::Exp => 2,
+			Self::Log => 3,
+			Self::Ln => 4,
+			Self::Huber => 5,
+			Self::Tan => 6,
+			Self::Relu => 7,
+			Self::Leak => 8,
+			Self::Sigmoid => 9,
+			Self::Tanh => 10,
+			Self::Selu => 11,
+			Self::Gelu => 12,
+			Self::Silu => 13,
+			Self::Elu => 14,
+			Self::Prelu => 15,
+			Self::Scale(_) => 16,
+		}
+	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -5177,6 +5224,10 @@ impl Block {
 		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
 		let q = |variant| self.clone().quantize(0, bits, variant);
 		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+	}
+	pub fn scale(self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.act(Activation::Scale(factor.to_bits()))
 	}
 }
 pub struct BlockQi {
@@ -6590,6 +6641,7 @@ impl Activation {
 			Self::Silu => "silu",
 			Self::Elu => "elu",
 			Self::Prelu => "prelu",
+			Self::Scale(_) => "scale",
 		}
 	}
 }
@@ -6621,6 +6673,14 @@ fn gelu = Gelu;
 fn silu = Silu;
 fn elu = Elu;
 fn prelu = Prelu; }
+impl Model {
+	/// Multiplies every value the preceding block produces by `factor`. Owns no
+	/// weights, preserves shape, and stores the factor with the model.
+	pub fn scale(&self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.activate(Activation::Scale(factor.to_bits()))
+	}
+}
 pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
@@ -7186,6 +7246,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let half = constant(&mut program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
+		}
+		Activation::Scale(factor) => {
+			let factor = f64::from_bits(factor);
+			require(factor.is_finite(), "scale factor must be finite")?;
+			let factor = constant(&mut program, factor);
+			program.op(ScalarOpcode::Multiply, factor, x)
 		}
 		Activation::Linear => unreachable!(),
 	};
