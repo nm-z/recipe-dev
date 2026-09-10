@@ -7597,9 +7597,10 @@ impl NativeTape {
 		if config.schedule_candidates == 0 || self.program.epoch.is_none() {
 			return Ok(());
 		}
+		let ratio = narrow(self.precision.state.bytes().div_ceil(self.precision.model.bytes()), "native contraction state ratio")? as u32;
 		let cache = self.program.artifact.path.with_extension("schedule");
 		if let Ok(text) = fs::read_to_string(&cache)
-			&& let Some(contractions) = parse_schedule(&text, &self.program.schedule.contractions)
+			&& let Some(contractions) = parse_schedule(&text, &self.program.schedule, &self.program.shapes, ratio)
 		{
 			self.program.schedule.contractions = contractions;
 			self.program.tile = dominant_tile(&self.program.shapes, &self.program.schedule.contractions).unwrap_or(self.program.tile);
@@ -7609,7 +7610,6 @@ impl NativeTape {
 		let snapshot = self.snapshot()?;
 		let checksum =
 			snapshot.weights.iter().chain(&snapshot.moments).chain(&snapshot.variances).fold(0x9E37_79B9_7F4A_7C15_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01B3));
-		let ratio = narrow(self.precision.state.bytes().div_ceil(self.precision.model.bytes()), "native contraction state ratio")? as u32;
 		// Nodes with the most gradient work measure first, until the epoch budget is spent.
 		let mut order =
 			(0..self.program.schedule.contractions.len()).filter(|index| self.program.schedule.contractions[*index].is_some() && self.program.shapes[*index].is_some()).collect::<Vec<_>>();
@@ -11253,17 +11253,32 @@ fn tile_text(extent: Tile) -> String {
 	format!("{} {} {}", extent.m, extent.n, extent.k)
 }
 /// The cached schedule, if it names every contraction node of this program.
-fn parse_schedule(text: &str, contractions: &[Option<NativeContractionTiles>]) -> Option<Vec<Option<NativeContractionTiles>>> {
-	let mut parsed = contractions.to_vec();
-	let mut seen = 0;
+fn parse_schedule(text: &str, schedule: &NativeSchedule, shapes: &[Option<NativeContractionShapes>], ratio: u32) -> Option<Vec<Option<NativeContractionTiles>>> {
+	let mut parsed = schedule.contractions.to_vec();
+	let mut seen = vec![false; parsed.len()];
 	for line in text.lines() {
 		let words = line.split_whitespace().map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>().ok()?;
 		let [index, fm, fnn, fk, gm, gn, gk, pm, pn, pk] = words[..] else { return None };
+		let seen_slot = seen.get_mut(index as usize)?;
+		if *seen_slot {
+			return None;
+		}
+		*seen_slot = true;
 		let slot = parsed.get_mut(index as usize)?.as_mut()?;
-		(slot.forward, slot.gradient, slot.previous) = (Tile { m: fm, n: fnn, k: fk }, Tile { m: gm, n: gn, k: gk }, Tile { m: pm, n: pn, k: pk });
-		seen += 1;
+		let cached = [Tile { m: fm, n: fnn, k: fk }, Tile { m: gm, n: gn, k: gk }, Tile { m: pm, n: pn, k: pk }];
+		let shape = shapes.get(index as usize)?.as_ref()?;
+		let current = [slot.forward, slot.gradient, slot.previous];
+		for direction in 0..3 {
+			let limits = [shape.forward, shape.gradient, shape.previous][direction];
+			let candidates = schedule_candidates(limits, current[direction], schedule, ratio, usize::MAX).ok()?;
+			if !candidates.contains(&cached[direction]) {
+				return None;
+			}
+		}
+		(slot.forward, slot.gradient, slot.previous) = (cached[0], cached[1], cached[2]);
 	}
-	(seen == contractions.iter().flatten().count()).then_some(parsed)
+	(seen.iter().enumerate().filter(|(index, present)| **present && schedule.contractions.get(*index).is_some_and(Option::is_some)).count() == schedule.contractions.iter().flatten().count())
+		.then_some(parsed)
 }
 /// The gradient tile of the contraction with the most gradient work. Ties keep
 /// the first node, the rule the compiled schedule already applies.
