@@ -12361,13 +12361,16 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 		}
 	}
 	// Every column of a lone table is a candidate record of file names: the stems
-	// it holds, in that table's own row order.
+	// it holds, in that table's own row order. It becomes a source candidate only
+	// when its values overlap the names of one sibling-file source below. A path-
+	// looking value by itself remains an ordinary categorical feature.
 	let mut recorded = Vec::new();
 	for source in &sources {
 		let [table] = source.as_slice() else { continue };
 		for column in 0..table.headers.len() {
-			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
-			recorded.push((table.name.clone(), table.headers[column].clone(), column, table.rows.iter().map(stem).collect::<Vec<_>>()))
+			let values = table.rows.iter().map(|row| row.get(column).cloned().unwrap_or_default()).collect::<Vec<_>>();
+			let stem = |value: &String| Path::new(value).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, values.iter().map(stem).collect::<Vec<_>>()))
 		}
 	}
 	// The recorded order of each group, when exactly one reading exists. Two
@@ -12399,6 +12402,21 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			}
 		}
 		orders.push(found.map(|(_, _, order)| order.clone()));
+		// A same-sized column that names at least one member of this source is a
+		// source-alignment candidate. If it did not resolve to the complete unique
+		// set above, reject it instead of silently encoding an unresolved or
+		// duplicate filename as a feature. Columns with no source-name overlap are
+		// not candidates, even when their values look like paths or URLs.
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, column, order) in &recorded {
+				if order.len() == names.len()
+					&& order.iter().any(|name| names.contains(name.as_str()))
+					&& !references.contains(&(table.clone(), *column))
+				{
+					return Err(RecipeError::new(format!("table {table:?} column {header:?} contains unresolved file references")));
+				}
+			}
+		}
 	}
 	// A recorded group contributes one sample per file. An unrecorded group is one
 	// source whose partitions each contribute their own rows.
