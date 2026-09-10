@@ -2545,6 +2545,61 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::TopK) => {
+					let count = checked_mul(self.rows, node.output.length, "router count")?;
+					emit_fixed_loop(&mut ir, index, "topk", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							value = pointers.value,
+							experts = node.output.channels,
+							length = node.output.length,
+							top = node.argument[0],
+							scoring = node.argument[1],
+							renormalize = node.argument[2]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::ExpertIn) => {
+					let count = checked_mul(self.rows, node.output.elements(), "expert input count")?;
+					emit_fixed_loop(&mut ir, index, "expert.in", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_in_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							routing = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							channels = node.input.channels,
+							length = node.output.length,
+							hidden = node.argument[2],
+							experts = node.argument[0],
+							top = node.argument[1]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::ExpertOut) => {
+					let count = checked_mul(self.rows, node.output.elements(), "expert output count")?;
+					emit_fixed_loop(&mut ir, index, "expert.out", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_out_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							routing = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							channels = node.output.channels,
+							length = node.output.length,
+							hidden = node.argument[2],
+							experts = node.argument[0],
+							top = node.argument[1]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					emit_row_loop(&mut ir, index, "pool", node.output.elements(), |ir, p| {
@@ -2695,6 +2750,94 @@ impl NativeModelIr {
 					if composed_previous {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::TopK) => {
+					let count = checked_mul(self.rows, node.output.length, "router reverse count")?;
+					emit_fixed_loop(&mut ir, index, "topk.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @topk_reverse_body( {pointer} {source}, {pointer} {value}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {experts}, i32 {length}, i32 {scoring}, i32 {renormalize} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							value = pointers.value,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							experts = node.output.channels,
+							length = node.output.length,
+							scoring = node.argument[1],
+							renormalize = node.argument[2]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::ExpertIn) => {
+					let (channels, length) = (node.input.channels, node.output.length);
+					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
+					let count = checked_mul(self.rows, node.input.elements(), "expert input reverse count")?;
+					emit_fixed_loop(&mut ir, index, "expert.in.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_in_reverse_input_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							pointer = pointer_type(backend),
+							routing = pointers.second,
+							weights = pointers.weights,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers)?;
+					let offset = narrow(plan.node.offset, "expert gradient offset")?;
+					emit_fixed_loop(&mut ir, index, "expert.in.gradient", node.parameters, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_in_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							delta = pointers.delta,
+							context = pointers.context
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::ExpertOut) => {
+					let (channels, length) = (node.output.channels, node.output.length);
+					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
+					let count = checked_mul(self.rows, node.input.elements(), "expert output reverse count")?;
+					emit_fixed_loop(&mut ir, index, "expert.out.reverse", count, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_out_reverse_values_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							pointer = pointer_type(backend),
+							routing = pointers.second,
+							weights = pointers.weights,
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					let positions = checked_mul(self.rows, length, "expert routing reverse count")?;
+					emit_fixed_loop(&mut ir, index, "expert.out.routing", positions, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_out_reverse_routing_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							routing = pointers.second,
+							weights = pointers.weights,
+							delta = pointers.delta,
+							adjoint = pointers.second_adjoint
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers)?;
+					let offset = narrow(plan.node.offset, "expert gradient offset")?;
+					emit_fixed_loop(&mut ir, index, "expert.out.gradient", node.parameters, |ir, p| {
+						ir.push_str(&format!(
+							"call void @expert_out_reverse_weight_body( {pointer} {source}, {pointer} {routing}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							routing = pointers.second,
+							delta = pointers.delta,
+							context = pointers.context
+						));
+					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
@@ -3716,6 +3859,35 @@ fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut 
 	Ok(())
 }
 
+/// Emits a grid-stride loop over a fixed launch-wide count.
+fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+	let prefix = format!("n{index}.{name}");
+	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	body(ir, &format!("%{prefix}.p"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
+
+/// List the positions routed to each expert, in ascending expert and position
+/// order. A weight gradient walks one expert's list instead of every position.
+fn emit_expert_buckets(ir: &mut String, backend: Backend, index: usize, rows: usize, node: &Node, pointers: &ModelPointers) -> Result<()> {
+	let pairs = checked_mul(rows, node.output.length, "routed positions")?;
+	emit_fixed_loop(ir, index, "expert.bucket", node.argument[0] as usize, |ir, p| {
+		ir.push_str(&format!(
+			"call void @moe_bucket_body( {pointer} {routing}, {pointer} {context}, i32 {p}, i32 {pairs}, i32 {length}, i32 {experts}, i32 {top} )\n",
+			pointer = pointer_type(backend),
+			routing = pointers.second,
+			context = pointers.context,
+			length = node.output.length,
+			experts = node.argument[0],
+			top = node.argument[1]
+		));
+	})?;
+	ir.push_str(barrier(backend));
+	Ok(())
+}
+
 static NATIVE_ARTIFACT_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 struct NativeTemporaryFiles {
@@ -4321,6 +4493,34 @@ mod bundle {
 		require(fields.next().is_none(), "activation has trailing fields")?;
 		Ok(activation)
 	}
+	fn scoring(value: u8) -> Result<Scoring> {
+		match value {
+			0 => Ok(Scoring::Softmax),
+			1 => Ok(Scoring::Sigmoid),
+			_ => Err(RecipeError::new(format!("invalid scoring {value}"))),
+		}
+	}
+	fn activation_code(value: u8) -> Result<Activation> {
+		match value {
+			0 => Ok(Activation::Linear),
+			1 => Ok(Activation::Cos),
+			2 => Ok(Activation::Exp),
+			3 => Ok(Activation::Log),
+			4 => Ok(Activation::Ln),
+			5 => Ok(Activation::Huber),
+			6 => Ok(Activation::Tan),
+			7 => Ok(Activation::Relu),
+			8 => Ok(Activation::Leak),
+			9 => Ok(Activation::Sigmoid),
+			10 => Ok(Activation::Tanh),
+			11 => Ok(Activation::Selu),
+			12 => Ok(Activation::Gelu),
+			13 => Ok(Activation::Silu),
+			14 => Ok(Activation::Elu),
+			15 => Ok(Activation::Prelu),
+			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
+		}
+	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
 			Operation::Layer(width) => format!("layer,{width}"),
@@ -4344,6 +4544,9 @@ mod bundle {
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Route(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
+				format!("route,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
+			}
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Identity => "identity".to_owned(),
 		}
@@ -4425,6 +4628,15 @@ mod bundle {
 					split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
 				))
 			}
+			"route" => Ok(Operation::Route(
+				value_at(fields.next(), "routed experts")?,
+				value_at(fields.next(), "routed top-k")?,
+				value_at(fields.next(), "routed expert width")?,
+				activation_code(value_at(fields.next(), "routed activation")?)?,
+				scoring(value_at(fields.next(), "routed scoring")?)?,
+				bool_value(fields.next().unwrap_or(""), "routed renormalization")?,
+				bool_value(fields.next().unwrap_or(""), "routed shared expert")?,
+			)),
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -5176,6 +5388,9 @@ pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
 	Block::of(Operation::Moe(top_k, experts.into()))
 }
+pub fn route(experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Block {
+	Block::of(Operation::Route(experts, top_k, hidden, activation, scoring, renormalize, shared))
+}
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
 #[derive(Clone, Copy, Debug)]
@@ -5236,6 +5451,7 @@ enum Operation {
 	Lstm(usize),
 	Residual(Vec<Block>),
 	Moe(usize, Vec<Block>),
+	Route(usize, usize, usize, Activation, Scoring, bool, bool),
 	Perceptron(usize),
 	/// Computes nothing. It carries a step that is only an activation or only
 	/// a normalization, so those need no operation of their own.
@@ -5288,6 +5504,13 @@ impl Activation {
 			Self::Scale(_) => 16,
 		}
 	}
+}
+/// How the router turns its scores into routing weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Scoring {
+	Softmax,
+	Sigmoid,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -5502,6 +5725,9 @@ impl Model {
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	pub fn route(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
+		self.push(Operation::Route(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
 	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
 		let mut model = self.clone();
@@ -6873,6 +7099,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
+			Self::Route(..) => "route",
 			Self::Perceptron(_) => "perc",
 		}
 	}
@@ -7082,6 +7309,9 @@ enum Primitive {
 	Normalize = 8,
 	Predictor = 9,
 	Rope = 11,
+	TopK = 15,
+	ExpertIn = 16,
+	ExpertOut = 17,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -7120,6 +7350,9 @@ impl Node {
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
 			Primitive::Rope => "Rope",
+			Primitive::TopK => "TopK",
+			Primitive::ExpertIn => "ExpertIn",
+			Primitive::ExpertOut => "ExpertOut",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -7332,6 +7565,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Identity => {}
+		Operation::Route(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_route(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -7670,10 +7904,14 @@ fn binary(graph: &mut Graph, first: i32, second: i32, shape: Shape, opcode: Scal
 	scalar.op(opcode, -1.0, -2.0);
 	program(graph, first, second, shape, &[], scalar)
 }
-fn constant(graph: &mut Graph, source: i32, shape: Shape, value: f64) -> Result<i32> {
-	let mut scalar = ScalarProgram(Vec::new());
-	scalar.constant(value);
-	program(graph, source, -2, shape, &[], scalar)
+/// Lower one gated feed-forward: `down(act(gate(x)) * up(x))`.
+fn lower_gated(graph: &mut Graph, gate: i32, up: i32, shape: Shape, activation: Activation, config: Config) -> Result<i32> {
+	reset(graph, gate, shape);
+	if activation != Activation::Linear {
+		lower_activation(graph, activation, config)?;
+	}
+	let activated = graph.source;
+	binary(graph, activated, up, shape, ScalarOpcode::Multiply)
 }
 fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
@@ -7681,6 +7919,12 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 		lower_activation(graph, value, config)?;
 	}
 	Ok((graph.source, graph.output))
+}
+
+fn constant(graph: &mut Graph, source: i32, shape: Shape, value: f64) -> Result<i32> {
+	let mut scalar = ScalarProgram(Vec::new());
+	scalar.constant(value);
+	program(graph, source, -2, shape, &[], scalar)
 }
 fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
@@ -7774,6 +8018,56 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 		scores.push(graph.source);
 	}
 	select(graph, &branches, &scores, output, top_k, config)
+}
+/// The dense reference the routed form is measured against: every expert is
+/// evaluated and the scores outside the top `top_k` are masked away. It costs
+/// every expert per position, so it stays for composed experts and for the
+/// models already saved with them, not for width.
+fn lower_route(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+	require(experts != 0, "route requires an expert")?;
+	require(top_k != 0 && top_k <= experts, "route top-k is invalid")?;
+	require(hidden != 0, "route expert width must be positive")?;
+	let (source, input) = (graph.source, graph.output);
+	// One router scores every expert per position. The top-k weights name the
+	// experts whose gated feed-forward runs, so a position costs top-k of them.
+	lower_project(graph, experts)?;
+	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let routing = graph.source;
+	let routed = Shape { channels: checked_mul(top_k, hidden, "moe routed width")?, length: input.length };
+	let table = checked_mul(experts, checked_mul(hidden, input.channels, "moe expert matrix")?, "moe expert table")?;
+	let dispatch = [experts as f64, top_k as f64, hidden as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+	reset(graph, source, input);
+	push_node(graph, Primitive::ExpertIn, routed, table, dispatch, routing)?;
+	let gate = graph.source;
+	reset(graph, source, input);
+	push_node(graph, Primitive::ExpertIn, routed, table, dispatch, routing)?;
+	let up = graph.source;
+	let product = lower_gated(graph, gate, up, routed, activation, config)?;
+	reset(graph, product, routed);
+	push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing)?;
+	if !shared {
+		return Ok(());
+	}
+	// The shared expert runs for every position and joins the routed sum under
+	// one trainable gain.
+	let dispatched = graph.source;
+	let wide = Shape { channels: hidden, length: input.length };
+	reset(graph, source, input);
+	lower_project(graph, hidden)?;
+	let shared_gate = graph.source;
+	reset(graph, source, input);
+	lower_project(graph, hidden)?;
+	let shared_up = graph.source;
+	let shared_product = lower_gated(graph, shared_gate, shared_up, wide, activation, config)?;
+	reset(graph, shared_product, wide);
+	lower_project(graph, input.channels)?;
+	let mut gain = ScalarProgram(Vec::new());
+	let scale = gain.op(ScalarOpcode::Parameter, 0.0, 0.0);
+	gain.op(ScalarOpcode::Multiply, scale, -1.0);
+	push_program(graph, -2, &[1.0], gain)?;
+	let scaled = graph.source;
+	binary(graph, dispatched, scaled, input, ScalarOpcode::Add)?;
+	Ok(())
 }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
@@ -7889,7 +8183,14 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		if matches!(node.op, Primitive::Elementwise | Primitive::Normalize) {
 			continue;
 		}
-		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
+		// An expert table holds every expert slice, but one output sums over a
+		// single slice: the fan-in is that slice, not the whole table.
+		let span = match node.op {
+			Primitive::ExpertIn => node.input.channels,
+			Primitive::ExpertOut => node.argument[2] as usize,
+			_ => node.parameters / node.output.channels.max(1),
+		};
+		let fan_in = span.max(1) as f64;
 		let scale = config.initial / fan_in.sqrt();
 		for index in node.offset..node.offset + node.parameters {
 			if graph.frozen[index] == 0 {
@@ -8888,6 +9189,12 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// One count per expert, then every routed position of every expert in
+		// ascending expert and position order.
+		Primitive::ExpertIn | Primitive::ExpertOut => {
+			let entries = checked_mul(checked_mul(rows, node.output.length, "routed positions")?, node.argument[1] as usize, "routed slots")?;
+			return checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes");
+		}
 		// Four statistic planes over the group count the emitted kernel walks:
 		// batch and evaluation groups are channels; layer, RMS, and L2 groups
 		// are row positions, multiplied by their normalized head count.
