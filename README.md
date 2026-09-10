@@ -96,6 +96,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	hyper(lanes, rank, &model)
 
 	A branch step is an ordinary model step, so anything above goes inside one,
 	carrying its own activation, normalization, quantization and profile, and a
@@ -125,6 +126,8 @@ estimators:
 ```
 
 Feature generation is banned.
+
+`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into a Recipe submodel through a gate, writes its output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
 
 ## data
 
