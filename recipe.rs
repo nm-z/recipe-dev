@@ -5632,7 +5632,6 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
-		assert!(operation.weighted() || !(model.frozen || model.packed), "{} owns no weights to qualify", operation.name());
 		model.blocks.push(Block {
 			operation,
 			activation: Activation::Linear,
@@ -7432,6 +7431,9 @@ fn node_optimizer_state<'a>(state: &'a [f64], frozen: &[u8], offset: usize, coun
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	require(!(model.frozen || model.packed), "block qualifier requires a following block")?;
+	for block in &model.blocks {
+		require(block.weighted() || !(block.frozen || block.packed), format!("{} owns no weights to qualify", block.operation.name()))?;
+	}
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
