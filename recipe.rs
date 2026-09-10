@@ -2524,11 +2524,10 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(reverse, Primitive::Rope) => {
-					let count = checked_mul(self.rows, node.output.elements(), "rotary count")?;
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
 					let ty = self.precision.model_type;
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
-					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
+					emit_row_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, node.output.elements(), |ir, p| {
 						ir.push_str(&format!(
 							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
@@ -2574,11 +2573,11 @@ impl NativeModelIr {
 						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
-						emit_fixed_loop(&mut ir, index, "index", checked_mul(self.rows, blocks, "indexer block count")?, |ir, p| {
+						emit_row_loop(&mut ir, index, "index", blocks, |ir, p| {
 							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
-						emit_fixed_loop(&mut ir, index, "select", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+						emit_row_loop(&mut ir, index, "select", node.output.length, |ir, p| {
 							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
@@ -2724,7 +2723,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 					if attention_blocks(node) != 0 {
 						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
-						emit_fixed_loop(&mut ir, index, "index.reverse", checked_mul(self.rows, node.output.length, "indexer query count")?, |ir, p| {
+						emit_row_loop(&mut ir, index, "index.reverse", node.output.length, |ir, p| {
 							ir.push_str(&format!(
 								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
 							));
