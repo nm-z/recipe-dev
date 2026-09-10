@@ -39,11 +39,171 @@ SNAPSHOT_BLOB="$TRANSFER_ROOT/snapshot.tar.gz"
 RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
 PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-2700}"
+ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
+ADMISSION_LEASE_SECONDS=60
+ADMISSION_BLOB="runtime/windows/admission.lock"
+admission_lease_id=""
+admission_renew_pid=""
+admission_started="$(date +%s)"
+
+if [[ ! "$ADMISSION_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+	echo "AZURE_ADMISSION_WAIT_SECONDS must be a nonnegative integer" >&2
+	exit 2
+fi
+
+release_admission() {
+	if [ -n "$admission_renew_pid" ]; then
+		kill "$admission_renew_pid" 2>/dev/null || true
+		wait "$admission_renew_pid" 2>/dev/null || true
+		admission_renew_pid=""
+	fi
+	if [ -n "$admission_lease_id" ]; then
+		az storage blob lease release \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--blob-name "$ADMISSION_BLOB" \
+			--lease-id "$admission_lease_id" \
+			--only-show-errors -o none || {
+			echo "could not release the Azure GPU admission lease; it will expire automatically" >&2
+			return 1
+		}
+		admission_lease_id=""
+	fi
+}
+trap 'release_admission || true' EXIT
 
 mkdir -p evidence
 
 echo "== subscription =="
 az account show --query "{name:name, id:id, state:state}" -o json | tee evidence/azure-account.json
+
+ensure_admission_blob() {
+	local exists
+	if ! exists="$(az storage blob exists \
+		--auth-mode login \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--name "$ADMISSION_BLOB" \
+		--query exists -o tsv --only-show-errors)"; then
+		echo "could not inspect the Azure GPU admission blob" >&2
+		return 1
+	fi
+	if [ "$exists" = true ]; then
+		return 0
+	fi
+	if ! az storage blob upload \
+		--auth-mode login \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--name "$ADMISSION_BLOB" \
+		--data "$WORKER" \
+		--overwrite false \
+		--content-type text/plain \
+		--only-show-errors -o none; then
+		# Another waiting run may have created it between exists and upload.
+		exists="$(az storage blob exists \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--name "$ADMISSION_BLOB" \
+			--query exists -o tsv --only-show-errors)" || return 1
+		[ "$exists" = true ] || return 1
+	fi
+}
+
+renew_admission() {
+	while sleep 30; do
+		renewed=false
+		for attempt in 1 2 3; do
+			if az storage blob lease renew \
+				--auth-mode login \
+				--account-name "$AZURE_STORAGE_ACCOUNT" \
+				--container-name "$AZURE_STORAGE_CONTAINER" \
+				--blob-name "$ADMISSION_BLOB" \
+				--lease-id "$admission_lease_id" \
+				--only-show-errors -o none; then
+				renewed=true
+				break
+			fi
+			sleep 2
+		done
+		if [ "$renewed" != true ]; then
+			echo "Azure GPU admission lease renewal failed; stopping before provisioning can overlap" >&2
+			kill -TERM "$$" 2>/dev/null || true
+			return 1
+		fi
+	done
+}
+
+acquire_admission() {
+	local deadline now lease_error_file lease_error detail
+	deadline=$(( $(date +%s) + ADMISSION_WAIT_SECONDS ))
+	if ! ensure_admission_blob; then
+		cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-admission-storage-unavailable",
+  "detail": "The Azure storage blob used for GPU admission could not be inspected or created.",
+  "resolution": "Restore the storage account/container permissions before retrying the Windows GPU check."
+}
+JSON
+		cat evidence/blocker.json
+		return 1
+	fi
+	lease_error_file="evidence/azure-admission-error.log"
+	: > "$lease_error_file"
+	while :; do
+		if admission_lease_id="$(az storage blob lease acquire \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--blob-name "$ADMISSION_BLOB" \
+			--lease-duration "$ADMISSION_LEASE_SECONDS" \
+			--query leaseId -o tsv --only-show-errors 2>"$lease_error_file")" && [ -n "$admission_lease_id" ]; then
+			admission_renew_pid=""
+			renew_admission &
+			admission_renew_pid=$!
+			printf '{"worker":"%s","wait_seconds":%s,"lease_seconds":%s}\n' \
+				"$WORKER" "$(( $(date +%s) - admission_started ))" "$ADMISSION_LEASE_SECONDS" \
+				> evidence/azure-admission.json
+			cat evidence/azure-admission.json
+			return 0
+		fi
+		lease_error="$(sed -n '1,8p' "$lease_error_file")"
+		if ! grep --ignore-case --extended-regexp --quiet 'lease.?already|active lease|condition.?not.?met|status.?code.?409|\b409\b' "$lease_error_file"; then
+			detail="$(jq -Rs . < "$lease_error_file")"
+			cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-admission-error",
+  "detail": $detail,
+  "resolution": "Resolve the Azure storage authorization or network error before retrying the Windows GPU check."
+}
+JSON
+			cat evidence/blocker.json
+			return 1
+		fi
+		if [ -n "$lease_error" ]; then
+			echo "Azure GPU admission is busy: $lease_error"
+		fi
+		now="$(date +%s)"
+		if [ "$now" -ge "$deadline" ]; then
+			cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-admission-timeout",
+  "detail": "Another Windows GPU runtime owns the shared Azure admission lease, and this run waited ${ADMISSION_WAIT_SECONDS} seconds without a slot.",
+  "resolution": "Retry this run after the active Windows GPU runtime releases its worker."
+}
+JSON
+			cat evidence/blocker.json
+			return 1
+		fi
+		echo "Azure GPU admission is busy; waiting for the active worker"
+		sleep 15
+	done
+}
+
+echo "== acquiring the Windows GPU admission lease =="
+acquire_admission
 
 echo "== selecting available GPU capacity =="
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
@@ -221,6 +381,9 @@ cleanup_on_exit() {
 		echo "worker $WORKER was already absent"
 	fi
 	if ! wait_for_worker_absent; then
+		cleanup_status=1
+	fi
+	if ! release_admission; then
 		cleanup_status=1
 	fi
 	if [ "$primary" -ne 0 ]; then
