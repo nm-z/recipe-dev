@@ -1309,6 +1309,8 @@ mod program_ir {
 	}
 }
 
+
+
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
@@ -2760,7 +2762,7 @@ impl NativeModelIr {
 				(false, Primitive::TopK) => {
 					// One router decision per row and position: a `[1, length]` shape.
 					let positions = Shape { channels: 1, length: node.output.length };
-					emit_fixed_loop(&mut ir, index, "topk", self.rows, positions, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "topk", self.rows, positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
 							pointer = pointer_type(backend),
@@ -2776,7 +2778,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Expand) => {
-					emit_fixed_loop(&mut ir, index, "expand", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expand", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expand_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 							pointer = pointer_type(backend),
@@ -2793,7 +2795,7 @@ impl NativeModelIr {
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
 					let ty = self.precision.model_type;
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
-					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @rope_body( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
@@ -2807,7 +2809,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertIn) => {
-					emit_fixed_loop(&mut ir, index, "expert.in", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.in", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_in_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
@@ -2826,7 +2828,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Read) => {
-					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @read_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
@@ -2842,7 +2844,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Dconv) => {
-					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
@@ -2878,7 +2880,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Fold) => {
-					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @fold_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {groups}, i32 {width}, i32 {length} )\n",
 							pointer = pointer_type(backend),
@@ -2892,7 +2894,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Outer) => {
-					emit_fixed_loop(&mut ir, index, "outer", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "outer", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
@@ -2916,7 +2918,7 @@ impl NativeModelIr {
 					// so a training layout commits every entry; an inference layout holds
 					// the live state alone and commits nothing.
 					let entries = if self.inference { 0 } else { shape.chunks };
-					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
@@ -2932,7 +2934,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
-					emit_fixed_loop(&mut ir, index, "expert.out", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.out", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_out_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
@@ -2953,7 +2955,7 @@ impl NativeModelIr {
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let store_indices = !self.inference;
-					emit_fixed_loop(&mut ir, index, "pool", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "pool", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {from}, i32 {to}, i32 {size}, i32 {channels}, i1 {store_indices} )\n",
 							pointer = pointer_type(backend),
@@ -2989,7 +2991,6 @@ impl NativeModelIr {
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						// The selection clears the block score gradients the reverse pass
 						// accumulates; an inference layout holds none.
-						let derivatives = !self.inference;
 						let block = integer_argument(node.argument[3], "indexer block")?;
 						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
 						let end = format!("%n{index}.end");
@@ -2998,7 +2999,7 @@ impl NativeModelIr {
 							last = block - 1
 						));
 						let touched = NodeWindow { begin: first, span: count };
-						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, p, wide| {
+						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
@@ -3141,7 +3142,7 @@ impl NativeModelIr {
 				// leaves it frozen, so the embedding contributes no reverse pass.
 				(true, Primitive::Gather) => {}
 				(true, Primitive::Expand) => {
-					emit_fixed_loop(&mut ir, index, "expand.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expand.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expand_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 							pointer = pointer_type(backend),
@@ -3156,7 +3157,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::TopK) => {
 					let positions = Shape { channels: 1, length: node.output.length };
-					emit_fixed_loop(&mut ir, index, "topk.reverse", self.rows, positions, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "topk.reverse", self.rows, positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @topk_reverse_body( {pointer} {source}, {pointer} {value}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {experts}, i32 {length}, i32 {scoring}, i32 {renormalize} )\n",
 							pointer = pointer_type(backend),
@@ -3173,7 +3174,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Dconv) => {
-					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
@@ -3191,7 +3192,7 @@ impl NativeModelIr {
 					let kernel = integer_argument(node.argument[0], "depthwise kernel")? as usize;
 					let taps = Shape { channels: node.output.channels, length: kernel };
 					let whole = NodeWindow { begin: "0".to_owned(), span: kernel.to_string() };
-					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
@@ -3210,7 +3211,7 @@ impl NativeModelIr {
 				// rows it stages contribute no reverse pass.
 				(true, Primitive::Lookup) => {}
 				(true, Primitive::Fold) => {
-					emit_fixed_loop(&mut ir, index, "fold.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "fold.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @fold_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {groups}, i32 {width}, i32 {length} )\n",
 							pointer = pointer_type(backend),
@@ -3226,7 +3227,7 @@ impl NativeModelIr {
 				(true, Primitive::ExpertIn) => {
 					let (channels, length) = (node.input.channels, node.output.length);
 					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
-					emit_fixed_loop(&mut ir, index, "expert.in.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.in.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_in_reverse_input_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
@@ -3242,7 +3243,7 @@ impl NativeModelIr {
 					// One table entry per element: a `[1, parameters]` shape walked whole.
 					let table = Shape { channels: 1, length: node.parameters };
 					let whole = NodeWindow { begin: "0".to_owned(), span: node.parameters.to_string() };
-					emit_fixed_loop(&mut ir, index, "expert.in.gradient", 1, table, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.in.gradient", 1, table, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_in_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
@@ -3254,13 +3255,13 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Read) => {
-					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!("call void @read_reverse_body( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Outer) => {
-					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_reverse_branch_body( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
@@ -3277,7 +3278,7 @@ impl NativeModelIr {
 					if node.second >= 0 {
 						// One gate per row, lane, and position: a `[lanes, length]` shape walked whole.
 						let gates = Shape { channels: integer_argument(node.argument[0], "outer lanes")? as usize, length: node.input.length };
-						emit_fixed_loop(&mut ir, index, "outer.gate.reverse", self.rows, gates, &window, |ir, p, wide| {
+						emit_fixed_loop(&mut ir, index, "outer.gate.reverse", self.rows, gates, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
 								"call void @outer_reverse_gate_body( {pointer} {source}, {pointer} {delta}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 								pointer = pointer_type(backend),
@@ -3299,7 +3300,7 @@ impl NativeModelIr {
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// One row and key head per element, so the value heads sharing a key head
 					// walk in one thread and own the query and key adjoint elements they share.
-					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @delta_reverse_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
@@ -3315,7 +3316,7 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 					// Then one decay scale per value head, folding that head's row partials.
-					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @delta_reverse_decay_body( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
@@ -3330,7 +3331,7 @@ impl NativeModelIr {
 				(true, Primitive::ExpertOut) => {
 					let (channels, length) = (node.output.channels, node.output.length);
 					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
-					emit_fixed_loop(&mut ir, index, "expert.out.reverse", self.rows, node.input, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.out.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_out_reverse_values_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
@@ -3342,7 +3343,7 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 					let positions = Shape { channels: 1, length };
-					emit_fixed_loop(&mut ir, index, "expert.out.routing", self.rows, positions, &window, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.out.routing", self.rows, positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_out_reverse_routing_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
@@ -3358,7 +3359,7 @@ impl NativeModelIr {
 					let offset = narrow(plan.node.offset, "expert gradient offset")?;
 					let table = Shape { channels: 1, length: node.parameters };
 					let whole = NodeWindow { begin: "0".to_owned(), span: node.parameters.to_string() };
-					emit_fixed_loop(&mut ir, index, "expert.out.gradient", 1, table, &whole, |ir, p, wide| {
+					emit_fixed_loop(&mut ir, index, "expert.out.gradient", 1, table, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @expert_out_reverse_weight_body( {pointer} {source}, {pointer} {routing}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
@@ -19243,5 +19244,3 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
-
-
