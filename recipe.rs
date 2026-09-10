@@ -8185,7 +8185,7 @@ fn route_counts(route: &[usize], links: &[Link], rows: usize) -> Result<Vec<usiz
 	let mut remainders = Vec::with_capacity(route.len());
 	for (index, device) in route.iter().enumerate() {
 		let exact = remaining as f64 * links[*device].work / total;
-		require(exact.is_finite() && exact >= 0.0, "route share is invalid")?;
+		require(exact.is_finite() && (0.0..=remaining as f64).contains(&exact), "route share is invalid")?;
 		let base = exact.floor() as usize;
 		counts[index] += base;
 		remainders.push((exact - base as f64, index));
