@@ -7525,27 +7525,42 @@ impl NativeTape {
 	/// launch carries its own row count, so the last short batch reads only the
 	/// rows it was given and the compiled tile shapes stay as they trained.
 	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
-		self.upload_weights(&graph.parameters)?;
-		self.load_storage(graph)?;
 		let input = graph.input.elements();
-		let (rows, mut predictions, mut row) = (samples.len() / input, Vec::new(), first);
-		while row < rows {
-			let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
-			self.rows = narrow(end - row, "native evaluation rows")? as u32;
-			self.samples.write_float_bytes(0, &samples[row * input..end * input], self.precision.model)?;
-			self.forward(ForwardMode::Inference)?;
-			predictions.extend_from_slice(&self.predictions()?);
-			row = end;
-		}
-		self.rows = narrow(self.capacity, "native rows")? as u32;
-		self.upload_weights(&graph.parameters).map(|_| predictions)
+		require(input != 0 && samples.len() % input == 0, format!("evaluation samples must be a multiple of {input} values"))?;
+		let rows = samples.len() / input;
+		require(first <= rows, format!("evaluation start row {first} exceeds {rows} rows"))?;
+		let saved_rows = self.rows;
+		let result = (|| {
+			self.upload_weights(&graph.parameters)?;
+			// Holdout evaluation must use the trained effective weights. The graph's
+			// stored bytes are the last quantized checkpoint and would overwrite those
+			// weights if model-load ran here.
+			let evaluation_sample_count = checked_mul(self.capacity, input, "native evaluation sample allocation")?;
+			let evaluation_samples = Buffer::upload_float(self.program.gpu, &vec![0.0; evaluation_sample_count], self.precision.model)?;
+			let mut predictions = Vec::new();
+			let mut row = first;
+			while row < rows {
+				let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
+				self.rows = narrow(end - row, "native evaluation rows")? as u32;
+				evaluation_samples.write_float_bytes(0, &samples[row * input..end * input], self.precision.model)?;
+				self.forward_with_samples(evaluation_samples.pointer, ForwardMode::Inference)?;
+				predictions.extend_from_slice(&self.predictions()?);
+				row = end;
+			}
+			Ok(predictions)
+		})();
+		self.rows = saved_rows;
+		result
 	}
 	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
+		self.forward_with_samples(self.samples.pointer, mode)
+	}
+	fn forward_with_samples(&mut self, samples: u64, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let mode = mode as i32;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
+		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
