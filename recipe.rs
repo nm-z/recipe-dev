@@ -4233,10 +4233,12 @@ mod bundle {
 	fn activation(text: &str) -> Result<Activation> {
 		let mut fields = text.split(',');
 		let value: u8 = value_at(fields.next(), "activation code")?;
-		if value == 16 {
-			return Ok(Activation::Scale(value_at(fields.next(), "scale factor")?));
-		}
-		match value {
+		let activation = if value == 16 {
+			let factor = value_at::<u64>(fields.next(), "scale factor")?;
+			require(f64::from_bits(factor).is_finite(), "scale factor must be finite")?;
+			Activation::Scale(factor)
+		} else {
+			match value {
 			0 => Ok(Activation::Linear),
 			1 => Ok(Activation::Cos),
 			2 => Ok(Activation::Exp),
@@ -4254,7 +4256,10 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
-		}
+			}?
+		};
+		require(fields.next().is_none(), "activation has trailing fields")?;
+		Ok(activation)
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
@@ -7243,7 +7248,9 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
 		Activation::Scale(factor) => {
-			let factor = constant(&mut program, f64::from_bits(factor));
+			let factor = f64::from_bits(factor);
+			require(factor.is_finite(), "scale factor must be finite")?;
+			let factor = constant(&mut program, factor);
 			program.op(ScalarOpcode::Multiply, factor, x)
 		}
 		Activation::Linear => unreachable!(),

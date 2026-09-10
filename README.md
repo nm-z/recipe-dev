@@ -136,12 +136,8 @@ scale(factor)
 ```
 
 `scale(factor)` multiplies every value the preceding block produces by one
-constant. It owns no weights and preserves the shape, so it states embedding
-scaling or logit softcapping directly:
-
-```rust
-.layer(width).scale(1.0 / softcapping)
-```
+finite constant. It owns no weights and preserves the shape, so it states an
+explicit scalar rescaling directly.
 
 ## 4 normalizations
 
