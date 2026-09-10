@@ -9422,6 +9422,10 @@ enum Driver {
 #[allow(dead_code)]
 struct Gpu {
 	name: String,
+	// The user-facing selector stays in `name`; this stable backend identity is
+	// the key used for local admission so CUDA ordinal remapping cannot alias or
+	// split a physical device's lease.
+	lease_id: String,
 	backend: Backend,
 	native_target: BackendTarget,
 	driver: Driver,
@@ -9479,6 +9483,11 @@ impl Library {
 		Ok(Self(handle as usize))
 	}
 	fn function<F: Copy>(&self, name: &[u8]) -> Result<F> {
+		let pointer = self.optional_function(name);
+		require(pointer.is_some(), format!("runtime symbol {:?} is absent", name))?;
+		Ok(pointer.expect("checked runtime symbol"))
+	}
+	fn optional_function<F: Copy>(&self, name: &[u8]) -> Option<F> {
 		let pointer = unsafe {
 			#[cfg(unix)]
 			{
@@ -9489,8 +9498,7 @@ impl Library {
 				GetProcAddress(self.0 as Ptr, name.as_ptr().cast())
 			}
 		};
-		require(!pointer.is_null(), format!("runtime symbol {:?} is absent", name))?;
-		Ok(unsafe { std::mem::transmute_copy(&pointer) })
+		(!pointer.is_null()).then(|| unsafe { std::mem::transmute_copy(&pointer) })
 	}
 }
 
@@ -9530,6 +9538,53 @@ fn load_native_cpu_path(path: &Path, state_bytes: usize, training: bool, has_sto
 #[cfg(any(amd, nvidia))]
 fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
+}
+#[cfg(nvidia)]
+unsafe fn cuda_lease_id(runtime: &Library, attribute: NvQuery, device: i32) -> Result<String> {
+	type CudaUuid = unsafe extern "C" fn(*mut [u8; 16], i32) -> i32;
+	type CudaPciBusId = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
+	let uuid_function = runtime
+		.optional_function::<CudaUuid>(b"cuDeviceGetUuid\0")
+		.or_else(|| runtime.optional_function::<CudaUuid>(b"cuDeviceGetUuid_v2\0"));
+	if let Some(get_uuid) = uuid_function {
+		let mut uuid = [0_u8; 16];
+		if unsafe { get_uuid(&mut uuid, device) } == 0 && uuid.iter().any(|byte| *byte != 0) {
+			let mut identity = String::from("nv-uuid-");
+			for byte in uuid {
+				identity.push_str(&format!("{byte:02x}"));
+			}
+			return Ok(identity);
+		}
+	}
+	if let Some(get_pci_bus_id) = runtime.optional_function::<CudaPciBusId>(b"cuDeviceGetPCIBusId\0") {
+		let mut bytes = [0_u8; 64];
+		if unsafe { get_pci_bus_id(bytes.as_mut_ptr(), bytes.len() as i32, device) } == 0 {
+			let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+			if let Ok(bus_id) = std::str::from_utf8(&bytes[..end]) {
+				if !bus_id.is_empty() && bus_id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte == b'.') {
+					let mut identity = String::from("nv-pci-");
+					for byte in bus_id.bytes() {
+						identity.push(if matches!(byte, b':' | b'.') { '-' } else { byte as char });
+					}
+					return Ok(identity);
+				}
+			}
+		}
+	}
+	// A CUDA driver old enough to omit the UUID entry point still exposes the
+	// immutable PCI coordinates. They remain stable while CUDA_VISIBLE_DEVICES
+	// changes the logical ordinal presented to this process. The attributes are
+	// a final compatibility fallback for drivers without either identity helper.
+	let pci = |kind: i32, action: &str| -> Result<u32> {
+		let mut value = 0_i32;
+		driver_status(Backend::Nvidia, unsafe { attribute(&mut value, kind, device) }, action)?;
+		require(value >= 0, format!("Nvidia {action} is negative: {value}"))?;
+		Ok(value as u32)
+	};
+	let domain = pci(50, "PCI domain query")?;
+	let bus = pci(33, "PCI bus query")?;
+	let slot = pci(34, "PCI device query")?;
+	Ok(format!("nv-pci-{domain:08x}-{bus:02x}-{slot:02x}"))
 }
 impl Gpu {
 	#[cfg(any(amd, nvidia))]
@@ -9863,7 +9918,16 @@ fn cpu_worker_threads() -> Result<u32> {
 	u32::try_from(if limit == 0 { available } else { available.min(limit) }).map_err(|_| RecipeError::new("CPU worker threads exceed u32"))
 }
 fn cpu_device() -> Result<Gpu> {
-	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
+	Ok(Gpu {
+		name: "cpu".to_owned(),
+		lease_id: "cpu".to_owned(),
+		backend: Backend::Cpu,
+		native_target: native_cpu_target()?,
+		driver: Driver::Cpu,
+		memory: u64::MAX,
+		shared_limit: u32::MAX,
+		dispatch: Mutex::new(()),
+	})
 }
 fn shared_cpu_device() -> Result<&'static Gpu> {
 	static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
@@ -10088,12 +10152,18 @@ fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
 /// the machine, including the child processes the determinism suite spawns per case.
 /// Remote devices are not leased either: the lease is local to one machine, and
 /// admitting a run on another host is what #262 still needs.
+fn local_lease_names(selected: &[&'static Gpu]) -> Result<Vec<String>> {
+	let mut identities = Vec::<(String, String)>::new();
+	for gpu in selected.iter().filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':')) {
+		if let Some((previous, _)) = identities.iter().find(|(_, identity)| identity == &gpu.lease_id) {
+			return Err(RecipeError::new(format!("devices {:?} and {:?} refer to the same physical device", previous, gpu.name)));
+		}
+		identities.push((gpu.name.clone(), gpu.lease_id.clone()));
+	}
+	Ok(identities.into_iter().map(|(_, identity)| identity).collect())
+}
 fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
-	let names = selected
-		.iter()
-		.filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':'))
-		.map(|gpu| gpu.name.clone())
-		.collect::<Vec<_>>();
+	let names = local_lease_names(&selected)?;
 	let held = acquire_leases(names)?;
 	LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
 	Ok(selected)
@@ -10113,18 +10183,23 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			let names = device_names(&selection)?;
 			let selected_names = names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }).collect::<Vec<_>>();
 			let local_prefix = format!("{host}:");
-			let local_leases = selected_names
+			let provisional_names = selected_names
 				.iter()
 				.filter_map(|name| {
 					let local_name = name.strip_prefix(&local_prefix).unwrap_or(name);
 					let local = !name.contains(':') || name.starts_with(&local_prefix);
-					(local && (local_name.starts_with("amd") || local_name.starts_with("nv"))).then(|| local_name.to_owned())
+					// HSA initialization can allocate KFD resources during discovery;
+					// reserve AMD's logical selector before discovery. CUDA identity is
+					// resolved below without creating a context, so ordinal aliases do
+					// not acquire a misleading logical lease here.
+					(local && local_name.starts_with("amd")).then(|| local_name.to_owned())
 				})
 				.collect::<Vec<_>>();
 			// Runtime initialization can itself open KFD/CUDA resources. Reserve
 			// explicit local accelerators before discovery so a queued process has
-			// no driver allocation while it waits.
-			let held = acquire_leases(local_leases)?;
+			// no HSA allocation while it waits. CUDA is admitted by its stable
+			// UUID or PCI identity after the context-free descriptor is loaded.
+			let held = acquire_leases(provisional_names.clone())?;
 			let resolved = (|| {
 				let mut selected = Vec::new();
 				for name in selected_names {
@@ -10148,7 +10223,14 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			})();
 			match resolved {
 				Ok(selected) => {
-					LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
+					let stable_names = local_lease_names(&selected)?
+						.into_iter()
+						.filter(|identity| !provisional_names.iter().any(|name| name == identity))
+						.collect::<Vec<_>>();
+					let stable_held = acquire_leases(stable_names)?;
+					let mut leases = LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?;
+					leases.extend(held);
+					leases.extend(stable_held);
 					Ok(selected)
 				}
 				Err(error) => Err(error),
@@ -10259,6 +10341,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	};
 	let gpu = Box::leak(Box::new(Gpu {
 		name: canonical.to_owned(),
+		lease_id: canonical.to_owned(),
 		backend,
 		native_target,
 		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave, worker_threads }),
@@ -10899,7 +10982,18 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			workgroup,
 			lds,
 		};
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
+		Ok(Gpu {
+			name: format!("amd{index}"),
+			// HSA agent handles are process-local. Keep the existing stable ordinal
+			// key for AMD until the runtime exposes a stable UUID through this API.
+			lease_id: format!("amd{index}"),
+			backend: Backend::Amd,
+			native_target,
+			driver: Driver::Hsa(hsa),
+			memory: memory as u64,
+			shared_limit: lds,
+			dispatch: Mutex::new(()),
+		})
 	}
 }
 fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
@@ -10938,6 +11032,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		check(count_devices(&mut count), "device enumeration")?;
 		let load_device = |device, index| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
+			let lease_id = cuda_lease_id(&runtime, attribute, device)?;
 			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
 			check(total(&mut memory, device), "VRAM size")?;
@@ -10983,6 +11078,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			};
 			Ok(Gpu {
 				name: format!("nv{index}"),
+				lease_id,
 				backend: Backend::Nvidia,
 				native_target,
 				driver: Driver::Cuda(cuda),
