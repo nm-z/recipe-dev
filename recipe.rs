@@ -9489,6 +9489,7 @@ fn lease_directory() -> Result<PathBuf> {
 fn take_lease(path: &Path) -> Result<Option<fs::File>> {
 	#[cfg(unix)]
 	{
+		use std::io::ErrorKind;
 		use std::os::fd::AsRawFd;
 		let file = fs::OpenOptions::new()
 			.create(true)
@@ -9498,19 +9499,26 @@ fn take_lease(path: &Path) -> Result<Option<fs::File>> {
 			.map_err(|error| RecipeError::new(format!("cannot open the device lease {}: {error}", path.display())))?;
 		// LOCK_EX | LOCK_NB. The lock is released with the file description, so a
 		// killed process frees its device without anything running afterwards.
-		let held = unsafe { flock(file.as_raw_fd(), 2 | 4) } == 0;
-		Ok(held.then_some(file))
+		if unsafe { flock(file.as_raw_fd(), 2 | 4) } == 0 {
+			Ok(Some(file))
+		} else {
+			let error = std::io::Error::last_os_error();
+			if error.kind() == ErrorKind::WouldBlock {
+				Ok(None)
+			} else {
+				Err(RecipeError::new(format!("cannot lock the device lease {}: {error}", path.display())))
+			}
+		}
 	}
 	#[cfg(windows)]
 	{
-		use std::io::ErrorKind;
 		use std::os::windows::fs::OpenOptionsExt;
 		// Open the handle that is retained with share_mode(0). The previous code
 		// opened a second exclusive handle, dropped it immediately, and retained a
 		// default-sharing handle, so Windows never held the lease.
 		match fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(path) {
 			Ok(file) => Ok(Some(file)),
-			Err(error) if matches!(error.kind(), ErrorKind::PermissionDenied | ErrorKind::WouldBlock) => Ok(None),
+			Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
 			Err(error) => Err(RecipeError::new(format!("cannot open the device lease {}: {error}", path.display()))),
 		}
 	}
