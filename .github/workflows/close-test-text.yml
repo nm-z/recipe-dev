@@ -194,31 +194,42 @@ jobs:
   draft-conflicts:
     if: github.event_name == 'push' || github.event.pull_request.state == 'open'
     concurrency:
-      group: recipe-merge-conflict-policy
+      group: recipe-merge-conflict-policy-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Convert conflicting pull requests to draft
         env:
-          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN can read and comment on pull requests but GitHub's
+          # GraphQL draft mutation rejects it. A repository-scoped token can
+          # be supplied as RECIPE_POLICY_TOKEN when automatic conversion is
+          # required; the workflow reports the missing capability otherwise.
+          GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
 
-          numbers="$(gh pr list \
-            --repo "$REPOSITORY" \
-            --state open \
-            --base minimal \
-            --limit 1000 \
-            --json number \
-            --jq '.[].number')"
+          if [[ "$EVENT_NAME" == 'pull_request_target' ]]; then
+            numbers="$PR_NUMBER"
+          else
+            numbers="$(gh pr list \
+              --repo "$REPOSITORY" \
+              --state open \
+              --base minimal \
+              --limit 1000 \
+              --json number \
+              --jq '.[].number')"
+          fi
           if [[ -z "$numbers" ]]; then
             exit 0
           fi
           mapfile -t pr_numbers <<< "$numbers"
 
           marker='<!-- recipe-merge-conflict-policy -->'
+          failed_prs=()
           for pr_number in "${pr_numbers[@]}"; do
             mergeable='unknown'
             draft='false'
@@ -258,7 +269,16 @@ jobs:
             fi
 
             if [[ "$draft" != 'true' ]]; then
-              gh pr ready "$pr_number" --repo "$REPOSITORY" --undo
+              if ! mutation_error="$(gh pr ready "$pr_number" --repo "$REPOSITORY" --undo 2>&1)"; then
+                printf 'Could not convert conflicting PR %s to draft:\n%s\n' "$pr_number" "$mutation_error" >&2
+                {
+                  printf '### Draft conversion blocked for PR #%s\n\n' "$pr_number"
+                  printf 'GitHub reported the following mutation error:\n\n```text\n%s\n```\n\n' "$mutation_error"
+                  printf 'The workflow can read the conflict, but automatic draft conversion requires the `RECIPE_POLICY_TOKEN` repository secret with pull-request write access. Mark the PR draft manually or configure that token.\n\n'
+                } >> "$GITHUB_STEP_SUMMARY"
+                failed_prs+=("$pr_number")
+                continue
+              fi
             fi
 
             reason="$marker
@@ -269,3 +289,8 @@ jobs:
               gh api -X POST "repos/$REPOSITORY/issues/$pr_number/comments" -f body="$reason"
             fi
           done
+
+          if (( ${#failed_prs[@]} != 0 )); then
+            printf 'Draft conversion failed for PRs: %s.\n' "${failed_prs[*]}" >&2
+            exit 1
+          fi
