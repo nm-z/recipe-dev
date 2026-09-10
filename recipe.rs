@@ -4209,6 +4209,7 @@ mod bundle {
 			return match fields.next().unwrap_or("") {
 				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
 				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
+<<<<<<< HEAD
 				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
 				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
 			};
@@ -4337,6 +4338,7 @@ mod bundle {
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
+<<<<<<< HEAD
 			activation: activation(&fields[1])?,
 			normalization: normalization(Some(&fields[2]), "block normalization")?,
 			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
@@ -5220,6 +5222,7 @@ impl Block {
 		let q = |variant| self.clone().quantize(0, bits, variant);
 		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
+<<<<<<< HEAD
 	pub fn scale(self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.act(Activation::Scale(factor.to_bits()))
@@ -11868,7 +11871,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 /// samples their decoded pixels. Anything else falls through to the table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
-	let [target] = data.target.as_slice() else { return Ok(None) };
+	let targets = data.target.as_slice();
+	if targets.is_empty() {
+		return Ok(None);
+	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
@@ -11879,6 +11885,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
 	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
 	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
+		// A sidecar file and a labeled file name each carry one label per sample.
+		let [target] = targets else { return Ok(None) };
 		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
 		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
 			let mut builder = SampleTableBuilder::new(target.clone());
@@ -11917,13 +11925,13 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Paired subdirectories: identical sample stems in every directory, one directory named
-	// for the requested target. Each stem is one sample and each directory one column group.
+	// for each requested target. Each stem is one sample and each directory one column group.
 	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
 	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
 	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
-	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
-	let sample_target = stems[0].contains(target);
-	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
+	let paired_target = targets.iter().all(|target| directories.keys().any(|directory| singular(directory) == *target));
+	let sample_target = targets.iter().all(|target| stems[0].contains(target));
+	require(!(aligned && paired_target && sample_target), format!("targets {targets:?} name both paired directories and per-sample files"))?;
 	// Per-sample layouts use directories as rows; paired layouts use directories as columns.
 	if aligned && (sample_target || paired_target) {
 		let mut columns = Vec::new();
@@ -11945,13 +11953,13 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut kind = None;
 			for (row, (path, bytes)) in entries.iter().enumerate() {
 				let (shape, values) = sample_values(path, bytes)?;
-				require(!sample_target || column != target || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
+				require(!sample_target || !targets.contains(column) || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
 				let current = (shape, values.len());
 				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
 			}
 			let (shape, width) = kind.unwrap_or((None, 0));
-			if column != target
+			if !targets.contains(column)
 				&& let Some(previous) = attention
 			{
 				attention = shape
@@ -11966,6 +11974,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
+	// A class subdirectory names one value, so this layout carries one target.
+	let [target] = targets else { return Ok(None) };
 	// Only a declared column overrides the directory names; the positional names a headerless
 	// sample takes name its one field by convention rather than carrying a label.
 	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
