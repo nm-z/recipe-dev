@@ -4544,7 +4544,7 @@ mod ngram {
 		/// gather and everything after it stay where the table is mapped.
 		fn placed(&self) -> Result<(&'static Gpu, &'static Gpu)> {
 			let devices = selected_gpus()?;
-			let named = std::env::var("RECIPE_DEVICE").map_or(1, |selection| selection.split(',').count());
+			let named = devices.len();
 			require(
 				named <= 2,
 				format!("an n-gram placement names the device before block {} and the device from it on, so at most two; {named} are selected", self.layer),
