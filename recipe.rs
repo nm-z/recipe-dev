@@ -2809,7 +2809,7 @@ impl NativeModelIr {
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
 						ir.push_str(&format!("{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
-						if node.second >= 0 {
+						if node.second != -2 {
 							let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, &format!("{prefix}.first.owned")));
 							ir.push_str(&format!(
@@ -3140,6 +3140,8 @@ impl NativeModelIr {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[second], &format!("{prefix}.second")));
 			format!("%{prefix}.second")
+		} else if plan.node.second == -1 {
+			"%samples".to_owned()
 		} else {
 			source.clone()
 		};
@@ -3165,6 +3167,8 @@ impl NativeModelIr {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second adjoint node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[second], &format!("{prefix}.second.adjoint")));
 			format!("%{prefix}.second.adjoint")
+		} else if reverse && plan.node.second == -1 {
+			"%input_adjoint".to_owned()
 		} else {
 			source_adjoint.clone()
 		};
