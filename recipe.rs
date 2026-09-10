@@ -7792,7 +7792,16 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
 	let mut scores = Vec::with_capacity(experts.len());
 	for _ in experts {
-		scores.push(project_moe_shape(graph, source, input, output)?);
+		// Every expert has its own learned router. Unlike an expert adapter, a
+		// router must not disappear when its input already has the canonical shape:
+		// identical input and output shapes still require a distinct projection.
+		reset(graph, source, input);
+		if input.length == output.length {
+			lower_project(graph, output.channels)?;
+		} else {
+			lower_flatten_project(graph, output)?;
+		}
+		scores.push(graph.source);
 	}
 	select(graph, &branches, &scores, output, top_k, config)
 }
