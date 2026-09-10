@@ -4209,7 +4209,7 @@ mod bundle {
 			return match fields.next().unwrap_or("") {
 				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
 				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
 				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
 			};
 		}
@@ -4337,7 +4337,7 @@ mod bundle {
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
-			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			activation: activation(&fields[1])?,
 			normalization: normalization(Some(&fields[2]), "block normalization")?,
 			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
 			quantization: value_at(Some(&fields[3]), "block quantization")?,
