@@ -8786,7 +8786,11 @@ impl Kernel {
 #[cfg(nvidia)]
 struct Cuda {
 	_runtime: std::sync::Arc<Library>,
-	context: Ptr,
+	// Context creation is deferred until after local-device admission. The
+	// descriptor can be enumerated and scheduled without opening a CUDA context.
+	context: Mutex<usize>,
+	device: i32,
+	create: unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32,
 	set: unsafe extern "C" fn(Ptr) -> i32,
 	allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
 	free: unsafe extern "C" fn(u64) -> i32,
@@ -8835,14 +8839,17 @@ struct Hsa {
 	symbol: HsaSymbol,
 	symbol_info: HsaSymbolInfo,
 	allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32,
+	queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32,
+	signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32,
 	free: unsafe extern "C" fn(Ptr) -> i32,
 	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
 	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32,
 	store: unsafe extern "C" fn(u64, i64),
 	wait: unsafe extern "C" fn(u64, i32, i64, u64, i32) -> i64,
 	write: unsafe extern "C" fn(*const HsaQueue, u64) -> u64,
-	queue: Ptr,
-	signal: u64,
+	// Queue and completion signal creation are deferred until after local-device
+	// admission. Agent and memory-pool queries above are discovery only.
+	queue_state: Mutex<Option<(usize, u64)>>,
 	cpu_agent: u64,
 	vram_pool: u64,
 	kernarg_pool: u64,
@@ -9061,12 +9068,22 @@ impl Gpu {
 		match &self.driver {
 			Driver::Cpu | Driver::Remote(_) => Ok(()),
 			#[cfg(nvidia)]
-			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
+			Driver::Cuda(driver) => {
+				let mut context = driver.context.lock().map_err(|_| RecipeError::new("CUDA context state is poisoned"))?;
+				if *context == 0 {
+					let mut created = ptr::null_mut();
+					self.status(unsafe { (driver.create)(&mut created, 0, driver.device) }, "context creation")?;
+					require(!created.is_null(), "CUDA context creation returned a null context")?;
+					*context = created as usize;
+				}
+				self.status(unsafe { (driver.set)(*context as Ptr) }, "context")
+			}
 			#[cfg(amd)]
-			Driver::Hsa(_) => Ok(()),
+			Driver::Hsa(driver) => driver.activate(),
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+		self.activate()?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
 			1
@@ -9271,8 +9288,12 @@ impl Gpu {
 				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
-					(driver.set)(driver.context);
-					(driver.free)(pointer);
+					if let Ok(context) = driver.context.lock().map(|context| *context) {
+						if context != 0 {
+							(driver.set)(context as Ptr);
+							(driver.free)(pointer);
+						}
+					}
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
@@ -9346,7 +9367,10 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
-				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
+				Driver::Hsa(driver) => {
+					let (_, signal) = driver.queue_signal()?;
+					require((driver.wait)(signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed")
+				}
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
 					channel.write_u8(REMOTE_SYNCHRONIZE)?;
@@ -9523,23 +9547,12 @@ fn take_lease(path: &Path) -> Result<Option<fs::File>> {
 		}
 	}
 }
-/// Admits this run to the local accelerators it named. One run at a time holds a
-/// device: a second run naming it waits rather than opening a second context on
-/// it and contending for its memory.
-///
-/// The CPU is deliberately not leased. It is shared by design — `cpu-worker-threads`
-/// already divides it — and leasing it would serialize every forced-CPU run on the
-/// machine, including the child processes the determinism suite spawns per case.
-/// Remote devices are not leased either: the lease is local to one machine, and
-/// admitting a run on another host is what #262 still needs.
-fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
-	let mut names = selected
-		.iter()
-		.filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':'))
-		.map(|gpu| gpu.name.clone())
-		.collect::<Vec<_>>();
+/// Takes local accelerator leases in sorted order, without holding a partial set
+/// while waiting. The CPU is shared by design and remote devices are outside this
+/// local lease; `admit` applies those scope rules to resolved device descriptors.
+fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
 	if names.is_empty() {
-		return Ok(selected);
+		return Ok(Vec::new());
 	}
 	// Acquired in name order, and all or nothing: a run that cannot take every
 	// device it named releases what it holds and retries, so two runs naming the
@@ -9564,8 +9577,7 @@ fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
 			}
 		}
 		if blocked.is_none() {
-			LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
-			return Ok(selected);
+			return Ok(held);
 		}
 		// Releasing before sleeping is what keeps this deadlock-free: nothing is
 		// held across the wait, so no run can be waiting on a device another
@@ -9590,6 +9602,25 @@ fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
 		std::thread::sleep(poll);
 	}
 }
+/// Admits this run to the local accelerators it named. One run at a time holds a
+/// device: a second run naming it waits rather than opening a second context on
+/// it and contending for its memory.
+///
+/// The CPU is deliberately not leased. It is shared by design — `cpu-worker-threads`
+/// already divides it — and leasing it would serialize every forced-CPU run on
+/// the machine, including the child processes the determinism suite spawns per case.
+/// Remote devices are not leased either: the lease is local to one machine, and
+/// admitting a run on another host is what #262 still needs.
+fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
+	let names = selected
+		.iter()
+		.filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':'))
+		.map(|gpu| gpu.name.clone())
+		.collect::<Vec<_>>();
+	let held = acquire_leases(names)?;
+	LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
+	Ok(selected)
+}
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
@@ -9600,12 +9631,27 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 		.get_or_init(|| {
 			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]).and_then(admit) };
 			let (host, local_only) = (local_host()?, Config::load()?.multi_device == MultiDevice::Local);
-			let mut selected = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
 			// selection never connects to, allocates on, or executes on another.
 			let names = device_names(&selection)?;
-			for name in names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }) {
-				let local_name = name.strip_prefix(&format!("{host}:")).unwrap_or(name);
+			let selected_names = names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }).collect::<Vec<_>>();
+			let local_prefix = format!("{host}:");
+			let local_leases = selected_names
+				.iter()
+				.filter_map(|name| {
+					let local_name = name.strip_prefix(&local_prefix).unwrap_or(name);
+					let local = !name.contains(':') || name.starts_with(&local_prefix);
+					(local && (local_name.starts_with("amd") || local_name.starts_with("nv"))).then(|| local_name.to_owned())
+				})
+				.collect::<Vec<_>>();
+			// Runtime initialization can itself open KFD/CUDA resources. Reserve
+			// explicit local accelerators before discovery so a queued process has
+			// no driver allocation while it waits.
+			let held = acquire_leases(local_leases)?;
+			let resolved = (|| {
+				let mut selected = Vec::new();
+				for name in selected_names {
+					let local_name = name.strip_prefix(&local_prefix).unwrap_or(name);
 				let gpu = if local_name == "cpu" {
 					device(Some("cpu"))?
 				} else {
@@ -9619,9 +9665,17 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 				};
 				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
 				selected.push(gpu);
+				}
+				require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
+				Ok(selected)
+			})();
+			match resolved {
+				Ok(selected) => {
+					LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
+					Ok(selected)
+				}
+				Err(error) => Err(error),
 			}
-			require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
-			admit(selected)
 		})
 		.as_ref()
 		.map(Vec::as_slice)
@@ -9823,6 +9877,29 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> {
 }
 #[cfg(amd)]
 impl Hsa {
+	fn activate(&self) -> Result<()> {
+		let mut state = self.queue_state.lock().map_err(|_| RecipeError::new("AMD queue state is poisoned"))?;
+		if state.is_none() {
+			let mut queue = ptr::null_mut();
+			driver_status(
+				Backend::Amd,
+				unsafe { (self.queue_create)(self.agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue) },
+				"queue creation",
+			)?;
+			let mut signal = 0;
+			driver_status(Backend::Amd, unsafe { (self.signal_create)(0, 0, ptr::null(), &mut signal) }, "signal creation")?;
+			*state = Some((queue as usize, signal));
+		}
+		Ok(())
+	}
+
+	fn queue_signal(&self) -> Result<(Ptr, u64)> {
+		self.activate()?;
+		let state = self.queue_state.lock().map_err(|_| RecipeError::new("AMD queue state is poisoned"))?;
+		let (queue, signal) = state.ok_or_else(|| RecipeError::new("AMD queue state is absent after activation"))?;
+		Ok((queue as Ptr, signal))
+	}
+
 	unsafe fn native_dispatch(&self, executable: u64, element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
@@ -9858,6 +9935,12 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
+	fn context(&self) -> Result<Ptr> {
+		let context = self.context.lock().map_err(|_| RecipeError::new("CUDA context state is poisoned"))?;
+		require(*context != 0, "CUDA context is absent after activation")?;
+		Ok(*context as Ptr)
+	}
+
 	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
@@ -9889,7 +9972,7 @@ impl Cuda {
 		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
 	) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
-			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
+			driver_status(Backend::Nvidia, (self.set)(self.context()?), "native context")?;
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 			let program = NativeCudaProgram { module: module as usize, unload: self.unload };
@@ -10177,8 +10260,9 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 				if implicit_bytes != 0 {
 					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
 				}
-				(driver.store)(driver.signal, 1);
-				let queue = &mut *(driver.queue as *mut HsaQueue);
+				let (queue_pointer, signal) = driver.queue_signal()?;
+				(driver.store)(signal, 1);
+				let queue = &mut *(queue_pointer as *mut HsaQueue);
 				let index = (driver.write)(queue, 1);
 				let packet = queue.base.cast::<HsaPacket>().add(index as usize & (queue.size as usize - 1));
 				packet.write(HsaPacket {
@@ -10196,14 +10280,14 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					object: dispatch.kernel.object,
 					kernarg,
 					reserved1: 0,
-					completion: driver.signal,
+					completion: signal,
 				});
 				std::sync::atomic::fence(Ordering::Release);
 				let header = &*(&mut (*packet).header as *mut u16 as *mut std::sync::atomic::AtomicU16);
 				header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
 				(driver.store)(queue.doorbell, index as i64);
 				debug("AMD dispatch submitted")?;
-				let completed = (driver.wait)(driver.signal, 0, 0, u64::MAX, 1);
+				let completed = (driver.wait)(signal, 0, 0, u64::MAX, 1);
 				debug(&format!("AMD dispatch completed with signal {completed}"))?;
 				require(completed == 0, "native AMD dispatch failed")
 			}
@@ -10245,6 +10329,9 @@ fn load_amd(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
 	#[cfg(amd)]
 	unsafe {
+		if _selection.is_some_and(|names| !names.iter().any(|name| name.starts_with("amd"))) {
+			return Ok(Vec::new());
+		}
 		let runtime = std::sync::Arc::new(Library::open(env!("RECIPE_HSA_RUNTIME"))?);
 		let init: unsafe extern "C" fn() -> i32 = runtime.function(b"hsa_init\0")?;
 		let iterate: unsafe extern "C" fn(extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 = runtime.function(b"hsa_iterate_agents\0")?;
@@ -10306,9 +10393,6 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
 		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
-		let (mut queue, mut completion) = (ptr::null_mut(), 0);
-		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
-		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa {
 			_runtime: runtime.clone(),
 			reader_create,
@@ -10320,15 +10404,16 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			symbol,
 			symbol_info,
 			allocate,
+			queue_create,
+			signal_create,
 			allow,
-			queue,
+			queue_state: Mutex::new(None),
 			cpu_agent,
 			free: runtime.function(b"hsa_amd_memory_pool_free\0")?,
 			copy: runtime.function(b"hsa_memory_copy\0")?,
 			store: runtime.function(b"hsa_signal_store_screlease\0")?,
 			wait: runtime.function(b"hsa_signal_wait_scacquire\0")?,
 			write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?,
-			signal: completion,
 			vram_pool: vram.found,
 			kernarg_pool: kernarg.found,
 			agent,
@@ -10345,6 +10430,9 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	return Err(RecipeError::new("NVIDIA support is not compiled into this build"));
 	#[cfg(nvidia)]
 	unsafe {
+		if _selection.is_some_and(|names| !names.iter().any(|name| name.starts_with("nv"))) {
+			return Ok(Vec::new());
+		}
 		const MAX_BLOCK: i32 = 1;
 		const BLOCK_LDS: i32 = 8;
 		const WAVE: i32 = 10;
@@ -10373,7 +10461,6 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		check(count_devices(&mut count), "device enumeration")?;
 		let load_device = |device, index| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
-			let mut context = ptr::null_mut();
 			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
 			check(total(&mut memory, device), "VRAM size")?;
@@ -10392,10 +10479,11 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			}
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
-			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda {
 				_runtime: runtime.clone(),
-				context,
+				context: Mutex::new(0),
+				device,
+				create,
 				set: runtime.function(b"cuCtxSetCurrent\0")?,
 				allocate: runtime.function(b"cuMemAlloc_v2\0")?,
 				free: runtime.function(b"cuMemFree_v2\0")?,
@@ -10531,7 +10619,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let has_storage = wire.read_u8()? != 0;
 				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match native_epoch_layout(state_bytes) {
 					Err(error) => Err(error),
-					Ok(epoch_layout) => match &gpu.driver {
+					Ok(epoch_layout) => gpu.activate().and_then(|_| match &gpu.driver {
 						Driver::Cpu => (|| {
 							let (path, temporary) = remote_native_artifact(&gpu.native_target, &artifact)?;
 							let cpu = load_native_cpu_path(&path, state_bytes, training, has_storage)?;
@@ -10548,7 +10636,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 						Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
 							.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
 						Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
-					},
+					}),
 				};
 				#[cfg(not(any(amd, nvidia)))]
 				let _ = waves;
