@@ -77,7 +77,10 @@ cli.rs          cli options
 ## blocks
 
 ```
-frozen.packed.blck
+blck.atvn.norm.quant
+frozen.blck.atvn.norm.quant
+packed.blck.atvn.norm.quant
+frozen.packed.blck.atvn.norm.quant
 ```
 
 ## 18 thingys
