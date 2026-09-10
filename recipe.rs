@@ -2504,7 +2504,7 @@ impl NativeModelIr {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i1 {flatten}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
 						pointer = pointer_type(backend),
 						has_bias = node.argument[2] == 0.0,
 						source = pointers.source,
@@ -2516,6 +2516,7 @@ impl NativeModelIr {
 						out_length = node.output.length,
 						kernel = integer_argument(node.argument[0], "contraction kernel")?,
 						relu = node.argument[1] == 1.0,
+						flatten = node.argument[3] == 1.0,
 						tile_m = extent.m,
 						tile_n = extent.n,
 						tile_k = extent.k
@@ -2656,9 +2657,9 @@ impl NativeModelIr {
 					let composed_previous = kernel <= 1;
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i1 {flatten}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, flatten = node.argument[3] == 1.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i1 {flatten}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, flatten = node.argument[3] == 1.0, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -7299,6 +7300,15 @@ fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
+/// A learned projection over the flattened row. Unlike a channel-only layer,
+/// this can map any finite `(channels, length)` shape to any other shape.
+fn lower_flatten_project(graph: &mut Graph, target: Shape) -> Result<()> {
+	require(target.channels != 0 && target.length != 0, "dense projection shape must be positive")?;
+	let input = graph.output;
+	let matrix = checked_mul(input.elements(), target.elements(), "dense projection matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, target.elements(), "dense projection bias")? } else { matrix };
+	push_node(graph, Primitive::Contraction, target, parameters, [0.0, 0.0, f64::from(!graph.bias), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
+}
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
@@ -7378,23 +7388,16 @@ fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: us
 	Ok((graph.source, graph.output))
 }
 /// Adapt one branch to the canonical shape selected by the first MoE expert.
-/// A contraction learns channel mixing; a valid convolution also reduces a
-/// longer sequence to the requested length. Sequence expansion has no existing
-/// Recipe primitive, so it is rejected explicitly instead of padding or
-/// dropping the expert.
+/// Adapt one branch to the canonical shape selected by the first MoE expert.
+/// The projection is learned over the flattened row, so it preserves every
+/// declared expert even when its sequence is shorter or longer.
 fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape) -> Result<i32> {
 	if from == target {
 		reset(graph, source, from);
 		return Ok(source);
 	}
-	require(from.length >= target.length, "MoE expert projection cannot lengthen the sequence")?;
 	reset(graph, source, from);
-	if from.length != target.length {
-		let kernel = checked_add(from.length - target.length, 1, "MoE expert projection kernel")?;
-		lower_conv(graph, target.channels, kernel)?;
-	} else if from.channels != target.channels {
-		lower_project(graph, target.channels)?;
-	}
+	lower_flatten_project(graph, target)?;
 	require(graph.output == target, "MoE expert projection did not match the canonical shape")?;
 	Ok(graph.source)
 }
@@ -11486,10 +11489,11 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 			let dimensions = match node.op {
 				Primitive::Contraction => {
 					let span = integer_argument(node.argument[0], "native contraction kernel")?.max(1) as usize;
-					let window = checked_mul(node.input.channels, span, "native contraction window")?;
+					let flatten = node.argument[3] == 1.0;
+					let window = if flatten { node.input.elements() } else { checked_mul(node.input.channels, span, "native contraction window")? };
 					let output_rows = checked_mul(rows, node.output.length, "native contraction output rows")?;
 					let input_rows = checked_mul(rows, node.input.length, "native contraction input rows")?;
-					let previous_terms = checked_mul(node.output.channels, span, "native contraction previous terms")?;
+					let previous_terms = if flatten { node.output.channels } else { checked_mul(node.output.channels, span, "native contraction previous terms")? };
 					Some(((output_rows, node.output.channels, window), (window, node.output.channels, output_rows), (input_rows, node.input.channels, previous_terms), node.parameters))
 				}
 				Primitive::Scan => {

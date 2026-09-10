@@ -39,10 +39,11 @@ declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
 declare void @llvm.trap() @contraction_tile = external addrspace(3) global [0 x double], align 16
 define internal double @contraction_input(
-ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv ) #1 { entry:
+ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv, i1 %flatten ) #1 { entry:
 %channel = udiv i32 %term, %span %window = urem i32 %term, %span
 %offset = select i1 %conv, i32 %window, i32 0 %channel.base = mul i32 %channel, %length
-%local.0 = add i32 %channel.base, %position %local = add i32 %local.0, %offset
+%local.0 = add i32 %channel.base, %position %local.1 = add i32 %local.0, %offset
+%local = select i1 %flatten, i32 %term, i32 %local.1
 %index = add i32 %row.base, %local %ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
 %value = load double, ptr addrspace(1) %ptr, align 8 ret double %value }
 define internal double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %index, i1 %relu) #1 {
@@ -772,12 +773,12 @@ ret void
 }
 define internal void @contraction_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel,
-i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
+i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i1 %flatten, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
 ; The running sums live in the arithmetic type for the whole K extent and are
 ; rounded to the model type once, at the store. Staging the operands in tiles
 ; therefore cannot move a rounding point.
 %sums = alloca [RECIPE_REGISTER_COUNT x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5) %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x() %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
-%in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length %is.conv = icmp ne i32 %kernel, 0 %span = select i1 %is.conv, i32 %kernel, i32 1 %terms = mul i32 %in.channels, %span %m.total = mul i32 %rows, %out.length
+%in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length %is.conv = icmp ne i32 %kernel, 0 %span = select i1 %is.conv, i32 %kernel, i32 1 %terms.raw = mul i32 %in.channels, %span %terms = select i1 %flatten, i32 %in.elements, i32 %terms.raw %m.total = mul i32 %rows, %out.length
 %m.short = icmp ult i32 %tile.m, %m.total %m.tile = select i1 %m.short, i32 %tile.m, i32 %m.total %n.short = icmp ult i32 %tile.n, %out.channels %n.tile = select i1 %n.short, i32 %tile.n, i32 %out.channels %k.short = icmp ult i32 %tile.k, %terms %k.tile = select i1 %k.short, i32 %tile.k, i32 %terms
 %m.adjusted = add i32 %m.total, %m.tile %m.numerator = sub i32 %m.adjusted, 1 %m.tiles = udiv i32 %m.numerator, %m.tile %n.adjusted = add i32 %out.channels, %n.tile %n.numerator = sub i32 %n.adjusted, 1 %n.tiles = udiv i32 %n.numerator, %n.tile %jobs = mul i32 %m.tiles, %n.tiles br label %job.loop job.loop:
 %job = phi i32 [ %group, %entry ], [ %job.next, %job.done ] %job.more = icmp ult i32 %job, %jobs br i1 %job.more, label %job.step, label %exit job.step:
@@ -829,7 +830,7 @@ load.a.vector:
 call void @contraction_stage_a_fragment(<RECIPE_FRAGMENT_K x double> %a.vector.value, i32 %a.k, i32 %a.m, i32 %tile.m, i32 %tile.k)
 br label %load.advance
 load.a.scalar:
-%a.loaded = call double @contraction_input( ptr addrspace(1) %input, i32 %a.row.base, i32 %a.position, i32 %a.term, i32 %span, i32 %in.length, i1 %is.conv )
+%a.loaded = call double @contraction_input( ptr addrspace(1) %input, i32 %a.row.base, i32 %a.position, i32 %a.term, i32 %span, i32 %in.length, i1 %is.conv, i1 %flatten )
 br i1 %a.gate, label %load.a.activation, label %load.a.ready
 load.a.activation:
 %a.activation.channel = mul i32 %a.term, %in.length %a.activation.local = add i32 %a.activation.channel, %a.position %a.activation.index = add i32 %a.row.base, %a.activation.local %a.activation.ptr = getelementptr inbounds double, ptr addrspace(1) %activation, i32 %a.activation.index %a.activation.value = load double, ptr addrspace(1) %a.activation.ptr, align 2 %a.activation.positive = call i1 @recipe.ogt(double %a.activation.value, double 0.0) %a.gated = select i1 %a.activation.positive, double %a.loaded, double 0.0
@@ -2373,7 +2374,7 @@ br i1 %precompute.more, label %precompute.step, label %precompute.done precomput
 call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %precompute.weights,
 ptr addrspace(1) %precompute.context, ptr addrspace(1) %input,
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels,
-i32 %length, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false,
+i32 %length, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false, i1 false,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 %precompute.next = add i32 %precompute.gate, 1 br label %precompute.loop precompute.done:
 call void @grid_barrier(i32 %threads) br label %row.loop row.loop:
@@ -2472,13 +2473,13 @@ br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %t
 %row.next = add i32 %row, %threads br label %row.loop exit: ret void }
 define internal void @contraction_reverse_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 %has.bias, i1 %relu, i1 %matrix.gradient,
-i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
+i1 %flatten, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
 i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #1 { entry:
 %sums = alloca [RECIPE_REGISTER_COUNT x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %bias.sums = alloca [RECIPE_REGISTER_N x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x() %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
 %in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length %is.conv = icmp ne i32 %kernel, 0
-%span = select i1 %is.conv, i32 %kernel, i32 1 %window = mul i32 %in.channels, %span
+%span = select i1 %is.conv, i32 %kernel, i32 1 %window.raw = mul i32 %in.channels, %span %window = select i1 %flatten, i32 %in.elements, i32 %window.raw
 %gradient.r.total = mul i32 %rows, %out.length
 %gradient.matrix.values = mul i32 %out.channels, %window
 %gradient.bias.values = select i1 %has.bias, i32 %out.channels, i32 0
@@ -2600,7 +2601,7 @@ gradient.load.a.vector:
 call void @contraction_stage_a_columns(<RECIPE_FRAGMENT_K x double> %gradient.a.vector.value, i32 %gradient.a.r, i32 %gradient.a.m, i32 %gradient.tile.m, i32 %gradient.tile.k)
 br label %gradient.load.advance
 gradient.load.a.scalar:
-%gradient.a.value = call double @contraction_input( ptr addrspace(1) %input, i32 %gradient.a.row.base, i32 %gradient.a.position, i32 %gradient.a.term, i32 %span, i32 %in.length, i1 %is.conv )
+%gradient.a.value = call double @contraction_input( ptr addrspace(1) %input, i32 %gradient.a.row.base, i32 %gradient.a.position, i32 %gradient.a.term, i32 %span, i32 %in.length, i1 %is.conv, i1 %flatten )
 br label %gradient.load.store
 gradient.load.b.step: %gradient.b.local = sub i32 %gradient.load, %gradient.a.count %gradient.b.r = udiv i32 %gradient.b.local, %gradient.b.columns %gradient.b.column = urem i32 %gradient.b.local, %gradient.b.columns %gradient.b.n = mul i32 %gradient.b.column, %gradient.b.width %gradient.b.global = add i32 %gradient.r.base, %gradient.b.r
 %gradient.b.row = udiv i32 %gradient.b.global, %out.length %gradient.b.position = urem i32 %gradient.b.global, %out.length %gradient.b.filter = add i32 %gradient.n.base, %gradient.b.n
@@ -3016,7 +3017,7 @@ br i1 %projection.more, label %projection.step, label %exit projection.step:
 %projection.delta = getelementptr inbounds double, ptr addrspace(1) %context, i32 %projection.delta.offset
 %projection.gradient.offset = add i32 %offset, %projection.weight.offset
 call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %projection.weights, ptr addrspace(1) %output,
-ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false, i1 false, i1 false,
+ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false, i1 false, i1 false, i1 false,
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
 i32 %projection.gradient.offset, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k,
 i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) call void @grid_barrier(i32 %threads) %projection.next = add i32 %projection.gate, 1 br label %projection.loop
