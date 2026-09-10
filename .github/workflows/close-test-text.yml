@@ -34,20 +34,127 @@ jobs:
             "repos/$REPOSITORY/pulls/$PR_NUMBER" \
             > "$scan_directory/pull.diff"
 
-          awk '
-            /^diff --git / { in_hunk=0; next }
-            /^@@ / { in_hunk=1; next }
-            !in_hunk { next }
-            /^\+/ { print substr($0, 2) }
-          ' "$scan_directory/pull.diff" > "$scan_directory/added.txt"
-
           banned_fragment="$(printf 'te%s' 'st')"
-          if ! grep --ignore-case --fixed-strings --word-regexp --quiet "$banned_fragment" "$scan_directory/added.txt"; then
+          files_url="https://github.com/$REPOSITORY/pull/$PR_NUMBER/files"
+          added_file="$scan_directory/added.txt"
+          location_file="$scan_directory/added-locations.txt"
+          match_file="$scan_directory/matches.txt"
+          report_file="$scan_directory/matches.md"
+          : > "$added_file"
+          : > "$location_file"
+
+          awk -v added_file="$added_file" \
+            -v location_file="$location_file" '
+            /^diff --git / {
+              in_hunk = 0
+              next
+            }
+
+            !in_hunk && /^\+\+\+ / {
+              path = substr($0, 5)
+              sub(/\t.*$/, "", path)
+              if (length(path) >= 2 && substr(path, 1, 1) == "\"" && substr(path, length(path), 1) == "\"") {
+                path = substr(path, 2, length(path) - 2)
+              }
+              if (path != "/dev/null" && path ~ /^b\//) sub(/^b\//, "", path)
+              current_path = path
+              next
+            }
+
+            /^@@ / {
+              in_hunk = match($0, / \+[0-9]+/)
+              if (in_hunk) {
+                new_line = substr($0, RSTART + 2)
+                sub(/,.*/, "", new_line)
+                new_line += 0
+              }
+              next
+            }
+
+            !in_hunk { next }
+
+            /^\+/ {
+              added_text = substr($0, 2)
+              print added_text > added_file
+              printf "%s:%d\n", current_path, new_line > location_file
+              new_line++
+              next
+            }
+
+            /^-/ { next }
+
+            /^ / {
+              new_line++
+              next
+            }
+
+          ' "$scan_directory/pull.diff"
+
+          if grep --ignore-case --fixed-strings --word-regexp --line-number \
+            "$banned_fragment" "$added_file" > "$match_file"; then
+            :
+          else
+            grep_status=$?
+            if (( grep_status == 1 )); then
+              exit 0
+            fi
+            exit "$grep_status"
+          fi
+
+          match_count="$(wc -l < "$match_file")"
+          if (( match_count == 0 )); then
             exit 0
           fi
 
-          reason="Closed automatically because added content in this pull request's current diff contains the banned whole word \`$banned_fragment\`. Remove it from the current diff, then reopen this PR. Commit history, title, body, and file paths are not scanned."
-          gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+          escape_html() {
+            sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
+              -e 's/>/\&gt;/g' -e 's/@/\&#64;/g' -e 's/\r/\&#13;/g'
+          }
+          : > "$report_file"
+          mapfile -t added_lines < "$added_file"
+          mapfile -t locations < "$location_file"
+          while IFS=: read -r added_index _; do
+            location="$(printf '%s' "${locations[added_index - 1]}" | escape_html)"
+            quote="$(printf '%s' "${added_lines[added_index - 1]}" | escape_html)"
+            printf -- '- <a href="%s"><code>%s</code></a>: <pre><code>%s</code></pre>\n' \
+              "$files_url" "$location" "$quote" >> "$report_file"
+          done < "$match_file"
+
+          # Keep the comment below GitHub's issue-comment limit while retaining
+          # the complete location-and-quote report in the workflow summary.
+          {
+            printf '## Banned whole word in added diff\n\n'
+            printf 'Closed automatically because added content in this pull request\x27s current diff contains the banned whole word `%s`. Remove it from the current diff, then reopen this PR.\n\n' "$banned_fragment"
+            printf 'The scan covers only added lines in the current diff. Commit history, title, body, file paths, PR comments, and linked issue comments are not scanned.\n\n'
+            printf 'Matches (file and current line):\n\n'
+          } > "$scan_directory/comment.md"
+
+          {
+            printf '## Banned whole word matches\n\n'
+            printf 'The following entries are the complete report for the current diff:\n\n'
+            cat "$scan_directory/matches.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          max_comment_bytes=60000
+          LC_ALL=C awk -v max_bytes="$max_comment_bytes" '
+            {
+              line_bytes = length($0) + 1
+              if (used + line_bytes <= max_bytes) {
+                print
+                used += line_bytes
+                shown++
+              }
+            }
+          ' "$scan_directory/matches.md" > "$scan_directory/comment-matches.md"
+
+          shown_match_count="$(LC_ALL=C awk '/^- <a /{count++} END { print count + 0 }' "$scan_directory/comment-matches.md")"
+          cat "$scan_directory/comment-matches.md" >> "$scan_directory/comment.md"
+          if (( shown_match_count < match_count )); then
+            printf '_Showing %s of %s matches. The complete report is in the workflow summary._\n\n' \
+              "$shown_match_count" "$match_count" >> "$scan_directory/comment.md"
+          fi
+
+          jq -n --rawfile body "$scan_directory/comment.md" '{body: $body}' \
+            | gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --input -
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
 
   require-minimal-base:
