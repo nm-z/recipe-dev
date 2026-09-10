@@ -89,6 +89,9 @@ weights:
 	attn(heads)
 	perc(width)
 	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.yarn(factor, og_ctx, b_fast, b_slow)][.index(heads, width, block, keep)][.gate()]
+	dconv(kernel)
+	delta(heads, kernel)
+	delta((heads, d_k, d_v), kernel)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
@@ -125,6 +128,27 @@ estimators:
 ```
 
 Feature generation is banned.
+
+`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+
+`delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `d_k` by `d_v` state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
+`delta(heads, kernel)` derives both extents as `channels / heads`, which is a
+square state and requires the residual width to divide by the head count;
+`delta((heads, d_k, d_v), kernel)` states them, so the query and key planes are
+`heads * d_k` wide, the value plane and the block output are `heads * d_v`, and
+neither is tied to the residual width.
+`delta((k_heads, d_k, v_heads, d_v), kernel)` shares each key head across
+`v_heads / k_heads` value heads and keeps the query/key and value planes
+independent. Set the final output gate explicitly with
+`.delta_gate(DeltaGate::Sigmoid)` or `.delta_gate(DeltaGate::Silu)`; sigmoid is
+the default and keeps existing models unchanged.
+
+```rust
+recipe.model()
+	.layer(8)
+	.delta((2, 3, 4, 5), 4)
+	.delta_gate(DeltaGate::Silu);
+```
 
 ## data
 
