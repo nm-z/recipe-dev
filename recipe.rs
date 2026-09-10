@@ -7683,7 +7683,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	};
 	// The query plane the attention writes. With a divisible residual width this
 	// remains exactly `input.channels`; otherwise the rounded-up Q/K/V projection
-	// supplies the padding channels and the closing projection restores the input
+	// creates a wider internal plane and the closing projection restores the input
 	// width.
 	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
