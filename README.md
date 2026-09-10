@@ -88,6 +88,7 @@ weights:
 	conv(filters, kernel)
 	attn(heads)
 	perc(width)
+	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.yarn(factor, og_ctx, b_fast, b_slow)][.index(heads, width, block, keep)][.gate()]
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
@@ -189,11 +190,43 @@ explicit scalar rescaling directly.
 .norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
 ```
 
+`.rope(layout, dimensions, base)` rotates the first `dimensions` channels of
+every query and key head by their position. The layout states the pairing: `neox`
+pairs channel `i` with channel `i + dimensions / 2`. A model states it so the
+same weights cannot silently run under a different pairing.
+
+`.yarn(factor, og_ctx, b_fast, b_slow)` follows a `rope` and scales its
+frequencies for an extended context: `factor` is the extension ratio, `og_ctx`
+the original training context, and the blend runs between the fast and slow
+rotation boundaries. It also applies YaRN's attention-magnitude correction
+`0.1 * ln(factor) + 1` for factors above one. It owns no weights and is
+invalid without a preceding `rope`.
+
+```rust
+.attn(32).rope(neox, 128, 10000.0).yarn(4.0, 8192, 64.0, 1.0)
+```
+
 `.qk(rms|l2)` follows `attn(heads)` and normalizes each head's query and key rows
 over its head-width slice, leaving the values untouched:
 
 ```rust
 .attn(4).qk(rms)
+```
+
+## sparse attention
+
+`attn(heads)` builds one query, key and value plane per head. `.width(d)` unties
+the head width from the block input: without it a head is `channels / heads` wide
+and the residual width must divide by the head count, with it a head is `d` wide
+whatever the residual width is, and the block projects `heads * d` back to the
+residual width on the way out. `.kv(heads)` unties
+the key-value head count, so each key-value head serves `heads / kv` query heads.
+`.index(heads, width, block, keep)` adds a side projection that scores every group
+of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
+attention output by a sigmoid of its own projection of the block input.
+
+```rust
+.attn(8).width(64).kv(2).qk(rms).rope(neox, 32, 10000.0).index(2, 16, 32, 4).gate()
 ```
 
 ## exclusions
