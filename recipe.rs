@@ -10091,15 +10091,15 @@ fn take_lease(path: &Path) -> Result<Option<fs::File>> {
 /// Takes local accelerator leases in sorted order, without holding a partial set
 /// while waiting. The CPU is shared by design and remote devices are outside this
 /// local lease; `admit` applies those scope rules to resolved device descriptors.
-fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
-	if names.is_empty() {
+fn acquire_leases_named(mut requests: Vec<(String, String)>) -> Result<Vec<fs::File>> {
+	if requests.is_empty() {
 		return Ok(Vec::new());
 	}
 	// Acquired in name order, and all or nothing: a run that cannot take every
 	// device it named releases what it holds and retries, so two runs naming the
 	// same pair in opposite orders cannot hold half of it each.
-	names.sort();
-	names.dedup();
+	requests.sort_by(|left, right| left.0.cmp(&right.0));
+	requests.dedup_by(|left, right| left.0 == right.0);
 	let directory = lease_directory()?;
 	let timeout = Duration::from_millis(natural("device admission timeout", env!("RECIPE_ADMISSION_TIMEOUT_MS"))? as u64);
 	let poll = Duration::from_millis(natural("device admission poll", env!("RECIPE_ADMISSION_POLL_MS"))? as u64);
@@ -10108,11 +10108,11 @@ fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
 	loop {
 		let mut held = Vec::new();
 		let mut blocked = None;
-		for name in &names {
-			match take_lease(&directory.join(format!("{name}.lease")))? {
+		for (identity, display) in &requests {
+			match take_lease(&directory.join(format!("{identity}.lease")))? {
 				Some(file) => held.push(file),
 				None => {
-					blocked = Some(name.clone());
+					blocked = Some(display.clone());
 					break;
 				}
 			}
@@ -10143,6 +10143,9 @@ fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
 		std::thread::sleep(poll);
 	}
 }
+fn acquire_leases(names: Vec<String>) -> Result<Vec<fs::File>> {
+	acquire_leases_named(names.into_iter().map(|name| (name.clone(), name)).collect())
+}
 /// Admits this run to the local accelerators it named. One run at a time holds a
 /// device: a second run naming it waits rather than opening a second context on
 /// it and contending for its memory.
@@ -10152,7 +10155,7 @@ fn acquire_leases(mut names: Vec<String>) -> Result<Vec<fs::File>> {
 /// the machine, including the child processes the determinism suite spawns per case.
 /// Remote devices are not leased either: the lease is local to one machine, and
 /// admitting a run on another host is what #262 still needs.
-fn local_lease_names(selected: &[&'static Gpu]) -> Result<Vec<String>> {
+fn local_lease_requests(selected: &[&'static Gpu]) -> Result<Vec<(String, String)>> {
 	let mut identities = Vec::<(String, String)>::new();
 	for gpu in selected.iter().filter(|gpu| gpu.backend != Backend::Cpu && !gpu.name.contains(':')) {
 		if let Some((previous, _)) = identities.iter().find(|(_, identity)| identity == &gpu.lease_id) {
@@ -10160,11 +10163,10 @@ fn local_lease_names(selected: &[&'static Gpu]) -> Result<Vec<String>> {
 		}
 		identities.push((gpu.name.clone(), gpu.lease_id.clone()));
 	}
-	Ok(identities.into_iter().map(|(_, identity)| identity).collect())
+	Ok(identities.into_iter().map(|(display, identity)| (identity, display)).collect())
 }
 fn admit(selected: Vec<&'static Gpu>) -> Result<Vec<&'static Gpu>> {
-	let names = local_lease_names(&selected)?;
-	let held = acquire_leases(names)?;
+	let held = acquire_leases_named(local_lease_requests(&selected)?)?;
 	LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?.extend(held);
 	Ok(selected)
 }
@@ -10223,11 +10225,11 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			})();
 			match resolved {
 				Ok(selected) => {
-					let stable_names = local_lease_names(&selected)?
+					let stable_names = local_lease_requests(&selected)?
 						.into_iter()
-						.filter(|identity| !provisional_names.iter().any(|name| name == identity))
+						.filter(|(identity, _)| !provisional_names.iter().any(|name| name == identity))
 						.collect::<Vec<_>>();
-					let stable_held = acquire_leases(stable_names)?;
+					let stable_held = acquire_leases_named(stable_names)?;
 					let mut leases = LEASES.lock().map_err(|_| RecipeError::new("device lease list is poisoned"))?;
 					leases.extend(held);
 					leases.extend(stable_held);
