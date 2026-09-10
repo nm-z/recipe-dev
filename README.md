@@ -107,6 +107,8 @@ blocks:
 	res([res([layer(8), relu(), layer(8)]), gelu()])
 	moe(1, [layer(8), res([layer(8), relu(), layer(8)])])
 
+	left * right       elementwise product of two model fragments from one input
+
 	norm(rms)          a normalization on its own, computing nothing before it
 
 feature reduction:
