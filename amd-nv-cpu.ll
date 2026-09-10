@@ -1076,7 +1076,7 @@ ret void }
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
 define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
- i32 %head.width, i32 %dims, i32 %rotated, double %base, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+ i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %yarn.context, double %yarn.low, double %yarn.high, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %p
@@ -1088,10 +1088,24 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %partner = select i1 %upper, i64 %partner.down, i64 %partner.up
 %partner.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %partner
 %other = load double, ptr addrspace(1) %partner.ptr, align 8
-%two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %two.index.value = call double @recipe.from.u32(i32 %two.index.i32)
+%two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %index.i32 = trunc i64 %index to i32 %two.index.value = call double @recipe.from.u32(i32 %two.index.i32) %index.value = call double @recipe.from.u32(i32 %index.i32)
 %dims.value = call double @recipe.from.u32(i32 %dims) %ratio = call double @recipe.div(double %two.index.value, double %dims.value)
 %log.base = call double @recipe.log(double %base) %exponent.positive = call double @recipe.mul(double %ratio, double %log.base)
-%exponent = call double @recipe.neg(double %exponent.positive) %frequency = call double @recipe.exp(double %exponent)
+%exponent = call double @recipe.neg(double %exponent.positive) %frequency.raw = call double @recipe.exp(double %exponent)
+%yarn.on = call i1 @recipe.ogt(double %yarn.factor, double 1.0)
+%ramp.span = call double @recipe.sub(double %yarn.high, double %yarn.low)
+%ramp.offset = call double @recipe.sub(double %index.value, double %yarn.low)
+%ramp.raw = call double @recipe.div(double %ramp.offset, double %ramp.span)
+%ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.raw)
+%ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.raw
+%ramp.high = call i1 @recipe.ogt(double %ramp.clamped.low, double 1.0)
+%ramp = select i1 %ramp.high, double 1.0, double %ramp.clamped.low
+%interpolated = call double @recipe.div(double %frequency.raw, double %yarn.factor)
+%extrapolated.part = call double @recipe.mul(double %ramp, double %frequency.raw)
+%ramp.inverse = call double @recipe.sub(double 1.0, double %ramp)
+%interpolated.part = call double @recipe.mul(double %ramp.inverse, double %interpolated)
+%blended = call double @recipe.add(double %extrapolated.part, double %interpolated.part)
+%frequency = select i1 %yarn.on, double %blended, double %frequency.raw
 %position.i32 = trunc i64 %position to i32 %position.value = call double @recipe.from.u32(i32 %position.i32) %angle = call double @recipe.mul(double %position.value, double %frequency)
 %cos = call double @recipe.cos(double %angle) %sin = call double @recipe.sin(double %angle) %sin.negative = call double @recipe.neg(double %sin)
 %sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)

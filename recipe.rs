@@ -2795,9 +2795,14 @@ impl NativeModelIr {
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
 					let ty = self.precision.model_type;
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					let mscale = native_literal(self.precision.model, ty, node.argument[4]);
+					let factor = native_literal(self.precision.model, ty, node.argument[5]);
+					let context = native_literal(self.precision.model, ty, node.argument[6]);
+					let fast = native_literal(self.precision.model, ty, node.argument[7]);
+					let slow = native_literal(self.precision.model, ty, node.argument[8]);
 					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @rope_body( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
 							channels = node.output.channels,
 							length = node.output.length,
@@ -6647,11 +6652,12 @@ mod bundle {
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
-				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
+				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer::NONE);
 				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
+				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims}",
+					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}",
 					attention.heads,
 					attention.kv,
 					index.heads,
@@ -6731,7 +6737,21 @@ mod bundle {
 				let score_normalization = fields.next().map(|field| normalization(Some(field), "indexer scoring normalization")).transpose()?.flatten();
 				let score_dims = fields.next().map(|field| value_at(Some(field), "indexer rotary dimensions")).transpose()?.unwrap_or(0);
 				index.score = score_normalization.map(|normalization| (normalization, score_dims));
-				Ok(Operation::Attention(AttentionBlock { heads, kv, width, rope: (dims != 0).then_some((dims, base.to_bits())), index: (index.block != 0).then_some(index), gate }))
+				let layout = match fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(1) {
+					1 => RopeLayout::Neox,
+					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
+				};
+				let yarn = match fields.next() {
+					None => None,
+					Some(factor) => Some((
+						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+						value_at(fields.next(), "yarn original context")?,
+						value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
+						value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
+					)),
+				};
+				require(fields.next().is_none(), "attention record has trailing fields")?;
+				Ok(Operation::Attention(AttentionBlock { heads, kv, width, rope: (dims != 0).then_some((layout, dims, base.to_bits())), yarn, index: (index.block != 0).then_some(index), gate }))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
@@ -7483,6 +7503,28 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// The rotary pairing declared by an attention block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+	Neox,
+}
+impl RopeLayout {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Neox => 1,
+		}
+	}
+}
+pub trait RopeSelector {
+	fn layout(self) -> RopeLayout;
+}
+pub struct Neox;
+pub const neox: Neox = Neox;
+impl RopeSelector for Neox {
+	fn layout(self) -> RopeLayout {
+		RopeLayout::Neox
+	}
+}
 /// A step of a model, and equally a step of a fragment inside one. `res`,
 /// `moe` and the model builder all take the same thing, because a branch step
 /// is an ordinary step: it carries an operation with its activation, its
@@ -7592,13 +7634,14 @@ struct AttentionBlock {
 	heads: usize,
 	kv: usize,
 	width: usize,
-	rope: Option<(usize, u64)>,
+	rope: Option<(RopeLayout, usize, u64)>,
+	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, kv: heads, width: 0, rope: None, index: None, gate: false }
+		Self { heads, kv: heads, width: 0, rope: None, yarn: None, index: None, gate: false }
 	}
 	/// The head width this block attends at, and the inner width its heads span.
 	fn extent(self, channels: usize) -> Result<(usize, usize)> {
@@ -8065,8 +8108,21 @@ impl Model {
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
 	/// frequencies `base^(-2i/dims)`.
-	pub fn rope(&self, dims: usize, base: f64) -> Self {
-		self.attention("rope", |attention| attention.rope = Some((dims, base.to_bits())))
+	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
+		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling for the preceding rotary attention block.
+	pub fn yarn(&self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
+			assert!(context != 0, "yarn context must be positive");
+			assert!(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered");
+			attention.yarn = Some((factor.to_bits(), context, fast.to_bits(), slow.to_bits()));
+		})
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
@@ -10340,7 +10396,7 @@ impl<'a> Builder<'a> {
 		if normalized {
 			block = block.qk(rms);
 		}
-		block = block.rope(rope_dims, rope_base);
+		block = block.rope(neox, rope_dims, rope_base);
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
@@ -11905,6 +11961,24 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
 }
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
+	require(base.is_finite() && base > 1.0, "yarn rotary base must exceed one")?;
+	require(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered")?;
+	let correction = |value: f64| -> Result<f64> {
+		let value = dims as f64 * (context as f64 / (value * std::f64::consts::TAU)).ln() / (2.0 * base.ln());
+		require(value.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(value)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f64);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if high == low { high + 0.001 } else { high };
+	let mscale = 1.0 + 0.1 * factor.ln();
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((mscale, low, high))
+}
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
@@ -11949,7 +12023,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, kv, rope, index, gate, .. } = attention;
+	let AttentionBlock { heads, kv, rope, yarn, index, gate, .. } = attention;
 	let (input, source) = (graph.output, graph.source);
 	// The heads attend at their own width, so the inner width the block spans is
 	// independent of the stream the output projection returns to.
@@ -11963,11 +12037,22 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		// normalized span stops at the value plane and each head owns one group.
 		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
 	}
-	if let Some((dims, base)) = rope {
+	if let Some((layout, dims, base)) = rope {
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		match layout {
+			RopeLayout::Neox => {}
+		}
 		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+		let (mscale, factor, context, low, high) = match yarn {
+			None => (1.0, 1.0, 0.0, 0.0, 1.0),
+			Some((factor, context, fast, slow)) => {
+				let factor = f64::from_bits(factor);
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				(mscale, factor, context as f64, low, high)
+			}
+		};
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -11993,9 +12078,17 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let parameters = if normalization == BlockNormalization::Rms { if scored { checked_add(query_channels, index.width, "indexer query and key scales")? } else { span } } else { 0 };
 		lower_normalize_parameters(graph, normalization, index.width, span, parameters)?;
 		if dims != 0 {
-			let (_, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
+			let (_, _, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+			let (mscale, factor, context, low, high) = match yarn {
+				None => (1.0, 1.0, 0.0, 0.0, 1.0),
+				Some((factor, context, fast, slow)) => {
+					let factor = f64::from_bits(factor);
+					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+					(mscale, factor, context as f64, low, high)
+				}
+			};
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, mscale, factor, context, low, high], -2)?;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
