@@ -17581,6 +17581,7 @@ impl Train {
 		} else {
 			coefficient(&prepared.targets[training_values..], &evaluated)
 		};
+		let validation_r2 = (training_rows < prepared.rows).then_some(r2);
 		if !evaluated.is_empty() {
 			predictions = evaluated
 		}
@@ -17592,7 +17593,7 @@ impl Train {
 			predictions,
 			r2,
 			evaluator_r2: None,
-			validation_r2: None,
+			validation_r2,
 			predicted_reward: None,
 			measured_reward: None,
 			tile: tape.tile(),
@@ -17821,7 +17822,8 @@ impl TrainingReport {
 	pub const fn evaluator_r2(&self) -> Option<f64> {
 		self.evaluator_r2
 	}
-	/// Returns R² over measured proposals withheld from evaluator fitting, if any.
+	/// Returns R² computed on rows excluded from ordinary training, if this run had a holdout.
+	/// Command RAT does not create a holdout and returns `None`.
 	pub const fn validation_r2(&self) -> Option<f64> {
 		self.validation_r2
 	}
