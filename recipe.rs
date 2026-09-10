@@ -7391,6 +7391,11 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	if graph.lanes != 0 {
 		lower_collapse(graph)?;
 	}
+	// A nested hyper-connection may leave its own gate rank on the shared
+	// graph.  Its lane stream was collapsed above with that nested rank; the
+	// enclosing hyper-connection must restore its rank before its outer write
+	// or a following block collapses the enclosing lane stream.
+	graph.rank = rank;
 	graph.lanes = lanes;
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
