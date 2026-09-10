@@ -104,8 +104,9 @@ same weights cannot silently run under a different pairing.
 `.yarn(factor, og_ctx, b_fast, b_slow)` follows a `rope` and scales its
 frequencies for an extended context: `factor` is the extension ratio, `og_ctx`
 the original training context, and the blend runs between the fast and slow
-rotation boundaries. It owns no weights and is invalid without a preceding
-`rope`.
+rotation boundaries. It also applies YaRN's attention-magnitude correction
+`0.1 * ln(factor) + 1` for factors above one. It owns no weights and is
+invalid without a preceding `rope`.
 
 ```rust
 .attn(32).rope(neox, 128, 10000.0).yarn(4.0, 8192, 64.0, 1.0)

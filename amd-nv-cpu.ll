@@ -908,7 +908,7 @@ store i64 %maximum.index.wide, ptr addrspace(1) %context.ptr, align 8 ret void }
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
 define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %channels, i32 %length,
-i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.factor, double %yarn.context, double %yarn.fast, double %yarn.slow, i1 %reverse ) #1 { entry: %per.row = mul i32 %channels, %length
+i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %yarn.context, double %yarn.low, double %yarn.high, i1 %reverse ) #1 { entry: %per.row = mul i32 %channels, %length
 %within = urem i32 %p, %per.row %channel = udiv i32 %within, %length %position = urem i32 %within, %length
 %local = urem i32 %channel, %head.width %half = udiv i32 %dims, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %p
@@ -920,23 +920,16 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local
 %partner = select i1 %upper, i32 %partner.down, i32 %partner.up
 %partner.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %partner
 %other = load double, ptr addrspace(1) %partner.ptr, align 8
-%two.index = mul i32 %index, 2 %two.index.value = call double @recipe.from.u32(i32 %two.index)
+%two.index = mul i32 %index, 2 %two.index.value = call double @recipe.from.u32(i32 %two.index) %index.value = call double @recipe.from.u32(i32 %index)
 %dims.value = call double @recipe.from.u32(i32 %dims) %ratio = call double @recipe.div(double %two.index.value, double %dims.value)
 %log.base = call double @recipe.log(double %base) %exponent.positive = call double @recipe.mul(double %ratio, double %log.base)
 %exponent = call double @recipe.neg(double %exponent.positive) %frequency.raw = call double @recipe.exp(double %exponent)
-; A dimension completes %rotations turns over the original context. The ramp runs
-; from the fast boundary, where the frequency is kept, to the slow boundary,
-; where it is divided by the extension factor; between them the two are blended.
+; The builder computes the reference's truncated correction dimensions. The ramp
+; runs from the fast boundary, where the frequency is kept, to the slow
+; boundary, where it is divided by the extension factor.
 %yarn.on = call i1 @recipe.ogt(double %yarn.factor, double 1.0)
-; %yarn.context arrives already divided by two pi, so the turns a dimension
-; completes over the original context are one multiply and the kernel carries no
-; literal that a narrower precision cannot spell.
-%rotations = call double @recipe.mul(double %yarn.context, double %frequency.raw)
-; The builder requires the fast boundary to exceed the slow one, so the span is
-; strictly positive and needs no guard here. A guard would need an epsilon, and
-; a literal this kernel cannot spell in every precision is what LLVM rejects.
-%ramp.span = call double @recipe.sub(double %yarn.fast, double %yarn.slow)
-%ramp.offset = call double @recipe.sub(double %rotations, double %yarn.slow)
+%ramp.span = call double @recipe.sub(double %yarn.high, double %yarn.low)
+%ramp.offset = call double @recipe.sub(double %index.value, double %yarn.low)
 %ramp.raw = call double @recipe.div(double %ramp.offset, double %ramp.span)
 %ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.raw)
 %ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.raw
@@ -953,7 +946,7 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i32 %local
 %sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)
 %sin.term = select i1 %upper, double %sin.signed, double %sin.signed.negative
 %cos.part = call double @recipe.mul(double %value, double %cos) %sin.part = call double @recipe.mul(double %other, double %sin.term)
-%rotated.value = call double @recipe.add(double %cos.part, double %sin.part) br label %finish finish:
+%rotated.raw = call double @recipe.add(double %cos.part, double %sin.part) %rotated.value = call double @recipe.mul(double %rotated.raw, double %yarn.mscale) br label %finish finish:
 %result = phi double [ %value, %entry ], [ %rotated.value, %rotate ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
 br i1 %reverse, label %accumulate, label %assign accumulate: %prior = load double, ptr addrspace(1) %output.ptr, align 8

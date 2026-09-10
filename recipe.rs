@@ -2517,9 +2517,10 @@ impl NativeModelIr {
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
 					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, count, |ir, p| {
 						ir.push_str(&format!(
-							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
 							factor = native_literal(self.precision.model, ty, node.argument[5]),
+							mscale = native_literal(self.precision.model, ty, node.argument[4]),
 							context = native_literal(self.precision.model, ty, node.argument[6]),
 							fast = native_literal(self.precision.model, ty, node.argument[7]),
 							slow = native_literal(self.precision.model, ty, node.argument[8]),
@@ -4174,8 +4175,10 @@ mod bundle {
 					.map(|(factor, context, fast, slow)| format!(",{},{context},{},{}", f64::from_bits(factor), f64::from_bits(fast), f64::from_bits(slow)))
 					.unwrap_or_default();
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-				let width = attention.width.map(|width| format!(",{width}")).unwrap_or_default();
-				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout}{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				// A zero width is the explicit absent-width marker. Keeping this field
+				// present lets the following YaRN fields be parsed unambiguously.
+				let width = attention.width.unwrap_or(0);
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout},{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4228,17 +4231,18 @@ mod bundle {
 					0 | 1 => RopeLayout::Neox,
 					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
 				};
-				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?;
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.filter(|width| *width != 0);
 				// The four yarn values follow the head width, all four or none.
-				let yarn = match (fields.next(), fields.next(), fields.next(), fields.next()) {
-					(Some(factor), Some(context), Some(fast), Some(slow)) => Some((
+				let yarn = match fields.next() {
+					None => None,
+					Some(factor) => Some((
 						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
-						value_at(Some(context), "yarn original context")?,
-						value_at::<f64>(Some(fast), "yarn fast boundary")?.to_bits(),
-						value_at::<f64>(Some(slow), "yarn slow boundary")?.to_bits(),
+						value_at(fields.next(), "yarn original context")?,
+						value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
+						value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
 					)),
-					_ => None,
 				};
+				require(fields.next().is_none(), "attention record has extra fields")?;
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
@@ -5190,7 +5194,7 @@ impl Model {
 			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
 			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
 			assert!(og_ctx != 0, "yarn original context must be positive");
-			assert!(b_fast.is_finite() && b_slow.is_finite(), "yarn boundaries must be finite, received {b_fast} and {b_slow}");
+			assert!(b_fast.is_finite() && b_slow.is_finite() && b_slow > 0.0, "yarn boundaries must be finite and positive, received {b_fast} and {b_slow}");
 			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
 			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
 		})
@@ -7164,6 +7168,27 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
 }
+/// The integer correction range and attention magnitude used by the reference
+/// YaRN construction. The range is derived from rotations over the original
+/// context, then truncated exactly as the reference implementation does.
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
+	require(fast.is_finite() && slow.is_finite() && slow > 0.0 && fast > slow, "yarn beta values must be finite, positive, and ordered")?;
+	let correction = |value: f64| -> Result<f64> {
+		let denominator = value * std::f64::consts::TAU;
+		let correction = dims as f64 * (context as f64 / denominator).ln() / (2.0 * base.ln());
+		require(correction.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(correction)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f64);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if low == high { high + 0.001 } else { high };
+	let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((mscale, low, high))
+}
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
 	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels)
 }
@@ -7220,16 +7245,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
 		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
-		// The kernel pairs %local with %local +/- %half, which is the NeoX pairing,
-		// so the layout is carried for the record and for a future second layout
-		// rather than to switch anything here.
-		// A zero factor is no scaling, which is what a model without yarn carries.
-		// The context is divided by two pi here so the kernel needs no literal for
-		// it: a narrower precision cannot spell one and LLVM rejects it outright.
-		let (factor, context, fast, slow) = yarn.map_or((0.0, 0.0, 0.0, 0.0), |(factor, context, fast, slow)| {
-			(f64::from_bits(factor), context as f64 / std::f64::consts::TAU, f64::from_bits(fast), f64::from_bits(slow))
-		});
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, f64::from(layout.code()), factor, context, fast, slow], -2)?;
+		// The kernel currently implements the declared NeoX pairing. Keep the
+		// selector in the model record, but do not silently invent another layout.
+		match layout {
+			RopeLayout::Neox => {}
+		}
+		let (mscale, factor, context, low, high) = match yarn {
+			None => (1.0, 0.0, 0.0, 0.0, 1.0),
+			Some((factor, context, fast, slow)) => {
+				let factor = f64::from_bits(factor);
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
+			}
+		};
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
