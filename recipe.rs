@@ -7534,6 +7534,19 @@ fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
+/// Project every element in a row, then restore the declared shape for the
+/// following block. The existing contraction layout already supports this
+/// representation: reinterpret the row as one channel vector, project it,
+/// and reinterpret the projected vector as the target shape.
+fn lower_flatten_project(graph: &mut Graph, target: Shape) -> Result<()> {
+	require(target.channels != 0 && target.length != 0, "dense projection shape must be positive")?;
+	let input = graph.output;
+	reset(graph, graph.source, Shape { channels: input.elements(), length: 1 });
+	lower_project(graph, target.elements())?;
+	let projected = graph.source;
+	reset(graph, projected, target);
+	Ok(())
+}
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
@@ -7716,6 +7729,18 @@ fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: us
 	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
+/// Adapt one branch to the canonical shape selected by the first MoE expert.
+/// The projection is learned over the flattened row, so it preserves every
+/// declared expert even when its sequence is shorter or longer.
+fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape) -> Result<i32> {
+	if from == target {
+		reset(graph, source, from);
+		return Ok(source);
+	}
+	reset(graph, source, from);
+	lower_flatten_project(graph, target)?;
+	Ok(graph.source)
+}
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
 	let mut scalar = ScalarProgram(Vec::new());
 	let condition = scalar.op(ScalarOpcode::Greater, -1.0, -2.0);
@@ -7788,18 +7813,23 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, d
 	let mut output = None;
 	for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
-		if let Some(expected) = output {
-			require(shape == expected, "moe experts must have one output shape")?;
-		}
-		output = Some(shape);
+		let canonical = output.unwrap_or(shape);
+		let branch = project_moe_shape(graph, branch, shape, canonical)?;
+		output = Some(canonical);
 		branches.push(branch);
 	}
 	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
 	let mut scores = Vec::with_capacity(experts.len());
 	for _ in experts {
+		// Every expert has its own learned router. Unlike an expert adapter, a
+		// router must not disappear when its input already has the canonical shape:
+		// identical input and output shapes still require a distinct projection.
 		reset(graph, source, input);
-		lower_project(graph, output.channels)?;
-		require(graph.output == output, "moe router shape does not match its experts")?;
+		if input.length == output.length {
+			lower_project(graph, output.channels)?;
+		} else {
+			lower_flatten_project(graph, output)?;
+		}
 		scores.push(graph.source);
 	}
 	select(graph, &branches, &scores, output, top_k, config)
