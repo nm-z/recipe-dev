@@ -9028,15 +9028,15 @@ fn lease_directory() -> Result<PathBuf> {
 /// One exclusive lease, taken without blocking. `None` means another process
 /// holds it; an error means the lease itself could not be attempted.
 fn take_lease(path: &Path) -> Result<Option<fs::File>> {
-	let file = fs::OpenOptions::new()
-		.create(true)
-		.write(true)
-		.truncate(false)
-		.open(path)
-		.map_err(|error| RecipeError::new(format!("cannot open the device lease {}: {error}", path.display())))?;
 	#[cfg(unix)]
 	{
 		use std::os::fd::AsRawFd;
+		let file = fs::OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(false)
+			.open(path)
+			.map_err(|error| RecipeError::new(format!("cannot open the device lease {}: {error}", path.display())))?;
 		// LOCK_EX | LOCK_NB. The lock is released with the file description, so a
 		// killed process frees its device without anything running afterwards.
 		let held = unsafe { flock(file.as_raw_fd(), 2 | 4) } == 0;
@@ -9044,12 +9044,16 @@ fn take_lease(path: &Path) -> Result<Option<fs::File>> {
 	}
 	#[cfg(windows)]
 	{
+		use std::io::ErrorKind;
 		use std::os::windows::fs::OpenOptionsExt;
-		// share_mode(0) is the same exclusion without a second handle type: the
-		// open fails while another process holds the file, and Windows closes the
-		// handle when the process ends.
-		let held = fs::OpenOptions::new().write(true).create(true).share_mode(0).open(path);
-		Ok(held.ok().map(|_| file))
+		// Open the handle that is retained with share_mode(0). The previous code
+		// opened a second exclusive handle, dropped it immediately, and retained a
+		// default-sharing handle, so Windows never held the lease.
+		match fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(path) {
+			Ok(file) => Ok(Some(file)),
+			Err(error) if matches!(error.kind(), ErrorKind::PermissionDenied | ErrorKind::WouldBlock) => Ok(None),
+			Err(error) => Err(RecipeError::new(format!("cannot open the device lease {}: {error}", path.display()))),
+		}
 	}
 }
 /// Admits this run to the local accelerators it named. One run at a time holds a
