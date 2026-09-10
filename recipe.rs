@@ -4611,18 +4611,20 @@ mod bundle {
 			_ => unreachable!(),
 		};
 		let operation = operation(&fields[0])?;
+		let activation = activation(&fields[1])?;
 		let normalization = normalization(Some(&fields[2]), "block normalization")?;
-		require(operation.weighted() || normalization == Some(BlockNormalization::Rms) || !(frozen || packed), format!("{} owns no weights to qualify", operation.name()))?;
-		Ok(Block {
+		let block = Block {
 			operation,
-			activation: activation(&fields[1])?,
+			activation,
 			normalization,
 			qk,
 			quantization: value_at(Some(&fields[3]), "block quantization")?,
 			profile: bool_value(&fields[4], "block quantization profile")?,
 			frozen,
 			packed,
-		})
+		};
+		require(block.weighted() || !(frozen || packed), format!("{} owns no weights to qualify", block.operation.name()))?;
+		Ok(block)
 	}
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
@@ -5527,7 +5529,7 @@ impl Block {
 		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false }
 	}
 	fn weighted(&self) -> bool {
-		self.operation.weighted() || self.normalization == Some(BlockNormalization::Rms)
+		self.operation.weighted() || self.activation == Activation::Prelu || self.normalization == Some(BlockNormalization::Rms)
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
