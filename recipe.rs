@@ -5235,8 +5235,8 @@ impl HeadCounts for [usize; 3] {
 		self
 	}
 }
-/// One attention block: query heads, key-value heads, and the rotary, indexer
-/// and output gate selectors.
+/// One attention block: query, key, and value heads, plus the rotary, indexer,
+/// and output-gate selectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AttentionBlock {
 	heads: usize,
@@ -5565,7 +5565,7 @@ impl Model {
 	pub fn width(&self, d: usize) -> Self {
 		self.attention("width", |attention| attention.width = Some(d))
 	}
-	/// Key-value heads of the preceding `attn` block. Each key-value head serves
+	/// Equal key and value heads of the preceding `attn` block. Each head serves
 	/// `heads / kv` query heads.
 	pub fn kv(&self, heads: usize) -> Self {
 		self.attention("kv", |attention| {
