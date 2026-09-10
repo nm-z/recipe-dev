@@ -1323,6 +1323,7 @@ impl BackendTarget {
 				let configured = option_env!("RECIPE_CPU_TARGET").ok_or_else(|| RecipeError::new("CPU native target is unavailable"))?;
 				require(target == configured, format!("CPU target {target:?} does not match configured target {configured:?}"))?;
 				require(!compiler.is_empty() && !cpu.is_empty() && !features.is_empty(), "CPU native target identity is incomplete")?;
+				cpu_llvm_major(compiler)?;
 			}
 			Self::Amd { architecture } => {
 				let suffix = architecture.strip_prefix("gfx").unwrap_or("");
@@ -1351,6 +1352,10 @@ fn cpu_llvm_major(compiler: &str) -> Result<u32> {
 		.and_then(|major| major.parse().ok())
 		.filter(|major| *major != 0)
 		.ok_or_else(|| RecipeError::new("CPU compiler LLVM major version is absent"))
+}
+
+fn cpu_compiler_version(text: &str) -> Result<&str> {
+	text.lines().find(|line| line.contains("clang version")).map(str::trim).ok_or_else(|| RecipeError::new("CPU compiler query omitted compiler identity"))
 }
 
 fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
@@ -1393,7 +1398,7 @@ fn native_cpu_target() -> Result<BackendTarget> {
 	features.sort_unstable();
 	features.dedup();
 	require(!features.is_empty(), "CPU native target query omitted target features")?;
-	let version = text.lines().find(|line| line.contains("clang version")).map(str::trim).ok_or_else(|| RecipeError::new("CPU native target query omitted compiler identity"))?;
+	let version = cpu_compiler_version(&text).map_err(|_| RecipeError::new("CPU native target query omitted compiler identity"))?;
 	let identity = format!("target={target};compiler={compiler}@{version};cpu={cpu};features={}", features.join(","));
 	let target = BackendTarget::Cpu { target: identity };
 	target.validate()?;
@@ -1428,6 +1433,13 @@ const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
+fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
+	match state_bytes {
+		8 => Ok(NATIVE_EPOCH_LAYOUT_FP64),
+		4 => Ok(NATIVE_EPOCH_LAYOUT_FP32),
+		width => Err(RecipeError::new(format!("native epoch state width {width} is unsupported"))),
+	}
+}
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
 		impl NativePrecision {
@@ -3229,12 +3241,12 @@ impl NativeModelIr {
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
-		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
 			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
-			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
@@ -3655,6 +3667,36 @@ impl Drop for NativeTemporaryFiles {
 	}
 }
 
+fn remote_native_artifact(target: &BackendTarget, bytes: &[u8]) -> Result<(PathBuf, NativeTemporaryFiles)> {
+	let directory = native_artifact_directory("remote")?;
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create remote native artifact directory {}: {error}", directory.display())))?;
+	#[cfg(unix)]
+	fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+		.map_err(|error| RecipeError::new(format!("cannot secure remote native artifact directory {}: {error}", directory.display())))?;
+	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos());
+	let mut attempt = 0_u64;
+	let (path, mut file) = loop {
+		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+		let path = directory.join(format!(".recipe-remote-native-{}-{timestamp:x}-{serial:x}-{attempt:x}.{}", std::process::id(), target.artifact_extension()));
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		match options.open(&path) {
+			Ok(file) => break (path, file),
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				attempt = attempt.wrapping_add(1);
+			}
+			Err(error) => return Err(RecipeError::new(format!("cannot create remote native artifact {}: {error}", path.display()))),
+		}
+	};
+	if let Err(error) = file.write_all(bytes).and_then(|_| file.flush()) {
+		let _ = fs::remove_file(&path);
+		return Err(RecipeError::new(format!("cannot write remote native artifact {}: {error}", path.display())));
+	}
+	Ok((path.clone(), NativeTemporaryFiles { paths: vec![path] }))
+}
+
 fn home_directory() -> Result<PathBuf> {
 	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).ok_or_else(|| RecipeError::new("home directory is absent"))
 }
@@ -3664,14 +3706,34 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
-fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
+fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
+	let version = match target {
+		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v5".as_slice(),
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
+	};
+	let requirement = match target {
+		BackendTarget::Cpu { target } => {
+			let (target, _, cpu, features) = cpu_identity(target)?;
+			format!("target={target};cpu={cpu};features={features}")
+		}
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => native_target_label(target).to_owned(),
+	};
+	let producer = match target {
+		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
+		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => String::new(),
+	};
+	let mut parts = vec![version, requirement.as_bytes()];
+	if matches!(target, BackendTarget::Cpu { .. }) {
+		parts.push(producer.as_bytes());
+	}
+	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
+	for part in parts {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
 	}
-	format!("recipe-native-{hash:016x}")
+	Ok(format!("recipe-native-{hash:016x}"))
 }
 
 /// Run a compiler and return whatever it wrote to its diagnostic stream, which
@@ -3679,7 +3741,14 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 fn native_command(mut command: Command, role: &str, key: &str) -> Result<String> {
 	debug(&format!("native compiler key={key} role={role} command={command:?}"))?;
 	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
-	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+	let mut diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+	if !output.stdout.is_empty() {
+		if !diagnostic.is_empty() {
+			diagnostic.push('\n');
+		}
+		diagnostic.push_str(&String::from_utf8_lossy(&output.stdout));
+	}
+	let diagnostic = diagnostic.trim().to_owned();
 	if output.status.success() {
 		return Ok(diagnostic);
 	}
@@ -3736,6 +3805,17 @@ fn native_cpu_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_CPU_COMPILER").ok_or_else(|| RecipeError::new("CPU native compiler is unavailable"))
 }
 
+fn native_cpu_compiler_identity() -> Result<String> {
+	let compiler = native_cpu_compiler()?;
+	let output = Command::new(compiler).arg("--version").output().map_err(|error| RecipeError::new(format!("cannot query CPU native compiler: {error}")))?;
+	require(output.status.success(), format!("CPU native compiler query failed: {}", String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no compiler diagnostic")))?;
+	let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+	text.push_str(&String::from_utf8_lossy(&output.stdout));
+	let identity = format!("{compiler}@{}", cpu_compiler_version(&text)?);
+	cpu_llvm_major(&identity)?;
+	Ok(identity)
+}
+
 fn native_cpu_setting(name: &str) -> Result<&'static str> {
 	match name {
 		"linker" => option_env!("RECIPE_CPU_LINKER"),
@@ -3783,16 +3863,29 @@ fn native_nvidia_ptx_version() -> Result<&'static str> {
 	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
 }
 
+fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
+	let ignored = |line: &str| line.contains("ignoring feature") || line.contains("not a recognized feature") || line.contains("unknown target feature");
+	features
+		.split(',')
+		.find(|feature| diagnostic.lines().any(|line| ignored(line) && line.contains(&format!("'{feature}'"))))
+		.map(str::to_owned)
+		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
+}
+
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
-			let (target, compiler_identity, _, _) = cpu_identity(target)?;
+			let (target, _, cpu, features) = cpu_identity(target)?;
+			let compiler_identity = native_cpu_compiler_identity()?;
 			let linker = Path::new(native_cpu_setting("linker")?);
 			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", target, "-march=native"]);
-			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
+			command.args(["-target", target, "-Xclang", "-target-cpu", "-Xclang", cpu]);
+			for feature in features.split(',') {
+				command.args(["-Xclang", "-target-feature", "-Xclang", feature]);
+			}
+			if cpu_llvm_major(&compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
 				command.args(["-mllvm", "-opaque-pointers=1"]);
 			}
 			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
@@ -3808,7 +3901,12 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				.args(["-o"])
 				.arg(output)
 				.arg(source);
-			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
+			let role = format!("CPU LLVM IR compiler ({compiler_identity})");
+			let diagnostic = native_command(command, &role, key)?;
+			if let Some(feature) = cpu_unsupported_feature(features, &diagnostic) {
+				return Err(RecipeError::new(format!("{role} ignored required {feature} for remote CPU target: {diagnostic}")));
+			}
+			Ok(Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
@@ -3859,7 +3957,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	}
 	.filter(|_| model.schedule.matrix);
 	let ir = model.emit(target.backend(), matrix, loss)?;
-	let key = native_artifact_key(target, &ir);
+	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
 	let path = directory.join(format!("artifact.{}", target.artifact_extension()));
@@ -4053,21 +4151,66 @@ mod bundle {
 		}
 	}
 
-	fn residual_text(value: &Residual) -> String {
-		match value {
-			Residual::Layer(width) => format!("layer,{width}"),
-			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
-			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+	/// One backslash per nesting level, so a fragment's steps can be whole
+	/// blocks that themselves hold fragments.
+	fn escape(value: &str) -> String {
+		let mut text = String::with_capacity(value.len());
+		for character in value.chars() {
+			if matches!(character, '\\' | ';' | '|' | ',') {
+				text.push('\\')
+			}
+			text.push(character)
 		}
+		text
 	}
-	fn residual(value: &str) -> Result<Residual> {
-		let mut fields = value.split(',');
-		match fields.next().unwrap_or("") {
-			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
-			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
-			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
-			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+	fn unescape(value: &str) -> Result<String> {
+		let mut text = String::with_capacity(value.len());
+		let mut characters = value.chars();
+		while let Some(character) = characters.next() {
+			match character {
+				'\\' => text.push(characters.next().ok_or_else(|| RecipeError::new("model record ends in an escape"))?),
+				other => text.push(other),
+			}
 		}
+		Ok(text)
+	}
+	/// Splits on the delimiters this level wrote, leaving escaped ones for the
+	/// level below. Text with no escapes splits exactly as `str::split` does,
+	/// which is what keeps older records readable.
+	fn split_escaped(value: &str, delimiter: char) -> Vec<String> {
+		let (mut parts, mut current, mut escaped) = (Vec::new(), String::new(), false);
+		for character in value.chars() {
+			if escaped {
+				(current.push(character), escaped = false).1
+			} else if character == '\\' {
+				(current.push(character), escaped = true).1
+			} else if character == delimiter {
+				parts.push(std::mem::take(&mut current))
+			} else {
+				current.push(character)
+			}
+		}
+		parts.push(current);
+		parts
+	}
+	fn residual_text(value: &Block) -> String {
+		escape(&block_text(value))
+	}
+	fn residual(value: &str) -> Result<Block> {
+		let text = unescape(value)?;
+		// A fragment step used to be one of three fixed shapes carrying no
+		// fields of its own, written without a block's six. Those records still
+		// read: only the newer form holds the block separator.
+		if !text.contains('|') {
+			let mut fields = text.split(',');
+			return match fields.next().unwrap_or("") {
+				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
+				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
+				"activation" => Ok(Block { activation: activation(value_at(fields.next(), "residual activation")?)?, ..Block::of(Operation::Identity) }),
+				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+			};
+		}
+		block(&text)
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -4109,6 +4252,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
+			Operation::Identity => "identity".to_owned(),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4137,10 +4281,14 @@ mod bundle {
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
-			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
+			"identity" => Ok(Operation::Identity),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				Ok(Operation::Moe(
+					value_at(Some(top_k), "MoE top-k")?,
+					split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -4171,15 +4319,15 @@ mod bundle {
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
+		let fields = split_escaped(value, '|');
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
-			operation: operation(fields[0])?,
-			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization: normalization(Some(fields[2]), "block normalization")?,
-			qk: normalization(Some(fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(fields[3]), "block quantization")?,
-			profile: bool_value(fields[4], "block quantization profile")?,
+			operation: operation(&fields[0])?,
+			activation: activation(value_at(Some(&fields[1]), "block activation")?)?,
+			normalization: normalization(Some(&fields[2]), "block normalization")?,
+			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
+			quantization: value_at(Some(&fields[3]), "block quantization")?,
+			profile: bool_value(&fields[4], "block quantization profile")?,
 		})
 	}
 	fn model_text(model: &Model) -> Vec<String> {
@@ -4684,7 +4832,10 @@ mod bundle {
 	}
 }
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::{
+	ffi::OsStrExt,
+	fs::{OpenOptionsExt, PermissionsExt},
+};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::{
@@ -4701,7 +4852,7 @@ use std::{
 		Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub static recipe: Recipe = Recipe;
 static RUN: AtomicU64 = AtomicU64::new(0);
@@ -4796,17 +4947,69 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Conv(usize, usize),
-	Activation(Activation),
+/// A step of a model, and equally a step of a fragment inside one. `res`,
+/// `moe` and the model builder all take the same thing, because a branch step
+/// is an ordinary step: it carries an operation with its activation, its
+/// normalization, its Q/K normalization, its quantization and its profile, and
+/// its operation may itself be another fragment.
+pub const fn layer(width: usize) -> Block {
+	Block::of(Operation::Layer(width))
 }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+pub const fn conv(filters: usize, kernel: usize) -> Block {
+	Block::of(Operation::Conv(filters, kernel))
 }
-pub const fn conv(filters: usize, kernel: usize) -> Residual {
-	Residual::Conv(filters, kernel)
+/// A normalization on its own, computing nothing before it.
+pub fn norm(normalization: impl NormalizationSelector) -> Block {
+	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+}
+pub fn pool(size: usize) -> Block {
+	Block::of(Operation::Pool(size))
+}
+pub fn attn(heads: usize) -> Block {
+	Block::of(Operation::Attention(heads))
+}
+pub fn rnn(width: usize) -> Block {
+	Block::of(Operation::Rnn(width))
+}
+pub fn gru(width: usize) -> Block {
+	Block::of(Operation::Gru(width))
+}
+pub fn lstm(width: usize) -> Block {
+	Block::of(Operation::Lstm(width))
+}
+pub fn perc(width: usize) -> Block {
+	Block::of(Operation::Perceptron(width))
+}
+pub fn kmeans(clusters: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" }))
+}
+pub fn knn(neighbors: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" }))
+}
+pub fn svm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" }))
+}
+pub fn forest(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" }))
+}
+pub fn bayes() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" }))
+}
+pub fn cbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" }))
+}
+pub fn xgbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" }))
+}
+pub fn lgbm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" }))
+}
+/// A fragment as one step, so a branch nests inside a branch.
+pub fn res<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Residual(parts.into()))
+}
+pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
+	Block::of(Operation::Moe(top_k, experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -4833,9 +5036,12 @@ enum Operation {
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
-	Residual(Vec<Residual>),
-	Moe(usize, Vec<Residual>),
+	Residual(Vec<Block>),
+	Moe(usize, Vec<Block>),
 	Perceptron(usize),
+	/// Computes nothing. It carries a step that is only an activation or only
+	/// a normalization, so those need no operation of their own.
+	Identity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -4897,18 +5103,18 @@ impl NormalizationSelector for L2 {
 		BlockNormalization::L2
 	}
 }
-impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
+impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0) {
-			Residual::Layer(_) => BlockNormalization::Layer,
+		match self(0).operation {
+			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
-	Residual::Activation(Activation::$value) })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false } })+}; }
 pub mod atv {
-	use super::{Activation, Residual};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -4916,7 +5122,7 @@ pub mod atv {
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Block {
+pub struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
@@ -4924,6 +5130,72 @@ struct Block {
 	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
+}
+macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
+	self.act(Activation::$activation)
+})+}; }
+impl Block {
+	const fn of(operation: Operation) -> Self {
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false }
+	}
+	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
+	/// the pair `layer(8), relu()` are the same step written two ways.
+	pub fn act(mut self, activation: Activation) -> Self {
+		assert!(self.normalization.is_none(), "activation must precede normalization");
+		self.activation = activation;
+		self
+	}
+	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.normalization = Some(normalization.normalization());
+		self
+	}
+	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
+		self.qk = Some(normalization);
+		self
+	}
+	/// A step inside a fragment keeps its own storage format, exactly as a step
+	/// of the model does.
+	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
+		let format = family << 12 | variant << 8 | u16::from(bits);
+		self.quantization = format;
+		self.profile = StorageFormat(format).selection().is_some();
+		self
+	}
+	pub fn profile(mut self, profile: bool) -> Self {
+		self.profile = profile;
+		self
+	}
+	block_activations! {
+		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
+		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
+		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
+	}
+	pub fn qi(&self, bits: u8) -> BlockQi {
+		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
+		let q = |variant| self.clone().quantize(0, bits, variant);
+		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+	}
+}
+pub struct BlockQi {
+	pub q0: Block,
+	pub q1: Block,
+	pub nf: Block,
+	pub k: BlockQk,
+}
+pub struct BlockQk {
+	model: Block,
+	pub s: Block,
+	pub m: Block,
+	pub l: Block,
+}
+impl std::ops::Deref for BlockQk {
+	type Target = Block;
+	fn deref(&self) -> &Block {
+		&self.model
+	}
 }
 #[derive(Clone)]
 pub struct Model {
@@ -4972,10 +5244,10 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
-	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
+	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
@@ -5026,30 +5298,27 @@ impl Model {
 		Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
-		let has = |value| metrics.iter().any(|metric| metric.0 == value);
-		let selected = (has(5), has(6), has(7), has(9));
+		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
 		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
 		self.blocks
 			.iter()
 			.take(self.blocks.len() - output)
 			.filter_map(|block| {
 				let mut names = Vec::new();
-				if selected.0 {
-					names.push(block.operation.name().to_owned())
-				}
-				if selected.1 && block.activation != Activation::Linear {
-					names.push(block.activation.name().to_owned())
-				}
-				if selected.2 {
+				if selected {
+					names.push(block.operation.name().to_owned());
+					if block.activation != Activation::Linear {
+						names.push(block.activation.name().to_owned())
+					}
 					if let Some(name) = block.qk.map(BlockNormalization::name) {
 						names.push(format!("qk-{name}"))
 					}
 					if let Some(name) = block.normalization.map(BlockNormalization::name) {
 						names.push(name.to_owned())
 					}
-				}
-				if selected.3 && block.quantization != 0 {
-					names.push(quantization(block.quantization))
+					if block.quantization != 0 {
+						names.push(quantization(block.quantization))
+					}
 				}
 				(!names.is_empty()).then(|| names.join("."))
 			})
@@ -6296,6 +6565,7 @@ impl Operation {
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
 			Self::Perceptron(_) => "perc",
 		}
@@ -6358,7 +6628,7 @@ pub struct LossFunction(u8);
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
 pub struct ZScore;
-pub type Normalization = fn(usize) -> Residual;
+pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
 pub type Loss = LossFunction;
 pub const adamw: Adamw = Adamw;
@@ -6375,13 +6645,17 @@ pub const Loss: Metric = Metric(1);
 pub const R2: Metric = Metric(2);
 pub const Time: Metric = Metric(3);
 pub const Epoch: Metric = Metric(4);
+/// The whole of a block: its operation, its activation, its normalization and
+/// Q/K normalization, its tokens and its quantization. One block is one thing,
+/// so selecting parts of its description separately was a distinction the
+/// caller never wanted, and it spent four names on it -- including `norm`,
+/// which a model step wants.
 pub const blck: Metric = Metric(5);
-pub const atvn: Metric = Metric(6);
-pub const norm: Metric = Metric(7);
-pub const tok: Metric = Metric(8);
-pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
-pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+/// All progress fields except the native tile schedule.
+pub const all: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
+/// All progress fields, including the native tile schedule.
+pub const dev: [Metric; 7] = [Run, Time, Epoch, R2, Loss, blck, tile];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -6623,12 +6897,8 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
-	let convolutional = model.blocks.iter().any(|block| match &block.operation {
-		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
-		_ => false,
-	});
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch at any depth.
+	let convolutional = model.blocks.iter().any(|block| sequenced_operation(&block.operation));
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
@@ -6736,8 +7006,9 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
-		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -6993,14 +7264,9 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 	}
 	Ok((graph.source, graph.output))
 }
-fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, config: Config) -> Result<(i32, Shape)> {
+fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
-	match value {
-		Residual::Layer(width) => lower_project(graph, *width)?,
-		Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-		Residual::Activation(value) if *value != Activation::Linear => lower_activation(graph, *value, config)?,
-		Residual::Activation(_) => {}
-	}
+	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
@@ -7068,13 +7334,13 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 	reset(graph, output.ok_or_else(|| RecipeError::new("selection has no output"))?, shape);
 	Ok(())
 }
-fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Config) -> Result<()> {
+fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
 	let mut output = None;
 	for value in experts {
-		let (branch, shape) = expert(graph, source, input, value, config)?;
+		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
 		if let Some(expected) = output {
 			require(shape == expected, "moe experts must have one output shape")?;
 		}
@@ -7098,20 +7364,42 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
 }
-fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
+/// Whether an operation reads along the sequence, itself or through a branch.
+fn sequenced_operation(operation: &Operation) -> bool {
+	match operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
+		_ => false,
+	}
+}
+fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
-	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
+	let branch = graph.source;
+	let branch_shape = graph.output;
+	if branch_shape != shape {
+		// Keep the declared branch as-is and adapt the skip path to it. A learned
+		// contraction handles channel changes; a contraction with a valid window
+		// also handles a branch that shortens the sequence. Upsampling a skip path
+		// would require a distinct operator, so refuse that genuinely unsupported
+		// connection instead of padding or truncating it silently.
+		require(branch_shape.length <= shape.length, "residual projection cannot lengthen the skip sequence")?;
+		reset(graph, skip, shape);
+		if branch_shape.length != shape.length {
+			let kernel = checked_add(shape.length - branch_shape.length, 1, "residual projection kernel")?;
+			lower_conv(graph, branch_shape.channels, kernel)?;
+		} else if branch_shape.channels != shape.channels {
+			lower_project(graph, branch_shape.channels)?;
+		}
+		require(graph.output == branch_shape, "residual projection did not match the branch")?;
+	}
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
-	push_program(graph, skip, &[], program)
+	let second = if branch_shape == shape { skip } else { branch };
+	push_program(graph, second, &[], program)
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
@@ -7583,8 +7871,13 @@ impl NativeTape {
 		Ok(stats)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.rows as usize * self.output, self.precision.model)?;
+		let node = i32::try_from(self.program.artifact.layout.values.len()).map_err(|_| RecipeError::new("native output node count exceeds i32"))? - 1;
+		self.predictions_at(node, self.output)
+	}
+	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
+		let index = usize::try_from(node).map_err(|_| RecipeError::new("native output source is absent"))?;
+		let offset = *self.program.artifact.layout.values.get(index).ok_or_else(|| RecipeError::new("native model output arena is absent"))?;
+		let values = self.values.download_float_bytes(offset, self.rows as usize * output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -7840,7 +8133,13 @@ fn optimizer_work(graph: &Graph) -> f64 {
 /// dispatch isolates fixed cost, and the gradient dispatch measures planned work
 /// without allocating, forwarding, training, or dispatching the placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let workers = if matches!(&gpu.driver, Driver::Cpu) { cpu_worker_threads()? as usize } else { 1 };
+	let workers = match &gpu.driver {
+		Driver::Cpu if gpu.backend == Backend::Cpu => cpu_worker_threads()?,
+		Driver::Remote(remote) if gpu.backend == Backend::Cpu => remote.worker_threads,
+		_ => 1,
+	};
+	let workers = usize::try_from(workers).map_err(|_| RecipeError::new("CPU worker count exceeds usize"))?;
+	require(workers != 0, "CPU worker count is empty")?;
 	let rows = checked_mul(checked_mul(config.surrogate_epochs, config.surrogate_width, "surrogate rows")?, workers, "parallel surrogate rows")?;
 	let features = config.surrogate_width;
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
@@ -8563,6 +8862,7 @@ type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
+	worker_threads: u32,
 }
 enum Driver {
 	Cpu,
@@ -8659,11 +8959,15 @@ impl Drop for Library {
 }
 
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
-	let library = Library::open(&artifact.path)?;
+	load_native_cpu_path(&artifact.path, artifact.precision.state.bytes(), artifact.training, !artifact.storage.is_empty())
+}
+
+fn load_native_cpu_path(path: &Path, state_bytes: usize, training: bool, has_storage: bool) -> Result<NativeCpuProgram> {
+	let library = Library::open(path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
-		match artifact.precision.state.bytes() {
+		match state_bytes {
 			8 => library.function::<NativeEpochF64>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F64),
 			4 => library.function::<NativeEpochF32>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F32),
 			2 => library.function::<NativeEpochF16>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F16),
@@ -8671,8 +8975,8 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 			_ => Err(RecipeError::new("native CPU precision width is invalid")),
 		}
 	};
-	let epoch = artifact.training.then(epoch).transpose()?;
-	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
+	let epoch = training.then(epoch).transpose()?;
+	let model_load = has_storage.then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
 	Ok(NativeCpuProgram { _library: library, thread, forward, epoch, model_load })
 }
 
@@ -8695,12 +8999,13 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
-		let vector_waves = if matches!(&self.driver, Driver::Cpu) {
+		let cpu = self.backend == Backend::Cpu;
+		let vector_waves = if cpu {
 			1
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
 		};
-		let shared_values = if matches!(&self.driver, Driver::Cpu) {
+		let shared_values = if cpu {
 			narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32
 		} else {
 			self.shared_limit / precision.bytes() as u32
@@ -8984,7 +9289,7 @@ impl Gpu {
 		}
 	}
 }
-static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+static DEVICES: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 fn cpu_worker_threads() -> Result<u32> {
 	let limit = count("CPU worker threads", env!("RECIPE_CPU_WORKER_THREADS"))?;
 	let available = std::thread::available_parallelism().map_err(|error| RecipeError::new(format!("cannot read available CPU parallelism: {error}")))?.get();
@@ -8993,18 +9298,53 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
+fn shared_cpu_device() -> Result<&'static Gpu> {
+	static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
+	CPU.get_or_init(cpu_device).as_ref().map_err(Clone::clone)
+}
+/// Parses device selectors into canonical names without opening devices.
+pub fn device_names(selection: &str) -> Result<Vec<String>> {
+	require(!selection.contains(','), "commas are not valid device separators; use one dot-separated device chain")?;
+	let mut names = Vec::new();
+	let mut host = String::new();
+	let mut hostname = Vec::new();
+	for part in selection.split('.') {
+		require(!part.is_empty(), "device selection contains an empty component")?;
+		let name = if let Some((prefix, name)) = part.split_once(':') {
+			require(!prefix.is_empty(), "device host is empty")?;
+			hostname.push(prefix);
+			host = hostname.join(".");
+			hostname.clear();
+			name
+		} else {
+			part
+		};
+		let numbered_cpu = name.strip_prefix("cpu").is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()));
+		require(!numbered_cpu, format!("invalid device {name:?}; use cpu for the available CPU pool"))?;
+		let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
+		if !gpu && name != "cpu" && !part.contains(':') {
+			hostname.push(part);
+			continue;
+		}
+		require(hostname.is_empty(), format!("host {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
+		require(gpu || name == "cpu", format!("invalid device selector {name:?}; expected amd<number>, nv<number>, or cpu"))?;
+		names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
+	}
+	require(hostname.is_empty(), format!("host {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
+	Ok(names)
+}
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
 /// `None` selects the whole machine, so an unnamed run still sees every device.
 fn device_selection() -> Result<Option<Vec<String>>> {
 	let Ok(selection) = std::env::var("RECIPE_DEVICE") else { return Ok(None) };
 	let prefix = format!("{}:", local_host()?);
-	Ok(Some(selection.split(',').map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_owned()).collect()))
+	Ok(Some(device_names(&selection)?.into_iter().map(|name| name.strip_prefix(&prefix).unwrap_or(&name).to_owned()).collect()))
 }
-fn devices() -> Result<&'static [Gpu]> {
+fn devices() -> Result<&'static [&'static Gpu]> {
 	DEVICES
 		.get_or_init(|| {
 			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
-				return cpu_device().map(|gpu| vec![gpu]);
+				return shared_cpu_device().map(|gpu| vec![gpu]);
 			}
 			let selection = device_selection()?;
 			let mut found = Vec::new();
@@ -9015,8 +9355,10 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() && !cfg!(any(amd, nvidia)) {
-				found.push(cpu_device()?);
+			let mut found: Vec<&'static Gpu> = found.into_iter().map(|gpu| &*Box::leak(Box::new(gpu))).collect();
+			let selected_cpu = selection.as_deref().is_some_and(|names| names.iter().any(|name| name == "cpu"));
+			if selected_cpu || (found.is_empty() && !cfg!(any(amd, nvidia))) {
+				found.push(shared_cpu_device()?);
 			}
 			// A selection names devices on other hosts too, so an empty local list is not an error.
 			require(!found.is_empty() || selection.is_some(), errors.join("; "))?;
@@ -9027,18 +9369,30 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map_err(Clone::clone)
 }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
+	if name == Some("cpu") {
+		return shared_cpu_device();
+	}
 	let found = devices()?;
 	if let Some(name) = name {
-		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
+		return found.iter().copied().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
 #[cfg(unix)]
 fn local_host() -> Result<String> {
-	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	require(output.status.success(), "cannot read hostname")?;
-	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	// gethostname(3) rather than the hostname(1) executable, which a minimal
+	// image need not carry: a container without it failed device selection
+	// with "cannot read hostname: No such file or directory".
+	unsafe extern "C" {
+		fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
+	}
+	let mut bytes = [0_u8; 256];
+	// The call truncates rather than failing on a long name, and POSIX leaves
+	// truncated output possibly unterminated, so the last byte stays reserved.
+	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query hostname")?;
+	let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 #[cfg(windows)]
@@ -9049,9 +9403,10 @@ fn local_host() -> Result<String> {
 	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
-/// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
-/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
-/// a reachable host (`benji:nv0`); the first name is the primary device.
+/// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
+/// Dots chain devices under the most recent host prefix. Commas are invalid.
+/// `cpu` names the available CPU pool, not a physical socket.
+/// The first name is the primary device.
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -9060,13 +9415,19 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 			let mut selected = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
 			// selection never connects to, allocates on, or executes on another.
-			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
-				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
-					Some(gpu) => gpu,
-					None => match name.split_once(':') {
-						Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
-					},
+			let names = device_names(&selection)?;
+			for name in names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }) {
+				let local_name = name.strip_prefix(&format!("{host}:")).unwrap_or(name);
+				let gpu = if local_name == "cpu" {
+					device(Some("cpu"))?
+				} else {
+					match devices()?.iter().copied().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+						Some(gpu) => gpu,
+						None => match name.split_once(':') {
+							Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
+							_ => return Err(RecipeError::new(format!("device {name:?} is absent"))),
+						},
+					}
 				};
 				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
 				selected.push(gpu);
@@ -9097,11 +9458,19 @@ fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
 }
 fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	let mut command = Command::new("ssh");
-	command.args(["-o", "BatchMode=yes", host, "umask 077; mktemp -d /tmp/recipe.XXXXXXXX"]);
+	command.args(["-o", "BatchMode=yes", host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
 	let output = command_output(&mut command, &format!("create a private worker directory on {host}"))?;
 	let path = String::from_utf8(output).map_err(|error| RecipeError::new(format!("worker directory from {host} is invalid: {error}")))?.trim().to_owned();
+	let marker = "/.cache/recipe/native/remote-worker.";
+	let (prefix, suffix) = path.rsplit_once(marker).ok_or_else(|| RecipeError::new(format!("worker directory from {host} is unsafe: {path:?}")))?;
 	require(
-		path.starts_with("/tmp/recipe.") && path.len() == "/tmp/recipe.".len() + 8 && path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)),
+		Path::new(&path).is_absolute()
+			&& !prefix.is_empty()
+			&& path.match_indices(marker).count() == 1
+			&& path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+			&& !path.split('/').any(|component| matches!(component, "." | ".."))
+			&& suffix.len() == 8
+			&& suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
 		format!("worker directory from {host} is unsafe: {path:?}"),
 	)?;
 	Ok(RemoteDirectory { host: host.to_owned(), path })
@@ -9150,24 +9519,30 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let backend = match channel.read_u8()? {
 		1 => Backend::Amd,
 		2 => Backend::Nvidia,
+		3 => Backend::Cpu,
 		byte => return Err(RecipeError::new(format!("remote worker reported unknown backend {byte}"))),
 	};
-	let mut architecture = vec![0_u8; channel.read_u8()? as usize];
+	let architecture_length = usize::try_from(channel.read_u32()?).map_err(|_| RecipeError::new("remote architecture metadata length exceeds usize"))?;
+	require(architecture_length <= 4096, "remote architecture metadata is too large")?;
+	let mut architecture = vec![0_u8; architecture_length];
 	channel.read_into(&mut architecture)?;
 	let architecture = String::from_utf8(architecture).map_err(|error| RecipeError::new(format!("remote architecture is invalid: {error}")))?;
 	let memory = channel.read_u64()?;
 	let shared_limit = channel.read_u32()?;
 	let wave = channel.read_u32()?;
+	let worker_threads = channel.read_u32()?;
+	require(worker_threads != 0, "remote worker thread count is empty")?;
 	drop(directory);
 	let native_target = match backend {
+		Backend::Cpu => BackendTarget::Cpu { target: architecture },
 		Backend::Amd => BackendTarget::Amd { architecture },
-		_ => BackendTarget::Nvidia { architecture },
+		Backend::Nvidia => BackendTarget::Nvidia { architecture },
 	};
 	let gpu = Box::leak(Box::new(Gpu {
 		name: canonical.to_owned(),
 		backend,
 		native_target,
-		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave }),
+		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave, worker_threads }),
 		memory,
 		shared_limit,
 		dispatch: Mutex::new(()),
@@ -9444,6 +9819,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 impl NativeProgram {
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
+		native_epoch_layout(artifact.precision.state.bytes())?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
@@ -9487,7 +9863,7 @@ impl NativeProgram {
 				channel.write_u32(register_values)?;
 				channel.write_u8(element)?;
 				channel.write_u8(u8::from(artifact.training))?;
-				channel.write_u8(u8::from(artifact.precision.epoch_layout == NATIVE_EPOCH_LAYOUT_FP64))?;
+				channel.write_u8(u8::try_from(artifact.precision.state.bytes()).map_err(|_| RecipeError::new("native epoch state width exceeds wire width"))?)?;
 				channel.write_u8(u8::from(!artifact.storage.is_empty()))?;
 				channel.flush()?;
 				channel.read_status("artifact load")?;
@@ -9881,6 +10257,7 @@ struct WorkerProgram {
 	dispatches: [Option<Dispatch>; 3],
 	shared_values: u32,
 	reduction_values: u32,
+	_temporary: NativeTemporaryFiles,
 }
 /// Serves one local device to a remote Recipe process over stdin/stdout: the
 /// transport half of a cross-host topology link. Commands mirror the `Gpu`
@@ -9888,14 +10265,15 @@ struct WorkerProgram {
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
-	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+	let probe: Result<(&'static Gpu, u8, u32, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		Driver::Cpu => Ok((gpu, 3_u8, 1, cpu_worker_threads()?)),
 		#[cfg(amd)]
-		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
+		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave, 1)),
 		#[cfg(nvidia)]
-		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
-		_ => Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
+		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave, 1)),
+		Driver::Remote(_) => Err(RecipeError::new(format!("device {name:?} is not a local device"))),
 	});
-	let (gpu, backend, wave) = match probe {
+	let (gpu, backend, wave, worker_threads) = match probe {
 		Ok(probe) => probe,
 		Err(error) => {
 			wire.status(&Err(error.clone()))?;
@@ -9905,11 +10283,13 @@ pub fn worker_serve(name: &str) -> Result<()> {
 	};
 	wire.status(&Ok(()))?;
 	let architecture = native_target_label(&gpu.native_target);
-	wire.write_bytes(&[backend, architecture.len() as u8])?;
+	wire.write_u8(backend)?;
+	wire.write_u32(u32::try_from(architecture.len()).map_err(|_| RecipeError::new("remote target metadata is too long"))?)?;
 	wire.write_bytes(architecture.as_bytes())?;
 	wire.write_bytes(&gpu.memory.to_le_bytes())?;
 	wire.write_u32(gpu.shared_limit)?;
 	wire.write_u32(wave)?;
+	wire.write_u32(worker_threads)?;
 	wire.flush()?;
 	let mut program: Option<WorkerProgram> = None;
 	loop {
@@ -9959,21 +10339,33 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let register_values = wire.read_u32()?;
 				let element = wire.read_u8()?;
 				let training = wire.read_u8()? != 0;
-				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
+				let state_bytes = usize::from(wire.read_u8()?);
 				let has_storage = wire.read_u8()? != 0;
-				#[cfg(not(any(amd, nvidia)))]
-				let _ = (waves, element, training, epoch_layout, has_storage);
-				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
-					#[cfg(amd)]
-					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
-					#[cfg(nvidia)]
-					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
-						.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load)),
-					_ => Err(RecipeError::new("worker device driver is not native")),
+				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match native_epoch_layout(state_bytes) {
+					Err(error) => Err(error),
+					Ok(epoch_layout) => match &gpu.driver {
+						Driver::Cpu => (|| {
+							let (path, temporary) = remote_native_artifact(&gpu.native_target, &artifact)?;
+							let cpu = load_native_cpu_path(&path, state_bytes, training, has_storage)?;
+							let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+							let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry };
+							let epoch = training.then_some(Dispatch { kernel: Kernel::remote(0, element, epoch_layout), geometry });
+							let model_load = has_storage.then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+							Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load, temporary))
+						})(),
+						#[cfg(amd)]
+						Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
+							.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
+						#[cfg(nvidia)]
+						Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
+							.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
+						Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
+					},
 				};
+				#[cfg(not(any(amd, nvidia)))]
+				let _ = waves;
 				wire.status(&loaded.as_ref().map(|_| ()).map_err(Clone::clone))?;
-				if let Ok((backend, forward, epoch, model_load)) = loaded {
+				if let Ok((backend, forward, epoch, model_load, temporary)) = loaded {
 					let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 					let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 					for dispatch in [Some(forward), epoch, model_load].into_iter().flatten() {
@@ -9981,7 +10373,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 						wire.write_u32(dispatch.geometry.groups)?;
 						wire.write_u32(dispatch.geometry.block)?;
 					}
-					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values, reduction_values });
+					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values, reduction_values, _temporary: temporary });
 				}
 			}
 			REMOTE_LAUNCH => {
@@ -10067,12 +10459,12 @@ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 }
 fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
-	if graph.nodes.is_empty() {
+	if graph.source < 0 {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
 	tape.forward(ForwardMode::Training)?;
-	tape.predictions()
+	tape.predictions_at(graph.source, graph.output.elements())
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
@@ -10667,17 +11059,18 @@ fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<Predict
 fn xgboost_leaf(rows: &[usize], gradients: &[f64], regularization: f64) -> f64 {
 	-rows.iter().map(|&row| gradients[row]).sum::<f64>() / (rows.len() as f64 + regularization)
 }
-fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> TreeNode {
+fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> Result<TreeNode> {
 	if depth == 0 || rows.len() < 2 * minimum {
-		return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization));
+		return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)));
 	}
 	let total = rows.iter().map(|&row| gradients[row]).sum::<f64>();
 	let parent = total * total / (rows.len() as f64 + regularization);
-	let mut best = None;
-	for feature in 0..features {
+	// Each feature orders and scans the node rows independently, so the candidate
+	// splits divide over the workers and the best gains reduce in feature order.
+	let best = parallel_map(features, |feature| {
 		let mut ordered = rows.iter().map(|&row| (samples[row * features + feature], row)).collect::<Vec<_>>();
 		ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
-		let mut left = 0.0;
+		let (mut left, mut best) = (0.0, None);
 		for split in 1..ordered.len() {
 			left += gradients[ordered[split - 1].1];
 			if split < minimum || ordered.len() - split < minimum || ordered[split - 1].0 >= ordered[split].0 {
@@ -10685,19 +11078,23 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 			}
 			let right = total - left;
 			let gain = 0.5 * (left * left / (split as f64 + regularization) + right * right / ((ordered.len() - split) as f64 + regularization) - parent);
-			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, usize, f64)| gain > value.0) {
-				best = Some((gain, feature, (ordered[split - 1].0 + ordered[split].0) * 0.5))
+			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, f64)| gain > value.0) {
+				best = Some((gain, (ordered[split - 1].0 + ordered[split].0) * 0.5))
 			}
 		}
-	}
-	let Some((_, feature, threshold)) = best else { return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)) };
+		best.map(|(gain, threshold)| (gain, feature, threshold))
+	})?
+	.into_iter()
+	.flatten()
+	.reduce(|best, candidate| if candidate.0 > best.0 { candidate } else { best });
+	let Some((_, feature, threshold)) = best else { return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization))) };
 	let (left, right): (Vec<_>, Vec<_>) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
-	TreeNode::Split {
+	Ok(TreeNode::Split {
 		feature,
 		threshold,
-		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)),
-		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)),
-	}
+		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)?),
+		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)?),
+	})
 }
 fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
@@ -10707,7 +11104,7 @@ fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result
 	let mut trees = Vec::with_capacity(config.boost_iterations);
 	for _ in 0..config.boost_iterations {
 		let gradients = predictions.iter().zip(&data.targets[..rows]).map(|(prediction, target)| prediction - target).collect::<Vec<_>>();
-		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain);
+		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain)?;
 		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
 			predictions[row] += config.boost_rate * tree_predict(&tree, sample)
 		}
@@ -11456,7 +11853,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 /// samples their decoded pixels. Anything else falls through to the table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
-	let [target] = data.target.as_slice() else { return Ok(None) };
+	let targets = data.target.as_slice();
+	if targets.is_empty() {
+		return Ok(None);
+	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
@@ -11467,6 +11867,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
 	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
 	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
+		// A sidecar file and a labeled file name each carry one label per sample.
+		let [target] = targets else { return Ok(None) };
 		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
 		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
 			let mut builder = SampleTableBuilder::new(target.clone());
@@ -11505,13 +11907,13 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Paired subdirectories: identical sample stems in every directory, one directory named
-	// for the requested target. Each stem is one sample and each directory one column group.
+	// for each requested target. Each stem is one sample and each directory one column group.
 	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
 	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
 	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
-	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
-	let sample_target = stems[0].contains(target);
-	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
+	let paired_target = targets.iter().all(|target| directories.keys().any(|directory| singular(directory) == *target));
+	let sample_target = targets.iter().all(|target| stems[0].contains(target));
+	require(!(aligned && paired_target && sample_target), format!("targets {targets:?} name both paired directories and per-sample files"))?;
 	// Per-sample layouts use directories as rows; paired layouts use directories as columns.
 	if aligned && (sample_target || paired_target) {
 		let mut columns = Vec::new();
@@ -11533,13 +11935,13 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut kind = None;
 			for (row, (path, bytes)) in entries.iter().enumerate() {
 				let (shape, values) = sample_values(path, bytes)?;
-				require(!sample_target || column != target || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
+				require(!sample_target || !targets.contains(column) || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
 				let current = (shape, values.len());
 				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
 			}
 			let (shape, width) = kind.unwrap_or((None, 0));
-			if column != target
+			if !targets.contains(column)
 				&& let Some(previous) = attention
 			{
 				attention = shape
@@ -11554,6 +11956,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
+	// A class subdirectory names one value, so this layout carries one target.
+	let [target] = targets else { return Ok(None) };
 	// Only a declared column overrides the directory names; the positional names a headerless
 	// sample takes name its one field by convention rather than carrying a label.
 	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
@@ -13583,7 +13987,7 @@ impl Train {
 			graph.parameters = tape.weights()?;
 			predictions.clear();
 			let mut raw_outputs = Vec::new();
-			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+			let stream = self.log_metrics.iter().any(|metric| metric.0 == blck.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
