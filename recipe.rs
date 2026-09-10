@@ -11866,13 +11866,14 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			// at feeds the model the label of a vector it already has, and a stem
 			// like "scan-0000" reaches the row as its bytes.
 			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
-			if !dropped.is_empty() && dropped.len() < table.headers.len() {
-				for column in dropped.into_iter().rev() {
-					table.headers.remove(column);
-					for row in &mut table.rows {
-						if column < row.len() {
-							row.remove(column);
-						}
+			if dropped.len() == table.headers.len() {
+				continue
+			}
+			for column in dropped.into_iter().rev() {
+				table.headers.remove(column);
+				for row in &mut table.rows {
+					if column < row.len() {
+						row.remove(column);
 					}
 				}
 			}
