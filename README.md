@@ -102,6 +102,18 @@ square state and requires the residual width to divide by the head count;
 `delta((heads, d_k, d_v), kernel)` states them, so the query and key planes are
 `heads * d_k` wide, the value plane and the block output are `heads * d_v`, and
 neither is tied to the residual width.
+`delta((k_heads, d_k, v_heads, d_v), kernel)` shares each key head across
+`v_heads / k_heads` value heads and keeps the query/key and value planes
+independent. Set the final output gate explicitly with
+`.delta_gate(DeltaGate::Sigmoid)` or `.delta_gate(DeltaGate::Silu)`; sigmoid is
+the default and keeps existing models unchanged.
+
+```rust
+recipe.model()
+	.layer(8)
+	.delta((2, 3, 4, 5), 4)
+	.delta_gate(DeltaGate::Silu);
+```
 
 ## data
 

@@ -951,7 +951,7 @@ define internal double @softplus(double %x) #1 { entry: %magnitude = call double
 ; ascending order, so the position update never depends on the chunk it sits in.
 define internal void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %keys, i32 %values, i32 %length, i32 %time, double %decay.scale, i1 %store ) #3 { entry:
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 %store ) #3 { entry:
 %decay.index = add i32 %a.base, %time
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %decay.index
 %decay.input = load double, ptr addrspace(1) %decay.pointer, align 8 %softplus = call double @softplus(double %decay.input)
@@ -960,12 +960,12 @@ i32 %keys, i32 %values, i32 %length, i32 %time, double %decay.scale, i1 %store )
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %write.index
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
 br label %column.loop
-column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.more = icmp ult i32 %column, %values
+column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.more = icmp ult i32 %column, %vwidth
 br i1 %column.more, label %read.loop, label %exit
 read.loop: %read.i = phi i32 [ 0, %column.loop ], [ %read.next, %read.step ]
 %read.sum = phi double [ 0.0, %column.loop ], [ %read.sum.next, %read.step ]
-%read.more = icmp ult i32 %read.i, %keys br i1 %read.more, label %read.step, label %read.done
-read.step: %read.row = mul i32 %read.i, %values %read.cell = add i32 %read.row, %column %read.index = add i32 %work.base, %read.cell
+%read.more = icmp ult i32 %read.i, %kwidth br i1 %read.more, label %read.step, label %read.done
+read.step: %read.row = mul i32 %read.i, %vwidth %read.cell = add i32 %read.row, %column %read.index = add i32 %work.base, %read.cell
 %read.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %read.index
 %read.state = load double, ptr addrspace(1) %read.pointer, align 8
 %read.offset.row = mul i32 %read.i, %length %read.offset = add i32 %read.offset.row, %time %read.key.index = add i32 %k.base, %read.offset
@@ -980,8 +980,8 @@ read.done: %value.row = mul i32 %column, %length %value.offset = add i32 %value.
 br label %write.loop
 write.loop: %write.i = phi i32 [ 0, %read.done ], [ %write.next, %write.step ]
 %write.sum = phi double [ 0.0, %read.done ], [ %write.sum.next, %write.step ]
-%write.more = icmp ult i32 %write.i, %keys br i1 %write.more, label %write.step, label %write.done
-write.step: %write.row = mul i32 %write.i, %values %write.cell = add i32 %write.row, %column %write.cell.index = add i32 %work.base, %write.cell
+%write.more = icmp ult i32 %write.i, %kwidth br i1 %write.more, label %write.step, label %write.done
+write.step: %write.row = mul i32 %write.i, %vwidth %write.cell = add i32 %write.row, %column %write.cell.index = add i32 %work.base, %write.cell
 %write.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %write.cell.index
 %write.state = load double, ptr addrspace(1) %write.state.pointer, align 8
 %write.decayed = call double @recipe.mul(double %decay, double %write.state)
@@ -1007,17 +1007,18 @@ exit: ret void }
 ; %chunk positions and the carried state is committed at every chunk start, so a
 ; chunk of one commits each decode step. The chunk never reaches the arithmetic.
 define internal void @delta_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i32 %p, i32 %heads, i32 %keys, i32 %values, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs ) #3 { entry:
-%row = udiv i32 %p, %heads %head = urem i32 %p, %heads %state = mul i32 %keys, %values
-%key.channels = mul i32 %heads, %keys %key.plane = mul i32 %key.channels, %length
-%value.channels = mul i32 %heads, %values %value.plane = mul i32 %value.channels, %length
-%stream = add i32 %key.plane, %key.plane %triple = add i32 %stream, %value.plane
-%input.row = mul i32 %row, %triple %key.head = mul i32 %head, %keys %head.offset = mul i32 %key.head, %length
-%value.head = mul i32 %head, %values %value.offset = mul i32 %value.head, %length
-%q.base = add i32 %input.row, %head.offset %k.base = add i32 %q.base, %key.plane
-%value.row.base = add i32 %input.row, %stream %v.base = add i32 %value.row.base, %value.offset
-%output.row = mul i32 %row, %value.plane %o.base = add i32 %output.row, %value.offset
-%gate.stream = mul i32 %heads, %length %gate.row = mul i32 %row, %gate.stream %gate.pair = mul i32 %gate.row, 2
+i32 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs ) #3 { entry:
+%row = udiv i32 %p, %vheads %head = urem i32 %p, %vheads %state = mul i32 %kwidth, %vwidth
+%kchannels = mul i32 %kheads, %kwidth %kstream = mul i32 %kchannels, %length
+%vchannels = mul i32 %vheads, %vwidth %stream = mul i32 %vchannels, %length
+%kplanes = mul i32 %kstream, 2 %row.stride = add i32 %kplanes, %stream
+%input.row = mul i32 %row, %row.stride %group = udiv i32 %vheads, %kheads %khead = udiv i32 %head, %group
+%khead.base = mul i32 %khead, %kwidth %khead.offset = mul i32 %khead.base, %length
+%head.base = mul i32 %head, %vwidth %head.offset = mul i32 %head.base, %length
+%q.base = add i32 %input.row, %khead.offset %k.base = add i32 %q.base, %kstream
+%value.plane = add i32 %input.row, %kplanes %v.base = add i32 %value.plane, %head.offset
+%output.row = mul i32 %row, %stream %o.base = add i32 %output.row, %head.offset
+%gate.stream = mul i32 %vheads, %length %gate.row = mul i32 %row, %gate.stream %gate.pair = mul i32 %gate.row, 2
 %head.length = mul i32 %head, %length %a.base = add i32 %gate.pair, %head.length %b.base = add i32 %a.base, %gate.stream
 %entry.span = mul i32 %chunks, %state %entry.base = mul i32 %p, %entry.span
 %work.region = mul i32 %pairs, %entry.span %work.offset = mul i32 %p, %state %work.base = add i32 %work.region, %work.offset
@@ -1044,7 +1045,7 @@ time.loop: %offset = phi i32 [ 0, %commit.loop ], [ %offset.next, %step.done ] %
 br i1 %step.more, label %step, label %chunk.done
 step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %keys, i32 %values, i32 %length, i32 %time, double %decay.scale, i1 true )
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 true )
 br label %step.done
 step.done: %offset.next = add nuw i32 %offset, 1 br label %time.loop
 chunk.done: %chunk.next = add nuw i32 %chunk.index, 1 br label %chunk.loop
@@ -1056,7 +1057,7 @@ exit: ret void }
 ; contribution to the decay scale gradient.
 define internal double @delta_back( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %delta,
 ptr addrspace(1) %input.adjoint, ptr addrspace(1) %gate.adjoint, i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base,
-i32 %previous, i32 %adjoint.base, i32 %vector.base, i32 %keys, i32 %values, i32 %length, i32 %time, double %decay.scale ) #3 { entry:
+i32 %previous, i32 %adjoint.base, i32 %vector.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale ) #3 { entry:
 %decay.index = add i32 %a.base, %time
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %decay.index
 %decay.input = load double, ptr addrspace(1) %decay.pointer, align 8 %softplus = call double @softplus(double %decay.input)
@@ -1064,12 +1065,12 @@ i32 %previous, i32 %adjoint.base, i32 %vector.base, i32 %keys, i32 %values, i32 
 %decay = call double @recipe.exp(double %negated) %write.index = add i32 %b.base, %time
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %write.index
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
-%weight.base = add i32 %vector.base, %values
+%weight.base = add i32 %vector.base, %vwidth
 br label %seed.row
-seed.row: %seed.i = phi i32 [ 0, %entry ], [ %seed.i.next, %seed.row.done ] %seed.i.more = icmp ult i32 %seed.i, %keys
+seed.row: %seed.i = phi i32 [ 0, %entry ], [ %seed.i.next, %seed.row.done ] %seed.i.more = icmp ult i32 %seed.i, %kwidth
 %seed.i.row = mul i32 %seed.i, %length %seed.i.offset = add i32 %seed.i.row, %time %seed.query.index = add i32 %q.base, %seed.i.offset
 br i1 %seed.i.more, label %seed.column, label %column.loop
-seed.column: %seed.j = phi i32 [ 0, %seed.row ], [ %seed.j.next, %seed.step ] %seed.j.more = icmp ult i32 %seed.j, %values
+seed.column: %seed.j = phi i32 [ 0, %seed.row ], [ %seed.j.next, %seed.step ] %seed.j.more = icmp ult i32 %seed.j, %vwidth
 br i1 %seed.j.more, label %seed.step, label %seed.row.done
 seed.step: %seed.query.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i32 %seed.query.index
 %seed.query = load double, ptr addrspace(1) %seed.query.pointer, align 8
@@ -1077,7 +1078,7 @@ seed.step: %seed.query.pointer = getelementptr inbounds double, ptr addrspace(1)
 %seed.delta.pointer = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %seed.delta.index
 %seed.delta = load double, ptr addrspace(1) %seed.delta.pointer, align 8
 %seed.product = call double @recipe.mul(double %seed.query, double %seed.delta)
-%seed.row.base = mul i32 %seed.i, %values %seed.cell = add i32 %seed.row.base, %seed.j %seed.index = add i32 %adjoint.base, %seed.cell
+%seed.row.base = mul i32 %seed.i, %vwidth %seed.cell = add i32 %seed.row.base, %seed.j %seed.index = add i32 %adjoint.base, %seed.cell
 %seed.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %seed.index
 %seed.prior = load double, ptr addrspace(1) %seed.pointer, align 8
 %seed.total = call double @recipe.add(double %seed.prior, double %seed.product)
@@ -1085,12 +1086,12 @@ store double %seed.total, ptr addrspace(1) %seed.pointer, align 8 %seed.j.next =
 seed.row.done: %seed.i.next = add nuw i32 %seed.i, 1 br label %seed.row
 column.loop: %column = phi i32 [ 0, %seed.row ], [ %column.next, %column.done ]
 %write.gradient = phi double [ 0.0, %seed.row ], [ %write.gradient.next, %column.done ]
-%column.more = icmp ult i32 %column, %values br i1 %column.more, label %column.row, label %row.loop
+%column.more = icmp ult i32 %column, %vwidth br i1 %column.more, label %column.row, label %row.loop
 column.row: %column.i = phi i32 [ 0, %column.loop ], [ %column.i.next, %column.step ]
 %readout = phi double [ 0.0, %column.loop ], [ %readout.next, %column.step ]
 %weight = phi double [ 0.0, %column.loop ], [ %weight.next, %column.step ]
-%column.i.more = icmp ult i32 %column.i, %keys br i1 %column.i.more, label %column.step, label %column.store
-column.step: %column.i.row = mul i32 %column.i, %values %column.cell = add i32 %column.i.row, %column
+%column.i.more = icmp ult i32 %column.i, %kwidth br i1 %column.i.more, label %column.step, label %column.store
+column.step: %column.i.row = mul i32 %column.i, %vwidth %column.cell = add i32 %column.i.row, %column
 %column.state.index = add i32 %previous, %column.cell
 %column.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %column.state.index
 %column.state = load double, ptr addrspace(1) %column.state.pointer, align 8
@@ -1127,16 +1128,16 @@ store double %value.total, ptr addrspace(1) %value.adjoint.pointer, align 8
 column.done: %column.next = add nuw i32 %column, 1 br label %column.loop
 row.loop: %row.i = phi i32 [ 0, %column.loop ], [ %row.i.next, %row.done ]
 %decay.gradient = phi double [ 0.0, %column.loop ], [ %decay.gradient.next, %row.done ]
-%row.i.more = icmp ult i32 %row.i, %keys
+%row.i.more = icmp ult i32 %row.i, %kwidth
 %row.i.offset.row = mul i32 %row.i, %length %row.i.offset = add i32 %row.i.offset.row, %time
-%row.key.index = add i32 %k.base, %row.i.offset %row.query.index = add i32 %q.base, %row.i.offset %row.i.base = mul i32 %row.i, %values
+%row.key.index = add i32 %k.base, %row.i.offset %row.query.index = add i32 %q.base, %row.i.offset %row.i.base = mul i32 %row.i, %vwidth
 br i1 %row.i.more, label %row.column, label %gates.entry
 row.column: %row.j = phi i32 [ 0, %row.loop ], [ %row.j.next, %row.step ]
 %decay.part = phi double [ 0.0, %row.loop ], [ %decay.part.next, %row.step ]
 %key.direct = phi double [ 0.0, %row.loop ], [ %key.direct.next, %row.step ]
 %key.readout = phi double [ 0.0, %row.loop ], [ %key.readout.next, %row.step ]
 %query.part = phi double [ 0.0, %row.loop ], [ %query.part.next, %row.step ]
-%row.j.more = icmp ult i32 %row.j, %values br i1 %row.j.more, label %row.step, label %row.store
+%row.j.more = icmp ult i32 %row.j, %vwidth br i1 %row.j.more, label %row.step, label %row.store
 row.step: %row.cell = add i32 %row.i.base, %row.j %row.state.index = add i32 %previous, %row.cell
 %row.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %row.state.index
 %row.state = load double, ptr addrspace(1) %row.state.pointer, align 8
@@ -1207,30 +1208,46 @@ store double %write.total, ptr addrspace(1) %write.adjoint.pointer, align 8
 ; in this pair's partial for the fold below.
 define internal void @delta_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %context,
 ptr addrspace(1) %delta, ptr addrspace(1) %input.adjoint, ptr addrspace(1) %gate.adjoint,
-i32 %p, i32 %heads, i32 %keys, i32 %values, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs ) #3 { entry:
-%row = udiv i32 %p, %heads %head = urem i32 %p, %heads %state = mul i32 %keys, %values
-%key.channels = mul i32 %heads, %keys %key.plane = mul i32 %key.channels, %length
-%value.channels = mul i32 %heads, %values %value.plane = mul i32 %value.channels, %length
-%stream = add i32 %key.plane, %key.plane %triple = add i32 %stream, %value.plane
-%input.row = mul i32 %row, %triple %key.head = mul i32 %head, %keys %head.offset = mul i32 %key.head, %length
-%value.head = mul i32 %head, %values %value.offset = mul i32 %value.head, %length
-%q.base = add i32 %input.row, %head.offset %k.base = add i32 %q.base, %key.plane
-%value.row.base = add i32 %input.row, %stream %v.base = add i32 %value.row.base, %value.offset
-%output.row = mul i32 %row, %value.plane %o.base = add i32 %output.row, %value.offset
-%gate.stream = mul i32 %heads, %length %gate.row = mul i32 %row, %gate.stream %gate.pair = mul i32 %gate.row, 2
-%head.length = mul i32 %head, %length %a.base = add i32 %gate.pair, %head.length %b.base = add i32 %a.base, %gate.stream
-%entry.span = mul i32 %chunks, %state %entry.base = mul i32 %p, %entry.span
-%work.region = mul i32 %pairs, %entry.span %work.offset = mul i32 %p, %state %work.base = add i32 %work.region, %work.offset
+i32 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs ) #3 { entry:
+%row = udiv i32 %p, %kheads %khead = urem i32 %p, %kheads %state = mul i32 %kwidth, %vwidth
+%kchannels = mul i32 %kheads, %kwidth %kstream = mul i32 %kchannels, %length
+%vchannels = mul i32 %vheads, %vwidth %stream = mul i32 %vchannels, %length
+%kplanes = mul i32 %kstream, 2 %row.stride = add i32 %kplanes, %stream
+%input.row = mul i32 %row, %row.stride %group = udiv i32 %vheads, %kheads
+%khead.base = mul i32 %khead, %kwidth %khead.offset = mul i32 %khead.base, %length
+%q.base = add i32 %input.row, %khead.offset %k.base = add i32 %q.base, %kstream
+%value.plane = add i32 %input.row, %kplanes
+%output.row = mul i32 %row, %stream
+%gate.stream = mul i32 %vheads, %length %gate.row = mul i32 %row, %gate.stream %gate.pair = mul i32 %gate.row, 2
+%entry.span = mul i32 %chunks, %state
+%work.region = mul i32 %pairs, %entry.span
 %pair.states = mul i32 %pairs, %state %replay.region = add i32 %work.region, %pair.states
-%replay.span = mul i32 %chunk, %state %replay.offset = mul i32 %p, %replay.span %replay.base = add i32 %replay.region, %replay.offset
+%replay.span = mul i32 %chunk, %state
 %replay.total = mul i32 %pairs, %replay.span %adjoint.region = add i32 %replay.region, %replay.total
-%adjoint.base = add i32 %adjoint.region, %work.offset %vector.region = add i32 %adjoint.region, %pair.states
-%vector.span = mul i32 %values, 2 %vector.offset = mul i32 %p, %vector.span %vector.base = add i32 %vector.region, %vector.offset
-%vector.total = mul i32 %pairs, %vector.span %partial.region = add i32 %vector.region, %vector.total %partial.index = add i32 %partial.region, %p
+%vector.region = add i32 %adjoint.region, %pair.states
+%vector.span = mul i32 %vwidth, 2
+%vector.total = mul i32 %pairs, %vector.span %partial.region = add i32 %vector.region, %vector.total
+%khead.first = mul i32 %khead, %group %pair.row = mul i32 %row, %vheads
+br label %head.loop
+; Every value head sharing this key head walks in turn, so one thread owns the
+; query and key adjoint elements of the head they share. One value head per key
+; head makes exactly one pass and keeps the ungrouped indexing.
+head.loop: %g = phi i32 [ 0, %entry ], [ %g.next, %head.done ] %g.more = icmp ult i32 %g, %group
+br i1 %g.more, label %head.body, label %exit
+head.body: %head = add i32 %khead.first, %g %pair = add i32 %pair.row, %head
+%head.base = mul i32 %head, %vwidth %head.offset = mul i32 %head.base, %length
+%v.base = add i32 %value.plane, %head.offset %o.base = add i32 %output.row, %head.offset
+%head.length = mul i32 %head, %length %a.base = add i32 %gate.pair, %head.length %b.base = add i32 %a.base, %gate.stream
+%entry.base = mul i32 %pair, %entry.span
+%work.offset = mul i32 %pair, %state %work.base = add i32 %work.region, %work.offset
+%replay.offset = mul i32 %pair, %replay.span %replay.base = add i32 %replay.region, %replay.offset
+%adjoint.base = add i32 %adjoint.region, %work.offset
+%vector.offset = mul i32 %pair, %vector.span %vector.base = add i32 %vector.region, %vector.offset
+%partial.index = add i32 %partial.region, %pair
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %head
 %decay.parameter = load double, ptr addrspace(1) %decay.pointer, align 8 %decay.scale = call double @recipe.exp(double %decay.parameter)
 br label %zero.loop
-zero.loop: %zero.i = phi i32 [ 0, %entry ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.i, %state
+zero.loop: %zero.i = phi i32 [ 0, %head.body ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.i, %state
 br i1 %zero.more, label %zero.step, label %chunk.loop
 zero.step: %zero.index = add i32 %adjoint.base, %zero.i
 %zero.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %zero.index
@@ -1261,7 +1278,7 @@ save.step: %save.work = add i32 %work.base, %save.i
 store double %save.value, ptr addrspace(1) %save.slot.pointer, align 8 %save.next = add nuw i32 %save.i, 1 br label %replay.save
 replay.step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %keys, i32 %values, i32 %length, i32 %replay.time, double %decay.scale, i1 false )
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %replay.time, double %decay.scale, i1 false )
 %replay.i.next = add nuw i32 %replay.i, 1 br label %replay.loop
 backward.loop: %backward.i = phi i32 [ %replay.i, %replay.loop ], [ %backward.index, %backward.step ]
 %decay.sum = phi double [ %total, %replay.loop ], [ %decay.sum.next, %backward.step ]
@@ -1270,11 +1287,13 @@ backward.step: %backward.index = sub i32 %backward.i, 1 %backward.time = add i32
 %backward.slot.offset = mul i32 %backward.index, %state %backward.slot = add i32 %replay.base, %backward.slot.offset
 %contribution = call double @delta_back( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %delta,
 ptr addrspace(1) %input.adjoint, ptr addrspace(1) %gate.adjoint, i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base,
-i32 %backward.slot, i32 %adjoint.base, i32 %vector.base, i32 %keys, i32 %values, i32 %length, i32 %backward.time, double %decay.scale )
+i32 %backward.slot, i32 %adjoint.base, i32 %vector.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %backward.time, double %decay.scale )
 %decay.sum.next = call double @recipe.add(double %decay.sum, double %contribution) br label %backward.loop
 chunk.done: %remaining.next = sub i32 %remaining, 1 br label %chunk.loop
 store: %partial.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %partial.index
-store double %total, ptr addrspace(1) %partial.pointer, align 8 ret void }
+store double %total, ptr addrspace(1) %partial.pointer, align 8 br label %head.done
+head.done: %g.next = add nuw i32 %g, 1 br label %head.loop
+exit: ret void }
 ; Decay scale %p sums its per-row partials in row order and writes the gradient.
 define internal void @delta_reverse_decay_body( ptr addrspace(1) %context, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %heads, i32 %partials, i32 %offset ) #1 { entry:
 br label %loop loop: %r = phi i32 [ 0, %entry ], [ %next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
