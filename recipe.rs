@@ -2572,7 +2572,7 @@ impl NativeModelIr {
 					if blocks != 0 {
 						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
-						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
+						let keep = integer_argument(node.argument[5], "indexer blocks kept")?;
 						emit_row_loop(&mut ir, index, "index", blocks, |ir, p| {
 							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
 						})?;
@@ -3454,14 +3454,15 @@ fn type_literal(ty: &str, value: f64) -> String {
 /// The selector arguments every attention kernel takes after its tiling.
 fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
 	Ok(format!(
-		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
-		kv = integer_argument(node.argument[1], "attention key-value heads")?,
-		index_heads = integer_argument(node.argument[5], "indexer heads")?,
-		index_width = integer_argument(node.argument[6], "indexer width")?,
-		block = integer_argument(node.argument[3], "indexer block")?,
-		gate = node.argument[2] != 0.0,
+		"i32 {keys}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		keys = integer_argument(node.argument[1], "attention key heads")?,
+		values = integer_argument(node.argument[2], "attention value heads")?,
+		index_heads = integer_argument(node.argument[6], "indexer heads")?,
+		index_width = integer_argument(node.argument[7], "indexer width")?,
+		block = integer_argument(node.argument[4], "indexer block")?,
+		gate = node.argument[3] != 0.0,
 		ty = precision.model_type,
-		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+		epsilon = native_literal(precision.model, precision.model_type, number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?)
 	))
 }
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
@@ -4337,7 +4338,8 @@ mod bundle {
 				// A zero width is the explicit absent-width marker. Keeping this field
 				// present lets the following YaRN fields be parsed unambiguously.
 				let width = attention.width.unwrap_or(0);
-				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout},{width}{yarn}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout},{width}{yarn}{values}", attention.heads, attention.keys, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -4372,7 +4374,7 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let heads = value_at(fields.next(), "attention heads")?;
-				let kv = value_at(fields.next(), "attention key-value heads")?;
+				let keys = value_at(fields.next(), "attention key heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
 				let index = Indexer {
@@ -4392,21 +4394,33 @@ mod bundle {
 					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
 				};
 				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.filter(|width| *width != 0);
-				// The four yarn values follow the head width, all four or none.
-				let yarn = match fields.next() {
-					None => None,
-					Some(factor) => Some((
-						value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
-						value_at(fields.next(), "yarn original context")?,
-						value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
-						value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
-					)),
+				// The four yarn values follow the head width, all four or none. A
+				// value-head marker may appear immediately after width when YaRN is
+				// absent, so it cannot be mistaken for a yarn factor.
+				let first_optional = fields.next();
+				let (yarn, value_marker) = match first_optional {
+					None => (None, None),
+					Some(value) if value.starts_with("v=") => (None, Some(value)),
+					Some(factor) => (
+						Some((
+							value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+							value_at(fields.next(), "yarn original context")?,
+							value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
+							value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
+						)),
+						fields.next(),
+					),
+				};
+				let values = match value_marker {
+					None => keys,
+					Some(value) => value.strip_prefix("v=").ok_or_else(|| RecipeError::new("attention record has extra fields"))?.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?,
 				};
 				require(fields.next().is_none(), "attention record has extra fields")?;
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
-					kv,
+					keys,
+					values,
 					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
 					yarn,
 					index: (index.block != 0).then_some(index),
@@ -5130,8 +5144,12 @@ pub fn norm(normalization: impl NormalizationSelector) -> Block {
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
 }
-pub fn attn(heads: usize) -> Block {
-	Block::of(Operation::Attention(AttentionBlock::new(heads)))
+pub fn attn(heads: impl HeadCounts) -> Block {
+	let [query, keys, values] = heads.counts();
+	let mut attention = AttentionBlock::new(query);
+	attention.keys = keys;
+	attention.values = values;
+	Block::of(Operation::Attention(attention))
 }
 pub fn rnn(width: usize) -> Block {
 	Block::of(Operation::Rnn(width))
@@ -5201,6 +5219,22 @@ struct Indexer {
 	block: usize,
 	keep: usize,
 }
+/// The attention head counts: one count for all three, or explicit query, key,
+/// and value counts. The array form is the typed Rust spelling of the three
+/// count API; the scalar form remains the equal-head shorthand.
+pub trait HeadCounts {
+	fn counts(self) -> [usize; 3];
+}
+impl HeadCounts for usize {
+	fn counts(self) -> [usize; 3] {
+		[self, self, self]
+	}
+}
+impl HeadCounts for [usize; 3] {
+	fn counts(self) -> [usize; 3] {
+		self
+	}
+}
 /// One attention block: query heads, key-value heads, and the rotary, indexer
 /// and output gate selectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5209,7 +5243,10 @@ struct AttentionBlock {
 	/// The width of one query, key and value head. `None` derives it from the
 	/// residual width, which is what `attn(heads)` alone has always meant.
 	width: Option<usize>,
-	kv: usize,
+	/// The key and value head counts. They may differ, while each must divide
+	/// the query count so grouped-query/value attention has an unambiguous map.
+	keys: usize,
+	values: usize,
 	/// The rotary layout, the rotated channel count, and the base as its bits.
 	rope: Option<(RopeLayout, usize, u64)>,
 	/// YaRN frequency scaling of the rotary above: the context extension factor,
@@ -5221,7 +5258,7 @@ struct AttentionBlock {
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, width: None, kv: heads, rope: None, yarn: None, index: None, gate: false }
+		Self { heads, width: None, keys: heads, values: heads, rope: None, yarn: None, index: None, gate: false }
 	}
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5492,11 +5529,19 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(AttentionBlock::new(heads));
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
+	/// Attention over query heads. The scalar form gives keys and values the
+	/// same count; the array form states query, key, and value counts separately.
+	pub fn attn(&self, heads: impl HeadCounts) -> Self {
+		let [query, keys, values] = heads.counts();
+		let mut attention = AttentionBlock::new(query);
+		attention.keys = keys;
+		attention.values = values;
+		self.push(Operation::Attention(attention))
+	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -5523,7 +5568,10 @@ impl Model {
 	/// Key-value heads of the preceding `attn` block. Each key-value head serves
 	/// `heads / kv` query heads.
 	pub fn kv(&self, heads: usize) -> Self {
-		self.attention("kv", |attention| attention.kv = heads)
+		self.attention("kv", |attention| {
+			attention.keys = heads;
+			attention.values = heads;
+		})
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -7571,12 +7619,22 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, width, kv, rope, yarn, index, gate } = attention;
+	let AttentionBlock { heads, width, keys, values, rope, yarn, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
 	// A declared head width stands on its own; a derived one is still the residual
 	// width split evenly, so `attn(heads)` keeps its exact rejection and message.
-	require(width.is_some() || graph.output.channels % heads == 0, "attention head partition is invalid")?;
-	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
+	require(
+		width.is_some() || graph.output.channels % heads == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
+	require(
+		keys != 0 && keys <= heads && heads % keys == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
+	require(
+		values != 0 && values <= heads && heads % values == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
 	let input = graph.output;
 	let width = match width {
 		Some(width) => {
@@ -7589,7 +7647,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	// `input.channels`, so every expression below is the one this code emitted
 	// before the width could be declared.
 	let inner = checked_mul(heads, width, "attention query plane")?;
-	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	let side = match index {
 		Some(index) => {
 			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
@@ -7608,12 +7666,12 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
-		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, kv, "attention query and key heads")?, "attention query and key span")?)?;
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, keys, "attention query and key heads")?, "attention query and key span")?)?;
 	}
 	if let Some((layout, dims, base)) = rope {
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
-		let rotated = checked_mul(width, checked_add(heads, kv, "rotary head partition")?, "rotary width")?;
+		let rotated = checked_mul(width, checked_add(heads, keys, "rotary query and key partition")?, "rotary width")?;
 		// The kernel currently implements the declared NeoX pairing. Keep the
 		// selector in the model record, but do not silently invent another layout.
 		match layout {
@@ -7630,8 +7688,11 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
-	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
+	let _ = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	// Attention node arguments carry query, key, and value counts separately.
+	// The native emitter obtains the normalization epsilon from the build
+	// configuration, so argument slot eight remains available to storage tags.
+	let argument = [heads as f64, keys as f64, values as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, 0.0];
 	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
 	// shape, so declaring the width is a matter of pushing the query plane here
 	// rather than the block input. The closing projection maps it back to the
@@ -7653,7 +7714,7 @@ fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: 
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
 fn attention_blocks(node: &Node) -> usize {
-	let block = node.argument[3] as usize;
+	let block = node.argument[4] as usize;
 	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
@@ -8876,7 +8937,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
 			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
 			let blocks = attention_blocks(node);
-			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[7] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
 			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
 			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
@@ -9468,7 +9529,7 @@ impl Gpu {
 			require(heads != 0, "attention heads are empty")?;
 			// The matrix path covers dense attention with tied heads, no gate and
 			// no indexer.
-			let plain = node.argument[1] == node.argument[0] && node.argument[2] == 0.0 && node.argument[3] == 0.0;
+			let plain = node.argument[1] == node.argument[0] && node.argument[2] == node.argument[0] && node.argument[3] == 0.0 && node.argument[4] == 0.0;
 			Ok::<_, RecipeError>(aligned && plain && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
