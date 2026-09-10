@@ -4980,6 +4980,30 @@ pub fn lstm(width: usize) -> Block {
 pub fn perc(width: usize) -> Block {
 	Block::of(Operation::Perceptron(width))
 }
+pub fn kmeans(clusters: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" }))
+}
+pub fn knn(neighbors: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" }))
+}
+pub fn svm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" }))
+}
+pub fn forest(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" }))
+}
+pub fn bayes() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" }))
+}
+pub fn cbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" }))
+}
+pub fn xgbst() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" }))
+}
+pub fn lgbm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" }))
+}
 /// A fragment as one step, so a branch nests inside a branch.
 pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 	Block::of(Operation::Residual(parts.into()))
@@ -5107,6 +5131,9 @@ pub struct Block {
 	quantization: u16,
 	profile: bool,
 }
+macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
+	self.act(Activation::$activation)
+})+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false }
@@ -5139,6 +5166,34 @@ impl Block {
 	pub fn profile(mut self, profile: bool) -> Self {
 		self.profile = profile;
 		self
+	}
+	block_activations! {
+		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
+		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
+		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
+	}
+	pub fn qi(&self, bits: u8) -> BlockQi {
+		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
+		let q = |variant| self.clone().quantize(0, bits, variant);
+		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+	}
+}
+pub struct BlockQi {
+	pub q0: Block,
+	pub q1: Block,
+	pub nf: Block,
+	pub k: BlockQk,
+}
+pub struct BlockQk {
+	model: Block,
+	pub s: Block,
+	pub m: Block,
+	pub l: Block,
+}
+impl std::ops::Deref for BlockQk {
+	type Target = Block;
+	fn deref(&self) -> &Block {
+		&self.model
 	}
 }
 #[derive(Clone)]
@@ -7322,10 +7377,28 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, d
 	for part in parts {
 		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
-	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
+	let branch = graph.source;
+	let branch_shape = graph.output;
+	if branch_shape != shape {
+		// Keep the declared branch as-is and adapt the skip path to it. A learned
+		// contraction handles channel changes; a contraction with a valid window
+		// also handles a branch that shortens the sequence. Upsampling a skip path
+		// would require a distinct operator, so refuse that genuinely unsupported
+		// connection instead of padding or truncating it silently.
+		require(branch_shape.length <= shape.length, "residual projection cannot lengthen the skip sequence")?;
+		reset(graph, skip, shape);
+		if branch_shape.length != shape.length {
+			let kernel = checked_add(shape.length - branch_shape.length, 1, "residual projection kernel")?;
+			lower_conv(graph, branch_shape.channels, kernel)?;
+		} else if branch_shape.channels != shape.channels {
+			lower_project(graph, branch_shape.channels)?;
+		}
+		require(graph.output == branch_shape, "residual projection did not match the branch")?;
+	}
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
-	push_program(graph, skip, &[], program)
+	let second = if branch_shape == shape { skip } else { branch };
+	push_program(graph, second, &[], program)
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
@@ -7758,8 +7831,13 @@ impl NativeTape {
 		Ok(stats)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		let node = i32::try_from(self.program.artifact.layout.values.len()).map_err(|_| RecipeError::new("native output node count exceeds i32"))? - 1;
+		self.predictions_at(node, self.output)
+	}
+	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
+		let index = usize::try_from(node).map_err(|_| RecipeError::new("native output source is absent"))?;
+		let offset = *self.program.artifact.layout.values.get(index).ok_or_else(|| RecipeError::new("native model output arena is absent"))?;
+		let values = self.values.download_float_bytes(offset, self.capacity * output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -10336,12 +10414,12 @@ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 }
 fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
-	if graph.nodes.is_empty() {
+	if graph.source < 0 {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
 	tape.forward(ForwardMode::Training)?;
-	tape.predictions()
+	tape.predictions_at(graph.source, graph.output.elements())
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
