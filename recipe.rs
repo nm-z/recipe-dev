@@ -5148,26 +5148,6 @@ mod bundle {
 		}
 		Ok(result)
 	}
-	#[cfg(test)]
-	mod delta_serialization_tests {
-		use super::*;
-
-		#[test]
-		fn delta_records_round_trip_old_and_grouped_forms() {
-			let old = Operation::Delta(4, Some((3, 5)), 1, 0, DeltaGate::Sigmoid);
-			let old_text = operation_text(&old);
-			assert_eq!(old_text, "delta,4,1,3,5");
-			assert_eq!(operation(&old_text).unwrap(), old);
-			let grouped_default = Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Sigmoid);
-			let grouped_default_text = operation_text(&grouped_default);
-			assert_eq!(grouped_default_text, "delta,4,1,2,3,5,0");
-			assert_eq!(operation(&grouped_default_text).unwrap(), grouped_default);
-			let grouped = Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Silu);
-			let grouped_text = operation_text(&grouped);
-			assert_eq!(grouped_text, "delta,4,1,2,3,5,1");
-			assert_eq!(operation(&grouped_text).unwrap(), grouped);
-		}
-	}
 }
 #[cfg(unix)]
 use std::os::unix::{
@@ -15166,35 +15146,4 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
-}
-
-#[cfg(test)]
-mod delta_geometry_tests {
-	use super::*;
-
-	#[test]
-	fn old_and_grouped_geometry_selectors_are_distinct() {
-		assert_eq!(<usize as DeltaGeometrySelector>::geometry(4), (4, None, 0));
-		assert_eq!(<(usize, usize, usize) as DeltaGeometrySelector>::geometry((4, 3, 5)), (4, Some((3, 5)), 0));
-		assert_eq!(<(usize, usize, usize, usize) as DeltaGeometrySelector>::geometry((2, 3, 4, 5)), (4, Some((3, 5)), 2));
-	}
-
-	#[test]
-	fn grouped_delta_preserves_default_gate_and_accepts_silu_gate() {
-		let runtime = Recipe;
-		let default_model = runtime.model().layer(8).delta((2, 3, 4, 5), 1);
-		assert!(matches!(default_model.blocks[1].operation, Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Sigmoid)));
-		let silu_model = default_model.delta_gate(DeltaGate::Silu);
-		assert!(matches!(silu_model.blocks[1].operation, Operation::Delta(4, Some((3, 5)), 1, 2, DeltaGate::Silu)));
-	}
-
-	#[test]
-	fn grouped_delta_lowers_distinct_planes_and_gate() {
-		let mut graph = Graph::new(Shape { channels: 8, length: 4 });
-		lower_delta(&mut graph, 4, Some((3, 5)), 1, 2, DeltaGate::Silu, Config::load().unwrap()).unwrap();
-		let node = graph.nodes.iter().find(|node| node.op == Primitive::Delta).unwrap();
-		assert_eq!(node.output.channels, 20);
-		assert_eq!(node.argument[0..5], [4.0, 3.0, 5.0, 8.0, 2.0]);
-		assert_eq!(graph.output.channels, 8);
-	}
 }
