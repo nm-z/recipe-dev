@@ -4801,6 +4801,7 @@ mod bundle {
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => {
 				format!("product,{},{}", product_branch_text(left), product_branch_text(right))
@@ -4891,6 +4892,7 @@ mod bundle {
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
 			"identity" => Ok(Operation::Identity),
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"ensemble" => Ok(Operation::Ensemble(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::Moe(
@@ -5591,7 +5593,7 @@ impl RopeSelector for Neox {
 	}
 }
 /// A step of a model, and equally a step of a fragment inside one. `res`,
-/// `moe` and the model builder all take the same thing, because a branch step
+/// `ensemble`, `moe`, and the model builder all take the same thing, because a branch step
 /// is an ordinary step: it carries an operation with its activation, its
 /// normalization, its Q/K normalization, its quantization and its profile, and
 /// its operation may itself be another fragment.
@@ -5636,24 +5638,25 @@ pub fn knn(neighbors: usize) -> Block {
 pub fn svm() -> Block {
 	Block::of(Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" }))
 }
-pub fn forest(trees: usize) -> Block {
-	Block::of(Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" }))
-}
 pub fn bayes() -> Block {
 	Block::of(Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" }))
 }
-pub fn cbst() -> Block {
-	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" }))
+pub fn cbst(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: positive_estimator, param: trees, name: "cbst" }))
 }
-pub fn xgbst() -> Block {
-	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" }))
+pub fn xgbst(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: positive_estimator, param: trees, name: "xgbst" }))
 }
-pub fn lgbm() -> Block {
-	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" }))
+pub fn lgbm(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: positive_estimator, param: trees, name: "lgbm" }))
 }
 /// A fragment as one step, so a branch nests inside a branch.
 pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 	Block::of(Operation::Residual(parts.into()))
+}
+/// The equal-weight mean of members that read the same input and produce the same shape.
+pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
+	Block::of(Operation::Ensemble(members.into()))
 }
 pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
 	Block::of(Operation::Moe(top_k, experts.into()))
@@ -5738,6 +5741,7 @@ enum Operation {
 	Gru(usize),
 	Lstm(usize),
 	Residual(Vec<Block>),
+	Ensemble(Vec<Block>),
 	Moe(usize, Vec<Block>),
 	Product(ProductBranch, ProductBranch),
 	Perceptron(usize),
@@ -6000,11 +6004,10 @@ impl Model {
 	fn kmeans(clusters: usize) = Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" });
 	fn knn(neighbors: usize) = Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" });
 	fn svm() = Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" });
-	fn forest(trees: usize) = Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" });
 	fn bayes() = Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" });
-	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
-	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
-	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
+	fn cbst(trees: usize) = Operation::Estimator(Estimator { fit: fit_catboost, validate: positive_estimator, param: trees, name: "cbst" });
+	fn xgbst(trees: usize) = Operation::Estimator(Estimator { fit: fit_xgboost, validate: positive_estimator, param: trees, name: "xgbst" });
+	fn lgbm(trees: usize) = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: positive_estimator, param: trees, name: "lgbm" });
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
@@ -6020,6 +6023,9 @@ impl Model {
 	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
+	}
+	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
+		self.push(Operation::Ensemble(members.into()))
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
@@ -7395,6 +7401,7 @@ impl Operation {
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Ensemble(_) => "ensemble",
 			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
 			Self::Product(..) => "product",
@@ -7764,13 +7771,13 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch at any depth.
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual, ensemble, or mixture branch at any depth.
 	let convolutional = model.blocks.iter().any(|block| sequenced_operation(&block.operation));
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
-	// inside a residual, a mixture or a product excludes the bias too.
+	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
 	graph.bias = model.exclusions & bias.mask() == 0;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
@@ -7878,6 +7885,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::Identity => {}
@@ -8398,21 +8406,42 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 fn sequenced_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequenced_operation(&part.operation)),
 		_ => false,
 	}
 }
 /// Counts estimator blocks at every nesting level. Saved predictor programs are
 /// stored once for each estimator and output target channel, so this count must
-/// follow the same recursive lowering order as residual and mixture branches.
+/// follow the same recursive lowering order as residual, ensemble, and mixture branches.
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Moe(_, parts) => parts.iter().map(estimator_count).sum(),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
+}
+fn lower_ensemble(graph: &mut Graph, members: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!members.is_empty(), "ensemble requires a member")?;
+	let (source, input, mut output, mut sum) = (graph.source, graph.output, None, None);
+	for member in members {
+		let (branch, shape) = expert(graph, source, input, member, total, data, targets, rows, gpu, config)?;
+		if let Some(expected) = output {
+			require(shape == expected, format!("ensemble members produce {}x{} and {}x{}", expected.channels, expected.length, shape.channels, shape.length))?;
+		} else {
+			output = Some(shape)
+		}
+		sum = Some(match sum {
+			Some(previous) => binary(graph, previous, branch, shape, ScalarOpcode::Add)?,
+			None => branch,
+		});
+	}
+	reset(graph, sum.ok_or_else(|| RecipeError::new("ensemble has no output"))?, output.ok_or_else(|| RecipeError::new("ensemble has no output shape"))?);
+	if members.len() > 1 {
+		lower_activation(graph, Activation::Scale((members.len() as f64).recip().to_bits()), config)?
+	}
+	Ok(())
 }
 fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
@@ -12038,6 +12067,11 @@ fn valid_estimator(_: usize, _: usize) -> Result<()> {
 fn positive_estimator(value: usize, _: usize) -> Result<()> {
 	require(value != 0, format!("estimator count {value} is invalid"))
 }
+/// Boosters saved before their constructors took a tree count carry zero, so
+/// keep the configured count as their restoration fallback.
+fn boosting_trees(count: usize, configured: usize) -> usize {
+	if count == 0 { configured } else { count }
+}
 fn cluster_estimator(value: usize, rows: usize) -> Result<()> {
 	require(value != 0 && value <= rows, format!("kmeans cluster count {value} is invalid for {rows} training rows"))
 }
@@ -12314,13 +12348,14 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)?),
 	})
 }
-fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_xgboost(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let indices = (0..rows).collect::<Vec<_>>();
-	let mut trees = Vec::with_capacity(config.boost_iterations);
-	for _ in 0..config.boost_iterations {
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
+	for _ in 0..count {
 		let gradients = predictions.iter().zip(&data.targets[..rows]).map(|(prediction, target)| prediction - target).collect::<Vec<_>>();
 		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain)?;
 		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
@@ -12396,16 +12431,17 @@ fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 		None => TreeNode::Leaf(nodes[index].value),
 	}
 }
-fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_lightgbm(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(config.lightgbm_bins >= 2, "LightGBM histogram bins must be at least two")?;
 	require(config.lightgbm_leaves >= 2 && rows >= config.tree_min_rows && data.features != 0, "LightGBM requires at least two leaves and enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
-	let mut trees = Vec::with_capacity(config.boost_iterations);
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
 	// One scan reads one feature of every row, so the rows are transposed once
 	// into a column per feature instead of striding across every sample.
 	let columns = parallel_map(data.features, |feature| data.samples[..rows * data.features].iter().skip(feature).step_by(data.features).copied().collect::<Vec<_>>())?;
-	for _ in 0..config.boost_iterations {
+	for _ in 0..count {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
 		let residual_squares = residuals.iter().map(|residual| residual * residual).collect::<Vec<_>>();
 		let mut nodes = vec![light_node(&columns, &residuals, &residual_squares, (0..rows).collect(), config)?];
@@ -12501,15 +12537,16 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 	let (feature, threshold) = splits[level];
 	TreeNode::Split { feature, threshold, left: Box::new(oblivious_tree(splits, leaves, level + 1, code | 1 << level)), right: Box::new(oblivious_tree(splits, leaves, level + 1, code)) }
 }
-fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_catboost(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
 	let borders = catboost_borders(&data.samples, data.features, rows, config.catboost_borders);
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut state = config.random_seed as u64;
-	let mut trees = Vec::with_capacity(config.boost_iterations);
-	for _ in 0..config.boost_iterations {
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
+	for _ in 0..count {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
 		let mut permutation = (0..rows).collect::<Vec<_>>();
 		for index in (1..permutation.len()).rev() {

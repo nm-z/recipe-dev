@@ -96,6 +96,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	ensemble([...])
 	left * right
 
 	A branch step is an ordinary model step, so anything above goes inside one,
@@ -106,19 +107,20 @@ blocks:
 	res([norm(rms), layer(8).act(Activation::Relu), layer(8).quantize(0, 8, 0)])
 	res([res([layer(8), relu(), layer(8)]), gelu()])
 	moe(1, [layer(8), res([layer(8), relu(), layer(8)])])
+	ensemble([cbst(8), xgbst(8), lgbm(8)])
 
 	norm(rms)          a normalization on its own, computing nothing before it
+	ensemble members read the same input, must produce the same shape, and are averaged equally
 
 feature reduction:
 	pool(size)
 	kmeans(clusters)
 	knn(neighbors)
 
-trees:
-	forest(trees)
-	cbst()
-	xgbst()
-	lgbm()
+tree ensembles:
+	cbst(trees)
+	xgbst(trees)
+	lgbm(trees)
 
 estimators:
 	svm()
@@ -135,8 +137,8 @@ let gated = gate * up;
 ```
 
 Both branches receive gradients and retain their own weights, bias exclusions,
-and block quantization. Nested residuals, mixtures, and estimator blocks use the
-same lowering and saved-model paths. Configure subsequent blocks on the product
+and block quantization. Nested residuals, ensembles, mixtures, and estimator
+blocks use the same lowering and saved-model paths. Configure subsequent blocks on the product
 model. Use `.scale(factor)` for multiplication by a scalar.
 
 Feature generation is banned.
