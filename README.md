@@ -288,15 +288,6 @@ report.tile();
 report.epoch_seconds();
 ```
 
-**Implementation files**
-
-```text
-recipe.rs       runtime
-amd-nv-cpu.ll   kernels
-build.rs        compiler
-cli.rs          cli options
-```
-
 ###### **Infer**
 
 ```rust
