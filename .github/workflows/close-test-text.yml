@@ -1,4 +1,4 @@
-name: Pull request policy
+name: PRs
 
 on:
   pull_request_target:
