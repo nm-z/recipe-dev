@@ -53,7 +53,7 @@ frozen.packed.blck.atvn.norm.quant = block
 ```rust
 blck:
 	layer(neurons)
-	conv(filters, kernel)
+	conv(filters, kernel)|cnn(filters, kernel)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)

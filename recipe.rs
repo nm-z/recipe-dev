@@ -5646,6 +5646,10 @@ pub const fn layer(width: usize) -> Block {
 pub const fn conv(filters: usize, kernel: usize) -> Block {
 	Block::of(Operation::Conv(filters, kernel))
 }
+/// The convolution under its network name, the spelling `.res([cnn(4, 4)])` uses.
+pub const fn cnn(filters: usize, kernel: usize) -> Block {
+	conv(filters, kernel)
+}
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
 	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
@@ -6043,6 +6047,7 @@ impl Model {
 	operation_methods! {
 	fn layer(width: usize) = Operation::Layer(width);
 	fn conv(filters: usize, kernel: usize) = Operation::Conv(filters, kernel);
+	fn cnn(filters: usize, kernel: usize) = Operation::Conv(filters, kernel);
 	fn pool(size: usize) = Operation::Pool(size);
 	fn kmeans(clusters: usize) = Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" });
 	fn knn(neighbors: usize) = Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" });
