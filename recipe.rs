@@ -4426,7 +4426,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
-			let codegen = native_nvidia_codegen()?;
+			let codegen = native_nvidia_codegen().ok().filter(|path| Path::new(path).is_file());
 			let device = native_nvidia_device_library()?;
 			let ptx_version = native_nvidia_ptx_version()?;
 			let bitcode = output.with_extension("bc");
@@ -4434,16 +4434,20 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-O2", "-emit-llvm", "-c", "-x", "ir"])
-				.arg(source)
-				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(&bitcode);
+				.arg("-Xclang").arg("-target-feature").arg("-Xclang").arg(ptx_version);
+			if codegen.is_some() {
+				command.args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(&bitcode);
+			} else {
+				command.args(["-O2", "-S", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(output);
+			}
 			native_command(command, "NVIDIA LLVM IR compiler", key)?;
-			let mut command = Command::new(codegen);
-			command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
-			let generated = native_command(command, "NVIDIA PTX code generator", key);
-			fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
-			generated?;
+			if let Some(codegen) = codegen {
+				let mut command = Command::new(codegen);
+				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
+				let generated = native_command(command, "NVIDIA PTX code generator", key);
+				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
+				generated?;
+			}
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
