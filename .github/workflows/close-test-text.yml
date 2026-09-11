@@ -5,7 +5,7 @@ on:
     types: [opened, reopened, synchronize, edited, ready_for_review]
   push:
     branches:
-      - minimal
+      - '**'
 
 permissions:
   contents: read
@@ -14,17 +14,23 @@ permissions:
 
 jobs:
   close:
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    if: github.event_name == 'push' || github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
     steps:
       - name: Close a pull request containing test text
         env:
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            echo 'No pull request event to check.'
+            exit 0
+          fi
 
           scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
           mkdir -p "$scan_directory"
@@ -158,20 +164,26 @@ jobs:
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
 
   require-minimal-base:
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    if: github.event_name == 'push' || github.event.pull_request.state == 'open'
     concurrency:
-      group: recipe-minimal-base-policy-${{ github.event.pull_request.number }}
+      group: recipe-minimal-base-policy-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Require minimal as the pull request base
         env:
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            echo 'No pull request event to check.'
+            exit 0
+          fi
 
           BASE_REF="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
           if [[ "$BASE_REF" == 'minimal' ]]; then
