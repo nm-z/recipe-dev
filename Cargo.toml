@@ -16,6 +16,13 @@ path = "cli.rs"
 [package.metadata.recipe]
 dependency-allowlist = []
 multi-device = "auto"
+runtime-connect-milliseconds = 5000
+runtime-poll-milliseconds = 10
+runtime-idle-milliseconds = 1000
+runtime-frame-bytes = 67108864
+runtime-stream-bytes = 65536
+runtime-controller = "engi"
+runtime-devices = "engi:amd0,archy:nv0,archy:nv1,archy:nv2,archy:nv3,archy:nv4"
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
 contraction-register-n = 8
@@ -52,6 +59,7 @@ hsa-finite-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc
 hsa-math-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc" }
 nvidia-ptx = "ptx71"
 nvidia-compiler = { linux = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
+nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc.exe" }
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
