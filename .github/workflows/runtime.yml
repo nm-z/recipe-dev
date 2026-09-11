@@ -11,7 +11,7 @@ on:
     # No path filters: a required check must never be omitted by a path rule.
   push:
     branches:
-      - minimal
+      - '**'
   workflow_dispatch:
     inputs:
       request_id:
@@ -120,7 +120,7 @@ jobs:
               exit 1
             fi
             echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-            echo "candidate $candidate_sha supplied by the minimal push"
+            echo "candidate $candidate_sha supplied by the branch push"
             exit 0
           fi
           if [ "$EVENT_NAME" != "pull_request" ]; then
@@ -345,7 +345,7 @@ jobs:
   linux-gpu:
     name: linux/nv
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -719,7 +719,7 @@ jobs:
   windows-gpu:
     name: win/nv
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     concurrency:
@@ -850,7 +850,7 @@ jobs:
   macos-cpu:
     name: mac/cpu
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: macos-15
     timeout-minutes: 45
     env:
