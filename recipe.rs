@@ -7490,6 +7490,16 @@ impl std::ops::Mul for Model {
 		}
 	}
 }
+/// A step multiplies the same way, so `gate * up` is one step of a fragment:
+/// each side is a one-block branch that inherits the enclosing model's bias
+/// setting and keeps its own activation, normalization, and quantization.
+impl std::ops::Mul for Block {
+	type Output = Self;
+	fn mul(self, right: Self) -> Self {
+		let branch = |block| ProductBranch { blocks: vec![block], quantization: 0, exclusions: 0 };
+		Self::of(Operation::Product(branch(self), branch(right)))
+	}
+}
 pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
