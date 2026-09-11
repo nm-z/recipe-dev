@@ -5899,6 +5899,60 @@ impl Block {
 		self.qk = Some(normalization);
 		self
 	}
+	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		match &mut self.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		self
+	}
+	/// Head width of this `attn` block: the width of one query, key and value
+	/// head. Without it the width is the residual width divided upward over the
+	/// heads, so a residual width that is not divisible by the head count still
+	/// has a complete Q/K/V projection; with it the two are independent and the
+	/// block projects `heads * d` back to the residual width on the way out.
+	pub fn width(self, d: usize) -> Self {
+		self.attention("width", |attention| attention.width = Some(d))
+	}
+	/// Equal key and value heads of this `attn` block. Each head serves
+	/// `heads / kv` query heads.
+	pub fn kv(self, heads: usize) -> Self {
+		self.attention("kv", |attention| {
+			attention.keys = heads;
+			attention.values = heads;
+		})
+	}
+	/// Rotary position embedding on this `attn` block: the first `dims` channels
+	/// of every query and key head rotate by their position at frequencies
+	/// `base^(-2i/dims)`.
+	pub fn rope(self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
+	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
+	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	pub fn yarn(self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
+			assert!(og_ctx != 0, "yarn original context must be positive");
+			assert!(b_fast.is_finite() && b_slow.is_finite() && b_slow > 0.0, "yarn boundaries must be finite and positive, received {b_fast} and {b_slow}");
+			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
+			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
+		})
+	}
+	/// Sparse key selection on this `attn` block. `heads` query projections and
+	/// one key projection, each `width` wide, score every group of `block` keys,
+	/// and each query attends to its best `keep` blocks.
+	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+	}
+	/// Sigmoid gate on the output of this `attn` block, from its own projection
+	/// of the block input.
+	pub fn gate(self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
+	}
 	/// A step inside a fragment keeps its own storage format, exactly as a step
 	/// of the model does.
 	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
@@ -6030,61 +6084,37 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
 	}
-	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+	/// Applies one attention modifier to the preceding block, so the model chain
+	/// and a standalone `attn(...)` block share one configuration path.
+	fn attention(&self, selector: &str, apply: impl FnOnce(Block) -> Block) -> Self {
 		let mut model = self.clone();
-		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
-		match &mut block.operation {
-			Operation::Attention(attention) => apply(attention),
-			_ => panic!("{selector} requires a preceding attn block"),
-		}
+		let block = model.blocks.pop().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		model.blocks.push(apply(block));
 		model
 	}
-	/// Head width of the preceding `attn` block: the width of one query, key and
-	/// value head. Without it the width is the residual width divided upward over
-	/// the heads, so a residual width that is not divisible by the head count still
-	/// has a complete Q/K/V projection; with it the two are independent and the
-	/// block projects `heads * d` back to the residual width on the way out.
+	/// [`Block::width`] of the preceding `attn` block.
 	pub fn width(&self, d: usize) -> Self {
-		self.attention("width", |attention| attention.width = Some(d))
+		self.attention("width", |block| block.width(d))
 	}
-	/// Equal key and value heads of the preceding `attn` block. Each head serves
-	/// `heads / kv` query heads.
+	/// [`Block::kv`] of the preceding `attn` block.
 	pub fn kv(&self, heads: usize) -> Self {
-		self.attention("kv", |attention| {
-			attention.keys = heads;
-			attention.values = heads;
-		})
+		self.attention("kv", |block| block.kv(heads))
 	}
-	/// Rotary position embedding on the preceding `attn` block: the first `dims`
-	/// channels of every query and key head rotate by their position at
-	/// frequencies `base^(-2i/dims)`.
+	/// [`Block::rope`] on the preceding `attn` block.
 	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
-		let layout = layout.layout();
-		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+		self.attention("rope", |block| block.rope(layout, dims, base))
 	}
-	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
-	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
-	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	/// [`Block::yarn`] on the preceding `attn` block.
 	pub fn yarn(&self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
-		self.attention("yarn", |attention| {
-			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
-			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
-			assert!(og_ctx != 0, "yarn original context must be positive");
-			assert!(b_fast.is_finite() && b_slow.is_finite() && b_slow > 0.0, "yarn boundaries must be finite and positive, received {b_fast} and {b_slow}");
-			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
-			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
-		})
+		self.attention("yarn", |block| block.yarn(factor, og_ctx, b_fast, b_slow))
 	}
-	/// Sparse key selection on the preceding `attn` block. `heads` query
-	/// projections and one key projection, each `width` wide, score every group
-	/// of `block` keys, and each query attends to its best `keep` blocks.
+	/// [`Block::index`] on the preceding `attn` block.
 	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+		self.attention("index", |value| value.index(heads, width, block, keep))
 	}
-	/// Sigmoid gate on the output of the preceding `attn` block, from its own
-	/// projection of the block input.
+	/// [`Block::gate`] on the preceding `attn` block.
 	pub fn gate(&self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
+		self.attention("gate", |block| block.gate())
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -6095,17 +6125,7 @@ impl Model {
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
 	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
-		let mut model = self.clone();
-		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("query and key normalization requires a preceding block"));
-		let normalization = normalization.normalization();
-		if !matches!(block.operation, Operation::Attention(_)) {
-			panic!("query and key normalization requires an attention block");
-		}
-		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
-			panic!("query and key normalization must be rms or l2");
-		}
-		block.qk = Some(normalization);
-		model
+		self.attention("qk", |block| block.qk(normalization))
 	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
 		let mut model = self.clone();
