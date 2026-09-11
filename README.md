@@ -2,6 +2,12 @@
 
 GPU/CPU ML training and inference in Rust.
 
+key:<br>
+`.`       optional continue<br>
+`[...]`   optional children<br>
+`|`       chain alternative<br>
+`(...)`   multiple children
+
 ###### **Data**
 
 ```rust
@@ -12,24 +18,10 @@ let data = recipe.data("measurements/")
 ```
 
 ```rust
-data(auto)
-	.set(source)
-	.include([features])
-	.exclude([features])
+data(path|auto)
+	.set(add)
+	.include([features])|exclude([features])
 ```
-
-Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
-
-```text
-measurements.csv    input,temperature,target    one sample per row
-
-scans/                                          3,000 samples
-	meta.csv        scan,temperature,y            scan names and orders files
-	scan-0000.csv   magnitude,phase               sample 0
-	...                                           2,999 more scan files
-```
-
-Feature generation is banned.
 
 ###### **Model**
 
@@ -41,50 +33,77 @@ let model = recipe.model()
 	.loss(mae);
 ```
 
-```text
-frozen.packed.blck
-```
+frozen.packed.blck.atvn.norm.quant = block
+  │      │      │    │    │    └─ quantization
+  │      │      │    │    └────── normalization
+  │      │      │    └─────────── activation
+  │      │      └──────────────── ""
+  │      └─────────────────────── packed qualifier
+  └────────────────────────────── frozen qualifier
 
 ```rust
-blocks:
+blck:
 	layer(neurons)
 	conv(filters, kernel)
-	attn(heads) or attn([query_heads, key_heads, value_heads])
-	perc(width)
-	attn(heads)[.width(d)][.kv(heads)][.qk(rms|l2)][.rope(neox, dims, base)][.yarn(factor, og_ctx, b_fast, b_slow)][.index(heads, width, block, keep)][.gate()]
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
-
+	perc(width)
+	estimators:
+		svm()
+		bayes()
+	trees:
+		cbst(trees)
+		xgbst(trees)
+		lgbm(trees)
+	attention:
+		attn(heads)
+		attn([query_heads, key_heads, value_heads])
+		attn(heads).width(d).kv(heads).qk(rms|l2).rope(neox, dims, base).yarn(factor, og_ctx, b_fast, b_slow).index(heads, width, block, keep).gate()
+atvn:
+	relu()
+	leak()
+	sigmoid()
+	tanh()
+	selu()
+	gelu()
+	silu()
+	elu()
+	prelu()
+	cos()
+	exp()
+	log()
+	ln()
+	huber()
+	tan()
+	scale(factor)
+	feature reduction:
+		pool(size)
+		kmeans(clusters)
+		knn(neighbors)
+norm:
+	.norm(batch)
+	.norm(layer)
+	.norm(rms)
+	.norm(l2)
+quant:
+	quantized integer:
+		.qi(4|5|8).(0|1)
+		.qi(2|6|8).k
+		.qi(3).k.[s|m|l]
+		.qi(4|5).k.[s|m]
+		.qi(4).nf
+	importance quantized:
+		.iq(1).(s|m)
+		.iq(2|3).(xxs|xs|s|m)
+		.iq(4).(xs|nl)
 composites:
-	moe(topk, [...])
-	res([...])
-	ensemble([...])
-	left * right
-
-	res([layer(8), relu(), layer(8)])
-	res([norm(rms), layer(8).act(Activation::Relu), layer(8).quantize(0, 8, 0)])
-	res([res([layer(8), relu(), layer(8)]), gelu()])
-	moe(1, [layer(8), res([layer(8), relu(), layer(8)])])
-	ensemble([cbst(8), xgbst(8), lgbm(8)])
-
-	norm(rms)          a normalization on its own, computing nothing before it
-	ensemble members read the same input, must produce the same shape, and are averaged equally
-
-feature reduction:
-	pool(size)
-	kmeans(clusters)
-	knn(neighbors)
-
-tree ensembles:
-	cbst(trees)
-	xgbst(trees)
-	lgbm(trees)
-
-estimators:
-	svm()
-	bayes()
+	moe(topk, [blocks])
+	res([blocks])
+	ensemble([blocks])
+	block * block
 ```
+**arithmetic**
 
 `left * right` evaluates two model fragments from the same input and multiplies
 their equal-shaped outputs elementwise:
@@ -100,18 +119,10 @@ and block quantization. Nested residuals, ensembles, mixtures, and estimator
 blocks use the same lowering and saved-model paths. Configure subsequent blocks
 on the product model. Use `.scale(factor)` for multiplication by a scalar.
 
-**Losses**
+**losses**
 
 ```rust
 .loss(mse|rmse|huber|mae|bce|ce|focal)
-```
-
-**Activations**
-
-```text
-relu  leak  sigmoid  tanh   selu   gelu   silu   elu
-prelu cos   exp      log    ln     huber  tan
-scale(factor)
 ```
 
 `scale(factor)` multiplies every value the preceding block produces by one
@@ -120,12 +131,7 @@ explicit scalar rescaling directly.
 
 **Normalizations**
 
-```rust
-.norm(batch)   per-channel statistics over the batch
-.norm(layer)   per-row statistics over the channels
-.norm(rms)     per-row root mean square, one trainable scale per channel
-.norm(l2)      per-row Euclidean norm, floored at the normalization epsilon
-```
+
 
 `.rope(layout, dimensions, base)` rotates the first `dimensions` channels of
 every query and key head by their position. The layout states the pairing: `neox`
@@ -173,35 +179,9 @@ input.
 **Exclusions**
 
 ```rust
-recipe.model().no(bias).layer(64).relu().layer(1)
+.no(bias)
 ```
 
-`.no(option)` declares a default the model excludes. `.no(bias)` removes the
-bias from every weighted block beneath it: layers, attention projections,
-convolutions, recurrent gates, and every nested branch. Excluded tensors are not
-allocated, initialized, trained, saved, or loaded, and the exclusion travels
-with the saved model.
-
-**Quantization**
-
-key:<br>
-`.`       optional continue<br>
-`[...]`   optional children<br>
-`|`       chain alternative<br>
-`(...)`   multiple children
-
-```rust
-quantized integer:
-	.qi(4|5|8).(0|1)
-	.qi(2|6|8).k
-	.qi(3).k.[s|m|l]
-	.qi(4|5).k.[s|m]
-	.qi(4).nf
-importance quantized:
-	.iq(1).(s|m)
-	.iq(2|3).(xxs|xs|s|m)
-	.iq(4).(xs|nl)
-```
 
 **Planned**
 
