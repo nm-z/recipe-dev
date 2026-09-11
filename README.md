@@ -219,10 +219,11 @@ over its head-width slice, leaving the values untouched:
 counts independently; each key and value count must divide the query count.
 `.width(d)` unties
 the head width from the block input: without it a head is
-`channels.div_ceil(heads)` wide, so the Q/K/V projections also support residual
-widths that are not divisible by the query count; with it a head is `d` wide
-whatever the residual width is, and the block projects `heads * d` back to the
-residual width on the way out. `.kv(heads)` unties
+`channels.div_ceil(heads)` wide. When the query, key, and value counts are equal,
+Recipe lowers an indivisible head count to the largest divisor no greater than
+the request. Unequal explicit counts retain their declared query count. With
+`.width(d)`, a head is `d` wide whatever the residual width is, and the block
+projects `heads * d` back to the residual width on the way out. `.kv(heads)` unties
 the key-value head count, so each key-value head serves `heads / kv` query heads.
 `.index(heads, width, block, keep)` adds a side projection that scores every group
 of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
