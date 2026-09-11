@@ -14,7 +14,7 @@ key:<br>
 recipe run train.rs --device amd0.cpu.archy:cpu.nv7.nv8
 ```
 
-###### **Data**
+## **Data**
 
 ```rust
 let data = recipe.data("measurements/")
@@ -29,7 +29,7 @@ data(path|auto)
 	.include([features])|exclude([features])
 ```
 
-###### **Model**
+## **Model**
 
 ```rust
 let model = recipe.model()
@@ -38,7 +38,7 @@ let model = recipe.model()
 	.layer(1)
 	.loss(mae);
 ```
-
+```r
 frozen.packed.blck.atvn.norm.quant = block
   │      │      │    │    │    └─ quantization
   │      │      │    │    └────── normalization
@@ -46,6 +46,7 @@ frozen.packed.blck.atvn.norm.quant = block
   │      │      └──────────────── ""
   │      └─────────────────────── packed qualifier
   └────────────────────────────── frozen qualifier
+```
 
 **blocks:**
 
@@ -130,7 +131,7 @@ left * right
 .scale(factor)
 ```
 
-###### **Train**
+## **Train**
 
 ```rust
 recipe.train()
@@ -155,7 +156,7 @@ observe:
 	.log(Run|Loss|R2|Time|Epoch|blck|tile|all)
 ```
 
-###### **Infer**
+## **Infer**
 
 ```rust
 let prediction = recipe.infer("model.ogdl", &input);
