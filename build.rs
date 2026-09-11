@@ -857,6 +857,8 @@ fn main() -> BuildResult<()> {
 		("schedule-candidates", "RECIPE_SCHEDULE_CANDIDATES"),
 		("schedule-measurements", "RECIPE_SCHEDULE_MEASUREMENTS"),
 		("schedule-budget", "RECIPE_SCHEDULE_BUDGET"),
+		("schedule-warmups", "RECIPE_SCHEDULE_WARMUPS"),
+		("schedule-minimum-improvement", "RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"),
 		("random-seed", "RECIPE_RANDOM_SEED"),
 		("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"),
 		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),

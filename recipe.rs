@@ -1279,6 +1279,397 @@ mod program_ir {
 	}
 }
 
+#[derive(Clone, Copy)]
+struct ScheduleCandidate {
+	node: usize,
+	direction: usize,
+	limits: Tile,
+	current: Tile,
+	extent: Tile,
+}
+struct ScheduleGroup {
+	reference: ScheduleCandidate,
+	candidates: Vec<ScheduleCandidate>,
+	unmeasured: Vec<usize>,
+	best: Option<(ScheduleCandidate, f64)>,
+}
+fn assign_candidate(assignment: &mut [Option<NativeContractionTiles>], candidate: ScheduleCandidate) -> Result<()> {
+	let tiles = assignment.get_mut(candidate.node).and_then(Option::as_mut).ok_or_else(|| RecipeError::new("native candidate node has no contraction"))?;
+	match candidate.direction {
+		0 => tiles.forward = candidate.extent,
+		1 => tiles.gradient = candidate.extent,
+		2 => tiles.previous = candidate.extent,
+		_ => return Err(RecipeError::new("native candidate direction is invalid")),
+	}
+	Ok(())
+}
+
+/// The schedule RAT uses one shared proposer for every contraction direction.
+/// Candidate features include the node, direction, shape limits, and proposed
+/// tile. The proposer sees the same node state plus the currently selected tile,
+/// then projects its continuous output onto the legal, unmeasured candidates.
+const SCHEDULE_RAT_STATE: usize = 8;
+const SCHEDULE_RAT_ACTION: usize = 8;
+
+fn schedule_axis(value: u32) -> f64 {
+	f64::from(value.max(1)).log2() / 16.0
+}
+
+fn schedule_candidate_features(candidate: &ScheduleCandidate) -> [f64; SCHEDULE_RAT_ACTION] {
+	[
+		(candidate.node as f64 + 1.0).log2() / 8.0,
+		candidate.direction as f64 / 2.0,
+		schedule_axis(candidate.extent.m),
+		schedule_axis(candidate.extent.n),
+		schedule_axis(candidate.extent.k),
+		schedule_axis(candidate.limits.m),
+		schedule_axis(candidate.limits.n),
+		schedule_axis(candidate.limits.k),
+	]
+}
+
+fn schedule_candidate_state(candidate: &ScheduleCandidate) -> [f64; SCHEDULE_RAT_STATE] {
+	[
+		(candidate.node as f64 + 1.0).log2() / 8.0,
+		candidate.direction as f64 / 2.0,
+		schedule_axis(candidate.limits.m),
+		schedule_axis(candidate.limits.n),
+		schedule_axis(candidate.limits.k),
+		schedule_axis(candidate.current.m),
+		schedule_axis(candidate.current.n),
+		schedule_axis(candidate.current.k),
+	]
+}
+
+/// Shared internal RAT state. Only real fused-epoch measurements are added to
+/// the scorer corpus; no synthetic timing or portable model state is stored.
+struct ScheduleRat {
+	proposer: Graph,
+	gpu: &'static Gpu,
+	samples: Vec<f64>,
+	seconds: Vec<f64>,
+}
+
+impl ScheduleRat {
+	fn new(gpu: &'static Gpu, config: Config) -> Result<Self> {
+		let data = Prepared {
+			samples: vec![0.0; SCHEDULE_RAT_STATE],
+			targets: vec![0.0; SCHEDULE_RAT_ACTION],
+			target_width: SCHEDULE_RAT_ACTION,
+			rows: 1,
+			source_rows: 1,
+			features: SCHEDULE_RAT_STATE,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let model = recipe.model().layer(config.surrogate_width).tanh().layer(SCHEDULE_RAT_ACTION);
+		let proposer = compile(&model, &data, &data.targets, 1, gpu, config, true)?;
+		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new() })
+	}
+
+	fn observe(&mut self, candidate: &ScheduleCandidate, seconds: f64) -> Result<()> {
+		require(seconds.is_finite() && seconds > 0.0, "native RAT measurement is invalid")?;
+		self.samples.extend(schedule_candidate_features(candidate));
+		self.seconds.push(seconds);
+		Ok(())
+	}
+
+	fn can_propose(&self) -> bool {
+		self.seconds.len() >= 2
+	}
+
+	fn proposal_launches(config: Config) -> Result<usize> {
+		checked_add(checked_mul(config.surrogate_epochs, 2, "native RAT proposal launches")?, 1, "native RAT proposal inference")
+	}
+
+	/// Fit a frozen differentiable scorer to the measured schedule corpus, then
+	/// update the shared proposer through the existing predictor/surrogate
+	/// straight-through composition. The returned indexes always address the
+	/// caller's currently unmeasured legal candidates.
+	fn propose(&mut self, groups: &[ScheduleGroup], config: Config) -> Result<Vec<Option<usize>>> {
+		if !self.can_propose() || groups.is_empty() {
+			return Ok(vec![None; groups.len()]);
+		}
+		let rows = self.seconds.len();
+		require(self.samples.len() == checked_mul(rows, SCHEDULE_RAT_ACTION, "native RAT sample corpus")?, "native RAT sample corpus has the wrong shape")?;
+		let minimum = self.seconds.iter().copied().fold(f64::INFINITY, f64::min);
+		let maximum = self.seconds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+		let span = (maximum - minimum).max(f64::EPSILON);
+		let targets = self.seconds.iter().map(|seconds| ((*seconds - minimum) / span).clamp(0.0, 1.0)).collect::<Vec<_>>();
+		let observed = Prepared {
+			samples: self.samples.clone(),
+			targets: targets.clone(),
+			target_width: 1,
+			rows,
+			source_rows: rows,
+			features: SCHEDULE_RAT_ACTION,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let validation = fit_knn(1, &observed, rows, config)?;
+		let held_out = predict_rows(&validation, &self.samples, SCHEDULE_RAT_ACTION)?;
+		debug(&format!("schedule RAT observations={rows} held_out_r2={:.6}", coefficient(&targets, &held_out)))?;
+		let rat_config = config;
+		let surrogate = fit_surrogate(Shape { channels: SCHEDULE_RAT_ACTION, length: 1 }, &self.samples, &targets, rat_config.surrogate_width, self.gpu, rat_config)?;
+		let mut composition = self.proposer.clone();
+		let proposal_source = composition.source;
+		let proposer_parameters = composition.parameters.len();
+		push_predictor(&mut composition, validation.program)?;
+		let measured_score = composition.source;
+		reset(&mut composition, proposal_source, Shape { channels: SCHEDULE_RAT_ACTION, length: 1 });
+		let surrogate_score = append_graph(&mut composition, surrogate)?;
+		let mut straight_through = ScalarProgram(Vec::new());
+		straight_through.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
+		program(&mut composition, measured_score, surrogate_score, Shape { channels: 1, length: 1 }, &[], straight_through)?;
+		let mut moments = vec![0.0; composition.parameters.len()];
+		let mut variances = vec![0.0; composition.parameters.len()];
+		if self.proposer.state.moments.len() == proposer_parameters {
+			moments[..proposer_parameters].copy_from_slice(&self.proposer.state.moments);
+		}
+		if self.proposer.state.variances.len() == proposer_parameters {
+			variances[..proposer_parameters].copy_from_slice(&self.proposer.state.variances);
+		}
+		composition.state.moments = moments;
+		composition.state.variances = variances;
+		composition.state.epoch = self.proposer.state.epoch;
+		composition.frozen[proposer_parameters..].fill(1);
+
+		let states = groups.iter().map(|group| schedule_candidate_state(&group.reference)).flatten().collect::<Vec<_>>();
+		let targets = vec![0.0; groups.len()];
+		let mut tape = NativeTape::new(&composition, &states, &targets, self.gpu, rat_config.precision, Some(mse))?;
+		for _ in 0..rat_config.surrogate_epochs {
+			tape.advance()?;
+			tape.full_epoch(rat_config.surrogate_rate, rat_config)?;
+		}
+		tape.capture(&mut composition)?;
+		self.proposer.parameters.copy_from_slice(&composition.parameters[..proposer_parameters]);
+		self.proposer.state.moments = composition.state.moments[..proposer_parameters].to_vec();
+		self.proposer.state.variances = composition.state.variances[..proposer_parameters].to_vec();
+		self.proposer.state.epoch = composition.state.epoch;
+		let mut tape = NativeTape::new(&self.proposer, &states, &[], self.gpu, rat_config.precision, None)?;
+		tape.forward(ForwardMode::Inference)?;
+		let proposals = tape.predictions()?;
+		require(proposals.len() == groups.len() * SCHEDULE_RAT_ACTION, "native RAT proposer output has the wrong shape")?;
+		Ok(groups
+			.iter()
+			.enumerate()
+			.map(|(group, value)| {
+				let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
+				value.unmeasured.iter().enumerate().min_by(|left, right| {
+					distance(proposal, &schedule_candidate_features(&value.candidates[*left.1]))
+						.total_cmp(&distance(proposal, &schedule_candidate_features(&value.candidates[*right.1])))
+				}).map(|(position, _)| position)
+			})
+			.collect())
+	}
+}
+struct ScheduleMeasurement {
+	median: f64,
+	low: f64,
+	high: f64,
+	repeatable: bool,
+	state: NativeEpochState,
+}
+/// Measures one runtime schedule on the real fused epoch. Warmups are excluded
+/// from the timing sample, and every launch starts from the same full state.
+fn measure_schedule(tape: &mut NativeTape, snapshot: &NativeTrainingState, assignment: &[Option<NativeContractionTiles>], rate: f64, config: Config) -> Result<ScheduleMeasurement> {
+	let measured = (|| {
+		let launches = checked_add(config.schedule_warmups, config.schedule_measurements, "native schedule measurement launches")?;
+		let mut times = Vec::with_capacity(config.schedule_measurements);
+		let mut observed: Option<NativeEpochState> = None;
+		let mut repeatable = true;
+		for launch in 0..launches {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+			tape.restore_state(snapshot)?;
+			tape.apply_contraction_schedule(assignment.to_vec())?;
+			tape.advance()?;
+			tape.program.gpu.synchronize()?;
+			let started = Instant::now();
+			let objective = tape.full_epoch(rate, config)?;
+			tape.program.gpu.synchronize()?;
+			let elapsed = started.elapsed().as_secs_f64();
+			require(objective.is_finite(), "native schedule measurement produced a nonfinite objective")?;
+			require(elapsed.is_finite() && elapsed > 0.0, "native schedule measurement duration is invalid")?;
+			if launch < config.schedule_warmups {
+				continue;
+			}
+			let state = tape.epoch_state(objective)?;
+			if let Some(first) = &observed {
+				repeatable &= first == &state;
+			} else {
+				observed = Some(state);
+			}
+			times.push(elapsed);
+		}
+		require(!times.is_empty(), "native schedule measurement is empty")?;
+		times.sort_by(f64::total_cmp);
+		let state = observed.ok_or_else(|| RecipeError::new("native schedule measurement state is empty"))?;
+		Ok(ScheduleMeasurement { median: times[times.len() / 2], low: times[0], high: *times.last().unwrap_or(&times[0]), repeatable, state })
+	})();
+	let restored = tape.restore_state(snapshot);
+	match (measured, restored) {
+		(Ok(measured), Ok(())) => Ok(measured),
+		(Err(error), _) | (_, Err(error)) => Err(error),
+	}
+}
+/// Tunes one shard and publishes only an exact, repeatable, statistically
+/// separated winner. A failed combined gate leaves the complete heuristic in
+/// place, even when individual directions looked promising.
+fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, budget: &mut usize) -> Result<()> {
+	if config.schedule_candidates == 0 || tape.program.epoch.is_none() || tape.program.schedule.contractions.iter().all(Option::is_none) {
+		return Ok(());
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted before native schedule tuning")?;
+	let launches = checked_add(config.schedule_warmups, config.schedule_measurements, "native schedule launches")?;
+	if *budget < launches {
+		debug(&format!("schedule tune skipped device={} allocation={} required={launches}", tape.device_label()?, *budget))?;
+		return Ok(());
+	}
+	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
+	let allocation = *budget;
+	let identity = native_device_identity(tape.program.gpu, config, allocation);
+	let cache = native_schedule_cache_path(&tape.program.artifact, &identity)?;
+	let heuristic = tape.program.schedule.contractions.clone();
+	if let Some(assignment) = load_schedule_cache(&cache, &identity, &tape.program.schedule, &tape.program.shapes, ratio) {
+		tape.apply_contraction_schedule(assignment)?;
+		debug(&format!("schedule cache hit path={} device={identity} tiles={}", cache.display(), tape.schedule()))?;
+		return Ok(());
+	}
+	let mut groups = Vec::new();
+	for (node, shape) in tape.program.shapes.iter().enumerate() {
+		let Some(shape) = shape else { continue };
+		let Some(current_tiles) = heuristic[node] else { continue };
+		for (direction, (limits, current)) in [(shape.forward, current_tiles.forward), (shape.gradient, current_tiles.gradient), (shape.previous, current_tiles.previous)].into_iter().enumerate() {
+			let reference = ScheduleCandidate { node, direction, limits, current, extent: current };
+			let candidates = schedule_candidates(limits, current, &tape.program.schedule, ratio, config.schedule_candidates)?
+				.into_iter()
+				.filter(|extent| *extent != current)
+				.map(|extent| ScheduleCandidate { node, direction, limits, current, extent })
+				.collect::<Vec<_>>();
+			if !candidates.is_empty() {
+				groups.push(ScheduleGroup { reference, unmeasured: (0..candidates.len()).collect(), candidates, best: None });
+			}
+		}
+	}
+	if groups.is_empty() {
+		require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+		store_schedule_cache(&cache, &identity, &heuristic)?;
+		return Ok(());
+	}
+	let snapshot = tape.snapshot_state()?;
+	let mut rat = ScheduleRat::new(tape.program.gpu, config)?;
+	*budget -= launches;
+	let baseline = measure_schedule(tape, &snapshot, &heuristic, rate, config)?;
+	let mut assignments = 1_usize;
+	debug(&format!("schedule tune baseline median={:.6} low={:.6} high={:.6} repeatable={} budget={} device={identity}", baseline.median, baseline.low, baseline.high, baseline.repeatable, budget))?;
+	if !baseline.repeatable {
+		tape.restore_state(&snapshot)?;
+		tape.apply_contraction_schedule(heuristic.clone())?;
+		return debug(&format!("schedule tune retained heuristic without caching after nonrepeatable baseline device={identity}"));
+	}
+	// One measured heuristic assignment supplies the real reference action for
+	// each independent node/direction decision state.
+	for group in &groups {
+		rat.observe(&group.reference, baseline.median)?;
+	}
+	let mut random = config.random_seed as u64 ^ fnv(&identity);
+	let mut explored = false;
+	let mut proposed = false;
+	let proposal_launches = ScheduleRat::proposal_launches(config)?;
+	let candidate_with_reserve = checked_mul(launches, 2, "native RAT candidate and combined launches")?;
+	while groups.iter().any(|group| !group.unmeasured.is_empty()) {
+		let exploration = !explored;
+		let proposals = if explored && !proposed && rat.can_propose() {
+			let required = checked_add(proposal_launches, candidate_with_reserve, "native RAT proposal budget")?;
+			if *budget < required {
+				break;
+			}
+			*budget -= proposal_launches;
+			proposed = true;
+			Some(rat.propose(&groups, config)?)
+		} else if explored {
+			break;
+		} else {
+			None
+		};
+		for (index, group) in groups.iter_mut().enumerate() {
+			if group.unmeasured.is_empty() {
+				continue;
+			}
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+			let required = if exploration { checked_add(proposal_launches, candidate_with_reserve, "native RAT exploration reserve")? } else { candidate_with_reserve };
+			if *budget < required {
+				break;
+			}
+			let proposed = proposals.as_ref().and_then(|proposals| proposals.get(index).copied().flatten());
+			let pick = proposed.unwrap_or_else(|| next_random(&mut random) as usize % group.unmeasured.len());
+			let candidate = group.candidates[group.unmeasured.remove(pick)];
+			debug(&format!(
+				"schedule RAT proposal node={} direction={} tile={}x{}x{} source={}",
+				candidate.node,
+				candidate.direction,
+				candidate.extent.m,
+				candidate.extent.n,
+				candidate.extent.k,
+				if proposed.is_some() { "proposer" } else { "exploration" }
+			))?;
+			let mut assignment = heuristic.clone();
+			assign_candidate(&mut assignment, candidate)?;
+			*budget -= launches;
+			let measurement = measure_schedule(tape, &snapshot, &assignment, rate, config)?;
+			assignments = checked_add(assignments, 1, "native schedule assignments")?;
+			let exact = baseline.repeatable && measurement.repeatable && measurement.state == baseline.state;
+			let stable = exact && measurement.high < baseline.low && measurement.median <= baseline.median * (1.0 - config.schedule_minimum_improvement);
+			debug(&format!(
+				"schedule tune node={} direction={} tile={}x{}x{} median={:.6} low={:.6} high={:.6} exact={exact} stable={stable}",
+				candidate.node, candidate.direction, candidate.extent.m, candidate.extent.n, candidate.extent.k, measurement.median, measurement.low, measurement.high
+			))?;
+			if exact {
+				rat.observe(&candidate, measurement.median)?;
+			}
+			if stable && group.best.is_none_or(|(_, seconds)| measurement.median < seconds) {
+				group.best = Some((candidate, measurement.median));
+			}
+		}
+		explored = true;
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+	let winners = groups.iter().filter_map(|group| group.best).collect::<Vec<_>>();
+	let mut selected = heuristic.clone();
+	let mut selected_seconds = baseline.median;
+	if !winners.is_empty() && *budget >= launches {
+		let mut combined = heuristic.clone();
+		for (candidate, _) in &winners {
+			assign_candidate(&mut combined, *candidate)?;
+		}
+		*budget -= launches;
+		let measurement = measure_schedule(tape, &snapshot, &combined, rate, config)?;
+		assignments = checked_add(assignments, 1, "native schedule assignments")?;
+		let exact = baseline.repeatable && measurement.repeatable && measurement.state == baseline.state;
+		let stable = exact && measurement.high < baseline.low && measurement.median <= baseline.median * (1.0 - config.schedule_minimum_improvement);
+		debug(&format!("schedule tune combined median={:.6} low={:.6} high={:.6} exact={exact} stable={stable}", measurement.median, measurement.low, measurement.high))?;
+		if stable {
+			selected = combined;
+			selected_seconds = measurement.median;
+		}
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+	tape.restore_state(&snapshot)?;
+	tape.apply_contraction_schedule(selected.clone())?;
+	store_schedule_cache(&cache, &identity, &selected)?;
+	debug(&format!("schedule select seconds={selected_seconds:.6} assignments={assignments} budget={} tiles={} cache={} device={identity}", budget, tape.schedule(), cache.display()))
+}
+
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
@@ -1287,6 +1678,9 @@ pub(crate) struct NativeLayout {
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
 	pub adjoints: Vec<usize>,
+	/// Byte offset of each contraction or scan node's runtime schedule words in
+	/// the context arena. Nodes without a schedule use `usize::MAX`.
+	pub schedule: Vec<usize>,
 	pub values_bytes: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
@@ -1464,6 +1858,9 @@ native_precisions! {
 	Compute::Int(format) if format == IntFormat::INT4 => ("-int4", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Int(format) if format == IntFormat::INT1 => ("-int1", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 }
+/// Runtime schedule words per contraction or scan node: three i32 extents for
+/// each of the forward, gradient, and previous directions.
+const NATIVE_SCHEDULE_WORDS: usize = 9;
 fn align(value: usize, boundary: usize) -> Result<usize> {
 	let boundary = boundary.max(1);
 	let remainder = value % boundary;
@@ -1488,7 +1885,17 @@ impl NativeLayout {
 			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision)?, "model context arena")?;
 			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
 		}
-		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
+		let mut schedule = Vec::with_capacity(graph.nodes.len());
+		for node in &graph.nodes {
+			if matches!(node.op, Primitive::Contraction | Primitive::Scan) {
+				context_offset = align(context_offset, 8)?;
+				schedule.push(context_offset);
+				context_offset = checked_add(context_offset, NATIVE_SCHEDULE_WORDS * size_of::<i32>(), "model schedule arena")?;
+			} else {
+				schedule.push(usize::MAX);
+			}
+		}
+		Ok(Self { values, contexts, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
 	}
 }
 
@@ -2489,6 +2896,25 @@ mod quantized {
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
+	/// Emits loads of a runtime schedule slot from the context arena. Keeping
+	/// the slot outside each node's work context prevents schedule words from
+	/// aliasing mutable scan, attention, or normalization state.
+	fn emit_schedule_words(&self, backend: Backend, index: usize, prefix: &str, first: usize, count: usize, ir: &mut String) -> Result<Vec<String>> {
+		let offset = *self.layout.schedule.get(index).filter(|offset| **offset != usize::MAX).ok_or_else(|| RecipeError::new("native contraction schedule slot is absent"))?;
+		let pointer = pointer_type(backend);
+		let base = format!("%{prefix}.base");
+		let offset = i64::try_from(offset).map_err(|_| RecipeError::new("native schedule offset exceeds i64"))?;
+		ir.push_str(&format!("{base} = getelementptr i8, {pointer} %contexts, i64 {offset}\n"));
+		Ok((first..first + count)
+			.map(|component| {
+				let name = format!("%{prefix}.{component}");
+				let pointer_name = format!("{name}.ptr");
+				ir.push_str(&format!("{pointer_name} = getelementptr i32, {pointer} {base}, i32 {component}\n{name} = load i32, {pointer} {pointer_name}, align 4\n"));
+				name
+			})
+			.collect())
+	}
+
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
 		let order = if reverse {
@@ -2501,8 +2927,7 @@ impl NativeModelIr {
 			let node = &plan.node;
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
-					require(self.schedule.contractions[index].is_some(), "native contraction schedule is absent")?;
-					let [tile_m, tile_n, tile_k] = schedule_slots(&mut ir, index, &pointers.context, pointer_type(backend), 0);
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
 						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
@@ -2517,9 +2942,9 @@ impl NativeModelIr {
 						out_length = node.output.length,
 						kernel = integer_argument(node.argument[0], "contraction kernel")?,
 						relu = node.argument[1] == 1.0,
-						tile_m = tile_m,
-						tile_n = tile_n,
-						tile_k = tile_k
+						tile_m = tiles[0],
+						tile_n = tiles[1],
+						tile_k = tiles[2]
 					);
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
@@ -2587,8 +3012,8 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
-					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2687,16 +3112,15 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Contraction) => {
 					require(self.schedule.contractions[index].is_some(), "native contraction schedule is absent")?;
-					let [gradient_m, gradient_n, gradient_k] = schedule_slots(&mut ir, index, &pointers.context, pointer_type(backend), 3);
-					let [previous_m, previous_n, previous_k] = schedule_slots(&mut ir, index, &pointers.context, pointer_type(backend), 6);
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
 					let composed_previous = kernel <= 1;
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = gradient_m, gradient_n = gradient_n, gradient_k = gradient_k, previous_m = previous_m, previous_n = previous_n, previous_k = previous_k));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = previous_m, previous_n = previous_n, previous_k = previous_k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -2735,8 +3159,8 @@ impl NativeModelIr {
 					}
 				}
 				(true, Primitive::Scan) => {
-					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -3712,15 +4136,6 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	Ok(())
 }
 
-/// Loads three tiles of a contraction node schedule slot and names values for a kernel call.
-fn schedule_slots(ir: &mut String, index: usize, context: &str, pointer: &str, first: usize) -> [String; 3] {
-	["m", "n", "k"].map(|axis| {
-		let name = format!("%n{index}.schedule.{first}.{axis}");
-		let word = first + usize::from(axis == "n") + 2 * usize::from(axis == "k");
-		ir.push_str(&format!("{name}.ptr = getelementptr inbounds i32, {pointer} {context}, i32 {word}\n{name} = load i32, {pointer} {name}.ptr, align 4\n"));
-		name
-	})
-}
 /// Emits a grid-stride loop over active rows. The bound is the dispatch row
 /// count times the node row width, so a short batch never touches stale rows.
 fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
@@ -8277,6 +8692,8 @@ struct Config {
 	schedule_candidates: usize,
 	schedule_measurements: usize,
 	schedule_budget: usize,
+	schedule_warmups: usize,
+	schedule_minimum_improvement: f64,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -8322,6 +8739,8 @@ impl Config {
 			schedule_candidates: count("schedule candidates", env!("RECIPE_SCHEDULE_CANDIDATES"))?,
 			schedule_measurements: natural("schedule measurements", env!("RECIPE_SCHEDULE_MEASUREMENTS"))?,
 			schedule_budget: count("schedule budget", env!("RECIPE_SCHEDULE_BUDGET"))?,
+			schedule_warmups: natural("schedule warmups", env!("RECIPE_SCHEDULE_WARMUPS"))?,
+			schedule_minimum_improvement: fraction("schedule minimum improvement", env!("RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"))?,
 			progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?,
 			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
@@ -8467,11 +8886,13 @@ impl NativeTape {
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
+		let contexts = Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?;
+		write_contraction_schedule(&contexts, &layout, &program.schedule.contractions)?;
 		let tape = Self {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
+			contexts,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
@@ -8491,31 +8912,74 @@ impl NativeTape {
 			capacity: rows,
 		};
 		tape.load_storage(graph)?;
-		tape.write_schedule()?;
 		Ok(tape)
 	}
 	/// Writes every contraction node's forward, gradient, and previous tiles
 	/// into its schedule slot, where the kernels read them at dispatch.
 	fn write_schedule(&self) -> Result<()> {
-		for (index, tiles) in self.program.schedule.contractions.iter().enumerate() {
-			if let Some(tiles) = tiles {
-				let words = [tiles.forward, tiles.gradient, tiles.previous].iter().flat_map(|extent| [extent.m, extent.n, extent.k]).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-				self.contexts.write_bytes(self.program.artifact.layout.contexts[index], &words)?;
-			}
-		}
+		write_contraction_schedule(&self.contexts, &self.program.artifact.layout, &self.program.schedule.contractions)
+	}
+	/// Applies a runtime contraction schedule to both the host description and
+	/// the words read by the native kernels.
+	fn apply_contraction_schedule(&mut self, contractions: Vec<Option<NativeContractionTiles>>) -> Result<()> {
+		require(contractions.len() == self.program.schedule.contractions.len(), "native contraction schedule assignment has the wrong shape")?;
+		self.program.schedule.contractions = contractions;
+		self.write_schedule()?;
+		self.program.tile = dominant_tile(&self.program.shapes, &self.program.schedule.contractions).unwrap_or(self.program.tile);
 		Ok(())
 	}
-	/// Every byte of mutable training state, so a measurement can start from
-	/// exactly the state it found.
-	fn snapshot(&self) -> Result<ScheduleSnapshot> {
-		Ok(ScheduleSnapshot {
-			weights: self.weights.download_range(0, self.weights.bytes)?,
-			moments: self.moments.download_range(0, self.moments.bytes)?,
-			variances: self.variances.download_range(0, self.variances.bytes)?,
-			contexts: self.contexts.download_range(0, self.contexts.bytes)?,
-			metrics: self.metrics.download_range(0, self.metrics.bytes)?,
+	/// Every mutable device buffer and host-side training field. A schedule
+	/// measurement restores this complete state before every launch.
+	fn snapshot_state(&self) -> Result<NativeTrainingState> {
+		Ok(NativeTrainingState {
+			values: self.values.download(self.values.bytes)?,
+			contexts: self.contexts.download(self.contexts.bytes)?,
+			adjoints: self.adjoints.download(self.adjoints.bytes)?,
+			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
+			weights: self.weights.download(self.weights.bytes)?,
+			frozen: self.frozen.download(self.frozen.bytes)?,
+			moments: self.moments.download(self.moments.bytes)?,
+			variances: self.variances.download(self.variances.bytes)?,
+			gradient: self.gradient.download(self.gradient.bytes)?,
+			metrics: self.metrics.download(self.metrics.bytes)?,
+			contractions: self.program.schedule.contractions.clone(),
+			tile: self.program.tile,
 			step: self.step,
 			best_loss: self.best_loss,
+		})
+	}
+	fn restore_state(&mut self, state: &NativeTrainingState) -> Result<()> {
+		self.values.write_bytes(0, &state.values)?;
+		self.contexts.write_bytes(0, &state.contexts)?;
+		self.adjoints.write_bytes(0, &state.adjoints)?;
+		self.input_adjoint.write_bytes(0, &state.input_adjoint)?;
+		self.weights.write_bytes(0, &state.weights)?;
+		self.frozen.write_bytes(0, &state.frozen)?;
+		self.moments.write_bytes(0, &state.moments)?;
+		self.variances.write_bytes(0, &state.variances)?;
+		self.gradient.write_bytes(0, &state.gradient)?;
+		self.metrics.write_bytes(0, &state.metrics)?;
+		self.program.schedule.contractions.clone_from(&state.contractions);
+		self.program.tile = state.tile;
+		self.step = state.step;
+		self.best_loss = state.best_loss;
+		self.write_schedule()
+	}
+	/// Returns the exact persistent post-epoch state relevant to repeatability.
+	/// Activations, adjoints, gradients, metrics, and other fused-epoch scratch
+	/// are restored before every measurement but are overwritten by the next
+	/// epoch, so they are not part of semantic schedule equivalence.
+	fn epoch_state(&self, objective: f64) -> Result<NativeEpochState> {
+		Ok(NativeEpochState {
+			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
+			weights: self.weights.download(self.weights.bytes)?,
+			frozen: self.frozen.download(self.frozen.bytes)?,
+			moments: self.moments.download(self.moments.bytes)?,
+			variances: self.variances.download(self.variances.bytes)?,
+			batch_normalizations: self.extract_bn_stats()?.into_iter().map(f64::to_bits).collect(),
+			best_loss: self.best_loss.map(f64::to_bits),
+			step: self.step,
+			objective: objective.to_bits(),
 		})
 	}
 	/// Decodes the graph's stored weights over the uploaded parameters.
@@ -8561,106 +9025,6 @@ impl NativeTape {
 		})();
 		self.rows = saved_rows;
 		result
-	}
-	fn restore(&mut self, snapshot: &ScheduleSnapshot) -> Result<()> {
-		self.weights.write_bytes(0, &snapshot.weights)?;
-		self.moments.write_bytes(0, &snapshot.moments)?;
-		self.variances.write_bytes(0, &snapshot.variances)?;
-		self.contexts.write_bytes(0, &snapshot.contexts)?;
-		self.metrics.write_bytes(0, &snapshot.metrics)?;
-		self.step = snapshot.step;
-		self.best_loss = snapshot.best_loss;
-		self.write_schedule()
-	}
-	/// The quickest of `measurements` real epochs with the current schedule,
-	/// each from the snapshot state.
-	fn measure(&mut self, snapshot: &ScheduleSnapshot, rate: f64, config: Config) -> Result<f64> {
-		let mut quickest = f64::INFINITY;
-		for _ in 0..config.schedule_measurements.max(1) {
-			self.restore(snapshot)?;
-			self.advance()?;
-			let started = Instant::now();
-			self.full_epoch(rate, config)?;
-			quickest = quickest.min(started.elapsed().as_secs_f64());
-		}
-		self.restore(snapshot)?;
-		Ok(quickest)
-	}
-	/// Measures every contraction node's forward, gradient, and previous tile
-	/// against the candidates the compiled allocation admits, on the real fused
-	/// epoch from the untouched training state, and keeps the quickest. The
-	/// choice is cached beside the artifact, so the same model on the same
-	/// target reuses it and another target measures again.
-	fn tune(&mut self, rate: f64, config: Config) -> Result<()> {
-		if config.schedule_candidates == 0 || self.program.epoch.is_none() {
-			return Ok(());
-		}
-		let ratio = narrow(self.precision.state.bytes().div_ceil(self.precision.model.bytes()), "native contraction state ratio")? as u32;
-		let cache = self.program.artifact.path.with_extension("schedule");
-		if let Ok(text) = fs::read_to_string(&cache)
-			&& let Some(contractions) = parse_schedule(&text, &self.program.schedule, &self.program.shapes, ratio)
-		{
-			self.program.schedule.contractions = contractions;
-			self.program.tile = dominant_tile(&self.program.shapes, &self.program.schedule.contractions).unwrap_or(self.program.tile);
-			debug(&format!("schedule reused from {}", cache.display()))?;
-			return self.write_schedule();
-		}
-		let snapshot = self.snapshot()?;
-		let checksum =
-			snapshot.weights.iter().chain(&snapshot.moments).chain(&snapshot.variances).fold(0x9E37_79B9_7F4A_7C15_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01B3));
-		// Nodes with the most gradient work measure first, until the epoch budget is spent.
-		let mut order =
-			(0..self.program.schedule.contractions.len()).filter(|index| self.program.schedule.contractions[*index].is_some() && self.program.shapes[*index].is_some()).collect::<Vec<_>>();
-		order.sort_by_key(|index| std::cmp::Reverse(self.program.shapes[*index].map_or(0, |shape| shape.gradient.m as usize * shape.gradient.n as usize * shape.gradient.k as usize)));
-		let mut budget = config.schedule_budget;
-		for index in order {
-			let (Some(mut tiles), Some(shapes)) = (self.program.schedule.contractions[index], self.program.shapes[index]) else { continue };
-			for direction in 0..3 {
-				let limits = [shapes.forward, shapes.gradient, shapes.previous][direction];
-				let current = [tiles.forward, tiles.gradient, tiles.previous][direction];
-				let candidates = schedule_candidates(limits, current, &self.program.schedule, ratio, config.schedule_candidates)?;
-				let cost = candidates.len() * config.schedule_measurements.max(1);
-				if candidates.len() < 2 || cost > budget {
-					continue;
-				}
-				budget -= cost;
-				let mut best = (f64::INFINITY, current);
-				for candidate in candidates {
-					if INTERRUPTED.load(Ordering::Acquire) {
-						break;
-					}
-					*[&mut tiles.forward, &mut tiles.gradient, &mut tiles.previous][direction] = candidate;
-					self.program.schedule.contractions[index] = Some(tiles);
-					let seconds = self.measure(&snapshot, rate, config)?;
-					debug(&format!("schedule node {index} direction {direction} tile {}x{}x{} seconds {seconds:.6} state {checksum:016x}", candidate.m, candidate.n, candidate.k))?;
-					if seconds < best.0 {
-						best = (seconds, candidate);
-					}
-				}
-				*[&mut tiles.forward, &mut tiles.gradient, &mut tiles.previous][direction] = best.1;
-				self.program.schedule.contractions[index] = Some(tiles);
-			}
-		}
-		self.restore(&snapshot)?;
-		// The activations still hold the last measurement, so the untouched state
-		// runs forward once more before the report reads its initial predictions.
-		// Inference, not training: restore() has just put the batch normalization
-		// running statistics back and a training forward would move them again.
-		self.forward(ForwardMode::Inference)?;
-		self.program.tile = dominant_tile(&self.program.shapes, &self.program.schedule.contractions).unwrap_or(self.program.tile);
-		if INTERRUPTED.load(Ordering::Acquire) {
-			return Ok(());
-		}
-		let text = self
-			.program
-			.schedule
-			.contractions
-			.iter()
-			.enumerate()
-			.filter_map(|(index, tiles)| tiles.map(|tiles| format!("{index} {} {} {}\n", tile_text(tiles.forward), tile_text(tiles.gradient), tile_text(tiles.previous))))
-			.collect::<String>();
-		fs::write(&cache, text).map_err(|error| RecipeError::new(format!("cannot write the schedule cache {}: {error}", cache.display())))?;
-		debug(&format!("schedule measured and cached at {}", cache.display()))
 	}
 	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
 		self.forward_with_samples(self.samples.pointer, mode)
@@ -9144,12 +9508,30 @@ impl DeviceTape {
 	fn tile(&self) -> Tile {
 		self.shards[0].tile()
 	}
-	/// Measures the contraction schedule on one device; a placed run keeps the heuristic.
+	/// Measures the contraction schedule independently on every placed shard.
 	fn tune(&mut self, rate: f64, config: Config) -> Result<()> {
-		if self.shards.len() == 1 { self.shards[0].tune(rate, config) } else { Ok(()) }
+		if config.schedule_candidates == 0 || config.schedule_budget == 0 {
+			return Ok(());
+		}
+		let shard_count = self.shards.len();
+		let base = config.schedule_budget / shard_count;
+		let remainder = config.schedule_budget % shard_count;
+		for (index, shard) in self.shards.iter_mut().enumerate() {
+			let mut budget = base + usize::from(index < remainder);
+			debug(&format!("schedule budget device={} launches={budget}", shard.device_label()?))?;
+			tune_contraction_schedule(shard, rate, config, &mut budget)?;
+		}
+		Ok(())
 	}
 	fn schedule(&self) -> String {
-		self.shards[0].schedule()
+		if self.shards.len() == 1 {
+			return self.shards[0].schedule();
+		}
+		self.shards
+			.iter()
+			.map(|shard| format!("{}={}", shard.device_label().unwrap_or_else(|_| shard.program.gpu.name.clone()), shard.schedule()))
+			.collect::<Vec<_>>()
+			.join(" ")
 	}
 	/// The one fused epoch every policy runs: each shard computes its gradient
 	/// concurrently, the leading device applies the one emitted optimizer to the
@@ -11262,12 +11644,17 @@ const CTRL_C_EVENT: u32 = 0;
 #[cfg(windows)]
 const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
 #[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 8;
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
 	fn LoadLibraryW(name: *const u16) -> Ptr;
 	fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn FreeLibrary(handle: Ptr) -> i32;
 	fn GetComputerNameExW(format: i32, name: *mut u16, length: *mut u32) -> i32;
+	fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
 	fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
 }
 unsafe extern "C" {
@@ -12365,34 +12752,125 @@ fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, registe
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
 /// the same allocation, so K is bounded by whichever phase is larger, and a tile
 /// too wide to stage a whole chunk narrows its M lanes until one fits.
-/// The mutable training state a schedule measurement starts from.
-struct ScheduleSnapshot {
+/// The complete mutable state a schedule measurement starts from.
+struct NativeTrainingState {
+	values: Vec<u8>,
+	contexts: Vec<u8>,
+	adjoints: Vec<u8>,
+	input_adjoint: Vec<u8>,
 	weights: Vec<u8>,
+	frozen: Vec<u8>,
 	moments: Vec<u8>,
 	variances: Vec<u8>,
-	contexts: Vec<u8>,
+	gradient: Vec<u8>,
 	metrics: Vec<u8>,
+	contractions: Vec<Option<NativeContractionTiles>>,
+	tile: Tile,
 	step: u32,
 	best_loss: [f64; 4],
 }
-fn tile_text(extent: Tile) -> String {
-	format!("{} {} {}", extent.m, extent.n, extent.k)
+
+#[derive(PartialEq, Eq)]
+struct NativeEpochState {
+	input_adjoint: Vec<u8>,
+	weights: Vec<u8>,
+	frozen: Vec<u8>,
+	moments: Vec<u8>,
+	variances: Vec<u8>,
+	batch_normalizations: Vec<u64>,
+	best_loss: [u64; 4],
+	step: u32,
+	objective: u64,
 }
-/// The cached schedule, if it names every contraction node of this program.
-fn parse_schedule(text: &str, schedule: &NativeSchedule, shapes: &[Option<NativeContractionShapes>], ratio: u32) -> Option<Vec<Option<NativeContractionTiles>>> {
+
+fn write_contraction_schedule(contexts: &Buffer, layout: &NativeLayout, contractions: &[Option<NativeContractionTiles>]) -> Result<()> {
+	require(layout.schedule.len() == contractions.len(), "native contraction schedule does not cover the graph")?;
+	for (offset, tiles) in layout.schedule.iter().zip(contractions) {
+		if *offset == usize::MAX {
+			continue;
+		}
+		let tiles = tiles.ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
+		let words = [tiles.forward, tiles.gradient, tiles.previous]
+			.iter()
+			.flat_map(|direction| [direction.m, direction.n, direction.k])
+			.flat_map(|extent| (extent as i32).to_le_bytes())
+			.collect::<Vec<_>>();
+		contexts.write_bytes(*offset, &words)?;
+	}
+	Ok(())
+}
+
+fn fnv(text: &str) -> u64 {
+	let mut hash = 14695981039346656037_u64;
+	for byte in text.as_bytes() {
+		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
+	}
+	hash
+}
+fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> String {
+	let label = device_label(gpu).unwrap_or_else(|_| gpu.name.clone());
+	let driver = match &gpu.driver {
+		Driver::Cpu => "cpu".to_owned(),
+		#[cfg(amd)]
+		Driver::Hsa(driver) => format!("hsa;cus={};wave={};workgroup={};lds={}", driver.cus, driver.wave, driver.workgroup, driver.lds),
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => format!(
+			"cuda;cus={};wave={};workgroup={};block_lds={};sm_lds={};registers={};threads={}",
+			driver.cus, driver.wave, driver.workgroup, driver.block_lds, driver.sm_lds, driver.registers, driver.threads
+		),
+		Driver::Remote(remote) => format!("remote;wave={};workers={}", remote.wave, remote.worker_threads),
+	};
+	format!(
+		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={}",
+		gpu.backend,
+		native_target_label(&gpu.native_target),
+		gpu.memory,
+		gpu.shared_limit,
+		config.schedule_candidates,
+		config.schedule_measurements,
+		config.schedule_warmups,
+		config.schedule_budget,
+		config.schedule_minimum_improvement.to_bits(),
+		config.surrogate_epochs,
+		config.surrogate_width,
+		config.surrogate_rate.to_bits(),
+		config.random_seed,
+	)
+}
+fn native_schedule_cache_path(artifact: &NativeArtifact, identity: &str) -> Result<PathBuf> {
+	let directory = artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?;
+	Ok(directory.join(format!("schedule-{:016x}.tsv", fnv(identity))))
+}
+/// Loads a complete cache only when its explicit device identity matches this
+/// run and every tile remains legal for the compiled artifact.
+fn load_schedule_cache(path: &Path, identity: &str, schedule: &NativeSchedule, shapes: &[Option<NativeContractionShapes>], ratio: u32) -> Option<Vec<Option<NativeContractionTiles>>> {
+	let text = fs::read_to_string(path).ok()?;
+	let mut lines = text.lines();
+	let header = format!("device {identity}");
+	if lines.next() != Some(header.as_str()) {
+		return None;
+	}
 	let mut parsed = schedule.contractions.to_vec();
 	let mut seen = vec![false; parsed.len()];
 	for line in text.lines() {
-		let words = line.split_whitespace().map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>().ok()?;
-		let [index, fm, fnn, fk, gm, gn, gk, pm, pn, pk] = words[..] else { return None };
-		let seen_slot = seen.get_mut(index as usize)?;
+		if line == header {
+			continue;
+		}
+		let fields = line.split_whitespace().collect::<Vec<_>>();
+		if fields.len() != 11 || fields[0] != "node" {
+			return None;
+		}
+		let index = fields[1].parse::<usize>().ok()?;
+		let extents = fields[2..].iter().map(|field| field.parse::<u32>().ok()).collect::<Option<Vec<_>>>()?;
+		let [fm, fnn, fk, gm, gn, gk, pm, pn, pk] = extents[..] else { return None };
+		let seen_slot = seen.get_mut(index)?;
 		if *seen_slot {
 			return None;
 		}
 		*seen_slot = true;
-		let slot = parsed.get_mut(index as usize)?.as_mut()?;
+		let slot = parsed.get_mut(index)?.as_mut()?;
 		let cached = [Tile { m: fm, n: fnn, k: fk }, Tile { m: gm, n: gn, k: gk }, Tile { m: pm, n: pn, k: pk }];
-		let shape = shapes.get(index as usize)?.as_ref()?;
+		let shape = shapes.get(index)?.as_ref()?;
 		let current = [slot.forward, slot.gradient, slot.previous];
 		for direction in 0..3 {
 			let limits = [shape.forward, shape.gradient, shape.previous][direction];
@@ -12406,6 +12884,45 @@ fn parse_schedule(text: &str, schedule: &NativeSchedule, shapes: &[Option<Native
 	(seen.iter().enumerate().filter(|(index, present)| **present && schedule.contractions.get(*index).is_some_and(Option::is_some)).count() == schedule.contractions.iter().flatten().count())
 		.then_some(parsed)
 }
+#[cfg(not(windows))]
+fn replace_schedule_cache(temporary: &Path, path: &Path) -> std::io::Result<()> {
+	fs::rename(temporary, path)
+}
+#[cfg(windows)]
+fn replace_schedule_cache(temporary: &Path, path: &Path) -> std::io::Result<()> {
+	let temporary = temporary.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	let path = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	if unsafe { MoveFileExW(temporary.as_ptr(), path.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+		Ok(())
+	} else {
+		Err(std::io::Error::last_os_error())
+	}
+}
+fn store_schedule_cache(path: &Path, identity: &str, contractions: &[Option<NativeContractionTiles>]) -> Result<()> {
+	let mut text = format!("device {identity}\n");
+	for (index, tiles) in contractions.iter().enumerate() {
+		let Some(tiles) = tiles else { continue };
+		text.push_str(&format!("node {index} {} {} {} {} {} {} {} {} {}\n", tiles.forward.m, tiles.forward.n, tiles.forward.k, tiles.gradient.m, tiles.gradient.n, tiles.gradient.k, tiles.previous.m, tiles.previous.n, tiles.previous.k));
+	}
+	let filename = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("native schedule cache path is invalid"))?;
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let temporary = path.with_file_name(format!(".{filename}-{}-{serial}", std::process::id()));
+	let published = (|| {
+		let mut file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&temporary)
+			.map_err(|error| RecipeError::new(format!("cannot create native schedule cache {}: {error}", temporary.display())))?;
+		file.write_all(text.as_bytes()).map_err(|error| RecipeError::new(format!("cannot write native schedule cache {}: {error}", temporary.display())))?;
+		file.sync_all().map_err(|error| RecipeError::new(format!("cannot flush native schedule cache {}: {error}", temporary.display())))?;
+		drop(file);
+		replace_schedule_cache(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish native schedule cache {}: {error}", path.display())))
+	})();
+	if published.is_err() || temporary.exists() {
+		let _ = fs::remove_file(&temporary);
+	}
+	published
+}
 /// The gradient tile of the contraction with the most gradient work. Ties keep
 /// the first node, the rule the compiled schedule already applies.
 fn dominant_tile(shapes: &[Option<NativeContractionShapes>], contractions: &[Option<NativeContractionTiles>]) -> Option<Tile> {
@@ -12416,17 +12933,32 @@ fn dominant_tile(shapes: &[Option<NativeContractionShapes>], contractions: &[Opt
 		.reduce(|best, node| if node.0 > best.0 { node } else { best })
 		.map(|(_, gradient)| gradient)
 }
-/// Tiles for one contraction direction that the compiled artifact can run: the
-/// lane ladders halve from the widest, K takes the room the compiled local
-/// memory leaves, and the private chunk buffer must hold every chunk a lane
-/// owns. The current tile comes first; at most `budget` follow it, and a
-/// matrix schedule admits no other.
+/// Tiles for one contraction direction that the compiled artifact can run.
+/// M and N vary over the lane ladders, but K stays fixed to the analytic tile
+/// so every candidate preserves the reduction order. The current tile comes
+/// first, and at most `budget` alternatives follow it. Matrix candidates keep
+/// the compiled 16x16 fragment mapping and only narrow its mapped M/N span.
 fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, ratio: u32, budget: usize) -> Result<Vec<Tile>> {
 	let mut candidates = vec![current];
-	if schedule.matrix {
+	if budget == 0 {
 		return Ok(candidates);
 	}
-	let (register_m, register_n, block, fragment, chunk) = (schedule.register_m, schedule.register_n, schedule.block, schedule.fragment_k, schedule.chunk_k);
+	if schedule.matrix {
+		for m_fragments in (1..=current.m / 16).rev() {
+			for n_fragments in (1..=current.n / 16).rev() {
+				let extent = Tile { m: m_fragments * 16, n: n_fragments * 16, k: current.k };
+				if candidates.contains(&extent) || native_contraction_shared_values(extent, schedule.register_m, schedule.register_n, schedule.block, schedule.fragment_k, ratio, true)? > schedule.shared_values {
+					continue;
+				}
+				candidates.push(extent);
+				if candidates.len() > budget {
+					return Ok(candidates);
+				}
+			}
+		}
+		return Ok(candidates);
+	}
+	let (register_m, register_n, block, chunk) = (schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k);
 	let owned_capacity = schedule.chunk_values.div_ceil(schedule.register_count).max(1);
 	let ladder = |widest: u32| std::iter::successors(Some(widest.max(1)), |lanes| (*lanes > 1).then_some(lanes / 2)).collect::<Vec<_>>();
 	for lane_m in ladder(limits.m.div_ceil(register_m)) {
@@ -12435,16 +12967,15 @@ fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, r
 				continue;
 			}
 			let (m, n) = (lane_m * register_m, lane_n * register_n);
-			let staging_k = schedule.shared_values / (m + n);
-			let partial_k = (schedule.shared_values / native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?) * fragment;
-			let room = staging_k.min(partial_k);
-			let k = if room >= limits.k { limits.k } else { room - room % fragment };
-			if k == 0 {
+			let extent = Tile { m, n, k: current.k };
+			if current.k == 0 {
 				continue;
 			}
-			let extent = Tile { m, n, k };
+			if native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, false)? > schedule.shared_values {
+				continue;
+			}
 			let output_lanes = (m / register_m).max(1) * (n / register_n).max(1);
-			let owned = k.div_ceil(chunk).div_ceil((block / output_lanes).max(2));
+			let owned = current.k.div_ceil(chunk).div_ceil((block / output_lanes).max(2));
 			if owned > owned_capacity || native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, false)? > schedule.shared_values || candidates.contains(&extent) {
 				continue;
 			}
@@ -14969,7 +15500,15 @@ impl Train {
 			None,
 		)?;
 		tape.print_devices()?;
-		tape.tune(self.learning_rate, config)?;
+		if let Err(error) = tape.tune(self.learning_rate, config) {
+			// An interrupt during pre-epoch tuning restores the measured state and
+			// follows the same one-checkpoint exit path as an interrupted real epoch.
+			let _ = self.finish_dispatch::<()>(Err(error), &mut stored, &prepared.schema, &tape, None)?;
+			unreachable!("an error result cannot finish successfully")
+		}
+		// The initial report must come from the selected runtime schedule, not
+		// from the heuristic forward that initialized the tape before tuning.
+		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
@@ -15314,4 +15853,180 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+	use super::*;
+	use std::{fs, path::PathBuf};
+
+	fn vector_schedule() -> NativeSchedule {
+		NativeSchedule {
+			matrix: false,
+			block: 64,
+			tile: Tile { m: 64, n: 64, k: 128 },
+			register_m: 8,
+			register_n: 8,
+			register_count: 64,
+			fragment_k: 16,
+			chunk_k: 64,
+			chunk_values: 4096,
+			chunk_bias_values: 0,
+			scratch_base: 0,
+			shared_values: 65_536,
+			contractions: Vec::new(),
+			attention: Vec::new(),
+		}
+	}
+
+	fn matrix_schedule() -> NativeSchedule {
+		NativeSchedule {
+			matrix: true,
+			block: 64,
+			tile: Tile { m: 64, n: 64, k: 32 },
+			register_m: 16,
+			register_n: 16,
+			register_count: 16,
+			fragment_k: 16,
+			chunk_k: 64,
+			chunk_values: 4096,
+			chunk_bias_values: 0,
+			scratch_base: 0,
+			shared_values: 4096,
+			contractions: Vec::new(),
+			attention: Vec::new(),
+		}
+	}
+
+	fn contraction_tiles(forward: Tile, gradient: Tile, previous: Tile) -> NativeContractionTiles {
+		NativeContractionTiles { forward, gradient, previous, gradient_shape: gradient, parameters: 1 }
+	}
+
+	fn contraction_shapes(forward: Tile, gradient: Tile, previous: Tile) -> NativeContractionShapes {
+		NativeContractionShapes { forward, gradient, previous, parameters: 1 }
+	}
+
+	fn cache_path(label: &str) -> PathBuf {
+		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+		std::env::temp_dir().join(format!("recipe-issue93-{label}-{}-{serial}.tsv", std::process::id()))
+	}
+
+	fn assert_contractions_eq(expected: &[Option<NativeContractionTiles>], actual: &[Option<NativeContractionTiles>]) {
+		assert_eq!(expected.len(), actual.len());
+		for (expected, actual) in expected.iter().zip(actual) {
+			match (expected, actual) {
+				(None, None) => {}
+				(Some(expected), Some(actual)) => {
+					assert_eq!(expected.forward, actual.forward);
+					assert_eq!(expected.gradient, actual.gradient);
+					assert_eq!(expected.previous, actual.previous);
+					assert_eq!(expected.gradient_shape, actual.gradient_shape);
+					assert_eq!(expected.parameters, actual.parameters);
+				}
+				(mismatch, actual) => panic!("cache contraction mismatch: expected {mismatch:?}, got {actual:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn vector_candidates_keep_the_fixed_reduction_extent_and_are_legal() {
+		let schedule = vector_schedule();
+		let limits = Tile { m: 128, n: 128, k: 128 };
+		let current = Tile { m: 64, n: 64, k: 128 };
+		let candidates = schedule_candidates(limits, current, &schedule, 1, usize::MAX).expect("vector candidates");
+		assert!(candidates.len() > 1, "the fixture must admit a vector alternative");
+		assert_eq!(candidates[0], current);
+		for candidate in candidates {
+			assert_eq!(candidate.k, current.k, "candidate changed reduction extent: {candidate:?}");
+			assert!(candidate.m <= limits.m && candidate.n <= limits.n, "candidate exceeds shape limits: {candidate:?}");
+			assert_eq!(candidate.m % schedule.register_m, 0);
+			assert_eq!(candidate.n % schedule.register_n, 0);
+			assert!(candidate.m / schedule.register_m * (candidate.n / schedule.register_n) <= schedule.block);
+			assert!(native_contraction_shared_values(candidate, schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k, 1, false).expect("shared values") <= schedule.shared_values);
+		}
+	}
+
+	#[test]
+	fn candidate_budget_bounds_alternatives_and_zero_keeps_current_only() {
+		let schedule = vector_schedule();
+		let limits = Tile { m: 128, n: 128, k: 128 };
+		let current = Tile { m: 64, n: 64, k: 128 };
+		assert_eq!(schedule_candidates(limits, current, &schedule, 1, 0).unwrap(), vec![current]);
+		for budget in 1..=4 {
+			let candidates = schedule_candidates(limits, current, &schedule, 1, budget).expect("bounded vector candidates");
+			assert_eq!(candidates[0], current);
+			assert!(candidates.len() <= budget + 1, "{} candidates for {} alternatives", candidates.len(), budget);
+		}
+	}
+
+	#[test]
+	fn matrix_candidates_preserve_fragment_mapping_and_fit_shared_memory() {
+		let schedule = matrix_schedule();
+		let limits = Tile { m: 128, n: 128, k: 32 };
+		let current = Tile { m: 64, n: 64, k: 32 };
+		let candidates = schedule_candidates(limits, current, &schedule, 1, usize::MAX).expect("matrix candidates");
+		assert!(candidates.len() > 1, "the fixture must admit a matrix alternative");
+		assert_eq!(candidates[0], current);
+		for candidate in candidates {
+			assert_eq!(candidate.k, current.k);
+			assert_eq!(candidate.m % 16, 0, "matrix M is not fragment-aligned: {candidate:?}");
+			assert_eq!(candidate.n % 16, 0, "matrix N is not fragment-aligned: {candidate:?}");
+			assert!(candidate.m <= current.m && candidate.n <= current.n, "matrix candidate widened a mapped span: {candidate:?}");
+			assert!(native_contraction_shared_values(candidate, schedule.register_m, schedule.register_n, schedule.block, schedule.fragment_k, 1, true).expect("matrix shared values") <= schedule.shared_values);
+		}
+	}
+
+	#[test]
+	fn schedule_cache_requires_identity_complete_nodes_and_legal_tiles() {
+		let identity = "device-a";
+		let schedule = NativeSchedule { contractions: vec![Some(contraction_tiles(Tile { m: 64, n: 64, k: 128 }, Tile { m: 64, n: 64, k: 128 }, Tile { m: 64, n: 64, k: 128 })), Some(contraction_tiles(Tile { m: 32, n: 64, k: 128 }, Tile { m: 32, n: 64, k: 128 }, Tile { m: 32, n: 64, k: 128 }))], ..vector_schedule() };
+		let shapes = vec![
+			Some(contraction_shapes(Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 })),
+			Some(contraction_shapes(Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 })),
+		];
+		let expected = schedule.contractions.clone();
+		let path = cache_path("valid");
+		store_schedule_cache(&path, identity, &expected).expect("store schedule cache");
+		let loaded = load_schedule_cache(&path, identity, &schedule, &shapes, 1).expect("complete cache should load");
+		assert_contractions_eq(&expected, &loaded);
+
+		let text = fs::read_to_string(&path).expect("read stored cache");
+		fs::write(&path, text.replacen("device device-a", "device another-device", 1)).expect("write identity mismatch");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "cache from another device must not load");
+
+		let missing = "device device-a\nnode 0 64 64 128 64 64 128 64 64 128\n";
+		fs::write(&path, missing).expect("write incomplete cache");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "incomplete cache must not load");
+
+		let invalid = "device device-a\nnode 0 64 64 129 64 64 128 64 64 128\nnode 1 32 64 128 32 64 128 32 64 128\n";
+		fs::write(&path, invalid).expect("write invalid cache");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "cache with an illegal fixed-K tile must not load");
+		fs::remove_file(path).expect("remove schedule cache fixture");
+	}
+
+	#[test]
+	fn dominant_tile_uses_largest_gradient_work_and_keeps_first_tie() {
+		let shapes = vec![
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 2, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			None,
+		];
+		let contractions = vec![
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 16, n: 16, k: 16 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 32, n: 32, k: 32 }, Tile { m: 8, n: 8, k: 8 })),
+			None,
+		];
+		assert_eq!(dominant_tile(&shapes, &contractions), Some(Tile { m: 32, n: 32, k: 32 }));
+
+		let tie_shapes = vec![
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+		];
+		let tie_contractions = vec![
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 11, n: 13, k: 17 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 19, n: 23, k: 29 }, Tile { m: 8, n: 8, k: 8 })),
+		];
+		assert_eq!(dominant_tile(&tie_shapes, &tie_contractions), Some(Tile { m: 11, n: 13, k: 17 }));
+		assert_eq!(dominant_tile(&[], &[]), None);
+	}
 }
