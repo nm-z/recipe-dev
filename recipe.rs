@@ -13458,6 +13458,108 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 	}
 	Ok(aligned)
 }
+fn grouped_sample_table<'a>(
+	name: String, targets: &[String], groups: BTreeMap<String, (Vec<String>, BTreeMap<String, &'a (PathBuf, Vec<u8>)>)>,
+) -> Result<Table> {
+	require(!groups.is_empty(), "sample groups are empty")?;
+	let fields = groups.values().next().unwrap().1.keys().cloned().collect::<Vec<_>>();
+	require(groups.values().all(|(values, inputs)| values.len() == targets.len() && inputs.keys().eq(fields.iter())), "samples have different input or target fields")?;
+	let mut kinds = BTreeMap::<String, (Option<Shape>, usize)>::new();
+	let mut headers = Vec::new();
+	let mut rows = Vec::with_capacity(groups.len());
+	let mut attention = Some(Shape { channels: 0, length: 0 });
+	for (row_index, (sample, (target_values, inputs))) in groups.iter().enumerate() {
+		let mut row = Vec::new();
+		for (field, (path, bytes)) in inputs {
+			let (shape, values) = sample_values(path, bytes)?;
+			let kind = (shape, values.len());
+			require(*kinds.entry(field.clone()).or_insert(kind) == kind, format!("input {field:?} of sample {sample:?} changes shape"))?;
+			if row_index == 0 {
+				headers.extend((1..=values.len()).map(|index| if values.len() == 1 { field.clone() } else { format!("{field}.{index}") }));
+			}
+			if let Some(previous) = attention {
+				attention = shape
+					.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+					.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+			}
+			row.extend(values);
+		}
+		row.extend(target_values.iter().cloned());
+		rows.push(row);
+	}
+	headers.extend(targets.iter().cloned());
+	Ok(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) })
+}
+fn manifest_sample<'a>(root: &Path, value: &str, files: &'a [(PathBuf, Vec<u8>)]) -> Option<(&'a Path, &'a [u8], Option<usize>)> {
+	let (name, page) = match value.split_once("#page=") {
+		Some((name, page)) => (name, Some(page.parse().ok()?)),
+		None => (value, None),
+	};
+	if name.is_empty() || !Path::new(name).components().all(|component| matches!(component, std::path::Component::Normal(_))) {
+		return None;
+	}
+	let path = root.join(name);
+	files.iter().find(|(candidate, _)| *candidate == path).map(|(path, bytes)| (path.as_path(), bytes.as_slice(), page))
+}
+
+/// A manifest table whose selected inputs all name image files becomes one row
+/// of decoded pixels per manifest row. Target columns remain ordinary named
+/// values, so split, save, resume, and inference preserve their row boundary.
+fn manifest_table(data: &Data, root: &Path, files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
+	for (_, table) in parsed {
+		let targets = data
+			.target
+			.iter()
+			.map(|name| table.headers.iter().enumerate().find(|(column, header)| column_match(name, table, header, *column)).map(|(column, _)| column))
+			.collect::<Option<Vec<_>>>();
+		let Some(targets) = targets else { continue };
+		let mut inputs = table
+			.headers
+			.iter()
+			.enumerate()
+			.filter(|(column, header)| !targets.contains(column) && data.features.selects(table, header, *column))
+			.map(|(column, header)| (column, header.clone()))
+			.collect::<Vec<_>>();
+		if inputs.is_empty() || !inputs.iter().all(|(column, _)| table.rows.iter().all(|row| row.get(*column).and_then(|value| manifest_sample(root, value, files)).is_some())) {
+			continue;
+		}
+		if let FeatureSelection::Include(names) = &data.features {
+			inputs.sort_by_key(|(column, header)| names.iter().position(|name| column_match(name, table, header, *column)).unwrap_or(names.len()));
+		}
+		let mut kinds = vec![None; inputs.len()];
+		let mut headers = Vec::new();
+		let mut rows = Vec::with_capacity(table.rows.len());
+		let mut attention = Some(Shape { channels: 0, length: 0 });
+		for (row_index, source) in table.rows.iter().enumerate() {
+			let mut row = Vec::new();
+			for (input, (column, name)) in inputs.iter().enumerate() {
+				let (path, bytes, page) = manifest_sample(root, &source[*column], files).unwrap();
+				let (shape, values) = if path.extension().and_then(|value| value.to_str()).is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "tif" | "tiff")) {
+					let (width, height, channels, pixels) = tiff_pixels(bytes, page.unwrap_or(0))?;
+					(Some(Shape { channels: checked_mul(width, channels, "TIFF row width")?, length: height }), pixels.into_iter().map(|value| value.to_string()).collect::<Vec<_>>())
+				} else {
+					sample_values(path, bytes)?
+				};
+				let kind = (shape, values.len());
+				require(*kinds[input].get_or_insert(kind) == kind, format!("manifest input {name:?} changes shape"))?;
+				if row_index == 0 {
+					headers.extend((1..=values.len()).map(|index| if values.len() == 1 { name.clone() } else { format!("{name}.{index}") }));
+				}
+				if let Some(previous) = attention {
+					attention = shape
+						.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+						.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+				}
+				row.extend(values);
+			}
+			row.extend(targets.iter().map(|column| source[*column].clone()));
+			rows.push(row);
+		}
+		headers.extend(data.target.iter().cloned());
+		return Ok(Some(Table { name: table.name.clone(), headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+	}
+	Ok(None)
+}
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
 /// subdirectories. Each file is read once; text samples contribute their content and image
@@ -13476,33 +13578,127 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
 	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
-	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
+	if let Some(table) = manifest_table(data, &root, files, parsed)? {
+		return Ok(Some(table));
+	}
+	// Flat sidecar samples: every sample may have one named input file or a
+	// `<sample>.<input>.<extension>` group of independently named views. Target
+	// sidecars are `<sample>.<target>`; `.label` and WebDataset's `.cls` retain
+	// their established single-target meaning.
 	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
-		// A sidecar file and a labeled file name each carry one label per sample.
-		let [target] = targets else { return Ok(None) };
-		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
-		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
-			let mut builder = SampleTableBuilder::new(target.clone());
-			for (path, bytes) in &samples {
-				let (_, label) = sidecar(path).unwrap();
-				builder.push(path, bytes, sample_text(path, label)?)?;
-			}
-			return builder.finish(name).map(Some);
+		let sidecar = |sample: &str, target: &str| {
+			let named = root.join(format!("{sample}.{target}"));
+			files.iter().find(|(candidate, _)| *candidate == named).or_else(|| {
+				(targets.len() == 1).then(|| {
+					["label", "cls"].into_iter().find_map(|extension| {
+						let fallback = root.join(format!("{sample}.{extension}"));
+						files.iter().find(|(candidate, _)| *candidate == fallback)
+					})
+				}).flatten()
+			})
+		};
+		let mut groups = BTreeMap::<String, BTreeMap<String, &(PathBuf, Vec<u8>)>>::new();
+		for &entry in &samples {
+			let full = stem(&entry.0);
+			let (sample, input) = if targets.iter().all(|target| sidecar(&full, target).is_some()) {
+				(full.as_str(), "input")
+			} else {
+				full.rsplit_once('.').map_or((full.as_str(), "input"), |(sample, input)| (sample, input))
+			};
+			require(groups.entry(sample.to_owned()).or_default().insert(input.to_owned(), entry).is_none(), format!("flat sample {sample:?} repeats input {input:?}"))?;
 		}
-		// Name-labeled samples: `<target>__<name>` carries the label in the file name
-		// rather than in a sibling or a directory. Every file under the root has to be
-		// one labeled sample, so a tree whose samples are only partly recognized never
-		// trains on the recognized part alone.
-		const SEPARATOR: &str = "__";
-		let labels = samples.iter().map(|(path, _)| stem(path).split_once(SEPARATOR).map(|(label, _)| label.to_owned())).collect::<Option<Vec<_>>>();
-		if let Some(labels) = labels.filter(|labels| samples.len() == files.len() && labels.iter().collect::<BTreeSet<_>>().len() > 1) {
-			let mut builder = SampleTableBuilder::new(target.clone());
-			for ((path, bytes), label) in samples.iter().zip(labels) {
-				builder.push(path, bytes, label)?;
+		if !groups.is_empty() && groups.keys().all(|sample| targets.iter().all(|target| sidecar(sample, target).is_some())) {
+			let fields = groups.values().next().unwrap().keys().cloned().collect::<Vec<_>>();
+			require(groups.values().all(|inputs| inputs.keys().eq(fields.iter())), "flat samples have different input fields")?;
+			let mut kinds = BTreeMap::<String, (Option<Shape>, usize)>::new();
+			let mut headers = Vec::new();
+			let mut rows = Vec::with_capacity(groups.len());
+			let mut attention = Some(Shape { channels: 0, length: 0 });
+			for (row_index, (sample, inputs)) in groups.iter().enumerate() {
+				let mut row = Vec::new();
+				for (field, (path, bytes)) in inputs {
+					let (shape, values) = sample_values(path, bytes)?;
+					let kind = (shape, values.len());
+					require(*kinds.entry(field.clone()).or_insert(kind) == kind, format!("flat input {field:?} of sample {sample:?} changes shape"))?;
+					if row_index == 0 {
+						headers.extend((1..=values.len()).map(|index| if values.len() == 1 { field.clone() } else { format!("{field}.{index}") }));
+					}
+					if let Some(previous) = attention {
+						attention = shape
+							.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+							.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+					}
+					row.extend(values);
+				}
+				for target in targets {
+					let (path, bytes) = sidecar(sample, target).unwrap();
+					row.push(sample_text(path, bytes)?);
+				}
+				rows.push(row);
 			}
-			return builder.finish(name).map(Some);
+			headers.extend(targets.iter().cloned());
+			return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		}
+		// Name-labeled samples: one `__`-separated value per declared target
+		// precedes the sample name. An optional final `.input` qualifier groups
+		// independently named input documents for the same sample.
+		const SEPARATOR: &str = "__";
+		let mut qualifiers = BTreeMap::<String, usize>::new();
+		for (path, _) in &samples {
+			if let Some((sample, _)) = stem(path).rsplit_once('.') { *qualifiers.entry(sample.to_owned()).or_default() += 1; }
+		}
+		let mut named = BTreeMap::<String, (Vec<String>, BTreeMap<String, &(PathBuf, Vec<u8>)>)>::new();
+		let mut complete = samples.len() == files.len();
+		for &entry in &samples {
+			let full = stem(&entry.0);
+			let (stem, input) = full
+				.rsplit_once('.')
+				.filter(|(sample, _)| qualifiers.get(*sample).is_some_and(|count| *count > 1))
+				.map_or((full.as_str(), "input"), |(sample, input)| (sample, input));
+			let parts = stem.split(SEPARATOR).collect::<Vec<_>>();
+			if parts.len() <= targets.len() {
+				complete = false;
+				break;
+			}
+			let values = parts[..targets.len()].iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+			let sample = parts[targets.len()..].join(SEPARATOR);
+			let group = named.entry(format!("{}::{sample}", values.join("::"))).or_insert_with(|| (values.clone(), BTreeMap::new()));
+			complete &= group.0 == values && group.1.insert(input.to_owned(), entry).is_none();
+		}
+		if complete && !named.is_empty() && targets.iter().enumerate().all(|(index, _)| named.values().map(|(values, _)| &values[index]).collect::<BTreeSet<_>>().len() > 1) {
+			return grouped_sample_table(name, targets, named).map(Some);
 		}
 		return Ok(None);
+	}
+	// Nested class samples: each relative parent component supplies one named
+	// target value. Qualified stems group multiple named input views inside the
+	// same class sample. The established one-level, one-input class layout stays
+	// on the legacy path below.
+	let mut class_qualifiers = BTreeMap::<String, usize>::new();
+	for (path, _) in &samples {
+		let full = stem(path);
+		if let (Some(relative), Some((sample, _))) = (path.parent().and_then(|parent| parent.strip_prefix(&root).ok()), full.rsplit_once('.')) {
+			*class_qualifiers.entry(format!("{}\0{sample}", relative.display())).or_default() += 1;
+		}
+	}
+	let mut classes = BTreeMap::<String, (Vec<String>, BTreeMap<String, &(PathBuf, Vec<u8>)>)>::new();
+	let mut class_layout = true;
+	let mut qualified = false;
+	for &entry in &samples {
+		let relative = entry.0.parent().and_then(|parent| parent.strip_prefix(&root).ok());
+		let Some(relative) = relative else { class_layout = false; break };
+		let values = relative.components().map(|component| component.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>();
+		if values.len() != targets.len() { class_layout = false; break }
+		let full = stem(&entry.0);
+		let (sample, input) = full
+			.rsplit_once('.')
+			.filter(|(sample, _)| class_qualifiers.get(&format!("{}\0{sample}", relative.display())).is_some_and(|count| *count > 1))
+			.map_or((full.as_str(), "input"), |(sample, input)| { qualified = true; (sample, input) });
+		let group = classes.entry(format!("{}::{sample}", values.join("::"))).or_insert_with(|| (values.clone(), BTreeMap::new()));
+		class_layout &= group.0 == values && group.1.insert(input.to_owned(), entry).is_none();
+	}
+	if class_layout && (targets.len() > 1 || qualified) {
+		return grouped_sample_table(name, targets, classes).map(Some);
 	}
 	// One level of subdirectories under the root.
 	if !samples.iter().all(|(path, _)| path.parent().and_then(Path::parent) == Some(root.as_path())) {
@@ -13519,7 +13715,14 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	}
 	// Paired subdirectories: identical sample stems in every directory, one directory named
 	// for each requested target. Each stem is one sample and each directory one column group.
-	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
+	let singular = |directory: &str| {
+		directory
+			.strip_suffix("es")
+			.filter(|value| value.ends_with('s'))
+			.or_else(|| directory.strip_suffix('s').filter(|value| !value.is_empty()))
+			.unwrap_or(directory)
+			.to_owned()
+	};
 	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
 	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
 	let paired_target = targets.iter().all(|target| directories.keys().any(|directory| singular(directory) == *target));
@@ -13546,7 +13749,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut kind = None;
 			for (row, (path, bytes)) in entries.iter().enumerate() {
 				let (shape, values) = sample_values(path, bytes)?;
-				require(!sample_target || !targets.contains(column) || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
 				let current = (shape, values.len());
 				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
@@ -13966,11 +14168,105 @@ fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
 	}
 	Ok((width, height, channels, pixels))
 }
+/// One uncompressed 8-bit grayscale or interleaved RGB(A) image from a TIFF
+/// image-file directory. Strip order is the stored row order, and the optional
+/// manifest page selects the corresponding linked directory.
+fn tiff_pixels(bytes: &[u8], page: usize) -> Result<(usize, usize, usize, Vec<u8>)> {
+	require(bytes.len() >= 8, "TIFF header is truncated")?;
+	let little = match &bytes[..2] {
+		b"II" => true,
+		b"MM" => false,
+		_ => return Err(RecipeError::new("TIFF byte order is invalid")),
+	};
+	let read16 = |offset: usize| -> Option<u16> {
+		bytes.get(offset..offset.checked_add(2)?).map(|value| if little { u16::from_le_bytes(value.try_into().unwrap()) } else { u16::from_be_bytes(value.try_into().unwrap()) })
+	};
+	let read32 = |offset: usize| -> Option<u32> {
+		bytes.get(offset..offset.checked_add(4)?).map(|value| if little { u32::from_le_bytes(value.try_into().unwrap()) } else { u32::from_be_bytes(value.try_into().unwrap()) })
+	};
+	require(read16(2) == Some(42), "TIFF magic is invalid")?;
+	let mut directory = read32(4).ok_or_else(|| RecipeError::new("TIFF first directory is absent"))? as usize;
+	let mut visited = BTreeSet::new();
+	for _ in 0..page {
+		require(visited.insert(directory), "TIFF directory chain contains a cycle")?;
+		let entries = read16(directory).ok_or_else(|| RecipeError::new("TIFF directory is truncated"))? as usize;
+		let next = checked_add(directory, checked_add(2, checked_mul(entries, 12, "TIFF entries")?, "TIFF entries")?, "TIFF directory")?;
+		directory = read32(next).filter(|offset| *offset != 0).ok_or_else(|| RecipeError::new(format!("TIFF page {page} is absent")))? as usize;
+	}
+	require(visited.insert(directory), "TIFF directory chain contains a cycle")?;
+	let entries = read16(directory).ok_or_else(|| RecipeError::new("TIFF directory is truncated"))? as usize;
+	let mut tags = BTreeMap::<u16, Vec<u32>>::new();
+	for index in 0..entries {
+		let entry = checked_add(checked_add(directory, 2, "TIFF entry")?, checked_mul(index, 12, "TIFF entry")?, "TIFF entry")?;
+		let tag = read16(entry).ok_or_else(|| RecipeError::new("TIFF entry is truncated"))?;
+		let kind = read16(checked_add(entry, 2, "TIFF entry type")?).ok_or_else(|| RecipeError::new("TIFF entry type is truncated"))?;
+		let count = read32(checked_add(entry, 4, "TIFF entry count")?).ok_or_else(|| RecipeError::new("TIFF entry count is truncated"))? as usize;
+		let width = match kind { 3 => 2, 4 => 4, _ => continue };
+		let bytes_count = checked_mul(count, width, "TIFF tag values")?;
+		let value_field = checked_add(entry, 8, "TIFF tag offset")?;
+		let values = if bytes_count <= 4 { value_field } else { read32(value_field).ok_or_else(|| RecipeError::new("TIFF tag offset is truncated"))? as usize };
+		let decoded = (0..count)
+			.map(|value| {
+				let offset = checked_add(values, checked_mul(value, width, "TIFF tag value")?, "TIFF tag value")?;
+				if kind == 3 { read16(offset).map(u32::from) } else { read32(offset) }.ok_or_else(|| RecipeError::new("TIFF tag value is truncated"))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		tags.insert(tag, decoded);
+	}
+	let one = |tag: u16, role: &str| tags.get(&tag).and_then(|values| values.first()).copied().ok_or_else(|| RecipeError::new(format!("TIFF {role} is absent")));
+	let width = one(256, "width")? as usize;
+	let height = one(257, "height")? as usize;
+	let compression = one(259, "compression")?;
+	require(compression == 1, format!("TIFF compression {compression} is unsupported"))?;
+	let photometric = one(262, "photometric interpretation")?;
+	let channels = tags.get(&277).and_then(|values| values.first()).copied().unwrap_or(1) as usize;
+	require(matches!(channels, 1 | 3 | 4), format!("TIFF channel count {channels} is unsupported"))?;
+	require(tags.get(&258).is_some_and(|bits| !bits.is_empty() && bits.iter().all(|bits| *bits == 8)), "TIFF samples must be 8-bit")?;
+	require(tags.get(&284).and_then(|values| values.first()).copied().unwrap_or(1) == 1, "TIFF planar storage is unsupported")?;
+	let offsets = tags.get(&273).ok_or_else(|| RecipeError::new("TIFF strip offsets are absent"))?;
+	let counts = tags.get(&279).ok_or_else(|| RecipeError::new("TIFF strip byte counts are absent"))?;
+	require(offsets.len() == counts.len(), "TIFF strip offsets and sizes differ")?;
+	let expected = checked_mul(checked_mul(width, height, "TIFF pixels")?, channels, "TIFF samples")?;
+	let mut pixels = Vec::with_capacity(expected);
+	for (offset, count) in offsets.iter().zip(counts) {
+		let (offset, count) = (*offset as usize, *count as usize);
+		let end = checked_add(offset, count, "TIFF strip")?;
+		pixels.extend_from_slice(bytes.get(offset..end).ok_or_else(|| RecipeError::new("TIFF strip is truncated"))?);
+	}
+	require(pixels.len() == expected, format!("TIFF pixel data expected {expected} bytes, received {}", pixels.len()))?;
+	match photometric {
+		0 if channels == 1 => pixels.iter_mut().for_each(|value| *value = 255 - *value),
+		1 if channels == 1 => {}
+		2 if channels >= 3 => {}
+		_ => return Err(RecipeError::new(format!("TIFF photometric interpretation {photometric} is unsupported"))),
+	}
+	Ok((width, height, channels, pixels))
+}
+/// A headerless table can receive stable logical names from the existing
+/// public selectors: `include` names the leading input fields and `target`
+/// names the trailing target fields. Without both exact widths, the
+/// established positional `colN` and final `target` names remain unchanged.
+fn name_headerless(data: &Data, tables: &mut [Table]) -> Result<()> {
+	let [table] = tables else { return Ok(()) };
+	let FeatureSelection::Include(inputs) = &data.features else { return Ok(()) };
+	if table.declared {
+		return Ok(());
+	}
+	let width = checked_add(inputs.len(), data.target.len(), "headerless declared fields")?;
+	if width != table.headers.len() {
+		return Ok(());
+	}
+	table.headers = inputs.iter().chain(&data.target).cloned().collect();
+	table.declared = true;
+	Ok(())
+}
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
+	name_headerless(data, &mut tables)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
 	if !data.tests.is_empty() {
-		let (tests, test_sources) = load_tables(data, &data.tests)?;
+		let (mut tests, test_sources) = load_tables(data, &data.tests)?;
+		name_headerless(data, &mut tests)?;
 		require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
 		for (table, test) in tables.iter_mut().zip(tests) {
@@ -14015,6 +14311,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 				columns.push((table, column, infer_feature(value, column, source_table_rows)));
 			}
 		}
+	}
+	if let FeatureSelection::Include(names) = &data.features {
+		columns.sort_by_key(|(table, column, _)| names.iter().position(|name| column_match(name, &tables[*table], &tables[*table].headers[*column], *column)).unwrap_or(names.len()));
 	}
 	let features = columns.iter().map(|column| column.2.width()).sum();
 	let mut sequence_widths = BTreeMap::new();
@@ -14102,7 +14401,7 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 				continue;
 			}
 			for (row, values) in table.rows.iter().enumerate() {
-				let text = values.get(column).cloned().unwrap_or_default();
+				let text = values.get(column).map_or("", String::as_str).trim();
 				let chars = text
 					.chars()
 					.map(|character| CHAR_IDS.iter().position(|value| *value == character).ok_or_else(|| RecipeError::new(format!("unsupported character {character:?} in row {}", row + 1))))
@@ -14195,10 +14494,10 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool {
-	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml")
+	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml" | "gz" | "xlsx")
 }
 fn is_archive(extension: &str) -> bool {
-	matches!(extension.to_ascii_lowercase().as_str(), "zip")
+	matches!(extension.to_ascii_lowercase().as_str(), "zip" | "tar")
 }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
@@ -14229,8 +14528,16 @@ fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf,
 			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
 		}
 	};
-	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+	if let Some(extension) = path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase)
+		&& is_archive(&extension)
+	{
+		let entries = match extension.as_str() {
+			"zip" => zip_entries(&bytes),
+			"tar" => tar_entries(&bytes),
+			_ => unreachable!(),
+		}.map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+		for (entry, contents) in entries {
+			require(!entry.is_empty() && Path::new(&entry).components().all(|component| matches!(component, std::path::Component::Normal(_))), format!("archive member path {entry:?} is invalid"))?;
 			let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 				&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
 			if metadata {
@@ -14353,6 +14660,12 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+		Some("gz") => {
+			let decoded = gzip_inflate(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			let inner = path.file_stem().map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("dataset {} has no compressed file name", path.display())))?;
+			decode_tables(&inner, &decoded)
+		}
+		Some("xlsx") => xlsx_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("jsonl") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = text
@@ -14518,8 +14831,9 @@ fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
 	}
 	Ok(values)
 }
-/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman blocks.
-fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman
+/// blocks, with the number of source bytes consumed through the final block.
+fn inflate_consumed(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
 	struct Bits<'a> {
 		bytes: &'a [u8],
 		position: usize,
@@ -14655,9 +14969,12 @@ fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
 			_ => return Err(RecipeError::new("DEFLATE block type is invalid")),
 		}
 		if last == 1 {
-			return Ok(output);
+			return Ok((output, bits.position.div_ceil(8)));
 		}
 	}
+}
+fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	inflate_consumed(bytes).map(|(output, _)| output)
 }
 /// zlib envelope: header check, DEFLATE body, Adler-32 verification.
 fn zlib_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -14702,11 +15019,38 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 		Ok(())
 	}
 	let object_messages = |header: usize| -> Result<Vec<(u16, usize, usize)>> {
-		require(bytes.get(header) == Some(&1), "HDF5 object header version is unsupported")?;
-		let mut count = read16(header + 2).ok_or_else(truncated)?;
-		let size = read32(header + 8).ok_or_else(truncated)?;
+		if bytes.get(header) == Some(&1) {
+			let mut count = read16(header + 2).ok_or_else(truncated)?;
+			let size = read32(header + 8).ok_or_else(truncated)?;
+			let mut output = Vec::new();
+			messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+			return Ok(output);
+		}
+		require(bytes.get(header..header + 4) == Some(&b"OHDR"[..]) && bytes.get(header + 4) == Some(&2), "HDF5 object header version is unsupported")?;
+		let flags = *bytes.get(header + 5).ok_or_else(truncated)?;
+		let mut chunk = header + 6;
+		if flags & 0x20 != 0 { chunk = checked_add(chunk, 16, "HDF5 object timestamps")?; }
+		if flags & 0x10 != 0 { chunk = checked_add(chunk, 4, "HDF5 attribute phase change")?; }
+		let width = 1_usize << (flags & 3);
+		let size_bytes = bytes.get(chunk..chunk + width).ok_or_else(truncated)?;
+		let size = size_bytes.iter().enumerate().fold(0_usize, |value, (index, byte)| value | usize::from(*byte) << (8 * index));
+		chunk += width;
+		let end = checked_add(chunk, size, "HDF5 object message chunk")?;
+		require(end <= bytes.len(), "HDF5 object message chunk is truncated")?;
 		let mut output = Vec::new();
-		messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+		let mut offset = chunk;
+		while offset + 4 <= end {
+			let kind = u16::from(bytes[offset]);
+			let size = u16::from_le_bytes(bytes[offset + 1..offset + 3].try_into().unwrap()) as usize;
+			let header_size = if flags & 4 == 0 { 4 } else { 6 };
+			let body = checked_add(offset, header_size, "HDF5 version-2 message")?;
+			let next = checked_add(body, size, "HDF5 version-2 message")?;
+			require(next <= end, "HDF5 version-2 message is truncated")?;
+			if kind != 0 {
+				output.push((kind, body, size));
+			}
+			offset = next;
+		}
 		Ok(output)
 	};
 	let (mut btree, mut heap) = (None, None);
@@ -14751,7 +15095,12 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 			match kind {
 				1 => {
 					let rank = bytes[body + 1] as usize;
-					dims = (0..rank).map(|index| read64(body + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+					let dimensions = match bytes[body] {
+						1 => body + 8,
+						2 => body + 4,
+						version => return Err(RecipeError::new(format!("HDF5 dataspace version {version} is unsupported"))),
+					};
+					dims = (0..rank).map(|index| read64(dimensions + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
 				}
 				3 => {
 					let class = bytes[body] & 0xf;
@@ -14861,6 +15210,96 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
+fn gzip_crc32(bytes: &[u8]) -> u32 {
+	let mut crc = u32::MAX;
+	for byte in bytes {
+		crc ^= u32::from(*byte);
+		for _ in 0..8 { crc = if crc & 1 == 0 { crc >> 1 } else { crc >> 1 ^ 0xedb8_8320 }; }
+	}
+	!crc
+}
+/// Concatenated gzip members containing deflate streams. Every member validates
+/// its header checksum when present, CRC-32, and uncompressed size. Corpus
+/// padding may follow only after the final complete member.
+fn gzip_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	let mut cursor = 0;
+	let mut combined = Vec::new();
+	loop {
+		if bytes[cursor..].iter().all(|byte| matches!(*byte, 0 | b'p')) {
+			return require(!combined.is_empty(), "gzip file has no members").map(|()| combined);
+		}
+		let member = cursor;
+		require(bytes.len().saturating_sub(cursor) >= 18 && bytes[cursor..cursor + 2] == [0x1f, 0x8b], "gzip header is absent")?;
+		require(bytes[cursor + 2] == 8, format!("gzip compression method {} is unsupported", bytes[cursor + 2]))?;
+		let flags = bytes[cursor + 3];
+		require(flags & 0xe0 == 0, "gzip reserved flags are set")?;
+		cursor = checked_add(cursor, 10, "gzip header")?;
+		if flags & 4 != 0 {
+			let length = bytes.get(cursor..cursor + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize).ok_or_else(|| RecipeError::new("gzip extra field is truncated"))?;
+			cursor = checked_add(cursor, checked_add(2, length, "gzip extra field")?, "gzip extra field")?;
+		}
+		for flag in [8, 16] {
+			if flags & flag != 0 {
+				let end = bytes.get(cursor..).and_then(|value| value.iter().position(|byte| *byte == 0)).ok_or_else(|| RecipeError::new("gzip text field is unterminated"))?;
+				cursor = checked_add(cursor, end + 1, "gzip text field")?;
+			}
+		}
+		if flags & 2 != 0 {
+			let after = checked_add(cursor, 2, "gzip header checksum")?;
+			let expected = bytes.get(cursor..after).map(|value| u16::from_le_bytes(value.try_into().unwrap())).ok_or_else(|| RecipeError::new("gzip header checksum is truncated"))?;
+			require(gzip_crc32(&bytes[member..cursor]) as u16 == expected, "gzip header checksum mismatch")?;
+			cursor = after;
+		}
+		let (output, consumed) = inflate_consumed(bytes.get(cursor..).ok_or_else(|| RecipeError::new("gzip deflate stream is truncated"))?)?;
+		let trailer = checked_add(cursor, consumed, "gzip trailer")?;
+		let after = checked_add(trailer, 8, "gzip trailer")?;
+		require(after <= bytes.len(), "gzip trailer is absent")?;
+		let expected_crc = u32::from_le_bytes(bytes[trailer..trailer + 4].try_into().unwrap());
+		require(gzip_crc32(&output) == expected_crc, "gzip checksum mismatch")?;
+		let size = u32::from_le_bytes(bytes[trailer + 4..after].try_into().unwrap()) as usize;
+		require(output.len() & u32::MAX as usize == size, format!("gzip uncompressed size expected {size}, received {}", output.len()))?;
+		combined.extend(output);
+		cursor = after;
+		if cursor == bytes.len() { return Ok(combined) }
+	}
+}
+
+/// Regular files from a POSIX ustar archive. Dataset archives use short UTF-8
+/// names; metadata, links, and directories are ignored.
+fn tar_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+	let text = |field: &[u8]| -> Result<String> {
+		let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+		Ok(str::from_utf8(&field[..end]).map_err(|error| RecipeError::new(format!("TAR text is not UTF-8: {error}")))?.trim().to_owned())
+	};
+	let mut offset = 0;
+	let mut entries = Vec::new();
+	while offset + 512 <= bytes.len() {
+		let header = &bytes[offset..offset + 512];
+		if header.iter().all(|byte| *byte == 0) {
+			break;
+		}
+		let name = text(&header[..100])?;
+		let prefix = text(&header[345..500])?;
+		let name = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+		let name = name.strip_prefix("./").unwrap_or(&name).to_owned();
+		let checksum_text = text(&header[148..156])?;
+		let checksum = usize::from_str_radix(checksum_text.trim_matches([' ', '\0']), 8).map_err(|error| RecipeError::new(format!("TAR entry {name:?} has an invalid checksum: {error}")))?;
+		let measured = header.iter().enumerate().map(|(index, byte)| if (148..156).contains(&index) { usize::from(b' ') } else { usize::from(*byte) }).sum::<usize>();
+		require(checksum == measured, format!("TAR entry {name:?} checksum mismatch"))?;
+		let size_text = text(&header[124..136])?;
+		let size = usize::from_str_radix(size_text.trim_matches([' ', '\0']), 8).map_err(|error| RecipeError::new(format!("TAR entry {name:?} has an invalid size: {error}")))?;
+		let start = checked_add(offset, 512, "TAR entry")?;
+		let end = checked_add(start, size, "TAR entry")?;
+		require(end <= bytes.len(), format!("TAR entry {name:?} is truncated"))?;
+		if matches!(header[156], 0 | b'0') && !name.is_empty() {
+			entries.push((name, bytes[start..end].to_vec()));
+		}
+		offset = checked_add(start, size.div_ceil(512) * 512, "TAR padding")?;
+	}
+	require(!entries.is_empty(), "TAR archive has no regular files")?;
+	Ok(entries)
+}
+
 /// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -14893,6 +15332,176 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	}
 	require(!entries.is_empty(), "ZIP archive has no entries")?;
 	Ok(entries)
+}
+
+fn xml_entities(value: &str) -> Result<String> {
+	let mut output = String::new();
+	let mut rest = value;
+	while let Some(position) = rest.find('&') {
+		output.push_str(&rest[..position]);
+		let tail = &rest[position + 1..];
+		let end = tail.find(';').ok_or_else(|| RecipeError::new("XML entity is unterminated"))?;
+		let entity = &tail[..end];
+		match entity {
+			"amp" => output.push('&'),
+			"lt" => output.push('<'),
+			"gt" => output.push('>'),
+			"quot" => output.push('"'),
+			"apos" => output.push('\''),
+			_ => {
+				let code = entity
+					.strip_prefix("#x").map(|digits| u32::from_str_radix(digits, 16))
+					.or_else(|| entity.strip_prefix('#').map(str::parse))
+					.ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is unsupported")))?
+					.map_err(|error| RecipeError::new(format!("invalid XML entity: {error}")))?;
+				output.push(char::from_u32(code).ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is invalid")))?);
+			}
+		}
+		rest = &tail[end + 1..];
+	}
+	output.push_str(rest);
+	Ok(output)
+}
+
+fn xml_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+	let marker = format!("{name}=\"");
+	let value = tag.split_once(&marker)?.1;
+	value.split_once('"').map(|(value, _)| value)
+}
+
+fn xml_values(block: &str, tag: &str) -> Result<Vec<String>> {
+	let opening = format!("<{tag}");
+	let closing = format!("</{tag}>");
+	let mut values = Vec::new();
+	let mut rest = block;
+	while let Some(start) = rest.find(&opening) {
+		let tagged = &rest[start + opening.len()..];
+		let body = tagged.find('>').ok_or_else(|| RecipeError::new(format!("XML {tag} tag is unterminated")))? + 1;
+		let end = tagged[body..].find(&closing).ok_or_else(|| RecipeError::new(format!("XML {tag} value is unterminated")))?;
+		values.push(xml_entities(&tagged[body..body + end])?);
+		rest = &tagged[body + end + closing.len()..];
+	}
+	Ok(values)
+}
+
+fn xml_tags<'a>(document: &'a str, tag: &str) -> Result<Vec<&'a str>> {
+	let opening = format!("<{tag} ");
+	let mut tags = Vec::new();
+	let mut rest = document;
+	while let Some(start) = rest.find(&opening) {
+		let tagged = &rest[start + opening.len()..];
+		let end = tagged.find('>').ok_or_else(|| RecipeError::new(format!("XML {tag} tag is unterminated")))?;
+		tags.push(&tagged[..end]);
+		rest = &tagged[end + 1..];
+	}
+	Ok(tags)
+}
+
+fn xlsx_column(reference: &str) -> Result<usize> {
+	let letters = reference.chars().take_while(char::is_ascii_alphabetic).collect::<String>();
+	require(!letters.is_empty(), format!("XLSX cell reference {reference:?} has no column"))?;
+	letters.bytes().try_fold(0_usize, |column, letter| {
+		checked_add(checked_mul(column, 26, "XLSX column")?, usize::from(letter.to_ascii_uppercase() - b'A' + 1), "XLSX column")
+	}).map(|column| column - 1)
+}
+
+/// The first worksheet row is the table header. Inline strings, shared
+/// strings, numeric cells, formula results, and omitted empty cells retain
+/// their spreadsheet order.
+fn xlsx_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+	let mut entries = zip_entries(bytes)?;
+	entries.sort_by(|left, right| left.0.cmp(&right.0));
+	let entry_text = |name: &str| -> Result<&str> {
+		let bytes = entries.iter().find(|(entry, _)| entry == name).map(|(_, bytes)| bytes.as_slice()).ok_or_else(|| RecipeError::new(format!("XLSX entry {name:?} is absent")))?;
+		str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX entry {name:?} is not UTF-8: {error}")))
+	};
+	let mut relationships = BTreeMap::new();
+	for tag in xml_tags(entry_text("xl/_rels/workbook.xml.rels")?, "Relationship")? {
+		let Some(id) = xml_attribute(tag, "Id") else { continue };
+		let Some(target) = xml_attribute(tag, "Target") else { continue };
+		let target = if target.starts_with('/') { target.trim_start_matches('/').to_owned() } else { format!("xl/{target}") };
+		relationships.insert(id.to_owned(), target);
+	}
+	let mut worksheets = Vec::new();
+	for tag in xml_tags(entry_text("xl/workbook.xml")?, "sheet")? {
+		let name = xml_entities(xml_attribute(tag, "name").ok_or_else(|| RecipeError::new("XLSX sheet name is absent"))?)?;
+		let id = xml_attribute(tag, "r:id").ok_or_else(|| RecipeError::new(format!("XLSX sheet {name:?} relationship is absent")))?;
+		let target = relationships.get(id).ok_or_else(|| RecipeError::new(format!("XLSX sheet {name:?} relationship {id:?} is absent")))?.clone();
+		require(entries.iter().any(|(entry, _)| *entry == target), format!("XLSX sheet {name:?} entry {target:?} is absent"))?;
+		worksheets.push((name, target));
+	}
+	require(!worksheets.is_empty(), "XLSX workbook has no declared worksheets")?;
+	let shared = entries
+		.iter()
+		.find(|(name, _)| name == "xl/sharedStrings.xml")
+		.map(|(_, bytes)| {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX shared strings are not UTF-8: {error}")))?;
+			let mut strings = Vec::new();
+			let mut rest = text;
+			while let Some(start) = rest.find("<si") {
+				let tagged = &rest[start + 3..];
+				let body = tagged.find('>').ok_or_else(|| RecipeError::new("XLSX shared string is unterminated"))? + 1;
+				let end = tagged[body..].find("</si>").ok_or_else(|| RecipeError::new("XLSX shared string is unterminated"))?;
+				strings.push(xml_values(&tagged[body..body + end], "t")?.join(""));
+				rest = &tagged[body + end + 5..];
+			}
+			Ok(strings)
+		})
+		.transpose()?
+		.unwrap_or_default();
+	let mut tables = Vec::new();
+	for (name, entry) in worksheets {
+		let bytes = entries.iter().find(|(candidate, _)| *candidate == entry).map(|(_, bytes)| bytes).unwrap();
+		let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX worksheet {name:?} is not UTF-8: {error}")))?;
+		let sheet = text.split_once("<sheetData").and_then(|(_, rest)| rest.split_once('>')).and_then(|(_, rest)| rest.split_once("</sheetData>").map(|(body, _)| body))
+			.ok_or_else(|| RecipeError::new(format!("XLSX worksheet {name:?} has no sheet data")))?;
+		let mut rows = Vec::new();
+		let mut rest = sheet;
+		while let Some(start) = rest.find("<row") {
+			let tagged = &rest[start + 4..];
+			let body = tagged.find('>').ok_or_else(|| RecipeError::new("XLSX row is unterminated"))? + 1;
+			let end = tagged[body..].find("</row>").ok_or_else(|| RecipeError::new("XLSX row is unterminated"))?;
+			let row_text = &tagged[body..body + end];
+			let mut row = Vec::<String>::new();
+			let mut cells = row_text;
+			while let Some(cell_start) = cells.find("<c") {
+				let cell = &cells[cell_start + 2..];
+				let open = cell.find('>').ok_or_else(|| RecipeError::new("XLSX cell is unterminated"))?;
+				let tag = &cell[..open];
+				let (value, consumed) = if tag.trim_end().ends_with('/') {
+					("", open + 1)
+				} else {
+					let close = cell[open + 1..].find("</c>").ok_or_else(|| RecipeError::new("XLSX cell is unterminated"))?;
+					(&cell[open + 1..open + 1 + close], open + 1 + close + 4)
+				};
+				let reference = xml_attribute(tag, "r").ok_or_else(|| RecipeError::new("XLSX cell reference is absent"))?;
+				let column = xlsx_column(reference)?;
+				row.resize(column + 1, String::new());
+				row[column] = match xml_attribute(tag, "t") {
+					Some("inlineStr") => xml_values(value, "t")?.join(""),
+					Some("s") => {
+						let index = xml_values(value, "v")?.first().ok_or_else(|| RecipeError::new("XLSX shared-string cell is empty"))?.parse::<usize>()
+							.map_err(|error| RecipeError::new(format!("XLSX shared-string index is invalid: {error}")))?;
+						shared.get(index).cloned().ok_or_else(|| RecipeError::new(format!("XLSX shared-string index {index} is absent")))?
+					}
+					_ => xml_values(value, "v")?.first().cloned().unwrap_or_default(),
+				};
+				cells = &cell[consumed..];
+			}
+			rows.push(row);
+			rest = &tagged[body + end + 6..];
+		}
+		require(!rows.is_empty(), format!("XLSX worksheet {name:?} has no rows"))?;
+		let headers = rows.remove(0);
+		require(!headers.is_empty() && headers.iter().all(|header| !header.is_empty()), format!("XLSX worksheet {name:?} has an empty header"))?;
+		for row in &mut rows {
+			require(row.len() <= headers.len(), format!("XLSX worksheet {name:?} row exceeds {} columns", headers.len()))?;
+			row.resize(headers.len(), String::new());
+		}
+		tables.push(Table { name, headers, declared: true, rows, attention: None });
+	}
+	require(!tables.is_empty(), "XLSX workbook has no worksheets")?;
+	Ok(tables)
 }
 /// One named column group from an NPY array: trailing dimensions flatten to `name.1..name.k` columns.
 fn npy_columns(name: &str, bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
@@ -16065,5 +16674,12 @@ mod schedule_tests {
 		];
 		assert_eq!(dominant_tile(&tie_shapes, &tie_contractions), Some(Tile { m: 11, n: 13, k: 17 }));
 		assert_eq!(dominant_tile(&[], &[]), None);
+	}
+
+	#[test]
+	fn tiff_page_selection_rejects_directory_cycles() {
+		let bytes = [b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 8, 0, 0, 0];
+		let error = tiff_pixels(&bytes, 2).expect_err("cyclic TIFF directory chain must fail");
+		assert_eq!(error.to_string(), "TIFF directory chain contains a cycle");
 	}
 }
