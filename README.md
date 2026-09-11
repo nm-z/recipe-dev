@@ -2,32 +2,16 @@
 
 GPU/CPU ML training and inference in Rust.
 
+###### **Data**
+
 ```rust
 let data = recipe.data("measurements/")
 	.target(["temperature"])
 	.norm(z_score)
 	.split(0.8);
-
-let model = recipe.model()
-	.conv(16, 5).pool(64).gelu()
-	.layer(32).gelu()
-	.layer(1)
-	.loss(mae);
-
-recipe.train()
-	.fp(32)
-	.lr(0.0001)
-	.stop(0.1)
-	.epochs(100000)
-	.save("model.ogdl")
-	.run(&model, &data);
-
-let prediction = recipe.infer("model.ogdl", &input);
 ```
 
 Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
-
-## samples
 
 ```
 measurements.csv    input,temperature,target    one sample per row
@@ -36,6 +20,34 @@ scans/                                          3,000 samples
 	meta.csv        scan,temperature,y            scan names and orders files
 	scan-0000.csv   magnitude,phase               sample 0
 	...                                           2,999 more scan files
+```
+
+###### **Model**
+
+```rust
+let model = recipe.model()
+	.conv(16, 5).pool(64).gelu()
+	.layer(32).gelu()
+	.layer(1)
+	.loss(mae);
+```
+
+###### **Train**
+
+```rust
+recipe.train()
+	.fp(32)
+	.lr(0.0001)
+	.stop(0.1)
+	.epochs(100000)
+	.save("model.ogdl")
+	.run(&model, &data);
+```
+
+###### **Infer**
+
+```rust
+let prediction = recipe.infer("model.ogdl", &input);
 ```
 
 ## devices
