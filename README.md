@@ -161,3 +161,26 @@ observe:
 ```rust
 let prediction = recipe.infer("model.ogdl", &input);
 ```
+
+## **Decode**
+
+```rust
+let generation = recipe.decode("model.ogdl", &prompt_ids, &mut recipe.sampler().temperature(0.0), &stop_ids, budget);
+recipe.serve("model.ogdl", "127.0.0.1:8080", requests);
+```
+
+```rust
+sampler
+	.temperature(t)
+	.top_k(k)
+	.top_p(p)
+	.min_p(p)
+	.repeat(penalty, window)
+	.seed(value)
+generation
+	.ids
+	.logits
+	.prefill_seconds
+	.step_seconds
+GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7
+```
