@@ -1,3 +1,0 @@
-imputed corpus-clean.previous_usage_ms: 0.1669%
-imputed corpus-clean.previous_input_tokens: 0.1669%
-run [38;2;242;40;60m1[0m  time [38;2;255;194;0m144.7649 s[0m  epoch [38;2;135;90;251m1[0m  r2 [38;2;39;125;255m-0.2506[0m  mse [38;2;0;174;107m0.7314[0m  score [38;2;135;90;251m0.305820781[0m

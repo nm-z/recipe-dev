@@ -1,1 +1,0 @@
-HARNESS_REPORT policy=full epochs_requested=1 epoch_seconds=144.764884 initial_loss=0.7314410277944313 final_loss=0.7314410277944313 r2=NaN evaluator_r2=-0.2506037755199426 validation_r2=none predicted_reward=0.009999999600713643 measured_reward=0.2685589722055687
