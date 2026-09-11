@@ -8165,8 +8165,19 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, width, keys, values, rope, yarn, index, gate } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
+	if width.is_none() && keys == heads && values == heads && graph.output.channels % heads != 0 {
+		let requested = heads;
+		let valid = (1..=requested.min(graph.output.channels)).rev().filter(|heads| graph.output.channels % heads == 0).take(3).collect::<Vec<_>>();
+		heads = valid[0];
+		keys = heads;
+		values = heads;
+		eprintln!(
+			"invalid: attn({requested})  valid: {}  choosing attn({heads})",
+			valid.iter().map(|heads| format!("attn({heads})")).collect::<Vec<_>>().join("|")
+		);
+	}
 	require(
 		keys != 0 && keys <= heads && heads % keys == 0,
 		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
