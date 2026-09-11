@@ -5,10 +5,6 @@ name: os/device check
 # uploads machine-readable evidence for the exact source snapshot it ran.
 
 on:
-  pull_request:
-    branches:
-      - minimal
-    # No path filters: a required check must never be omitted by a path rule.
   push:
     branches:
       - '**'
@@ -37,10 +33,10 @@ permissions:
 concurrency:
   # Provider jobs are not cancelled in place. Camber's current CLI has no
   # cancellation operation, and cancelling a run can leave a pending provider
-  # job alive after GitHub has forgotten its cleanup context. GitHub still
-  # keeps one running and one pending candidate per pull request; a newer
-  # pending candidate replaces only an older pending candidate.
-  group: recipe-runtime-${{ inputs.request_id || github.event.pull_request.number || github.ref }}
+  # job alive after GitHub has forgotten its cleanup context. Keep one running
+  # and one pending candidate per pushed ref; a newer pending candidate replaces
+  # only an older pending candidate for the same ref.
+  group: recipe-runtime-${{ inputs.request_id || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -721,14 +717,13 @@ jobs:
     needs: linux-cpu
     if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
+    environment: recipe-windows-gpu
     timeout-minutes: 90
     concurrency:
-      # Keep one Windows GPU worker per pull request, rather than one global
-      # pending slot for the repository. GitHub retains only one running and
-      # one pending job in a concurrency group, so a global group silently
-      # cancelled every older PR's queued job before it ran. azure-run.sh
-      # still admits only one worker at a time through the Azure lease.
-      group: recipe-windows-nvidia-${{ github.event.pull_request.number || github.run_id }}
+      # Keep one Windows GPU worker per push run rather than one global pending
+      # slot. azure-run.sh still admits only one worker at a time through the
+      # Azure lease.
+      group: recipe-windows-nvidia-${{ github.run_id }}
       cancel-in-progress: false
     permissions:
       actions: read
