@@ -179,7 +179,7 @@ jobs:
   require-minimal-base:
     name: target-minimal
     concurrency:
-      group: recipe-minimal-base-policy-${{ github.ref }}
+      group: recipe-minimal-base-policy-${{ github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
@@ -234,7 +234,7 @@ jobs:
   draft-conflicts:
     name: draft-prs-w-merge-conflicts
     concurrency:
-      group: recipe-merge-conflict-policy-${{ github.ref }}
+      group: recipe-merge-conflict-policy-${{ github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:

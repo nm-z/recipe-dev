@@ -33,10 +33,9 @@ permissions:
 concurrency:
   # Provider jobs are not cancelled in place. Camber's current CLI has no
   # cancellation operation, and cancelling a run can leave a pending provider
-  # job alive after GitHub has forgotten its cleanup context. Keep one running
-  # and one pending candidate per pushed ref; a newer pending candidate replaces
-  # only an older pending candidate for the same ref.
-  group: recipe-runtime-${{ inputs.request_id || github.ref }}
+  # job alive after GitHub has forgotten its cleanup context. Give every push
+  # its own group so rapid pushes cannot replace an older pending run.
+  group: recipe-runtime-${{ inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
 env:
