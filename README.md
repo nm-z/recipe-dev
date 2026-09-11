@@ -83,7 +83,7 @@ frozen.packed.blck
 ## 18 thingys
 
 ```rust
-weights:
+blocks:
 	layer(neurons)
 	conv(filters, kernel)
 	attn(heads) or attn([query_heads, key_heads, value_heads])
@@ -93,7 +93,7 @@ weights:
 	gru(hidden)
 	lstm(hidden)
 
-blocks:
+composites:
 	moe(topk, [...])
 	res([...])
 	ensemble([...])
