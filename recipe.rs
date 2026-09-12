@@ -10257,10 +10257,15 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		budget,
 		|_| Ok(()),
 		|tape, samples, settled, reached| {
-			for position in settled as usize..reached as usize {
-				tape.write_sample(position, samples[position])?;
+			let values = &samples[settled as usize..reached as usize];
+			tape.write_tokens(settled as usize, values)?;
+			tape.write_samples(settled as usize, values)?;
+			let mut begin = settled;
+			while begin < reached {
+				let end = reached.min(begin.saturating_add(tape.program.tile.m.max(1)));
+				tape.forward_window(begin, end, ForwardMode::Inference)?;
+				begin = end;
 			}
-			tape.forward_window(settled, reached, ForwardMode::Inference)?;
 			let predictions = tape.predictions()?;
 			let logits = tape.last_logits(&predictions, settled, reached)?;
 			Ok((predictions, logits))
@@ -13532,10 +13537,6 @@ impl NativeTape {
 		let target = tokens.get_mut(first..end).ok_or_else(|| RecipeError::new("token write exceeds the sequence"))?;
 		target.copy_from_slice(values);
 		Ok(())
-	}
-	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
-		self.write_tokens(position, &[value])?;
-		self.write_samples(position, &[value])
 	}
 	/// The output positions the input positions `begin..end` reach: the window
 	/// every node derives from its source, as the emitted forward derives it,
