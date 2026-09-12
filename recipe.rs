@@ -12117,12 +12117,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			*variance += (value - mean).powi(2) / rows as f64
 		}
 	}
-	// Regularize the variance like normalize_samples does: an exact-zero guard
-	// misses float-residue variances on numerically constant features, whose
-	// unbounded inverses cannot survive the model's storage format. A feature is
-	// attenuated, never amplified: a block's initial activations can be near
-	// constant, and their inverse deviation would magnify every later shift of
-	// the trained prefix into the frozen prediction.
+	// Cap inverse deviation at one to avoid amplifying nearly constant features.
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	for value in &mut inverse {
 		*value = (*value + epsilon).sqrt().max(1.0).recip()
