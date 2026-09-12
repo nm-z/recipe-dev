@@ -1,30 +1,56 @@
-name: Pull request policy
+name: PRs
 
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, edited, ready_for_review]
   push:
     branches:
-      - minimal
+      - '**'
+  workflow_run:
+    workflows: ['os/device check']
+    types: [completed]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  check_run:
+    types: [completed]
+  status:
+  workflow_dispatch:
 
 permissions:
   contents: read
+  checks: read
+  statuses: read
   issues: write
   pull-requests: write
 
 jobs:
   close:
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    if: github.event_name == 'push'
+    name: no-tests
     runs-on: ubuntu-latest
     steps:
       - name: Close a pull request containing test text
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
           set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
+
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
+            exit 0
+          fi
+          mapfile -t PR_NUMBERS <<< "$numbers"
+
+          check_pull_request() {
+          local PR_NUMBER="$1"
 
           scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
           mkdir -p "$scan_directory"
@@ -96,14 +122,14 @@ jobs:
           else
             grep_status=$?
             if (( grep_status == 1 )); then
-              exit 0
+              return 0
             fi
-            exit "$grep_status"
+            return "$grep_status"
           fi
 
           match_count="$(wc -l < "$match_file")"
           if (( match_count == 0 )); then
-            exit 0
+            return 0
           fi
 
           escape_html() {
@@ -156,45 +182,73 @@ jobs:
           jq -n --rawfile body "$scan_directory/comment.md" '{body: $body}' \
             | gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --input -
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
+          }
+
+          for PR_NUMBER in "${PR_NUMBERS[@]}"; do
+            check_pull_request "$PR_NUMBER"
+          done
 
   require-minimal-base:
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    if: github.event_name == 'push'
+    name: target-minimal
     concurrency:
-      group: recipe-minimal-base-policy-${{ github.event.pull_request.number }}
+      group: recipe-minimal-base-policy-${{ github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Require minimal as the pull request base
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
           set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
 
-          BASE_REF="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
-          if [[ "$BASE_REF" == 'minimal' ]]; then
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
             exit 0
           fi
+          mapfile -t PR_NUMBERS <<< "$numbers"
 
           marker='<!-- recipe-minimal-base-policy -->'
-          reason="$marker
-          Development pull requests must target \`minimal\`. This pull request targets \`$BASE_REF\`. Rebase or restack the branch as needed, then change the base. Automation does not retarget branches."
+          failed_prs=()
+          for PR_NUMBER in "${PR_NUMBERS[@]}"; do
+            BASE_REF="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+            if [[ "$BASE_REF" == 'minimal' ]]; then
+              continue
+            fi
 
-          comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            --jq '.[] | .body // ""')"
-          if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
-            gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+            reason="$marker
+            Development pull requests must target \`minimal\`. This pull request targets \`$BASE_REF\`. Rebase or restack the branch as needed, then change the base. Automation does not retarget branches."
+
+            comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+              --jq '.[] | .body // ""')"
+            if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
+              gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+            fi
+
+            printf 'Development pull request %s must target minimal; found %s.\n' "$PR_NUMBER" "$BASE_REF"
+            failed_prs+=("$PR_NUMBER")
+          done
+
+          if (( ${#failed_prs[@]} != 0 )); then
+            printf 'Pull requests with a non-minimal base: %s.\n' "${failed_prs[*]}" >&2
+            exit 1
           fi
 
-          printf 'Development pull requests must target minimal; found %s.\n' "$BASE_REF"
-          exit 1
-
   draft-conflicts:
-    if: github.event_name == 'push' || github.event.pull_request.state == 'open'
+    if: github.event_name == 'push'
+    name: draft-prs-w-merge-conflicts
     concurrency:
-      group: recipe-merge-conflict-policy-${{ github.event.pull_request.number || github.ref }}
+      group: recipe-merge-conflict-policy-${{ github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
@@ -205,25 +259,21 @@ jobs:
           # be supplied as RECIPE_POLICY_TOKEN when automatic conversion is
           # required; the workflow reports the missing capability otherwise.
           GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          HEAD_REF: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
           set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
 
-          if [[ "$EVENT_NAME" == 'pull_request_target' ]]; then
-            numbers="$PR_NUMBER"
-          else
-            numbers="$(gh pr list \
-              --repo "$REPOSITORY" \
-              --state open \
-              --base minimal \
-              --limit 1000 \
-              --json number \
-              --jq '.[].number')"
-          fi
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
           if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
             exit 0
           fi
           mapfile -t pr_numbers <<< "$numbers"
@@ -294,3 +344,40 @@ jobs:
             printf 'Draft conversion failed for PRs: %s.\n' "${failed_prs[*]}" >&2
             exit 1
           fi
+
+  draft-failed-checks:
+    name: draft-prs-w-failed-checks
+    needs: [close, require-minimal-base, draft-conflicts]
+    if: always()
+    runs-on: ubuntu-latest
+    concurrency:
+      group: recipe-draft-failed-checks
+      cancel-in-progress: false
+    steps:
+      - name: Draft open pull requests with failed checks
+        env:
+          GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed='[.statusCheckRollup[]? | select(
+            .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or
+            .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or
+            .state == "FAILURE" or .state == "ERROR")] | length > 0'
+          candidates="$(gh pr list --repo "$REPOSITORY" --state open --limit 1000 \
+            --json number,isDraft,statusCheckRollup \
+            --jq ".[] | select(.isDraft == false) | select($failed) | .number")"
+          while IFS= read -r number; do
+            [[ -n "$number" ]] || continue
+            pull="$(gh pr view "$number" --repo "$REPOSITORY" \
+              --json state,isDraft,headRefOid,statusCheckRollup)"
+            if ! jq -e "(.state == \"OPEN\" and .isDraft == false) and ($failed)" <<< "$pull" >/dev/null; then
+              continue
+            fi
+            sha="$(jq -r .headRefOid <<< "$pull")"
+            current="$(gh pr view "$number" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
+            [[ "$sha" == "$current" ]] || continue
+            gh pr ready "$number" --repo "$REPOSITORY" --undo
+            printf 'Drafted PR #%s: failed checks on %s.\n' "$number" "$sha" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$candidates"

@@ -15,9 +15,13 @@ QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 WORKER_EXECUTION_TIMEOUT_SECONDS="${WORKER_EXECUTION_TIMEOUT_SECONDS:-1500}"
+CANCEL_RETRY_WINDOW_SECONDS="${CANCEL_RETRY_WINDOW_SECONDS:-300}"
 
 case "$WORKER_EXECUTION_TIMEOUT_SECONDS" in
 	''|*[!0-9]*) echo "worker execution timeout must be an integer" >&2; exit 1 ;;
+esac
+case "$CANCEL_RETRY_WINDOW_SECONDS" in
+	''|*[!0-9]*) echo "cancel retry window must be an integer" >&2; exit 1 ;;
 esac
 
 mkdir -p evidence
@@ -186,67 +190,83 @@ camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
 camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
 
-echo "== creating the Camber L4 job =="
 job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS bash worker.sh"
-create_output="$(printf 'y\n' | camber job create \
-	--engine base \
-	--size xsmall \
-	--gpu \
-	--num-nodes 1 \
-	--path "$stash_root/" \
-	--cmd "$job_command" 2>&1)" || {
-	printf '%s\n' "$create_output" >&2
-	exit 1
-}
-printf '%s\n' "$create_output"
-job_id="$(printf '%s\n' "$create_output" | awk -F: '/Job ID:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
-if [ -z "$job_id" ]; then
-	job_id="$(printf '%s\n' "$create_output" | jq -er '.job_id // .id // empty' 2>/dev/null || true)"
-fi
-case "$job_id" in
-	''|*[!0-9]*) echo "Camber did not return a numeric job ID" >&2; exit 1 ;;
-esac
-printf '%s\n' "$job_id" > camber-job-id
-echo "submitted Camber job $job_id for $CANDIDATE_SHA"
-
-echo "== polling the Camber job =="
-started="$(date +%s)"
-state=""
-while :; do
-	now="$(date +%s)"
-	elapsed=$((now - started))
-	job_json="$(camber job get "$job_id" --output json)"
-	state="$(printf '%s' "$job_json" | jq -er '(.job_status // .status // .state // "") | tostring | ascii_upcase' 2>/dev/null || true)"
-	echo "  t=${elapsed}s state=${state:-UNKNOWN}"
-	case "$state" in
-	COMPLETED|SUCCEEDED|SUCCESS|FINISHED|FAILED|ERROR|CANCELLED|CANCELED|TERMINATED)
-		break
-		;;
-	QUEUED|PENDING|SUBMITTED)
-		if [ "$elapsed" -ge "$QUEUE_DEADLINE_SECONDS" ]; then
-			echo "queue deadline of ${QUEUE_DEADLINE_SECONDS}s exceeded" >&2
-			exit 1
-		fi
-		;;
-	*)
-		if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
-			echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
-			exit 1
-		fi
-		;;
+for provider_attempt in 1 2; do
+	echo "== creating the Camber L4 job, attempt $provider_attempt of 2 =="
+	create_output="$(printf 'y\n' | camber job create \
+		--engine base \
+		--size xsmall \
+		--gpu \
+		--num-nodes 1 \
+		--path "$stash_root/" \
+		--cmd "$job_command" 2>&1)" || {
+		printf '%s\n' "$create_output" >&2
+		exit 1
+	}
+	printf '%s\n' "$create_output"
+	job_id="$(printf '%s\n' "$create_output" | awk -F: '/Job ID:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+	if [ -z "$job_id" ]; then
+		job_id="$(printf '%s\n' "$create_output" | jq -er '.job_id // .id // empty' 2>/dev/null || true)"
+	fi
+	case "$job_id" in
+		''|*[!0-9]*) echo "Camber did not return a numeric job ID" >&2; exit 1 ;;
 	esac
-	sleep "$POLL_SECONDS"
+	printf '%s\n' "$job_id" > camber-job-id
+	echo "submitted Camber job $job_id for $CANDIDATE_SHA"
+
+	echo "== polling the Camber job =="
+	started="$(date +%s)"
+	state=""
+	while :; do
+		now="$(date +%s)"
+		elapsed=$((now - started))
+		job_json="$(camber job get "$job_id" --output json)"
+		state="$(printf '%s' "$job_json" | jq -er '(.job_status // .status // .state // "") | tostring | ascii_upcase' 2>/dev/null || true)"
+		echo "  t=${elapsed}s state=${state:-UNKNOWN}"
+		case "$state" in
+		COMPLETED|SUCCEEDED|SUCCESS|FINISHED|FAILED|ERROR|CANCELLED|CANCELED|TERMINATED)
+			break
+			;;
+		QUEUED|PENDING|SUBMITTED)
+			if [ "$elapsed" -ge "$QUEUE_DEADLINE_SECONDS" ]; then
+				echo "queue deadline of ${QUEUE_DEADLINE_SECONDS}s exceeded" >&2
+				exit 1
+			fi
+			;;
+		*)
+			if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
+				echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
+				exit 1
+			fi
+			;;
+		esac
+		sleep "$POLL_SECONDS"
+	done
+
+	echo "== collecting job logs and worker evidence =="
+	logs_returned=false
+	if camber job logs "$job_id" > evidence/worker-run.log 2>&1 && [ -s evidence/worker-run.log ]; then
+		logs_returned=true
+	else
+		logs_returned=false
+		echo "Camber did not return job logs" >&2
+	fi
+
+	case "$state" in
+		COMPLETED|SUCCEEDED|SUCCESS|FINISHED)
+			break
+			;;
+		CANCELLED|CANCELED)
+			if [ "$logs_returned" = false ] && [ "$provider_attempt" -eq 1 ] \
+				&& [ "$elapsed" -le "$CANCEL_RETRY_WINDOW_SECONDS" ]; then
+				echo "Camber cancelled the job before returning logs; retrying once" >&2
+				continue
+			fi
+			;;
+	esac
+	echo "the Camber job reached $state, not a successful terminal state" >&2
+	exit 1
 done
-
-echo "== collecting job logs and worker evidence =="
-if ! camber job logs "$job_id" > evidence/worker-run.log 2>&1; then
-	echo "Camber did not return job logs" >&2
-fi
-
-case "$state" in
-	COMPLETED|SUCCEEDED|SUCCESS|FINISHED) ;;
-	*) echo "the Camber job reached $state, not a successful terminal state" >&2; exit 1 ;;
-esac
 [ -f evidence/worker-run.log ] || { echo "worker log is absent" >&2; exit 1; }
 awk '/^RECIPE_SUITE_JSON_BEGIN$/{capture=1; next} /^RECIPE_SUITE_JSON_END$/{capture=0; exit} capture{print}' evidence/worker-run.log | tr -d '\r\n' | base64 -d > evidence/suite.json || {
 	echo "the Camber job log did not contain valid suite evidence" >&2

@@ -1,0 +1,1 @@
+All sensors reported on schedule with no gaps in the series.
