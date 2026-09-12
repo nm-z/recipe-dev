@@ -778,7 +778,138 @@ define internal double @recipe.model.weight(ptr addrspace(1) %weights, i64 %inde
 %packed = icmp ne i32 %decode, 0 br i1 %packed, label %decoded, label %direct
 direct: %ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %index %loaded = load double, ptr addrspace(1) %ptr, align 8 ret double %loaded
 decoded: %value = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %index, i32 %decode) ret double %value }
+; Single-position GEMV. Decode appends one position at a time, so one output
+; row can be assigned to each lane without staging a full input vector or
+; synchronizing every K tile. The wrapper below selects this only for the
+; exact one-position, non-activation forward case.
+define internal void @contraction_forward_gemv_body(
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
+i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%groups = udiv i32 %threads, %block
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%terms = add i32 %in.channels, 0
+%terms.wide = zext i32 %terms to i64
+%weight.base.wide = add i64 %weight.base, 0
+%position = zext i32 %out.begin to i64
+%tiles.adjusted = add i32 %out.channels, %block
+%tiles.numerator = sub i32 %tiles.adjusted, 1
+%tiles = udiv i32 %tiles.numerator, %block
+br label %job.loop
+job.loop:
+%job = phi i32 [ %group, %entry ], [ %job.next, %job.done ]
+%job.more = icmp ult i32 %job, %tiles
+br i1 %job.more, label %job.step, label %exit
+job.step:
+%n.base = mul i32 %job, %block
+%n.remaining = sub i32 %out.channels, %n.base
+%n.partial = icmp ult i32 %n.remaining, %block
+%n.count = select i1 %n.partial, i32 %n.remaining, i32 %block
+%lane.active = icmp ult i32 %lid, %n.count
+%channel = add i32 %n.base, %lid
+%channel.wide = zext i32 %channel to i64
+br i1 %lane.active, label %sum.loop, label %job.done
+sum.loop:
+%k = phi i32 [ 0, %job.step ], [ %k.next, %weight.ready ]
+%sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %sum.next, %weight.ready ]
+%k.more = icmp ult i32 %k, %terms
+br i1 %k.more, label %sum.step, label %sum.done
+sum.step:
+%k.wide = zext i32 %k to i64
+%weight.local = mul i64 %channel.wide, %terms.wide
+%weight.local.index = add i64 %weight.local, %k.wide
+%weight.decode.index = add i64 %weight.base.wide, %weight.local.index
+%weight.packed = icmp ne i32 %decode, 0
+br i1 %weight.packed, label %weight.packed.load, label %weight.dense.load
+weight.dense.load:
+%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %weight.local.index
+%weight.dense.model = load double, ptr addrspace(1) %weight.ptr, align 8
+br label %weight.ready
+weight.packed.load:
+%weight.packed.model = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %weight.decode.index, i32 %decode)
+br label %weight.ready
+weight.ready:
+%weight.model = phi double [ %weight.dense.model, %weight.dense.load ], [ %weight.packed.model, %weight.packed.load ]
+%input.channel = zext i32 %k to i64
+%input.length.wide = zext i32 %in.length to i64
+%input.offset = mul i64 %input.channel, %input.length.wide
+%input.index = add i64 %input.offset, %position
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %input.index
+%input.model = load double, ptr addrspace(1) %input.ptr, align 8
+%weight.wide = call RECIPE_STATE @recipe.decode(double %weight.model)
+%input.wide = call RECIPE_STATE @recipe.decode(double %input.model)
+%product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
+%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
+%k.next = add i32 %k, 1
+br label %sum.loop
+sum.done:
+%bias.base = mul i32 %out.channels, %terms
+%bias.index = add i32 %bias.base, %channel
+%bias.wide.index = zext i32 %bias.index to i64
+br i1 %has.bias, label %bias.load, label %bias.zero
+bias.load:
+%bias.decode.index = add i64 %weight.base.wide, %bias.wide.index
+%bias.packed = icmp ne i32 %decode, 0
+br i1 %bias.packed, label %bias.packed.load, label %bias.dense.load
+bias.dense.load:
+%bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %bias.wide.index
+%bias.dense.model = load double, ptr addrspace(1) %bias.ptr, align 8
+br label %bias.ready
+bias.packed.load:
+%bias.packed.model = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %bias.decode.index, i32 %decode)
+br label %bias.ready
+bias.zero:
+%bias.zero.model = call double @recipe.encode(RECIPE_STATE %state.zero)
+br label %bias.ready
+bias.ready:
+%bias.model = phi double [ %bias.dense.model, %bias.dense.load ], [ %bias.packed.model, %bias.packed.load ], [ %bias.zero.model, %bias.zero ]
+%bias.wide = call RECIPE_STATE @recipe.decode(double %bias.model)
+%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %bias.wide)
+%sum.value = select i1 %has.bias, RECIPE_STATE %sum.bias, RECIPE_STATE %sum
+%result.model = call double @recipe.encode(RECIPE_STATE %sum.value)
+%result.positive = call i1 @recipe.ogt(double %result.model, double 0.0)
+%result.activated = select i1 %result.positive, double %result.model, double 0.0
+%result = select i1 %relu, double %result.activated, double %result.model
+%output.channel = zext i32 %channel to i64
+%out.length.wide = zext i32 %out.length to i64
+%output.channel.base = mul i64 %output.channel, %out.length.wide
+%output.index = add i64 %output.channel.base, %position
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.index
+store double %result, ptr addrspace(1) %output.ptr, align 8
+br label %job.done
+job.done:
+%job.next = add i32 %job, %groups
+br label %job.loop
+exit:
+ret void
+}
 define internal void @contraction_forward_body(
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
+i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
+%one = icmp eq i32 %out.span, 1
+%kernel.zero = icmp eq i32 %kernel, 0
+%rows.one = icmp eq i32 %rows, 1
+%reverse.off = xor i1 %reverse, true
+%accumulate.off = xor i1 %accumulate, true
+%relu.off = xor i1 %relu, true
+%transpose.off = xor i1 %transpose, true
+%fast.a = and i1 %one, %kernel.zero
+%fast.b = and i1 %fast.a, %rows.one
+%fast.c = and i1 %fast.b, %reverse.off
+%fast.d = and i1 %fast.c, %accumulate.off
+%fast.e = and i1 %fast.d, %relu.off
+%fast = and i1 %fast.e, %transpose.off
+br i1 %fast, label %gemv, label %gemm
+gemv:
+call void @contraction_forward_gemv_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
+ret void
+gemm:
+call void @contraction_forward_gemm_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
+ret void
+}
+define internal void @contraction_forward_gemm_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
 i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
 ; A packed node passes a nonzero decoder selector and keeps its weights in the stored
