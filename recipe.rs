@@ -14943,11 +14943,16 @@ impl DeviceTape {
 		}
 		self.shards[0].inject_bn_stats(stats)
 	}
-	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
+	/// Recompute batch statistics using the current weights before saving.
+	fn extract_bn_stats(&mut self) -> Result<Vec<f64>> {
 		if self.shards.len() > 1 {
 			return Ok(Vec::new());
 		}
-		self.shards[0].extract_bn_stats()
+		let shard = &mut self.shards[0];
+		if !shard.batch_normalizations.is_empty() {
+			shard.forward(ForwardMode::Training)?;
+		}
+		shard.extract_bn_stats()
 	}
 	fn advance(&mut self) -> Result<()> {
 		self.shards.iter_mut().try_for_each(NativeTape::advance)
@@ -21899,12 +21904,12 @@ impl Train {
 			let ((loss, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
 				let ((loss, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
 				if checkpoint_requested {
 					stored.bn_stats = tape.extract_bn_stats()?
 				}
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, checkpoint_requested.then_some(()))?;
 				let checkpoint = checkpoint.or(persisted);
-				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
 				Ok((loss, checkpoint.or(persisted), predictions))
 			})?;
