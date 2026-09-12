@@ -2593,7 +2593,7 @@ mod quantized {
 			self.next += 1;
 			name
 		}
-		fn instruction(&mut self, instruction: String) -> String {
+		pub(super) fn instruction(&mut self, instruction: String) -> String {
 			let name = self.name();
 			self.ir.push_str(&format!("{name} = {instruction}\n"));
 			name
@@ -2648,23 +2648,23 @@ mod quantized {
 		}
 		fn half(&mut self, offset: Self::Int) -> Self::Value {
 			let pointer = pointer_type(self.backend);
-			let ty = self.precision.model_type;
+			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load half, {pointer} {address}, align 2"));
-			self.instruction(format!("call {ty} @recipe.from.f16(half {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16(half {loaded})"))
 		}
 		fn float(&mut self, offset: Self::Int) -> Self::Value {
 			let pointer = pointer_type(self.backend);
-			let ty = self.precision.model_type;
+			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
-			self.instruction(format!("call {ty} @recipe.from.f32(float {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f32(float {loaded})"))
 		}
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
-			let ty = self.precision.model_type;
+			let state = self.precision.state_type;
 			let bits = self.instruction(format!("trunc i64 {bits} to i16"));
 			let half = self.instruction(format!("bitcast i16 {bits} to half"));
-			self.instruction(format!("call {ty} @recipe.from.f16(half {half})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16(half {half})"))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
 			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
@@ -2677,42 +2677,42 @@ mod quantized {
 			self.instruction(format!("sext i8 {loaded} to i64"))
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
-			let ty = self.precision.model_type;
+			let ty = self.precision.state_type;
 			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
 				self.globals.push_str(&format!(
 					"@recipe_model_{name} = private unnamed_addr constant [{} x {ty}] [{}]\n",
 					values.len(),
-					values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.model, ty, *value))).collect::<Vec<_>>().join(", ")
+					values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.state, ty, *value))).collect::<Vec<_>>().join(", ")
 				));
 			}
 			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
 			self.instruction(format!("load {ty}, ptr {address}, align {}", super::alignment(ty)))
 		}
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
-			let ty = self.precision.model_type;
+			let ty = self.precision.state_type;
 			let value = self.instruction(format!("trunc i64 {value} to i32"));
-			self.instruction(format!("call {ty} @recipe.from.{}32(i32 {value})", if signed { "s" } else { "u" }))
+			self.instruction(format!("call {ty} @recipe.state.from.{}32(i32 {value})", if signed { "s" } else { "u" }))
 		}
 		fn literal(&self, value: f64) -> Self::Value {
-			native_literal(self.precision.model, self.precision.model_type, value)
+			native_literal(self.precision.state, self.precision.state_type, value)
 		}
 		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value {
-			let ty = self.precision.model_type;
+			let ty = self.precision.state_type;
 			let operation = match operation {
 				QuantValueOp::Add => "add",
 				QuantValueOp::Subtract => "sub",
 				QuantValueOp::Multiply => "mul",
 			};
-			self.instruction(format!("call {ty} @recipe.{operation}({ty} {left}, {ty} {right})"))
+			self.instruction(format!("call {ty} @recipe.state.{operation}({ty} {left}, {ty} {right})"))
 		}
 		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
-			let ty = self.precision.model_type;
+			let ty = self.precision.state_type;
 			let condition = self.instruction(format!("icmp ne i64 {condition}, 0"));
 			self.instruction(format!("select i1 {condition}, {ty} {yes}, {ty} {no}"))
 		}
 		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
-			let ty = self.precision.model_type;
-			let negative = self.instruction(format!("call {ty} @recipe.neg({ty} {magnitude})"));
+			let ty = self.precision.state_type;
+			let negative = self.instruction(format!("call {ty} @recipe.state.neg({ty} {magnitude})"));
 			let sign = self.instruction(format!("icmp ne i64 {sign}, 0"));
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
@@ -4036,6 +4036,7 @@ impl NativeModelIr {
 		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision: self.precision, next: 0 };
 		require(!matches!(native, NativeDequant::Nf4), "NF4 native dequantization requires its model codebook")?;
 		let result = native.decode(&mut operations);
+		let result = operations.instruction(format!("call {ty} @recipe.model.from.state({} {result})", self.precision.state_type));
 		Ok(format!(
 			"{globals}define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i64 %row, i64 %column, i64 %columns) #1 {{\nentry:\n%blocks = udiv i64 %columns, {block}\n%row.base = mul i64 %row, %blocks\n%block.local = udiv i64 %column, {block}\n%block.index = add i64 %row.base, %block.local\n%block.offset = mul i64 %block.index, {stride}\n%block = getelementptr inbounds i8, {pointer} %matrix, i64 %block.offset\n%local = urem i64 %column, {block}\n{body}ret {ty} {result}\n}}\n",
 			globals = operations.globals,
@@ -4054,6 +4055,7 @@ impl NativeModelIr {
 		let scales_name = format!("{name}_scales");
 		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision: self.precision, next: 0 };
 		let result = dequant_nf4(&mut operations, block, &table_name, table, &scales_name, scales);
+		let result = operations.instruction(format!("call {ty} @recipe.model.from.state({} {result})", self.precision.state_type));
 		Ok(format!(
 			"{globals}define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i64 %row, i64 %column, i64 %columns) #1 {{\nentry:\n%block = getelementptr inbounds i8, {pointer} %matrix, i64 0\n%local = add i64 %column, 0\n{body}ret {ty} {result}\n}}\n",
 			globals = operations.globals,
