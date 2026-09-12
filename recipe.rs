@@ -4415,6 +4415,9 @@ fn native_amd_compiler() -> Result<&'static str> {
 fn native_nvidia_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_NV_COMPILER").ok_or_else(|| RecipeError::new("NVIDIA native compiler is unavailable"))
 }
+fn native_nvidia_codegen() -> Result<&'static str> {
+	option_env!("RECIPE_NV_CODEGEN").ok_or_else(|| RecipeError::new("NVIDIA native code generator is unavailable"))
+}
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY")
@@ -4496,17 +4499,28 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
+			let codegen = native_nvidia_codegen().ok().filter(|path| Path::new(path).is_file());
 			let device = native_nvidia_device_library()?;
 			let ptx_version = native_nvidia_ptx_version()?;
+			let bitcode = output.with_extension("bc");
 			let mut command = Command::new(compiler);
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
-				.arg(source)
-				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(output);
+				.arg("-Xclang").arg("-target-feature").arg("-Xclang").arg(ptx_version);
+			if codegen.is_some() {
+				command.args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(&bitcode);
+			} else {
+				command.args(["-O2", "-S", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(output);
+			}
 			native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			if let Some(codegen) = codegen {
+				let mut command = Command::new(codegen);
+				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
+				let generated = native_command(command, "NVIDIA PTX code generator", key);
+				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
+				generated?;
+			}
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -8495,8 +8509,19 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, width, keys, values, rope, yarn, index, gate } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate } = attention;
 	require(heads != 0, "attention head partition is invalid")?;
+	if width.is_none() && keys == heads && values == heads && graph.output.channels % heads != 0 {
+		let requested = heads;
+		let valid = (1..=requested.min(graph.output.channels)).rev().filter(|heads| graph.output.channels % heads == 0).take(3).collect::<Vec<_>>();
+		heads = valid[0];
+		keys = heads;
+		values = heads;
+		eprintln!(
+			"invalid: attn({requested})  valid: {}  choosing attn({heads})",
+			valid.iter().map(|heads| format!("attn({heads})")).collect::<Vec<_>>().join("|")
+		);
+	}
 	require(
 		keys != 0 && keys <= heads && heads % keys == 0,
 		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
