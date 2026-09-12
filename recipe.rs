@@ -3694,7 +3694,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, epoch: bool) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let mut ir = backend_template(backend, self.precision, matrix)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
@@ -3739,7 +3739,7 @@ impl NativeModelIr {
 				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
-		if let Some(loss) = loss {
+		if let Some(loss) = loss.filter(|_| epoch) {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
@@ -4455,7 +4455,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
 	let matrix = match target {
@@ -4464,7 +4464,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		_ => None,
 	}
 	.filter(|_| model.schedule.matrix);
-	let ir = model.emit(target.backend(), matrix, loss)?;
+	let ir = model.emit(target.backend(), matrix, loss, epoch)?;
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -4504,7 +4504,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: graph_storage(&model.graph)?, training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: graph_storage(&model.graph)?, training: epoch })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8917,7 +8917,8 @@ impl NativeTape {
 		let rows = samples.len() / input;
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
-		let program = gpu.native_program(graph, rows, precision, loss)?;
+		// A tape without targets only runs forward passes, so its artifact carries no epoch kernel.
+		let program = gpu.native_program(graph, rows, precision, loss, !targets.is_empty())?;
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
 		let zeros = vec![0.0; parameters.max(1)];
 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
@@ -10274,7 +10275,7 @@ impl Gpu {
 			Driver::Hsa(_) => Ok(()),
 		}
 	}
-	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
 			1
@@ -10426,7 +10427,7 @@ impl Gpu {
 			contractions,
 			attention,
 		};
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
+		let artifact = compile_model(&self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
 		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
 		let required = fixed
