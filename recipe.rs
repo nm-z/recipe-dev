@@ -4200,6 +4200,11 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
+		if loss.is_none() && matches!(backend, Backend::Amd) {
+			ir.push_str("declare void @llvm.assume(i1)\nattributes #4 = { nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }\n");
+			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
+			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
+		}
 		if loss.is_some() {
 			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
@@ -13512,10 +13517,13 @@ impl NativeTape {
 		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
-		let thread_count = threads;
+		let mut thread_count = threads;
+		let single = matches!(mode, ForwardMode::Inference) && end - begin == 1;
+		#[cfg(amd)]
+		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
-		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
@@ -14614,6 +14622,7 @@ impl Drop for HsaExecutable {
 #[cfg(amd)]
 struct NativeHsaProgram {
 	executable: HsaExecutable,
+	step: Option<Dispatch>,
 	kernarg: usize,
 	kernarg_size: usize,
 	grid_sync: usize,
@@ -15731,15 +15740,17 @@ impl Hsa {
 			driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 			driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
 			let forward = self.native_dispatch(executable.handle, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
+			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
+			let step = (!training).then(|| self.native_dispatch(executable.handle, element, step_waves, "recipe_model_step", NATIVE_FORWARD_LAYOUT)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-			let kernarg_size = [Some(forward), epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
+			let kernarg_size = [Some(forward), step, epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
 			let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
 			let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
 			let mut kernarg = ptr::null_mut();
 			driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, allocation_size, 0, &mut kernarg), "native KERNARG allocation")?;
 			driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), kernarg), "native GPU KERNARG access")?;
-			Ok((NativeHsaProgram { executable, kernarg: kernarg as usize, kernarg_size, grid_sync: kernarg.add(grid_sync) as usize, free: self.free }, forward, epoch, model_load))
+			Ok((NativeHsaProgram { executable, step, kernarg: kernarg as usize, kernarg_size, grid_sync: kernarg.add(grid_sync) as usize, free: self.free }, forward, epoch, model_load))
 		}
 	}
 }
@@ -15988,7 +15999,12 @@ impl NativeProgram {
 		}
 	}
 
-	fn launch_forward(&self, arguments: &mut [Ptr]) -> Result<()> {
+	fn launch_forward(&self, arguments: &mut [Ptr], single: bool) -> Result<()> {
+		#[cfg(amd)]
+		if single && let NativeBackend::Amd(program) = &self.backend && let Some(dispatch) = program.step {
+			return self.launch_dispatch(NativeEntry::Forward, arguments, dispatch.geometry.threads()?, dispatch);
+		}
+		let _ = single;
 		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?)
 	}
 
@@ -16003,9 +16019,11 @@ impl NativeProgram {
 	}
 
 	fn launch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32) -> Result<()> {
+		self.launch_dispatch(entry, arguments, threads, self.dispatch(entry)?)
+	}
+	fn launch_dispatch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dispatch: Dispatch) -> Result<()> {
 		let gpu = self.gpu;
 		require(!INTERRUPTED.load(Ordering::Acquire), "interrupted before native dispatch")?;
-		let dispatch = self.dispatch(entry)?;
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
 		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
