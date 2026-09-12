@@ -157,7 +157,7 @@ define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addr
 const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
-define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: %bits = bitcast RECIPE_STATE %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to RECIPE_STATE ret RECIPE_STATE %partner }"#;
+define internal float @recipe.wave.partner(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
