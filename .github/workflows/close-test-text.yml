@@ -4,14 +4,26 @@ on:
   push:
     branches:
       - '**'
+  workflow_run:
+    workflows: ['os/device check']
+    types: [completed]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  check_run:
+    types: [completed]
+  status:
+  workflow_dispatch:
 
 permissions:
   contents: read
+  checks: read
+  statuses: read
   issues: write
   pull-requests: write
 
 jobs:
   close:
+    if: github.event_name == 'push'
     name: no-tests
     runs-on: ubuntu-latest
     steps:
@@ -177,6 +189,7 @@ jobs:
           done
 
   require-minimal-base:
+    if: github.event_name == 'push'
     name: target-minimal
     concurrency:
       group: recipe-minimal-base-policy-${{ github.run_id }}
@@ -232,6 +245,7 @@ jobs:
           fi
 
   draft-conflicts:
+    if: github.event_name == 'push'
     name: draft-prs-w-merge-conflicts
     concurrency:
       group: recipe-merge-conflict-policy-${{ github.run_id }}
@@ -330,3 +344,40 @@ jobs:
             printf 'Draft conversion failed for PRs: %s.\n' "${failed_prs[*]}" >&2
             exit 1
           fi
+
+  draft-failed-checks:
+    name: draft-prs-w-failed-checks
+    needs: [close, require-minimal-base, draft-conflicts]
+    if: always()
+    runs-on: ubuntu-latest
+    concurrency:
+      group: recipe-draft-failed-checks
+      cancel-in-progress: false
+    steps:
+      - name: Draft open pull requests with failed checks
+        env:
+          GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed='[.statusCheckRollup[]? | select(
+            .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or
+            .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or
+            .state == "FAILURE" or .state == "ERROR")] | length > 0'
+          candidates="$(gh pr list --repo "$REPOSITORY" --state open --limit 1000 \
+            --json number,isDraft,statusCheckRollup \
+            --jq ".[] | select(.isDraft == false) | select($failed) | .number")"
+          while IFS= read -r number; do
+            [[ -n "$number" ]] || continue
+            pull="$(gh pr view "$number" --repo "$REPOSITORY" \
+              --json state,isDraft,headRefOid,statusCheckRollup)"
+            if ! jq -e "(.state == \"OPEN\" and .isDraft == false) and ($failed)" <<< "$pull" >/dev/null; then
+              continue
+            fi
+            sha="$(jq -r .headRefOid <<< "$pull")"
+            current="$(gh pr view "$number" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
+            [[ "$sha" == "$current" ]] || continue
+            gh pr ready "$number" --repo "$REPOSITORY" --undo
+            printf 'Drafted PR #%s: failed checks on %s.\n' "$number" "$sha" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$candidates"
