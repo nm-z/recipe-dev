@@ -3068,7 +3068,21 @@ impl NativeModelIr {
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
 					let attention_carry = i32::from(pointers.attention_kv.is_some());
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let (tile_m, tile_n) = if self.inference && attention == "attention_forward_body" {
+						let step = native_attention_tile(
+							narrow(node.output.length, "attention length")? as u32,
+							extent.k,
+							self.schedule.shared_values,
+							1,
+							true,
+						)?;
+						let prefix = format!("n{index}.attention.step");
+						ir.push_str(&format!("%{prefix}.one = icmp eq i32 {span}, 1\n%{prefix}.m = select i1 %{prefix}.one, i32 1, i32 {full_m}\n%{prefix}.n = select i1 %{prefix}.one, i32 {step_n}, i32 {full_n}\n", full_m = extent.m, full_n = extent.n, step_n = step.n));
+						(format!("%{prefix}.m"), format!("%{prefix}.n"))
+					} else {
+						(extent.m.to_string(), extent.n.to_string())
+					};
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
