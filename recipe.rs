@@ -5397,6 +5397,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
+		precision: Compute,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
@@ -5417,7 +5418,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, precision: Compute::FP64 })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -5462,6 +5463,11 @@ mod gguf {
 		/// Every key-value pair of the first shard, in file order.
 		pub fn metadata(&self) -> &[(String, GgufValue)] {
 			&self.metadata
+		}
+		/// Select arithmetic precision without changing the file's weight storage.
+		pub fn fp(mut self, bits: u8) -> Self {
+			self.precision = recipe.train().fp(bits).precision;
+			self
 		}
 		pub fn value(&self, key: &str) -> Option<&GgufValue> {
 			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
@@ -10001,7 +10007,7 @@ impl Binding {
 /// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
-	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, Compute::FP64, None)?;
+	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, model.precision, None)?;
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
@@ -10013,7 +10019,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		*slot = f64::from(*id);
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
-	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Compute::FP64, None)?;
+	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, model.precision, None)?;
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -10044,7 +10050,8 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	let config = Config::load()?;
+	let mut config = Config::load()?;
+	config.precision = model.precision;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
