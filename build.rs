@@ -761,6 +761,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
+	println!("cargo:rustc-env=RECIPE_NV_CODEGEN={}", platform(manifest, "nvidia-codegen", os)?);
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	println!(
 		"cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}",
