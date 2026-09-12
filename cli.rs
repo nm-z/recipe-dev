@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [export]\n       recipe --runtime\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -57,32 +57,16 @@ fn library_path(directory: &Path) -> PathBuf {
 	}
 	selected
 }
-fn source_hash(source: &Path) -> u64 {
-	fs::read(source)
-		.unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()))
-		.into_iter()
-		.fold(1_469_598_103_934_665_603, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211))
-}
 
 fn run(source: &Path, device: Option<&str>) {
-	#[cfg(target_os = "linux")]
-	if std::env::var_os("RECIPE_RUNTIME_EXECUTOR").is_none() {
-		recipe::submit(source, device)
-	}
-	recipe::runtime_watch().unwrap_or_else(|error| panic!("{error}"));
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
 	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
-	let expected = std::env::var("RECIPE_RUNTIME_SOURCE_HASH").ok().map(|hash| u64::from_str_radix(&hash, 16).unwrap_or_else(|error| panic!("invalid runtime source hash: {error}")));
-	if let Some(expected) = expected {
-		assert_eq!(source_hash(source), expected, "submitted source changed before compilation");
-	}
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc")
 		.arg("--edition=2024")
-		.args(["--crate-name", "recipe_script"])
 		.arg(source)
 		.arg("--extern")
 		.arg(format!("recipe={}", library.display()))
@@ -95,12 +79,6 @@ fn run(source: &Path, device: Option<&str>) {
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
-	}
-	if let Some(expected) = expected
-		&& source_hash(source) != expected
-	{
-		fs::remove_file(&output).ok();
-		panic!("submitted source changed during compilation")
 	}
 	let mut command = Command::new(&output);
 	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
@@ -122,13 +100,6 @@ fn main() {
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	while let Some(argument) = arguments.next() {
-		if argument == "--runtime" {
-			recipe::runtime_serve().unwrap_or_else(|error| {
-				eprintln!("{error}");
-				std::process::exit(1)
-			});
-			return;
-		}
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
 			recipe::worker_serve(&name).unwrap_or_else(|error| {
@@ -169,7 +140,7 @@ fn main() {
 	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
 	let device = device.as_deref();
 	let source = Path::new(&source);
-	if source.extension().and_then(|value| value.to_str()) != Some("rs") && std::env::var_os("RECIPE_RUNTIME_EXECUTOR").is_none() {
+	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
