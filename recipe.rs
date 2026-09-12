@@ -10954,10 +10954,10 @@ impl Sampler {
 			let logit = &mut candidates[*id as usize].1;
 			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
 		}
-		candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
 		if self.temperature <= 0.0 {
-			return candidates[0].0;
+			return candidates.iter().max_by(|left, right| left.1.total_cmp(&right.1).then(right.0.cmp(&left.0))).unwrap().0;
 		}
+		candidates.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
 		if self.top_k != 0 {
 			candidates.truncate(self.top_k);
 		}
