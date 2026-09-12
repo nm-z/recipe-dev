@@ -3,7 +3,7 @@ use recipe::*;
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
 
 fn main() {
-	let precision = std::env::var("RNJ_FP").ok().map(|v| v.parse().unwrap()).unwrap_or(32);
+	let precision = std::env::var("RNJ_FP").ok().map(|v| v.parse().unwrap()).unwrap_or(16);
 	let data = recipe.gguf(GGUF).fp(precision);
 	let integer = |key: &str| data.value(key).unwrap().integer().unwrap() as usize;
 	let float = |key: &str| data.value(key).unwrap().float().unwrap();
