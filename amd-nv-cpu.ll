@@ -2426,7 +2426,7 @@ ret void
 }
 define internal void @attention_forward_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
-ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context,
+ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
@@ -2596,7 +2596,7 @@ tile.scan.block.done:
 %tile.scan.q.next = add i32 %tile.scan.q, 1
 br label %tile.scan.loop
 key.stage.loop:
-%key.p = phi i32 [ %lid, %key.tile.prepare ], [ %lid, %tile.scan.block.step ], [ %key.p.next, %key.stage.step ]
+%key.p = phi i32 [ %lid, %key.tile.prepare ], [ %lid, %tile.scan.block.step ], [ %key.p.next, %key.loaded ]
 %key.p.more = icmp ult i32 %key.p, %active.key.values
 br i1 %key.p.more, label %key.stage.step, label %key.stage.done
 key.stage.step:
@@ -2608,15 +2608,45 @@ key.stage.step:
 %key.local.wide = zext i32 %key.local to i64 %key.position.wide = zext i32 %key.position to i64 %key.input.local = add i64 %key.channel.base, %key.position.wide
 %key.plane = add i64 %row.base.wide, %from.global
 %key.input.index = add i64 %key.plane, %key.input.local
+%key.past = icmp ult i32 %key.position, %query.begin
+%key.use.cache = and i1 %carry, %key.past
+br i1 %key.use.cache, label %key.cache.load, label %key.source.load
+key.cache.load:
+%key.cache.row = mul i64 %row.wide, %kv.planes.global
+%key.cache.index = add i64 %key.cache.row, %key.input.local
+%key.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.cache.index
+%key.cache.value = load double, ptr addrspace(1) %key.cache.ptr, align 8
+%value.cache.index = add i64 %key.cache.row, %kv.plane.global
+%value.cache.index.final = add i64 %value.cache.index, %key.input.local
+%value.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.cache.index.final
+%value.cache.value = load double, ptr addrspace(1) %value.cache.ptr, align 8
+br label %key.loaded
+key.source.load:
 %key.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %key.input.index
-%key.value = load double, ptr addrspace(1) %key.input.ptr, align 8
-%key.shared.index = add i32 %key.base.shared, %key.p
-%key.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %key.shared.index
-store double %key.value, ptr addrspace(3) %key.shared.ptr, align 8
+%key.source.value = load double, ptr addrspace(1) %key.input.ptr, align 8
 %value.row = add i64 %row.base.wide, %value.plane.base.global
 %value.input.index = add i64 %value.row, %key.input.local
 %value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.input.index
-%value.value = load double, ptr addrspace(1) %value.input.ptr, align 8
+%value.source.value = load double, ptr addrspace(1) %value.input.ptr, align 8
+br i1 %carry, label %key.cache.store, label %key.loaded.source
+key.cache.store:
+%key.store.row = mul i64 %row.wide, %kv.planes.global
+%key.store.index = add i64 %key.store.row, %key.input.local
+%key.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.store.index
+store double %key.source.value, ptr addrspace(1) %key.store.ptr, align 8
+%value.store.index = add i64 %key.store.row, %kv.plane.global
+%value.store.index.final = add i64 %value.store.index, %key.input.local
+%value.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.store.index.final
+store double %value.source.value, ptr addrspace(1) %value.store.ptr, align 8
+br label %key.loaded.source
+key.loaded.source:
+br label %key.loaded
+key.loaded:
+%key.value = phi double [ %key.cache.value, %key.cache.load ], [ %key.source.value, %key.loaded.source ]
+%value.value = phi double [ %value.cache.value, %key.cache.load ], [ %value.source.value, %key.loaded.source ]
+%key.shared.index = add i32 %key.base.shared, %key.p
+%key.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %key.shared.index
+store double %key.value, ptr addrspace(3) %key.shared.ptr, align 8
 %value.shared.index = add i32 %value.base.shared, %key.p
 %value.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %value.shared.index
 store double %value.value, ptr addrspace(3) %value.shared.ptr, align 8
@@ -2836,9 +2866,54 @@ br label %job.loop
 exit:
 ret void
 }
+define internal void @attention_cache_body(
+ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) %kv.context,
+i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %length, i32 %threads ) #3 { entry:
+%lid = call i32 @recipe.local.id.x()
+%head.width = udiv i32 %from, %heads
+%kv.channels = mul i32 %kv.heads, %head.width
+%kv.plane = mul i32 %kv.channels, %length
+%kv.planes = mul i32 %kv.plane, 2
+%row.stride = add i32 %from, %kv.planes
+%total = mul i32 %rows, %kv.planes
+%start = add i32 %lid, 0
+br label %cache.loop
+cache.loop:
+%p = phi i32 [ %start, %entry ], [ %next, %cache.step ]
+%more = icmp ult i32 %p, %total
+br i1 %more, label %cache.step, label %cache.done
+cache.step:
+%row = udiv i32 %p, %kv.planes
+%within = urem i32 %p, %kv.planes
+%plane = udiv i32 %within, %kv.plane
+%local = urem i32 %within, %kv.plane
+%channel = udiv i32 %local, %length
+%position = urem i32 %local, %length
+%source.row = mul i32 %row, %row.stride
+%source.plane.other = add i32 %from, %kv.plane
+%plane.zero = icmp eq i32 %plane, 0
+%source.plane = select i1 %plane.zero, i32 %from, i32 %source.plane.other
+%source.channel = mul i32 %channel, %length
+%source.index = add i32 %source.row, %source.plane
+%source.index.local = add i32 %source.index, %source.channel
+%source.index.final = add i32 %source.index.local, %position
+%source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %source.index.final
+%value = load double, ptr addrspace(1) %source.ptr, align 8
+%kv.row = mul i32 %row, %kv.planes
+%kv.plane.base = mul i32 %plane, %kv.plane
+%kv.index = add i32 %kv.row, %kv.plane.base
+%kv.index.local = add i32 %kv.index, %source.channel
+%kv.index.final = add i32 %kv.index.local, %position
+%kv.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i32 %kv.index.final
+store double %value, ptr addrspace(1) %kv.ptr, align 8
+%next = add i32 %p, %threads
+br label %cache.loop
+cache.done:
+ret void
+}
 define internal void @attention_forward_matrix_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
-ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context,
+ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
@@ -2850,6 +2925,12 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %head.width = udiv i32 %channels, %heads
 %width.double = call double @recipe.from.u32(i32 %head.width)
 %scale = call double @recipe.sqrt(double %width.double)
+br i1 %carry, label %attention.cache.entry, label %attention.cache.done
+attention.cache.entry:
+call void @attention_cache_body( ptr addrspace(1) %input, ptr addrspace(1) %kv.context, i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %length, i32 %threads )
+call void @recipe.local.barrier()
+br label %attention.cache.done
+attention.cache.done:
 %head.jobs = mul i32 %rows, %heads
 %statistics.rows = mul i32 %head.jobs, %length
 %rows.global = zext i32 %rows to i64 %from.global = zext i32 %from to i64 %channels.global = zext i32 %channels to i64 %heads.global = zext i32 %heads to i64 %length.global = zext i32 %length to i64 %head.width.global = zext i32 %head.width to i64

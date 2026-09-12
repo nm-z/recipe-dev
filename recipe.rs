@@ -1318,6 +1318,9 @@ use std::sync::atomic::AtomicUsize;
 pub(crate) struct NativeLayout {
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
+	/// The persistent K/V history region for an inference attention node, or
+	/// `None` for training and non-attention nodes.
+	pub attention_kv: Vec<Option<usize>>,
 	pub adjoints: Vec<usize>,
 	pub values_bytes: usize,
 	pub contexts_bytes: usize,
@@ -1595,7 +1598,12 @@ fn retained_outputs(graph: &Graph) -> Vec<bool> {
 		if node.op == Primitive::Scan {
 			retained[index] = true;
 		}
-		if let Ok(source) = usize::try_from(node.source) {
+		// Inference attention writes its settled keys and values to the dedicated
+		// context region. Its combined QKV source therefore only needs to live for
+		// the current window; training keeps the old full source for the reverse pass.
+		if node.op != Primitive::Attention
+			&& let Ok(source) = usize::try_from(node.source)
+		{
 			retained[source] |= beyond;
 		}
 		if let Ok(second) = usize::try_from(node.second) {
@@ -1633,6 +1641,7 @@ impl NativeLayout {
 		let unit = element.max(8);
 		let mut values = Vec::with_capacity(graph.nodes.len());
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
+		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_offset, mut context_offset, mut adjoint_offset) = (0, 0, 0);
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
@@ -1652,6 +1661,14 @@ impl NativeLayout {
 			context_offset = align(context_offset, unit)?;
 			contexts.push(context_offset);
 			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision, inference)?, "model context arena")?;
+			let kv = if inference && node.op == Primitive::Attention {
+				let offset = align(context_offset, unit)?;
+				context_offset = checked_add(offset, attention_kv_bytes(node, rows, precision)?, "attention K/V context")?;
+				Some(offset)
+			} else {
+				None
+			};
+			attention_kv.push(kv);
 			if inference {
 				adjoints.push(0);
 				let mut operands = [node.source, node.second, index as i32];
@@ -1671,7 +1688,7 @@ impl NativeLayout {
 				adjoint_offset = checked_add(adjoint_offset, bytes, "model adjoint arena")?;
 			}
 		}
-		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
+		Ok(Self { values, contexts, attention_kv, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
 	}
 }
 
@@ -1679,6 +1696,7 @@ struct NodePlan {
 	node: Node,
 	value: usize,
 	context: usize,
+	attention_kv: Option<usize>,
 	adjoint: usize,
 	stored: Option<StoredWeight>,
 	storage_offset: usize,
@@ -1757,6 +1775,7 @@ impl NativeModelIr {
 				node,
 				value: layout.values[index],
 				context: layout.contexts[index],
+				attention_kv: layout.attention_kv[index],
 				adjoint: layout.adjoints[index],
 				stored,
 				storage_offset,
@@ -3047,7 +3066,9 @@ impl NativeModelIr {
 					// the window are zero and the causal mask drops them, so it stays
 					// correct on a step but reworks the positions the window skips.
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
+					let attention_carry = i32::from(pointers.attention_kv.is_some());
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -3931,6 +3952,11 @@ impl NativeModelIr {
 		};
 		let value = format!("%{prefix}.value");
 		let context = format!("%{prefix}.context");
+		let attention_kv = plan.attention_kv.map(|offset| {
+			let pointer = format!("{prefix}.attention.kv");
+			ir.push_str(&ptr_gep(backend, "contexts", offset, &pointer));
+			format!("%{pointer}")
+		});
 		let delta = format!("%{prefix}.delta");
 		let weights = format!("%{prefix}.weights");
 		ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("{prefix}.value")));
@@ -3955,7 +3981,7 @@ impl NativeModelIr {
 		} else {
 			source_adjoint.clone()
 		};
-		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
+		Ok(ModelPointers { source, second, value, context, attention_kv, delta, weights, source_adjoint, second_adjoint })
 	}
 
 	fn emit_native_quantization(&self, backend: Backend, format: &'static Quantization, native: NativeDequant) -> Result<String> {
@@ -4279,6 +4305,7 @@ struct ModelPointers {
 	second: String,
 	value: String,
 	context: String,
+	attention_kv: Option<String>,
 	delta: String,
 	weights: String,
 	source_adjoint: String,
@@ -14180,6 +14207,21 @@ fn structural(value: f64) -> Result<i32> {
 }
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
+}
+/// The inference attention carry stores only the key and value planes for every
+/// settled position. Queries remain in the ordinary source window.
+fn attention_kv_bytes(node: &Node, rows: usize, precision: Compute) -> Result<usize> {
+	let heads = integer_argument(node.argument[0], "attention heads")? as usize;
+	let kv = integer_argument(node.argument[1], "attention key-value heads")? as usize;
+	require(heads != 0 && kv != 0 && heads % kv == 0, "attention key-value head partition is invalid")?;
+	require(node.output.channels % heads == 0, "attention channels do not divide query heads")?;
+	let width = node.output.channels / heads;
+	let elements = checked_mul(
+		checked_mul(checked_mul(rows, 2, "attention K/V rows")?, checked_mul(kv, width, "attention K/V channels")?, "attention K/V planes")?,
+		node.output.length,
+		"attention K/V positions",
+	)?;
+	checked_mul(elements, precision.bytes(), "attention K/V bytes")
 }
 // An embedding row is addressed inside the packed table, so the row must span
 // whole blocks and the layout must keep one row's blocks together.
