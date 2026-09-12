@@ -9644,31 +9644,10 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
-fn route_counts(route: &[usize], links: &[Link], rows: usize) -> Result<Vec<usize>> {
-	require(!route.is_empty() && route.len() <= rows, "route row capacity is invalid")?;
-	let total = route.iter().map(|device| links[*device].work).sum::<f64>();
-	require(total.is_finite() && total > 0.0, "route work is invalid")?;
-	let remaining = rows - route.len();
-	let mut counts = vec![1_usize; route.len()];
-	let mut remainders = Vec::with_capacity(route.len());
-	for (index, device) in route.iter().enumerate() {
-		let exact = remaining as f64 * links[*device].work / total;
-		require(exact.is_finite() && (0.0..=remaining as f64).contains(&exact), "route share is invalid")?;
-		let base = exact.floor() as usize;
-		counts[index] += base;
-		remainders.push((exact - base as f64, index));
-	}
-	let assigned = counts.iter().sum::<usize>();
-	let left = rows.checked_sub(assigned).ok_or_else(|| RecipeError::new("route shares exceed the available rows"))?;
-	remainders.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
-	require(left <= remainders.len(), "route shares leave too many rows")?;
-	for &(_, index) in remainders.iter().take(left) {
-		counts[index] += 1;
-	}
-	Ok(counts)
-}
-fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction) -> Result<(Vec<usize>, Placement)> {
-	let counts = route_counts(route, links, rows)?;
+fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
+	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
+	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
+	counts[0] += rows - counts.iter().sum::<usize>();
 	let (gradient_to_host, weights_from_host) = (
 		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
 		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
@@ -9721,7 +9700,7 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
 		// The fastest device leads the route and applies the one update.
 		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
-		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss)?;
+		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
 		let [computation, transfers, synchronization, movement] = placement.predicted;
 		eprintln!(
 			"route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}",
