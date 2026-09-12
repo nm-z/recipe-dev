@@ -18992,6 +18992,8 @@ struct Table {
 	rows: Vec<Vec<String>>,
 	/// Row-major image values are channel-major when each image row is one channel.
 	attention: Option<Shape>,
+	/// The file this table was decoded from, which is what a row naming it records; empty once tables are joined.
+	path: PathBuf,
 }
 enum FeatureType {
 	Numeric,
@@ -19037,13 +19039,15 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			continue;
 		}
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		for table in decode_tables(path, bytes)? {
+		for mut table in decode_tables(path, bytes)? {
+			table.path = path.clone();
 			grouped.push((directory.clone(), table));
 		}
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
 		return Ok((vec![table], paths));
 	}
+	resolve_references(&mut grouped)?;
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
@@ -19051,6 +19055,32 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		tables = align_samples(tables)?
 	}
 	Ok((tables, paths))
+}
+/// Resolve every column that records file names. A value names a file when it
+/// is a plain relative path from the recording table's directory to a table
+/// that was decoded. The first row decides whether a column is such a record;
+/// once it is, every row must resolve, and the cell becomes the path itself, so
+/// merging or joining the table never loses which file each row named.
+fn resolve_references(grouped: &mut [(PathBuf, Table)]) -> Result<()> {
+	let decoded = grouped.iter().map(|(_, table)| table.path.clone()).collect::<BTreeSet<_>>();
+	let reference = |directory: &Path, value: &str| {
+		let relative = Path::new(value);
+		let plain = !value.is_empty() && relative.components().all(|component| matches!(component, std::path::Component::Normal(_)));
+		plain.then(|| directory.join(relative)).filter(|path| decoded.contains(path))
+	};
+	for (directory, Table { name, headers, rows, .. }) in grouped.iter_mut() {
+		for (column, header) in headers.iter().enumerate() {
+			if rows.first().and_then(|row| row.get(column)).and_then(|value| reference(directory, value)).is_none() {
+				continue;
+			}
+			for row in rows.iter_mut() {
+				let value = row.get(column).map_or("", String::as_str);
+				let resolved = reference(directory, value).ok_or_else(|| RecipeError::new(format!("table {name:?} column {header:?} contains unresolved file reference {value:?}")))?;
+				row[column] = resolved.to_string_lossy().into_owned();
+			}
+		}
+	}
+	Ok(())
 }
 /// Align feature sources by logical sample count. A lone table's rows are its
 /// samples. Sibling tables that share a schema are whole-table samples, one per
@@ -19067,31 +19097,31 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			None => sources.push(vec![table]),
 		}
 	}
-	// Every column of a lone table is a candidate record of file names: the stems
+	// Every column of a lone table is a candidate record of file names: the paths
 	// it holds, in that table's own row order. It becomes a source candidate only
-	// when its values overlap the names of one sibling-file source below. A path-
+	// when its values overlap the paths of one sibling-file source below. A path-
 	// looking value by itself remains an ordinary categorical feature.
 	let mut recorded = Vec::new();
 	for source in &sources {
 		let [table] = source.as_slice() else { continue };
 		for column in 0..table.headers.len() {
 			let values = table.rows.iter().map(|row| row.get(column).cloned().unwrap_or_default()).collect::<Vec<_>>();
-			let stem = |value: &String| Path::new(value).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
-			recorded.push((table.name.clone(), table.headers[column].clone(), column, values.iter().map(stem).collect::<Vec<_>>()))
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, values))
 		}
 	}
 	// The recorded order of each group, when exactly one reading exists. Two
 	// columns naming the same files in different orders leave the association
-	// ambiguous, and files sharing a name cannot be ordered by name at all.
+	// ambiguous. Files are known by the path each was decoded from, so two
+	// captures may record the same file name without naming the same file.
 	let mut orders = Vec::new();
 	// The (table, column) pairs that turned out to name files.
 	let mut references = BTreeSet::new();
 	for source in &sources {
-		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		let names = source.iter().map(|table| table.path.to_string_lossy().into_owned()).collect::<BTreeSet<_>>();
 		let mut found: Option<(&String, &String, &Vec<String>)> = None;
 		if source.len() > 1 && names.len() == source.len() {
 			for (table, header, column, order) in &recorded {
-				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
+				if order.len() != names.len() || order.iter().cloned().collect::<BTreeSet<_>>() != names {
 					continue;
 				}
 				// A column that resolves a group's files is that group's identity, not
@@ -19116,11 +19146,8 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 		// not candidates, even when their values look like paths or URLs.
 		if source.len() > 1 && names.len() == source.len() {
 			for (table, header, column, order) in &recorded {
-				if order.len() == names.len()
-					&& order.iter().any(|name| names.contains(name.as_str()))
-					&& !references.contains(&(table.clone(), *column))
-				{
-					return Err(RecipeError::new(format!("table {table:?} column {header:?} contains unresolved file references")));
+				if order.len() == names.len() && order.iter().any(|name| names.contains(name)) && !references.contains(&(table.clone(), *column)) {
+					return Err(RecipeError::new(format!("table {table:?} column {header:?} names files of one source without recording each of its {} files once", names.len())));
 				}
 			}
 		}
@@ -19169,10 +19196,10 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			// Partitions of one source: every table's rows are samples of the same shape.
 			let headers = source[0].headers.clone();
 			let rows = source.into_iter().flat_map(|table| table.rows).collect::<Vec<_>>();
-			aligned.push(Table { name: "data".to_owned(), headers, declared, rows, attention: None });
+			aligned.push(Table { name: "data".to_owned(), headers, declared, rows, attention: None, path: PathBuf::new() });
 			continue;
 		};
-		source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()));
+		source.sort_by_key(|table| order.iter().position(|name| *name == table.path.to_string_lossy()).unwrap_or(order.len()));
 		let rows = source[0].rows.len();
 		let mut headers = Vec::new();
 		for row in 1..=rows {
@@ -19183,7 +19210,7 @@ fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
 			require(table.rows.len() == rows, format!("sample {:?} expected {rows} rows, received {}", table.name, table.rows.len()))?;
 			values.push(table.rows.into_iter().flatten().collect())
 		}
-		aligned.push(Table { name: "data".to_owned(), headers, declared, rows: values, attention: None })
+		aligned.push(Table { name: "data".to_owned(), headers, declared, rows: values, attention: None, path: PathBuf::new() })
 	}
 	Ok(aligned)
 }
@@ -19217,7 +19244,7 @@ fn grouped_sample_table<'a>(
 		rows.push(row);
 	}
 	headers.extend(targets.iter().cloned());
-	Ok(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) })
+	Ok(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0), path: PathBuf::new() })
 }
 fn manifest_sample<'a>(root: &Path, value: &str, files: &'a [(PathBuf, Vec<u8>)]) -> Option<(&'a Path, &'a [u8], Option<usize>)> {
 	let (name, page) = match value.split_once("#page=") {
@@ -19285,7 +19312,7 @@ fn manifest_table(data: &Data, root: &Path, files: &[(PathBuf, Vec<u8>)], parsed
 			rows.push(row);
 		}
 		headers.extend(data.target.iter().cloned());
-		return Ok(Some(Table { name: table.name.clone(), headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		return Ok(Some(Table { name: table.name.clone(), headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0), path: PathBuf::new() }));
 	}
 	Ok(None)
 }
@@ -19366,7 +19393,7 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 				rows.push(row);
 			}
 			headers.extend(targets.iter().cloned());
-			return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+			return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0), path: PathBuf::new() }));
 		}
 		// Name-labeled samples: one `__`-separated value per declared target
 		// precedes the sample name. An optional final `.input` qualifier groups
@@ -19492,7 +19519,7 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			}
 			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0), path: PathBuf::new() }));
 	}
 	if aligned {
 		return Ok(None);
@@ -19540,7 +19567,7 @@ impl SampleTableBuilder {
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, declared: true, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
+		Ok(Table { name, headers: self.headers, declared: true, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }), path: PathBuf::new() })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
@@ -20347,7 +20374,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, declared: true, rows, attention: None }])
+	Ok(vec![Table { name: "data".to_owned(), headers, declared: true, rows, attention: None, path: PathBuf::new() }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -20365,7 +20392,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), declared: true, rows: Vec::new(), attention: None };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), declared: true, rows: Vec::new(), attention: None, path: PathBuf::new() };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
@@ -20373,7 +20400,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 		}
 	}
 	let mut rows = Vec::new();
-	for index in members {
+	for &index in &members {
 		let positions = tables[index].headers.iter().map(|header| headers.iter().position(|value| value == header).unwrap()).collect::<Vec<_>>();
 		for row in std::mem::take(&mut tables[index].rows) {
 			let mut merged = std::iter::repeat_with(String::new).take(headers.len()).collect::<Vec<_>>();
@@ -20383,8 +20410,11 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 			rows.push(merged);
 		}
 	}
-	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, declared: true, rows, attention: None }])
+	// The partitions become one table where the first of them stood. Every other
+	// table, such as the sample files the partition rows name, stays for alignment.
+	let mut kept = tables.into_iter().enumerate().filter(|(index, _)| !members.contains(index)).map(|(_, table)| table).collect::<Vec<_>>();
+	kept.insert(members[0], Table { name: "data".to_owned(), headers, declared: true, rows, attention: None, path: PathBuf::new() });
+	Ok(kept)
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -20463,7 +20493,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None });
+		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None, path: PathBuf::new() });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -21228,7 +21258,7 @@ fn xlsx_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("XLSX worksheet {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize(headers.len(), String::new());
 		}
-		tables.push(Table { name, headers, declared: true, rows, attention: None });
+		tables.push(Table { name, headers, declared: true, rows, attention: None, path: PathBuf::new() });
 	}
 	require(!tables.is_empty(), "XLSX workbook has no worksheets")?;
 	Ok(tables)
@@ -21293,7 +21323,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, declared: true, rows: table_rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows: table_rows, attention: None, path: PathBuf::new() })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -21516,7 +21546,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, declared: true, rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows, attention: None, path: PathBuf::new() })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -21541,7 +21571,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, declared: !headerless, rows, attention: None }, blank))
+	Ok((Table { name, headers, declared: !headerless, rows, attention: None, path: PathBuf::new() }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
