@@ -1,0 +1,1 @@
+oval | stable neutral observation with a declared sample boundary

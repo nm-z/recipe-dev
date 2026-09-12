@@ -761,6 +761,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
+	println!("cargo:rustc-env=RECIPE_NV_CODEGEN={}", platform(manifest, "nvidia-codegen", os)?);
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	println!(
 		"cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}",
@@ -854,6 +855,11 @@ fn main() -> BuildResult<()> {
 		("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"),
 		("surrogate-rate", "RECIPE_SURROGATE_RATE"),
 		("surrogate-width", "RECIPE_SURROGATE_WIDTH"),
+		("schedule-candidates", "RECIPE_SCHEDULE_CANDIDATES"),
+		("schedule-measurements", "RECIPE_SCHEDULE_MEASUREMENTS"),
+		("schedule-budget", "RECIPE_SCHEDULE_BUDGET"),
+		("schedule-warmups", "RECIPE_SCHEDULE_WARMUPS"),
+		("schedule-minimum-improvement", "RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"),
 		("random-seed", "RECIPE_RANDOM_SEED"),
 		("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"),
 		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),
