@@ -100,6 +100,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	left * right
 
 	A branch step is an ordinary model step, so anything above goes inside one,
 	carrying its own activation, normalization, quantization and profile, and a
@@ -127,6 +128,21 @@ estimators:
 	svm()
 	bayes()
 ```
+
+`left * right` evaluates two model fragments from the same input and multiplies
+their equal-shaped outputs elementwise:
+
+```rust
+let gate = recipe.model().layer(width).gelu();
+let up = recipe.model().layer(width);
+let gated = gate * up;
+let model = recipe.model().res([gated]);
+```
+
+Both branches receive gradients and retain their own weights, bias exclusions,
+and block quantization. Nested residuals, mixtures, and estimator blocks use the
+same lowering and saved-model paths. Use `.scale(factor)` for multiplication by
+a scalar.
 
 Feature generation is banned.
 

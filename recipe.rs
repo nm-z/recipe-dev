@@ -6612,6 +6612,32 @@ mod bundle {
 	fn residual_text(value: &Block) -> String {
 		escape(&block_text(value))
 	}
+	fn product_branch_text(value: &ProductBranch) -> String {
+		let blocks = value.blocks.iter().map(residual_text).collect::<Vec<_>>().join(";");
+		format!("{}:{}:{blocks}", value.quantization, value.exclusions)
+	}
+	fn product_branch(value: &str) -> Result<ProductBranch> {
+		// Product records written before branch settings were carried contain only
+		// escaped block lists. New records prefix quantization and exclusions, so
+		// split only the first two colons and leave nested product text untouched.
+		let mut fields = value.splitn(3, ':');
+		let first = fields.next().unwrap_or("");
+		if let (Some(exclusions), Some(blocks)) = (fields.next(), fields.next())
+			&& let Ok(quantization) = first.parse::<u16>()
+			&& let Ok(exclusions) = exclusions.parse::<u8>()
+		{
+			return Ok(ProductBranch {
+				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				quantization,
+				exclusions,
+			});
+		}
+		Ok(ProductBranch {
+			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+			quantization: 0,
+			exclusions: 0,
+		})
+	}
 	fn residual(value: &str) -> Result<Block> {
 		let text = unescape(value)?;
 		// A fragment step used to be one of three fixed shapes carrying no
@@ -6710,6 +6736,7 @@ mod bundle {
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
 				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
 			}
@@ -6794,6 +6821,11 @@ mod bundle {
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
 			"identity" => Ok(Operation::Identity),
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"product" => {
+				let branches = split_escaped(rest, ',');
+				require(branches.len() == 2, "product must contain two branches")?;
+				Ok(Operation::Product(product_branch(&branches[0])?, product_branch(&branches[1])?))
+			}
 			"moe_blocks" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
@@ -7762,6 +7794,7 @@ enum Operation {
 	Gru(usize),
 	Lstm(usize),
 	Residual(Vec<Block>),
+	Product(ProductBranch, ProductBranch),
 	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
@@ -7904,6 +7937,15 @@ pub struct Block {
 	frozen: bool,
 	packed: bool,
 }
+/// The blocks and model-level forward settings captured by one product branch.
+/// Product lowering applies exclusions locally, so one branch cannot alter the
+/// bias configuration of its sibling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductBranch {
+	blocks: Vec<Block>,
+	quantization: u16,
+	exclusions: u8,
+}
 macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
 	self.act(Activation::$activation)
 })+}; }
@@ -7928,6 +7970,48 @@ impl Block {
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
 		self.qk = Some(normalization);
 		self
+	}
+	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		match &mut self.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		self
+	}
+	/// Head width of this `attn` block. Without it, the width comes from the
+	/// residual stream and the heads partition the input.
+	pub fn width(self, width: usize) -> Self {
+		self.attention("width", |attention| attention.width = width)
+	}
+	/// Equal key and value heads of this `attn` block. Each head serves
+	/// `heads / kv` query heads.
+	pub fn kv(self, heads: usize) -> Self {
+		self.attention("kv", |attention| attention.kv = heads)
+	}
+	/// Rotary position embedding on this `attn` block.
+	pub fn rope(self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
+		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling for this `rope`.
+	pub fn yarn(self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
+			assert!(context != 0, "yarn context must be positive");
+			assert!(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered");
+			attention.yarn = Some((factor.to_bits(), context, fast.to_bits(), slow.to_bits()));
+		})
+	}
+	/// Sparse key selection on this `attn` block.
+	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
+	}
+	/// Sigmoid gate on the output of this `attn` block.
+	pub fn gate(self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
 	}
 	/// A step inside a fragment keeps its own storage format, exactly as a step
 	/// of the model does.
@@ -8081,13 +8165,12 @@ impl Model {
 	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
-	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+	/// Applies one attention modifier to the preceding block, so the model chain
+	/// and a standalone `attn(...)` block share one configuration path.
+	fn attention(&self, selector: &str, apply: impl FnOnce(Block) -> Block) -> Self {
 		let mut model = self.suffix();
-		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
-		match &mut block.operation {
-			Operation::Attention(attention) => apply(attention),
-			_ => panic!("{selector} requires a preceding attn block"),
-		}
+		let block = model.blocks.pop().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		model.blocks.push(apply(block));
 		model
 	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
@@ -8115,13 +8198,13 @@ impl Model {
 	/// Key-value heads of the preceding `attn` block. Each key-value head serves
 	/// `heads / kv` query heads.
 	pub fn kv(&self, heads: usize) -> Self {
-		self.attention("kv", |attention| attention.kv = heads)
+		self.attention("kv", |block| block.kv(heads))
 	}
 	/// Head width of the preceding `attn` block, so the heads need not partition
 	/// the stream. The block attends over `heads * width` and its gate spans the
 	/// same width before the output projection returns to the stream.
 	pub fn head(&self, width: usize) -> Self {
-		self.attention("head", |attention| attention.width = width)
+		self.attention("head", |block| block.width(width))
 	}
 	/// Compatibility spelling for the public attention head-width selector.
 	pub fn width(&self, width: usize) -> Self {
@@ -8145,26 +8228,17 @@ impl Model {
 	/// channels of every query and key head rotate by their position at
 	/// frequencies `base^(-2i/dims)`.
 	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
-		let layout = layout.layout();
-		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
-		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
-		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+		self.attention("rope", |block| block.rope(layout, dims, base))
 	}
 	/// YaRN frequency scaling for the preceding rotary attention block.
 	pub fn yarn(&self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
-		self.attention("yarn", |attention| {
-			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
-			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
-			assert!(context != 0, "yarn context must be positive");
-			assert!(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered");
-			attention.yarn = Some((factor.to_bits(), context, fast.to_bits(), slow.to_bits()));
-		})
+		self.attention("yarn", |block| block.yarn(factor, context, fast, slow))
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
 	/// of `block` keys, and each query attends to its best `keep` blocks.
 	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
+		self.attention("index", |value| value.index(heads, width, block, keep))
 	}
 	/// Token budget of the preceding `index`: each query keeps the blocks that
 	/// cover `tokens` keys, which is how a checkpoint's `attention.indexer.top_k`
@@ -8184,15 +8258,17 @@ impl Model {
 		self.indexer("score", |index| index.score = Some((normalization, dims)))
 	}
 	fn indexer(&self, selector: &str, apply: impl FnOnce(&mut Indexer)) -> Self {
-		self.attention(selector, |attention| match &mut attention.index {
-			Some(index) => apply(index),
-			None => panic!("{selector} requires a preceding index"),
+		self.attention(selector, |block| {
+			block.attention(selector, |attention| match &mut attention.index {
+				Some(index) => apply(index),
+				None => panic!("{selector} requires a preceding index"),
+			})
 		})
 	}
 	/// Sigmoid gate on the output of the preceding `attn` block, from its own
 	/// projection of the block input.
 	pub fn gate(&self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
+		self.attention("gate", |block| block.gate())
 	}
 	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
 	/// through a gated read and takes its output back through gated writes.
@@ -8224,17 +8300,7 @@ impl Model {
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
 	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
-		let mut model = self.clone();
-		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("query and key normalization requires a preceding block"));
-		let normalization = normalization.normalization();
-		if !matches!(block.operation, Operation::Attention(_)) {
-			panic!("query and key normalization requires an attention block");
-		}
-		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
-			panic!("query and key normalization must be rms or l2");
-		}
-		block.qk = Some(normalization);
-		model
+		self.attention("qk", |block| block.qk(normalization))
 	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
 		let mut model = self.clone();
@@ -9658,6 +9724,7 @@ impl Operation {
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Product(..) => "product",
 			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
 			Self::MoeBlocks(..) => "moe",
@@ -9678,6 +9745,7 @@ impl Operation {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) => false,
 			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
+			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
 			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			_ => true,
@@ -9741,6 +9809,35 @@ impl Model {
 	pub fn scale(&self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.activate(Activation::Scale(factor.to_bits()))
+	}
+}
+/// Rust multiplication composes two model fragments from the same incoming
+/// activation and produces one block, so the product can be placed in `res`.
+/// Each branch keeps its own blocks, quantization, and bias exclusions.
+impl std::ops::Mul for Model {
+	type Output = Block;
+	fn mul(self, right: Self) -> Block {
+		let Model { blocks: left, quantization, epsilon, frozen, packed, exclusions, .. } = self;
+		let Model { blocks: right, quantization: right_quantization, epsilon: right_epsilon, frozen: right_frozen, packed: right_packed, exclusions: right_exclusions, .. } = right;
+		assert!(!left.is_empty(), "the left product branch has no blocks");
+		assert!(!right.is_empty(), "the right product branch has no blocks");
+		assert!(!frozen && !packed && !right_frozen && !right_packed, "product branch qualifier requires a following block");
+		assert!(epsilon.to_bits() == right_epsilon.to_bits(), "product branches must use the same normalization epsilon");
+		Block::of(Operation::Product(
+			ProductBranch { blocks: left, quantization, exclusions },
+			ProductBranch { blocks: right, quantization: right_quantization, exclusions: right_exclusions },
+		))
+	}
+}
+/// Rust multiplication also composes two standalone blocks. Their modifiers
+/// remain attached to their respective product branches.
+impl std::ops::Mul for Block {
+	type Output = Self;
+	fn mul(self, right: Self) -> Self {
+		Block::of(Operation::Product(
+			ProductBranch { blocks: vec![self], quantization: 0, exclusions: 0 },
+			ProductBranch { blocks: vec![right], quantization: 0, exclusions: 0 },
+		))
 	}
 }
 pub struct Recipe;
@@ -11425,6 +11522,7 @@ fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) => true,
 		Operation::Residual(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
@@ -11625,6 +11723,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
@@ -12432,6 +12531,7 @@ fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
 		Operation::Residual(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
 }
@@ -12463,6 +12563,35 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, d
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	let second = if branch_shape == shape { skip } else { branch };
 	push_program(graph, second, &[], program)
+}
+/// Lower two model fragments from one source and multiply their outputs
+/// elementwise. The scalar-program reverse pass supplies each branch with the
+/// other branch's value, so both branch gradients reach the shared source.
+fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a product branch must contain an operation")?;
+	let (source, input) = (graph.source, graph.output);
+	let inherited_bias = graph.bias;
+	let (outer_frozen, outer_packed, outer_kind) = (graph.block_frozen, graph.block_packed, graph.block_kind);
+	graph.bias = inherited_bias && left.exclusions & bias.mask() == 0;
+	for block in &left.blocks {
+		graph.block_frozen = block.frozen;
+		graph.block_packed = block.packed;
+		graph.block_kind = block.operation.name();
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	let (left_source, shape) = (graph.source, graph.output);
+	reset(graph, source, input);
+	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
+	for block in &right.blocks {
+		graph.block_frozen = block.frozen;
+		graph.block_packed = block.packed;
+		graph.block_kind = block.operation.name();
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	graph.bias = inherited_bias;
+	(graph.block_frozen, graph.block_packed, graph.block_kind) = (outer_frozen, outer_packed, outer_kind);
+	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
+	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
 fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
