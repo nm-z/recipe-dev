@@ -154,6 +154,12 @@ const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
 %width = zext i16 %value to i32 ret i32 %width }"#;
+const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.wavefrontsize()
+define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
+define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: %bits = bitcast RECIPE_STATE %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to RECIPE_STATE ret RECIPE_STATE %partner }"#;
+const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
+define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }"#;
 fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
 	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
@@ -711,7 +717,7 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 }
 fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
-	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
+	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER).replace("; RECIPE_WAVE_HELPERS", AMD_WAVE_HELPERS);
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
@@ -745,6 +751,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
+		.replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
@@ -771,7 +778,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
+	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}

@@ -37,6 +37,7 @@ define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void
 ; NUMERIC END
 declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
+; RECIPE_WAVE_HELPERS
 declare void @llvm.trap() @contraction_tile = external addrspace(3) global [0 x double], align 16
 define internal double @contraction_input(
 ptr addrspace(1) %input, i64 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv ) #1 { entry:
@@ -885,6 +886,133 @@ br label %job.loop
 exit:
 ret void
 }
+; One output row per wave. The two waves in the normal gfx11 workgroup each
+; walk adjacent K elements, then use the wave fadd reduction without LDS.
+define internal void @contraction_forward_gemv_wave_body(
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
+i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%groups = udiv i32 %threads, %block
+%width = call i32 @recipe.wavefront.width()
+%waves = udiv i32 %block, %width
+%wave = udiv i32 %lid, %width
+%lane = urem i32 %lid, %width
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%terms = add i32 %in.channels, 0
+%terms.wide = zext i32 %terms to i64
+%in.length.wide = zext i32 %in.length to i64
+%position = zext i32 %out.begin to i64
+%weight.base.wide = add i64 %weight.base, 0
+%jobs.adjusted = add i32 %out.channels, %waves
+%jobs.numerator = sub i32 %jobs.adjusted, 1
+%jobs = udiv i32 %jobs.numerator, %waves
+br label %job.loop
+job.loop:
+%job = phi i32 [ %group, %entry ], [ %job.next, %job.done ]
+%job.more = icmp ult i32 %job, %jobs
+br i1 %job.more, label %job.step, label %exit
+job.step:
+%channel.base = mul i32 %job, %waves
+%channel = add i32 %channel.base, %wave
+%channel.active = icmp ult i32 %channel, %out.channels
+%channel.safe = select i1 %channel.active, i32 %channel, i32 0
+%channel.wide = zext i32 %channel.safe to i64
+%channel.offset = mul i64 %channel.wide, %terms.wide
+br label %sum.loop
+sum.loop:
+%k = phi i32 [ %lane, %job.step ], [ %k.next, %weight.ready ]
+%sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %sum.next, %weight.ready ]
+%k.more = icmp ult i32 %k, %terms
+br i1 %k.more, label %sum.step, label %sum.done
+sum.step:
+%k.wide = zext i32 %k to i64
+%weight.local.index = add i64 %channel.offset, %k.wide
+%weight.decode.index = add i64 %weight.base.wide, %weight.local.index
+%weight.packed = icmp ne i32 %decode, 0
+br i1 %weight.packed, label %weight.packed.load, label %weight.dense.load
+weight.dense.load:
+%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %weight.local.index
+%weight.dense.model = load double, ptr addrspace(1) %weight.ptr, align 8
+br label %weight.ready
+weight.packed.load:
+%weight.packed.model = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %weight.decode.index, i32 %decode)
+br label %weight.ready
+weight.ready:
+%weight.model = phi double [ %weight.dense.model, %weight.dense.load ], [ %weight.packed.model, %weight.packed.load ]
+%input.channel = zext i32 %k to i64
+%input.offset = mul i64 %input.channel, %in.length.wide
+%input.index = add i64 %input.offset, %position
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %input.index
+%input.model = load double, ptr addrspace(1) %input.ptr, align 8
+%weight.wide = call RECIPE_STATE @recipe.decode(double %weight.model)
+%input.wide = call RECIPE_STATE @recipe.decode(double %input.model)
+%product.raw = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
+%product = select i1 %channel.active, RECIPE_STATE %product.raw, RECIPE_STATE %state.zero
+%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
+%k.next = add i32 %k, %width
+br label %sum.loop
+sum.done:
+%reduce.offset.initial = udiv i32 %width, 2
+br label %reduce.loop
+reduce.loop:
+%reduce.offset = phi i32 [ %reduce.offset.initial, %sum.done ], [ %reduce.offset.next, %reduce.step ]
+%reduced = phi RECIPE_STATE [ %sum, %sum.done ], [ %reduced.next, %reduce.step ]
+%reduce.more = icmp ugt i32 %reduce.offset, 0
+br i1 %reduce.more, label %reduce.step, label %reduce.done
+reduce.step:
+%partner.lane = xor i32 %lane, %reduce.offset
+%partner.index = mul i32 %partner.lane, 4
+%partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %reduced, i32 %partner.index)
+%reduced.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %reduced, RECIPE_STATE %partner)
+%reduce.offset.next = udiv i32 %reduce.offset, 2
+br label %reduce.loop
+reduce.done:
+%owner = icmp eq i32 %lane, 0
+%store = and i1 %owner, %channel.active
+br i1 %store, label %bias.select, label %job.done
+bias.select:
+%bias.base = mul i32 %out.channels, %terms
+%bias.index = add i32 %bias.base, %channel
+%bias.wide.index = zext i32 %bias.index to i64
+br i1 %has.bias, label %bias.load, label %bias.zero
+bias.load:
+%bias.decode.index = add i64 %weight.base.wide, %bias.wide.index
+%bias.packed = icmp ne i32 %decode, 0
+br i1 %bias.packed, label %bias.packed.load, label %bias.dense.load
+bias.dense.load:
+%bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %bias.wide.index
+%bias.dense.model = load double, ptr addrspace(1) %bias.ptr, align 8
+br label %bias.ready
+bias.packed.load:
+%bias.packed.model = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %bias.decode.index, i32 %decode)
+br label %bias.ready
+bias.zero:
+%bias.zero.model = call double @recipe.encode(RECIPE_STATE %state.zero)
+br label %bias.ready
+bias.ready:
+%bias.model = phi double [ %bias.dense.model, %bias.dense.load ], [ %bias.packed.model, %bias.packed.load ], [ %bias.zero.model, %bias.zero ]
+%bias.wide = call RECIPE_STATE @recipe.decode(double %bias.model)
+%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %reduced, RECIPE_STATE %bias.wide)
+%sum.value = select i1 %has.bias, RECIPE_STATE %sum.bias, RECIPE_STATE %reduced
+%result.model = call double @recipe.encode(RECIPE_STATE %sum.value)
+%result.positive = call i1 @recipe.ogt(double %result.model, double 0.0)
+%result.activated = select i1 %result.positive, double %result.model, double 0.0
+%result = select i1 %relu, double %result.activated, double %result.model
+%output.channel = zext i32 %channel to i64
+%out.length.wide = zext i32 %out.length to i64
+%output.channel.base = mul i64 %output.channel, %out.length.wide
+%output.index = add i64 %output.channel.base, %position
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.index
+store double %result, ptr addrspace(1) %output.ptr, align 8
+br label %job.done
+job.done:
+%job.next = add i32 %job, %groups
+br label %job.loop
+exit:
+ret void
+}
 define internal void @contraction_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
 i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
@@ -900,9 +1028,21 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %fast.c = and i1 %fast.b, %reverse.off
 %fast.d = and i1 %fast.c, %accumulate.off
 %fast.e = and i1 %fast.d, %relu.off
-%fast = and i1 %fast.e, %transpose.off
-br i1 %fast, label %gemv, label %gemm
-gemv:
+%fast.f = and i1 %fast.e, %transpose.off
+%block = call i32 @recipe.workgroup.size.x()
+%width = call i32 @recipe.wavefront.width()
+%waves = udiv i32 %block, %width
+%waves.ok = icmp ugt i32 %waves, 0
+%width.ok = icmp ugt i32 %width, 1
+%wave.available = and i1 %waves.ok, %width.ok
+%wave.fast = and i1 %fast.f, %wave.available
+br i1 %wave.fast, label %wave, label %scalar.check
+wave:
+call void @contraction_forward_gemv_wave_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
+ret void
+scalar.check:
+br i1 %fast.f, label %scalar, label %gemm
+scalar:
 call void @contraction_forward_gemv_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
 ret void
 gemm:
