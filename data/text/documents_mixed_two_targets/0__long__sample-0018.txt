@@ -1,0 +1,1 @@
+system record 0018; stable named input observation 0018 with verified neutral sample content | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary

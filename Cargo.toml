@@ -52,6 +52,7 @@ hsa-finite-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc
 hsa-math-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc" }
 nvidia-ptx = "ptx71"
 nvidia-compiler = { linux = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
+nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc.exe" }
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
@@ -87,6 +88,11 @@ quantization-block-weights = 64
 surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
+schedule-candidates = 3
+schedule-measurements = 2
+schedule-budget = 64
+schedule-warmups = 1
+schedule-minimum-improvement = 0.05
 random-seed = 17
 progress-refresh-hz = 240
 normalization-epsilon = 0.00001

@@ -1279,6 +1279,397 @@ mod program_ir {
 	}
 }
 
+#[derive(Clone, Copy)]
+struct ScheduleCandidate {
+	node: usize,
+	direction: usize,
+	limits: Tile,
+	current: Tile,
+	extent: Tile,
+}
+struct ScheduleGroup {
+	reference: ScheduleCandidate,
+	candidates: Vec<ScheduleCandidate>,
+	unmeasured: Vec<usize>,
+	best: Option<(ScheduleCandidate, f64)>,
+}
+fn assign_candidate(assignment: &mut [Option<NativeContractionTiles>], candidate: ScheduleCandidate) -> Result<()> {
+	let tiles = assignment.get_mut(candidate.node).and_then(Option::as_mut).ok_or_else(|| RecipeError::new("native candidate node has no contraction"))?;
+	match candidate.direction {
+		0 => tiles.forward = candidate.extent,
+		1 => tiles.gradient = candidate.extent,
+		2 => tiles.previous = candidate.extent,
+		_ => return Err(RecipeError::new("native candidate direction is invalid")),
+	}
+	Ok(())
+}
+
+/// The schedule RAT uses one shared proposer for every contraction direction.
+/// Candidate features include the node, direction, shape limits, and proposed
+/// tile. The proposer sees the same node state plus the currently selected tile,
+/// then projects its continuous output onto the legal, unmeasured candidates.
+const SCHEDULE_RAT_STATE: usize = 8;
+const SCHEDULE_RAT_ACTION: usize = 8;
+
+fn schedule_axis(value: u32) -> f64 {
+	f64::from(value.max(1)).log2() / 16.0
+}
+
+fn schedule_candidate_features(candidate: &ScheduleCandidate) -> [f64; SCHEDULE_RAT_ACTION] {
+	[
+		(candidate.node as f64 + 1.0).log2() / 8.0,
+		candidate.direction as f64 / 2.0,
+		schedule_axis(candidate.extent.m),
+		schedule_axis(candidate.extent.n),
+		schedule_axis(candidate.extent.k),
+		schedule_axis(candidate.limits.m),
+		schedule_axis(candidate.limits.n),
+		schedule_axis(candidate.limits.k),
+	]
+}
+
+fn schedule_candidate_state(candidate: &ScheduleCandidate) -> [f64; SCHEDULE_RAT_STATE] {
+	[
+		(candidate.node as f64 + 1.0).log2() / 8.0,
+		candidate.direction as f64 / 2.0,
+		schedule_axis(candidate.limits.m),
+		schedule_axis(candidate.limits.n),
+		schedule_axis(candidate.limits.k),
+		schedule_axis(candidate.current.m),
+		schedule_axis(candidate.current.n),
+		schedule_axis(candidate.current.k),
+	]
+}
+
+/// Shared internal RAT state. Only real fused-epoch measurements are added to
+/// the scorer corpus; no synthetic timing or portable model state is stored.
+struct ScheduleRat {
+	proposer: Graph,
+	gpu: &'static Gpu,
+	samples: Vec<f64>,
+	seconds: Vec<f64>,
+}
+
+impl ScheduleRat {
+	fn new(gpu: &'static Gpu, config: Config) -> Result<Self> {
+		let data = Prepared {
+			samples: vec![0.0; SCHEDULE_RAT_STATE],
+			targets: vec![0.0; SCHEDULE_RAT_ACTION],
+			target_width: SCHEDULE_RAT_ACTION,
+			rows: 1,
+			source_rows: 1,
+			features: SCHEDULE_RAT_STATE,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let model = recipe.model().layer(config.surrogate_width).tanh().layer(SCHEDULE_RAT_ACTION);
+		let proposer = compile(&model, &data, &data.targets, 1, gpu, config, true)?;
+		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new() })
+	}
+
+	fn observe(&mut self, candidate: &ScheduleCandidate, seconds: f64) -> Result<()> {
+		require(seconds.is_finite() && seconds > 0.0, "native RAT measurement is invalid")?;
+		self.samples.extend(schedule_candidate_features(candidate));
+		self.seconds.push(seconds);
+		Ok(())
+	}
+
+	fn can_propose(&self) -> bool {
+		self.seconds.len() >= 2
+	}
+
+	fn proposal_launches(config: Config) -> Result<usize> {
+		checked_add(checked_mul(config.surrogate_epochs, 2, "native RAT proposal launches")?, 1, "native RAT proposal inference")
+	}
+
+	/// Fit a frozen differentiable scorer to the measured schedule corpus, then
+	/// update the shared proposer through the existing predictor/surrogate
+	/// straight-through composition. The returned indexes always address the
+	/// caller's currently unmeasured legal candidates.
+	fn propose(&mut self, groups: &[ScheduleGroup], config: Config) -> Result<Vec<Option<usize>>> {
+		if !self.can_propose() || groups.is_empty() {
+			return Ok(vec![None; groups.len()]);
+		}
+		let rows = self.seconds.len();
+		require(self.samples.len() == checked_mul(rows, SCHEDULE_RAT_ACTION, "native RAT sample corpus")?, "native RAT sample corpus has the wrong shape")?;
+		let minimum = self.seconds.iter().copied().fold(f64::INFINITY, f64::min);
+		let maximum = self.seconds.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+		let span = (maximum - minimum).max(f64::EPSILON);
+		let targets = self.seconds.iter().map(|seconds| ((*seconds - minimum) / span).clamp(0.0, 1.0)).collect::<Vec<_>>();
+		let observed = Prepared {
+			samples: self.samples.clone(),
+			targets: targets.clone(),
+			target_width: 1,
+			rows,
+			source_rows: rows,
+			features: SCHEDULE_RAT_ACTION,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities: Vec::new(),
+			fitted: Vec::new(),
+		};
+		let validation = fit_knn(1, &observed, rows, config)?;
+		let held_out = predict_rows(&validation, &self.samples, SCHEDULE_RAT_ACTION)?;
+		debug(&format!("schedule RAT observations={rows} held_out_r2={:.6}", coefficient(&targets, &held_out)))?;
+		let rat_config = config;
+		let surrogate = fit_surrogate(Shape { channels: SCHEDULE_RAT_ACTION, length: 1 }, &self.samples, &targets, rat_config.surrogate_width, self.gpu, rat_config)?;
+		let mut composition = self.proposer.clone();
+		let proposal_source = composition.source;
+		let proposer_parameters = composition.parameters.len();
+		push_predictor(&mut composition, validation.program)?;
+		let measured_score = composition.source;
+		reset(&mut composition, proposal_source, Shape { channels: SCHEDULE_RAT_ACTION, length: 1 });
+		let surrogate_score = append_graph(&mut composition, surrogate)?;
+		let mut straight_through = ScalarProgram(Vec::new());
+		straight_through.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
+		program(&mut composition, measured_score, surrogate_score, Shape { channels: 1, length: 1 }, &[], straight_through)?;
+		let mut moments = vec![0.0; composition.parameters.len()];
+		let mut variances = vec![0.0; composition.parameters.len()];
+		if self.proposer.state.moments.len() == proposer_parameters {
+			moments[..proposer_parameters].copy_from_slice(&self.proposer.state.moments);
+		}
+		if self.proposer.state.variances.len() == proposer_parameters {
+			variances[..proposer_parameters].copy_from_slice(&self.proposer.state.variances);
+		}
+		composition.state.moments = moments;
+		composition.state.variances = variances;
+		composition.state.epoch = self.proposer.state.epoch;
+		composition.frozen[proposer_parameters..].fill(1);
+
+		let states = groups.iter().map(|group| schedule_candidate_state(&group.reference)).flatten().collect::<Vec<_>>();
+		let targets = vec![0.0; groups.len()];
+		let mut tape = NativeTape::new(&composition, &states, &targets, self.gpu, rat_config.precision, Some(mse))?;
+		for _ in 0..rat_config.surrogate_epochs {
+			tape.advance()?;
+			tape.full_epoch(rat_config.surrogate_rate, rat_config)?;
+		}
+		tape.capture(&mut composition)?;
+		self.proposer.parameters.copy_from_slice(&composition.parameters[..proposer_parameters]);
+		self.proposer.state.moments = composition.state.moments[..proposer_parameters].to_vec();
+		self.proposer.state.variances = composition.state.variances[..proposer_parameters].to_vec();
+		self.proposer.state.epoch = composition.state.epoch;
+		let mut tape = NativeTape::new(&self.proposer, &states, &[], self.gpu, rat_config.precision, None)?;
+		tape.forward(ForwardMode::Inference)?;
+		let proposals = tape.predictions()?;
+		require(proposals.len() == groups.len() * SCHEDULE_RAT_ACTION, "native RAT proposer output has the wrong shape")?;
+		Ok(groups
+			.iter()
+			.enumerate()
+			.map(|(group, value)| {
+				let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
+				value.unmeasured.iter().enumerate().min_by(|left, right| {
+					distance(proposal, &schedule_candidate_features(&value.candidates[*left.1]))
+						.total_cmp(&distance(proposal, &schedule_candidate_features(&value.candidates[*right.1])))
+				}).map(|(position, _)| position)
+			})
+			.collect())
+	}
+}
+struct ScheduleMeasurement {
+	median: f64,
+	low: f64,
+	high: f64,
+	repeatable: bool,
+	state: NativeEpochState,
+}
+/// Measures one runtime schedule on the real fused epoch. Warmups are excluded
+/// from the timing sample, and every launch starts from the same full state.
+fn measure_schedule(tape: &mut NativeTape, snapshot: &NativeTrainingState, assignment: &[Option<NativeContractionTiles>], rate: f64, config: Config) -> Result<ScheduleMeasurement> {
+	let measured = (|| {
+		let launches = checked_add(config.schedule_warmups, config.schedule_measurements, "native schedule measurement launches")?;
+		let mut times = Vec::with_capacity(config.schedule_measurements);
+		let mut observed: Option<NativeEpochState> = None;
+		let mut repeatable = true;
+		for launch in 0..launches {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+			tape.restore_state(snapshot)?;
+			tape.apply_contraction_schedule(assignment.to_vec())?;
+			tape.advance()?;
+			tape.program.gpu.synchronize()?;
+			let started = Instant::now();
+			let objective = tape.full_epoch(rate, config)?;
+			tape.program.gpu.synchronize()?;
+			let elapsed = started.elapsed().as_secs_f64();
+			require(objective.is_finite(), "native schedule measurement produced a nonfinite objective")?;
+			require(elapsed.is_finite() && elapsed > 0.0, "native schedule measurement duration is invalid")?;
+			if launch < config.schedule_warmups {
+				continue;
+			}
+			let state = tape.epoch_state(objective)?;
+			if let Some(first) = &observed {
+				repeatable &= first == &state;
+			} else {
+				observed = Some(state);
+			}
+			times.push(elapsed);
+		}
+		require(!times.is_empty(), "native schedule measurement is empty")?;
+		times.sort_by(f64::total_cmp);
+		let state = observed.ok_or_else(|| RecipeError::new("native schedule measurement state is empty"))?;
+		Ok(ScheduleMeasurement { median: times[times.len() / 2], low: times[0], high: *times.last().unwrap_or(&times[0]), repeatable, state })
+	})();
+	let restored = tape.restore_state(snapshot);
+	match (measured, restored) {
+		(Ok(measured), Ok(())) => Ok(measured),
+		(Err(error), _) | (_, Err(error)) => Err(error),
+	}
+}
+/// Tunes one shard and publishes only an exact, repeatable, statistically
+/// separated winner. A failed combined gate leaves the complete heuristic in
+/// place, even when individual directions looked promising.
+fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, budget: &mut usize) -> Result<()> {
+	if config.schedule_candidates == 0 || tape.program.epoch.is_none() || tape.program.schedule.contractions.iter().all(Option::is_none) {
+		return Ok(());
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted before native schedule tuning")?;
+	let launches = checked_add(config.schedule_warmups, config.schedule_measurements, "native schedule launches")?;
+	if *budget < launches {
+		debug(&format!("schedule tune skipped device={} allocation={} required={launches}", tape.device_label()?, *budget))?;
+		return Ok(());
+	}
+	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
+	let allocation = *budget;
+	let identity = native_device_identity(tape.program.gpu, config, allocation);
+	let cache = native_schedule_cache_path(&tape.program.artifact, &identity)?;
+	let heuristic = tape.program.schedule.contractions.clone();
+	if let Some(assignment) = load_schedule_cache(&cache, &identity, &tape.program.schedule, &tape.program.shapes, ratio) {
+		tape.apply_contraction_schedule(assignment)?;
+		debug(&format!("schedule cache hit path={} device={identity} tiles={}", cache.display(), tape.schedule()))?;
+		return Ok(());
+	}
+	let mut groups = Vec::new();
+	for (node, shape) in tape.program.shapes.iter().enumerate() {
+		let Some(shape) = shape else { continue };
+		let Some(current_tiles) = heuristic[node] else { continue };
+		for (direction, (limits, current)) in [(shape.forward, current_tiles.forward), (shape.gradient, current_tiles.gradient), (shape.previous, current_tiles.previous)].into_iter().enumerate() {
+			let reference = ScheduleCandidate { node, direction, limits, current, extent: current };
+			let candidates = schedule_candidates(limits, current, &tape.program.schedule, ratio, config.schedule_candidates)?
+				.into_iter()
+				.filter(|extent| *extent != current)
+				.map(|extent| ScheduleCandidate { node, direction, limits, current, extent })
+				.collect::<Vec<_>>();
+			if !candidates.is_empty() {
+				groups.push(ScheduleGroup { reference, unmeasured: (0..candidates.len()).collect(), candidates, best: None });
+			}
+		}
+	}
+	if groups.is_empty() {
+		require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+		store_schedule_cache(&cache, &identity, &heuristic)?;
+		return Ok(());
+	}
+	let snapshot = tape.snapshot_state()?;
+	let mut rat = ScheduleRat::new(tape.program.gpu, config)?;
+	*budget -= launches;
+	let baseline = measure_schedule(tape, &snapshot, &heuristic, rate, config)?;
+	let mut assignments = 1_usize;
+	debug(&format!("schedule tune baseline median={:.6} low={:.6} high={:.6} repeatable={} budget={} device={identity}", baseline.median, baseline.low, baseline.high, baseline.repeatable, budget))?;
+	if !baseline.repeatable {
+		tape.restore_state(&snapshot)?;
+		tape.apply_contraction_schedule(heuristic.clone())?;
+		return debug(&format!("schedule tune retained heuristic without caching after nonrepeatable baseline device={identity}"));
+	}
+	// One measured heuristic assignment supplies the real reference action for
+	// each independent node/direction decision state.
+	for group in &groups {
+		rat.observe(&group.reference, baseline.median)?;
+	}
+	let mut random = config.random_seed as u64 ^ fnv(&identity);
+	let mut explored = false;
+	let mut proposed = false;
+	let proposal_launches = ScheduleRat::proposal_launches(config)?;
+	let candidate_with_reserve = checked_mul(launches, 2, "native RAT candidate and combined launches")?;
+	while groups.iter().any(|group| !group.unmeasured.is_empty()) {
+		let exploration = !explored;
+		let proposals = if explored && !proposed && rat.can_propose() {
+			let required = checked_add(proposal_launches, candidate_with_reserve, "native RAT proposal budget")?;
+			if *budget < required {
+				break;
+			}
+			*budget -= proposal_launches;
+			proposed = true;
+			Some(rat.propose(&groups, config)?)
+		} else if explored {
+			break;
+		} else {
+			None
+		};
+		for (index, group) in groups.iter_mut().enumerate() {
+			if group.unmeasured.is_empty() {
+				continue;
+			}
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+			let required = if exploration { checked_add(proposal_launches, candidate_with_reserve, "native RAT exploration reserve")? } else { candidate_with_reserve };
+			if *budget < required {
+				break;
+			}
+			let proposed = proposals.as_ref().and_then(|proposals| proposals.get(index).copied().flatten());
+			let pick = proposed.unwrap_or_else(|| next_random(&mut random) as usize % group.unmeasured.len());
+			let candidate = group.candidates[group.unmeasured.remove(pick)];
+			debug(&format!(
+				"schedule RAT proposal node={} direction={} tile={}x{}x{} source={}",
+				candidate.node,
+				candidate.direction,
+				candidate.extent.m,
+				candidate.extent.n,
+				candidate.extent.k,
+				if proposed.is_some() { "proposer" } else { "exploration" }
+			))?;
+			let mut assignment = heuristic.clone();
+			assign_candidate(&mut assignment, candidate)?;
+			*budget -= launches;
+			let measurement = measure_schedule(tape, &snapshot, &assignment, rate, config)?;
+			assignments = checked_add(assignments, 1, "native schedule assignments")?;
+			let exact = baseline.repeatable && measurement.repeatable && measurement.state == baseline.state;
+			let stable = exact && measurement.high < baseline.low && measurement.median <= baseline.median * (1.0 - config.schedule_minimum_improvement);
+			debug(&format!(
+				"schedule tune node={} direction={} tile={}x{}x{} median={:.6} low={:.6} high={:.6} exact={exact} stable={stable}",
+				candidate.node, candidate.direction, candidate.extent.m, candidate.extent.n, candidate.extent.k, measurement.median, measurement.low, measurement.high
+			))?;
+			if exact {
+				rat.observe(&candidate, measurement.median)?;
+			}
+			if stable && group.best.is_none_or(|(_, seconds)| measurement.median < seconds) {
+				group.best = Some((candidate, measurement.median));
+			}
+		}
+		explored = true;
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+	let winners = groups.iter().filter_map(|group| group.best).collect::<Vec<_>>();
+	let mut selected = heuristic.clone();
+	let mut selected_seconds = baseline.median;
+	if !winners.is_empty() && *budget >= launches {
+		let mut combined = heuristic.clone();
+		for (candidate, _) in &winners {
+			assign_candidate(&mut combined, *candidate)?;
+		}
+		*budget -= launches;
+		let measurement = measure_schedule(tape, &snapshot, &combined, rate, config)?;
+		assignments = checked_add(assignments, 1, "native schedule assignments")?;
+		let exact = baseline.repeatable && measurement.repeatable && measurement.state == baseline.state;
+		let stable = exact && measurement.high < baseline.low && measurement.median <= baseline.median * (1.0 - config.schedule_minimum_improvement);
+		debug(&format!("schedule tune combined median={:.6} low={:.6} high={:.6} exact={exact} stable={stable}", measurement.median, measurement.low, measurement.high))?;
+		if stable {
+			selected = combined;
+			selected_seconds = measurement.median;
+		}
+	}
+	require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
+	tape.restore_state(&snapshot)?;
+	tape.apply_contraction_schedule(selected.clone())?;
+	store_schedule_cache(&cache, &identity, &selected)?;
+	debug(&format!("schedule select seconds={selected_seconds:.6} assignments={assignments} budget={} tiles={} cache={} device={identity}", budget, tape.schedule(), cache.display()))
+}
+
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
@@ -1287,6 +1678,9 @@ pub(crate) struct NativeLayout {
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
 	pub adjoints: Vec<usize>,
+	/// Byte offset of each contraction or scan node's runtime schedule words in
+	/// the context arena. Nodes without a schedule use `usize::MAX`.
+	pub schedule: Vec<usize>,
 	pub values_bytes: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
@@ -1464,6 +1858,9 @@ native_precisions! {
 	Compute::Int(format) if format == IntFormat::INT4 => ("-int4", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Int(format) if format == IntFormat::INT1 => ("-int1", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 }
+/// Runtime schedule words per contraction or scan node: three i32 extents for
+/// each of the forward, gradient, and previous directions.
+const NATIVE_SCHEDULE_WORDS: usize = 9;
 fn align(value: usize, boundary: usize) -> Result<usize> {
 	let boundary = boundary.max(1);
 	let remainder = value % boundary;
@@ -1488,7 +1885,17 @@ impl NativeLayout {
 			context_offset = checked_add(context_offset, node_context(graph, node, rows, precision)?, "model context arena")?;
 			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
 		}
-		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
+		let mut schedule = Vec::with_capacity(graph.nodes.len());
+		for node in &graph.nodes {
+			if matches!(node.op, Primitive::Contraction | Primitive::Scan) {
+				context_offset = align(context_offset, 8)?;
+				schedule.push(context_offset);
+				context_offset = checked_add(context_offset, NATIVE_SCHEDULE_WORDS * size_of::<i32>(), "model schedule arena")?;
+			} else {
+				schedule.push(usize::MAX);
+			}
+		}
+		Ok(Self { values, contexts, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
 	}
 }
 
@@ -1553,16 +1960,16 @@ impl NativeModelIr {
 		}
 		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
 	}
-	fn storage(&self) -> Vec<u8> {
-		let mut storage = Vec::with_capacity(self.storage_bytes);
-		for plan in &self.plans {
-			if let Some(weight) = &plan.stored {
-				storage.resize(plan.storage_offset, 0);
-				storage.extend_from_slice(&weight.bytes);
-			}
-		}
-		storage
+}
+
+/// Packs the stored weights into the arena the model-load kernel indexes.
+fn graph_storage(graph: &Graph) -> Result<Vec<u8>> {
+	let mut storage = Vec::new();
+	for weight in graph.stored.iter().flatten() {
+		storage.resize(align(storage.len(), alignment("float"))?, 0);
+		storage.extend_from_slice(&weight.bytes);
 	}
+	Ok(storage)
 }
 
 fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
@@ -2489,6 +2896,25 @@ mod quantized {
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
+	/// Emits loads of a runtime schedule slot from the context arena. Keeping
+	/// the slot outside each node's work context prevents schedule words from
+	/// aliasing mutable scan, attention, or normalization state.
+	fn emit_schedule_words(&self, backend: Backend, index: usize, prefix: &str, first: usize, count: usize, ir: &mut String) -> Result<Vec<String>> {
+		let offset = *self.layout.schedule.get(index).filter(|offset| **offset != usize::MAX).ok_or_else(|| RecipeError::new("native contraction schedule slot is absent"))?;
+		let pointer = pointer_type(backend);
+		let base = format!("%{prefix}.base");
+		let offset = i64::try_from(offset).map_err(|_| RecipeError::new("native schedule offset exceeds i64"))?;
+		ir.push_str(&format!("{base} = getelementptr i8, {pointer} %contexts, i64 {offset}\n"));
+		Ok((first..first + count)
+			.map(|component| {
+				let name = format!("%{prefix}.{component}");
+				let pointer_name = format!("{name}.ptr");
+				ir.push_str(&format!("{pointer_name} = getelementptr i32, {pointer} {base}, i32 {component}\n{name} = load i32, {pointer} {pointer_name}, align 4\n"));
+				name
+			})
+			.collect())
+	}
+
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
 		let order = if reverse {
@@ -2501,11 +2927,12 @@ impl NativeModelIr {
 			let node = &plan.node;
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
-					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 {has_bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n",
 						pointer = pointer_type(backend),
+						has_bias = node.argument[2] == 0.0,
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
@@ -2515,17 +2942,38 @@ impl NativeModelIr {
 						out_length = node.output.length,
 						kernel = integer_argument(node.argument[0], "contraction kernel")?,
 						relu = node.argument[1] == 1.0,
-						tile_m = extent.m,
-						tile_n = extent.n,
-						tile_k = extent.k
+						tile_m = tiles[0],
+						tile_n = tiles[1],
+						tile_k = tiles[2]
 					);
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
+				(reverse, Primitive::Rope) => {
+					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
+					let ty = self.precision.model_type;
+					let base = native_literal(self.precision.model, ty, node.argument[1]);
+					emit_row_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, node.output.elements(), |ir, p| {
+						ir.push_str(&format!(
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							pointer = pointer_type(backend),
+							factor = native_literal(self.precision.model, ty, node.argument[5]),
+							mscale = native_literal(self.precision.model, ty, node.argument[4]),
+							context = native_literal(self.precision.model, ty, node.argument[6]),
+							fast = native_literal(self.precision.model, ty, node.argument[7]),
+							slow = native_literal(self.precision.model, ty, node.argument[8]),
+							channels = node.output.channels,
+							length = node.output.length,
+							head_width = node.argument[2],
+							dims = node.argument[0],
+							rotated = node.argument[3]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
-					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
-					emit_fixed_loop(&mut ir, index, "pool", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "pool", node.output.elements(), |ir, p| {
 						ir.push_str(&format!(
 							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n",
 							pointer = pointer_type(backend),
@@ -2544,16 +2992,31 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					let blocks = attention_blocks(node);
+					if blocks != 0 {
+						let (pointer, source, context) = (pointer_type(backend), &pointers.source, &pointers.context);
+						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
+						let keep = integer_argument(node.argument[5], "indexer blocks kept")?;
+						emit_row_loop(&mut ir, index, "index", blocks, |ir, p| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+						emit_row_loop(&mut ir, index, "select", node.output.length, |ir, p| {
+							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+						})?;
+						ir.push_str(barrier(backend));
+					}
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
-					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
-					let count = checked_mul(self.rows, node.output.elements(), "scalar output count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
@@ -2580,7 +3043,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "scalar", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "scalar", node.output.elements(), |ir, p| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
@@ -2604,7 +3067,6 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Predictor) => {
-					let count = checked_mul(self.rows, node.output.elements(), "predictor output count")?;
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2635,7 +3097,7 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "predictor", node.output.elements(), |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 						ir.push_str(&forward.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -2649,24 +3111,24 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Contraction) => {
-					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
+					require(self.schedule.contractions[index].is_some(), "native contraction schedule is absent")?;
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
 					let composed_previous = kernel <= 1;
 					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {has_bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), has_bias = node.argument[2] == 0.0, source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					}
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
-					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.pool.reverse");
-					emit_fixed_loop(&mut ir, index, "pool.reverse", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "pool.reverse", node.output.elements(), |ir, p| {
 						let context_pointer = format!("%{prefix}.context.ptr");
 						let context_wide = format!("%{prefix}.context.index.wide");
 						let context_index = format!("%{prefix}.context.index");
@@ -2682,12 +3144,23 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					let selectors = attention_selectors(node, &self.precision)?;
+					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
+					if attention_blocks(node) != 0 {
+						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.source, &pointers.context, &pointers.source_adjoint);
+						emit_row_loop(&mut ir, index, "index.reverse", node.output.length, |ir, p| {
+							ir.push_str(&format!(
+								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
+							));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				(true, Primitive::Scan) => {
-					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -2763,7 +3236,7 @@ impl NativeModelIr {
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
 						ir.push_str(&format!("{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
-						if node.second >= 0 {
+						if node.second != -2 {
 							let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, &format!("{prefix}.first.owned")));
 							ir.push_str(&format!(
@@ -2782,7 +3255,7 @@ impl NativeModelIr {
 						}
 					};
 					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, scalar_body)?;
+						emit_row_loop(&mut ir, index, "scalar.reverse", node.output.elements(), scalar_body)?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -2817,7 +3290,6 @@ impl NativeModelIr {
 					}
 				}
 				(false, Primitive::Normalize) => {
-					let count = checked_mul(self.rows, node.output.elements(), "normalize output count")?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
@@ -2827,7 +3299,7 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "normalize", node.output.elements(), |ir, p| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						ir.push_str(&format!(
@@ -2897,7 +3369,7 @@ impl NativeModelIr {
 						));
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
+					emit_row_loop(&mut ir, index, "normalize.reverse", node.output.elements(), |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -3095,6 +3567,8 @@ impl NativeModelIr {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[second], &format!("{prefix}.second")));
 			format!("%{prefix}.second")
+		} else if plan.node.second == -1 {
+			"%samples".to_owned()
 		} else {
 			source.clone()
 		};
@@ -3120,6 +3594,8 @@ impl NativeModelIr {
 			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second adjoint node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[second], &format!("{prefix}.second.adjoint")));
 			format!("%{prefix}.second.adjoint")
+		} else if reverse && plan.node.second == -1 {
+			"%input_adjoint".to_owned()
 		} else {
 			source_adjoint.clone()
 		};
@@ -3246,12 +3722,12 @@ impl NativeModelIr {
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
-		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
 			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
-			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
@@ -3295,19 +3771,18 @@ impl NativeModelIr {
 	fn emit_loss_and_seed(
 		&self, backend: Backend, loss: LossFunction, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize,
 	) -> Result<String> {
-		let output = self.graph.output.elements();
-		let items = checked_mul(self.rows, output, "native loss items")?;
+		let output = i32::try_from(self.graph.output.elements()).map_err(|_| RecipeError::new("native loss row width exceeds i32"))?;
 		let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
 		let prediction_offset = last.value;
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
-		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
+		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.count = mul i32 %rows, {output}\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 %loss.count)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -3337,8 +3812,8 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, %loss.count\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%loss.count")?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
@@ -3407,6 +3882,20 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
+/// The selector arguments every attention kernel takes after its tiling.
+fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+	Ok(format!(
+		"i32 {keys}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		keys = integer_argument(node.argument[1], "attention key heads")?,
+		values = integer_argument(node.argument[2], "attention value heads")?,
+		index_heads = integer_argument(node.argument[6], "indexer heads")?,
+		index_width = integer_argument(node.argument[7], "indexer width")?,
+		block = integer_argument(node.argument[4], "indexer block")?,
+		gate = node.argument[3] != 0.0,
+		ty = precision.model_type,
+		epsilon = native_literal(precision.model, precision.model_type, number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?)
+	))
+}
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
 		"double" => type_literal(ty, value),
@@ -3647,10 +4136,12 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	Ok(())
 }
 
-fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+/// Emits a grid-stride loop over active rows. The bound is the dispatch row
+/// count times the node row width, so a short batch never touches stale rows.
+fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
-	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
-	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	let per_row = i32::try_from(per_row).map_err(|_| RecipeError::new(format!("native {name} row width exceeds i32")))?;
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\n%{prefix}.count = mul i32 %rows, {per_row}\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, %{prefix}.count\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
 	body(ir, &format!("%{prefix}.p"));
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
@@ -3847,6 +4338,9 @@ fn native_amd_compiler() -> Result<&'static str> {
 fn native_nvidia_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_NV_COMPILER").ok_or_else(|| RecipeError::new("NVIDIA native compiler is unavailable"))
 }
+fn native_nvidia_codegen() -> Result<&'static str> {
+	option_env!("RECIPE_NV_CODEGEN").ok_or_else(|| RecipeError::new("NVIDIA native code generator is unavailable"))
+}
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY")
@@ -3928,17 +4422,28 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
+			let codegen = native_nvidia_codegen().ok().filter(|path| Path::new(path).is_file());
 			let device = native_nvidia_device_library()?;
 			let ptx_version = native_nvidia_ptx_version()?;
+			let bitcode = output.with_extension("bc");
 			let mut command = Command::new(compiler);
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
-				.arg(source)
-				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(output);
+				.arg("-Xclang").arg("-target-feature").arg("-Xclang").arg(ptx_version);
+			if codegen.is_some() {
+				command.args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(&bitcode);
+			} else {
+				command.args(["-O2", "-S", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(output);
+			}
 			native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			if let Some(codegen) = codegen {
+				let mut command = Command::new(codegen);
+				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
+				let generated = native_command(command, "NVIDIA PTX code generator", key);
+				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
+				generated?;
+			}
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -3999,7 +4504,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: graph_storage(&model.graph)?, training: loss.is_some() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4672,21 +5177,92 @@ mod bundle {
 		}
 	}
 
-	fn residual_text(value: &Residual) -> String {
-		match value {
-			Residual::Layer(width) => format!("layer,{width}"),
-			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
-			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+	/// One backslash per nesting level, so a fragment's steps can be whole
+	/// blocks that themselves hold fragments.
+	fn escape(value: &str) -> String {
+		let mut text = String::with_capacity(value.len());
+		for character in value.chars() {
+			if matches!(character, '\\' | ';' | '|' | ',') {
+				text.push('\\')
+			}
+			text.push(character)
 		}
+		text
 	}
-	fn residual(value: &str) -> Result<Residual> {
-		let mut fields = value.split(',');
-		match fields.next().unwrap_or("") {
-			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
-			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
-			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
-			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+	fn unescape(value: &str) -> Result<String> {
+		let mut text = String::with_capacity(value.len());
+		let mut characters = value.chars();
+		while let Some(character) = characters.next() {
+			match character {
+				'\\' => text.push(characters.next().ok_or_else(|| RecipeError::new("model record ends in an escape"))?),
+				other => text.push(other),
+			}
 		}
+		Ok(text)
+	}
+	/// Splits on the delimiters this level wrote, leaving escaped ones for the
+	/// level below. Text with no escapes splits exactly as `str::split` does,
+	/// which is what keeps older records readable.
+	fn split_escaped(value: &str, delimiter: char) -> Vec<String> {
+		let (mut parts, mut current, mut escaped) = (Vec::new(), String::new(), false);
+		for character in value.chars() {
+			if escaped {
+				(current.push(character), escaped = false).1
+			} else if character == '\\' {
+				(current.push(character), escaped = true).1
+			} else if character == delimiter {
+				parts.push(std::mem::take(&mut current))
+			} else {
+				current.push(character)
+			}
+		}
+		parts.push(current);
+		parts
+	}
+	fn residual_text(value: &Block) -> String {
+		escape(&block_text(value))
+	}
+	fn product_branch_text(value: &ProductBranch) -> String {
+		let blocks = value.blocks.iter().map(residual_text).collect::<Vec<_>>().join(";");
+		format!("{}:{}:{blocks}", value.quantization, value.exclusions)
+	}
+	fn product_branch(value: &str) -> Result<ProductBranch> {
+		// Product records written before branch settings were carried contain only
+		// escaped block lists. New records prefix quantization and exclusions, so
+		// split only the first two colons and leave nested product text untouched.
+		let mut fields = value.splitn(3, ':');
+		let first = fields.next().unwrap_or("");
+		if let (Some(exclusions), Some(blocks)) = (fields.next(), fields.next())
+			&& let Ok(quantization) = first.parse::<u16>()
+			&& let Ok(exclusions) = exclusions.parse::<u8>()
+		{
+			return Ok(ProductBranch {
+				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				quantization,
+				exclusions,
+			});
+		}
+		Ok(ProductBranch {
+			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+			quantization: 0,
+			exclusions: 0,
+		})
+	}
+	fn residual(value: &str) -> Result<Block> {
+		let text = unescape(value)?;
+		// A fragment step used to be one of three fixed shapes carrying no
+		// fields of its own, written without a block's six. Those records still
+		// read: only the newer form holds the block separator.
+		if !text.contains('|') {
+			let mut fields = text.split(',');
+			return match fields.next().unwrap_or("") {
+				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
+				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
+				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
+				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+			};
+		}
+		block(&text)
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
@@ -4694,26 +5270,45 @@ mod bundle {
 	{
 		value.ok_or_else(|| RecipeError::new(format!("{role} is absent")))?.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
 	}
-	fn activation(value: u8) -> Result<Activation> {
-		match value {
-			0 => Ok(Activation::Linear),
-			1 => Ok(Activation::Cos),
-			2 => Ok(Activation::Exp),
-			3 => Ok(Activation::Log),
-			4 => Ok(Activation::Ln),
-			5 => Ok(Activation::Huber),
-			6 => Ok(Activation::Tan),
-			7 => Ok(Activation::Relu),
-			8 => Ok(Activation::Leak),
-			9 => Ok(Activation::Sigmoid),
-			10 => Ok(Activation::Tanh),
-			11 => Ok(Activation::Selu),
-			12 => Ok(Activation::Gelu),
-			13 => Ok(Activation::Silu),
-			14 => Ok(Activation::Elu),
-			15 => Ok(Activation::Prelu),
-			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
+	/// The saved form of an activation: its code, and for a parameterized one the
+	/// values after it. Every other field of the block record is one token, so the
+	/// values ride inside this one rather than widening the record.
+	fn activation_text(activation: Activation) -> String {
+		match activation {
+			Activation::Scale(factor) => format!("{},{factor}", activation.code()),
+			_ => activation.code().to_string(),
 		}
+	}
+	fn activation(text: &str) -> Result<Activation> {
+		let mut fields = text.split(',');
+		let value: u8 = value_at(fields.next(), "activation code")?;
+		let activation = if value == 16 {
+			let factor = value_at::<u64>(fields.next(), "scale factor")?;
+			require(f64::from_bits(factor).is_finite(), "scale factor must be finite")?;
+			Activation::Scale(factor)
+		} else {
+			match value {
+				0 => Ok(Activation::Linear),
+				1 => Ok(Activation::Cos),
+				2 => Ok(Activation::Exp),
+				3 => Ok(Activation::Log),
+				4 => Ok(Activation::Ln),
+				5 => Ok(Activation::Huber),
+				6 => Ok(Activation::Tan),
+				7 => Ok(Activation::Relu),
+				8 => Ok(Activation::Leak),
+				9 => Ok(Activation::Sigmoid),
+				10 => Ok(Activation::Tanh),
+				11 => Ok(Activation::Selu),
+				12 => Ok(Activation::Gelu),
+				13 => Ok(Activation::Silu),
+				14 => Ok(Activation::Elu),
+				15 => Ok(Activation::Prelu),
+				_ => Err(RecipeError::new(format!("invalid activation {value}"))),
+			}?
+		};
+		require(fields.next().is_none(), "activation has trailing fields")?;
+		Ok(activation)
 	}
 	fn operation_text(operation: &Operation) -> String {
 		match operation {
@@ -4721,13 +5316,30 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Attention(attention) => {
+				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let yarn = attention
+					.yarn
+					.map(|(factor, context, fast, slow)| format!(",{},{context},{},{}", f64::from_bits(factor), f64::from_bits(fast), f64::from_bits(slow)))
+					.unwrap_or_default();
+				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+				// A zero width is the explicit absent-width marker. Keeping this field
+				// present lets the following YaRN fields be parsed unambiguously.
+				let width = attention.width.unwrap_or(0);
+				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
+				format!("attn,{},{},{dims},{base},{},{},{},{},{},{layout},{width}{yarn}{values}", attention.heads, attention.keys, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Product(left, right) => {
+				format!("product,{},{}", product_branch_text(left), product_branch_text(right))
+			}
 			Operation::Perceptron(width) => format!("perc,{width}"),
+			Operation::Identity => "identity".to_owned(),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -4752,14 +5364,78 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
-			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"attn" => {
+				let heads = value_at(fields.next(), "attention heads")?;
+				let keys = value_at(fields.next(), "attention key heads")?;
+				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
+				let base = value_at::<f64>(fields.next(), "rotary base")?;
+				let index = Indexer {
+					heads: value_at(fields.next(), "indexer heads")?,
+					width: value_at(fields.next(), "indexer width")?,
+					block: value_at(fields.next(), "indexer block")?,
+					keep: value_at(fields.next(), "indexer blocks kept")?,
+				};
+				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
+				// A bundle written before the width could be declared has nine fields
+				// and derives its width, which is what it meant when it was saved.
+				// The layout precedes the optional head width, and a record written
+				// before rotary layouts were stated carries neither.
+				let layout = fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(0);
+				let layout = match layout {
+					0 | 1 => RopeLayout::Neox,
+					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
+				};
+				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.filter(|width| *width != 0);
+				// The four yarn values follow the head width, all four or none. A
+				// value-head marker may appear immediately after width when YaRN is
+				// absent, so it cannot be mistaken for a yarn factor.
+				let first_optional = fields.next();
+				let (yarn, value_marker) = match first_optional {
+					None => (None, None),
+					Some(value) if value.starts_with("v=") => (None, Some(value)),
+					Some(factor) => (
+						Some((
+							value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
+							value_at(fields.next(), "yarn original context")?,
+							value_at::<f64>(fields.next(), "yarn fast boundary")?.to_bits(),
+							value_at::<f64>(fields.next(), "yarn slow boundary")?.to_bits(),
+						)),
+						fields.next(),
+					),
+				};
+				let values = match value_marker {
+					None => keys,
+					Some(value) => value.strip_prefix("v=").ok_or_else(|| RecipeError::new("attention record has extra fields"))?.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?,
+				};
+				require(fields.next().is_none(), "attention record has extra fields")?;
+				Ok(Operation::Attention(AttentionBlock {
+					heads,
+					width,
+					keys,
+					values,
+					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
+					yarn,
+					index: (index.block != 0).then_some(index),
+					gate,
+				}))
+			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
-			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
+			"identity" => Ok(Operation::Identity),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
+			"ensemble" => Ok(Operation::Ensemble(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"moe" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				Ok(Operation::Moe(
+					value_at(Some(top_k), "MoE top-k")?,
+					split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+				))
+			}
+			"product" => {
+				let branches = split_escaped(rest, ',');
+				require(branches.len() == 2, "product must contain two branches")?;
+				Ok(Operation::Product(product_branch(&branches[0])?, product_branch(&branches[1])?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -4782,7 +5458,7 @@ mod bundle {
 		format!(
 			"{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
-			block.activation as u8,
+			activation_text(block.activation),
 			normalization_text(block.normalization),
 			block.quantization,
 			u8::from(block.profile),
@@ -4790,24 +5466,24 @@ mod bundle {
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
-		let fields = value.split('|').collect::<Vec<_>>();
+		let fields = split_escaped(value, '|');
 		require(fields.len() == 6, "semantic model block has the wrong width")?;
 		Ok(Block {
-			operation: operation(fields[0])?,
-			activation: activation(value_at(Some(fields[1]), "block activation")?)?,
-			normalization: normalization(Some(fields[2]), "block normalization")?,
-			qk: normalization(Some(fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(fields[3]), "block quantization")?,
-			profile: bool_value(fields[4], "block quantization profile")?,
+			operation: operation(&fields[0])?,
+			activation: activation(&fields[1])?,
+			normalization: normalization(Some(&fields[2]), "block normalization")?,
+			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
+			quantization: value_at(Some(&fields[3]), "block quantization")?,
+			profile: bool_value(&fields[4], "block quantization profile")?,
 		})
 	}
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, exclusions })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4888,7 +5564,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -4917,6 +5593,7 @@ mod bundle {
 	struct ModelParts {
 		loss: Option<u8>,
 		quantization: Option<u16>,
+		exclusions: u8,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -4947,6 +5624,7 @@ mod bundle {
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
 				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				parts.exclusions,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -4959,8 +5637,8 @@ mod bundle {
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
-			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
-			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
+			let estimators = model.blocks.iter().map(estimator_count).sum::<usize>();
+			require(self.predictors.len() == estimators * output.elements(), "semantic model fitted estimator programs are incomplete")?;
 			Ok(SemanticGraph {
 				model,
 				precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?,
@@ -5029,11 +5707,12 @@ mod bundle {
 			match kind {
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(fields.len() == 2, "semantic model header has the wrong width")?;
+					require(matches!(fields.len(), 2 | 3), "semantic model header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						exclusions: fields.get(2).map(|value| value_at(Some(*value), "semantic model exclusions")).transpose()?.unwrap_or(0),
 						..ModelParts::default()
 					});
 				}
@@ -5117,7 +5796,8 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {}", semantic.model.loss.0, semantic.model.quantization));
+			let exclusions = if semantic.model.exclusions == 0 { String::new() } else { format!(" {}", semantic.model.exclusions) };
+			field(&mut document, "model", &format!("{} {}{exclusions}", semantic.model.loss.0, semantic.model.quantization));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -5209,7 +5889,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};blocks:{};", model.loss.0, model.quantization, model_text(model).join("/")));
+		feed(&format!("loss:{};quant:{};no:{};blocks:{};", model.loss.0, model.quantization, model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -5400,7 +6080,6 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
-	broadcast: bool,
 	normalize: bool,
 	split: f64,
 	prepared: OnceLock<Result<Prepared>>,
@@ -5418,17 +6097,101 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Conv(usize, usize),
-	Activation(Activation),
+/// How a rotary embedding pairs the channels it rotates. Stated by the model so
+/// the same weights cannot silently run under a different pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeLayout {
+	/// The first half of the rotated channels pairs with the second half.
+	Neox,
 }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+impl RopeLayout {
+	const fn code(self) -> u8 {
+		match self {
+			Self::Neox => 1,
+		}
+	}
 }
-pub const fn conv(filters: usize, kernel: usize) -> Residual {
-	Residual::Conv(filters, kernel)
+/// The rotary layouts with a declared identity. Any other selector is rejected
+/// rather than guessing a pairing.
+pub trait RopeSelector {
+	fn layout(self) -> RopeLayout;
+}
+pub struct Neox;
+/// The NeoX pairing: channel `i` rotates with channel `i + dimensions / 2`.
+pub const neox: Neox = Neox;
+impl RopeSelector for Neox {
+	fn layout(self) -> RopeLayout {
+		RopeLayout::Neox
+	}
+}
+/// A step of a model, and equally a step of a fragment inside one. `res`,
+/// `ensemble`, `moe`, and the model builder all take the same thing, because a branch step
+/// is an ordinary step: it carries an operation with its activation, its
+/// normalization, its Q/K normalization, its quantization and its profile, and
+/// its operation may itself be another fragment.
+pub const fn layer(width: usize) -> Block {
+	Block::of(Operation::Layer(width))
+}
+pub const fn conv(filters: usize, kernel: usize) -> Block {
+	Block::of(Operation::Conv(filters, kernel))
+}
+/// A normalization on its own, computing nothing before it.
+pub fn norm(normalization: impl NormalizationSelector) -> Block {
+	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+}
+pub fn pool(size: usize) -> Block {
+	Block::of(Operation::Pool(size))
+}
+pub fn attn(heads: impl HeadCounts) -> Block {
+	let [query, keys, values] = heads.counts();
+	let mut attention = AttentionBlock::new(query);
+	attention.keys = keys;
+	attention.values = values;
+	Block::of(Operation::Attention(attention))
+}
+pub fn rnn(width: usize) -> Block {
+	Block::of(Operation::Rnn(width))
+}
+pub fn gru(width: usize) -> Block {
+	Block::of(Operation::Gru(width))
+}
+pub fn lstm(width: usize) -> Block {
+	Block::of(Operation::Lstm(width))
+}
+pub fn perc(width: usize) -> Block {
+	Block::of(Operation::Perceptron(width))
+}
+pub fn kmeans(clusters: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" }))
+}
+pub fn knn(neighbors: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" }))
+}
+pub fn svm() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" }))
+}
+pub fn bayes() -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" }))
+}
+pub fn cbst(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_catboost, validate: positive_estimator, param: trees, name: "cbst" }))
+}
+pub fn xgbst(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_xgboost, validate: positive_estimator, param: trees, name: "xgbst" }))
+}
+pub fn lgbm(trees: usize) -> Block {
+	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: positive_estimator, param: trees, name: "lgbm" }))
+}
+/// A fragment as one step, so a branch nests inside a branch.
+pub fn res<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Residual(parts.into()))
+}
+/// The equal-weight mean of members that read the same input and produce the same shape.
+pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
+	Block::of(Operation::Ensemble(members.into()))
+}
+pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
+	Block::of(Operation::Moe(top_k, experts.into()))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -5445,19 +6208,78 @@ impl PartialEq for Estimator {
 	}
 }
 impl Eq for Estimator {}
+/// Indexer that scores every key block and keeps the best `keep` blocks per
+/// query. `heads` query projections and one shared key projection, both
+/// `width` wide, compress `block` keys into one block score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Indexer {
+	heads: usize,
+	width: usize,
+	block: usize,
+	keep: usize,
+}
+/// The attention head counts: one count for all three, or explicit query, key,
+/// and value counts. The array form is the typed Rust spelling of the three
+/// count API; the scalar form remains the equal-head shorthand.
+pub trait HeadCounts {
+	fn counts(self) -> [usize; 3];
+}
+impl HeadCounts for usize {
+	fn counts(self) -> [usize; 3] {
+		[self, self, self]
+	}
+}
+impl HeadCounts for [usize; 3] {
+	fn counts(self) -> [usize; 3] {
+		self
+	}
+}
+/// One attention block: query, key, and value heads, plus the rotary, indexer,
+/// and output-gate selectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionBlock {
+	heads: usize,
+	/// The width of one query, key and value head. `None` derives it from the
+	/// residual width, which is what `attn(heads)` alone has always meant. The
+	/// inferred width rounds up when the residual width is not divisible by the
+	/// query count.
+	width: Option<usize>,
+	/// The key and value head counts. They may differ, while each must divide
+	/// the query count so grouped-query/value attention has an unambiguous map.
+	keys: usize,
+	values: usize,
+	/// The rotary layout, the rotated channel count, and the base as its bits.
+	rope: Option<(RopeLayout, usize, u64)>,
+	/// YaRN frequency scaling of the rotary above: the context extension factor,
+	/// the original training context, and the fast and slow rotation boundaries,
+	/// the three real values held as their bits.
+	yarn: Option<(u64, usize, u64, u64)>,
+	index: Option<Indexer>,
+	gate: bool,
+}
+impl AttentionBlock {
+	fn new(heads: usize) -> Self {
+		Self { heads, width: None, keys: heads, values: heads, rope: None, yarn: None, index: None, gate: false }
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Attention(usize),
+	Attention(AttentionBlock),
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
-	Residual(Vec<Residual>),
-	Moe(usize, Vec<Residual>),
+	Residual(Vec<Block>),
+	Ensemble(Vec<Block>),
+	Moe(usize, Vec<Block>),
+	Product(ProductBranch, ProductBranch),
 	Perceptron(usize),
+	/// Computes nothing. It carries a step that is only an activation or only
+	/// a normalization, so those need no operation of their own.
+	Identity,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -5478,6 +6300,34 @@ pub enum Activation {
 	Silu,
 	Elu,
 	Prelu,
+	/// Multiplies every value by one constant, held as its bit pattern so the
+	/// activation stays comparable. Owns no weights and preserves shape.
+	Scale(u64),
+}
+impl Activation {
+	/// The saved code of the activation. A parameterized activation writes its
+	/// values after the code, so this is not a cast.
+	const fn code(self) -> u8 {
+		match self {
+			Self::Linear => 0,
+			Self::Cos => 1,
+			Self::Exp => 2,
+			Self::Log => 3,
+			Self::Ln => 4,
+			Self::Huber => 5,
+			Self::Tan => 6,
+			Self::Relu => 7,
+			Self::Leak => 8,
+			Self::Sigmoid => 9,
+			Self::Tanh => 10,
+			Self::Selu => 11,
+			Self::Gelu => 12,
+			Self::Silu => 13,
+			Self::Elu => 14,
+			Self::Prelu => 15,
+			Self::Scale(_) => 16,
+		}
+	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -5519,18 +6369,18 @@ impl NormalizationSelector for L2 {
 		BlockNormalization::L2
 	}
 }
-impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
+impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	fn normalization(self) -> BlockNormalization {
-		match self(0) {
-			Residual::Layer(_) => BlockNormalization::Layer,
+		match self(0).operation {
+			Operation::Layer(_) => BlockNormalization::Layer,
 			_ => panic!("normalization selector must be batch, layer, rms, or l2"),
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
-	Residual::Activation(Activation::$value) })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false } })+}; }
 pub mod atv {
-	use super::{Activation, Residual};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -5538,7 +6388,7 @@ pub mod atv {
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Block {
+pub struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
@@ -5547,11 +6397,106 @@ struct Block {
 	quantization: u16,
 	profile: bool,
 }
+/// The blocks and model-level forward settings captured by one product branch.
+/// Product lowering applies exclusions locally, so one branch cannot alter the
+/// bias configuration of its sibling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductBranch {
+	blocks: Vec<Block>,
+	quantization: u16,
+	exclusions: u8,
+}
+macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
+	self.act(Activation::$activation)
+})+}; }
+impl Block {
+	const fn of(operation: Operation) -> Self {
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false }
+	}
+	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
+	/// the pair `layer(8), relu()` are the same step written two ways.
+	pub fn act(mut self, activation: Activation) -> Self {
+		assert!(self.normalization.is_none(), "activation must precede normalization");
+		self.activation = activation;
+		self
+	}
+	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.normalization = Some(normalization.normalization());
+		self
+	}
+	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
+		self.qk = Some(normalization);
+		self
+	}
+	/// A step inside a fragment keeps its own storage format, exactly as a step
+	/// of the model does.
+	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
+		let format = family << 12 | variant << 8 | u16::from(bits);
+		self.quantization = format;
+		self.profile = StorageFormat(format).selection().is_some();
+		self
+	}
+	pub fn profile(mut self, profile: bool) -> Self {
+		self.profile = profile;
+		self
+	}
+	block_activations! {
+		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
+		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
+		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
+	}
+	pub fn qi(&self, bits: u8) -> BlockQi {
+		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
+		let q = |variant| self.clone().quantize(0, bits, variant);
+		BlockQi { q0: q(0), q1: q(1), nf: q(2), k: BlockQk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+	}
+	pub fn scale(self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.act(Activation::Scale(factor.to_bits()))
+	}
+}
+pub struct BlockQi {
+	pub q0: Block,
+	pub q1: Block,
+	pub nf: Block,
+	pub k: BlockQk,
+}
+pub struct BlockQk {
+	model: Block,
+	pub s: Block,
+	pub m: Block,
+	pub l: Block,
+}
+impl std::ops::Deref for BlockQk {
+	type Target = Block;
+	fn deref(&self) -> &Block {
+		&self.model
+	}
+}
 #[derive(Clone)]
 pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
+	exclusions: u8,
+}
+/// A default a model excludes through `.no(option)`. Every future exclusion adds
+/// a marker here rather than a negative boolean on a block constructor.
+pub trait Exclusion {
+	fn mask(self) -> u8;
+}
+pub struct Bias;
+/// The bias of every weighted block: layers, attention projections, convolutions
+/// and recurrent gates.
+pub const bias: Bias = Bias;
+impl Exclusion for Bias {
+	fn mask(self) -> u8 {
+		1
+	}
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
@@ -5566,6 +6511,13 @@ impl Model {
 			quantization: model.quantization,
 			profile: StorageFormat(model.quantization).selection().is_some(),
 		});
+		model
+	}
+	/// Excludes a default from this model. The exclusion applies to every weighted
+	/// block and every nested branch beneath it, and travels with the saved model.
+	pub fn no(&self, option: impl Exclusion) -> Self {
+		let mut model = self.clone();
+		model.exclusions |= option.mask();
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
@@ -5584,21 +6536,87 @@ impl Model {
 	fn kmeans(clusters: usize) = Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" });
 	fn knn(neighbors: usize) = Operation::Estimator(Estimator { fit: fit_knn, validate: neighbor_estimator, param: neighbors, name: "knn" });
 	fn svm() = Operation::Estimator(Estimator { fit: fit_svm, validate: valid_estimator, param: 0, name: "svm" });
-	fn forest(trees: usize) = Operation::Estimator(Estimator { fit: fit_forest, validate: positive_estimator, param: trees, name: "forest" });
 	fn bayes() = Operation::Estimator(Estimator { fit: fit_bayes, validate: valid_estimator, param: 0, name: "bayes" });
-	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
-	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
-	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn attn(heads: usize) = Operation::Attention(heads);
+	fn cbst(trees: usize) = Operation::Estimator(Estimator { fit: fit_catboost, validate: positive_estimator, param: trees, name: "cbst" });
+	fn xgbst(trees: usize) = Operation::Estimator(Estimator { fit: fit_xgboost, validate: positive_estimator, param: trees, name: "xgbst" });
+	fn lgbm(trees: usize) = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: positive_estimator, param: trees, name: "lgbm" });
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
-	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
+	/// Attention over query heads. The scalar form gives keys and values the
+	/// same count; the array form states query, key, and value counts separately.
+	pub fn attn(&self, heads: impl HeadCounts) -> Self {
+		let [query, keys, values] = heads.counts();
+		let mut attention = AttentionBlock::new(query);
+		attention.keys = keys;
+		attention.values = values;
+		self.push(Operation::Attention(attention))
+	}
+	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
+	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
+		self.push(Operation::Ensemble(members.into()))
+	}
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::Moe(top_k, experts.into()))
+	}
+	fn attention(&self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		let mut model = self.clone();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding attn block"));
+		match &mut block.operation {
+			Operation::Attention(attention) => apply(attention),
+			_ => panic!("{selector} requires a preceding attn block"),
+		}
+		model
+	}
+	/// Head width of the preceding `attn` block: the width of one query, key and
+	/// value head. Without it the width is the residual width divided upward over
+	/// the heads, so a residual width that is not divisible by the head count still
+	/// has a complete Q/K/V projection; with it the two are independent and the
+	/// block projects `heads * d` back to the residual width on the way out.
+	pub fn width(&self, d: usize) -> Self {
+		self.attention("width", |attention| attention.width = Some(d))
+	}
+	/// Equal key and value heads of the preceding `attn` block. Each head serves
+	/// `heads / kv` query heads.
+	pub fn kv(&self, heads: usize) -> Self {
+		self.attention("kv", |attention| {
+			attention.keys = heads;
+			attention.values = heads;
+		})
+	}
+	/// Rotary position embedding on the preceding `attn` block: the first `dims`
+	/// channels of every query and key head rotate by their position at
+	/// frequencies `base^(-2i/dims)`.
+	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+		let layout = layout.layout();
+		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+	}
+	/// YaRN frequency scaling of the preceding `rope`. `factor` is the context
+	/// extension ratio, `og_ctx` the original training context, and `b_fast` and
+	/// `b_slow` the rotation boundaries the blend runs between. Owns no weights.
+	pub fn yarn(&self, factor: f64, og_ctx: usize, b_fast: f64, b_slow: f64) -> Self {
+		self.attention("yarn", |attention| {
+			assert!(attention.rope.is_some(), "yarn configures a preceding rope, and this attention block has none");
+			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one, received {factor}");
+			assert!(og_ctx != 0, "yarn original context must be positive");
+			assert!(b_fast.is_finite() && b_slow.is_finite() && b_slow > 0.0, "yarn boundaries must be finite and positive, received {b_fast} and {b_slow}");
+			assert!(b_fast > b_slow, "yarn fast boundary {b_fast} must exceed the slow boundary {b_slow}");
+			attention.yarn = Some((factor.to_bits(), og_ctx, b_fast.to_bits(), b_slow.to_bits()));
+		})
+	}
+	/// Sparse key selection on the preceding `attn` block. `heads` query
+	/// projections and one key projection, each `width` wide, score every group
+	/// of `block` keys, and each query attends to its best `keep` blocks.
+	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep }))
+	}
+	/// Sigmoid gate on the output of the preceding `attn` block, from its own
+	/// projection of the block input.
+	pub fn gate(&self) -> Self {
+		self.attention("gate", |attention| attention.gate = true)
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -5648,30 +6666,27 @@ impl Model {
 		Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
-		let has = |value| metrics.iter().any(|metric| metric.0 == value);
-		let selected = (has(5), has(6), has(7), has(9));
+		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
 		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
 		self.blocks
 			.iter()
 			.take(self.blocks.len() - output)
 			.filter_map(|block| {
 				let mut names = Vec::new();
-				if selected.0 {
-					names.push(block.operation.name().to_owned())
-				}
-				if selected.1 && block.activation != Activation::Linear {
-					names.push(block.activation.name().to_owned())
-				}
-				if selected.2 {
+				if selected {
+					names.push(block.operation.name().to_owned());
+					if block.activation != Activation::Linear {
+						names.push(block.activation.name().to_owned())
+					}
 					if let Some(name) = block.qk.map(BlockNormalization::name) {
 						names.push(format!("qk-{name}"))
 					}
 					if let Some(name) = block.normalization.map(BlockNormalization::name) {
 						names.push(name.to_owned())
 					}
-				}
-				if selected.3 && block.quantization != 0 {
-					names.push(quantization(block.quantization))
+					if block.quantization != 0 {
+						names.push(quantization(block.quantization))
+					}
 				}
 				(!names.is_empty()).then(|| names.join("."))
 			})
@@ -6946,12 +7961,15 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Attention(_) => "attn",
+			Self::Attention(..) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
 			Self::Residual(_) => "residual",
+			Self::Ensemble(_) => "ensemble",
+			Self::Identity => "identity",
 			Self::Moe(..) => "moe",
+			Self::Product(..) => "product",
 			Self::Perceptron(_) => "perc",
 		}
 	}
@@ -6975,6 +7993,7 @@ impl Activation {
 			Self::Silu => "silu",
 			Self::Elu => "elu",
 			Self::Prelu => "prelu",
+			Self::Scale(_) => "scale",
 		}
 	}
 }
@@ -7006,6 +8025,36 @@ fn gelu = Gelu;
 fn silu = Silu;
 fn elu = Elu;
 fn prelu = Prelu; }
+impl Model {
+	/// Multiplies every value the preceding block produces by `factor`. Owns no
+	/// weights, preserves shape, and stores the factor with the model.
+	pub fn scale(&self, factor: f64) -> Self {
+		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
+		self.activate(Activation::Scale(factor.to_bits()))
+	}
+}
+/// Rust multiplication composes two model fragments from the same incoming
+/// activation. The branches remain ordinary `Block` sequences, so nested
+/// residuals, mixtures, attention, normalization, quantization, and recurrent
+/// blocks keep their existing lowering and serialization paths.
+impl std::ops::Mul for Model {
+	type Output = Self;
+	fn mul(self, right: Self) -> Self {
+		let Model { blocks: left, loss, quantization, exclusions } = self;
+		let Model { blocks: right, quantization: right_quantization, exclusions: right_exclusions, .. } = right;
+		assert!(!left.is_empty(), "the left product branch has no blocks");
+		assert!(!right.is_empty(), "the right product branch has no blocks");
+		Model {
+			blocks: vec![Block::of(Operation::Product(
+				ProductBranch { blocks: left, quantization, exclusions },
+				ProductBranch { blocks: right, quantization: right_quantization, exclusions: right_exclusions },
+			))],
+			loss,
+			quantization: 0,
+			exclusions: 0,
+		}
+	}
+}
 pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
@@ -7013,7 +8062,7 @@ pub struct LossFunction(u8);
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
 pub struct ZScore;
-pub type Normalization = fn(usize) -> Residual;
+pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
 pub type Loss = LossFunction;
 pub const adamw: Adamw = Adamw;
@@ -7030,16 +8079,17 @@ pub const Loss: Metric = Metric(1);
 pub const R2: Metric = Metric(2);
 pub const Time: Metric = Metric(3);
 pub const Epoch: Metric = Metric(4);
+/// The whole of a block: its operation, its activation, its normalization and
+/// Q/K normalization, its tokens and its quantization. One block is one thing,
+/// so selecting parts of its description separately was a distinction the
+/// caller never wanted, and it spent four names on it -- including `norm`,
+/// which a model step wants.
 pub const blck: Metric = Metric(5);
-pub const atvn: Metric = Metric(6);
-pub const norm: Metric = Metric(7);
-pub const tok: Metric = Metric(8);
-pub const quant: Metric = Metric(9);
 pub const tile: Metric = Metric(10);
 /// All progress fields except the native tile schedule.
-pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
+pub const all: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
 /// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
+pub const dev: [Metric; 7] = [Run, Time, Epoch, R2, Loss, blck, tile];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -7103,14 +8153,13 @@ impl Recipe {
 			autoregressive: T::AUTO,
 			target: Vec::new(),
 			features: FeatureSelection::All,
-			broadcast: false,
 			normalize: false,
 			split: 1.0,
 			prepared: OnceLock::new(),
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, exclusions: 0 }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -7194,6 +8243,7 @@ enum Primitive {
 	Elementwise = 6,
 	Normalize = 8,
 	Predictor = 9,
+	Rope = 11,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -7231,6 +8281,7 @@ impl Node {
 			Primitive::Elementwise => "Elementwise",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
+			Primitive::Rope => "Rope",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -7275,6 +8326,9 @@ struct Graph {
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
+	/// Whether a weighted block allocates its bias. Set once from the model, so
+	/// every lowering below sees it without threading a flag through each one.
+	bias: bool,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -7290,6 +8344,7 @@ impl Graph {
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
+			bias: true,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -7324,15 +8379,14 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
-	let convolutional = model.blocks.iter().any(|block| match &block.operation {
-		Operation::Conv(..) | Operation::Pool(..) => true,
-		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
-		_ => false,
-	});
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual, ensemble, or mixture branch at any depth.
+	let convolutional = model.blocks.iter().any(|block| sequenced_operation(&block.operation));
 	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
+	// Set once. Every lowering below reads it from the graph, so a nested branch
+	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
+	graph.bias = model.exclusions & bias.mask() == 0;
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -7358,8 +8412,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if initialize {
 		initialize_graph(&mut graph, config);
 		if let Some(offset) = output_bias_offset(&graph) {
-			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-			graph.parameters[offset] = mean;
+			for (channel, mean) in target_means(&data.targets, data.target_width, rows).into_iter().enumerate() {
+				graph.parameters[offset + channel] = mean;
+			}
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
@@ -7475,12 +8530,15 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Attention(heads) => lower_attention(graph, *heads, block.qk)?,
+		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
-		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
+		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			graph.refresh_storage(config)?;
@@ -7659,6 +8717,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
+		Activation::Scale(factor) => {
+			let factor = f64::from_bits(factor);
+			require(factor.is_finite(), "scale factor must be finite")?;
+			let factor = constant(&mut program, factor);
+			program.op(ScalarOpcode::Multiply, factor, x)
+		}
 		Activation::Linear => unreachable!(),
 	};
 	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
@@ -7667,35 +8731,175 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 }
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let (parameters, output) = (checked_add(checked_mul(graph.output.channels, channels, "projection matrix")?, channels, "projection bias")?, Shape { channels, length: graph.output.length });
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2)
+	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
+	let output = Shape { channels, length: graph.output.length };
+	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
+}
+/// Project every element in a row, then restore the declared shape for the
+/// following block. The existing contraction layout already supports this
+/// representation: reinterpret the row as one channel vector, project it,
+/// and reinterpret the projected vector as the target shape.
+fn lower_flatten_project(graph: &mut Graph, target: Shape) -> Result<()> {
+	require(target.channels != 0 && target.length != 0, "dense projection shape must be positive")?;
+	let input = graph.output;
+	reset(graph, graph.source, Shape { channels: input.elements(), length: 1 });
+	lower_project(graph, target.elements())?;
+	let projected = graph.source;
+	reset(graph, projected, target);
+	Ok(())
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
-	let parameters = checked_add(checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?, filters, "conv bias")?;
+	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
+	let parameters = if graph.bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, [kernel as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
+}
+/// The integer correction range and attention magnitude used by the reference
+/// YaRN construction. The range is derived from rotations over the original
+/// context, then truncated exactly as the reference implementation does.
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
+	require(fast.is_finite() && slow.is_finite() && slow > 0.0 && fast > slow, "yarn beta values must be finite, positive, and ordered")?;
+	let correction = |value: f64| -> Result<f64> {
+		let denominator = value * std::f64::consts::TAU;
+		let correction = dims as f64 * (context as f64 / denominator).ln() / (2.0 * base.ln());
+		require(correction.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(correction)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f64);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if low == high { high + 0.001 } else { high };
+	let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((mscale, low, high))
+}
+// An unlabelled target component is absent, not zero, so its output bias is
+// seeded from only the rows that provide that component.
+fn target_means(targets: &[f64], width: usize, rows: usize) -> Vec<f64> {
+	(0..width)
+		.map(|channel| {
+			let values = targets[..rows * width].iter().skip(channel).step_by(width).filter(|value| value.is_finite());
+			let count = values.clone().count();
+			values.sum::<f64>() / count as f64
+		})
+		.collect()
 }
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels)
+	// Only walk the single-source activation/normalization chain from the actual
+	// output source. A contraction in an earlier branch is not an output bias.
+	let mut index = usize::try_from(graph.source).ok()?;
+	loop {
+		let node = graph.nodes.get(index)?;
+		if node.op == Primitive::Contraction {
+			return (node.output == graph.output && node.argument[2] == 0.0)
+				.then_some(node.offset + node.parameters - node.output.channels);
+		}
+		if !matches!(node.op, Primitive::Elementwise | Primitive::Normalize) || node.second != -2 || node.source < 0 {
+			return None;
+		}
+		index = usize::try_from(node.source).ok()?;
+	}
 }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
 }
-fn lower_attention(graph: &mut Graph, heads: usize, qk: Option<BlockNormalization>) -> Result<()> {
-	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
+/// Lowers one attention block into its projection, the optional query and key
+/// normalization and rotary nodes, the attention node and the output
+/// projection. The projection carries the query, key and value planes, then
+/// the indexer planes, then the gate plane.
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate } = attention;
+	require(heads != 0, "attention head partition is invalid")?;
+	if width.is_none() && keys == heads && values == heads && graph.output.channels % heads != 0 {
+		let requested = heads;
+		let valid = (1..=requested.min(graph.output.channels)).rev().filter(|heads| graph.output.channels % heads == 0).take(3).collect::<Vec<_>>();
+		heads = valid[0];
+		keys = heads;
+		values = heads;
+		eprintln!(
+			"invalid: attn({requested})  valid: {}  choosing attn({heads})",
+			valid.iter().map(|heads| format!("attn({heads})")).collect::<Vec<_>>().join("|")
+		);
+	}
+	require(
+		keys != 0 && keys <= heads && heads % keys == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
+	require(
+		values != 0 && values <= heads && heads % values == 0,
+		format!("attention head partition is invalid: {heads} query, {keys} key and {values} value heads"),
+	)?;
 	let input = graph.output;
-	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
-	let width = input.channels / heads;
+	let width = match width {
+		Some(width) => {
+			require(width != 0, "attention head width must be positive")?;
+			width
+		}
+		None => input.channels.div_ceil(heads),
+	};
+	// The query plane the attention writes. With a divisible residual width this
+	// remains exactly `input.channels`; otherwise the rounded-up Q/K/V projection
+	// creates a wider internal plane and the closing projection restores the input
+	// width.
+	let inner = checked_mul(heads, width, "attention query plane")?;
+	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
+	let side = match index {
+		Some(index) => {
+			require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
+			require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
+			checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?
+		}
+		None => 0,
+	};
+	// Every kernel defines the gate plane as the query plane
+	// (`%gate.plane = select i1 %gate, i32 %from, i32 0`), so it sizes from the
+	// query plane and not from the residual width. With a declared width those
+	// two differ, and using the residual width here would shift %row.stride and
+	// silently corrupt the indexer reads and the gate gradient store.
+	let gated = if gate { inner } else { 0 };
+	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
-		lower_normalize(graph, normalization, width, checked_mul(input.channels, 2, "attention query and key span")?)?;
+		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, keys, "attention query and key heads")?, "attention query and key span")?)?;
 	}
-	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
+	if let Some((layout, dims, base)) = rope {
+		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
+		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
+		let rotated = checked_mul(width, checked_add(heads, keys, "rotary query and key partition")?, "rotary width")?;
+		// The kernel currently implements the declared NeoX pairing. Keep the
+		// selector in the model record, but do not silently invent another layout.
+		match layout {
+			RopeLayout::Neox => {}
+		}
+		let (mscale, factor, context, low, high) = match yarn {
+			None => (1.0, 0.0, 0.0, 0.0, 1.0),
+			Some((factor, context, fast, slow)) => {
+				let factor = f64::from_bits(factor);
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
+			}
+		};
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
+	}
+	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
+	let _ = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	// Attention node arguments carry query, key, and value counts separately.
+	// The native emitter obtains the normalization epsilon from the build
+	// configuration, so argument slot eight remains available to storage tags.
+	let argument = [heads as f64, keys as f64, values as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, 0.0];
+	// The kernels derive the head width as `udiv i32 %channels, %heads` from this
+	// shape, so declaring the width is a matter of pushing the query plane here
+	// rather than the block input. The closing projection maps it back to the
+	// residual width.
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
@@ -7709,6 +8913,11 @@ fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: 
 	let offset = graph.parameters.len() - parameters;
 	graph.parameters[offset..].fill(1.0);
 	Ok(())
+}
+/// Key blocks the indexer scores for a sequence of `length` positions.
+fn attention_blocks(node: &Node) -> usize {
+	let block = node.argument[4] as usize;
+	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -7736,15 +8945,22 @@ fn activation(graph: &mut Graph, source: i32, shape: Shape, value: Activation, c
 	}
 	Ok((graph.source, graph.output))
 }
-fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Residual, config: Config) -> Result<(i32, Shape)> {
+fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<(i32, Shape)> {
 	reset(graph, source, shape);
-	match value {
-		Residual::Layer(width) => lower_project(graph, *width)?,
-		Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-		Residual::Activation(value) if *value != Activation::Linear => lower_activation(graph, *value, config)?,
-		Residual::Activation(_) => {}
-	}
+	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
+}
+/// Adapt one branch to the canonical shape selected by the first MoE expert.
+/// The projection is learned over the flattened row, so it preserves every
+/// declared expert even when its sequence is shorter or longer.
+fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape) -> Result<i32> {
+	if from == target {
+		reset(graph, source, from);
+		return Ok(source);
+	}
+	reset(graph, source, from);
+	lower_flatten_project(graph, target)?;
+	Ok(graph.source)
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
 	let mut scalar = ScalarProgram(Vec::new());
@@ -7811,25 +9027,30 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 	reset(graph, output.ok_or_else(|| RecipeError::new("selection has no output"))?, shape);
 	Ok(())
 }
-fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Config) -> Result<()> {
+fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
 	let mut output = None;
 	for value in experts {
-		let (branch, shape) = expert(graph, source, input, value, config)?;
-		if let Some(expected) = output {
-			require(shape == expected, "moe experts must have one output shape")?;
-		}
-		output = Some(shape);
+		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
+		let canonical = output.unwrap_or(shape);
+		let branch = project_moe_shape(graph, branch, shape, canonical)?;
+		output = Some(canonical);
 		branches.push(branch);
 	}
 	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
 	let mut scores = Vec::with_capacity(experts.len());
 	for _ in experts {
+		// Every expert has its own learned router. Unlike an expert adapter, a
+		// router must not disappear when its input already has the canonical shape:
+		// identical input and output shapes still require a distinct projection.
 		reset(graph, source, input);
-		lower_project(graph, output.channels)?;
-		require(graph.output == output, "moe router shape does not match its experts")?;
+		if input.length == output.length {
+			lower_project(graph, output.channels)?;
+		} else {
+			lower_flatten_project(graph, output)?;
+		}
 		scores.push(graph.source);
 	}
 	select(graph, &branches, &scores, output, top_k, config)
@@ -7837,86 +9058,205 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Conf
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
 	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?, checked_mul(channels, channels, "scan state matrix")?);
-	let stride = checked_add(checked_add(input, state, "scan gate")?, channels, "scan bias")?;
+	let matrices = checked_add(input, state, "scan gate")?;
+	let stride = if graph.bias { checked_add(matrices, channels, "scan bias")? } else { matrices };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2)
+	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, [gates as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
 }
-fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Config) -> Result<()> {
+/// Whether an operation reads along the sequence, itself or through a branch.
+fn sequenced_operation(operation: &Operation) -> bool {
+	match operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| sequenced_operation(&part.operation)),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequenced_operation(&part.operation)),
+		_ => false,
+	}
+}
+/// Counts estimator blocks at every nesting level. Saved predictor programs are
+/// stored once for each estimator and output target channel, so this count must
+/// follow the same recursive lowering order as residual, ensemble, and mixture branches.
+fn estimator_count(block: &Block) -> usize {
+	match &block.operation {
+		Operation::Estimator(_) => 1,
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Moe(_, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
+		_ => 0,
+	}
+}
+fn lower_ensemble(graph: &mut Graph, members: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!members.is_empty(), "ensemble requires a member")?;
+	let (source, input, mut output, mut sum) = (graph.source, graph.output, None, None);
+	for member in members {
+		let (branch, shape) = expert(graph, source, input, member, total, data, targets, rows, gpu, config)?;
+		if let Some(expected) = output {
+			require(shape == expected, format!("ensemble members produce {}x{} and {}x{}", expected.channels, expected.length, shape.channels, shape.length))?;
+		} else {
+			output = Some(shape)
+		}
+		sum = Some(match sum {
+			Some(previous) => binary(graph, previous, branch, shape, ScalarOpcode::Add)?,
+			None => branch,
+		});
+	}
+	reset(graph, sum.ok_or_else(|| RecipeError::new("ensemble has no output"))?, output.ok_or_else(|| RecipeError::new("ensemble has no output shape"))?);
+	if members.len() > 1 {
+		lower_activation(graph, Activation::Scale((members.len() as f64).recip().to_bits()), config)?
+	}
+	Ok(())
+}
+fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
-	require(graph.output.channels == shape.channels && graph.output.length == shape.length, "residual shape mismatch")?;
+	let branch = graph.source;
+	let branch_shape = graph.output;
+	if branch_shape != shape {
+		// Keep the declared branch as-is and adapt the skip path to it. A learned
+		// contraction handles channel changes; a contraction with a valid window
+		// also handles a branch that shortens the sequence. Upsampling a skip path
+		// would require a distinct operator, so refuse that genuinely unsupported
+		// connection instead of padding or truncating it silently.
+		require(branch_shape.length <= shape.length, "residual projection cannot lengthen the skip sequence")?;
+		reset(graph, skip, shape);
+		if branch_shape.length != shape.length {
+			let kernel = checked_add(shape.length - branch_shape.length, 1, "residual projection kernel")?;
+			lower_conv(graph, branch_shape.channels, kernel)?;
+		} else if branch_shape.channels != shape.channels {
+			lower_project(graph, branch_shape.channels)?;
+		}
+		require(graph.output == branch_shape, "residual projection did not match the branch")?;
+	}
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
-	push_program(graph, skip, &[], program)
+	let second = if branch_shape == shape { skip } else { branch };
+	push_program(graph, second, &[], program)
+}
+/// Lower two model fragments from one source and multiply their outputs
+/// elementwise. The scalar-program reverse pass supplies each branch with the
+/// other branch's value, so both branch gradients reach the shared source.
+fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a product branch must contain an operation")?;
+	let (source, input) = (graph.source, graph.output);
+	let inherited_bias = graph.bias;
+	graph.bias = inherited_bias && left.exclusions & bias.mask() == 0;
+	for block in &left.blocks {
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	let (left_source, shape) = (graph.source, graph.output);
+	reset(graph, source, input);
+	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
+	for block in &right.blocks {
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	}
+	graph.bias = inherited_bias;
+	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
+	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
-	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
-	let (predictor, surrogate) = if let Some(program) = restored {
-		let blank = Prepared {
-			samples: vec![0.0; input.elements()],
-			targets: vec![0.0],
-			target_width: 1,
-			rows: 1,
-			source_rows: 1,
-			features: input.elements(),
-			schema: DataSchema::default(),
-			sequence: None,
-			target_categorical: false,
-			norm_mean: Vec::new(),
-			norm_scale: Vec::new(),
-			identities: Vec::new(),
-			fitted: Vec::new(),
-		};
-		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
-		surrogate.frozen.fill(1);
-		(program, surrogate)
-	} else {
+	let width = data.target_width;
+	let scalar = Shape { channels: 1, length: 1 };
+	let base = graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count();
+	let restored = (0..width).map(|channel| data.fitted.get(base + channel).cloned()).collect::<Vec<_>>();
+	let inputs = if restored.iter().any(Option::is_none) {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, rows, gpu, config.precision)?;
-		let prepared = Prepared {
-			samples: inputs.clone(),
-			targets: targets[..rows].to_vec(),
-			target_width: 1,
-			rows,
-			source_rows: rows,
-			features: input.elements(),
-			schema: DataSchema::default(),
-			sequence: None,
-			target_categorical: data.target_categorical,
-			norm_mean: Vec::new(),
-			norm_scale: Vec::new(),
-			identities: Vec::new(),
-			fitted: Vec::new(),
-		};
-		let fitted = estimator.fit(&prepared, rows, config)?;
-		// The surrogate exists to carry this block's adjoint into its input, so a prefix
-		// whose parameters are all frozen never reads the weights a fit would produce.
-		let surrogate = if graph.frozen.contains(&0) {
-			let targets = predict_rows(&fitted, &inputs, input.elements())?;
-			fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
-		} else {
-			let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
-			untrained.frozen.fill(1);
-			untrained
-		};
-		(fitted.program, surrogate)
+		graph_inputs(graph, &data.samples, rows, gpu, config.precision)?
+	} else {
+		Vec::new()
 	};
-	reset(graph, source, input);
-	push_predictor(graph, predictor)?;
-	let real = graph.source;
-	reset(graph, source, input);
-	let surrogate = append_graph(graph, surrogate)?;
-	let mut rat = ScalarProgram(Vec::new());
-	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
-	program(graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat).map(drop)
+	let mut accumulated = None;
+	for (channel, fitted) in restored.into_iter().enumerate() {
+		let (predictor, surrogate) = if let Some(program) = fitted {
+			let blank = Prepared {
+				samples: vec![0.0; input.elements()],
+				targets: vec![0.0],
+				target_width: 1,
+				rows: 1,
+				source_rows: 1,
+				features: input.elements(),
+				schema: DataSchema::default(),
+				sequence: None,
+				target_categorical: false,
+				norm_mean: Vec::new(),
+				norm_scale: Vec::new(),
+				identities: Vec::new(),
+				fitted: Vec::new(),
+			};
+			let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
+			surrogate.frozen.fill(1);
+			(program, surrogate)
+		} else {
+			let column_targets = (0..rows).map(|row| targets[row * width + channel]).collect::<Vec<_>>();
+			let prepared = Prepared {
+				samples: inputs.clone(),
+				targets: column_targets,
+				target_width: 1,
+				rows,
+				source_rows: rows,
+				features: input.elements(),
+				schema: DataSchema::default(),
+				sequence: None,
+				target_categorical: data.target_categorical,
+				norm_mean: Vec::new(),
+				norm_scale: Vec::new(),
+				identities: Vec::new(),
+				fitted: Vec::new(),
+			};
+			let fitted = estimator.fit(&prepared, rows, config)?;
+			// A fully frozen prefix cannot use the fitted outputs for a surrogate
+			// update, so retain the existing no-fit path in that case.
+			let surrogate = if graph.frozen.contains(&0) {
+				let targets = predict_rows(&fitted, &inputs, input.elements())?;
+				fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+			} else {
+				let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+				untrained.frozen.fill(1);
+				untrained
+			};
+			(fitted.program, surrogate)
+		};
+		reset(graph, source, input);
+		push_predictor(graph, predictor)?;
+		let real = graph.source;
+		reset(graph, source, input);
+		let surrogate = append_graph(graph, surrogate)?;
+		let mut rat = ScalarProgram(Vec::new());
+		rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
+		let estimate = program(graph, real, surrogate, scalar, &[], rat)?;
+		if width == 1 {
+			return Ok(());
+		}
+		reset(graph, estimate, scalar);
+		place_estimator_channel(graph, channel, width)?;
+		let branch = graph.source;
+		accumulated = Some(match accumulated {
+			Some(previous) => binary(graph, previous, branch, Shape { channels: width, length: 1 }, ScalarOpcode::Add)?,
+			None => branch,
+		});
+	}
+	let accumulated = accumulated.ok_or_else(|| RecipeError::new("estimator has no target"))?;
+	reset(graph, accumulated, Shape { channels: width, length: 1 });
+	Ok(())
+}
+/// Routes one scalar estimator channel into a target-width vector without adding
+/// a bias. The route is frozen, so it cannot become an accidental output bias.
+fn place_estimator_channel(graph: &mut Graph, channel: usize, width: usize) -> Result<()> {
+	require(channel < width, "estimator target channel is out of range")?;
+	require(graph.output.elements() == 1, "estimator output is not scalar")?;
+	let input = graph.output;
+	let matrix = checked_mul(input.channels, width, "estimator channel matrix")?;
+	let output = Shape { channels: width, length: input.length };
+	push_node(graph, Primitive::Contraction, output, matrix, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("estimator channel projection is absent"))?;
+	let (offset, parameters) = (node.offset, node.parameters);
+	graph.parameters[offset..offset + parameters].fill(0.0);
+	for input_channel in 0..input.channels {
+		graph.parameters[offset + channel * input.channels + input_channel] = 1.0;
+	}
+	graph.frozen[offset..offset + parameters].fill(1);
+	Ok(())
 }
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
@@ -7933,10 +9273,11 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[index] = ((state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale;
 			}
 		}
-		if node.op == Primitive::Contraction {
+		let biased = node.argument[2] == 0.0;
+		if node.op == Primitive::Contraction && biased {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
-		if node.op == Primitive::Scan {
+		if node.op == Primitive::Scan && biased {
 			let channels = node.output.channels;
 			let input_matrix = node.input.channels * channels;
 			let state_matrix = channels * channels;
@@ -8038,6 +9379,11 @@ struct Config {
 	surrogate_epochs: usize,
 	surrogate_width: usize,
 	surrogate_rate: f64,
+	schedule_candidates: usize,
+	schedule_measurements: usize,
+	schedule_budget: usize,
+	schedule_warmups: usize,
+	schedule_minimum_improvement: f64,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -8080,6 +9426,11 @@ impl Config {
 			surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?,
 			surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?,
 			surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?,
+			schedule_candidates: count("schedule candidates", env!("RECIPE_SCHEDULE_CANDIDATES"))?,
+			schedule_measurements: natural("schedule measurements", env!("RECIPE_SCHEDULE_MEASUREMENTS"))?,
+			schedule_budget: count("schedule budget", env!("RECIPE_SCHEDULE_BUDGET"))?,
+			schedule_warmups: natural("schedule warmups", env!("RECIPE_SCHEDULE_WARMUPS"))?,
+			schedule_minimum_improvement: fraction("schedule minimum improvement", env!("RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"))?,
 			progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?,
 			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
@@ -8225,21 +9576,13 @@ impl NativeTape {
 		let adjoints_bytes = layout.adjoints_bytes.max(1);
 		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
-		if program.model_load.is_some() {
-			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
-			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
-			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
-			let mut call = ptrs![weights.pointer, storage.pointer, threads];
-			program.launch_model_load(&mut call)?;
-			gpu.synchronize()?;
-		} else {
-			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
-		}
-		Ok(Self {
+		let contexts = Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?;
+		write_contraction_schedule(&contexts, &layout, &program.schedule.contractions)?;
+		let tape = Self {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &native_context_values(graph, &layout, &weights, precision.model)?)?,
+			contexts,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
@@ -8257,14 +9600,131 @@ impl NativeTape {
 			step,
 			output,
 			capacity: rows,
+		};
+		tape.load_storage(graph)?;
+		Ok(tape)
+	}
+	/// Writes every contraction node's forward, gradient, and previous tiles
+	/// into its schedule slot, where the kernels read them at dispatch.
+	fn write_schedule(&self) -> Result<()> {
+		write_contraction_schedule(&self.contexts, &self.program.artifact.layout, &self.program.schedule.contractions)
+	}
+	/// Applies a runtime contraction schedule to both the host description and
+	/// the words read by the native kernels.
+	fn apply_contraction_schedule(&mut self, contractions: Vec<Option<NativeContractionTiles>>) -> Result<()> {
+		require(contractions.len() == self.program.schedule.contractions.len(), "native contraction schedule assignment has the wrong shape")?;
+		self.program.schedule.contractions = contractions;
+		self.write_schedule()?;
+		self.program.tile = dominant_tile(&self.program.shapes, &self.program.schedule.contractions).unwrap_or(self.program.tile);
+		Ok(())
+	}
+	/// Every mutable device buffer and host-side training field. A schedule
+	/// measurement restores this complete state before every launch.
+	fn snapshot_state(&self) -> Result<NativeTrainingState> {
+		Ok(NativeTrainingState {
+			values: self.values.download(self.values.bytes)?,
+			contexts: self.contexts.download(self.contexts.bytes)?,
+			adjoints: self.adjoints.download(self.adjoints.bytes)?,
+			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
+			weights: self.weights.download(self.weights.bytes)?,
+			frozen: self.frozen.download(self.frozen.bytes)?,
+			moments: self.moments.download(self.moments.bytes)?,
+			variances: self.variances.download(self.variances.bytes)?,
+			gradient: self.gradient.download(self.gradient.bytes)?,
+			metrics: self.metrics.download(self.metrics.bytes)?,
+			contractions: self.program.schedule.contractions.clone(),
+			tile: self.program.tile,
+			step: self.step,
+			best_loss: self.best_loss,
 		})
 	}
+	fn restore_state(&mut self, state: &NativeTrainingState) -> Result<()> {
+		self.values.write_bytes(0, &state.values)?;
+		self.contexts.write_bytes(0, &state.contexts)?;
+		self.adjoints.write_bytes(0, &state.adjoints)?;
+		self.input_adjoint.write_bytes(0, &state.input_adjoint)?;
+		self.weights.write_bytes(0, &state.weights)?;
+		self.frozen.write_bytes(0, &state.frozen)?;
+		self.moments.write_bytes(0, &state.moments)?;
+		self.variances.write_bytes(0, &state.variances)?;
+		self.gradient.write_bytes(0, &state.gradient)?;
+		self.metrics.write_bytes(0, &state.metrics)?;
+		self.program.schedule.contractions.clone_from(&state.contractions);
+		self.program.tile = state.tile;
+		self.step = state.step;
+		self.best_loss = state.best_loss;
+		self.write_schedule()
+	}
+	/// Returns the exact persistent post-epoch state relevant to repeatability.
+	/// Activations, adjoints, gradients, metrics, and other fused-epoch scratch
+	/// are restored before every measurement but are overwritten by the next
+	/// epoch, so they are not part of semantic schedule equivalence.
+	fn epoch_state(&self, objective: f64) -> Result<NativeEpochState> {
+		Ok(NativeEpochState {
+			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
+			weights: self.weights.download(self.weights.bytes)?,
+			frozen: self.frozen.download(self.frozen.bytes)?,
+			moments: self.moments.download(self.moments.bytes)?,
+			variances: self.variances.download(self.variances.bytes)?,
+			batch_normalizations: self.extract_bn_stats()?.into_iter().map(f64::to_bits).collect(),
+			best_loss: self.best_loss.map(f64::to_bits),
+			step: self.step,
+			objective: objective.to_bits(),
+		})
+	}
+	/// Decodes the graph's stored weights over the uploaded parameters.
+	fn load_storage(&self, graph: &Graph) -> Result<()> {
+		let storage = graph_storage(graph)?;
+		if self.program.model_load.is_none() {
+			return require(storage.is_empty(), "native artifact storage has no model-load entrypoint");
+		}
+		require(!storage.is_empty(), "native model-load storage is empty")?;
+		let storage = Buffer::upload(self.program.gpu, &storage)?;
+		let threads = self.program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
+		let mut call = ptrs![self.weights.pointer, storage.pointer, threads];
+		self.program.launch_model_load(&mut call)?;
+		self.program.gpu.synchronize()
+	}
+	/// Forwards the rows from `first` onward through the trained program. Each
+	/// launch carries its own row count, so the last short batch reads only the
+	/// rows it was given and the compiled tile shapes stay as they trained.
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+		let input = graph.input.elements();
+		require(input != 0 && samples.len() % input == 0, format!("evaluation samples must be a multiple of {input} values"))?;
+		let rows = samples.len() / input;
+		require(first <= rows, format!("evaluation start row {first} exceeds {rows} rows"))?;
+		let saved_rows = self.rows;
+		let result = (|| {
+			self.upload_weights(&graph.parameters)?;
+			// Holdout evaluation must use the trained effective weights. The graph's
+			// stored bytes are the last quantized checkpoint and would overwrite those
+			// weights if model-load ran here.
+			let evaluation_sample_count = checked_mul(self.capacity, input, "native evaluation sample allocation")?;
+			let evaluation_samples = Buffer::upload_float(self.program.gpu, &vec![0.0; evaluation_sample_count], self.precision.model)?;
+			let mut predictions = Vec::new();
+			let mut row = first;
+			while row < rows {
+				let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
+				self.rows = narrow(end - row, "native evaluation rows")? as u32;
+				evaluation_samples.write_float_bytes(0, &samples[row * input..end * input], self.precision.model)?;
+				self.forward_with_samples(evaluation_samples.pointer, ForwardMode::Inference)?;
+				predictions.extend_from_slice(&self.predictions()?);
+				row = end;
+			}
+			Ok(predictions)
+		})();
+		self.rows = saved_rows;
+		result
+	}
 	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
+		self.forward_with_samples(self.samples.pointer, mode)
+	}
+	fn forward_with_samples(&mut self, samples: u64, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let mode = mode as i32;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
+		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -8287,8 +9747,13 @@ impl NativeTape {
 		Ok(stats)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
+		let node = i32::try_from(self.program.artifact.layout.values.len()).map_err(|_| RecipeError::new("native output node count exceeds i32"))? - 1;
+		self.predictions_at(node, self.output)
+	}
+	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
+		let index = usize::try_from(node).map_err(|_| RecipeError::new("native output source is absent"))?;
+		let offset = *self.program.artifact.layout.values.get(index).ok_or_else(|| RecipeError::new("native model output arena is absent"))?;
+		let values = self.values.download_float_bytes(offset, self.rows as usize * output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
@@ -8394,6 +9859,7 @@ impl NativeTape {
 	fn schedule(&self) -> String {
 		let extents = self
 			.program
+			.schedule
 			.contractions
 			.iter()
 			.flatten()
@@ -8404,6 +9870,7 @@ impl NativeTape {
 			return extents.first().cloned().unwrap_or_default();
 		}
 		self.program
+			.schedule
 			.contractions
 			.iter()
 			.flatten()
@@ -8704,6 +10171,9 @@ impl DeviceTape {
 		}
 		Ok(predictions)
 	}
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+		self.shards[0].evaluate(graph, samples, first)
+	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		if self.shards.len() > 1 {
 			return require(stats.is_empty(), "batch normalization statistics cannot place across devices");
@@ -8728,8 +10198,30 @@ impl DeviceTape {
 	fn tile(&self) -> Tile {
 		self.shards[0].tile()
 	}
+	/// Measures the contraction schedule independently on every placed shard.
+	fn tune(&mut self, rate: f64, config: Config) -> Result<()> {
+		if config.schedule_candidates == 0 || config.schedule_budget == 0 {
+			return Ok(());
+		}
+		let shard_count = self.shards.len();
+		let base = config.schedule_budget / shard_count;
+		let remainder = config.schedule_budget % shard_count;
+		for (index, shard) in self.shards.iter_mut().enumerate() {
+			let mut budget = base + usize::from(index < remainder);
+			debug(&format!("schedule budget device={} launches={budget}", shard.device_label()?))?;
+			tune_contraction_schedule(shard, rate, config, &mut budget)?;
+		}
+		Ok(())
+	}
 	fn schedule(&self) -> String {
-		self.shards[0].schedule()
+		if self.shards.len() == 1 {
+			return self.shards[0].schedule();
+		}
+		self.shards
+			.iter()
+			.map(|shard| format!("{}={}", shard.device_label().unwrap_or_else(|_| shard.program.gpu.name.clone()), shard.schedule()))
+			.collect::<Vec<_>>()
+			.join(" ")
 	}
 	/// The one fused epoch every policy runs: each shard computes its gradient
 	/// concurrently, the leading device applies the one emitted optimizer to the
@@ -8857,8 +10349,17 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 		// minimum allocation below.
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		// Softmax statistics, then the indexer block representatives, then one
+		// row of block scores and one admission flag per block per query, then
+		// one block score gradient per attention head per query.
 		Primitive::Attention => {
-			checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?
+			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let blocks = attention_blocks(node);
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[7] as usize, "indexer representatives")?;
+			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
+			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
+			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -8866,6 +10367,9 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
+		Primitive::Rope => 1,
+		// Nine i32 tiles: the forward, gradient, and previous schedule the kernels read.
+		Primitive::Contraction => return Ok(9 * size_of::<i32>()),
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
 		// Four statistic planes over the group count the emitted kernel walks:
 		// batch and evaluation groups are channels; layer, RMS, and L2 groups
@@ -8875,7 +10379,6 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
 			checked_add(statistics, partials, "normalization")?
 		}
-		_ => 1,
 	};
 	checked_mul(elements.max(1), precision.bytes(), "context bytes")
 }
@@ -9073,7 +10576,8 @@ struct NativeProgram {
 	epoch: Option<Dispatch>,
 	model_load: Option<Dispatch>,
 	tile: Tile,
-	contractions: Vec<Option<NativeContractionTiles>>,
+	shapes: Vec<Option<NativeContractionShapes>>,
+	schedule: NativeSchedule,
 	shared_values: u32,
 	reduction_values: u32,
 	gradient_values: usize,
@@ -9445,7 +10949,10 @@ impl Gpu {
 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
 			let heads = integer_argument(node.argument[0], "attention heads")?;
 			require(heads != 0, "attention heads are empty")?;
-			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
+			// The matrix path covers dense attention with tied heads, no gate and
+			// no indexer.
+			let plain = node.argument[1] == node.argument[0] && node.argument[2] == node.argument[0] && node.argument[3] == 0.0 && node.argument[4] == 0.0;
+			Ok::<_, RecipeError>(aligned && plain && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
 			&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
@@ -9556,7 +11063,7 @@ impl Gpu {
 			attention,
 		};
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
+		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
 		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
 		let required = fixed
 			.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
@@ -9724,7 +11231,9 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 			host = hostname.join(".");
 			hostname.clear();
 			name
-		} else { part };
+		} else {
+			part
+		};
 		let numbered_cpu = name.strip_prefix("cpu").is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()));
 		require(!numbered_cpu, format!("invalid device {name:?}; use cpu for the available CPU pool"))?;
 		let gpu = ["amd", "nv"].iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())));
@@ -10224,7 +11733,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 }
 
 impl NativeProgram {
-	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
+	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, shapes: Vec<Option<NativeContractionShapes>>, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		native_epoch_layout(artifact.precision.state.bytes())?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
@@ -10295,19 +11804,7 @@ impl NativeProgram {
 		let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
-		Ok(Self {
-			gpu,
-			artifact,
-			backend,
-			forward,
-			epoch,
-			model_load,
-			tile: schedule.tile,
-			contractions: schedule.contractions,
-			shared_values: schedule.shared_values,
-			reduction_values,
-			gradient_values,
-		})
+		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, shapes, shared_values: schedule.shared_values, schedule, reduction_values, gradient_values })
 	}
 
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
@@ -10840,12 +12337,17 @@ const CTRL_C_EVENT: u32 = 0;
 #[cfg(windows)]
 const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
 #[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 8;
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
 	fn LoadLibraryW(name: *const u16) -> Ptr;
 	fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn FreeLibrary(handle: Ptr) -> i32;
 	fn GetComputerNameExW(format: i32, name: *mut u16, length: *mut u32) -> i32;
+	fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
 	fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
 }
 unsafe extern "C" {
@@ -10868,12 +12370,12 @@ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 }
 fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
-	if graph.nodes.is_empty() {
+	if graph.source < 0 {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
 	tape.forward(ForwardMode::Training)?;
-	tape.predictions()
+	tape.predictions_at(graph.source, graph.output.elements())
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
@@ -11229,6 +12731,11 @@ fn valid_estimator(_: usize, _: usize) -> Result<()> {
 fn positive_estimator(value: usize, _: usize) -> Result<()> {
 	require(value != 0, format!("estimator count {value} is invalid"))
 }
+/// Boosters saved before their constructors took a tree count carry zero, so
+/// keep the configured count as their restoration fallback.
+fn boosting_trees(count: usize, configured: usize) -> usize {
+	if count == 0 { configured } else { count }
+}
 fn cluster_estimator(value: usize, rows: usize) -> Result<()> {
 	require(value != 0 && value <= rows, format!("kmeans cluster count {value} is invalid for {rows} training rows"))
 }
@@ -11257,7 +12764,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
-	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	let mut intercept = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
 	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
@@ -11265,7 +12772,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
 			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
 			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
-				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let prediction = intercept + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
 				let error = prediction - target;
 				let direction = if error > config.svm_epsilon {
 					1.0
@@ -11289,7 +12796,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 				*value_gradient += partial
 			}
 		}
-		bias -= config.svm_rate * bias_gradient;
+		intercept -= config.svm_rate * bias_gradient;
 		for (weight, gradient) in weights.iter_mut().zip(gradient) {
 			*weight -= config.svm_rate * gradient
 		}
@@ -11303,7 +12810,7 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	table.extend(inverse);
 	table.extend(weights);
 	let mut program = PredictorBuilder::new();
-	program.constant(bias);
+	program.constant(intercept);
 	program.affine(table);
 	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
@@ -11468,17 +12975,18 @@ fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<Predict
 fn xgboost_leaf(rows: &[usize], gradients: &[f64], regularization: f64) -> f64 {
 	-rows.iter().map(|&row| gradients[row]).sum::<f64>() / (rows.len() as f64 + regularization)
 }
-fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> TreeNode {
+fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> Result<TreeNode> {
 	if depth == 0 || rows.len() < 2 * minimum {
-		return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization));
+		return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)));
 	}
 	let total = rows.iter().map(|&row| gradients[row]).sum::<f64>();
 	let parent = total * total / (rows.len() as f64 + regularization);
-	let mut best = None;
-	for feature in 0..features {
+	// Each feature orders and scans the node rows independently, so the candidate
+	// splits divide over the workers and the best gains reduce in feature order.
+	let best = parallel_map(features, |feature| {
 		let mut ordered = rows.iter().map(|&row| (samples[row * features + feature], row)).collect::<Vec<_>>();
 		ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
-		let mut left = 0.0;
+		let (mut left, mut best) = (0.0, None);
 		for split in 1..ordered.len() {
 			left += gradients[ordered[split - 1].1];
 			if split < minimum || ordered.len() - split < minimum || ordered[split - 1].0 >= ordered[split].0 {
@@ -11486,29 +12994,34 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 			}
 			let right = total - left;
 			let gain = 0.5 * (left * left / (split as f64 + regularization) + right * right / ((ordered.len() - split) as f64 + regularization) - parent);
-			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, usize, f64)| gain > value.0) {
-				best = Some((gain, feature, (ordered[split - 1].0 + ordered[split].0) * 0.5))
+			if gain > minimum_gain && best.as_ref().is_none_or(|value: &(f64, f64)| gain > value.0) {
+				best = Some((gain, (ordered[split - 1].0 + ordered[split].0) * 0.5))
 			}
 		}
-	}
-	let Some((_, feature, threshold)) = best else { return TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization)) };
+		best.map(|(gain, threshold)| (gain, feature, threshold))
+	})?
+	.into_iter()
+	.flatten()
+	.reduce(|best, candidate| if candidate.0 > best.0 { candidate } else { best });
+	let Some((_, feature, threshold)) = best else { return Ok(TreeNode::Leaf(xgboost_leaf(rows, gradients, regularization))) };
 	let (left, right): (Vec<_>, Vec<_>) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
-	TreeNode::Split {
+	Ok(TreeNode::Split {
 		feature,
 		threshold,
-		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)),
-		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)),
-	}
+		left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)?),
+		right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)?),
+	})
 }
-fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_xgboost(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let indices = (0..rows).collect::<Vec<_>>();
-	let mut trees = Vec::with_capacity(config.boost_iterations);
-	for _ in 0..config.boost_iterations {
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
+	for _ in 0..count {
 		let gradients = predictions.iter().zip(&data.targets[..rows]).map(|(prediction, target)| prediction - target).collect::<Vec<_>>();
-		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain);
+		let tree = fit_xgboost_tree(&data.samples, &gradients, data.features, &indices, config.tree_depth, config.tree_min_rows, config.xgboost_regularization, config.xgboost_min_gain)?;
 		for (row, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
 			predictions[row] += config.boost_rate * tree_predict(&tree, sample)
 		}
@@ -11582,16 +13095,17 @@ fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 		None => TreeNode::Leaf(nodes[index].value),
 	}
 }
-fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_lightgbm(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(config.lightgbm_bins >= 2, "LightGBM histogram bins must be at least two")?;
 	require(config.lightgbm_leaves >= 2 && rows >= config.tree_min_rows && data.features != 0, "LightGBM requires at least two leaves and enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
-	let mut trees = Vec::with_capacity(config.boost_iterations);
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
 	// One scan reads one feature of every row, so the rows are transposed once
 	// into a column per feature instead of striding across every sample.
 	let columns = parallel_map(data.features, |feature| data.samples[..rows * data.features].iter().skip(feature).step_by(data.features).copied().collect::<Vec<_>>())?;
-	for _ in 0..config.boost_iterations {
+	for _ in 0..count {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
 		let residual_squares = residuals.iter().map(|residual| residual * residual).collect::<Vec<_>>();
 		let mut nodes = vec![light_node(&columns, &residuals, &residual_squares, (0..rows).collect(), config)?];
@@ -11687,15 +13201,16 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 	let (feature, threshold) = splits[level];
 	TreeNode::Split { feature, threshold, left: Box::new(oblivious_tree(splits, leaves, level + 1, code | 1 << level)), right: Box::new(oblivious_tree(splits, leaves, level + 1, code)) }
 }
-fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
+fn fit_catboost(count: usize, data: &Prepared, rows: usize, config: Config) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
 	let borders = catboost_borders(&data.samples, data.features, rows, config.catboost_borders);
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut state = config.random_seed as u64;
-	let mut trees = Vec::with_capacity(config.boost_iterations);
-	for _ in 0..config.boost_iterations {
+	let count = boosting_trees(count, config.boost_iterations);
+	let mut trees = Vec::with_capacity(count);
+	for _ in 0..count {
 		let residuals = data.targets[..rows].iter().zip(&predictions).map(|(target, prediction)| target - prediction).collect::<Vec<_>>();
 		let mut permutation = (0..rows).collect::<Vec<_>>();
 		for index in (1..permutation.len()).rev() {
@@ -11938,6 +13453,242 @@ fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, registe
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
 /// the same allocation, so K is bounded by whichever phase is larger, and a tile
 /// too wide to stage a whole chunk narrows its M lanes until one fits.
+/// The complete mutable state a schedule measurement starts from.
+struct NativeTrainingState {
+	values: Vec<u8>,
+	contexts: Vec<u8>,
+	adjoints: Vec<u8>,
+	input_adjoint: Vec<u8>,
+	weights: Vec<u8>,
+	frozen: Vec<u8>,
+	moments: Vec<u8>,
+	variances: Vec<u8>,
+	gradient: Vec<u8>,
+	metrics: Vec<u8>,
+	contractions: Vec<Option<NativeContractionTiles>>,
+	tile: Tile,
+	step: u32,
+	best_loss: [f64; 4],
+}
+
+#[derive(PartialEq, Eq)]
+struct NativeEpochState {
+	input_adjoint: Vec<u8>,
+	weights: Vec<u8>,
+	frozen: Vec<u8>,
+	moments: Vec<u8>,
+	variances: Vec<u8>,
+	batch_normalizations: Vec<u64>,
+	best_loss: [u64; 4],
+	step: u32,
+	objective: u64,
+}
+
+fn write_contraction_schedule(contexts: &Buffer, layout: &NativeLayout, contractions: &[Option<NativeContractionTiles>]) -> Result<()> {
+	require(layout.schedule.len() == contractions.len(), "native contraction schedule does not cover the graph")?;
+	for (offset, tiles) in layout.schedule.iter().zip(contractions) {
+		if *offset == usize::MAX {
+			continue;
+		}
+		let tiles = tiles.ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
+		let words = [tiles.forward, tiles.gradient, tiles.previous]
+			.iter()
+			.flat_map(|direction| [direction.m, direction.n, direction.k])
+			.flat_map(|extent| (extent as i32).to_le_bytes())
+			.collect::<Vec<_>>();
+		contexts.write_bytes(*offset, &words)?;
+	}
+	Ok(())
+}
+
+fn fnv(text: &str) -> u64 {
+	let mut hash = 14695981039346656037_u64;
+	for byte in text.as_bytes() {
+		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
+	}
+	hash
+}
+fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> String {
+	let label = device_label(gpu).unwrap_or_else(|_| gpu.name.clone());
+	let driver = match &gpu.driver {
+		Driver::Cpu => "cpu".to_owned(),
+		#[cfg(amd)]
+		Driver::Hsa(driver) => format!("hsa;cus={};wave={};workgroup={};lds={}", driver.cus, driver.wave, driver.workgroup, driver.lds),
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => format!(
+			"cuda;cus={};wave={};workgroup={};block_lds={};sm_lds={};registers={};threads={}",
+			driver.cus, driver.wave, driver.workgroup, driver.block_lds, driver.sm_lds, driver.registers, driver.threads
+		),
+		Driver::Remote(remote) => format!("remote;wave={};workers={}", remote.wave, remote.worker_threads),
+	};
+	format!(
+		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={}",
+		gpu.backend,
+		native_target_label(&gpu.native_target),
+		gpu.memory,
+		gpu.shared_limit,
+		config.schedule_candidates,
+		config.schedule_measurements,
+		config.schedule_warmups,
+		config.schedule_budget,
+		config.schedule_minimum_improvement.to_bits(),
+		config.surrogate_epochs,
+		config.surrogate_width,
+		config.surrogate_rate.to_bits(),
+		config.random_seed,
+	)
+}
+fn native_schedule_cache_path(artifact: &NativeArtifact, identity: &str) -> Result<PathBuf> {
+	let directory = artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?;
+	Ok(directory.join(format!("schedule-{:016x}.tsv", fnv(identity))))
+}
+/// Loads a complete cache only when its explicit device identity matches this
+/// run and every tile remains legal for the compiled artifact.
+fn load_schedule_cache(path: &Path, identity: &str, schedule: &NativeSchedule, shapes: &[Option<NativeContractionShapes>], ratio: u32) -> Option<Vec<Option<NativeContractionTiles>>> {
+	let text = fs::read_to_string(path).ok()?;
+	let mut lines = text.lines();
+	let header = format!("device {identity}");
+	if lines.next() != Some(header.as_str()) {
+		return None;
+	}
+	let mut parsed = schedule.contractions.to_vec();
+	let mut seen = vec![false; parsed.len()];
+	for line in text.lines() {
+		if line == header {
+			continue;
+		}
+		let fields = line.split_whitespace().collect::<Vec<_>>();
+		if fields.len() != 11 || fields[0] != "node" {
+			return None;
+		}
+		let index = fields[1].parse::<usize>().ok()?;
+		let extents = fields[2..].iter().map(|field| field.parse::<u32>().ok()).collect::<Option<Vec<_>>>()?;
+		let [fm, fnn, fk, gm, gn, gk, pm, pn, pk] = extents[..] else { return None };
+		let seen_slot = seen.get_mut(index)?;
+		if *seen_slot {
+			return None;
+		}
+		*seen_slot = true;
+		let slot = parsed.get_mut(index)?.as_mut()?;
+		let cached = [Tile { m: fm, n: fnn, k: fk }, Tile { m: gm, n: gn, k: gk }, Tile { m: pm, n: pn, k: pk }];
+		let shape = shapes.get(index)?.as_ref()?;
+		let current = [slot.forward, slot.gradient, slot.previous];
+		for direction in 0..3 {
+			let limits = [shape.forward, shape.gradient, shape.previous][direction];
+			let candidates = schedule_candidates(limits, current[direction], schedule, ratio, usize::MAX).ok()?;
+			if !candidates.contains(&cached[direction]) {
+				return None;
+			}
+		}
+		(slot.forward, slot.gradient, slot.previous) = (cached[0], cached[1], cached[2]);
+	}
+	(seen.iter().enumerate().filter(|(index, present)| **present && schedule.contractions.get(*index).is_some_and(Option::is_some)).count() == schedule.contractions.iter().flatten().count())
+		.then_some(parsed)
+}
+#[cfg(not(windows))]
+fn replace_schedule_cache(temporary: &Path, path: &Path) -> std::io::Result<()> {
+	fs::rename(temporary, path)
+}
+#[cfg(windows)]
+fn replace_schedule_cache(temporary: &Path, path: &Path) -> std::io::Result<()> {
+	let temporary = temporary.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	let path = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	if unsafe { MoveFileExW(temporary.as_ptr(), path.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+		Ok(())
+	} else {
+		Err(std::io::Error::last_os_error())
+	}
+}
+fn store_schedule_cache(path: &Path, identity: &str, contractions: &[Option<NativeContractionTiles>]) -> Result<()> {
+	let mut text = format!("device {identity}\n");
+	for (index, tiles) in contractions.iter().enumerate() {
+		let Some(tiles) = tiles else { continue };
+		text.push_str(&format!("node {index} {} {} {} {} {} {} {} {} {}\n", tiles.forward.m, tiles.forward.n, tiles.forward.k, tiles.gradient.m, tiles.gradient.n, tiles.gradient.k, tiles.previous.m, tiles.previous.n, tiles.previous.k));
+	}
+	let filename = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("native schedule cache path is invalid"))?;
+	let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+	let temporary = path.with_file_name(format!(".{filename}-{}-{serial}", std::process::id()));
+	let published = (|| {
+		let mut file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&temporary)
+			.map_err(|error| RecipeError::new(format!("cannot create native schedule cache {}: {error}", temporary.display())))?;
+		file.write_all(text.as_bytes()).map_err(|error| RecipeError::new(format!("cannot write native schedule cache {}: {error}", temporary.display())))?;
+		file.sync_all().map_err(|error| RecipeError::new(format!("cannot flush native schedule cache {}: {error}", temporary.display())))?;
+		drop(file);
+		replace_schedule_cache(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish native schedule cache {}: {error}", path.display())))
+	})();
+	if published.is_err() || temporary.exists() {
+		let _ = fs::remove_file(&temporary);
+	}
+	published
+}
+/// The gradient tile of the contraction with the most gradient work. Ties keep
+/// the first node, the rule the compiled schedule already applies.
+fn dominant_tile(shapes: &[Option<NativeContractionShapes>], contractions: &[Option<NativeContractionTiles>]) -> Option<Tile> {
+	shapes.iter()
+		.zip(contractions)
+		.filter_map(|(shape, tiles)| Some((shape.as_ref()?, tiles.as_ref()?)))
+		.map(|(shape, tiles)| (shape.gradient.m as usize * shape.gradient.n as usize * shape.gradient.k as usize, tiles.gradient))
+		.reduce(|best, node| if node.0 > best.0 { node } else { best })
+		.map(|(_, gradient)| gradient)
+}
+/// Tiles for one contraction direction that the compiled artifact can run.
+/// M and N vary over the lane ladders, but K stays fixed to the analytic tile
+/// so every candidate preserves the reduction order. The current tile comes
+/// first, and at most `budget` alternatives follow it. Matrix candidates keep
+/// the compiled 16x16 fragment mapping and only narrow its mapped M/N span.
+fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, ratio: u32, budget: usize) -> Result<Vec<Tile>> {
+	let mut candidates = vec![current];
+	if budget == 0 {
+		return Ok(candidates);
+	}
+	if schedule.matrix {
+		for m_fragments in (1..=current.m / 16).rev() {
+			for n_fragments in (1..=current.n / 16).rev() {
+				let extent = Tile { m: m_fragments * 16, n: n_fragments * 16, k: current.k };
+				if candidates.contains(&extent) || native_contraction_shared_values(extent, schedule.register_m, schedule.register_n, schedule.block, schedule.fragment_k, ratio, true)? > schedule.shared_values {
+					continue;
+				}
+				candidates.push(extent);
+				if candidates.len() > budget {
+					return Ok(candidates);
+				}
+			}
+		}
+		return Ok(candidates);
+	}
+	let (register_m, register_n, block, chunk) = (schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k);
+	let owned_capacity = schedule.chunk_values.div_ceil(schedule.register_count).max(1);
+	let ladder = |widest: u32| std::iter::successors(Some(widest.max(1)), |lanes| (*lanes > 1).then_some(lanes / 2)).collect::<Vec<_>>();
+	for lane_m in ladder(limits.m.div_ceil(register_m)) {
+		for lane_n in ladder(limits.n.div_ceil(register_n)) {
+			if lane_m.checked_mul(lane_n).is_none_or(|lanes| lanes > block) {
+				continue;
+			}
+			let (m, n) = (lane_m * register_m, lane_n * register_n);
+			let extent = Tile { m, n, k: current.k };
+			if current.k == 0 {
+				continue;
+			}
+			if native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, false)? > schedule.shared_values {
+				continue;
+			}
+			let output_lanes = (m / register_m).max(1) * (n / register_n).max(1);
+			let owned = current.k.div_ceil(chunk).div_ceil((block / output_lanes).max(2));
+			if owned > owned_capacity || native_contraction_shared_values(extent, register_m, register_n, block, chunk, ratio, false)? > schedule.shared_values || candidates.contains(&extent) {
+				continue;
+			}
+			candidates.push(extent);
+			if candidates.len() > budget {
+				return Ok(candidates);
+			}
+		}
+	}
+	Ok(candidates)
+}
+
 fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Tile> {
 	require(register_m != 0 && register_n != 0 && block != 0 && fragment != 0 && ratio != 0, "native contraction tile inputs are empty")?;
 	if matrix {
@@ -12142,10 +13893,6 @@ impl Data {
 		self.sources.push(source.into());
 		self
 	}
-	pub const fn broadcast(mut self) -> Self {
-		self.broadcast = true;
-		self
-	}
 	pub const fn norm(mut self, _: ZScore) -> Self {
 		self.normalize = true;
 		self
@@ -12236,20 +13983,246 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
 	if tables.len() > 1 {
-		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
-		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
-		if data.broadcast {
-			for table in &mut tables {
-				let count = table.rows.len();
-				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-				if count != rows {
-					table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
+		tables = align_samples(tables)?
+	}
+	Ok((tables, paths))
+}
+/// Align feature sources by logical sample count. A lone table's rows are its
+/// samples. Sibling tables that share a schema are whole-table samples, one per
+/// file, only when another table records exactly their file names in one of its
+/// columns: that column is what identifies them as one source, and what orders
+/// them against the rows naming them. Sharing a schema is not itself an
+/// association, so an unrecorded group is read as row-level partitions of one
+/// source and its rows join instead. No order is ever taken from the path.
+fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
+	let mut sources = Vec::<Vec<Table>>::new();
+	for table in tables {
+		match sources.iter_mut().find(|source| source[0].headers == table.headers) {
+			Some(source) => source.push(table),
+			None => sources.push(vec![table]),
+		}
+	}
+	// Every column of a lone table is a candidate record of file names: the stems
+	// it holds, in that table's own row order. It becomes a source candidate only
+	// when its values overlap the names of one sibling-file source below. A path-
+	// looking value by itself remains an ordinary categorical feature.
+	let mut recorded = Vec::new();
+	for source in &sources {
+		let [table] = source.as_slice() else { continue };
+		for column in 0..table.headers.len() {
+			let values = table.rows.iter().map(|row| row.get(column).cloned().unwrap_or_default()).collect::<Vec<_>>();
+			let stem = |value: &String| Path::new(value).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			recorded.push((table.name.clone(), table.headers[column].clone(), column, values.iter().map(stem).collect::<Vec<_>>()))
+		}
+	}
+	// The recorded order of each group, when exactly one reading exists. Two
+	// columns naming the same files in different orders leave the association
+	// ambiguous, and files sharing a name cannot be ordered by name at all.
+	let mut orders = Vec::new();
+	// The (table, column) pairs that turned out to name files.
+	let mut references = BTreeSet::new();
+	for source in &sources {
+		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		let mut found: Option<(&String, &String, &Vec<String>)> = None;
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, column, order) in &recorded {
+				if order.len() != names.len() || order.iter().map(String::as_str).collect::<BTreeSet<_>>() != names {
+					continue;
+				}
+				// A column that resolves a group's files is that group's identity, not
+				// one of the row values the caller selected. Every column that reads as
+				// the record is one, including a second column that agrees with the
+				// first, so none of them is left to be encoded as a feature.
+				references.insert((table.clone(), *column));
+				match found {
+					Some((first, first_header, first_order)) => require(
+						first_order == order,
+						format!("{first:?} column {first_header:?} and {table:?} column {header:?} record the same {} file names in different orders", names.len()),
+					)?,
+					None => found = Some((table, header, order)),
+				}
+			}
+		}
+		orders.push(found.map(|(_, _, order)| order.clone()));
+		// A same-sized column that names at least one member of this source is a
+		// source-alignment candidate. If it did not resolve to the complete unique
+		// set above, reject it instead of silently encoding an unresolved or
+		// duplicate filename as a feature. Columns with no source-name overlap are
+		// not candidates, even when their values look like paths or URLs.
+		if source.len() > 1 && names.len() == source.len() {
+			for (table, header, column, order) in &recorded {
+				if order.len() == names.len()
+					&& order.iter().any(|name| names.contains(name.as_str()))
+					&& !references.contains(&(table.clone(), *column))
+				{
+					return Err(RecipeError::new(format!("table {table:?} column {header:?} contains unresolved file references")));
 				}
 			}
 		}
 	}
-	Ok((tables, paths))
+	// A recorded group contributes one sample per file. An unrecorded group is one
+	// source whose partitions each contribute their own rows.
+	let count = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[table] => table.rows.len(),
+		_ if order.is_some() => source.len(),
+		_ => source.iter().map(|table| table.rows.len()).sum(),
+	};
+	let samples = sources.iter().zip(&orders).map(|(source, order)| count(source, order)).max().unwrap_or(0);
+	// How a source was read is what a count mismatch is usually about, so the
+	// report says it rather than leaving the reader to infer the rule.
+	let reading = |source: &[Table], order: &Option<Vec<String>>| match source {
+		[_] => "its rows".to_owned(),
+		_ if order.is_some() => format!("one sample per file across {} files", source.len()),
+		_ => format!("the joined rows of {} partitions, because no column records their file names", source.len()),
+	};
+	let mut aligned = Vec::new();
+	for (mut source, order) in sources.into_iter().zip(orders) {
+		require(count(&source, &order) == samples, format!("source {:?} contributes {} samples as {}, expected {samples}", source[0].name, count(&source, &order), reading(&source, &order)))?;
+		if let [_] = source.as_slice() {
+			let mut table = source.remove(0);
+			// Drop the columns that resolved a group's files. They identified the
+			// samples; encoding a file name as numbers alongside the values it points
+			// at feeds the model the label of a vector it already has, and a stem
+			// like "scan-0000" reaches the row as its bytes.
+			let dropped = (0..table.headers.len()).filter(|column| references.contains(&(table.name.clone(), *column))).collect::<Vec<_>>();
+			if dropped.len() == table.headers.len() {
+				continue;
+			}
+			for column in dropped.into_iter().rev() {
+				table.headers.remove(column);
+				for row in &mut table.rows {
+					if column < row.len() {
+						row.remove(column);
+					}
+				}
+			}
+			aligned.push(table);
+			continue;
+		}
+		let declared = source[0].declared;
+		let Some(order) = order else {
+			// Partitions of one source: every table's rows are samples of the same shape.
+			let headers = source[0].headers.clone();
+			let rows = source.into_iter().flat_map(|table| table.rows).collect::<Vec<_>>();
+			aligned.push(Table { name: "data".to_owned(), headers, declared, rows, attention: None });
+			continue;
+		};
+		source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()));
+		let rows = source[0].rows.len();
+		let mut headers = Vec::new();
+		for row in 1..=rows {
+			headers.extend(source[0].headers.iter().map(|header| if rows == 1 { header.clone() } else { format!("{header}.{row}") }))
+		}
+		let mut values = Vec::with_capacity(source.len());
+		for table in source {
+			require(table.rows.len() == rows, format!("sample {:?} expected {rows} rows, received {}", table.name, table.rows.len()))?;
+			values.push(table.rows.into_iter().flatten().collect())
+		}
+		aligned.push(Table { name: "data".to_owned(), headers, declared, rows: values, attention: None })
+	}
+	Ok(aligned)
+}
+fn grouped_sample_table<'a>(
+	name: String, targets: &[String], groups: BTreeMap<String, (Vec<String>, BTreeMap<String, &'a (PathBuf, Vec<u8>)>)>,
+) -> Result<Table> {
+	require(!groups.is_empty(), "sample groups are empty")?;
+	let fields = groups.values().next().unwrap().1.keys().cloned().collect::<Vec<_>>();
+	require(groups.values().all(|(values, inputs)| values.len() == targets.len() && inputs.keys().eq(fields.iter())), "samples have different input or target fields")?;
+	let mut kinds = BTreeMap::<String, (Option<Shape>, usize)>::new();
+	let mut headers = Vec::new();
+	let mut rows = Vec::with_capacity(groups.len());
+	let mut attention = Some(Shape { channels: 0, length: 0 });
+	for (row_index, (sample, (target_values, inputs))) in groups.iter().enumerate() {
+		let mut row = Vec::new();
+		for (field, (path, bytes)) in inputs {
+			let (shape, values) = sample_values(path, bytes)?;
+			let kind = (shape, values.len());
+			require(*kinds.entry(field.clone()).or_insert(kind) == kind, format!("input {field:?} of sample {sample:?} changes shape"))?;
+			if row_index == 0 {
+				headers.extend((1..=values.len()).map(|index| if values.len() == 1 { field.clone() } else { format!("{field}.{index}") }));
+			}
+			if let Some(previous) = attention {
+				attention = shape
+					.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+					.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+			}
+			row.extend(values);
+		}
+		row.extend(target_values.iter().cloned());
+		rows.push(row);
+	}
+	headers.extend(targets.iter().cloned());
+	Ok(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) })
+}
+fn manifest_sample<'a>(root: &Path, value: &str, files: &'a [(PathBuf, Vec<u8>)]) -> Option<(&'a Path, &'a [u8], Option<usize>)> {
+	let (name, page) = match value.split_once("#page=") {
+		Some((name, page)) => (name, Some(page.parse().ok()?)),
+		None => (value, None),
+	};
+	if name.is_empty() || !Path::new(name).components().all(|component| matches!(component, std::path::Component::Normal(_))) {
+		return None;
+	}
+	let path = root.join(name);
+	files.iter().find(|(candidate, _)| *candidate == path).map(|(path, bytes)| (path.as_path(), bytes.as_slice(), page))
+}
+
+/// A manifest table whose selected inputs all name image files becomes one row
+/// of decoded pixels per manifest row. Target columns remain ordinary named
+/// values, so split, save, resume, and inference preserve their row boundary.
+fn manifest_table(data: &Data, root: &Path, files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
+	for (_, table) in parsed {
+		let targets = data
+			.target
+			.iter()
+			.map(|name| table.headers.iter().enumerate().find(|(column, header)| column_match(name, table, header, *column)).map(|(column, _)| column))
+			.collect::<Option<Vec<_>>>();
+		let Some(targets) = targets else { continue };
+		let mut inputs = table
+			.headers
+			.iter()
+			.enumerate()
+			.filter(|(column, header)| !targets.contains(column) && data.features.selects(table, header, *column))
+			.map(|(column, header)| (column, header.clone()))
+			.collect::<Vec<_>>();
+		if inputs.is_empty() || !inputs.iter().all(|(column, _)| table.rows.iter().all(|row| row.get(*column).and_then(|value| manifest_sample(root, value, files)).is_some())) {
+			continue;
+		}
+		if let FeatureSelection::Include(names) = &data.features {
+			inputs.sort_by_key(|(column, header)| names.iter().position(|name| column_match(name, table, header, *column)).unwrap_or(names.len()));
+		}
+		let mut kinds = vec![None; inputs.len()];
+		let mut headers = Vec::new();
+		let mut rows = Vec::with_capacity(table.rows.len());
+		let mut attention = Some(Shape { channels: 0, length: 0 });
+		for (row_index, source) in table.rows.iter().enumerate() {
+			let mut row = Vec::new();
+			for (input, (column, name)) in inputs.iter().enumerate() {
+				let (path, bytes, page) = manifest_sample(root, &source[*column], files).unwrap();
+				let (shape, values) = if path.extension().and_then(|value| value.to_str()).is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "tif" | "tiff")) {
+					let (width, height, channels, pixels) = tiff_pixels(bytes, page.unwrap_or(0))?;
+					(Some(Shape { channels: checked_mul(width, channels, "TIFF row width")?, length: height }), pixels.into_iter().map(|value| value.to_string()).collect::<Vec<_>>())
+				} else {
+					sample_values(path, bytes)?
+				};
+				let kind = (shape, values.len());
+				require(*kinds[input].get_or_insert(kind) == kind, format!("manifest input {name:?} changes shape"))?;
+				if row_index == 0 {
+					headers.extend((1..=values.len()).map(|index| if values.len() == 1 { name.clone() } else { format!("{name}.{index}") }));
+				}
+				if let Some(previous) = attention {
+					attention = shape
+						.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+						.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+				}
+				row.extend(values);
+			}
+			row.extend(targets.iter().map(|column| source[*column].clone()));
+			rows.push(row);
+		}
+		headers.extend(data.target.iter().cloned());
+		return Ok(Some(Table { name: table.name.clone(), headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+	}
+	Ok(None)
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -12257,7 +14230,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 /// samples their decoded pixels. Anything else falls through to the table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
-	let [target] = data.target.as_slice() else { return Ok(None) };
+	let targets = data.target.as_slice();
+	if targets.is_empty() {
+		return Ok(None);
+	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
@@ -12266,31 +14242,127 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
 	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
-	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
+	if let Some(table) = manifest_table(data, &root, files, parsed)? {
+		return Ok(Some(table));
+	}
+	// Flat sidecar samples: every sample may have one named input file or a
+	// `<sample>.<input>.<extension>` group of independently named views. Target
+	// sidecars are `<sample>.<target>`; `.label` and WebDataset's `.cls` retain
+	// their established single-target meaning.
 	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
-		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
-		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
-			let mut builder = SampleTableBuilder::new(target.clone());
-			for (path, bytes) in &samples {
-				let (_, label) = sidecar(path).unwrap();
-				builder.push(path, bytes, sample_text(path, label)?)?;
-			}
-			return builder.finish(name).map(Some);
+		let sidecar = |sample: &str, target: &str| {
+			let named = root.join(format!("{sample}.{target}"));
+			files.iter().find(|(candidate, _)| *candidate == named).or_else(|| {
+				(targets.len() == 1).then(|| {
+					["label", "cls"].into_iter().find_map(|extension| {
+						let fallback = root.join(format!("{sample}.{extension}"));
+						files.iter().find(|(candidate, _)| *candidate == fallback)
+					})
+				}).flatten()
+			})
+		};
+		let mut groups = BTreeMap::<String, BTreeMap<String, &(PathBuf, Vec<u8>)>>::new();
+		for &entry in &samples {
+			let full = stem(&entry.0);
+			let (sample, input) = if targets.iter().all(|target| sidecar(&full, target).is_some()) {
+				(full.as_str(), "input")
+			} else {
+				full.rsplit_once('.').map_or((full.as_str(), "input"), |(sample, input)| (sample, input))
+			};
+			require(groups.entry(sample.to_owned()).or_default().insert(input.to_owned(), entry).is_none(), format!("flat sample {sample:?} repeats input {input:?}"))?;
 		}
-		// Name-labeled samples: `<target>__<name>` carries the label in the file name
-		// rather than in a sibling or a directory. Every file under the root has to be
-		// one labeled sample, so a tree whose samples are only partly recognized never
-		// trains on the recognized part alone.
-		const SEPARATOR: &str = "__";
-		let labels = samples.iter().map(|(path, _)| stem(path).split_once(SEPARATOR).map(|(label, _)| label.to_owned())).collect::<Option<Vec<_>>>();
-		if let Some(labels) = labels.filter(|labels| samples.len() == files.len() && labels.iter().collect::<BTreeSet<_>>().len() > 1) {
-			let mut builder = SampleTableBuilder::new(target.clone());
-			for ((path, bytes), label) in samples.iter().zip(labels) {
-				builder.push(path, bytes, label)?;
+		if !groups.is_empty() && groups.keys().all(|sample| targets.iter().all(|target| sidecar(sample, target).is_some())) {
+			let fields = groups.values().next().unwrap().keys().cloned().collect::<Vec<_>>();
+			require(groups.values().all(|inputs| inputs.keys().eq(fields.iter())), "flat samples have different input fields")?;
+			let mut kinds = BTreeMap::<String, (Option<Shape>, usize)>::new();
+			let mut headers = Vec::new();
+			let mut rows = Vec::with_capacity(groups.len());
+			let mut attention = Some(Shape { channels: 0, length: 0 });
+			for (row_index, (sample, inputs)) in groups.iter().enumerate() {
+				let mut row = Vec::new();
+				for (field, (path, bytes)) in inputs {
+					let (shape, values) = sample_values(path, bytes)?;
+					let kind = (shape, values.len());
+					require(*kinds.entry(field.clone()).or_insert(kind) == kind, format!("flat input {field:?} of sample {sample:?} changes shape"))?;
+					if row_index == 0 {
+						headers.extend((1..=values.len()).map(|index| if values.len() == 1 { field.clone() } else { format!("{field}.{index}") }));
+					}
+					if let Some(previous) = attention {
+						attention = shape
+							.filter(|shape| previous.channels == 0 || previous.length == shape.channels)
+							.map(|shape| Shape { channels: previous.channels + shape.length, length: shape.channels });
+					}
+					row.extend(values);
+				}
+				for target in targets {
+					let (path, bytes) = sidecar(sample, target).unwrap();
+					row.push(sample_text(path, bytes)?);
+				}
+				rows.push(row);
 			}
-			return builder.finish(name).map(Some);
+			headers.extend(targets.iter().cloned());
+			return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		}
+		// Name-labeled samples: one `__`-separated value per declared target
+		// precedes the sample name. An optional final `.input` qualifier groups
+		// independently named input documents for the same sample.
+		const SEPARATOR: &str = "__";
+		let mut qualifiers = BTreeMap::<String, usize>::new();
+		for (path, _) in &samples {
+			if let Some((sample, _)) = stem(path).rsplit_once('.') { *qualifiers.entry(sample.to_owned()).or_default() += 1; }
+		}
+		let mut named = BTreeMap::<String, (Vec<String>, BTreeMap<String, &(PathBuf, Vec<u8>)>)>::new();
+		let mut complete = samples.len() == files.len();
+		for &entry in &samples {
+			let full = stem(&entry.0);
+			let (stem, input) = full
+				.rsplit_once('.')
+				.filter(|(sample, _)| qualifiers.get(*sample).is_some_and(|count| *count > 1))
+				.map_or((full.as_str(), "input"), |(sample, input)| (sample, input));
+			let parts = stem.split(SEPARATOR).collect::<Vec<_>>();
+			if parts.len() <= targets.len() {
+				complete = false;
+				break;
+			}
+			let values = parts[..targets.len()].iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+			let sample = parts[targets.len()..].join(SEPARATOR);
+			let group = named.entry(format!("{}::{sample}", values.join("::"))).or_insert_with(|| (values.clone(), BTreeMap::new()));
+			complete &= group.0 == values && group.1.insert(input.to_owned(), entry).is_none();
+		}
+		if complete && !named.is_empty() && targets.iter().enumerate().all(|(index, _)| named.values().map(|(values, _)| &values[index]).collect::<BTreeSet<_>>().len() > 1) {
+			return grouped_sample_table(name, targets, named).map(Some);
 		}
 		return Ok(None);
+	}
+	// Nested class samples: each relative parent component supplies one named
+	// target value. Qualified stems group multiple named input views inside the
+	// same class sample. The established one-level, one-input class layout stays
+	// on the legacy path below.
+	let mut class_qualifiers = BTreeMap::<String, usize>::new();
+	for (path, _) in &samples {
+		let full = stem(path);
+		if let (Some(relative), Some((sample, _))) = (path.parent().and_then(|parent| parent.strip_prefix(&root).ok()), full.rsplit_once('.')) {
+			*class_qualifiers.entry(format!("{}\0{sample}", relative.display())).or_default() += 1;
+		}
+	}
+	let mut classes = BTreeMap::<String, (Vec<String>, BTreeMap<String, &(PathBuf, Vec<u8>)>)>::new();
+	let mut class_layout = true;
+	let mut qualified = false;
+	for &entry in &samples {
+		let relative = entry.0.parent().and_then(|parent| parent.strip_prefix(&root).ok());
+		let Some(relative) = relative else { class_layout = false; break };
+		let values = relative.components().map(|component| component.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>();
+		if values.len() != targets.len() { class_layout = false; break }
+		let full = stem(&entry.0);
+		let (sample, input) = full
+			.rsplit_once('.')
+			.filter(|(sample, _)| class_qualifiers.get(&format!("{}\0{sample}", relative.display())).is_some_and(|count| *count > 1))
+			.map_or((full.as_str(), "input"), |(sample, input)| { qualified = true; (sample, input) });
+		let group = classes.entry(format!("{}::{sample}", values.join("::"))).or_insert_with(|| (values.clone(), BTreeMap::new()));
+		class_layout &= group.0 == values && group.1.insert(input.to_owned(), entry).is_none();
+	}
+	if class_layout && (targets.len() > 1 || qualified) {
+		return grouped_sample_table(name, targets, classes).map(Some);
 	}
 	// One level of subdirectories under the root.
 	if !samples.iter().all(|(path, _)| path.parent().and_then(Path::parent) == Some(root.as_path())) {
@@ -12306,13 +14378,20 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Paired subdirectories: identical sample stems in every directory, one directory named
-	// for the requested target. Each stem is one sample and each directory one column group.
-	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
+	// for each requested target. Each stem is one sample and each directory one column group.
+	let singular = |directory: &str| {
+		directory
+			.strip_suffix("es")
+			.filter(|value| value.ends_with('s'))
+			.or_else(|| directory.strip_suffix('s').filter(|value| !value.is_empty()))
+			.unwrap_or(directory)
+			.to_owned()
+	};
 	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
 	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
-	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
-	let sample_target = stems[0].contains(target);
-	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
+	let paired_target = targets.iter().all(|target| directories.keys().any(|directory| singular(directory) == *target));
+	let sample_target = targets.iter().all(|target| stems[0].contains(target));
+	require(!(aligned && paired_target && sample_target), format!("targets {targets:?} name both paired directories and per-sample files"))?;
 	// Per-sample layouts use directories as rows; paired layouts use directories as columns.
 	if aligned && (sample_target || paired_target) {
 		let mut columns = Vec::new();
@@ -12334,13 +14413,12 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut kind = None;
 			for (row, (path, bytes)) in entries.iter().enumerate() {
 				let (shape, values) = sample_values(path, bytes)?;
-				require(!sample_target || column != target || shape.is_none(), format!("per-sample target files {column:?} hold images, not values"))?;
 				let current = (shape, values.len());
 				require(*kind.get_or_insert(current) == current, format!("sample {} expected {:?}, received {current:?}", path.display(), kind.unwrap()))?;
 				rows[row].extend(values);
 			}
 			let (shape, width) = kind.unwrap_or((None, 0));
-			if column != target
+			if !targets.contains(column)
 				&& let Some(previous) = attention
 			{
 				attention = shape
@@ -12355,6 +14433,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
+	// A class subdirectory names one value, so this layout carries one target.
+	let [target] = targets else { return Ok(None) };
 	// Only a declared column overrides the directory names; the positional names a headerless
 	// sample takes name its one field by convention rather than carrying a label.
 	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
@@ -12752,11 +14832,105 @@ fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
 	}
 	Ok((width, height, channels, pixels))
 }
+/// One uncompressed 8-bit grayscale or interleaved RGB(A) image from a TIFF
+/// image-file directory. Strip order is the stored row order, and the optional
+/// manifest page selects the corresponding linked directory.
+fn tiff_pixels(bytes: &[u8], page: usize) -> Result<(usize, usize, usize, Vec<u8>)> {
+	require(bytes.len() >= 8, "TIFF header is truncated")?;
+	let little = match &bytes[..2] {
+		b"II" => true,
+		b"MM" => false,
+		_ => return Err(RecipeError::new("TIFF byte order is invalid")),
+	};
+	let read16 = |offset: usize| -> Option<u16> {
+		bytes.get(offset..offset.checked_add(2)?).map(|value| if little { u16::from_le_bytes(value.try_into().unwrap()) } else { u16::from_be_bytes(value.try_into().unwrap()) })
+	};
+	let read32 = |offset: usize| -> Option<u32> {
+		bytes.get(offset..offset.checked_add(4)?).map(|value| if little { u32::from_le_bytes(value.try_into().unwrap()) } else { u32::from_be_bytes(value.try_into().unwrap()) })
+	};
+	require(read16(2) == Some(42), "TIFF magic is invalid")?;
+	let mut directory = read32(4).ok_or_else(|| RecipeError::new("TIFF first directory is absent"))? as usize;
+	let mut visited = BTreeSet::new();
+	for _ in 0..page {
+		require(visited.insert(directory), "TIFF directory chain contains a cycle")?;
+		let entries = read16(directory).ok_or_else(|| RecipeError::new("TIFF directory is truncated"))? as usize;
+		let next = checked_add(directory, checked_add(2, checked_mul(entries, 12, "TIFF entries")?, "TIFF entries")?, "TIFF directory")?;
+		directory = read32(next).filter(|offset| *offset != 0).ok_or_else(|| RecipeError::new(format!("TIFF page {page} is absent")))? as usize;
+	}
+	require(visited.insert(directory), "TIFF directory chain contains a cycle")?;
+	let entries = read16(directory).ok_or_else(|| RecipeError::new("TIFF directory is truncated"))? as usize;
+	let mut tags = BTreeMap::<u16, Vec<u32>>::new();
+	for index in 0..entries {
+		let entry = checked_add(checked_add(directory, 2, "TIFF entry")?, checked_mul(index, 12, "TIFF entry")?, "TIFF entry")?;
+		let tag = read16(entry).ok_or_else(|| RecipeError::new("TIFF entry is truncated"))?;
+		let kind = read16(checked_add(entry, 2, "TIFF entry type")?).ok_or_else(|| RecipeError::new("TIFF entry type is truncated"))?;
+		let count = read32(checked_add(entry, 4, "TIFF entry count")?).ok_or_else(|| RecipeError::new("TIFF entry count is truncated"))? as usize;
+		let width = match kind { 3 => 2, 4 => 4, _ => continue };
+		let bytes_count = checked_mul(count, width, "TIFF tag values")?;
+		let value_field = checked_add(entry, 8, "TIFF tag offset")?;
+		let values = if bytes_count <= 4 { value_field } else { read32(value_field).ok_or_else(|| RecipeError::new("TIFF tag offset is truncated"))? as usize };
+		let decoded = (0..count)
+			.map(|value| {
+				let offset = checked_add(values, checked_mul(value, width, "TIFF tag value")?, "TIFF tag value")?;
+				if kind == 3 { read16(offset).map(u32::from) } else { read32(offset) }.ok_or_else(|| RecipeError::new("TIFF tag value is truncated"))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		tags.insert(tag, decoded);
+	}
+	let one = |tag: u16, role: &str| tags.get(&tag).and_then(|values| values.first()).copied().ok_or_else(|| RecipeError::new(format!("TIFF {role} is absent")));
+	let width = one(256, "width")? as usize;
+	let height = one(257, "height")? as usize;
+	let compression = one(259, "compression")?;
+	require(compression == 1, format!("TIFF compression {compression} is unsupported"))?;
+	let photometric = one(262, "photometric interpretation")?;
+	let channels = tags.get(&277).and_then(|values| values.first()).copied().unwrap_or(1) as usize;
+	require(matches!(channels, 1 | 3 | 4), format!("TIFF channel count {channels} is unsupported"))?;
+	require(tags.get(&258).is_some_and(|bits| !bits.is_empty() && bits.iter().all(|bits| *bits == 8)), "TIFF samples must be 8-bit")?;
+	require(tags.get(&284).and_then(|values| values.first()).copied().unwrap_or(1) == 1, "TIFF planar storage is unsupported")?;
+	let offsets = tags.get(&273).ok_or_else(|| RecipeError::new("TIFF strip offsets are absent"))?;
+	let counts = tags.get(&279).ok_or_else(|| RecipeError::new("TIFF strip byte counts are absent"))?;
+	require(offsets.len() == counts.len(), "TIFF strip offsets and sizes differ")?;
+	let expected = checked_mul(checked_mul(width, height, "TIFF pixels")?, channels, "TIFF samples")?;
+	let mut pixels = Vec::with_capacity(expected);
+	for (offset, count) in offsets.iter().zip(counts) {
+		let (offset, count) = (*offset as usize, *count as usize);
+		let end = checked_add(offset, count, "TIFF strip")?;
+		pixels.extend_from_slice(bytes.get(offset..end).ok_or_else(|| RecipeError::new("TIFF strip is truncated"))?);
+	}
+	require(pixels.len() == expected, format!("TIFF pixel data expected {expected} bytes, received {}", pixels.len()))?;
+	match photometric {
+		0 if channels == 1 => pixels.iter_mut().for_each(|value| *value = 255 - *value),
+		1 if channels == 1 => {}
+		2 if channels >= 3 => {}
+		_ => return Err(RecipeError::new(format!("TIFF photometric interpretation {photometric} is unsupported"))),
+	}
+	Ok((width, height, channels, pixels))
+}
+/// A headerless table can receive stable logical names from the existing
+/// public selectors: `include` names the leading input fields and `target`
+/// names the trailing target fields. Without both exact widths, the
+/// established positional `colN` and final `target` names remain unchanged.
+fn name_headerless(data: &Data, tables: &mut [Table]) -> Result<()> {
+	let [table] = tables else { return Ok(()) };
+	let FeatureSelection::Include(inputs) = &data.features else { return Ok(()) };
+	if table.declared {
+		return Ok(());
+	}
+	let width = checked_add(inputs.len(), data.target.len(), "headerless declared fields")?;
+	if width != table.headers.len() {
+		return Ok(());
+	}
+	table.headers = inputs.iter().chain(&data.target).cloned().collect();
+	table.declared = true;
+	Ok(())
+}
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
+	name_headerless(data, &mut tables)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
 	if !data.tests.is_empty() {
-		let (tests, test_sources) = load_tables(data, &data.tests)?;
+		let (mut tests, test_sources) = load_tables(data, &data.tests)?;
+		name_headerless(data, &mut tests)?;
 		require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
 		for (table, test) in tables.iter_mut().zip(tests) {
@@ -12801,6 +14975,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 				columns.push((table, column, infer_feature(value, column, source_table_rows)));
 			}
 		}
+	}
+	if let FeatureSelection::Include(names) = &data.features {
+		columns.sort_by_key(|(table, column, _)| names.iter().position(|name| column_match(name, &tables[*table], &tables[*table].headers[*column], *column)).unwrap_or(names.len()));
 	}
 	let features = columns.iter().map(|column| column.2.width()).sum();
 	let mut sequence_widths = BTreeMap::new();
@@ -12888,7 +15065,7 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 				continue;
 			}
 			for (row, values) in table.rows.iter().enumerate() {
-				let text = values.get(column).cloned().unwrap_or_default();
+				let text = values.get(column).map_or("", String::as_str).trim();
 				let chars = text
 					.chars()
 					.map(|character| CHAR_IDS.iter().position(|value| *value == character).ok_or_else(|| RecipeError::new(format!("unsupported character {character:?} in row {}", row + 1))))
@@ -12981,10 +15158,10 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool {
-	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml")
+	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml" | "gz" | "xlsx")
 }
 fn is_archive(extension: &str) -> bool {
-	matches!(extension.to_ascii_lowercase().as_str(), "zip")
+	matches!(extension.to_ascii_lowercase().as_str(), "zip" | "tar")
 }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
@@ -13015,8 +15192,16 @@ fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf,
 			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
 		}
 	};
-	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+	if let Some(extension) = path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase)
+		&& is_archive(&extension)
+	{
+		let entries = match extension.as_str() {
+			"zip" => zip_entries(&bytes),
+			"tar" => tar_entries(&bytes),
+			_ => unreachable!(),
+		}.map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+		for (entry, contents) in entries {
+			require(!entry.is_empty() && Path::new(&entry).components().all(|component| matches!(component, std::path::Component::Normal(_))), format!("archive member path {entry:?} is invalid"))?;
 			let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 				&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
 			if metadata {
@@ -13045,22 +15230,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 			})
 	};
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
-		let mut tables = Vec::new();
-		for mut group in groups.into_values() {
-			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
-			if group.iter().any(|table| table.headers != group[0].headers) {
-				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-				for table in &mut group {
-					let count = table.rows.len();
-					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-					if count != rows {
-						table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
-					}
-				}
-			}
-			tables.extend(group);
-		}
-		return Ok(tables);
+		return Ok(groups.into_values().flatten().collect());
 	}
 	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
 	require(!groups.is_empty(), "data source contains no usable captures")?;
@@ -13154,6 +15324,12 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+		Some("gz") => {
+			let decoded = gzip_inflate(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			let inner = path.file_stem().map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("dataset {} has no compressed file name", path.display())))?;
+			decode_tables(&inner, &decoded)
+		}
+		Some("xlsx") => xlsx_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("jsonl") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = text
@@ -13319,8 +15495,9 @@ fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
 	}
 	Ok(values)
 }
-/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman blocks.
-fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman
+/// blocks, with the number of source bytes consumed through the final block.
+fn inflate_consumed(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
 	struct Bits<'a> {
 		bytes: &'a [u8],
 		position: usize,
@@ -13456,9 +15633,12 @@ fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
 			_ => return Err(RecipeError::new("DEFLATE block type is invalid")),
 		}
 		if last == 1 {
-			return Ok(output);
+			return Ok((output, bits.position.div_ceil(8)));
 		}
 	}
+}
+fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	inflate_consumed(bytes).map(|(output, _)| output)
 }
 /// zlib envelope: header check, DEFLATE body, Adler-32 verification.
 fn zlib_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -13503,11 +15683,38 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 		Ok(())
 	}
 	let object_messages = |header: usize| -> Result<Vec<(u16, usize, usize)>> {
-		require(bytes.get(header) == Some(&1), "HDF5 object header version is unsupported")?;
-		let mut count = read16(header + 2).ok_or_else(truncated)?;
-		let size = read32(header + 8).ok_or_else(truncated)?;
+		if bytes.get(header) == Some(&1) {
+			let mut count = read16(header + 2).ok_or_else(truncated)?;
+			let size = read32(header + 8).ok_or_else(truncated)?;
+			let mut output = Vec::new();
+			messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+			return Ok(output);
+		}
+		require(bytes.get(header..header + 4) == Some(&b"OHDR"[..]) && bytes.get(header + 4) == Some(&2), "HDF5 object header version is unsupported")?;
+		let flags = *bytes.get(header + 5).ok_or_else(truncated)?;
+		let mut chunk = header + 6;
+		if flags & 0x20 != 0 { chunk = checked_add(chunk, 16, "HDF5 object timestamps")?; }
+		if flags & 0x10 != 0 { chunk = checked_add(chunk, 4, "HDF5 attribute phase change")?; }
+		let width = 1_usize << (flags & 3);
+		let size_bytes = bytes.get(chunk..chunk + width).ok_or_else(truncated)?;
+		let size = size_bytes.iter().enumerate().fold(0_usize, |value, (index, byte)| value | usize::from(*byte) << (8 * index));
+		chunk += width;
+		let end = checked_add(chunk, size, "HDF5 object message chunk")?;
+		require(end <= bytes.len(), "HDF5 object message chunk is truncated")?;
 		let mut output = Vec::new();
-		messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+		let mut offset = chunk;
+		while offset + 4 <= end {
+			let kind = u16::from(bytes[offset]);
+			let size = u16::from_le_bytes(bytes[offset + 1..offset + 3].try_into().unwrap()) as usize;
+			let header_size = if flags & 4 == 0 { 4 } else { 6 };
+			let body = checked_add(offset, header_size, "HDF5 version-2 message")?;
+			let next = checked_add(body, size, "HDF5 version-2 message")?;
+			require(next <= end, "HDF5 version-2 message is truncated")?;
+			if kind != 0 {
+				output.push((kind, body, size));
+			}
+			offset = next;
+		}
 		Ok(output)
 	};
 	let (mut btree, mut heap) = (None, None);
@@ -13552,7 +15759,12 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 			match kind {
 				1 => {
 					let rank = bytes[body + 1] as usize;
-					dims = (0..rank).map(|index| read64(body + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+					let dimensions = match bytes[body] {
+						1 => body + 8,
+						2 => body + 4,
+						version => return Err(RecipeError::new(format!("HDF5 dataspace version {version} is unsupported"))),
+					};
+					dims = (0..rank).map(|index| read64(dimensions + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
 				}
 				3 => {
 					let class = bytes[body] & 0xf;
@@ -13662,6 +15874,96 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
+fn gzip_crc32(bytes: &[u8]) -> u32 {
+	let mut crc = u32::MAX;
+	for byte in bytes {
+		crc ^= u32::from(*byte);
+		for _ in 0..8 { crc = if crc & 1 == 0 { crc >> 1 } else { crc >> 1 ^ 0xedb8_8320 }; }
+	}
+	!crc
+}
+/// Concatenated gzip members containing deflate streams. Every member validates
+/// its header checksum when present, CRC-32, and uncompressed size. Corpus
+/// padding may follow only after the final complete member.
+fn gzip_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	let mut cursor = 0;
+	let mut combined = Vec::new();
+	loop {
+		if bytes[cursor..].iter().all(|byte| matches!(*byte, 0 | b'p')) {
+			return require(!combined.is_empty(), "gzip file has no members").map(|()| combined);
+		}
+		let member = cursor;
+		require(bytes.len().saturating_sub(cursor) >= 18 && bytes[cursor..cursor + 2] == [0x1f, 0x8b], "gzip header is absent")?;
+		require(bytes[cursor + 2] == 8, format!("gzip compression method {} is unsupported", bytes[cursor + 2]))?;
+		let flags = bytes[cursor + 3];
+		require(flags & 0xe0 == 0, "gzip reserved flags are set")?;
+		cursor = checked_add(cursor, 10, "gzip header")?;
+		if flags & 4 != 0 {
+			let length = bytes.get(cursor..cursor + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize).ok_or_else(|| RecipeError::new("gzip extra field is truncated"))?;
+			cursor = checked_add(cursor, checked_add(2, length, "gzip extra field")?, "gzip extra field")?;
+		}
+		for flag in [8, 16] {
+			if flags & flag != 0 {
+				let end = bytes.get(cursor..).and_then(|value| value.iter().position(|byte| *byte == 0)).ok_or_else(|| RecipeError::new("gzip text field is unterminated"))?;
+				cursor = checked_add(cursor, end + 1, "gzip text field")?;
+			}
+		}
+		if flags & 2 != 0 {
+			let after = checked_add(cursor, 2, "gzip header checksum")?;
+			let expected = bytes.get(cursor..after).map(|value| u16::from_le_bytes(value.try_into().unwrap())).ok_or_else(|| RecipeError::new("gzip header checksum is truncated"))?;
+			require(gzip_crc32(&bytes[member..cursor]) as u16 == expected, "gzip header checksum mismatch")?;
+			cursor = after;
+		}
+		let (output, consumed) = inflate_consumed(bytes.get(cursor..).ok_or_else(|| RecipeError::new("gzip deflate stream is truncated"))?)?;
+		let trailer = checked_add(cursor, consumed, "gzip trailer")?;
+		let after = checked_add(trailer, 8, "gzip trailer")?;
+		require(after <= bytes.len(), "gzip trailer is absent")?;
+		let expected_crc = u32::from_le_bytes(bytes[trailer..trailer + 4].try_into().unwrap());
+		require(gzip_crc32(&output) == expected_crc, "gzip checksum mismatch")?;
+		let size = u32::from_le_bytes(bytes[trailer + 4..after].try_into().unwrap()) as usize;
+		require(output.len() & u32::MAX as usize == size, format!("gzip uncompressed size expected {size}, received {}", output.len()))?;
+		combined.extend(output);
+		cursor = after;
+		if cursor == bytes.len() { return Ok(combined) }
+	}
+}
+
+/// Regular files from a POSIX ustar archive. Dataset archives use short UTF-8
+/// names; metadata, links, and directories are ignored.
+fn tar_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+	let text = |field: &[u8]| -> Result<String> {
+		let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+		Ok(str::from_utf8(&field[..end]).map_err(|error| RecipeError::new(format!("TAR text is not UTF-8: {error}")))?.trim().to_owned())
+	};
+	let mut offset = 0;
+	let mut entries = Vec::new();
+	while offset + 512 <= bytes.len() {
+		let header = &bytes[offset..offset + 512];
+		if header.iter().all(|byte| *byte == 0) {
+			break;
+		}
+		let name = text(&header[..100])?;
+		let prefix = text(&header[345..500])?;
+		let name = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+		let name = name.strip_prefix("./").unwrap_or(&name).to_owned();
+		let checksum_text = text(&header[148..156])?;
+		let checksum = usize::from_str_radix(checksum_text.trim_matches([' ', '\0']), 8).map_err(|error| RecipeError::new(format!("TAR entry {name:?} has an invalid checksum: {error}")))?;
+		let measured = header.iter().enumerate().map(|(index, byte)| if (148..156).contains(&index) { usize::from(b' ') } else { usize::from(*byte) }).sum::<usize>();
+		require(checksum == measured, format!("TAR entry {name:?} checksum mismatch"))?;
+		let size_text = text(&header[124..136])?;
+		let size = usize::from_str_radix(size_text.trim_matches([' ', '\0']), 8).map_err(|error| RecipeError::new(format!("TAR entry {name:?} has an invalid size: {error}")))?;
+		let start = checked_add(offset, 512, "TAR entry")?;
+		let end = checked_add(start, size, "TAR entry")?;
+		require(end <= bytes.len(), format!("TAR entry {name:?} is truncated"))?;
+		if matches!(header[156], 0 | b'0') && !name.is_empty() {
+			entries.push((name, bytes[start..end].to_vec()));
+		}
+		offset = checked_add(start, size.div_ceil(512) * 512, "TAR padding")?;
+	}
+	require(!entries.is_empty(), "TAR archive has no regular files")?;
+	Ok(entries)
+}
+
 /// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -13694,6 +15996,176 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	}
 	require(!entries.is_empty(), "ZIP archive has no entries")?;
 	Ok(entries)
+}
+
+fn xml_entities(value: &str) -> Result<String> {
+	let mut output = String::new();
+	let mut rest = value;
+	while let Some(position) = rest.find('&') {
+		output.push_str(&rest[..position]);
+		let tail = &rest[position + 1..];
+		let end = tail.find(';').ok_or_else(|| RecipeError::new("XML entity is unterminated"))?;
+		let entity = &tail[..end];
+		match entity {
+			"amp" => output.push('&'),
+			"lt" => output.push('<'),
+			"gt" => output.push('>'),
+			"quot" => output.push('"'),
+			"apos" => output.push('\''),
+			_ => {
+				let code = entity
+					.strip_prefix("#x").map(|digits| u32::from_str_radix(digits, 16))
+					.or_else(|| entity.strip_prefix('#').map(str::parse))
+					.ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is unsupported")))?
+					.map_err(|error| RecipeError::new(format!("invalid XML entity: {error}")))?;
+				output.push(char::from_u32(code).ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is invalid")))?);
+			}
+		}
+		rest = &tail[end + 1..];
+	}
+	output.push_str(rest);
+	Ok(output)
+}
+
+fn xml_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+	let marker = format!("{name}=\"");
+	let value = tag.split_once(&marker)?.1;
+	value.split_once('"').map(|(value, _)| value)
+}
+
+fn xml_values(block: &str, tag: &str) -> Result<Vec<String>> {
+	let opening = format!("<{tag}");
+	let closing = format!("</{tag}>");
+	let mut values = Vec::new();
+	let mut rest = block;
+	while let Some(start) = rest.find(&opening) {
+		let tagged = &rest[start + opening.len()..];
+		let body = tagged.find('>').ok_or_else(|| RecipeError::new(format!("XML {tag} tag is unterminated")))? + 1;
+		let end = tagged[body..].find(&closing).ok_or_else(|| RecipeError::new(format!("XML {tag} value is unterminated")))?;
+		values.push(xml_entities(&tagged[body..body + end])?);
+		rest = &tagged[body + end + closing.len()..];
+	}
+	Ok(values)
+}
+
+fn xml_tags<'a>(document: &'a str, tag: &str) -> Result<Vec<&'a str>> {
+	let opening = format!("<{tag} ");
+	let mut tags = Vec::new();
+	let mut rest = document;
+	while let Some(start) = rest.find(&opening) {
+		let tagged = &rest[start + opening.len()..];
+		let end = tagged.find('>').ok_or_else(|| RecipeError::new(format!("XML {tag} tag is unterminated")))?;
+		tags.push(&tagged[..end]);
+		rest = &tagged[end + 1..];
+	}
+	Ok(tags)
+}
+
+fn xlsx_column(reference: &str) -> Result<usize> {
+	let letters = reference.chars().take_while(char::is_ascii_alphabetic).collect::<String>();
+	require(!letters.is_empty(), format!("XLSX cell reference {reference:?} has no column"))?;
+	letters.bytes().try_fold(0_usize, |column, letter| {
+		checked_add(checked_mul(column, 26, "XLSX column")?, usize::from(letter.to_ascii_uppercase() - b'A' + 1), "XLSX column")
+	}).map(|column| column - 1)
+}
+
+/// The first worksheet row is the table header. Inline strings, shared
+/// strings, numeric cells, formula results, and omitted empty cells retain
+/// their spreadsheet order.
+fn xlsx_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+	let mut entries = zip_entries(bytes)?;
+	entries.sort_by(|left, right| left.0.cmp(&right.0));
+	let entry_text = |name: &str| -> Result<&str> {
+		let bytes = entries.iter().find(|(entry, _)| entry == name).map(|(_, bytes)| bytes.as_slice()).ok_or_else(|| RecipeError::new(format!("XLSX entry {name:?} is absent")))?;
+		str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX entry {name:?} is not UTF-8: {error}")))
+	};
+	let mut relationships = BTreeMap::new();
+	for tag in xml_tags(entry_text("xl/_rels/workbook.xml.rels")?, "Relationship")? {
+		let Some(id) = xml_attribute(tag, "Id") else { continue };
+		let Some(target) = xml_attribute(tag, "Target") else { continue };
+		let target = if target.starts_with('/') { target.trim_start_matches('/').to_owned() } else { format!("xl/{target}") };
+		relationships.insert(id.to_owned(), target);
+	}
+	let mut worksheets = Vec::new();
+	for tag in xml_tags(entry_text("xl/workbook.xml")?, "sheet")? {
+		let name = xml_entities(xml_attribute(tag, "name").ok_or_else(|| RecipeError::new("XLSX sheet name is absent"))?)?;
+		let id = xml_attribute(tag, "r:id").ok_or_else(|| RecipeError::new(format!("XLSX sheet {name:?} relationship is absent")))?;
+		let target = relationships.get(id).ok_or_else(|| RecipeError::new(format!("XLSX sheet {name:?} relationship {id:?} is absent")))?.clone();
+		require(entries.iter().any(|(entry, _)| *entry == target), format!("XLSX sheet {name:?} entry {target:?} is absent"))?;
+		worksheets.push((name, target));
+	}
+	require(!worksheets.is_empty(), "XLSX workbook has no declared worksheets")?;
+	let shared = entries
+		.iter()
+		.find(|(name, _)| name == "xl/sharedStrings.xml")
+		.map(|(_, bytes)| {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX shared strings are not UTF-8: {error}")))?;
+			let mut strings = Vec::new();
+			let mut rest = text;
+			while let Some(start) = rest.find("<si") {
+				let tagged = &rest[start + 3..];
+				let body = tagged.find('>').ok_or_else(|| RecipeError::new("XLSX shared string is unterminated"))? + 1;
+				let end = tagged[body..].find("</si>").ok_or_else(|| RecipeError::new("XLSX shared string is unterminated"))?;
+				strings.push(xml_values(&tagged[body..body + end], "t")?.join(""));
+				rest = &tagged[body + end + 5..];
+			}
+			Ok(strings)
+		})
+		.transpose()?
+		.unwrap_or_default();
+	let mut tables = Vec::new();
+	for (name, entry) in worksheets {
+		let bytes = entries.iter().find(|(candidate, _)| *candidate == entry).map(|(_, bytes)| bytes).unwrap();
+		let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("XLSX worksheet {name:?} is not UTF-8: {error}")))?;
+		let sheet = text.split_once("<sheetData").and_then(|(_, rest)| rest.split_once('>')).and_then(|(_, rest)| rest.split_once("</sheetData>").map(|(body, _)| body))
+			.ok_or_else(|| RecipeError::new(format!("XLSX worksheet {name:?} has no sheet data")))?;
+		let mut rows = Vec::new();
+		let mut rest = sheet;
+		while let Some(start) = rest.find("<row") {
+			let tagged = &rest[start + 4..];
+			let body = tagged.find('>').ok_or_else(|| RecipeError::new("XLSX row is unterminated"))? + 1;
+			let end = tagged[body..].find("</row>").ok_or_else(|| RecipeError::new("XLSX row is unterminated"))?;
+			let row_text = &tagged[body..body + end];
+			let mut row = Vec::<String>::new();
+			let mut cells = row_text;
+			while let Some(cell_start) = cells.find("<c") {
+				let cell = &cells[cell_start + 2..];
+				let open = cell.find('>').ok_or_else(|| RecipeError::new("XLSX cell is unterminated"))?;
+				let tag = &cell[..open];
+				let (value, consumed) = if tag.trim_end().ends_with('/') {
+					("", open + 1)
+				} else {
+					let close = cell[open + 1..].find("</c>").ok_or_else(|| RecipeError::new("XLSX cell is unterminated"))?;
+					(&cell[open + 1..open + 1 + close], open + 1 + close + 4)
+				};
+				let reference = xml_attribute(tag, "r").ok_or_else(|| RecipeError::new("XLSX cell reference is absent"))?;
+				let column = xlsx_column(reference)?;
+				row.resize(column + 1, String::new());
+				row[column] = match xml_attribute(tag, "t") {
+					Some("inlineStr") => xml_values(value, "t")?.join(""),
+					Some("s") => {
+						let index = xml_values(value, "v")?.first().ok_or_else(|| RecipeError::new("XLSX shared-string cell is empty"))?.parse::<usize>()
+							.map_err(|error| RecipeError::new(format!("XLSX shared-string index is invalid: {error}")))?;
+						shared.get(index).cloned().ok_or_else(|| RecipeError::new(format!("XLSX shared-string index {index} is absent")))?
+					}
+					_ => xml_values(value, "v")?.first().cloned().unwrap_or_default(),
+				};
+				cells = &cell[consumed..];
+			}
+			rows.push(row);
+			rest = &tagged[body + end + 6..];
+		}
+		require(!rows.is_empty(), format!("XLSX worksheet {name:?} has no rows"))?;
+		let headers = rows.remove(0);
+		require(!headers.is_empty() && headers.iter().all(|header| !header.is_empty()), format!("XLSX worksheet {name:?} has an empty header"))?;
+		for row in &mut rows {
+			require(row.len() <= headers.len(), format!("XLSX worksheet {name:?} row exceeds {} columns", headers.len()))?;
+			row.resize(headers.len(), String::new());
+		}
+		tables.push(Table { name, headers, declared: true, rows, attention: None });
+	}
+	require(!tables.is_empty(), "XLSX workbook has no worksheets")?;
+	Ok(tables)
 }
 /// One named column group from an NPY array: trailing dimensions flatten to `name.1..name.k` columns.
 fn npy_columns(name: &str, bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
@@ -14338,6 +16810,15 @@ impl Train {
 			None,
 		)?;
 		tape.print_devices()?;
+		if let Err(error) = tape.tune(self.learning_rate, config) {
+			// An interrupt during pre-epoch tuning restores the measured state and
+			// follows the same one-checkpoint exit path as an interrupted real epoch.
+			let _ = self.finish_dispatch::<()>(Err(error), &mut stored, &prepared.schema, &tape, None)?;
+			unreachable!("an error result cannot finish successfully")
+		}
+		// The initial report must come from the selected runtime schedule, not
+		// from the heuristic forward that initialized the tape before tuning.
+		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
@@ -14384,7 +16865,7 @@ impl Train {
 			graph.parameters = tape.weights()?;
 			predictions.clear();
 			let mut raw_outputs = Vec::new();
-			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+			let stream = self.log_metrics.iter().any(|metric| metric.0 == blck.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
@@ -14408,11 +16889,8 @@ impl Train {
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
-			validation.inject_bn_stats(&stored.bn_stats)?;
-			validation.forward(ForwardMode::Inference)?;
-			let raw = validation.predictions()?;
+			let validation_targets = &target_values[training_values..];
+			let raw = tape.evaluate(&graph, &prepared.samples, training_rows)?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
 		}
@@ -14685,4 +17163,187 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+	use super::*;
+	use std::{fs, path::PathBuf};
+
+	fn vector_schedule() -> NativeSchedule {
+		NativeSchedule {
+			matrix: false,
+			block: 64,
+			tile: Tile { m: 64, n: 64, k: 128 },
+			register_m: 8,
+			register_n: 8,
+			register_count: 64,
+			fragment_k: 16,
+			chunk_k: 64,
+			chunk_values: 4096,
+			chunk_bias_values: 0,
+			scratch_base: 0,
+			shared_values: 65_536,
+			contractions: Vec::new(),
+			attention: Vec::new(),
+		}
+	}
+
+	fn matrix_schedule() -> NativeSchedule {
+		NativeSchedule {
+			matrix: true,
+			block: 64,
+			tile: Tile { m: 64, n: 64, k: 32 },
+			register_m: 16,
+			register_n: 16,
+			register_count: 16,
+			fragment_k: 16,
+			chunk_k: 64,
+			chunk_values: 4096,
+			chunk_bias_values: 0,
+			scratch_base: 0,
+			shared_values: 4096,
+			contractions: Vec::new(),
+			attention: Vec::new(),
+		}
+	}
+
+	fn contraction_tiles(forward: Tile, gradient: Tile, previous: Tile) -> NativeContractionTiles {
+		NativeContractionTiles { forward, gradient, previous, gradient_shape: gradient, parameters: 1 }
+	}
+
+	fn contraction_shapes(forward: Tile, gradient: Tile, previous: Tile) -> NativeContractionShapes {
+		NativeContractionShapes { forward, gradient, previous, parameters: 1 }
+	}
+
+	fn cache_path(label: &str) -> PathBuf {
+		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
+		std::env::temp_dir().join(format!("recipe-issue93-{label}-{}-{serial}.tsv", std::process::id()))
+	}
+
+	fn assert_contractions_eq(expected: &[Option<NativeContractionTiles>], actual: &[Option<NativeContractionTiles>]) {
+		assert_eq!(expected.len(), actual.len());
+		for (expected, actual) in expected.iter().zip(actual) {
+			match (expected, actual) {
+				(None, None) => {}
+				(Some(expected), Some(actual)) => {
+					assert_eq!(expected.forward, actual.forward);
+					assert_eq!(expected.gradient, actual.gradient);
+					assert_eq!(expected.previous, actual.previous);
+					assert_eq!(expected.gradient_shape, actual.gradient_shape);
+					assert_eq!(expected.parameters, actual.parameters);
+				}
+				(mismatch, actual) => panic!("cache contraction mismatch: expected {mismatch:?}, got {actual:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn vector_candidates_keep_the_fixed_reduction_extent_and_are_legal() {
+		let schedule = vector_schedule();
+		let limits = Tile { m: 128, n: 128, k: 128 };
+		let current = Tile { m: 64, n: 64, k: 128 };
+		let candidates = schedule_candidates(limits, current, &schedule, 1, usize::MAX).expect("vector candidates");
+		assert!(candidates.len() > 1, "the fixture must admit a vector alternative");
+		assert_eq!(candidates[0], current);
+		for candidate in candidates {
+			assert_eq!(candidate.k, current.k, "candidate changed reduction extent: {candidate:?}");
+			assert!(candidate.m <= limits.m && candidate.n <= limits.n, "candidate exceeds shape limits: {candidate:?}");
+			assert_eq!(candidate.m % schedule.register_m, 0);
+			assert_eq!(candidate.n % schedule.register_n, 0);
+			assert!(candidate.m / schedule.register_m * (candidate.n / schedule.register_n) <= schedule.block);
+			assert!(native_contraction_shared_values(candidate, schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k, 1, false).expect("shared values") <= schedule.shared_values);
+		}
+	}
+
+	#[test]
+	fn candidate_budget_bounds_alternatives_and_zero_keeps_current_only() {
+		let schedule = vector_schedule();
+		let limits = Tile { m: 128, n: 128, k: 128 };
+		let current = Tile { m: 64, n: 64, k: 128 };
+		assert_eq!(schedule_candidates(limits, current, &schedule, 1, 0).unwrap(), vec![current]);
+		for budget in 1..=4 {
+			let candidates = schedule_candidates(limits, current, &schedule, 1, budget).expect("bounded vector candidates");
+			assert_eq!(candidates[0], current);
+			assert!(candidates.len() <= budget + 1, "{} candidates for {} alternatives", candidates.len(), budget);
+		}
+	}
+
+	#[test]
+	fn matrix_candidates_preserve_fragment_mapping_and_fit_shared_memory() {
+		let schedule = matrix_schedule();
+		let limits = Tile { m: 128, n: 128, k: 32 };
+		let current = Tile { m: 64, n: 64, k: 32 };
+		let candidates = schedule_candidates(limits, current, &schedule, 1, usize::MAX).expect("matrix candidates");
+		assert!(candidates.len() > 1, "the fixture must admit a matrix alternative");
+		assert_eq!(candidates[0], current);
+		for candidate in candidates {
+			assert_eq!(candidate.k, current.k);
+			assert_eq!(candidate.m % 16, 0, "matrix M is not fragment-aligned: {candidate:?}");
+			assert_eq!(candidate.n % 16, 0, "matrix N is not fragment-aligned: {candidate:?}");
+			assert!(candidate.m <= current.m && candidate.n <= current.n, "matrix candidate widened a mapped span: {candidate:?}");
+			assert!(native_contraction_shared_values(candidate, schedule.register_m, schedule.register_n, schedule.block, schedule.fragment_k, 1, true).expect("matrix shared values") <= schedule.shared_values);
+		}
+	}
+
+	#[test]
+	fn schedule_cache_requires_identity_complete_nodes_and_legal_tiles() {
+		let identity = "device-a";
+		let schedule = NativeSchedule { contractions: vec![Some(contraction_tiles(Tile { m: 64, n: 64, k: 128 }, Tile { m: 64, n: 64, k: 128 }, Tile { m: 64, n: 64, k: 128 })), Some(contraction_tiles(Tile { m: 32, n: 64, k: 128 }, Tile { m: 32, n: 64, k: 128 }, Tile { m: 32, n: 64, k: 128 }))], ..vector_schedule() };
+		let shapes = vec![
+			Some(contraction_shapes(Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 })),
+			Some(contraction_shapes(Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 }, Tile { m: 128, n: 128, k: 128 })),
+		];
+		let expected = schedule.contractions.clone();
+		let path = cache_path("valid");
+		store_schedule_cache(&path, identity, &expected).expect("store schedule cache");
+		let loaded = load_schedule_cache(&path, identity, &schedule, &shapes, 1).expect("complete cache should load");
+		assert_contractions_eq(&expected, &loaded);
+
+		let text = fs::read_to_string(&path).expect("read stored cache");
+		fs::write(&path, text.replacen("device device-a", "device another-device", 1)).expect("write identity mismatch");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "cache from another device must not load");
+
+		let missing = "device device-a\nnode 0 64 64 128 64 64 128 64 64 128\n";
+		fs::write(&path, missing).expect("write incomplete cache");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "incomplete cache must not load");
+
+		let invalid = "device device-a\nnode 0 64 64 129 64 64 128 64 64 128\nnode 1 32 64 128 32 64 128 32 64 128\n";
+		fs::write(&path, invalid).expect("write invalid cache");
+		assert!(load_schedule_cache(&path, identity, &schedule, &shapes, 1).is_none(), "cache with an illegal fixed-K tile must not load");
+		fs::remove_file(path).expect("remove schedule cache fixture");
+	}
+
+	#[test]
+	fn dominant_tile_uses_largest_gradient_work_and_keeps_first_tie() {
+		let shapes = vec![
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 2, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			None,
+		];
+		let contractions = vec![
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 16, n: 16, k: 16 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 32, n: 32, k: 32 }, Tile { m: 8, n: 8, k: 8 })),
+			None,
+		];
+		assert_eq!(dominant_tile(&shapes, &contractions), Some(Tile { m: 32, n: 32, k: 32 }));
+
+		let tie_shapes = vec![
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_shapes(Tile { m: 8, n: 8, k: 8 }, Tile { m: 3, n: 3, k: 4 }, Tile { m: 8, n: 8, k: 8 })),
+		];
+		let tie_contractions = vec![
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 11, n: 13, k: 17 }, Tile { m: 8, n: 8, k: 8 })),
+			Some(contraction_tiles(Tile { m: 8, n: 8, k: 8 }, Tile { m: 19, n: 23, k: 29 }, Tile { m: 8, n: 8, k: 8 })),
+		];
+		assert_eq!(dominant_tile(&tie_shapes, &tie_contractions), Some(Tile { m: 11, n: 13, k: 17 }));
+		assert_eq!(dominant_tile(&[], &[]), None);
+	}
+
+	#[test]
+	fn tiff_page_selection_rejects_directory_cycles() {
+		let bytes = [b'I', b'I', 42, 0, 8, 0, 0, 0, 0, 0, 8, 0, 0, 0];
+		let error = tiff_pixels(&bytes, 2).expect_err("cyclic TIFF directory chain must fail");
+		assert_eq!(error.to_string(), "TIFF directory chain contains a cycle");
+	}
 }

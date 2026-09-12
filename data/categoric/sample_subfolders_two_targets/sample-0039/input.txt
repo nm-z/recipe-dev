@@ -1,0 +1,1 @@
+red | stable neutral observation with a declared sample boundary

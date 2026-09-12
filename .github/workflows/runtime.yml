@@ -5,13 +5,9 @@ name: os/device check
 # uploads machine-readable evidence for the exact source snapshot it ran.
 
 on:
-  pull_request:
-    branches:
-      - minimal
-    # No path filters: a required check must never be omitted by a path rule.
   push:
     branches:
-      - minimal
+      - '**'
   workflow_dispatch:
     inputs:
       request_id:
@@ -35,10 +31,12 @@ permissions:
   contents: read
 
 concurrency:
-  # A superseded candidate is cancelled; the external-worker jobs clean up in
-  # their own always() steps so cancellation still releases cloud resources.
-  group: recipe-runtime-${{ inputs.request_id || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Provider jobs are not cancelled in place. Camber's current CLI has no
+  # cancellation operation, and cancelling a run can leave a pending provider
+  # job alive after GitHub has forgotten its cleanup context. Give every push
+  # its own group so rapid pushes cannot replace an older pending run.
+  group: recipe-runtime-${{ inputs.request_id || github.run_id }}
+  cancel-in-progress: false
 
 env:
   SUITE_SEED: "17"
@@ -117,7 +115,7 @@ jobs:
               exit 1
             fi
             echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-            echo "candidate $candidate_sha supplied by the minimal push"
+            echo "candidate $candidate_sha supplied by the branch push"
             exit 0
           fi
           if [ "$EVENT_NAME" != "pull_request" ]; then
@@ -342,7 +340,7 @@ jobs:
   linux-gpu:
     name: linux/nv
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -716,11 +714,15 @@ jobs:
   windows-gpu:
     name: win/nv
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: ubuntu-24.04
+    environment: recipe-windows-gpu
     timeout-minutes: 90
     concurrency:
-      group: recipe-windows-nvidia
+      # Keep one Windows GPU worker per push run rather than one global pending
+      # slot. azure-run.sh still admits only one worker at a time through the
+      # Azure lease.
+      group: recipe-windows-nvidia-${{ github.run_id }}
       cancel-in-progress: false
     permissions:
       actions: read
@@ -842,7 +844,7 @@ jobs:
   macos-cpu:
     name: mac/cpu
     needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
     runs-on: macos-15
     timeout-minutes: 45
     env:

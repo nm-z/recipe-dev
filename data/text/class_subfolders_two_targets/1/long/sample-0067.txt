@@ -1,0 +1,1 @@
+system record 0067; stable named input observation 0067 with verified neutral sample content | stable neutral observation with a declared sample boundary
