@@ -17802,12 +17802,10 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 			*variance += (value - mean).powi(2) / rows as f64
 		}
 	}
-	// Regularize the variance like normalize_samples does: an exact-zero guard
-	// misses float-residue variances on numerically constant features, whose
-	// unbounded inverses cannot survive the model's storage format.
+	// Cap inverse deviation at one to avoid amplifying nearly constant features.
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	for value in &mut inverse {
-		*value = (*value + epsilon).sqrt().recip()
+		*value = (*value + epsilon).sqrt().max(1.0).recip()
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut intercept = data.targets[..rows].iter().sum::<f64>() / rows as f64;
