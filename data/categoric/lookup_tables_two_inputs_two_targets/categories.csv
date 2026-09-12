@@ -1,0 +1,17 @@
+color,shape,label,weight
+red,circle,accept,0.5000
+green,square,review,0.5500
+blue,triangle,accept,0.6000
+amber,circle,review,0.6500
+red,square,accept,0.7000
+green,triangle,review,0.7500
+blue,circle,accept,0.8000
+amber,square,review,0.8500
+red,triangle,accept,0.9000
+green,circle,review,0.9500
+blue,square,accept,1.0000
+amber,triangle,review,0.5000
+red,circle,accept,0.5500
+green,square,review,0.6000
+blue,triangle,accept,0.6500
+amber,circle,review,0.7000
