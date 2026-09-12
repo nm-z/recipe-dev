@@ -5425,7 +5425,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
-		pub(super) precision: Compute,
+		pub(super) precision: super::Compute,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
@@ -5446,7 +5446,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, precision: Compute::FP64 })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, precision: super::Compute::FP64 })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -5494,7 +5494,7 @@ mod gguf {
 		}
 		/// Select arithmetic precision without changing the file's weight storage.
 		pub fn fp(mut self, bits: u8) -> Self {
-			self.precision = recipe.train().fp(bits).precision;
+			self.precision = super::recipe.train().fp(bits).precision;
 			self
 		}
 		pub fn value(&self, key: &str) -> Option<&GgufValue> {
@@ -11837,6 +11837,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 			match bound.weight {
 				BoundWeight::Stored(weight) => {
 					node.packed = true;
+					if node.table() { node.argument[8] = f64::from(weight.format.0); }
 					Some(weight)
 				}
 				// A table has no parameter span: its rows decode from the bound
