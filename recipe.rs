@@ -1990,6 +1990,9 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	};
 	let key = matrix.map_or_else(|| suffix.to_owned(), |method| format!("{}{suffix}", method.key()));
 	let mut ir = fs::read_to_string(template_path(mapping, &key)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
+	// The NVIDIA driver JIT scales with PTX size, so the contraction bodies are
+	// compiled once there instead of inlined into every node of three kernel bodies.
+	ir = ir.replace("RECIPE_CONTRACTION_BODY", if matches!(backend, Backend::Nvidia) { "#3" } else { "#1" });
 	if let Compute::F(format) = precision.model {
 		for address_space in [" addrspace(3)", ""] {
 			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_exp monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.exp));
