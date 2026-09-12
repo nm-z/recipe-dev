@@ -9519,9 +9519,7 @@ impl DeviceTape {
 		}
 		self.shards[0].inject_bn_stats(stats)
 	}
-	/// Batch statistics belong to the weights they were measured under. An epoch
-	/// measures them before its optimizer step, so refresh them from the current
-	/// weights before they are stored with those weights.
+	/// Recompute batch statistics using the current weights before saving.
 	fn extract_bn_stats(&mut self) -> Result<Vec<f64>> {
 		if self.shards.len() > 1 {
 			return Ok(Vec::new());
