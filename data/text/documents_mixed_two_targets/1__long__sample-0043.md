@@ -1,0 +1,1 @@
+system record 0043; stable named input observation 0043 with verified neutral sample content

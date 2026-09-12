@@ -1,0 +1,1 @@
+system record 0045; stable named input observation 0045 with verified neutral sample content | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary | stable neutral observation with a declared sample boundary
