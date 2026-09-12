@@ -1,5 +1,6 @@
 use recipe::*;
 
+// RECIPE_PACKED_DOT=1 enables optional Q8 activation dot products on AMD.
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
 
 fn main() {

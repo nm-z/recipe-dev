@@ -908,9 +908,111 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %jobs.adjusted = add i32 %out.channels, %waves
 %jobs.numerator = sub i32 %jobs.adjusted, 1
 %jobs = udiv i32 %jobs.numerator, %waves
+%q4.selector = call i1 @recipe.model.q4k(i32 %decode)
+%q4.width = icmp eq i32 %width, 32
+%q4.remainder = urem i32 %terms, 256
+%q4.aligned = icmp eq i32 %q4.remainder, 0
+%q4.width.ok = and i1 %q4.width, %q4.aligned
+%q4.available = and i1 %q4.selector, %q4.width.ok
+%q6.selector = call i1 @recipe.model.q6k(i32 %decode)
+%q6.available = and i1 %q6.selector, %q4.width.ok
+%q8.available = or i1 %q4.available, %q6.available
+%q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
+br i1 %q8.available, label %q8.entry, label %job.loop
+q8.entry:
+%q8.blocks = udiv i32 %terms, 32
+br label %q8.block.loop
+q8.block.loop:
+%q8.block = phi i32 [ %wave, %q8.entry ], [ %q8.block.next, %q8.q.store ]
+%q8.more = icmp ult i32 %q8.block, %q8.blocks
+br i1 %q8.more, label %q8.block.step, label %q8.done
+q8.block.step:
+%q8.term.base = mul i32 %q8.block, 32
+%q8.term = add i32 %q8.term.base, %lane
+%q8.term.wide = zext i32 %q8.term to i64
+%q8.input.offset = mul i64 %q8.term.wide, %in.length.wide
+%q8.input.index = add i64 %q8.input.offset, %position
+%q8.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q8.input.index
+%q8.input.model = load double, ptr addrspace(1) %q8.input.ptr, align 8
+%q8.input.value = call RECIPE_STATE @recipe.decode(double %q8.input.model)
+%q8.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.input.value)
+%q8.max.offset.initial = udiv i32 %width, 2
+br label %q8.max.loop
+q8.max.loop:
+%q8.max.offset = phi i32 [ %q8.max.offset.initial, %q8.block.step ], [ %q8.max.offset.next, %q8.max.step ]
+%q8.max.value = phi RECIPE_STATE [ %q8.abs, %q8.block.step ], [ %q8.max.next, %q8.max.step ]
+%q8.max.more = icmp ugt i32 %q8.max.offset, 0
+br i1 %q8.max.more, label %q8.max.step, label %q8.max.done
+q8.max.step:
+%q8.max.partner.lane = xor i32 %lane, %q8.max.offset
+%q8.max.partner.index = mul i32 %q8.max.partner.lane, 4
+%q8.max.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %q8.max.value, i32 %q8.max.partner.index)
+%q8.max.greater = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value)
+%q8.max.next = select i1 %q8.max.greater, RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value
+%q8.max.offset.next = udiv i32 %q8.max.offset, 2
+br label %q8.max.loop
+q8.max.done:
+%q8.denominator = call RECIPE_STATE @recipe.state.from.u32(i32 127)
+%q8.d = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.max.value, RECIPE_STATE %q8.denominator)
+%q8.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%q8.nonzero = call i1 @recipe.state.ogt(RECIPE_STATE %q8.d, RECIPE_STATE %q8.zero)
+%q8.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%q8.d.safe = select i1 %q8.nonzero, RECIPE_STATE %q8.d, RECIPE_STATE %q8.one
+%q8.q.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.input.value, RECIPE_STATE %q8.d.safe)
+%q8.q.nonnegative = call i1 @recipe.state.oge(RECIPE_STATE %q8.q.raw, RECIPE_STATE %q8.zero)
+%q8.two = call RECIPE_STATE @recipe.state.from.u32(i32 2)
+%q8.half = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.two)
+%q8.negative.half = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %q8.half)
+%q8.round.offset = select i1 %q8.q.nonnegative, RECIPE_STATE %q8.half, RECIPE_STATE %q8.negative.half
+%q8.round.input = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q8.q.raw, RECIPE_STATE %q8.round.offset)
+%q8.q.int.raw = call i32 @recipe.state.to.s32(RECIPE_STATE %q8.round.input)
+%q8.q.low = icmp slt i32 %q8.q.int.raw, -127
+%q8.q.low.clamped = select i1 %q8.q.low, i32 -127, i32 %q8.q.int.raw
+%q8.q.high = icmp sgt i32 %q8.q.low.clamped, 127
+%q8.q.int = select i1 %q8.q.high, i32 127, i32 %q8.q.low.clamped
+%q8.q.state = call RECIPE_STATE @recipe.state.from.s32(i32 %q8.q.int)
+%q8.sum.offset.initial = udiv i32 %width, 2
+br label %q8.sum.loop
+q8.sum.loop:
+%q8.sum.offset = phi i32 [ %q8.sum.offset.initial, %q8.max.done ], [ %q8.sum.offset.next, %q8.sum.step ]
+%q8.sum.value = phi RECIPE_STATE [ %q8.q.state, %q8.max.done ], [ %q8.sum.next, %q8.sum.step ]
+%q8.sum.more = icmp ugt i32 %q8.sum.offset, 0
+br i1 %q8.sum.more, label %q8.sum.step, label %q8.sum.done
+q8.sum.step:
+%q8.sum.partner.lane = xor i32 %lane, %q8.sum.offset
+%q8.sum.partner.index = mul i32 %q8.sum.partner.lane, 4
+%q8.sum.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %q8.sum.value, i32 %q8.sum.partner.index)
+%q8.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q8.sum.value, RECIPE_STATE %q8.sum.partner)
+%q8.sum.offset.next = udiv i32 %q8.sum.offset, 2
+br label %q8.sum.loop
+q8.sum.done:
+%q8.s = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q8.d, RECIPE_STATE %q8.sum.value)
+%q8.d.f16 = call half @recipe.state.to.f16(RECIPE_STATE %q8.d)
+%q8.s.f16 = call half @recipe.state.to.f16(RECIPE_STATE %q8.s)
+%q8.block.wide = zext i32 %q8.block to i64
+%q8.block.offset = mul i64 %q8.block.wide, 36
+%q8.block.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q8.block.offset
+%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 0
+%q8.s.ptr = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 2
+%q8.owner = icmp eq i32 %lane, 0
+br i1 %q8.owner, label %q8.meta, label %q8.q.store
+q8.meta:
+store half %q8.d.f16, ptr addrspace(3) %q8.d.ptr, align 2
+store half %q8.s.f16, ptr addrspace(3) %q8.s.ptr, align 2
+br label %q8.q.store
+q8.q.store:
+%q8.q.offset = zext i32 %lane to i64
+%q8.q.ptr.base = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 4
+%q8.q.ptr = getelementptr i8, ptr addrspace(3) %q8.q.ptr.base, i64 %q8.q.offset
+%q8.q.byte = trunc i32 %q8.q.int to i8
+store i8 %q8.q.byte, ptr addrspace(3) %q8.q.ptr, align 1
+%q8.block.next = add i32 %q8.block, %waves
+br label %q8.block.loop
+q8.done:
+call void @recipe.local.barrier()
 br label %job.loop
 job.loop:
-%job = phi i32 [ %group, %entry ], [ %job.next, %job.done ]
+%job = phi i32 [ %group, %entry ], [ %group, %q8.done ], [ %job.next, %job.done ]
 %job.more = icmp ult i32 %job, %jobs
 br i1 %job.more, label %job.step, label %exit
 job.step:
@@ -920,10 +1022,64 @@ job.step:
 %channel.safe = select i1 %channel.active, i32 %channel, i32 0
 %channel.wide = zext i32 %channel.safe to i64
 %channel.offset = mul i64 %channel.wide, %terms.wide
-br label %sum.loop
+br i1 %q4.available, label %q4.sum.loop, label %q6.check
+q4.sum.loop:
+%q4.slice = phi i32 [ %lane, %job.step ], [ %q4.slice.next, %q4.slice.ready ]
+%q4.sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %q4.sum.next, %q4.slice.ready ]
+%q4.slices = udiv i32 %terms, 16
+%q4.slice.more = icmp ult i32 %q4.slice, %q4.slices
+br i1 %q4.slice.more, label %q4.sum.step, label %q4.sum.done
+q4.sum.step:
+%q4.row.blocks = udiv i32 %terms, 256
+%q4.row.blocks.wide = zext i32 %q4.row.blocks to i64
+%q4.channel.row = mul i64 %channel.wide, %q4.row.blocks.wide
+%q4.block = udiv i32 %q4.slice, 16
+%q4.slice.local = urem i32 %q4.slice, 16
+%q4.block.wide = zext i32 %q4.block to i64
+%q4.block.index = add i64 %q4.channel.row, %q4.block.wide
+%q4.byte.offset = mul i64 %q4.block.index, 144
+%q4.q8.offset = mul i64 %q4.block.wide, 288
+%q4.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q4.q8.offset
+%q4.loaded = call RECIPE_STATE @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %q4.byte.offset, ptr addrspace(3) %q4.q8.ptr, i32 %q4.slice.local)
+%q4.value.active = select i1 %channel.active, RECIPE_STATE %q4.loaded, RECIPE_STATE %state.zero
+%q4.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q4.sum, RECIPE_STATE %q4.value.active)
+%q4.slice.next = add i32 %q4.slice, %width
+br label %q4.slice.ready
+q4.slice.ready:
+br label %q4.sum.loop
+q4.sum.done:
+br label %sum.done
+q6.check:
+br i1 %q6.available, label %q6.sum.loop, label %sum.loop
+q6.sum.loop:
+%q6.slice = phi i32 [ %lane, %q6.check ], [ %q6.slice.next, %q6.slice.ready ]
+%q6.sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6.sum.next, %q6.slice.ready ]
+%q6.slices = udiv i32 %terms, 16
+%q6.slice.more = icmp ult i32 %q6.slice, %q6.slices
+br i1 %q6.slice.more, label %q6.sum.step, label %q6.sum.done
+q6.sum.step:
+%q6.row.blocks = udiv i32 %terms, 256
+%q6.row.blocks.wide = zext i32 %q6.row.blocks to i64
+%q6.channel.row = mul i64 %channel.wide, %q6.row.blocks.wide
+%q6.block = udiv i32 %q6.slice, 16
+%q6.slice.local = urem i32 %q6.slice, 16
+%q6.block.wide = zext i32 %q6.block to i64
+%q6.block.index = add i64 %q6.channel.row, %q6.block.wide
+%q6.byte.offset = mul i64 %q6.block.index, 210
+%q6.q8.offset = mul i64 %q6.block.wide, 288
+%q6.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q6.q8.offset
+%q6.loaded = call RECIPE_STATE @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %q6.byte.offset, ptr addrspace(3) %q6.q8.ptr, i32 %q6.slice.local)
+%q6.value.active = select i1 %channel.active, RECIPE_STATE %q6.loaded, RECIPE_STATE %state.zero
+%q6.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6.sum, RECIPE_STATE %q6.value.active)
+%q6.slice.next = add i32 %q6.slice, %width
+br label %q6.slice.ready
+q6.slice.ready:
+br label %q6.sum.loop
+q6.sum.done:
+br label %sum.done
 sum.loop:
-%k = phi i32 [ %lane, %job.step ], [ %k.next, %weight.ready ]
-%sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %sum.next, %weight.ready ]
+%k = phi i32 [ %lane, %q6.check ], [ %k.next, %weight.ready ]
+%sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %sum.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
 sum.step:
@@ -954,11 +1110,12 @@ weight.ready:
 %k.next = add i32 %k, %width
 br label %sum.loop
 sum.done:
+%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ]
 %reduce.offset.initial = udiv i32 %width, 2
 br label %reduce.loop
 reduce.loop:
 %reduce.offset = phi i32 [ %reduce.offset.initial, %sum.done ], [ %reduce.offset.next, %reduce.step ]
-%reduced = phi RECIPE_STATE [ %sum, %sum.done ], [ %reduced.next, %reduce.step ]
+%reduced = phi RECIPE_STATE [ %sum.final, %sum.done ], [ %reduced.next, %reduce.step ]
 %reduce.more = icmp ugt i32 %reduce.offset, 0
 br i1 %reduce.more, label %reduce.step, label %reduce.done
 reduce.step:
@@ -2163,6 +2320,663 @@ define internal double @attention_tile_score(i32 %query, i32 %key, i32 %width, i
 %score = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %sum, RECIPE_STATE %scale.wide)
 %result = call double @recipe.encode(RECIPE_STATE %score)
 ret double %result
+}
+define internal void @attention_step_score_store(ptr addrspace(1) %context, i64 %index, float %value) #1 { entry:
+%ptr = getelementptr float, ptr addrspace(1) %context, i64 %index
+store float %value, ptr addrspace(1) %ptr, align 4
+ret void
+}
+define internal float @attention_step_score_load(ptr addrspace(1) %context, i64 %index) #1 { entry:
+%ptr = getelementptr float, ptr addrspace(1) %context, i64 %index
+%value = load float, ptr addrspace(1) %ptr, align 4
+ret float %value
+}
+declare float @llvm.exp.f32(float)
+; Whole-grid inference attention for one query. The ordinary context's two
+; statistics planes temporarily hold one packed state float per score; the
+; dedicated K/V context keeps the settled half-precision history.
+define internal float @attention_step_key_dot(ptr addrspace(3) %query, ptr addrspace(1) %kv.context, i32 %key, i32 %kv.head, i32 %width, i32 %length) #1 {
+entry:
+%kv.channel.base = mul i32 %kv.head, %width
+br label %loop
+loop:
+%channel = phi i32 [ 0, %entry ], [ %channel.next, %step ]
+%sum.0 = phi float [ 0x0000000000000000, %entry ], [ %sum.0.next, %step ]
+%sum.1 = phi float [ 0x0000000000000000, %entry ], [ %sum.1.next, %step ]
+%sum.2 = phi float [ 0x0000000000000000, %entry ], [ %sum.2.next, %step ]
+%sum.3 = phi float [ 0x0000000000000000, %entry ], [ %sum.3.next, %step ]
+%sum.4 = phi float [ 0x0000000000000000, %entry ], [ %sum.4.next, %step ]
+%sum.5 = phi float [ 0x0000000000000000, %entry ], [ %sum.5.next, %step ]
+%sum.6 = phi float [ 0x0000000000000000, %entry ], [ %sum.6.next, %step ]
+%sum.7 = phi float [ 0x0000000000000000, %entry ], [ %sum.7.next, %step ]
+%sum.8 = phi float [ 0x0000000000000000, %entry ], [ %sum.8.next, %step ]
+%sum.9 = phi float [ 0x0000000000000000, %entry ], [ %sum.9.next, %step ]
+%sum.10 = phi float [ 0x0000000000000000, %entry ], [ %sum.10.next, %step ]
+%sum.11 = phi float [ 0x0000000000000000, %entry ], [ %sum.11.next, %step ]
+%sum.12 = phi float [ 0x0000000000000000, %entry ], [ %sum.12.next, %step ]
+%sum.13 = phi float [ 0x0000000000000000, %entry ], [ %sum.13.next, %step ]
+%sum.14 = phi float [ 0x0000000000000000, %entry ], [ %sum.14.next, %step ]
+%sum.15 = phi float [ 0x0000000000000000, %entry ], [ %sum.15.next, %step ]
+%more = icmp ult i32 %channel, %width
+br i1 %more, label %step, label %done
+step:
+%channel.0 = add i32 %channel, 0
+%channel.1 = add i32 %channel, 1
+%channel.2 = add i32 %channel, 2
+%channel.3 = add i32 %channel, 3
+%channel.4 = add i32 %channel, 4
+%channel.5 = add i32 %channel, 5
+%channel.6 = add i32 %channel, 6
+%channel.7 = add i32 %channel, 7
+%channel.8 = add i32 %channel, 8
+%channel.9 = add i32 %channel, 9
+%channel.10 = add i32 %channel, 10
+%channel.11 = add i32 %channel, 11
+%channel.12 = add i32 %channel, 12
+%channel.13 = add i32 %channel, 13
+%channel.14 = add i32 %channel, 14
+%channel.15 = add i32 %channel, 15
+%active.0 = icmp ult i32 %channel.0, %width
+%active.1 = icmp ult i32 %channel.1, %width
+%active.2 = icmp ult i32 %channel.2, %width
+%active.3 = icmp ult i32 %channel.3, %width
+%active.4 = icmp ult i32 %channel.4, %width
+%active.5 = icmp ult i32 %channel.5, %width
+%active.6 = icmp ult i32 %channel.6, %width
+%active.7 = icmp ult i32 %channel.7, %width
+%active.8 = icmp ult i32 %channel.8, %width
+%active.9 = icmp ult i32 %channel.9, %width
+%active.10 = icmp ult i32 %channel.10, %width
+%active.11 = icmp ult i32 %channel.11, %width
+%active.12 = icmp ult i32 %channel.12, %width
+%active.13 = icmp ult i32 %channel.13, %width
+%active.14 = icmp ult i32 %channel.14, %width
+%active.15 = icmp ult i32 %channel.15, %width
+%safe.0 = select i1 %active.0, i32 %channel.0, i32 0
+%safe.1 = select i1 %active.1, i32 %channel.1, i32 0
+%safe.2 = select i1 %active.2, i32 %channel.2, i32 0
+%safe.3 = select i1 %active.3, i32 %channel.3, i32 0
+%safe.4 = select i1 %active.4, i32 %channel.4, i32 0
+%safe.5 = select i1 %active.5, i32 %channel.5, i32 0
+%safe.6 = select i1 %active.6, i32 %channel.6, i32 0
+%safe.7 = select i1 %active.7, i32 %channel.7, i32 0
+%safe.8 = select i1 %active.8, i32 %channel.8, i32 0
+%safe.9 = select i1 %active.9, i32 %channel.9, i32 0
+%safe.10 = select i1 %active.10, i32 %channel.10, i32 0
+%safe.11 = select i1 %active.11, i32 %channel.11, i32 0
+%safe.12 = select i1 %active.12, i32 %channel.12, i32 0
+%safe.13 = select i1 %active.13, i32 %channel.13, i32 0
+%safe.14 = select i1 %active.14, i32 %channel.14, i32 0
+%safe.15 = select i1 %active.15, i32 %channel.15, i32 0
+%q.0.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.0
+%q.1.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.1
+%q.2.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.2
+%q.3.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.3
+%q.4.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.4
+%q.5.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.5
+%q.6.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.6
+%q.7.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.7
+%q.8.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.8
+%q.9.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.9
+%q.10.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.10
+%q.11.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.11
+%q.12.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.12
+%q.13.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.13
+%q.14.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.14
+%q.15.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.15
+%q.0.raw = load float, ptr addrspace(3) %q.0.ptr, align 4
+%q.1.raw = load float, ptr addrspace(3) %q.1.ptr, align 4
+%q.2.raw = load float, ptr addrspace(3) %q.2.ptr, align 4
+%q.3.raw = load float, ptr addrspace(3) %q.3.ptr, align 4
+%q.4.raw = load float, ptr addrspace(3) %q.4.ptr, align 4
+%q.5.raw = load float, ptr addrspace(3) %q.5.ptr, align 4
+%q.6.raw = load float, ptr addrspace(3) %q.6.ptr, align 4
+%q.7.raw = load float, ptr addrspace(3) %q.7.ptr, align 4
+%q.8.raw = load float, ptr addrspace(3) %q.8.ptr, align 4
+%q.9.raw = load float, ptr addrspace(3) %q.9.ptr, align 4
+%q.10.raw = load float, ptr addrspace(3) %q.10.ptr, align 4
+%q.11.raw = load float, ptr addrspace(3) %q.11.ptr, align 4
+%q.12.raw = load float, ptr addrspace(3) %q.12.ptr, align 4
+%q.13.raw = load float, ptr addrspace(3) %q.13.ptr, align 4
+%q.14.raw = load float, ptr addrspace(3) %q.14.ptr, align 4
+%q.15.raw = load float, ptr addrspace(3) %q.15.ptr, align 4
+%q.0 = select i1 %active.0, float %q.0.raw, float 0x0000000000000000
+%q.1 = select i1 %active.1, float %q.1.raw, float 0x0000000000000000
+%q.2 = select i1 %active.2, float %q.2.raw, float 0x0000000000000000
+%q.3 = select i1 %active.3, float %q.3.raw, float 0x0000000000000000
+%q.4 = select i1 %active.4, float %q.4.raw, float 0x0000000000000000
+%q.5 = select i1 %active.5, float %q.5.raw, float 0x0000000000000000
+%q.6 = select i1 %active.6, float %q.6.raw, float 0x0000000000000000
+%q.7 = select i1 %active.7, float %q.7.raw, float 0x0000000000000000
+%q.8 = select i1 %active.8, float %q.8.raw, float 0x0000000000000000
+%q.9 = select i1 %active.9, float %q.9.raw, float 0x0000000000000000
+%q.10 = select i1 %active.10, float %q.10.raw, float 0x0000000000000000
+%q.11 = select i1 %active.11, float %q.11.raw, float 0x0000000000000000
+%q.12 = select i1 %active.12, float %q.12.raw, float 0x0000000000000000
+%q.13 = select i1 %active.13, float %q.13.raw, float 0x0000000000000000
+%q.14 = select i1 %active.14, float %q.14.raw, float 0x0000000000000000
+%q.15 = select i1 %active.15, float %q.15.raw, float 0x0000000000000000
+%key.0.channel = add i32 %kv.channel.base, %safe.0
+%key.1.channel = add i32 %kv.channel.base, %safe.1
+%key.2.channel = add i32 %kv.channel.base, %safe.2
+%key.3.channel = add i32 %kv.channel.base, %safe.3
+%key.4.channel = add i32 %kv.channel.base, %safe.4
+%key.5.channel = add i32 %kv.channel.base, %safe.5
+%key.6.channel = add i32 %kv.channel.base, %safe.6
+%key.7.channel = add i32 %kv.channel.base, %safe.7
+%key.8.channel = add i32 %kv.channel.base, %safe.8
+%key.9.channel = add i32 %kv.channel.base, %safe.9
+%key.10.channel = add i32 %kv.channel.base, %safe.10
+%key.11.channel = add i32 %kv.channel.base, %safe.11
+%key.12.channel = add i32 %kv.channel.base, %safe.12
+%key.13.channel = add i32 %kv.channel.base, %safe.13
+%key.14.channel = add i32 %kv.channel.base, %safe.14
+%key.15.channel = add i32 %kv.channel.base, %safe.15
+%key.0.base = mul i32 %key.0.channel, %length
+%key.1.base = mul i32 %key.1.channel, %length
+%key.2.base = mul i32 %key.2.channel, %length
+%key.3.base = mul i32 %key.3.channel, %length
+%key.4.base = mul i32 %key.4.channel, %length
+%key.5.base = mul i32 %key.5.channel, %length
+%key.6.base = mul i32 %key.6.channel, %length
+%key.7.base = mul i32 %key.7.channel, %length
+%key.8.base = mul i32 %key.8.channel, %length
+%key.9.base = mul i32 %key.9.channel, %length
+%key.10.base = mul i32 %key.10.channel, %length
+%key.11.base = mul i32 %key.11.channel, %length
+%key.12.base = mul i32 %key.12.channel, %length
+%key.13.base = mul i32 %key.13.channel, %length
+%key.14.base = mul i32 %key.14.channel, %length
+%key.15.base = mul i32 %key.15.channel, %length
+%key.0.index = add i32 %key.0.base, %key
+%key.1.index = add i32 %key.1.base, %key
+%key.2.index = add i32 %key.2.base, %key
+%key.3.index = add i32 %key.3.base, %key
+%key.4.index = add i32 %key.4.base, %key
+%key.5.index = add i32 %key.5.base, %key
+%key.6.index = add i32 %key.6.base, %key
+%key.7.index = add i32 %key.7.base, %key
+%key.8.index = add i32 %key.8.base, %key
+%key.9.index = add i32 %key.9.base, %key
+%key.10.index = add i32 %key.10.base, %key
+%key.11.index = add i32 %key.11.base, %key
+%key.12.index = add i32 %key.12.base, %key
+%key.13.index = add i32 %key.13.base, %key
+%key.14.index = add i32 %key.14.base, %key
+%key.15.index = add i32 %key.15.base, %key
+%key.0.wide = zext i32 %key.0.index to i64
+%key.1.wide = zext i32 %key.1.index to i64
+%key.2.wide = zext i32 %key.2.index to i64
+%key.3.wide = zext i32 %key.3.index to i64
+%key.4.wide = zext i32 %key.4.index to i64
+%key.5.wide = zext i32 %key.5.index to i64
+%key.6.wide = zext i32 %key.6.index to i64
+%key.7.wide = zext i32 %key.7.index to i64
+%key.8.wide = zext i32 %key.8.index to i64
+%key.9.wide = zext i32 %key.9.index to i64
+%key.10.wide = zext i32 %key.10.index to i64
+%key.11.wide = zext i32 %key.11.index to i64
+%key.12.wide = zext i32 %key.12.index to i64
+%key.13.wide = zext i32 %key.13.index to i64
+%key.14.wide = zext i32 %key.14.index to i64
+%key.15.wide = zext i32 %key.15.index to i64
+%key.0.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.0.wide
+%key.1.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.1.wide
+%key.2.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.2.wide
+%key.3.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.3.wide
+%key.4.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.4.wide
+%key.5.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.5.wide
+%key.6.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.6.wide
+%key.7.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.7.wide
+%key.8.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.8.wide
+%key.9.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.9.wide
+%key.10.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.10.wide
+%key.11.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.11.wide
+%key.12.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.12.wide
+%key.13.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.13.wide
+%key.14.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.14.wide
+%key.15.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.15.wide
+%key.0.load = load half, ptr addrspace(1) %key.0.ptr, align 2
+%key.1.load = load half, ptr addrspace(1) %key.1.ptr, align 2
+%key.2.load = load half, ptr addrspace(1) %key.2.ptr, align 2
+%key.3.load = load half, ptr addrspace(1) %key.3.ptr, align 2
+%key.4.load = load half, ptr addrspace(1) %key.4.ptr, align 2
+%key.5.load = load half, ptr addrspace(1) %key.5.ptr, align 2
+%key.6.load = load half, ptr addrspace(1) %key.6.ptr, align 2
+%key.7.load = load half, ptr addrspace(1) %key.7.ptr, align 2
+%key.8.load = load half, ptr addrspace(1) %key.8.ptr, align 2
+%key.9.load = load half, ptr addrspace(1) %key.9.ptr, align 2
+%key.10.load = load half, ptr addrspace(1) %key.10.ptr, align 2
+%key.11.load = load half, ptr addrspace(1) %key.11.ptr, align 2
+%key.12.load = load half, ptr addrspace(1) %key.12.ptr, align 2
+%key.13.load = load half, ptr addrspace(1) %key.13.ptr, align 2
+%key.14.load = load half, ptr addrspace(1) %key.14.ptr, align 2
+%key.15.load = load half, ptr addrspace(1) %key.15.ptr, align 2
+%key.0.raw = fpext half %key.0.load to float
+%key.1.raw = fpext half %key.1.load to float
+%key.2.raw = fpext half %key.2.load to float
+%key.3.raw = fpext half %key.3.load to float
+%key.4.raw = fpext half %key.4.load to float
+%key.5.raw = fpext half %key.5.load to float
+%key.6.raw = fpext half %key.6.load to float
+%key.7.raw = fpext half %key.7.load to float
+%key.8.raw = fpext half %key.8.load to float
+%key.9.raw = fpext half %key.9.load to float
+%key.10.raw = fpext half %key.10.load to float
+%key.11.raw = fpext half %key.11.load to float
+%key.12.raw = fpext half %key.12.load to float
+%key.13.raw = fpext half %key.13.load to float
+%key.14.raw = fpext half %key.14.load to float
+%key.15.raw = fpext half %key.15.load to float
+%key.0 = select i1 %active.0, float %key.0.raw, float 0x0000000000000000
+%key.1 = select i1 %active.1, float %key.1.raw, float 0x0000000000000000
+%key.2 = select i1 %active.2, float %key.2.raw, float 0x0000000000000000
+%key.3 = select i1 %active.3, float %key.3.raw, float 0x0000000000000000
+%key.4 = select i1 %active.4, float %key.4.raw, float 0x0000000000000000
+%key.5 = select i1 %active.5, float %key.5.raw, float 0x0000000000000000
+%key.6 = select i1 %active.6, float %key.6.raw, float 0x0000000000000000
+%key.7 = select i1 %active.7, float %key.7.raw, float 0x0000000000000000
+%key.8 = select i1 %active.8, float %key.8.raw, float 0x0000000000000000
+%key.9 = select i1 %active.9, float %key.9.raw, float 0x0000000000000000
+%key.10 = select i1 %active.10, float %key.10.raw, float 0x0000000000000000
+%key.11 = select i1 %active.11, float %key.11.raw, float 0x0000000000000000
+%key.12 = select i1 %active.12, float %key.12.raw, float 0x0000000000000000
+%key.13 = select i1 %active.13, float %key.13.raw, float 0x0000000000000000
+%key.14 = select i1 %active.14, float %key.14.raw, float 0x0000000000000000
+%key.15 = select i1 %active.15, float %key.15.raw, float 0x0000000000000000
+%sum.0.next = call float @llvm.fma.f32(float %q.0, float %key.0, float %sum.0)
+%sum.1.next = call float @llvm.fma.f32(float %q.1, float %key.1, float %sum.1)
+%sum.2.next = call float @llvm.fma.f32(float %q.2, float %key.2, float %sum.2)
+%sum.3.next = call float @llvm.fma.f32(float %q.3, float %key.3, float %sum.3)
+%sum.4.next = call float @llvm.fma.f32(float %q.4, float %key.4, float %sum.4)
+%sum.5.next = call float @llvm.fma.f32(float %q.5, float %key.5, float %sum.5)
+%sum.6.next = call float @llvm.fma.f32(float %q.6, float %key.6, float %sum.6)
+%sum.7.next = call float @llvm.fma.f32(float %q.7, float %key.7, float %sum.7)
+%sum.8.next = call float @llvm.fma.f32(float %q.8, float %key.8, float %sum.8)
+%sum.9.next = call float @llvm.fma.f32(float %q.9, float %key.9, float %sum.9)
+%sum.10.next = call float @llvm.fma.f32(float %q.10, float %key.10, float %sum.10)
+%sum.11.next = call float @llvm.fma.f32(float %q.11, float %key.11, float %sum.11)
+%sum.12.next = call float @llvm.fma.f32(float %q.12, float %key.12, float %sum.12)
+%sum.13.next = call float @llvm.fma.f32(float %q.13, float %key.13, float %sum.13)
+%sum.14.next = call float @llvm.fma.f32(float %q.14, float %key.14, float %sum.14)
+%sum.15.next = call float @llvm.fma.f32(float %q.15, float %key.15, float %sum.15)
+%channel.next = add i32 %channel, 16
+br label %loop
+done:
+%sum.89 = fadd float %sum.8, %sum.9
+%sum.1011 = fadd float %sum.10, %sum.11
+%sum.1213 = fadd float %sum.12, %sum.13
+%sum.1415 = fadd float %sum.14, %sum.15
+%sum.89.1011 = fadd float %sum.89, %sum.1011
+%sum.1213.1415 = fadd float %sum.1213, %sum.1415
+%sum.8to15 = fadd float %sum.89.1011, %sum.1213.1415
+%sum.01 = fadd float %sum.0, %sum.1
+%sum.23 = fadd float %sum.2, %sum.3
+%sum.45 = fadd float %sum.4, %sum.5
+%sum.67 = fadd float %sum.6, %sum.7
+%sum.0123 = fadd float %sum.01, %sum.23
+%sum.4567 = fadd float %sum.45, %sum.67
+%sum.0to7 = fadd float %sum.0123, %sum.4567
+%sum = fadd float %sum.0to7, %sum.8to15
+ret float %sum
+}
+define internal void @attention_forward_step_body(
+ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture writeonly %output,
+ptr addrspace(1) %context, ptr addrspace(1) %kv.context,
+i32 %from, i32 %heads, i32 %channels, i32 %position, i32 %kv.heads, i32 %threads) #3 {
+entry:
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%global = mul i32 %group, %block
+%global.id = add i32 %global, %lid
+%length = udiv i32 %from, %channels
+%width = udiv i32 %channels, %heads
+%kv.group = udiv i32 %heads, %kv.heads
+%kv.channels = mul i32 %kv.heads, %width
+%kv.plane = mul i32 %kv.channels, %length
+%reached = add i32 %position, 1
+%wave.width = call i32 @recipe.wavefront.width()
+%wave = udiv i32 %lid, %wave.width
+%lane = urem i32 %lid, %wave.width
+%waves = udiv i32 %block, %wave.width
+%global.wave = udiv i32 %global.id, %wave.width
+%global.waves = udiv i32 %threads, %wave.width
+%width.float = uitofp i32 %width to float
+%scale = call float @llvm.sqrt.f32(float %width.float)
+%wave.half.start = lshr i32 %wave.width, 1
+%maximum.global.index = add i32 %waves, 0
+%denominator.global.index = add i32 %waves, 1
+%tile.base = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
+%tile.float = bitcast ptr addrspace(3) %tile.base to ptr addrspace(3)
+%maximum.global.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %maximum.global.index
+%denominator.global.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %denominator.global.index
+br label %cache.loop
+cache.loop:
+%cache.channel = phi i32 [ %global.id, %entry ], [ %cache.channel.next, %cache.step ]
+%cache.more = icmp ult i32 %cache.channel, %kv.channels
+br i1 %cache.more, label %cache.step, label %cache.done
+cache.step:
+%cache.channel.base = mul i32 %cache.channel, %length
+%cache.position.index = add i32 %cache.channel.base, %position
+%cache.position.wide = zext i32 %cache.position.index to i64
+%cache.key.source.index = add i32 %from, %cache.position.index
+%cache.key.source.wide = zext i32 %cache.key.source.index to i64
+%cache.key.source.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %cache.key.source.wide
+%cache.key.value = load half, ptr addrspace(1) %cache.key.source.ptr, align 2
+%cache.value.base = add i32 %from, %kv.plane
+%cache.value.source.index = add i32 %cache.value.base, %cache.position.index
+%cache.value.source.wide = zext i32 %cache.value.source.index to i64
+%cache.value.source.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %cache.value.source.wide
+%cache.value.value = load half, ptr addrspace(1) %cache.value.source.ptr, align 2
+%cache.key.ptr = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %cache.position.wide
+store half %cache.key.value, ptr addrspace(1) %cache.key.ptr, align 2
+%cache.value.index = add i32 %kv.plane, %cache.position.index
+%cache.value.wide = zext i32 %cache.value.index to i64
+%cache.value.ptr = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %cache.value.wide
+store half %cache.value.value, ptr addrspace(1) %cache.value.ptr, align 2
+%cache.channel.next = add i32 %cache.channel, %threads
+br label %cache.loop
+cache.done:
+call void @grid_barrier(i32 %threads)
+br label %score.tile.loop
+score.tile.loop:
+%score.tile.base = phi i32 [ 0, %cache.done ], [ %score.tile.next, %score.tile.advance ]
+%score.group.active = icmp ult i32 %group, %heads
+%score.tile.limit = icmp ult i32 %score.tile.base, %reached
+%score.tile.more = and i1 %score.group.active, %score.tile.limit
+br i1 %score.tile.more, label %score.query.copy.loop, label %score.done
+score.query.copy.loop:
+%score.query.channel = phi i32 [ %lid, %score.tile.loop ], [ %score.query.channel.next, %score.query.copy.step ]
+%score.query.channel.more = icmp ult i32 %score.query.channel, %width
+br i1 %score.query.channel.more, label %score.query.copy.step, label %score.query.copy.done
+score.query.copy.step:
+%score.head.channel = mul i32 %group, %width
+%score.query.global.channel = add i32 %score.head.channel, %score.query.channel
+%score.query.channel.base = mul i32 %score.query.global.channel, %length
+%score.query.index = add i32 %score.query.channel.base, %position
+%score.query.wide = zext i32 %score.query.index to i64
+%score.query.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %score.query.wide
+%score.query.value = load half, ptr addrspace(1) %score.query.ptr, align 2
+%score.query.float = fpext half %score.query.value to float
+%score.query.shared.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %score.query.channel
+store float %score.query.float, ptr addrspace(3) %score.query.shared.ptr, align 4
+%score.query.channel.next = add i32 %score.query.channel, %block
+br label %score.query.copy.loop
+score.query.copy.done:
+call void @recipe.local.barrier()
+%score.key = add i32 %score.tile.base, %lid
+%score.key.more = icmp ult i32 %score.key, %reached
+br i1 %score.key.more, label %score.key.compute, label %score.key.done
+score.key.compute:
+%score.kv.head = udiv i32 %group, %kv.group
+%score.scaled.raw = call float @attention_step_key_dot(ptr addrspace(3) %tile.float, ptr addrspace(1) %kv.context, i32 %score.key, i32 %score.kv.head, i32 %width, i32 %length)
+%score.scaled = fdiv float %score.scaled.raw, %scale
+%score.row = mul i32 %group, %length
+%score.slot = add i32 %score.row, %score.key
+%score.slot.wide = zext i32 %score.slot to i64
+call void @attention_step_score_store(ptr addrspace(1) %context, i64 %score.slot.wide, float %score.scaled)
+br label %score.key.done
+score.key.done:
+call void @recipe.local.barrier()
+br label %score.tile.advance
+score.tile.advance:
+%score.tile.next = add i32 %score.tile.base, %block
+br label %score.tile.loop
+score.done:
+call void @grid_barrier(i32 %threads)
+%active = icmp ult i32 %group, %heads
+%active.limit = select i1 %active, i32 %reached, i32 0
+br label %maximum.loop
+maximum.loop:
+%maximum.key = phi i32 [ %lid, %score.done ], [ %maximum.key.next, %maximum.step ]
+%maximum.value = phi float [ 0xC7EFFFFFE0000000, %score.done ], [ %maximum.next, %maximum.step ]
+%maximum.more = icmp ult i32 %maximum.key, %active.limit
+br i1 %maximum.more, label %maximum.step, label %maximum.wave.loop
+maximum.step:
+%maximum.row = mul i32 %group, %length
+%maximum.slot = add i32 %maximum.row, %maximum.key
+%maximum.slot.wide = zext i32 %maximum.slot to i64
+%maximum.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %maximum.slot.wide)
+%maximum.larger = fcmp ogt float %maximum.score, %maximum.value
+%maximum.next = select i1 %maximum.larger, float %maximum.score, float %maximum.value
+%maximum.key.next = add i32 %maximum.key, %block
+br label %maximum.loop
+maximum.wave.loop:
+%maximum.offset = phi i32 [ %wave.half.start, %maximum.loop ], [ %maximum.offset.next, %maximum.wave.step ]
+%maximum.wave.value = phi float [ %maximum.value, %maximum.loop ], [ %maximum.wave.value.next, %maximum.wave.step ]
+%maximum.wave.more = icmp ne i32 %maximum.offset, 0
+br i1 %maximum.wave.more, label %maximum.wave.step, label %maximum.wave.done
+maximum.wave.step:
+%maximum.partner.lane = xor i32 %lane, %maximum.offset
+%maximum.partner.index = mul i32 %maximum.partner.lane, 4
+%maximum.partner = call float @recipe.wave.partner.f32(float %maximum.wave.value, i32 %maximum.partner.index)
+%maximum.partner.larger = fcmp ogt float %maximum.partner, %maximum.wave.value
+%maximum.wave.value.next = select i1 %maximum.partner.larger, float %maximum.partner, float %maximum.wave.value
+%maximum.offset.next = lshr i32 %maximum.offset, 1
+br label %maximum.wave.loop
+maximum.wave.done:
+%maximum.owner = icmp eq i32 %lane, 0
+br i1 %maximum.owner, label %maximum.wave.store, label %maximum.wave.skip
+maximum.wave.store:
+%maximum.wave.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %wave
+store float %maximum.wave.value, ptr addrspace(3) %maximum.wave.ptr, align 4
+br label %maximum.wave.skip
+maximum.wave.skip:
+call void @recipe.local.barrier()
+%maximum.group.owner = icmp eq i32 %lid, 0
+br i1 %maximum.group.owner, label %maximum.group.loop, label %maximum.group.skip
+maximum.group.loop:
+%maximum.wave.index = phi i32 [ 0, %maximum.wave.skip ], [ %maximum.wave.index.next, %maximum.group.step ]
+%maximum.group.value = phi float [ 0xC7EFFFFFE0000000, %maximum.wave.skip ], [ %maximum.group.next, %maximum.group.step ]
+%maximum.group.more = icmp ult i32 %maximum.wave.index, %waves
+br i1 %maximum.group.more, label %maximum.group.step, label %maximum.group.done
+maximum.group.step:
+%maximum.group.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %maximum.wave.index
+%maximum.group.wave = load float, ptr addrspace(3) %maximum.group.ptr, align 4
+%maximum.group.larger = fcmp ogt float %maximum.group.wave, %maximum.group.value
+%maximum.group.next = select i1 %maximum.group.larger, float %maximum.group.wave, float %maximum.group.value
+%maximum.wave.index.next = add i32 %maximum.wave.index, 1
+br label %maximum.group.loop
+maximum.group.done:
+store float %maximum.group.value, ptr addrspace(3) %maximum.global.ptr, align 4
+br label %maximum.group.skip
+maximum.group.skip:
+call void @recipe.local.barrier()
+%maximum.global = load float, ptr addrspace(3) %maximum.global.ptr, align 4
+br label %denominator.loop
+denominator.loop:
+%denominator.key = phi i32 [ %lid, %maximum.group.skip ], [ %denominator.key.next, %denominator.step ]
+%denominator.value = phi float [ 0x0000000000000000, %maximum.group.skip ], [ %denominator.next, %denominator.step ]
+%denominator.more = icmp ult i32 %denominator.key, %active.limit
+br i1 %denominator.more, label %denominator.step, label %denominator.wave.loop
+denominator.step:
+%denominator.row = mul i32 %group, %length
+%denominator.slot = add i32 %denominator.row, %denominator.key
+%denominator.slot.wide = zext i32 %denominator.slot to i64
+%denominator.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %denominator.slot.wide)
+%denominator.centered = fsub float %denominator.score, %maximum.global
+%denominator.exp = call float @llvm.exp.f32(float %denominator.centered)
+%denominator.next = fadd float %denominator.value, %denominator.exp
+%denominator.key.next = add i32 %denominator.key, %block
+br label %denominator.loop
+denominator.wave.loop:
+%denominator.offset = phi i32 [ %wave.half.start, %denominator.loop ], [ %denominator.offset.next, %denominator.wave.step ]
+%denominator.wave.value = phi float [ %denominator.value, %denominator.loop ], [ %denominator.wave.value.next, %denominator.wave.step ]
+%denominator.wave.more = icmp ne i32 %denominator.offset, 0
+br i1 %denominator.wave.more, label %denominator.wave.step, label %denominator.wave.done
+denominator.wave.step:
+%denominator.partner.lane = xor i32 %lane, %denominator.offset
+%denominator.partner.index = mul i32 %denominator.partner.lane, 4
+%denominator.partner = call float @recipe.wave.partner.f32(float %denominator.wave.value, i32 %denominator.partner.index)
+%denominator.wave.value.next = fadd float %denominator.wave.value, %denominator.partner
+%denominator.offset.next = lshr i32 %denominator.offset, 1
+br label %denominator.wave.loop
+denominator.wave.done:
+%denominator.owner = icmp eq i32 %lane, 0
+br i1 %denominator.owner, label %denominator.wave.store, label %denominator.wave.skip
+denominator.wave.store:
+%denominator.wave.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %wave
+store float %denominator.wave.value, ptr addrspace(3) %denominator.wave.ptr, align 4
+br label %denominator.wave.skip
+denominator.wave.skip:
+call void @recipe.local.barrier()
+%denominator.group.owner = icmp eq i32 %lid, 0
+br i1 %denominator.group.owner, label %denominator.group.loop, label %denominator.group.skip
+denominator.group.loop:
+%denominator.wave.index = phi i32 [ 0, %denominator.wave.skip ], [ %denominator.wave.index.next, %denominator.group.step ]
+%denominator.group.value = phi float [ 0x0000000000000000, %denominator.wave.skip ], [ %denominator.group.next, %denominator.group.step ]
+%denominator.group.more = icmp ult i32 %denominator.wave.index, %waves
+br i1 %denominator.group.more, label %denominator.group.step, label %denominator.group.done
+denominator.group.step:
+%denominator.group.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %denominator.wave.index
+%denominator.group.wave = load float, ptr addrspace(3) %denominator.group.ptr, align 4
+%denominator.group.next = fadd float %denominator.group.value, %denominator.group.wave
+%denominator.wave.index.next = add i32 %denominator.wave.index, 1
+br label %denominator.group.loop
+denominator.group.done:
+store float %denominator.group.value, ptr addrspace(3) %denominator.global.ptr, align 4
+br label %denominator.group.skip
+denominator.group.skip:
+call void @recipe.local.barrier()
+%denominator.global = load float, ptr addrspace(3) %denominator.global.ptr, align 4
+br label %probability.loop
+probability.loop:
+%probability.key = phi i32 [ %lid, %denominator.group.skip ], [ %probability.key.next, %probability.step ]
+%probability.more = icmp ult i32 %probability.key, %active.limit
+br i1 %probability.more, label %probability.step, label %probability.done
+probability.step:
+%probability.row = mul i32 %group, %length
+%probability.slot = add i32 %probability.row, %probability.key
+%probability.slot.wide = zext i32 %probability.slot to i64
+%probability.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %probability.slot.wide)
+%probability.centered = fsub float %probability.score, %maximum.global
+%probability.exp = call float @llvm.exp.f32(float %probability.centered)
+%probability.value = fdiv float %probability.exp, %denominator.global
+call void @attention_step_score_store(ptr addrspace(1) %context, i64 %probability.slot.wide, float %probability.value)
+%probability.key.next = add i32 %probability.key, %block
+br label %probability.loop
+probability.done:
+call void @grid_barrier(i32 %threads)
+br label %output.channel.loop
+output.channel.loop:
+%output.channel = phi i32 [ %global.wave, %probability.done ], [ %output.channel.next, %output.channel.done ]
+%output.channel.more = icmp ult i32 %output.channel, %channels
+br i1 %output.channel.more, label %output.key.loop, label %output.stats.owner
+output.key.loop:
+%output.key = phi i32 [ %lane, %output.channel.loop ], [ %output.key.next, %output.key.step ]
+%output.sum.0 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.0.next, %output.key.step ]
+%output.sum.1 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.1.next, %output.key.step ]
+%output.sum.2 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.2.next, %output.key.step ]
+%output.sum.3 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.3.next, %output.key.step ]
+%output.key.more = icmp ult i32 %output.key, %reached
+br i1 %output.key.more, label %output.key.step, label %output.wave.prepare
+output.key.step:
+%output.head = udiv i32 %output.channel, %width
+%output.row = mul i32 %output.head, %length
+%output.kv.head = udiv i32 %output.head, %kv.group
+%output.kv.channel.base = mul i32 %output.kv.head, %width
+%output.local.channel = urem i32 %output.channel, %width
+%output.kv.channel = add i32 %output.kv.channel.base, %output.local.channel
+%output.kv.channel.offset = mul i32 %output.kv.channel, %length
+%output.key.0 = add i32 %output.key, 0
+%output.key.1 = add i32 %output.key, %wave.width
+%output.key.2 = add i32 %output.key.1, %wave.width
+%output.key.3 = add i32 %output.key.2, %wave.width
+%output.active.0 = icmp ult i32 %output.key.0, %reached
+%output.active.1 = icmp ult i32 %output.key.1, %reached
+%output.active.2 = icmp ult i32 %output.key.2, %reached
+%output.active.3 = icmp ult i32 %output.key.3, %reached
+%output.safe.0 = select i1 %output.active.0, i32 %output.key.0, i32 0
+%output.safe.1 = select i1 %output.active.1, i32 %output.key.1, i32 0
+%output.safe.2 = select i1 %output.active.2, i32 %output.key.2, i32 0
+%output.safe.3 = select i1 %output.active.3, i32 %output.key.3, i32 0
+%output.slot.0 = add i32 %output.row, %output.safe.0
+%output.slot.1 = add i32 %output.row, %output.safe.1
+%output.slot.2 = add i32 %output.row, %output.safe.2
+%output.slot.3 = add i32 %output.row, %output.safe.3
+%output.slot.0.wide = zext i32 %output.slot.0 to i64
+%output.slot.1.wide = zext i32 %output.slot.1 to i64
+%output.slot.2.wide = zext i32 %output.slot.2 to i64
+%output.slot.3.wide = zext i32 %output.slot.3 to i64
+%output.probability.0.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.0.wide)
+%output.probability.1.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.1.wide)
+%output.probability.2.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.2.wide)
+%output.probability.3.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.3.wide)
+%output.probability.0 = select i1 %output.active.0, float %output.probability.0.raw, float 0x0000000000000000
+%output.probability.1 = select i1 %output.active.1, float %output.probability.1.raw, float 0x0000000000000000
+%output.probability.2 = select i1 %output.active.2, float %output.probability.2.raw, float 0x0000000000000000
+%output.probability.3 = select i1 %output.active.3, float %output.probability.3.raw, float 0x0000000000000000
+%output.index.0.local = add i32 %output.kv.channel.offset, %output.safe.0
+%output.index.1.local = add i32 %output.kv.channel.offset, %output.safe.1
+%output.index.2.local = add i32 %output.kv.channel.offset, %output.safe.2
+%output.index.3.local = add i32 %output.kv.channel.offset, %output.safe.3
+%output.index.0 = add i32 %kv.plane, %output.index.0.local
+%output.index.1 = add i32 %kv.plane, %output.index.1.local
+%output.index.2 = add i32 %kv.plane, %output.index.2.local
+%output.index.3 = add i32 %kv.plane, %output.index.3.local
+%output.index.0.wide = zext i32 %output.index.0 to i64
+%output.index.1.wide = zext i32 %output.index.1 to i64
+%output.index.2.wide = zext i32 %output.index.2 to i64
+%output.index.3.wide = zext i32 %output.index.3 to i64
+%output.ptr.0 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.0.wide
+%output.ptr.1 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.1.wide
+%output.ptr.2 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.2.wide
+%output.ptr.3 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.3.wide
+%output.value.0.raw = load half, ptr addrspace(1) %output.ptr.0, align 2
+%output.value.1.raw = load half, ptr addrspace(1) %output.ptr.1, align 2
+%output.value.2.raw = load half, ptr addrspace(1) %output.ptr.2, align 2
+%output.value.3.raw = load half, ptr addrspace(1) %output.ptr.3, align 2
+%output.value.0.float = fpext half %output.value.0.raw to float
+%output.value.1.float = fpext half %output.value.1.raw to float
+%output.value.2.float = fpext half %output.value.2.raw to float
+%output.value.3.float = fpext half %output.value.3.raw to float
+%output.value.0 = select i1 %output.active.0, float %output.value.0.float, float 0x0000000000000000
+%output.value.1 = select i1 %output.active.1, float %output.value.1.float, float 0x0000000000000000
+%output.value.2 = select i1 %output.active.2, float %output.value.2.float, float 0x0000000000000000
+%output.value.3 = select i1 %output.active.3, float %output.value.3.float, float 0x0000000000000000
+%output.sum.0.next = call float @llvm.fma.f32(float %output.probability.0, float %output.value.0, float %output.sum.0)
+%output.sum.1.next = call float @llvm.fma.f32(float %output.probability.1, float %output.value.1, float %output.sum.1)
+%output.sum.2.next = call float @llvm.fma.f32(float %output.probability.2, float %output.value.2, float %output.sum.2)
+%output.sum.3.next = call float @llvm.fma.f32(float %output.probability.3, float %output.value.3, float %output.sum.3)
+%output.key.stride = mul i32 %wave.width, 4
+%output.key.next = add i32 %output.key, %output.key.stride
+br label %output.key.loop
+output.wave.prepare:
+%output.sum.01 = fadd float %output.sum.0, %output.sum.1
+%output.sum.23 = fadd float %output.sum.2, %output.sum.3
+%output.sum = fadd float %output.sum.01, %output.sum.23
+br label %output.wave.loop
+output.wave.loop:
+%output.offset = phi i32 [ %wave.half.start, %output.wave.prepare ], [ %output.offset.next, %output.wave.step ]
+%output.wave.sum = phi float [ %output.sum, %output.wave.prepare ], [ %output.wave.sum.next, %output.wave.step ]
+%output.wave.more = icmp ne i32 %output.offset, 0
+br i1 %output.wave.more, label %output.wave.step, label %output.wave.done
+output.wave.step:
+%output.partner.lane = xor i32 %lane, %output.offset
+%output.partner.index = mul i32 %output.partner.lane, 4
+%output.partner = call float @recipe.wave.partner.f32(float %output.wave.sum, i32 %output.partner.index)
+%output.wave.sum.next = fadd float %output.wave.sum, %output.partner
+%output.offset.next = lshr i32 %output.offset, 1
+br label %output.wave.loop
+output.wave.done:
+%output.owner = icmp eq i32 %lane, 0
+br i1 %output.owner, label %output.store, label %output.channel.done
+output.store:
+%output.position.base = mul i32 %output.channel, %length
+%output.position.index = add i32 %output.position.base, %position
+%output.position.wide = zext i32 %output.position.index to i64
+%output.ptr = getelementptr inbounds half, ptr addrspace(1) %output, i64 %output.position.wide
+%output.half.value = fptrunc float %output.wave.sum to half
+store half %output.half.value, ptr addrspace(1) %output.ptr, align 2
+br label %output.channel.done
+output.channel.done:
+%output.channel.next = add i32 %output.channel, %global.waves
+br label %output.channel.loop
+output.stats.owner:
+br label %exit
+exit:
+ret void
 }
 ; True when the query keeps the block that holds this key. Each query owns one
 ; row of block scores followed by one admission flag per block.

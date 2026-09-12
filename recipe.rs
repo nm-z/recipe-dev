@@ -3068,6 +3068,17 @@ impl NativeModelIr {
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
 					let attention_carry = i32::from(pointers.attention_kv.is_some());
+					let fast_attention = self.inference
+						&& self.rows == 1
+						&& backend == Backend::Amd
+						&& self.precision.model_type == "half"
+						&& self.precision.state_type == "float"
+						&& self.precision.state.bytes() <= self.precision.model.bytes().saturating_mul(2)
+						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
+						&& attention == "attention_forward_body"
+						&& blocks == 0
+						&& node.argument[2] == 0.0
+						&& pointers.attention_kv.is_some();
 					let (tile_m, tile_n) = if self.inference && attention == "attention_forward_body" {
 						let step = native_attention_tile(
 							narrow(node.output.length, "attention length")? as u32,
@@ -3082,7 +3093,15 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k));
+					let normal_call = format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					if fast_attention {
+						let prefix = format!("n{index}.attention.step");
+						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
+						let fast_call = format!("call void @attention_forward_step_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
+					} else {
+						ir.push_str(&normal_call);
+					}
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -4189,6 +4208,42 @@ impl NativeModelIr {
 		Ok(emitted)
 	}
 
+	fn emit_q4k_support(&self, backend: Backend) -> String {
+		let mut arms = String::new();
+		if self.inference && backend == Backend::Amd && self.precision.state_type == "float" && self.precision.model.bytes() >= 2 && std::env::var("RECIPE_PACKED_DOT").as_deref() == Ok("1") {
+			for (index, plan) in self.plans.iter().enumerate() {
+				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				let q4k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
+					let segments = stored.format_segments();
+					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * self.precision.model.bytes()
+						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
+				});
+				if q4k {
+					arms.push_str(&format!("i32 {}, label %q4k.yes\n", index + 1));
+				}
+			}
+		}
+		format!("define internal i1 @recipe.model.q4k(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q4k.no [\n{arms}]\nq4k.yes:\nret i1 true\nq4k.no:\nret i1 false\n}}\n")
+	}
+
+	fn emit_q6k_support(&self, backend: Backend) -> String {
+		let mut arms = String::new();
+		if self.inference && backend == Backend::Amd && self.precision.state_type == "float" && self.precision.model.bytes() >= 2 && std::env::var("RECIPE_PACKED_DOT").as_deref() == Ok("1") {
+			for (index, plan) in self.plans.iter().enumerate() {
+				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				let q6k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
+					let segments = stored.format_segments();
+					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * self.precision.model.bytes()
+						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
+				});
+				if q6k {
+					arms.push_str(&format!("i32 {}, label %q6k.yes\n", index + 1));
+				}
+			}
+		}
+		format!("define internal i1 @recipe.model.q6k(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q6k.no [\n{arms}]\nq6k.yes:\nret i1 true\nq6k.no:\nret i1 false\n}}\n")
+	}
+
 	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
@@ -4285,9 +4340,13 @@ impl NativeModelIr {
 		ir = strip_definition(ir, "recipe.model.decode");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
+		let q4k_support = self.emit_q4k_support(backend);
+		let q6k_support = self.emit_q6k_support(backend);
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
+		ir.push_str(&q4k_support);
+		ir.push_str(&q6k_support);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
 		let model_ty = self.precision.model_type;
@@ -5713,6 +5772,8 @@ mod gguf {
 			&self.metadata
 		}
 		/// Select arithmetic precision without changing the file's weight storage.
+		/// On AMD, `RECIPE_PACKED_DOT=1` opts into Q8 activation quantization for
+		/// supported packed contractions. This can change numerical results.
 		pub fn fp(mut self, bits: u8) -> Self {
 			self.precision = super::recipe.train().fp(bits).precision;
 			self
