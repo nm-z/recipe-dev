@@ -973,9 +973,9 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %ramp.high = call i1 @recipe.ogt(double %ramp.clamped.low, double 1.0)
 %ramp = select i1 %ramp.high, double 1.0, double %ramp.clamped.low
 %interpolated = call double @recipe.div(double %frequency.raw, double %yarn.factor)
-%extrapolated.part = call double @recipe.mul(double %ramp, double %frequency.raw)
 %ramp.inverse = call double @recipe.sub(double 1.0, double %ramp)
-%interpolated.part = call double @recipe.mul(double %ramp.inverse, double %interpolated)
+%extrapolated.part = call double @recipe.mul(double %ramp.inverse, double %frequency.raw)
+%interpolated.part = call double @recipe.mul(double %ramp, double %interpolated)
 %blended = call double @recipe.add(double %extrapolated.part, double %interpolated.part)
 %frequency = select i1 %yarn.on, double %blended, double %frequency.raw
 %position.i32 = trunc i64 %position to i32 %position.value = call double @recipe.from.u32(i32 %position.i32) %angle = call double @recipe.mul(double %position.value, double %frequency)

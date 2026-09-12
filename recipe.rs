@@ -8161,6 +8161,9 @@ impl Model {
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
+		if self.blocks.last().is_some_and(|block| block.activation != Activation::Linear) {
+			return self.push(Operation::Identity).activate(activation);
+		}
 		let mut model = self.suffix();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("activation requires a preceding block"));
 		if block.normalization.is_some() {
@@ -15816,7 +15819,7 @@ impl NativeProgram {
 		))?;
 		let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
-		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
+		let gradient_values = if artifact.training { native_gradient_values(graph.parameters.len(), &schedule.contractions)? } else { 0 };
 		Ok(Self {
 			gpu,
 			artifact,
