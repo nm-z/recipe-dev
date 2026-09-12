@@ -1,4 +1,5 @@
 use recipe::*;
+use std::io::Write as _;
 
 // RECIPE_PACKED_DOT=1 enables optional Q8 activation dot products on AMD.
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
@@ -55,15 +56,30 @@ fn main() {
 	let tokenizer = data.tokenizer();
 	let message = std::env::args().nth(1).unwrap_or_else(|| "What is the capital of France?".into());
 	let message = std::env::var("RNJ_PROMPT_FILE").map(|path| std::fs::read_to_string(path).unwrap()).unwrap_or(message);
-	let prompt = tokenizer.encode(&format!("<|start_header_id|>system<|end_header_id|>\nYou are rnj-1, a foundation model trained by Essential AI.\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n{message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"));
+	let formatted = format!("<|start_header_id|>system<|end_header_id|>\nYou are rnj-1, a foundation model trained by Essential AI.\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n{message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n");
+	let prompt = tokenizer.encode(if std::env::var_os("RNJ_RAW_PROMPT").is_some() { &message } else { &formatted });
 	let count = std::env::var("RNJ_TOKENS").ok().map(|v| v.parse().unwrap()).unwrap_or(32);
-	let context = std::env::var("RNJ_CONTEXT").ok().map(|v| v.parse().unwrap()).unwrap_or(16384 + count);
+	let context = std::env::var("RNJ_CONTEXT").ok().map(|v| v.parse().unwrap()).unwrap_or_else(|| integer("gemma3.context_length"));
 	let bos = integer("tokenizer.ggml.bos_token_id") as u32;
 	let mut stop = tokenizer.encode("<|eot_id|>").into_iter().filter(|id| *id != bos).collect::<Vec<_>>();
 	stop.push(integer("tokenizer.ggml.eos_token_id") as u32);
 	eprintln!("RNJ-1: {} prompt tokens, {context} context positions", prompt.len());
-	let generated = data.decode(&model, &plan, context, &prompt, &mut recipe.sampler().temperature(0.0), &stop, count);
-	println!("{}", tokenizer.decode(&generated.ids[prompt.len()..]));
+	if prompt.len() + count > context {
+		eprintln!("Context full: {} prompt tokens plus {count} reply tokens exceed {context}. Start a new chat or reduce reply length.", prompt.len());
+		std::process::exit(2);
+	}
+	let mut ids = Vec::new();
+	let mut printed = 0;
+	let generated = data.decode_stream(&model, &plan, context, &prompt, &mut recipe.sampler().temperature(0.0), &stop, count, |id| {
+		if stop.contains(&id) { return; }
+		ids.push(id);
+		let text = tokenizer.decode(&ids);
+		let text = text.trim_end_matches('�');
+		print!("{}", &text[printed..]);
+		std::io::stdout().flush().unwrap();
+		printed = text.len();
+	});
+	println!();
 	let seconds: f64 = generated.step_seconds.iter().sum();
 	eprintln!("prefill {} s; {} decode steps in {} s", generated.prefill_seconds, generated.step_seconds.len(), seconds);
 	if seconds > 0.0 {

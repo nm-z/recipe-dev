@@ -10374,7 +10374,11 @@ impl Gguf {
 	/// the positions it reaches. The logits are the model's output after the last
 	/// forward.
 	pub fn decode(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Emits each sampled token while generating from bound GGUF weights.
+	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
+		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
@@ -10447,7 +10451,8 @@ fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chann
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
-fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Result<Generation> {
+fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32)) -> Result<Generation> {
+	let load_started = std::time::Instant::now();
 	require(!prompt.is_empty(), "decode prompt is empty")?;
 	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the sequence of {sequence}", prompt.len()))?;
 	let mut samples = vec![0.0; sequence];
@@ -10456,6 +10461,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, model.precision, None)?;
+	if std::env::var_os("RECIPE_TIMINGS").is_some() { eprintln!("model preparation {} s", load_started.elapsed().as_secs_f64()); }
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -10463,7 +10469,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		sampler,
 		stop,
 		budget,
-		|_| Ok(()),
+		|id| { emit(id); Ok(()) },
 		|tape, samples, settled, reached| {
 			let values = &samples[settled as usize..reached as usize];
 			tape.write_tokens(settled as usize, values)?;
@@ -15368,7 +15374,14 @@ impl Gpu {
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
 					let mut pointer = ptr::null_mut();
-					self.status((driver.allocate)(driver.vram_pool, bytes, 0, &mut pointer), "allocation")?;
+					let status = (driver.allocate)(driver.vram_pool, bytes, 0, &mut pointer);
+					if status == 4104 && std::env::var("RECIPE_HOST_SPILL").as_deref() == Ok("1") {
+						self.status((driver.allocate)(driver.kernarg_pool, bytes, 0, &mut pointer), "system memory allocation")?;
+						self.status((driver.allow)(1, &driver.agent, ptr::null(), pointer), "GPU system memory access")?;
+						eprintln!("Using {} MiB of system memory for GPU allocation", bytes.div_ceil(1024 * 1024));
+					} else {
+						self.status(status, "allocation")?;
+					}
 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
 					Ok(pointer as u64)
 				}
