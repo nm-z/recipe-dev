@@ -1571,6 +1571,7 @@ fn window_signatures(graph: &Graph) -> Vec<String> {
 		signatures.push(match node.op {
 			Primitive::Predictor => "whole".to_owned(),
 			Primitive::Pool => format!("pool{}({source})", node.argument[0]),
+			Primitive::Last => "last".to_owned(),
 			Primitive::Contraction if node.argument[0] > 1.0 => format!("shift{}({source})", node.argument[0]),
 			_ => source,
 		});
@@ -2903,6 +2904,28 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Last) => {
+					let pointer = pointer_type(backend);
+					let ty = self.precision.model_type;
+					let prefix = format!("n{index}.last");
+					let source_end = if node.source >= 0 { format!("%n{}.end", node.source) } else { "%end".to_owned() };
+					let source_elements = node.input.elements();
+					emit_runtime_window_loop(&mut ir, index, "last", node.output, &window, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.position = sub i32 {source_end}, 1\n%{prefix}.position.wide = zext i32 %{prefix}.position to i64\n%{prefix}.source.local = add i64 %{prefix}.channel.base, %{prefix}.position.wide\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.source.index\n%{prefix}.source.value = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.source.value, {pointer} %{prefix}.output.ptr, align {align}\n",
+							channels = node.output.channels,
+							source_elements = source_elements,
+							source_length = node.input.length,
+							source_end = source_end,
+							ty = ty,
+							pointer = pointer,
+							source = pointers.source,
+							value = pointers.value,
+							align = alignment(ty),
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Outer) => {
 					emit_runtime_window_loop(&mut ir, index, "outer", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
@@ -3230,6 +3253,28 @@ impl NativeModelIr {
 							groups = node.output.channels,
 							width = node.argument[0],
 							length = node.output.length
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Last) => {
+					let pointer = pointer_type(backend);
+					let ty = self.precision.model_type;
+					let prefix = format!("n{index}.last.reverse");
+					let source_elements = node.input.elements();
+					let source_last = node.input.length - 1;
+					emit_fixed_loop(&mut ir, index, "last.reverse", self.rows, node.output, &window, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.source.local = add i64 %{prefix}.channel.base, {source_last}\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.delta.ptr = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n%{prefix}.delta = load {ty}, {pointer} %{prefix}.delta.ptr, align {align}\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 %{prefix}.source.index\n%{prefix}.source.prior = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.source.next = call {ty} @recipe.add({ty} %{prefix}.source.prior, {ty} %{prefix}.delta)\nstore {ty} %{prefix}.source.next, {pointer} %{prefix}.source.ptr, align {align}\n",
+							channels = node.output.channels,
+							source_elements = source_elements,
+							source_length = node.input.length,
+							source_last = source_last,
+							ty = ty,
+							pointer = pointer,
+							delta = pointers.delta,
+							source_adjoint = pointers.source_adjoint,
+							align = alignment(ty),
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3853,6 +3898,7 @@ impl NativeModelIr {
 					last = size - 1
 				));
 			}
+			Primitive::Last => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, 1\n")),
 			Primitive::Contraction if kernel > 1 => {
 				for (name, source) in [("begin", &begin), ("end", &end)] {
 					ir.push_str(&format!(
@@ -6783,6 +6829,7 @@ mod bundle {
 			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
+			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 		}
 	}
@@ -6851,6 +6898,7 @@ mod bundle {
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
 			"identity" => Ok(Operation::Identity),
+			"last" => Ok(Operation::Last),
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"product" => {
 				let branches = split_escaped(rest, ',');
@@ -7844,6 +7892,9 @@ enum Operation {
 	/// Computes nothing. It carries a step that is only an activation or only
 	/// a normalization, so those need no operation of their own.
 	Identity,
+	/// Keeps the last position reached by each forward window and collapses the
+	/// sequence axis to one position for a following projection.
+	Last,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -8190,6 +8241,7 @@ impl Model {
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
+	fn last() = Operation::Last;
 	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
 	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
@@ -9777,6 +9829,7 @@ impl Operation {
 			Self::Residual(_) => "residual",
 			Self::Product(..) => "product",
 			Self::Identity => "identity",
+			Self::Last => "last",
 			Self::Moe(..) => "moe",
 			Self::MoeBlocks(..) => "moe",
 			Self::Perceptron(_) => "perc",
@@ -9794,7 +9847,7 @@ impl Operation {
 		let weighted_parts = |parts: &[Block]| parts.iter().any(|part| part.operation.weighted());
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
-			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) => false,
+			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
 			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
 			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
@@ -11384,6 +11437,8 @@ enum Primitive {
 	Lookup = 20,
 	/// Every group of channels summed into one.
 	Fold = 21,
+	/// The final position reached by a forward window, collapsed to length one.
+	Last = 22,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -11447,6 +11502,7 @@ impl Node {
 			Primitive::ExpertOut => "ExpertOut",
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
+			Primitive::Last => "Last",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -11571,7 +11627,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 }
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) => true,
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last => true,
 		Operation::Residual(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
@@ -11780,6 +11836,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
+		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
@@ -12104,6 +12161,14 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
+}
+/// Keep only the final position of the stream reached by each forward window.
+/// The node has no weights or context: its native forward copies the source's
+/// newest position into output position zero, so a following vocabulary
+/// projection works on one row while attention state remains sequence-wide.
+fn lower_last(graph: &mut Graph) -> Result<()> {
+	require(graph.output.channels != 0 && graph.output.length != 0, "last-position selection needs a nonempty stream")?;
+	push_node(graph, Primitive::Last, Shape { channels: graph.output.channels, length: 1 }, 0, arguments(0.0, 0.0), -2)
 }
 fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()> {
 	require(vocabulary != 0 && width != 0, "embedding dimensions must be positive")?;
@@ -13460,6 +13525,7 @@ impl NativeTape {
 					require(size > 0, "native pool size must be positive")?;
 					(begin / size, end.div_ceil(size).min(length))
 				}
+				Primitive::Last => (0, 1),
 				Primitive::Contraction if node.argument[0] > 1.0 => {
 					let lag = integer_argument(node.argument[0], "contraction kernel")? as u32 - 1;
 					(begin.saturating_sub(lag), end.saturating_sub(lag))
