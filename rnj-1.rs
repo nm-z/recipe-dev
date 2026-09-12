@@ -31,7 +31,7 @@ fn main() {
 			])
 			.res([
 				norm(rms),
-				recipe.model().no(bias).layer(integer("gemma3.feed_forward_length")).gelu() * recipe.model().no(bias).layer(integer("gemma3.feed_forward_length")),
+				(recipe.model().no(bias).layer(integer("gemma3.feed_forward_length")).gelu() * recipe.model().no(bias).layer(integer("gemma3.feed_forward_length"))).into(),
 				layer(width),
 				norm(rms),
 			]);

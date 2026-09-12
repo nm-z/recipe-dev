@@ -3178,7 +3178,7 @@ ret double %result
 ; lies in the window starts from zero; one that began earlier keeps the sum an
 ; earlier window left, so a decode step adds one key to one block.
 define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) %context,
-i64 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads, i32 %index.width,
+i64 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width,
 i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64 %begin.wide = zext i32 %begin to i64 %end.wide = zext i32 %end to i64
 %length = udiv i64 %from.wide, %channels.wide
@@ -3258,7 +3258,7 @@ ret void
 ; the threshold is the score of the keep-th best, so a query keeps every block
 ; whose score reaches it.
 define internal void @attention_select_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
-i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads,
+i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads,
 i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
 %length = udiv i64 %from.wide, %channels.wide
@@ -3518,7 +3518,7 @@ define internal void @attention_forward_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
-i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
+i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
@@ -3529,9 +3529,12 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %head.width.double = call double @recipe.from.u32(i32 %head.width)
 %scale = call double @recipe.sqrt(double %head.width.double)
 %kv.group = udiv i32 %heads, %kv.heads
+%value.group = udiv i32 %heads, %value.heads
 %kv.channels = mul i32 %kv.heads, %head.width
 %kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
+%value.channels = mul i32 %value.heads, %head.width
+%value.plane = mul i32 %value.channels, %length
+%kv.planes = add i32 %kv.plane, %value.plane
 %value.plane.base = add i32 %from, %kv.plane
 %index.query.channels = mul i32 %index.heads, %index.width
 %index.channels = add i32 %index.query.channels, %index.width
@@ -3557,7 +3560,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %representative.total = mul i32 %representative.stride, %rows
 %score.base = add i32 %representative.base, %representative.total
 %rows.global = zext i32 %rows to i64 %from.global = zext i32 %from to i64 %channels.global = zext i32 %channels to i64 %heads.global = zext i32 %heads to i64 %length.global = zext i32 %length to i64 %head.width.global = zext i32 %head.width to i64 %blocks.global = zext i32 %blocks to i64 %index.width.global = zext i32 %index.width to i64 %block.divisor.global = zext i32 %block.divisor to i64 %kv.heads.global = zext i32 %kv.heads to i64 %index.heads.global = zext i32 %index.heads to i64
-%kv.channels.global = mul i64 %kv.heads.global, %head.width.global %kv.plane.global = mul i64 %kv.channels.global, %length.global %kv.planes.global = mul i64 %kv.plane.global, 2 %value.plane.base.global = add i64 %from.global, %kv.plane.global
+%kv.channels.global = mul i64 %kv.heads.global, %head.width.global %kv.plane.global = mul i64 %kv.channels.global, %length.global %value.heads.global = zext i32 %value.heads to i64 %value.channels.global = mul i64 %value.heads.global, %head.width.global %value.plane.global = mul i64 %value.channels.global, %length.global %kv.planes.global = add i64 %kv.plane.global, %value.plane.global %value.plane.base.global = add i64 %from.global, %kv.plane.global
 %index.query.channels.global = mul i64 %index.heads.global, %index.width.global %index.channels.global = add i64 %index.query.channels.global, %index.width.global %index.plane.global = mul i64 %index.channels.global, %length.global
 %gate.plane.global = select i1 %gate, i64 %from.global, i64 0 %index.query.base.global = add i64 %from.global, %kv.planes.global %gate.base.global = add i64 %index.query.base.global, 0 %row.stride.global = add i64 %gate.base.global, %gate.plane.global
 %blocks.numerator.global = add i64 %length.global, %block.divisor.global %blocks.less.global = sub i64 %blocks.numerator.global, 1 %blocks.full.global = udiv i64 %blocks.less.global, %block.divisor.global %blocks.selected.global = select i1 %select, i64 %blocks.full.global, i64 0
@@ -3598,6 +3601,8 @@ job.prepare:
 %head.start = mul i32 %head, %head.width
 %kv.head = udiv i32 %head, %kv.group
 %kv.head.start = mul i32 %kv.head, %head.width
+%value.head = udiv i32 %head, %value.group
+%value.head.start = mul i32 %value.head, %head.width
 %row.wide = zext i32 %row to i64
 %row.base.wide = mul i64 %row.wide, %row.stride.global
 %head.start.wide = zext i32 %head.start to i64
@@ -3696,6 +3701,8 @@ key.stage.step:
 %key.channel = add i32 %kv.head.start, %key.channel.local
 %key.channel.wide = zext i32 %key.channel to i64 %key.channel.base = mul i64 %key.channel.wide, %length.global
 %key.local.wide = zext i32 %key.local to i64 %key.position.wide = zext i32 %key.position to i64 %key.input.local = add i64 %key.channel.base, %key.position.wide
+%value.channel = add i32 %value.head.start, %key.channel.local
+%value.channel.wide = zext i32 %value.channel to i64 %value.channel.base = mul i64 %value.channel.wide, %length.global %value.input.local = add i64 %value.channel.base, %key.position.wide
 %key.plane = add i64 %row.base.wide, %from.global
 %key.input.index = add i64 %key.plane, %key.input.local
 %key.past = icmp ult i32 %key.position, %query.begin
@@ -3707,7 +3714,7 @@ key.cache.load:
 %key.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.cache.index
 %key.cache.value = load double, ptr addrspace(1) %key.cache.ptr, align 8
 %value.cache.index = add i64 %key.cache.row, %kv.plane.global
-%value.cache.index.final = add i64 %value.cache.index, %key.input.local
+%value.cache.index.final = add i64 %value.cache.index, %value.input.local
 %value.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.cache.index.final
 %value.cache.value = load double, ptr addrspace(1) %value.cache.ptr, align 8
 br label %key.loaded
@@ -3715,7 +3722,7 @@ key.source.load:
 %key.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %key.input.index
 %key.source.value = load double, ptr addrspace(1) %key.input.ptr, align 8
 %value.row = add i64 %row.base.wide, %value.plane.base.global
-%value.input.index = add i64 %value.row, %key.input.local
+%value.input.index = add i64 %value.row, %value.input.local
 %value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.input.index
 %value.source.value = load double, ptr addrspace(1) %value.input.ptr, align 8
 br i1 %carry, label %key.cache.store, label %key.loaded.source
@@ -3725,7 +3732,7 @@ key.cache.store:
 %key.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.store.index
 store double %key.source.value, ptr addrspace(1) %key.store.ptr, align 8
 %value.store.index = add i64 %key.store.row, %kv.plane.global
-%value.store.index.final = add i64 %value.store.index, %key.input.local
+%value.store.index.final = add i64 %value.store.index, %value.input.local
 %value.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.store.index.final
 store double %value.source.value, ptr addrspace(1) %value.store.ptr, align 8
 br label %key.loaded.source
@@ -3958,12 +3965,14 @@ ret void
 }
 define internal void @attention_cache_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) %kv.context,
-i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %length, i32 %threads ) #3 { entry:
+i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %length, i32 %threads ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %head.width = udiv i32 %from, %heads
 %kv.channels = mul i32 %kv.heads, %head.width
 %kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
+%value.channels = mul i32 %value.heads, %head.width
+%value.plane = mul i32 %value.channels, %length
+%kv.planes = add i32 %kv.plane, %value.plane
 %row.stride = add i32 %from, %kv.planes
 %total = mul i32 %rows, %kv.planes
 %start = add i32 %lid, 0
@@ -3975,25 +3984,13 @@ br i1 %more, label %cache.step, label %cache.done
 cache.step:
 %row = udiv i32 %p, %kv.planes
 %within = urem i32 %p, %kv.planes
-%plane = udiv i32 %within, %kv.plane
-%local = urem i32 %within, %kv.plane
-%channel = udiv i32 %local, %length
-%position = urem i32 %local, %length
 %source.row = mul i32 %row, %row.stride
-%source.plane.other = add i32 %from, %kv.plane
-%plane.zero = icmp eq i32 %plane, 0
-%source.plane = select i1 %plane.zero, i32 %from, i32 %source.plane.other
-%source.channel = mul i32 %channel, %length
-%source.index = add i32 %source.row, %source.plane
-%source.index.local = add i32 %source.index, %source.channel
-%source.index.final = add i32 %source.index.local, %position
+%source.index = add i32 %source.row, %from
+%source.index.final = add i32 %source.index, %within
 %source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %source.index.final
 %value = load double, ptr addrspace(1) %source.ptr, align 8
 %kv.row = mul i32 %row, %kv.planes
-%kv.plane.base = mul i32 %plane, %kv.plane
-%kv.index = add i32 %kv.row, %kv.plane.base
-%kv.index.local = add i32 %kv.index, %source.channel
-%kv.index.final = add i32 %kv.index.local, %position
+%kv.index.final = add i32 %kv.row, %within
 %kv.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i32 %kv.index.final
 store double %value, ptr addrspace(1) %kv.ptr, align 8
 %next = add i32 %p, %threads
@@ -4005,7 +4002,7 @@ define internal void @attention_forward_matrix_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
-i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
+i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
@@ -4017,7 +4014,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %scale = call double @recipe.sqrt(double %width.double)
 br i1 %carry, label %attention.cache.entry, label %attention.cache.done
 attention.cache.entry:
-call void @attention_cache_body( ptr addrspace(1) %input, ptr addrspace(1) %kv.context, i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %length, i32 %threads )
+call void @attention_cache_body( ptr addrspace(1) %input, ptr addrspace(1) %kv.context, i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %length, i32 %threads )
 call void @recipe.local.barrier()
 br label %attention.cache.done
 attention.cache.done:
@@ -4035,7 +4032,7 @@ attention.cache.done:
 %q.base.wide = zext i32 %q.base to i64 %k.base.wide = zext i32 %k.base to i64 %v.base.wide = zext i32 %v.base to i64 %p.base.wide = zext i32 %p.base to i64
 br label %attention.forward.matrix.job.loop
 attention.forward.matrix.job.loop:
-%head.job = phi i32 [ %group, %entry ], [ %head.job.next, %attention.forward.matrix.job.done ]
+%head.job = phi i32 [ %group, %attention.cache.done ], [ %head.job.next, %attention.forward.matrix.job.done ]
 %head.job.more = icmp ult i32 %head.job, %head.jobs
 br i1 %head.job.more, label %attention.forward.matrix.job.step, label %attention.forward.matrix.exit
 attention.forward.matrix.job.step:
@@ -4367,7 +4364,7 @@ define internal void @attention_reverse_matrix_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %output, ptr addrspace(1) %context,
 ptr addrspace(1) nocapture readonly %delta, ptr addrspace(1) nocapture writeonly %previous,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
-i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
+i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
@@ -4637,7 +4634,7 @@ define internal void @attention_reverse_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %output, ptr addrspace(1) %context,
 ptr addrspace(1) nocapture readonly %delta, ptr addrspace(1) nocapture writeonly %previous,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
-i32 %kv.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
+i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
 i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
@@ -4648,9 +4645,12 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %head.width.double = call double @recipe.from.u32(i32 %head.width)
 %scale = call double @recipe.sqrt(double %head.width.double)
 %kv.group = udiv i32 %heads, %kv.heads
+%value.group = udiv i32 %heads, %value.heads
 %kv.channels = mul i32 %kv.heads, %head.width
 %kv.plane = mul i32 %kv.channels, %length
-%kv.planes = mul i32 %kv.plane, 2
+%value.channels = mul i32 %value.heads, %head.width
+%value.plane = mul i32 %value.channels, %length
+%kv.planes = add i32 %kv.plane, %value.plane
 %value.plane.base = add i32 %from, %kv.plane
 %index.query.channels = mul i32 %index.heads, %index.width
 %index.channels = add i32 %index.query.channels, %index.width
@@ -4675,7 +4675,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %score.base = add i32 %representative.base, %representative.total
 %score.row.stride = mul i32 %length, %score.stride
 %attn.rows.wide = zext i32 %rows to i64 %attn.from.wide = zext i32 %from to i64 %attn.heads.wide = zext i32 %heads to i64 %attn.channels.wide = zext i32 %channels to i64 %attn.length.wide = zext i32 %length to i64 %attn.head.width.wide = zext i32 %head.width to i64 %attn.kv.heads.wide = zext i32 %kv.heads to i64 %attn.index.heads.wide = zext i32 %index.heads to i64 %attn.index.width.wide = zext i32 %index.width to i64
-%attn.kv.channels.wide = mul i64 %attn.kv.heads.wide, %attn.head.width.wide %attn.kv.plane.wide = mul i64 %attn.kv.channels.wide, %attn.length.wide %attn.kv.planes.wide = mul i64 %attn.kv.plane.wide, 2 %attn.value.plane.base.wide = add i64 %attn.from.wide, %attn.kv.plane.wide
+%attn.kv.channels.wide = mul i64 %attn.kv.heads.wide, %attn.head.width.wide %attn.kv.plane.wide = mul i64 %attn.kv.channels.wide, %attn.length.wide %attn.value.heads.wide = zext i32 %value.heads to i64 %attn.value.channels.wide = mul i64 %attn.value.heads.wide, %attn.head.width.wide %attn.value.plane.wide = mul i64 %attn.value.channels.wide, %attn.length.wide %attn.kv.planes.wide = add i64 %attn.kv.plane.wide, %attn.value.plane.wide %attn.value.plane.base.wide = add i64 %attn.from.wide, %attn.kv.plane.wide
 %attn.index.query.channels.wide = mul i64 %attn.index.heads.wide, %attn.index.width.wide %attn.index.channels.wide = add i64 %attn.index.query.channels.wide, %attn.index.width.wide %attn.index.plane.wide = mul i64 %attn.index.channels.wide, %attn.length.wide %attn.gate.plane.wide = select i1 %gate, i64 %attn.from.wide, i64 0
 %attn.index.query.base.wide = add i64 %attn.from.wide, %attn.kv.planes.wide %attn.gate.base.wide = add i64 %attn.index.query.base.wide, 0 %attn.row.stride.wide = add i64 %attn.gate.base.wide, %attn.gate.plane.wide
 %attn.blocks.wide = zext i32 %blocks to i64 %attn.score.stride.wide = mul i64 %attn.blocks.wide, 2 %attn.head.jobs.wide = mul i64 %attn.rows.wide, %attn.heads.wide %attn.statistics.rows.wide = mul i64 %attn.head.jobs.wide, %attn.length.wide %attn.representative.base.wide = mul i64 %attn.statistics.rows.wide, 2 %attn.representative.stride.wide = mul i64 %attn.blocks.wide, %attn.index.width.wide %attn.representative.total.wide = mul i64 %attn.representative.stride.wide, %attn.rows.wide %attn.score.base.wide = add i64 %attn.representative.base.wide, %attn.representative.total.wide %attn.score.row.stride.wide = mul i64 %attn.length.wide, %attn.score.stride.wide
@@ -4713,6 +4713,7 @@ dq.job.prepare:
 %dq.query.last = add i32 %dq.query.base, %dq.query.count
 %dq.head.start = mul i32 %dq.head, %head.width %dq.head.wide = zext i32 %dq.head to i64 %dq.head.start.wide = mul i64 %dq.head.wide, %attn.head.width.wide
 %dq.kv.head = udiv i32 %dq.head, %kv.group %dq.kv.head.wide = zext i32 %dq.kv.head to i64 %dq.kv.head.start = mul i32 %dq.kv.head, %head.width %dq.kv.head.start.wide = mul i64 %dq.kv.head.wide, %attn.head.width.wide
+%dq.value.head = udiv i32 %dq.head, %value.group %dq.value.head.start = mul i32 %dq.value.head, %head.width
 %dq.input.row = mul i32 %dq.row, %row.stride %dq.input.row.wide = mul i64 %dq.row.wide, %attn.row.stride.wide
 %dq.output.row = mul i32 %dq.row, %from %dq.output.row.wide = mul i64 %dq.row.wide, %attn.from.wide
 %dq.score.row = mul i32 %dq.row, %score.row.stride %dq.score.row.wide = mul i64 %dq.row.wide, %attn.score.row.stride.wide
@@ -4852,7 +4853,10 @@ dq.key.stage.step:
 %dq.key.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dq.key.shared.index
 store double %dq.key.value, ptr addrspace(3) %dq.key.shared.ptr, align 8
 %dq.value.row = add i32 %dq.input.row, %value.plane.base
-%dq.value.input.index = add i32 %dq.value.row, %dq.key.input.local
+%dq.value.channel = add i32 %dq.value.head.start, %dq.key.channel.local
+%dq.value.channel.base = mul i32 %dq.value.channel, %length
+%dq.value.input.local = add i32 %dq.value.channel.base, %dq.key.position
+%dq.value.input.index = add i32 %dq.value.row, %dq.value.input.local
 %dq.value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %dq.value.input.index
 %dq.value.value = load double, ptr addrspace(1) %dq.value.input.ptr, align 8
 %dq.value.shared.index = add i32 %dq.value.base.shared, %dq.key.p
@@ -4945,7 +4949,8 @@ dq.job.finish:
 %dq.job.next = add i32 %dq.job, %groups
 br label %dq.job.loop
 dq.exit:
-%dkv.head.jobs = mul i32 %rows, %kv.heads
+%dkv.total.heads = add i32 %kv.heads, %value.heads
+%dkv.head.jobs = mul i32 %rows, %dkv.total.heads
 %dkv.jobs = mul i32 %dkv.head.jobs, %key.tiles
 %dkv.value.base.shared = add i32 0, %key.values
 %dkv.key.gradient.base.shared = add i32 %dkv.value.base.shared, %key.values
@@ -4963,13 +4968,19 @@ br i1 %dkv.job.more, label %dkv.job.prepare, label %exit
 dkv.job.prepare:
 %dkv.key.tile = urem i32 %dkv.job, %key.tiles
 %dkv.kv.job = udiv i32 %dkv.job, %key.tiles
-%dkv.kv.head = urem i32 %dkv.kv.job, %kv.heads
-%dkv.row = udiv i32 %dkv.kv.job, %kv.heads
+; Key jobs own one key head and its query group; value jobs own one value head and its query group.
+%dkv.fixed.head = urem i32 %dkv.kv.job, %dkv.total.heads
+%dkv.row = udiv i32 %dkv.kv.job, %dkv.total.heads
+%dkv.is.key = icmp ult i32 %dkv.fixed.head, %kv.heads
+%dkv.fixed.value.head.raw = sub i32 %dkv.fixed.head, %kv.heads
+%dkv.fixed.value.head = select i1 %dkv.is.key, i32 0, i32 %dkv.fixed.value.head.raw
+%dkv.kv.head = select i1 %dkv.is.key, i32 %dkv.fixed.head, i32 0
 %dkv.key.base = mul i32 %dkv.key.tile, %tile.n
 %dkv.key.remaining = sub i32 %length, %dkv.key.base
 %dkv.key.short = icmp ult i32 %dkv.key.remaining, %tile.n
 %dkv.key.count = select i1 %dkv.key.short, i32 %dkv.key.remaining, i32 %tile.n
 %dkv.kv.head.start = mul i32 %dkv.kv.head, %head.width
+%dkv.store.value.head.start = mul i32 %dkv.fixed.value.head, %head.width
 %dkv.input.row = mul i32 %dkv.row, %row.stride
 %dkv.output.row = mul i32 %dkv.row, %from
 %dkv.score.row = mul i32 %dkv.row, %score.row.stride
@@ -4977,17 +4988,53 @@ dkv.job.prepare:
 %dkv.score.row.base = zext i32 %dkv.score.row.base.narrow to i64
 %dkv.active.key.values = mul i32 %dkv.key.count, %head.width
 %dkv.head.row = mul i32 %dkv.row, %heads
-%dkv.head.base = mul i32 %dkv.kv.head, %kv.group
+%dkv.head.base.key = mul i32 %dkv.fixed.head, %kv.group
+%dkv.head.base.value = mul i32 %dkv.fixed.value.head, %value.group
+%dkv.head.base = select i1 %dkv.is.key, i32 %dkv.head.base.key, i32 %dkv.head.base.value
+%dkv.head.count = select i1 %dkv.is.key, i32 %kv.group, i32 %value.group
+br label %dkv.zero.loop
+dkv.zero.loop:
+%dkv.zero.p = phi i32 [ %lid, %dkv.job.prepare ], [ %dkv.zero.p.next, %dkv.zero.step ]
+%dkv.zero.p.more = icmp ult i32 %dkv.zero.p, %dkv.active.key.values
+br i1 %dkv.zero.p.more, label %dkv.zero.step, label %dkv.zero.done
+dkv.zero.step:
+%dkv.key.gradient.index = add i32 %dkv.key.gradient.base.shared, %dkv.zero.p
+%dkv.key.gradient.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.key.gradient.index
+store double 0.0, ptr addrspace(3) %dkv.key.gradient.ptr, align 8
+%dkv.value.gradient.index = add i32 %dkv.value.gradient.base.shared, %dkv.zero.p
+%dkv.value.gradient.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.value.gradient.index
+store double 0.0, ptr addrspace(3) %dkv.value.gradient.ptr, align 8
+%dkv.zero.p.next = add i32 %dkv.zero.p, %block
+br label %dkv.zero.loop
+dkv.zero.done:
+call void @recipe.local.barrier()
+br label %dkv.head.loop
+dkv.head.loop:
+%dkv.head.slot = phi i32 [ 0, %dkv.zero.done ], [ %dkv.head.slot.next, %dkv.head.step ]
+%dkv.head.more = icmp ult i32 %dkv.head.slot, %dkv.head.count
+br i1 %dkv.head.more, label %dkv.head.prepare, label %dkv.store.begin
+dkv.head.prepare:
+%dkv.head = add i32 %dkv.head.base, %dkv.head.slot
+%dkv.head.start = mul i32 %dkv.head, %head.width
+%dkv.head.job = add i32 %dkv.head.row, %dkv.head
+; The tiles restage per query head: a key job reads that head's value head, a value job that head's key head.
+%dkv.head.key.head.query = udiv i32 %dkv.head, %kv.group
+%dkv.head.value.head.query = udiv i32 %dkv.head, %value.group
+%dkv.head.key.head = select i1 %dkv.is.key, i32 %dkv.fixed.head, i32 %dkv.head.key.head.query
+%dkv.head.value.head = select i1 %dkv.is.key, i32 %dkv.head.value.head.query, i32 %dkv.fixed.value.head
+%dkv.head.key.start = mul i32 %dkv.head.key.head, %head.width
+%dkv.head.value.start = mul i32 %dkv.head.value.head, %head.width
+call void @recipe.local.barrier()
 br label %dkv.key.stage.loop
 dkv.key.stage.loop:
-%dkv.key.p = phi i32 [ %lid, %dkv.job.prepare ], [ %dkv.key.p.next, %dkv.key.stage.step ]
+%dkv.key.p = phi i32 [ %lid, %dkv.head.prepare ], [ %dkv.key.p.next, %dkv.key.stage.step ]
 %dkv.key.p.more = icmp ult i32 %dkv.key.p, %dkv.active.key.values
 br i1 %dkv.key.p.more, label %dkv.key.stage.step, label %dkv.key.stage.done
 dkv.key.stage.step:
 %dkv.key.local = udiv i32 %dkv.key.p, %head.width
 %dkv.channel.local = urem i32 %dkv.key.p, %head.width
 %dkv.key.position = add i32 %dkv.key.base, %dkv.key.local
-%dkv.channel = add i32 %dkv.kv.head.start, %dkv.channel.local
+%dkv.channel = add i32 %dkv.head.key.start, %dkv.channel.local
 %dkv.channel.base = mul i32 %dkv.channel, %length
 %dkv.local = add i32 %dkv.channel.base, %dkv.key.position
 %dkv.key.plane = add i32 %dkv.input.row, %from
@@ -4996,37 +5043,25 @@ dkv.key.stage.step:
 %dkv.key.value = load double, ptr addrspace(1) %dkv.key.input.ptr, align 8
 %dkv.key.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.key.p
 store double %dkv.key.value, ptr addrspace(3) %dkv.key.shared.ptr, align 8
+%dkv.value.channel = add i32 %dkv.head.value.start, %dkv.channel.local
+%dkv.value.channel.base = mul i32 %dkv.value.channel, %length
+%dkv.value.local = add i32 %dkv.value.channel.base, %dkv.key.position
 %dkv.value.row = add i32 %dkv.input.row, %value.plane.base
-%dkv.value.input.index = add i32 %dkv.value.row, %dkv.local
+%dkv.value.input.index = add i32 %dkv.value.row, %dkv.value.local
 %dkv.value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %dkv.value.input.index
 %dkv.value.value = load double, ptr addrspace(1) %dkv.value.input.ptr, align 8
 %dkv.value.shared.index = add i32 %dkv.value.base.shared, %dkv.key.p
 %dkv.value.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.value.shared.index
 store double %dkv.value.value, ptr addrspace(3) %dkv.value.shared.ptr, align 8
-%dkv.key.gradient.index = add i32 %dkv.key.gradient.base.shared, %dkv.key.p
-%dkv.key.gradient.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.key.gradient.index
-store double 0.0, ptr addrspace(3) %dkv.key.gradient.ptr, align 8
-%dkv.value.gradient.index = add i32 %dkv.value.gradient.base.shared, %dkv.key.p
-%dkv.value.gradient.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.value.gradient.index
-store double 0.0, ptr addrspace(3) %dkv.value.gradient.ptr, align 8
 %dkv.key.p.next = add i32 %dkv.key.p, %block
 br label %dkv.key.stage.loop
 dkv.key.stage.done:
 call void @recipe.local.barrier()
 br label %dkv.key.norm.done
 dkv.key.norm.done:
-br label %dkv.head.loop
-dkv.head.loop:
-%dkv.head.slot = phi i32 [ 0, %dkv.key.norm.done ], [ %dkv.head.slot.next, %dkv.head.step ]
-%dkv.head.more = icmp ult i32 %dkv.head.slot, %kv.group
-br i1 %dkv.head.more, label %dkv.head.prepare, label %dkv.store.begin
-dkv.head.prepare:
-%dkv.head = add i32 %dkv.head.base, %dkv.head.slot
-%dkv.head.start = mul i32 %dkv.head, %head.width
-%dkv.head.job = add i32 %dkv.head.row, %dkv.head
 br label %dkv.query.tile.loop
 dkv.query.tile.loop:
-%dkv.query.base = phi i32 [ %dkv.key.base, %dkv.head.prepare ], [ %dkv.query.next, %dkv.query.advance ]
+%dkv.query.base = phi i32 [ %dkv.key.base, %dkv.key.norm.done ], [ %dkv.query.next, %dkv.query.advance ]
 %dkv.query.more = icmp ult i32 %dkv.query.base, %length
 br i1 %dkv.query.more, label %dkv.query.tile.prepare, label %dkv.head.step
 dkv.query.tile.prepare:
@@ -5199,13 +5234,15 @@ br label %dkv.adjoint.done
 dkv.adjoint.done:
 br label %dkv.store.loop
 dkv.store.loop:
-%dkv.store.p = phi i32 [ %lid, %dkv.adjoint.done ], [ %dkv.store.p.next, %dkv.store.step ]
+%dkv.store.p = phi i32 [ %lid, %dkv.adjoint.done ], [ %dkv.store.p.next, %dkv.store.next ]
 %dkv.store.p.more = icmp ult i32 %dkv.store.p, %dkv.active.key.values
 br i1 %dkv.store.p.more, label %dkv.store.step, label %dkv.store.done
 dkv.store.step:
 %dkv.store.key.local = udiv i32 %dkv.store.p, %head.width
 %dkv.store.channel.local = urem i32 %dkv.store.p, %head.width
 %dkv.store.key = add i32 %dkv.key.base, %dkv.store.key.local
+br i1 %dkv.is.key, label %dkv.store.key.step, label %dkv.store.value.step
+dkv.store.key.step:
 %dkv.store.channel = add i32 %dkv.kv.head.start, %dkv.store.channel.local
 %dkv.store.channel.base = mul i32 %dkv.store.channel, %length
 %dkv.store.local = add i32 %dkv.store.channel.base, %dkv.store.key
@@ -5216,13 +5253,20 @@ dkv.store.step:
 %dkv.store.key.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.store.key.shared.index
 %dkv.store.key.value = load double, ptr addrspace(3) %dkv.store.key.shared.ptr, align 8
 store double %dkv.store.key.value, ptr addrspace(1) %dkv.store.key.ptr, align 8
+br label %dkv.store.next
+dkv.store.value.step:
+%dkv.store.value.channel = add i32 %dkv.store.value.head.start, %dkv.store.channel.local
+%dkv.store.value.channel.base = mul i32 %dkv.store.value.channel, %length
+%dkv.store.value.local = add i32 %dkv.store.value.channel.base, %dkv.store.key
 %dkv.store.value.row = add i32 %dkv.input.row, %value.plane.base
-%dkv.store.value.index = add i32 %dkv.store.value.row, %dkv.store.local
+%dkv.store.value.index = add i32 %dkv.store.value.row, %dkv.store.value.local
 %dkv.store.value.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %dkv.store.value.index
 %dkv.store.value.shared.index = add i32 %dkv.value.gradient.base.shared, %dkv.store.p
 %dkv.store.value.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dkv.store.value.shared.index
 %dkv.store.value.value = load double, ptr addrspace(3) %dkv.store.value.shared.ptr, align 8
 store double %dkv.store.value.value, ptr addrspace(1) %dkv.store.value.ptr, align 8
+br label %dkv.store.next
+dkv.store.next:
 %dkv.store.p.next = add i32 %dkv.store.p, %block
 br label %dkv.store.loop
 dkv.store.done:
