@@ -15077,11 +15077,12 @@ impl Gpu {
 			.max()
 			.unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
-		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
+		let inference = loss.is_none();
+		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile, inference)?;
 		let attention_shared_values = attention
 			.iter()
 			.enumerate()
-			.filter_map(|(index, extent)| extent.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length)))
+			.filter_map(|(index, extent)| extent.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length, inference)))
 			.collect::<Result<Vec<_>>>()?
 			.into_iter()
 			.max()
@@ -17497,7 +17498,7 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 		})
 		.collect()
 }
-fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
+fn native_attention_shared_values(extent: Tile, full: bool, inference: bool) -> Result<u32> {
 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
 	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
 	let pairs = extent.m.checked_mul(extent.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
@@ -17519,6 +17520,11 @@ fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
 	let matrix_pairs = extent.m.checked_mul(extent.m);
 	let matrix =
 		queries.checked_mul(4).and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(extent.m));
+	if inference {
+		return forward
+			.and_then(|forward| matrix.map(|matrix| forward.max(if full { matrix } else { 0 })))
+			.ok_or_else(|| RecipeError::new("native attention shared values overflow"));
+	}
 	forward
 		.zip(query_gradient)
 		.zip(key_value_gradient)
@@ -17526,7 +17532,7 @@ fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
 		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
 		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
 }
-fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32) -> Result<Tile> {
+fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32, inference: bool) -> Result<Tile> {
 	require(length != 0 && width != 0 && shared_values != 0 && query_tile != 0, "native attention tile inputs are empty")?;
 	let mut queries = length.min(query_tile);
 	loop {
@@ -17542,9 +17548,13 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 		let key_value_gradient_fixed = query_values.checked_mul(2).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let key_value_gradient_per_key =
 			width.checked_mul(4).and_then(|values| queries.checked_mul(2).and_then(|queries| values.checked_add(queries))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
-		let keys = (shared_values.saturating_sub(forward_fixed) / forward_per_key)
-			.min(shared_values.saturating_sub(query_gradient_fixed) / query_gradient_per_key)
-			.min(shared_values.saturating_sub(key_value_gradient_fixed) / key_value_gradient_per_key);
+		let keys = if inference {
+			shared_values.saturating_sub(forward_fixed) / forward_per_key
+		} else {
+			(shared_values.saturating_sub(forward_fixed) / forward_per_key)
+				.min(shared_values.saturating_sub(query_gradient_fixed) / query_gradient_per_key)
+				.min(shared_values.saturating_sub(key_value_gradient_fixed) / key_value_gradient_per_key)
+		};
 		let pairs = queries.checked_mul(queries).ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
 		let matrix = query_values
 			.checked_mul(4)
@@ -17557,7 +17567,7 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 		queries = queries.checked_sub(1).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("native attention tile does not fit the device"))?;
 	}
 }
-fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32) -> Result<Vec<Option<Tile>>> {
+fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32, inference: bool) -> Result<Vec<Option<Tile>>> {
 	graph.nodes
 		.iter()
 		.map(|node| {
@@ -17568,7 +17578,7 @@ fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32) ->
 			let channels = narrow(node.output.channels, "native attention channels")? as u32;
 			let length = narrow(node.output.length, "native attention length")? as u32;
 			require(channels % heads == 0, "native attention head partition is invalid")?;
-			native_attention_tile(length, channels / heads, shared_values, query_tile).map(Some)
+			native_attention_tile(length, channels / heads, shared_values, query_tile, inference).map(Some)
 		})
 		.collect()
 }
