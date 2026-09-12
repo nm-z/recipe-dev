@@ -3852,13 +3852,24 @@ impl NativeModelIr {
 		let plane = length * heads;
 		let rows = format!("%{prefix}.rows.wide");
 		let threads = format!("%{prefix}.threads.wide");
-		ir.push_str(&format!("{rows} = zext i32 %rows to i64\n{threads} = zext i32 %threads to i64\n",));
+		let wave_width = format!("%{prefix}.wave.width");
+		let wave_width_wide = format!("%{prefix}.wave.width.wide");
+		let wave_lane = format!("%{prefix}.wave.lane");
+		let wave_id = format!("%{prefix}.wave.id");
+		let wave_count = format!("%{prefix}.wave.count");
+		let wave_width_half = format!("%{prefix}.wave.width.half");
+		ir.push_str(&format!("%{prefix}.tid.wide = zext i32 %tid to i64\n{rows} = zext i32 %rows to i64\n{threads} = zext i32 %threads to i64\n",));
+		let per_row = mode.per_row();
+		let items = if per_row { width.to_string() } else { items };
 		match mode {
 			program_ir::NormalizeMode::Batch => {
-				ir.push_str(&format!("{items} = mul i64 {rows}, {length}\n", length = length));
+				ir.push_str(&format!("{items} = mul i64 {rows}, {length}\n", items = items, length = length));
+			}
+			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 if !per_row => {
+				ir.push_str(&format!("{groups} = mul i64 {rows}, {plane}\n{items} = add i64 0, {width}\n"));
 			}
 			program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
-				ir.push_str(&format!("{groups} = mul i64 {rows}, {plane}\n{items} = add i64 0, {width}\n"));
+				ir.push_str(&format!("{groups} = mul i64 {rows}, {plane}\n"));
 			}
 			program_ir::NormalizeMode::Evaluation => return Ok(ir),
 		}
@@ -3868,9 +3879,9 @@ impl NativeModelIr {
 			program_ir::NormalizeMode::Evaluation => unreachable!(),
 		};
 		let group = format!("%{prefix}.group");
+		let counter = format!("%{prefix}.group.counter");
 		let mean_entry = if mode.per_row() { format!("%{prefix}.group.body") } else { format!("%{prefix}.group.loop") };
 		let (group_loop, group_next) = if mode.per_row() {
-			let counter = format!("%{prefix}.group.counter");
 			let begin = format!("%{prefix}.window.begin");
 			let span = format!("%{prefix}.window.span");
 			let window_groups = format!("%{prefix}.window.groups");
@@ -3883,17 +3894,8 @@ impl NativeModelIr {
 				rows = rows,
 			));
 			(
-				format!(
-					"{counter} = phi i64 [ %{prefix}.tid.wide, %{prefix}.entry ], [ {counter}.next, %{prefix}.store ]\n%{prefix}.group.more = icmp ult i64 {counter}, {window_count}\nbr i1 %{prefix}.group.more, label %{prefix}.group.body, label %{prefix}.done\n{prefix}.group.body:\n%{prefix}.group.row = udiv i64 {counter}, {window_groups}\n%{prefix}.group.local = urem i64 {counter}, {window_groups}\n%{prefix}.group.head = udiv i64 %{prefix}.group.local, {span}\n%{prefix}.group.position = urem i64 %{prefix}.group.local, {span}\n%{prefix}.group.row.base = mul i64 %{prefix}.group.row, {plane}\n%{prefix}.group.head.base = mul i64 %{prefix}.group.head, {length}\n%{prefix}.group.position.begin = add i64 {begin}, %{prefix}.group.position\n%{prefix}.group.offset = add i64 %{prefix}.group.row.base, %{prefix}.group.head.base\n{group} = add i64 %{prefix}.group.offset, %{prefix}.group.position.begin\nbr label %{prefix}.mean.loop\n",
-					counter = counter,
-					window_count = window_count,
-					window_groups = window_groups,
-					begin = begin,
-					plane = plane,
-					span = span,
-					length = length,
-				),
-				format!("{counter}.next = add i64 {counter}, {threads}\nbr label %{prefix}.group.loop\n", counter = counter, threads = threads),
+				format!("{counter} = phi i64 [ {wave_id}, %{prefix}.entry ], [ {counter}.next, %{prefix}.group.advance ]\n%{prefix}.group.more = icmp ult i64 {counter}, {window_count}\nbr i1 %{prefix}.group.more, label %{prefix}.group.body, label %{prefix}.done\n{prefix}.group.body:\n%{prefix}.group.row = udiv i64 {counter}, {window_groups}\n%{prefix}.group.local = urem i64 {counter}, {window_groups}\n%{prefix}.group.head = udiv i64 %{prefix}.group.local, {span}\n%{prefix}.group.position = urem i64 %{prefix}.group.local, {span}\n%{prefix}.group.row.base = mul i64 %{prefix}.group.row, {plane}\n%{prefix}.group.head.base = mul i64 %{prefix}.group.head, {length}\n%{prefix}.group.position.begin = add i64 {begin}, %{prefix}.group.position\n%{prefix}.group.offset = add i64 %{prefix}.group.row.base, %{prefix}.group.head.base\n{group} = add i64 %{prefix}.group.offset, %{prefix}.group.position.begin\nbr label %{prefix}.mean.loop\n", counter = counter, wave_id = wave_id, window_count = window_count, window_groups = window_groups, begin = begin, plane = plane, span = span, length = length),
+				format!("{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n", counter = counter, wave_count = wave_count),
 			)
 		} else {
 			(
@@ -3901,6 +3903,9 @@ impl NativeModelIr {
 				format!("%{prefix}.group.next = add i64 {group}, {threads}\nbr label %{prefix}.group.loop\n", group = group, threads = threads),
 			)
 		};
+		if per_row {
+			ir.push_str(&format!("{wave_width} = call i32 @recipe.wavefront.width()\n{wave_width_wide} = zext i32 {wave_width} to i64\n{wave_width_half} = udiv i64 {wave_width_wide}, 2\n{wave_lane} = urem i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_id} = udiv i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_count} = udiv i64 {threads}, {wave_width_wide}\n"));
+		}
 		let emit_index = |code: &mut String, phase: &str, p: &str| {
 			let row = format!("%{prefix}.{phase}.row");
 			let position = format!("%{prefix}.{phase}.position");
@@ -3922,27 +3927,115 @@ impl NativeModelIr {
 				program_ir::NormalizeMode::Evaluation => unreachable!(),
 			}
 		};
-		ir.push_str(&format!("%{prefix}.tid.wide = zext i32 %tid to i64\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ 0, {mean_entry} ], [ %{prefix}.mean.next, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {ty} [ {zero}, {mean_entry} ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label %{prefix}.variance.loop\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, ty = state_ty, zero = zero, items = items));
-		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n%{prefix}.mean.next = add i64 %{prefix}.mean.p, 1\nbr label %{prefix}.mean.loop\n{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ 0, %{prefix}.mean.loop ], [ %{prefix}.variance.next, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, %{prefix}.mean.loop ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n%{prefix}.items.value = uitofp i64 {items} to {state_ty}\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label %{prefix}.store\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty)));
-		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
-		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, align = alignment(ty)));
+		let mean_start = if mode.per_row() { wave_lane.clone() } else { "0".to_owned() };
+		let item_step = if mode.per_row() { wave_width_wide.clone() } else { "1".to_owned() };
+		let mean_exit = if mode.per_row() { format!("%{prefix}.mean.reduce.loop") } else { format!("%{prefix}.variance.loop") };
+		let variance_start = if mode.per_row() { wave_lane.clone() } else { "0".to_owned() };
+		let variance_exit = if mode.per_row() { format!("%{prefix}.variance.reduce.loop") } else { format!("%{prefix}.store") };
+		let variance_entry = if mode.per_row() { format!("%{prefix}.mean.reduce.done") } else { format!("%{prefix}.mean.loop") };
 		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
+		let mean_broadcast = format!("%{prefix}.mean.broadcast");
+		let wave_reduce = |phase: &str, source: &str, done_target: &str, tail: &str| {
+			let (offset, reduced, partner, partner_lane, partner_index, partner_index_i32) = (
+				format!("%{prefix}.{phase}.reduce.offset"),
+				format!("%{prefix}.{phase}.reduced"),
+				format!("%{prefix}.{phase}.partner"),
+				format!("%{prefix}.{phase}.partner.lane"),
+				format!("%{prefix}.{phase}.partner.index"),
+				format!("%{prefix}.{phase}.partner.index.i32"),
+			);
+			let done_code = if done_target.starts_with('%') && done_target.ends_with("reduce.done") { format!("{prefix}.{phase}.reduce.done:\n{tail}") } else { tail.to_owned() };
+			format!("{prefix}.{phase}.reduce.loop:\n{offset} = phi i64 [ {wave_width_half}, %{prefix}.{phase}.loop ], [ {offset}.next, %{prefix}.{phase}.reduce.step ]\n{reduced} = phi {state_ty} [ {source}, %{prefix}.{phase}.loop ], [ {reduced}.next, %{prefix}.{phase}.reduce.step ]\n%{prefix}.{phase}.reduce.more = icmp ugt i64 {offset}, 0\nbr i1 %{prefix}.{phase}.reduce.more, label %{prefix}.{phase}.reduce.step, label {done_target}\n{prefix}.{phase}.reduce.step:\n{partner_lane} = xor i64 {wave_lane}, {offset}\n{partner_index} = mul i64 {partner_lane}, 4\n{partner_index_i32} = trunc i64 {partner_index} to i32\n{partner} = call {state_ty} @recipe.wave.partner({state_ty} {reduced}, i32 {partner_index_i32})\n{reduced}.next = call {state_ty} @recipe.state.add({state_ty} {reduced}, {state_ty} {partner})\n{offset}.next = udiv i64 {offset}, 2\nbr label %{prefix}.{phase}.reduce.loop\n{done_code}")
+		};
+		let mean_reduce_code = if mode.per_row() {
+			let tail = format!("{mean_broadcast} = call {state_ty} @recipe.wave.partner({state_ty} %{prefix}.mean.reduced, i32 0)\nbr label %{prefix}.variance.loop\n");
+			wave_reduce("mean", &format!("%{prefix}.mean.sum"), &format!("%{prefix}.mean.reduce.done"), &tail)
+		} else {
+			String::new()
+		};
+		let mean_total = if mode.per_row() { mean_broadcast.clone() } else { format!("%{prefix}.mean.sum") };
+		let mean_code = if zero_mean {
+			String::new()
+		} else {
+			format!("%{prefix}.items.value = uitofp i64 {items} to {state_ty}\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} {mean_total}, {state_ty} %{prefix}.items.value)\n")
+		};
+		let centered_mean = if mode.per_row() { mean_broadcast.clone() } else { format!("%{prefix}.mean") };
+		let mean_next = if per_row { format!("%{prefix}.mean.p.next") } else { format!("%{prefix}.mean.next") };
+		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
+		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {state_ty} [ {zero}, {mean_entry} ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, state_ty = state_ty, zero = zero, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
+		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
+		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, {variance_entry} ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
+		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
+		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} {centered_mean})\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_mean = centered_mean, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
+		let variance_total = if mode.per_row() { format!("%{prefix}.variance.reduced") } else { format!("%{prefix}.variance.sum") };
+		let variance_items = if mode.per_row() { native_literal(self.precision.state, state_ty, width as f64) } else { format!("%{prefix}.items.value") };
+		let variance_reduce_code = if mode.per_row() {
+			let tail = String::new();
+			wave_reduce("variance", &format!("%{prefix}.variance.sum"), &format!("%{prefix}.store"), &tail)
+		} else {
+			String::new()
+		};
 		// L2 divides by the norm itself, floored at epsilon, instead of the root of
 		// the epsilon-shifted mean square.
 		let scale_code = if mode == program_ir::NormalizeMode::L2 {
 			format!(
-				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.variance.sum)\n%{prefix}.floored = call i1 @recipe.state.ogt({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n"
+				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt({state_ty} {variance_total})\n%{prefix}.floored = call i1 @recipe.state.ogt({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n",
+				variance_total = variance_total,
 			)
 		} else {
 			format!(
-				"%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n"
+				"%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} {variance_total}, {state_ty} {variance_items})\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n",
+				variance_total = variance_total,
+				variance_items = variance_items,
 			)
 		};
-		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i64 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, one = one, group = group, group_limit = group_limit));
-		let stored_mean = if zero_mean { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
-		ir.push_str(&format!("store {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}{prefix}.done:\n", pointer = pointer, ty = ty, stored_mean = stored_mean, align = alignment(ty), group_next = group_next));
+		ir.push_str(&format!(
+			"%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			prefix = prefix,
+			state_ty = state_ty,
+			difference = difference,
+			item_step = item_step,
+			variance_next = variance_next,
+		));
+		let stored_mean = if zero_mean { model_zero } else { format!("%{prefix}.mean.stored") };
+		let store_code = if mode.per_row() {
+			format!(
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
+				variance_reduce_code = variance_reduce_code,
+				scale_code = scale_code,
+				state_ty = state_ty,
+				one = one,
+				ty = ty,
+				pointer = pointer,
+				context = pointers.context,
+				group = group,
+				group_limit = groups,
+				wave_lane = wave_lane,
+				stored_mean = stored_mean,
+				align = alignment(ty),
+				counter = counter,
+				wave_count = wave_count,
+			)
+		} else {
+			format!(
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
+				variance_reduce_code = variance_reduce_code,
+				scale_code = scale_code,
+				state_ty = state_ty,
+				one = one,
+				ty = ty,
+				pointer = pointer,
+				context = pointers.context,
+				group = group,
+				group_limit = group_limit,
+				stored_mean = stored_mean,
+				align = alignment(ty),
+				group_next = group_next,
+			)
+		};
+		ir.push_str(&store_code);
+		ir.push_str(&format!("{prefix}.done:\n"));
 		Ok(ir)
 	}
 
