@@ -983,7 +983,8 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)
 %sin.term = select i1 %upper, double %sin.signed, double %sin.signed.negative
 %cos.part = call double @recipe.mul(double %value, double %cos) %sin.part = call double @recipe.mul(double %other, double %sin.term)
-%rotated.value = call double @recipe.add(double %cos.part, double %sin.part) br label %finish finish:
+%rotated.raw = call double @recipe.add(double %cos.part, double %sin.part)
+%rotated.value = call double @recipe.mul(double %rotated.raw, double %yarn.mscale) br label %finish finish:
 %result = phi double [ %value, %entry ], [ %rotated.value, %rotate ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
 br i1 %reverse, label %accumulate, label %assign accumulate: %prior = load double, ptr addrspace(1) %output.ptr, align 8
