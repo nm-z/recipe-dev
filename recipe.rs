@@ -4171,11 +4171,10 @@ fn remote_native_artifact(target: &BackendTarget, bytes: &[u8]) -> Result<(PathB
 	#[cfg(unix)]
 	fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
 		.map_err(|error| RecipeError::new(format!("cannot secure remote native artifact directory {}: {error}", directory.display())))?;
-	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos());
 	let mut attempt = 0_u64;
 	let (path, mut file) = loop {
 		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
-		let path = directory.join(format!(".recipe-remote-native-{}-{timestamp:x}-{serial:x}-{attempt:x}.{}", std::process::id(), target.artifact_extension()));
+		let path = directory.join(format!(".recipe-remote-native-{}-{serial:x}-{attempt:x}.{}", std::process::id(), target.artifact_extension()));
 		let mut options = fs::OpenOptions::new();
 		options.write(true).create_new(true);
 		#[cfg(unix)]
@@ -5512,7 +5511,7 @@ use std::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
 		mpsc::{RecvTimeoutError, SyncSender, sync_channel},
 	},
-	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant},
 };
 pub static recipe: Recipe = Recipe;
 static RUN: AtomicU64 = AtomicU64::new(0);
@@ -17819,8 +17818,9 @@ impl Train {
 		let updates = std::thread::spawn(move || -> Result<bool> {
 			let mut row = false;
 			loop {
-				match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
-					Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				std::thread::sleep(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64));
+				match wait.try_recv() {
+					Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
 						if INTERRUPTED.load(Ordering::Acquire) && !row {
 							Self::write_progress(
 								&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }),
@@ -17830,7 +17830,7 @@ impl Train {
 						};
 						return Ok(row || INTERRUPTED.load(Ordering::Acquire));
 					}
-					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+					Err(std::sync::mpsc::TryRecvError::Empty) => {
 						let interrupted = INTERRUPTED.load(Ordering::Acquire);
 						Self::write_progress(
 							&Self::metric_line(loss, &topology, &metrics, epochs, &schedule, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }),
