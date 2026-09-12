@@ -7676,6 +7676,7 @@ fn graph_range(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		state: TrainingState::default(),
 		block_index: last.block_index,
 		block_kind: last.block_kind,
+		bias: graph.bias,
 	})
 }
 /// The peak device bytes for one inference tape. This includes the model,
