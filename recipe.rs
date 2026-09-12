@@ -10264,6 +10264,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 			while begin < reached {
 				let end = reached.min(begin.saturating_add(tape.program.tile.m.max(1)));
 				tape.forward_window(begin, end, ForwardMode::Inference)?;
+				debug(&format!("decode window {begin}..{end} of {reached}"))?;
 				begin = end;
 			}
 			let predictions = tape.predictions()?;
@@ -11064,9 +11065,9 @@ fn decode_steps(
 ) -> Result<Generation> {
 	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
 	let mut settled = 0;
+	let mut started = std::time::Instant::now();
 	for step in 0..=budget {
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let started = std::time::Instant::now();
 		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
@@ -11074,6 +11075,7 @@ fn decode_steps(
 		} else {
 			generation.step_seconds.push(seconds);
 		}
+		started = std::time::Instant::now();
 		settled = reached;
 		generation.logits = predictions;
 		if step == budget {
