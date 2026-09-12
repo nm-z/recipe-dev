@@ -5397,7 +5397,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
-		precision: Compute,
+		pub(super) precision: Compute,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
