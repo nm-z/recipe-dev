@@ -3949,24 +3949,28 @@ impl NativeModelIr {
 		for (index, plan) in self.plans.iter().enumerate() {
 			// A lookup's table decodes on the host, so the device needs no decoder for it.
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.node.op != Primitive::Lookup) else { continue };
-			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
-			let format = spec.codec.quantization();
-			let native = format.native;
-			if matches!(native, NativeDequant::Nf4) {
-				emitted.push_str(&self.emit_native_nf4(backend, index, stored)?);
-				continue;
-			}
-			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) {
-				continue;
-			}
-			if let Some(table) = native.table() {
-				if !tables.contains(&table.name()) {
-					emitted.push_str(&table.definition());
-					tables.push(table.name());
+			let segments = stored.format_segments();
+			for (segment, _) in &segments {
+				let spec = segment.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", segment.0)))?;
+				let format = spec.codec.quantization();
+				let native = format.native;
+				if matches!(native, NativeDequant::Nf4) {
+					require(segments.len() == 1, "mixed mapped weights cannot include NF4 spans")?;
+					emitted.push_str(&self.emit_native_nf4(backend, index, stored)?);
+					continue;
 				}
+				if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) {
+					continue;
+				}
+				if let Some(table) = native.table() {
+					if !tables.contains(&table.name()) {
+						emitted.push_str(&table.definition());
+						tables.push(table.name());
+					}
+				}
+				emitted.push_str(&self.emit_native_quantization(backend, format, native)?);
+				seen.push(spec.codec);
 			}
-			emitted.push_str(&self.emit_native_quantization(backend, format, native)?);
-			seen.push(spec.codec);
 		}
 		Ok(emitted)
 	}
@@ -3977,17 +3981,41 @@ impl NativeModelIr {
 		let (mut arms, mut bodies) = (String::new(), String::new());
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
-			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
-			let format = spec.codec.quantization();
-			let (name, block) = match format.native {
-				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
-				_ => (format.name.to_owned(), spec.block),
-			};
-			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
+			let segments = stored.format_segments();
+			let mut bytes = 0usize;
+			let mut elements = 0usize;
+			let mut descriptors = Vec::with_capacity(segments.len());
+			for (segment, count) in &segments {
+				let spec = segment.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", segment.0)))?;
+				let format = spec.codec.quantization();
+				let (name, block, stride) = match format.native {
+					NativeDequant::Nf4 => {
+						require(segments.len() == 1, "mixed mapped weights cannot include NF4 spans")?;
+						(format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0, 0)
+					}
+					_ => (format.name.to_owned(), spec.block, spec.stride),
+				};
+				let segment_bytes = if stride == 0 { stored.bytes.len() } else { count.div_ceil(block).checked_mul(stride).ok_or_else(|| RecipeError::new("native quantized segment size overflows"))? };
+				let columns = i32::try_from(count.div_ceil(block).checked_mul(block).ok_or_else(|| RecipeError::new("native quantized block count overflows"))?)
+					.map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
+				descriptors.push((name, *count, columns, bytes));
+				bytes = checked_add(bytes, segment_bytes, "native quantized segment bytes")?;
+				elements = checked_add(elements, *count, "native quantized segment elements")?;
+			}
+			require(bytes == stored.bytes.len(), format!("native quantized spans total {bytes} bytes, stored weight has {}", stored.bytes.len()))?;
+			require(elements == stored.count, format!("native quantized spans total {elements} values, stored weight has {}", stored.count))?;
 			arms.push_str(&format!("i32 {}, label %decode.n{index}\n", index + 1));
-			bodies.push_str(&format!(
-				"decode.n{index}:\n%decode.n{index}.value = call {ty} @recipe_model_quantized_{name}({pointer} %matrix, i64 0, i64 %index, i64 {columns})\nret {ty} %decode.n{index}.value\n"
-			));
+			bodies.push_str(&format!("decode.n{index}:\n"));
+			for (segment_index, (name, count, columns, byte_offset)) in descriptors.iter().enumerate() {
+				let prefix = format!("decode.n{index}.s{segment_index}");
+				let offset = segments[..segment_index].iter().map(|(_, count)| *count).sum::<usize>();
+				bodies.push_str(&format!("%{prefix}.index = sub i64 %index, {offset}\n%{prefix}.matrix = getelementptr i8, {pointer} %matrix, i64 {byte_offset}\n"));
+				if segment_index + 1 < descriptors.len() {
+					bodies.push_str(&format!("%{prefix}.take = icmp ult i64 %{prefix}.index, {count}\nbr i1 %{prefix}.take, label %{prefix}.decode, label %{prefix}.next\n{prefix}.decode:\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.matrix, i64 0, i64 %{prefix}.index, i64 {columns})\nret {ty} %{prefix}.value\n{prefix}.next:\n"));
+				} else {
+					bodies.push_str(&format!("%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.matrix, i64 0, i64 %{prefix}.index, i64 {columns})\nret {ty} %{prefix}.value\n"));
+				}
+			}
 		}
 		Ok(format!("define internal {ty} @recipe.model.decode({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"))
 	}
@@ -5531,7 +5559,8 @@ mod gguf {
 		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
 			let shard = &self.shards[tensor.shard];
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
-			Ok(StoredWeight { format: block_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+			let format = block_format(tensor)?;
+			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, tensor.elements())] })
 		}
 		/// The embedding table's native layout. F32 and F16 tables use the same
 		/// mapped gather path as block-quantized tables, with one raw value per
@@ -5539,14 +5568,14 @@ mod gguf {
 		fn embedding_stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
 			let shard = &self.shards[tensor.shard];
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
-			Ok(StoredWeight { format: embedding_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+			let format = embedding_format(tensor)?;
+			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, tensor.elements())] })
 		}
-		/// Resolves a plan against this file, one bound weight per entry. The views
-		/// of one entry must share a layout: block-quantized views join as runs of
-		/// their own mappings, so nothing is decoded or copied here, and views in
-		/// an unblocked layout, or values the host rewrote, decode into values,
-		/// and then every view of the entry decodes with them. Block-quantized
-		/// views whose layouts differ are rejected by name before anything compiles.
+		/// Resolves a plan against this file, one bound weight per entry. Block-
+		/// quantized views join as runs of their own mappings, so nothing is decoded
+		/// or copied here; when adjacent views use different layouts, the stored
+		/// weight retains one decoder segment for each layout. Views in an unblocked
+		/// layout, or values the host rewrote, decode into values instead.
 		pub(super) fn bound(&self, plan: &Binding) -> Result<Vec<BoundNode>> {
 			plan.nodes
 				.iter()
@@ -5555,12 +5584,6 @@ mod gguf {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
 					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
 					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
-					if let Some(views) = views.as_ref().filter(|_| packed)
-						&& let Some(other) = views.iter().find(|plane| plane.kind != views[0].kind)
-					{
-						let name = |kind| layout(kind).map_or("an unsupported type", |(name, _, _, _)| name);
-						return Err(RecipeError::new(format!("tensor {} is {} but tensor {} of the same node is {}", other.name, name(other.kind), views[0].name, name(views[0].kind))));
-					}
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
@@ -5577,8 +5600,16 @@ mod gguf {
 						Some(views) => {
 							let parts = views.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
 							let format = parts[0].format;
+							let mut segments = Vec::new();
+							for part in &parts {
+								if let Some((last, count)) = segments.last_mut() && *last == part.format {
+									*count = checked_add(*count, part.count, "plan tensor segment elements")?;
+								} else {
+									segments.push((part.format, part.count));
+								}
+							}
 							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
-							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments })
 						}
 						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
 							let tensor = match first {
@@ -6974,7 +7005,8 @@ mod bundle {
 
 	pub(super) fn raw_weight(values: &[f64]) -> StoredWeight {
 		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-		StoredWeight { format: StorageFormat(0), count: values.len(), bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec() }
+		let count = values.len();
+		StoredWeight { format: StorageFormat(0), count, bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec(), segments: vec![(StorageFormat(0), count)] }
 	}
 	fn semantic_graph(stored: &StoredGraph) -> Result<SemanticGraph> {
 		let graph = &stored.graph;
@@ -7137,7 +7169,8 @@ mod bundle {
 		} else {
 			StorageFormat(format).decompress(&bytes, &codebook, count)?
 		};
-		Ok(StoredWeight { format: StorageFormat(format), count, bytes: bytes.into(), codebook, arithmetic })
+		let format = StorageFormat(format);
+		Ok(StoredWeight { format, count, bytes: bytes.into(), codebook, arithmetic, segments: vec![(format, count)] })
 	}
 	pub(super) fn load_semantic(path: &Path) -> Result<(DataSchema, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
@@ -9197,6 +9230,8 @@ impl From<Vec<u8>> for StoredBytes {
 
 /// One node's parameters as they are stored. `arithmetic` is the host copy the
 /// graph trains and saves; a weight the device decodes from `bytes` carries none.
+/// `segments` preserves the original block format of every mapped plane in the
+/// byte order the node consumes.
 #[derive(Clone)]
 pub(crate) struct StoredWeight {
 	pub(crate) format: StorageFormat,
@@ -9204,6 +9239,18 @@ pub(crate) struct StoredWeight {
 	pub(crate) bytes: StoredBytes,
 	pub(crate) codebook: Vec<f64>,
 	pub(crate) arithmetic: Vec<f64>,
+	/// Consecutive quantized spans and their element counts. A mapped node can
+	/// keep one decoder format per span when its planes use mixed GGML layouts.
+	/// Every stored weight has at least one span.
+	pub(crate) segments: Vec<(StorageFormat, usize)>,
+}
+impl StoredWeight {
+	/// The formats and element counts in the order their bytes occupy `bytes`.
+	/// Older in-memory callers may leave this empty, so retain the single-span
+	/// representation as a compatibility fallback.
+	fn format_segments(&self) -> Vec<(StorageFormat, usize)> {
+		if self.segments.is_empty() { vec![(self.format, self.count)] } else { self.segments.clone() }
+	}
 }
 
 /// What one parameterized node of a graph compiled over mapped tensors is
@@ -9243,7 +9290,8 @@ impl StorageFormat {
 	}
 	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
 		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
-		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes: bytes.into(), codebook, arithmetic: arithmetic.to_vec() })
+		let count = arithmetic.len();
+		Ok(StoredWeight { format: self, count, bytes: bytes.into(), codebook, arithmetic: arithmetic.to_vec(), segments: vec![(self, count)] })
 	}
 	fn unavailable(self) -> RecipeError {
 		RecipeError::new(format!(
@@ -12805,7 +12853,8 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		if node.table() {
 			if graph.stored[position].is_none() {
 				let arithmetic = (0..node.weights()).map(|_| next_weight(&mut state, scale)).collect::<Vec<_>>();
-				graph.stored[position] = Some(StoredWeight { format: StorageFormat(0), count: arithmetic.len(), bytes: Vec::new().into(), codebook: Vec::new(), arithmetic });
+				let count = arithmetic.len();
+				graph.stored[position] = Some(StoredWeight { format: StorageFormat(0), count, bytes: Vec::new().into(), codebook: Vec::new(), arithmetic, segments: vec![(StorageFormat(0), count)] });
 			}
 			continue;
 		}
