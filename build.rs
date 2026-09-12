@@ -564,13 +564,6 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?;
 	Ok(value)
 }
-fn natural<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
-	let value = setting(manifest, key)?;
-	if value.parse::<usize>().map_err(|error| io::Error::other(format!("{key} must be an integer: {error}")))? == 0 {
-		return Err(io::Error::other(format!("{key} must be positive")).into());
-	}
-	Ok(value)
-}
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into())
 }
@@ -897,18 +890,6 @@ fn main() -> BuildResult<()> {
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
-	}
-	for (key, environment) in [
-		("runtime-connect-milliseconds", "RECIPE_RUNTIME_CONNECT_MILLISECONDS"),
-		("runtime-poll-milliseconds", "RECIPE_RUNTIME_POLL_MILLISECONDS"),
-		("runtime-idle-milliseconds", "RECIPE_RUNTIME_IDLE_MILLISECONDS"),
-		("runtime-frame-bytes", "RECIPE_RUNTIME_FRAME_BYTES"),
-		("runtime-stream-bytes", "RECIPE_RUNTIME_STREAM_BYTES"),
-	] {
-		println!("cargo:rustc-env={environment}={}", natural(&manifest, key)?);
-	}
-	for (key, environment) in [("runtime-controller", "RECIPE_RUNTIME_CONTROLLER"), ("runtime-devices", "RECIPE_RUNTIME_DEVICES")] {
-		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
 	let placement = setting(&manifest, "multi-device")?;
 	println!(

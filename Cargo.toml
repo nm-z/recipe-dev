@@ -16,13 +16,6 @@ path = "cli.rs"
 [package.metadata.recipe]
 dependency-allowlist = []
 multi-device = "auto"
-runtime-connect-milliseconds = 5000
-runtime-poll-milliseconds = 10
-runtime-idle-milliseconds = 1000
-runtime-frame-bytes = 67108864
-runtime-stream-bytes = 65536
-runtime-controller = "engi"
-runtime-devices = "engi:amd0,archy:nv0,archy:nv1,archy:nv2,archy:nv3,archy:nv4"
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
 contraction-register-n = 8
