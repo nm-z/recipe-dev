@@ -14966,14 +14966,15 @@ impl DeviceTape {
 	fn tile(&self) -> Tile {
 		self.shards[0].tile()
 	}
-	/// Measures the contraction schedule independently on every placed shard.
-	fn tune(&mut self, rate: f64, config: Config) -> Result<()> {
-		if config.schedule_candidates == 0 || config.schedule_budget == 0 {
+	/// Cap total tuning launches by the requested epoch count.
+	fn tune(&mut self, rate: f64, epochs: usize, config: Config) -> Result<()> {
+		let budget = config.schedule_budget.min(epochs);
+		if config.schedule_candidates == 0 || budget == 0 {
 			return Ok(());
 		}
 		let shard_count = self.shards.len();
-		let base = config.schedule_budget / shard_count;
-		let remainder = config.schedule_budget % shard_count;
+		let base = budget / shard_count;
+		let remainder = budget % shard_count;
 		for (index, shard) in self.shards.iter_mut().enumerate() {
 			let mut budget = base + usize::from(index < remainder);
 			debug(&format!("schedule budget device={} launches={budget}", shard.device_label()?))?;
@@ -21906,7 +21907,7 @@ impl Train {
 			None,
 		)?;
 		tape.print_devices(&stored.graph)?;
-		if let Err(error) = tape.tune(self.learning_rate, config) {
+		if let Err(error) = tape.tune(self.learning_rate, self.epochs, config) {
 			// An interrupt during pre-epoch tuning restores the measured state and
 			// follows the same one-checkpoint exit path as an interrupted real epoch.
 			let _ = self.finish_dispatch::<()>(Err(error), &mut stored, &prepared.schema, &tape, None)?;
