@@ -66,6 +66,10 @@ fn environment(name: &str) -> String {
 	std::env::var(name).unwrap_or_else(|_| panic!("{name} is absent"))
 }
 
+fn prediction_bits(values: &[f64]) -> Vec<u64> { values.iter().map(|value| value.to_bits()).collect() }
+
+fn nonzero_tile(extent: [u32; 3]) -> bool { extent.iter().all(|value| *value != 0) }
+
 fn worst_absolute(got: &[f64], want: &[f64]) -> f64 {
 	assert_eq!(got.len(), want.len(), "prediction count does not match the dataset");
 	got.iter().zip(want).map(|(left, right)| (left - right).abs()).fold(0.0_f64, f64::max)
@@ -130,11 +134,31 @@ fn main() {
 	let multi_worst = worst_absolute(&sorted(multi_trained.predictions().iter().copied()), &sorted(multi_targets()));
 	report.record("multi_feature_reduction", multi_worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={multi_worst:.9} rows={MULTI_ROWS} features={}", MULTI_WEIGHTS.len()));
 
-	// 4. The same seed must reproduce the same loss bits on the same backend.
+	// 4. The same seed must reproduce the report bits and tile on the same backend.
 	let first = recipe.train().seed(SEED).lr(RATE).epochs(120).fp(PRECISION_BITS).run(&model, &linear);
 	let second = recipe.train().seed(SEED).lr(RATE).epochs(120).fp(PRECISION_BITS).run(&model, &linear);
-	let identical = first.final_loss().to_bits() == second.final_loss().to_bits();
-	report.record("determinism", identical, format!("first_bits={:016x} second_bits={:016x}", first.final_loss().to_bits(), second.final_loss().to_bits()));
+	let first_tile = first.tile();
+	let second_tile = second.tile();
+	let predictions_identical = prediction_bits(first.predictions()) == prediction_bits(second.predictions());
+	let identical = first.initial_loss().to_bits() == second.initial_loss().to_bits()
+		&& first.final_loss().to_bits() == second.final_loss().to_bits()
+		&& predictions_identical
+		&& first_tile == second_tile
+		&& nonzero_tile(first_tile);
+	report.record(
+		"determinism",
+		identical,
+		format!(
+			"first_bits={:016x} second_bits={:016x} initial_bits={:016x}/{:016x} prediction_bits_equal={} tile={:?}/{:?}",
+			first.final_loss().to_bits(),
+			second.final_loss().to_bits(),
+			first.initial_loss().to_bits(),
+			second.initial_loss().to_bits(),
+			predictions_identical,
+			first_tile,
+			second_tile,
+		),
+	);
 
 	// 5. Persistence: a resumed run starts from the state training saved, and
 	//    inference reads the bundle without rewriting it.
@@ -142,7 +166,29 @@ fn main() {
 	assert!(!saved.is_empty(), "training saved an empty bundle");
 	let resumed = recipe.train().seed(SEED).lr(RATE).epochs(60).fp(PRECISION_BITS).resume(&bundle).save(&bundle).run(&model, &linear);
 	let resumed_bytes = std::fs::read(&bundle).expect("resume did not save a bundle");
-	report.record("persistence_resume", resumed.initial_loss().is_finite() && !resumed_bytes.is_empty(), format!("resume_initial_loss={:.9} bundle_bytes={}", resumed.initial_loss(), resumed_bytes.len()));
+	let trained_tile = trained.tile();
+	let resumed_tile = resumed.tile();
+	let resume_predictions_match = prediction_bits(resumed.initial_predictions()) == prediction_bits(trained.predictions());
+	let resume_matches = resumed.initial_loss().is_finite()
+		&& resumed.initial_loss().to_bits() == trained.final_loss().to_bits()
+		&& resume_predictions_match
+		&& !resumed_bytes.is_empty()
+		&& trained_tile == resumed_tile
+		&& nonzero_tile(trained_tile);
+	report.record(
+		"persistence_resume",
+		resume_matches,
+		format!(
+			"resume_initial_loss={:.9} bundle_bytes={} resume_initial_bits={:016x} trained_final_bits={:016x} prediction_bits_equal={} tile={:?}/{:?}",
+			resumed.initial_loss(),
+			resumed_bytes.len(),
+			resumed.initial_loss().to_bits(),
+			trained.final_loss().to_bits(),
+			resume_predictions_match,
+			trained_tile,
+			resumed_tile,
+		),
+	);
 
 	// 6. Inference through the persisted bundle, point by point against the
 	//    closed form, and the bundle must be unchanged afterwards.
