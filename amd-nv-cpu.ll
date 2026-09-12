@@ -952,43 +952,48 @@ define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %outp
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %p
-%value = load double, ptr addrspace(1) %input.ptr, align 8
+%value.model = load double, ptr addrspace(1) %input.ptr, align 8
+%value = call RECIPE_STATE @recipe.decode(double %value.model)
 %rotates = icmp ult i64 %channel, %rotated.wide %inside = icmp ult i64 %local, %dims.wide %active = and i1 %rotates, %inside
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%base.wide = call RECIPE_STATE @recipe.decode(double %base) %mscale.wide = call RECIPE_STATE @recipe.decode(double %yarn.mscale) %factor.wide = call RECIPE_STATE @recipe.decode(double %yarn.factor) %low.wide = call RECIPE_STATE @recipe.decode(double %yarn.low) %high.wide = call RECIPE_STATE @recipe.decode(double %yarn.high)
+%unrotated.model = call double @recipe.encode(RECIPE_STATE %value)
 br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local, %half
 %local.upper = sub i64 %local, %half %index = select i1 %upper, i64 %local.upper, i64 %local
 %half.stride = mul i64 %half, %length.wide %partner.up = add i64 %p, %half.stride %partner.down = sub i64 %p, %half.stride
 %partner = select i1 %upper, i64 %partner.down, i64 %partner.up
 %partner.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %partner
-%other = load double, ptr addrspace(1) %partner.ptr, align 8
-%two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %index.i32 = trunc i64 %index to i32 %two.index.value = call double @recipe.from.u32(i32 %two.index.i32) %index.value = call double @recipe.from.u32(i32 %index.i32)
-%dims.value = call double @recipe.from.u32(i32 %dims) %ratio = call double @recipe.div(double %two.index.value, double %dims.value)
-%log.base = call double @recipe.log(double %base) %exponent.positive = call double @recipe.mul(double %ratio, double %log.base)
-%exponent = call double @recipe.neg(double %exponent.positive) %frequency.raw = call double @recipe.exp(double %exponent)
-%yarn.on = call i1 @recipe.ogt(double %yarn.factor, double 1.0)
-%ramp.span = call double @recipe.sub(double %yarn.high, double %yarn.low)
-%ramp.offset = call double @recipe.sub(double %index.value, double %yarn.low)
-%ramp.raw = call double @recipe.div(double %ramp.offset, double %ramp.span)
-%ramp.low = call i1 @recipe.ogt(double 0.0, double %ramp.raw)
-%ramp.clamped.low = select i1 %ramp.low, double 0.0, double %ramp.raw
-%ramp.high = call i1 @recipe.ogt(double %ramp.clamped.low, double 1.0)
-%ramp = select i1 %ramp.high, double 1.0, double %ramp.clamped.low
-%interpolated = call double @recipe.div(double %frequency.raw, double %yarn.factor)
-%ramp.inverse = call double @recipe.sub(double 1.0, double %ramp)
-%extrapolated.part = call double @recipe.mul(double %ramp.inverse, double %frequency.raw)
-%interpolated.part = call double @recipe.mul(double %ramp, double %interpolated)
-%blended = call double @recipe.add(double %extrapolated.part, double %interpolated.part)
-%frequency = select i1 %yarn.on, double %blended, double %frequency.raw
-%position.i32 = trunc i64 %position to i32 %position.value = call double @recipe.from.u32(i32 %position.i32) %angle = call double @recipe.mul(double %position.value, double %frequency)
-%cos = call double @recipe.cos(double %angle) %sin = call double @recipe.sin(double %angle) %sin.negative = call double @recipe.neg(double %sin)
-%sin.signed = select i1 %reverse, double %sin.negative, double %sin %sin.signed.negative = call double @recipe.neg(double %sin.signed)
-%sin.term = select i1 %upper, double %sin.signed, double %sin.signed.negative
-%cos.part = call double @recipe.mul(double %value, double %cos) %sin.part = call double @recipe.mul(double %other, double %sin.term)
-%rotated.raw = call double @recipe.add(double %cos.part, double %sin.part)
-%rotated.value = call double @recipe.mul(double %rotated.raw, double %yarn.mscale) br label %finish finish:
-%result = phi double [ %value, %entry ], [ %rotated.value, %rotate ]
+%other.model = load double, ptr addrspace(1) %partner.ptr, align 8
+%other = call RECIPE_STATE @recipe.decode(double %other.model)
+%two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %index.i32 = trunc i64 %index to i32 %two.index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %two.index.i32) %index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %index.i32)
+%dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
+%log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
+%exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
+%yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
+%ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
+%ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
+%ramp.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %ramp.offset, RECIPE_STATE %ramp.span)
+%ramp.low = call i1 @recipe.state.ogt(RECIPE_STATE %zero, RECIPE_STATE %ramp.raw)
+%ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
+%ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
+%ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
+%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %factor.wide)
+%ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
+%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.raw)
+%interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
+%blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
+%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.raw
+%position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
+%cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
+%sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
+%sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
+%cos.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %cos) %sin.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %sin.term)
+%rotated.raw = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.part)
+%rotated.value = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %rotated.raw, RECIPE_STATE %mscale.wide) %rotated.model = call double @recipe.encode(RECIPE_STATE %rotated.value) br label %finish finish:
+%result = phi double [ %unrotated.model, %entry ], [ %rotated.model, %rotate ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
-br i1 %reverse, label %accumulate, label %assign accumulate: %prior = load double, ptr addrspace(1) %output.ptr, align 8
-%sum = call double @recipe.add(double %prior, double %result) store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void
+br i1 %reverse, label %accumulate, label %assign accumulate: %prior.model = load double, ptr addrspace(1) %output.ptr, align 8
+%prior = call RECIPE_STATE @recipe.decode(double %prior.model) %result.wide = call RECIPE_STATE @recipe.decode(double %result) %sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %prior, RECIPE_STATE %result.wide) %sum.model = call double @recipe.encode(RECIPE_STATE %sum) store double %sum.model, ptr addrspace(1) %output.ptr, align 8 ret void
 assign: store double %result, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; Hyper-connection stream bodies. A stream row holds %lanes copies of
 ; %channels channels, lane l at channels [l * channels, (l + 1) * channels).
