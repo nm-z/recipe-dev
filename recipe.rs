@@ -8453,15 +8453,20 @@ pub fn lgbm(trees: usize) -> Block {
 	Block::of(Operation::Estimator(Estimator { fit: fit_lightgbm, validate: positive_estimator, param: trees, name: "lgbm" }))
 }
 /// A fragment as one step, so a branch nests inside a branch.
+/// A composition needs a block: an empty branch is rejected where it is written.
+fn branch<const N: usize>(blocks: [Block; N]) -> Vec<Block> {
+	const { assert!(N != 0, "a composition must contain a block") }
+	blocks.into()
+}
 pub fn res<const N: usize>(parts: [Block; N]) -> Block {
-	Block::of(Operation::Residual(parts.into()))
+	Block::of(Operation::Residual(branch(parts)))
 }
 /// The equal-weight mean of members that read the same input and produce the same shape.
 pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
-	Block::of(Operation::Ensemble(members.into()))
+	Block::of(Operation::Ensemble(branch(members)))
 }
 pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
-	Block::of(Operation::MoeBlocks(top_k, experts.into()))
+	Block::of(Operation::MoeBlocks(top_k, branch(experts)))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -8993,13 +8998,13 @@ impl Model {
 		self.push(Operation::Attention(attention))
 	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
-		self.push(Operation::Residual(parts.into()))
+		self.push(Operation::Residual(branch(parts)))
 	}
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
-		self.push(Operation::Ensemble(members.into()))
+		self.push(Operation::Ensemble(branch(members)))
 	}
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
-		self.push(Operation::MoeBlocks(top_k, experts.into()))
+		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
 	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
