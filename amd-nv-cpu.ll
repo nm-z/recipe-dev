@@ -5280,7 +5280,7 @@ ret void
 }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 	ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %time.begin, i32 %time.span, i32 %gates,
-	i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+	i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode, i1 %coded, i32 %cell.activation ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %time.limit = add i32 %time.begin, %time.span
 %weight.packed = icmp ne i32 %decode, 0
 %in.channels.wide = zext i32 %in.channels to i64 %out.channels.wide = zext i32 %out.channels to i64 %length.wide = zext i32 %length to i64 %rows.wide = zext i32 %rows to i64 %weight.base.wide = add i64 %weight.base, 0
@@ -5367,7 +5367,13 @@ gate.bias.ready:
 %rnn = icmp eq i32 %gates, 1 %last.gate = sub i32 %gates, 1 %candidate = icmp eq i32 %gate, %last.gate
 %use.tanh = or i1 %rnn, %candidate %tanh.value = call double @recipe.tanh(double %linear)
 %sigmoid.value = call double @sigmoid(double %linear)
-%gate.value = select i1 %use.tanh, double %tanh.value, double %sigmoid.value br label %gate.store gate.store:
+%builtin.value = select i1 %use.tanh, double %tanh.value, double %sigmoid.value
+%coded.relu = icmp eq i32 %cell.activation, 1 %coded.tanh = icmp eq i32 %cell.activation, 2 %coded.sigmoid = icmp eq i32 %cell.activation, 3
+%coded.positive = call i1 @recipe.ogt(double %linear, double 0.0) %coded.relu.value = select i1 %coded.positive, double %linear, double 0.0
+%coded.a = select i1 %coded.relu, double %coded.relu.value, double %linear
+%coded.b = select i1 %coded.tanh, double %tanh.value, double %coded.a
+%coded.value = select i1 %coded.sigmoid, double %sigmoid.value, double %coded.b
+%gate.value = select i1 %coded, double %coded.value, double %builtin.value br label %gate.store gate.store:
 %gate.context.base = mul i64 %gate.wide, %gate.batch.wide %gate.hidden.base = mul i64 %hidden.wide, %length.wide
 %gate.local = add i64 %gate.hidden.base, %time.wide %gate.row.local = add i64 %output.row.base, %gate.local
 %gate.index = add i64 %gate.context.base, %gate.row.local
@@ -5707,7 +5713,7 @@ define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
 i32 %length, i32 %out.channels, i32 %gates, i1 %has.bias, i32 %parameters, i32 %offset,
-i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
+i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads, i1 %coded, i32 %cell.activation ) #3 { entry:
 	%tid = call i32 @llvm.amdgcn.workitem.id.x() %scan.in.channels.wide = zext i32 %in.channels to i64 %scan.length.wide = zext i32 %length to i64 %scan.out.channels.wide = zext i32 %out.channels to i64 %scan.rows.wide = zext i32 %rows to i64 %scan.gates.wide = zext i32 %gates to i64 %scan.parameters.wide = zext i32 %parameters to i64 %in.elements = mul i32 %in.channels, %length %scan.in.elements.wide = mul i64 %scan.in.channels.wide, %scan.length.wide
 %out.elements = mul i32 %out.channels, %length %scan.out.elements.wide = mul i64 %scan.out.channels.wide, %scan.length.wide %batch = mul i32 %rows, %out.elements %scan.batch.wide = mul i64 %scan.rows.wide, %scan.out.elements.wide
 %gate.stride.0 = mul i32 %in.channels, %out.channels %scan.gate.stride.0.wide = mul i64 %scan.in.channels.wide, %scan.out.channels.wide %state.matrix = mul i32 %out.channels, %out.channels %scan.state.matrix.wide = mul i64 %scan.out.channels.wide, %scan.out.channels.wide
@@ -5756,7 +5762,14 @@ br i1 %rnn.more, label %rnn.delta.step, label %delta.done rnn.delta.step:
 %rnn.dy = load double, ptr addrspace(1) %rnn.dy.ptr, align 8
 %rnn.future = load double, ptr addrspace(1) %rnn.future.ptr, align 8
 %rnn.gate = load double, ptr addrspace(1) %rnn.gate.ptr, align 8 %rnn.dh = call double @recipe.add(double %rnn.dy, double %rnn.future)
-%rnn.square = call double @recipe.mul(double %rnn.gate, double %rnn.gate) %rnn.derivative = call double @recipe.sub(double 1.0, double %rnn.square)
+%rnn.square = call double @recipe.mul(double %rnn.gate, double %rnn.gate) %rnn.tanh.derivative = call double @recipe.sub(double 1.0, double %rnn.square)
+%rnn.coded.relu = icmp eq i32 %cell.activation, 1 %rnn.coded.tanh = icmp eq i32 %cell.activation, 2 %rnn.coded.sigmoid = icmp eq i32 %cell.activation, 3
+%rnn.positive = call i1 @recipe.ogt(double %rnn.gate, double 0.0) %rnn.relu.derivative = select i1 %rnn.positive, double 1.0, double 0.0
+%rnn.one.minus = call double @recipe.sub(double 1.0, double %rnn.gate) %rnn.sigmoid.derivative = call double @recipe.mul(double %rnn.gate, double %rnn.one.minus)
+%rnn.coded.a = select i1 %rnn.coded.relu, double %rnn.relu.derivative, double 1.0
+%rnn.coded.b = select i1 %rnn.coded.tanh, double %rnn.tanh.derivative, double %rnn.coded.a
+%rnn.coded.derivative = select i1 %rnn.coded.sigmoid, double %rnn.sigmoid.derivative, double %rnn.coded.b
+%rnn.derivative = select i1 %coded, double %rnn.coded.derivative, double %rnn.tanh.derivative
 %rnn.delta = call double @recipe.mul(double %rnn.dh, double %rnn.derivative) %rnn.delta.index = add i32 %delta.base, %rnn.index %scan.rnn.delta.index.wide = add i64 %scan.delta.base.wide, %scan.rnn.index.wide
 %rnn.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.rnn.delta.index.wide
 store double %rnn.delta, ptr addrspace(1) %rnn.delta.ptr, align 8 %rnn.next = add i32 %rnn.hidden, 1

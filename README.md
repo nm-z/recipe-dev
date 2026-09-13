@@ -122,6 +122,7 @@ exclude:
 	moe(topk, [blocks])
 	res([blocks])
 	ensemble([blocks])
+	recur([layer(width), activation])
 	block * block
 ```
 
