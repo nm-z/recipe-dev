@@ -4499,13 +4499,26 @@ impl NativeModelIr {
 	/// pool once its window is full, and every other primitive reads one input
 	/// position per output position. A node therefore extends by whole positions
 	/// and never rewrites a position whose inputs are already present.
+	///
+	/// A node that reads its source through another shape — a flattened row
+	/// projected to a new shape, or that projection read back as a sequence —
+	/// has no position of its own in the source's window: every output position
+	/// depends on the whole source, so it writes its whole length.
 	fn emit_node_window(&self, index: usize, node: &Node, ir: &mut String) -> Result<NodeWindow> {
 		let prefix = format!("n{index}");
 		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) } else { ("%begin".to_owned(), "%end".to_owned()) };
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
+		let source_length = match usize::try_from(node.source) {
+			Ok(source) => self.graph.nodes.get(source).map(|source| source.output.length),
+			Err(_) => Some(graph_positions(&self.graph)),
+		};
+		let reinterpreted = source_length.is_some_and(|source_length| source_length != node.input.length);
 		match node.op {
 			Primitive::Predictor => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n")),
+			_ if reinterpreted && !matches!(node.op, Primitive::Pool | Primitive::Last | Primitive::Gather) => {
+				ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n"))
+			}
 			Primitive::Pool => {
 				let size = integer_argument(node.argument[0], "pool size")?;
 				require(size > 0, "native pool size must be positive")?;
