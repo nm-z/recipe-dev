@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 // Every numeric source the loader accepts with a "target" column, plus the README data options.
 const DATASETS: [&str; 15] = ["sample_subfolders", "sample_subfolders", "sample_subfolders", "sample_subfolders_two_inputs", "sample_subfolders_two_targets", "sample_subfolders_two_inputs_two_targets", "single_csv_two_targets.csv", "single_csv.csv", "sharded_csv", "split_files", "compressed_csv.csv.gz", "arrays_npz.npz", "arrays_hdf5.h5", "records_jsonl.jsonl", "samples_sqlite.sqlite"];
@@ -188,6 +189,8 @@ fn main() {{
 
 fn run(path: &Path) -> Result<(), Failure> {
 	let harness = |error: std::io::Error| Failure { phase: "harness".to_owned(), message: error.to_string(), output: error.to_string() };
+	let timeout_seconds = number("RECIPE_COMPOSITION_TIMEOUT_SECONDS", 180);
+	assert!(timeout_seconds > 0, "RECIPE_COMPOSITION_TIMEOUT_SECONDS must be greater than zero");
 	let mut child = Command::new(runner())
 		.arg(path)
 		.env("RECIPE_COMPOSITION_PHASE_PATH", phase_file(path))
@@ -220,9 +223,26 @@ fn run(path: &Path) -> Result<(), Failure> {
 		let _ = stdout.read_to_end(&mut bytes);
 		bytes
 	});
-	let status = child.wait().map_err(harness)?;
+	let started = Instant::now();
+	let mut timed_out = false;
+	let status = loop {
+		if let Some(status) = child.try_wait().map_err(harness)? {
+			break status;
+		}
+		if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+			timed_out = true;
+			match child.kill() {
+				Ok(()) => break child.wait().map_err(harness)?,
+				Err(error) => match child.try_wait().map_err(harness)? {
+					Some(status) => break status,
+					None => return Err(harness(error)),
+				},
+			}
+		}
+		std::thread::sleep(Duration::from_millis(100));
+	};
 	let output = Output { status, stdout: stdout_thread.join().unwrap_or_default(), stderr: stderr_thread.join().unwrap_or_default() };
-	if output.status.success() {
+	if output.status.success() && !timed_out {
 		return Ok(());
 	}
 	let output_status = output.status;
@@ -238,18 +258,22 @@ fn run(path: &Path) -> Result<(), Failure> {
 	#[cfg(not(unix))]
 	let signal = None::<String>;
 	let last = lines.iter().rev().find(|line| !line.starts_with("note:")).map(|line| (*line).to_owned());
-	let message = lines
-		.iter()
-		.position(|line| line.contains("panicked at"))
-		.and_then(|index| lines.get(index + 1))
-		.map(|line| (*line).to_owned())
-		.or(signal)
-		.or_else(|| output_status.code().map(|code| match &last {
-			Some(last) => format!("exited with code {code} without a failure line, after: {last}"),
-			None => format!("exited with code {code} without output"),
-		}))
-		.or(last)
-		.unwrap_or_else(|| "candidate failed".to_owned());
+	let message = if timed_out {
+		format!("candidate exceeded {timeout_seconds}s during {phase}")
+	} else {
+		lines
+			.iter()
+			.position(|line| line.contains("panicked at"))
+			.and_then(|index| lines.get(index + 1))
+			.map(|line| (*line).to_owned())
+			.or(signal)
+			.or_else(|| output_status.code().map(|code| match &last {
+				Some(last) => format!("exited with code {code} without a failure line, after: {last}"),
+				None => format!("exited with code {code} without output"),
+			}))
+			.or(last)
+			.unwrap_or_else(|| "candidate failed".to_owned())
+	};
 	Err(Failure { phase, message: normalize(&message), output })
 }
 
