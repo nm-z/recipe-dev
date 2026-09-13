@@ -4414,14 +4414,18 @@ impl NativeModelIr {
 		} else {
 			format!("%{prefix}.items.value = uitofp i64 {items} to {state_ty}\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} {mean_total}, {state_ty} %{prefix}.items.value)\n")
 		};
-		let centered_mean = if mode.per_row() { mean_broadcast.clone() } else { format!("%{prefix}.mean") };
+		// A mean-centred variance subtracts the mean the variance loop derives from
+		// its total; the per-row broadcast is the wave's summed row before that
+		// division, so it is never the centre. RMS and L2 square the raw value.
+		let centered_code =
+			if zero_mean { String::new() } else { format!("%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n") };
 		let mean_next = if per_row { format!("%{prefix}.mean.p.next") } else { format!("%{prefix}.mean.next") };
 		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
 		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {state_ty} [ {zero}, {mean_entry} ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, state_ty = state_ty, zero = zero, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
 		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
 		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, {variance_entry} ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
-		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} {centered_mean})\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_mean = centered_mean, align = alignment(ty)));
+		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n{centered_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_code = centered_code, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
 		let variance_total = if mode.per_row() { format!("%{prefix}.variance.reduced") } else { format!("%{prefix}.variance.sum") };
 		let variance_items = if mode.per_row() { native_literal(self.precision.state, state_ty, width as f64) } else { format!("%{prefix}.items.value") };
@@ -4454,9 +4458,13 @@ impl NativeModelIr {
 			variance_next = variance_next,
 		));
 		let stored_mean = if zero_mean { model_zero } else { format!("%{prefix}.mean.stored") };
+		// The stored mean is converted once, in whichever store block runs: the
+		// per-row block writes it from lane zero of the wave, the group block from
+		// its single thread.
+		let mean_stored_code = if zero_mean { String::new() } else { format!("%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n") };
 		let store_code = if mode.per_row() {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n{mean_stored_code}%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
 				state_ty = state_ty,
@@ -4468,13 +4476,14 @@ impl NativeModelIr {
 				group_limit = groups,
 				wave_lane = wave_lane,
 				stored_mean = stored_mean,
+				mean_stored_code = mean_stored_code,
 				align = alignment(ty),
 				counter = counter,
 				wave_count = wave_count,
 			)
 		} else {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n{mean_stored_code}%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
 				state_ty = state_ty,
@@ -4485,6 +4494,7 @@ impl NativeModelIr {
 				group = group,
 				group_limit = group_limit,
 				stored_mean = stored_mean,
+				mean_stored_code = mean_stored_code,
 				align = alignment(ty),
 				group_next = group_next,
 			)
