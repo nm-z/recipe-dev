@@ -77,12 +77,17 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
+	// A tabular source has one row per sample, so a convolution or pool over its handful of
+	// features only asks Recipe for a kernel longer than the sequence (#214); those blocks
+	// belong to the sequence sources.
+	let sequential = dataset(cursor).contains("sample_subfolders");
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
 		0 => format!("layer({width})"),
 		1 => format!("rnn({width})"),
 		2 => format!("gru({width})"),
 		3 if member => format!("lstm({width})"),
 		4 if member => format!("perc({width})"),
+		3 if !sequential => format!("layer({width})"),
 		3 => format!("conv({width}, {})", 2 + (bits >> 8) % 4),
 		4 => format!("rnn({width})"),
 		5 => format!("gru({width})"),
@@ -91,6 +96,7 @@ fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<us
 		8 if AVOID_FILED => format!("layer({width})"),
 		8 => format!("attn({}).width({width}){}", 1 + (bits >> 8) % 4, pick(cursor, salt + 4, &ATTENTION_OPTIONS).replace("{width}", &width.to_string())),
 		9 => return pick(cursor, salt + 5, &ESTIMATORS).to_owned(),
+		_ if !sequential => format!("layer({width})"),
 		_ => format!("pool({})", 2 + (bits >> 8) % 3),
 	};
 	let norms: &[&str] = if AVOID_FILED { &NORMS_FILED } else { &NORMS };
@@ -175,17 +181,26 @@ fn run(path: &Path) -> Result<(), Failure> {
 	if output.status.success() {
 		return Ok(());
 	}
+	let output_status = output.status;
 	let output = diagnostic(&output);
 	let phase = std::fs::read_to_string(phase_file(path)).unwrap_or_else(|_| "compilation".to_owned());
 	// A panic message follows its "panicked at" line; the trailing backtrace note is never the failure.
 	let lines = output.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+	// A candidate the kernel killed left no panic line; its last line is a progress line that
+	// names no failure, so the signal is the message.
+	#[cfg(unix)]
+	let signal = std::os::unix::process::ExitStatusExt::signal(&output_status).map(|signal| format!("terminated by signal {signal}"));
+	#[cfg(not(unix))]
+	let signal = None::<String>;
 	let message = lines
 		.iter()
 		.position(|line| line.contains("panicked at"))
 		.and_then(|index| lines.get(index + 1))
-		.or_else(|| lines.iter().rev().find(|line| !line.starts_with("note:")))
-		.map_or("candidate failed", |line| line);
-	Err(Failure { phase, message: normalize(message), output })
+		.map(|line| (*line).to_owned())
+		.or(signal)
+		.or_else(|| lines.iter().rev().find(|line| !line.starts_with("note:")).map(|line| (*line).to_owned()))
+		.unwrap_or_else(|| "candidate failed".to_owned());
+	Err(Failure { phase, message: normalize(&message), output })
 }
 
 // Panic messages embed per-process temp paths; keep each file name's shape and line, drop the digits that change per run.
