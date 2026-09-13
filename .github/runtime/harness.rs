@@ -251,7 +251,9 @@ fn emit(cursor: u64, source: &str, path: &Path, failure: &Failure, replay: &Fail
 	eprintln!("id={id:016x}");
 	eprintln!("base={}", base());
 	eprintln!("cursor=cursor:{cursor} next:{} composition:{cursor}", cursor + 1);
-	eprintln!("data=path:{}", dataset(cursor));
+	// A replayed source names its own data; the generated one is the cursor's.
+	let data = source.lines().find_map(|line| line.split_once("recipe.data(\"").and_then(|(_, rest)| rest.split_once('"')).map(|(path, _)| path.to_owned())).unwrap_or_else(|| dataset(cursor));
+	eprintln!("data=path:{data}");
 	eprintln!("configuration=cursor:{cursor} seed:{seed}");
 	eprintln!("expected=the generated public Recipe composition trains and infers with finite values");
 	eprintln!("observed=phase:{} message:{}", failure.phase, failure.message);
@@ -267,11 +269,18 @@ fn main() {
 	let start = number("RECIPE_COMPOSITION_CURSOR", 0);
 	let end = start.saturating_add(number("RECIPE_COMPOSITION_COUNT", 1));
 	let seed = number("RECIPE_COMPOSITION_REPLAY_SEED", 17);
+	// RECIPE_COMPOSITION_SOURCE names a reproduction to run as it is, in place of the generated
+	// one: a failure recorded against an earlier Recipe source is checked again at the current one.
+	let given = env("RECIPE_COMPOSITION_SOURCE").map(|path| std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("cannot read {path}: {error}")));
 	for cursor in start..end {
-		let source = source(cursor, seed);
+		let (source, kind) = match &given {
+			Some(source) => (source.clone(), "replayed"),
+			None => (source(cursor, seed), "generated"),
+		};
 		let path = reproduction();
 		std::fs::write(&path, &source).expect("cannot write reproduction");
-		eprintln!("composition {cursor}: kind=generated body={}", model(cursor));
+		let body = source.lines().find_map(|line| line.trim().strip_prefix("let model = ")).map_or_else(|| model(cursor), |line| line.trim_end_matches(';').to_owned());
+		eprintln!("composition {cursor}: kind={kind} body={body}");
 		if let Err(failure) = run(&path) {
 			let replay = run(&path).err().unwrap_or(Failure { phase: "replay".to_owned(), message: "replay passed".to_owned(), output: "replay passed".to_owned() });
 			emit(cursor, &source, &path, &failure, &replay, seed);
