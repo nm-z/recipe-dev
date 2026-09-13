@@ -1,0 +1,108 @@
+name: azure trial
+
+# One bounded run of the composition harness on the Windows T4 worker: provision
+# the worker as win/nv does, build the candidate on it, run `count` compositions
+# from `cursor`, and return the harness's stderr (composition lines and failure
+# packets) as the evidence. Dispatched by hand so every run is a counted credit
+# decision; the worker is deleted in the cleanup step whatever happens.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cursor:
+        description: first composition cursor
+        required: true
+        default: "40000"
+      count:
+        description: number of compositions
+        required: true
+        default: "40"
+
+permissions:
+  contents: read
+
+jobs:
+  trial:
+    name: win/nv trial
+    runs-on: ubuntu-24.04
+    environment: recipe-windows-gpu
+    timeout-minutes: 90
+    concurrency:
+      group: recipe-windows-nvidia-${{ github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+    steps:
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+
+      - name: Build the immutable source snapshot
+        id: snapshot
+        working-directory: controller
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/snapshot"
+          git archive --format=tar HEAD | gzip -n > "$GITHUB_WORKSPACE/snapshot/recipe-source.tar.gz"
+          sha256="$(sha256sum "$GITHUB_WORKSPACE/snapshot/recipe-source.tar.gz" | cut -d' ' -f1)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "snapshot sha256=$sha256"
+
+      - name: Require the Azure federation
+        run: |
+          set -euo pipefail
+          [ -n "${AZURE_CLIENT_ID:-}" ] && [ -n "${AZURE_TENANT_ID:-}" ] && [ -n "${AZURE_SUBSCRIPTION_ID:-}" ] || { echo "the Azure federation is unavailable to this run" >&2; exit 1; }
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision, run the harness and collect the trial log
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
+        env:
+          RECIPE_WORKLOAD: trial
+          RECIPE_TRIAL_CURSOR: ${{ inputs.cursor }}
+          RECIPE_TRIAL_COUNT: ${{ inputs.count }}
+          CANDIDATE_SHA: ${{ steps.snapshot.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ steps.snapshot.outputs.sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Deallocate and clean up the worker
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-cleanup.sh"
+          else
+            echo "no Azure resources to clean up"
+          fi
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-trial
+          path: evidence/
+          if-no-files-found: warn
