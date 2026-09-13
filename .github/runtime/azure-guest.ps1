@@ -4,7 +4,11 @@ param(
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
 	[Parameter(Mandatory = $true)] [string] $snapshotUriEncoded,
-	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded,
+	[string] $workload = "suite",
+	[string] $trialCursor = "0",
+	[string] $trialCount = "0",
+	[string] $trialUriEncoded = ""
 )
 
 # Runs inside the Windows GPU worker, invoked through managed Run Command. It
@@ -241,6 +245,40 @@ try {
 	Write-Output "== guest: building with the NVIDIA backend =="
 	Push-Location $work
 	Invoke-Native "cargo" @("build", "--release", "--lib", "--bin", "recipe") "the native GPU build"
+
+	if ($workload -eq "trial") {
+		Write-Output "== guest: running the composition harness on nv0, cursor $trialCursor count $trialCount =="
+		$trial = Join-Path $work "trial"
+		New-Item -ItemType Directory -Force -Path $trial | Out-Null
+		Copy-Item -LiteralPath (Join-Path $runtime "harness.rs") -Destination (Join-Path $work "harness.rs")
+		$env:RECIPE_DEVICE = "nv0"
+		$env:RECIPE_COMPOSITION_RUNNER = Join-Path $work "target\release\recipe.exe"
+		$env:RECIPE_COMPOSITION_CURSOR = $trialCursor
+		$env:RECIPE_COMPOSITION_COUNT = $trialCount
+		$env:RECIPE_COMPOSITION_REPLAY_SEED = "17"
+		$env:RECIPE_COMPOSITION_REPRO = Join-Path $trial "repro.rs"
+		$env:RECIPE_TRIAL_DIRECTORY = $trial
+		# The harness prints one composition line per cursor and a failure packet per defect
+		# on stderr; that stream is the evidence, so its exit code is recorded, not thrown.
+		$trialStdout = Join-Path $trial "harness.out"
+		$trialStderr = Join-Path $trial "harness.log"
+		$trialProcess = Start-Process `
+			-FilePath (Join-Path $work "target\release\recipe.exe") `
+			-ArgumentList @((Join-Path $work "harness.rs")) `
+			-Wait -PassThru `
+			-RedirectStandardOutput $trialStdout `
+			-RedirectStandardError $trialStderr
+		Pop-Location
+		$packets = @(Select-String -LiteralPath $trialStderr -Pattern '^RECIPE FAILURE BEGIN$' -SimpleMatch:$false).Count
+		$compositions = @(Select-String -LiteralPath $trialStderr -Pattern '^composition [0-9]+:').Count
+		Write-Output "TRIAL EXIT $($trialProcess.ExitCode) compositions=$compositions packets=$packets"
+		# Run Command output is capped, so the log goes back through the private container.
+		$trialUri = Convert-EncodedUri $trialUriEncoded
+		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $trialUri -InFile $trialStderr -Headers @{ "x-ms-blob-type" = "BlockBlob" } | Out-Null
+		Write-Output "uploaded the trial log"
+		Write-Output "GUEST EXIT 0"
+		return
+	}
 
 	Write-Output "== guest: executing the suite on nv0 =="
 	New-Item -ItemType Directory -Force -Path (Join-Path $work "evidence"), (Join-Path $work "gpu-work") | Out-Null
