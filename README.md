@@ -38,6 +38,9 @@ let model = recipe.model()
 	.layer(1)
 	.loss(mae);
 ```
+```rust
+	.loss(mae|mse|...)|.loss(&evaluator)
+```
 ```r
 frozen.packed.blck.atvn.norm.quant = block
   │      │      │    │    │    └─ quantization
@@ -146,6 +149,8 @@ recipe.train()
 ```rust
 .seed(value)
 .resume(path)
+.rat(history|rolling|online|learned|full, "./evaluate")
+.target(value)
 precisions
 	.fp(8|16|32|64)
 	.int(1|4|8)
@@ -153,7 +158,7 @@ precisions
 	.tf(32)
 	.f(exp, mantissa)
 observe:
-	.log(Run|Loss|R2|Time|Epoch|blck|tile|all)
+	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|all|dev)
 ```
 
 ## **Infer**

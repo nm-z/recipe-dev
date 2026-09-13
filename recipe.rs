@@ -7735,7 +7735,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization, epsilon, exclusions, frozen: false, packed: false })
+		Ok(Model { blocks, loss: LossFunction(loss), downstream: None, quantization, epsilon, exclusions, frozen: false, packed: false })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -8265,14 +8265,14 @@ use std::os::unix::{
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
 	error::Error,
 	ffi::{OsStr, c_void},
 	fmt, fs,
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Command, Stdio},
 	ptr,
 	sync::{
 		Arc, Mutex, OnceLock,
@@ -8357,8 +8357,11 @@ pub struct Data {
 	features: FeatureSelection,
 	normalize: bool,
 	split: f64,
+	/// Whether `.split()` was called: the rolling RAT policy reads its window from it.
+	split_supplied: bool,
 	prepared: OnceLock<Result<Prepared>>,
 }
+#[derive(Clone)]
 enum FeatureSelection {
 	All,
 	Include(Vec<String>),
@@ -8887,6 +8890,8 @@ impl std::ops::Deref for BlockQk {
 pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
+	/// The evaluator a command-RAT proposer is scored through, from `.loss(&evaluator)`.
+	downstream: Option<Box<Model>>,
 	quantization: u16,
 	/// The epsilon every normalization the model lowers is built with; saved with the model.
 	epsilon: f64,
@@ -9141,9 +9146,21 @@ impl Model {
 	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
 		self.attention("qk", |block| block.qk(normalization))
 	}
-	pub fn loss(&self, loss: LossFunction) -> Self {
+	/// The loss the model trains against, or the evaluator model a command-RAT
+	/// proposer is scored through: `.loss(&evaluator)` takes the evaluator's own
+	/// loss and requires `.rat(policy, command)` on the run.
+	pub fn loss<'a>(&self, loss: impl Into<ModelLoss<'a>>) -> Self {
 		let mut model = self.clone();
-		model.loss = loss;
+		match loss.into() {
+			ModelLoss::Function(loss) => {
+				model.loss = loss;
+				model.downstream = None;
+			}
+			ModelLoss::Model(downstream) => {
+				model.loss = downstream.loss;
+				model.downstream = Some(Box::new(downstream.clone()));
+			}
+		}
 		model
 	}
 	/// The epsilon every normalization of this model lowers with: the floor under an
@@ -10682,7 +10699,7 @@ impl std::ops::Mul for Model {
 		Model { blocks: vec![Block::of(Operation::Product(
 			ProductBranch { blocks: left, quantization, exclusions },
 			ProductBranch { blocks: right, quantization: right_quantization, exclusions: right_exclusions },
-		))], loss, quantization: 0, epsilon, frozen: false, packed: false, exclusions: 0 }
+		))], loss, downstream: None, quantization: 0, epsilon, frozen: false, packed: false, exclusions: 0 }
 	}
 }
 impl From<Model> for Block {
@@ -10706,6 +10723,22 @@ pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
 pub struct LossFunction(u8);
+/// What `.loss(...)` accepts: a loss function, or the evaluator model of a
+/// command-RAT run.
+pub enum ModelLoss<'a> {
+	Function(LossFunction),
+	Model(&'a Model),
+}
+impl From<LossFunction> for ModelLoss<'_> {
+	fn from(loss: LossFunction) -> Self {
+		Self::Function(loss)
+	}
+}
+impl<'a> From<&'a Model> for ModelLoss<'a> {
+	fn from(model: &'a Model) -> Self {
+		Self::Model(model)
+	}
+}
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
 pub struct ZScore;
@@ -10733,10 +10766,17 @@ pub const Epoch: Metric = Metric(4);
 /// which a model step wants.
 pub const blck: Metric = Metric(5);
 pub const tile: Metric = Metric(10);
+/// The raw score the external command returned for the epoch's proposal, on a
+/// command-RAT run; absent otherwise.
+pub const Score: Metric = Metric(11);
+/// The observations the evaluator fitted in the epoch, on a command-RAT run.
+pub const Window: Metric = Metric(12);
+/// The decisions the epoch scored, on a command-RAT run.
+pub const Choices: Metric = Metric(13);
 /// All progress fields except the native tile schedule.
-pub const all: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
+pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, Score, Choices, Window];
 /// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 7] = [Run, Time, Epoch, R2, Loss, blck, tile];
+pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window];
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
@@ -10802,14 +10842,15 @@ impl Recipe {
 			features: FeatureSelection::All,
 			normalize: false,
 			split: 1.0,
+			split_supplied: false,
 			prepared: OnceLock::new(),
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0, epsilon: default_epsilon().unwrap_or_else(|error| panic!("{error}")), frozen: false, packed: false, exclusions: 0 }
+		Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, epsilon: default_epsilon().unwrap_or_else(|error| panic!("{error}")), frozen: false, packed: false, exclusions: 0 }
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None, rat_target: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -11651,10 +11692,10 @@ impl Sampler {
 		self.state = seed;
 		self
 	}
-	pub fn sample(&mut self, logits: &[f64], history: &[u32]) -> u32 {
+	pub fn sample(&mut self, logits: &[f64], previous: &[u32]) -> u32 {
 		assert!(!logits.is_empty(), "sampler received no logits");
 		let mut candidates = logits.iter().copied().enumerate().map(|(id, logit)| (id as u32, logit)).collect::<Vec<_>>();
-		for id in history.iter().rev().take(self.window) {
+		for id in previous.iter().rev().take(self.window) {
 			let logit = &mut candidates[*id as usize].1;
 			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
 		}
@@ -18408,7 +18449,7 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 		})
 		.collect()
 }
-fn native_attention_shared_values(extent: Tile, full: bool, inference: bool) -> Result<u32> {
+fn native_attention_shared_values(extent: Tile, whole: bool, inference: bool) -> Result<u32> {
 	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
 	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
 	let pairs = extent.m.checked_mul(extent.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
@@ -18432,14 +18473,14 @@ fn native_attention_shared_values(extent: Tile, full: bool, inference: bool) -> 
 		queries.checked_mul(4).and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs))).and_then(|values| values.checked_add(extent.m));
 	if inference {
 		return forward
-			.and_then(|forward| matrix.map(|matrix| forward.max(if full { matrix } else { 0 })))
+			.and_then(|forward| matrix.map(|matrix| forward.max(if whole { matrix } else { 0 })))
 			.ok_or_else(|| RecipeError::new("native attention shared values overflow"));
 	}
 	forward
 		.zip(query_gradient)
 		.zip(key_value_gradient)
 		.zip(matrix)
-		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
+		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if whole { matrix } else { 0 }))
 		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
 }
 fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32, inference: bool) -> Result<Tile> {
@@ -18962,6 +19003,7 @@ impl Data {
 	}
 	pub const fn split(mut self, fraction: f64) -> Self {
 		self.split = fraction;
+		self.split_supplied = true;
 		self
 	}
 }
@@ -18984,6 +19026,32 @@ struct Prepared {
 	/// The weights each parameterized node binds to, in lowering order, when the
 	/// graph compiles over mapped tensors instead of training.
 	bound: Option<Vec<BoundNode>>,
+}
+impl Prepared {
+	/// One batch of `rows` samples and their targets, with no schema, sequence
+	/// or normalization: a proposal set or an evaluator's observations.
+	fn matrix(samples: Vec<f64>, targets: Vec<f64>, rows: usize, target_width: usize) -> Result<Self> {
+		require(rows != 0 && target_width != 0, "prepared matrix shape must be positive")?;
+		require(targets.is_empty() || targets.len() == checked_mul(rows, target_width, "prepared matrix targets")?, "prepared matrix requires a whole target batch")?;
+		require(samples.len() % rows == 0, "prepared matrix requires a whole sample batch")?;
+		let identities = (0..rows as u64).collect();
+		Ok(Self {
+			features: samples.len() / rows,
+			samples,
+			targets,
+			target_width,
+			rows,
+			source_rows: rows,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities,
+			fitted: Vec::new(),
+			bound: None,
+		})
+	}
 }
 struct Table {
 	name: String,
@@ -19356,11 +19424,11 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		};
 		let mut groups = BTreeMap::<String, BTreeMap<String, &(PathBuf, Vec<u8>)>>::new();
 		for &entry in &samples {
-			let full = stem(&entry.0);
-			let (sample, input) = if targets.iter().all(|target| sidecar(&full, target).is_some()) {
-				(full.as_str(), "input")
+			let stemmed = stem(&entry.0);
+			let (sample, input) = if targets.iter().all(|target| sidecar(&stemmed, target).is_some()) {
+				(stemmed.as_str(), "input")
 			} else {
-				full.rsplit_once('.').map_or((full.as_str(), "input"), |(sample, input)| (sample, input))
+				stemmed.rsplit_once('.').map_or((stemmed.as_str(), "input"), |(sample, input)| (sample, input))
 			};
 			require(groups.entry(sample.to_owned()).or_default().insert(input.to_owned(), entry).is_none(), format!("flat sample {sample:?} repeats input {input:?}"))?;
 		}
@@ -19407,11 +19475,11 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		let mut named = BTreeMap::<String, (Vec<String>, BTreeMap<String, &(PathBuf, Vec<u8>)>)>::new();
 		let mut complete = samples.len() == files.len();
 		for &entry in &samples {
-			let full = stem(&entry.0);
-			let (stem, input) = full
+			let stemmed = stem(&entry.0);
+			let (stem, input) = stemmed
 				.rsplit_once('.')
 				.filter(|(sample, _)| qualifiers.get(*sample).is_some_and(|count| *count > 1))
-				.map_or((full.as_str(), "input"), |(sample, input)| (sample, input));
+				.map_or((stemmed.as_str(), "input"), |(sample, input)| (sample, input));
 			let parts = stem.split(SEPARATOR).collect::<Vec<_>>();
 			if parts.len() <= targets.len() {
 				complete = false;
@@ -19433,8 +19501,8 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	// on the legacy path below.
 	let mut class_qualifiers = BTreeMap::<String, usize>::new();
 	for (path, _) in &samples {
-		let full = stem(path);
-		if let (Some(relative), Some((sample, _))) = (path.parent().and_then(|parent| parent.strip_prefix(&root).ok()), full.rsplit_once('.')) {
+		let stemmed = stem(path);
+		if let (Some(relative), Some((sample, _))) = (path.parent().and_then(|parent| parent.strip_prefix(&root).ok()), stemmed.rsplit_once('.')) {
 			*class_qualifiers.entry(format!("{}\0{sample}", relative.display())).or_default() += 1;
 		}
 	}
@@ -19446,11 +19514,11 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		let Some(relative) = relative else { class_layout = false; break };
 		let values = relative.components().map(|component| component.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>();
 		if values.len() != targets.len() { class_layout = false; break }
-		let full = stem(&entry.0);
-		let (sample, input) = full
+		let stemmed = stem(&entry.0);
+		let (sample, input) = stemmed
 			.rsplit_once('.')
 			.filter(|(sample, _)| class_qualifiers.get(&format!("{}\0{sample}", relative.display())).is_some_and(|count| *count > 1))
-			.map_or((full.as_str(), "input"), |(sample, input)| { qualified = true; (sample, input) });
+			.map_or((stemmed.as_str(), "input"), |(sample, input)| { qualified = true; (sample, input) });
 		let group = classes.entry(format!("{}::{sample}", values.join("::"))).or_insert_with(|| (values.clone(), BTreeMap::new()));
 		class_layout &= group.0 == values && group.1.insert(input.to_owned(), entry).is_none();
 	}
@@ -21680,6 +21748,736 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 	}
 	Ok(())
 }
+/// How a command-RAT run keeps its scored observations for the evaluator fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatPolicy {
+	History,
+	Rolling,
+	Online,
+	Learned,
+	Full,
+}
+/// Fits every scored observation accumulated so far.
+pub const history: RatPolicy = RatPolicy::History;
+/// Retains the newest `floor(source_rows * fraction)` observations, with `.split(fraction)`.
+pub const rolling: RatPolicy = RatPolicy::Rolling;
+/// Retains only the newest scored observation while keeping model and optimizer state.
+pub const online: RatPolicy = RatPolicy::Online;
+/// Learns which available observations to fit: a selector over the observation
+/// sequence, trained through a scorer that predicts the evaluator's fit quality.
+pub const learned: RatPolicy = RatPolicy::Learned;
+/// Scores fresh proposals for every source row each epoch, then updates each
+/// model once. Replaces scored observations while retaining learned state.
+/// The logged score is the mean raw score of the evaluated proposals.
+pub const full: RatPolicy = RatPolicy::Full;
+impl RatPolicy {
+	fn validate(self, data: &Data) -> Result<()> {
+		if self == Self::Rolling {
+			require(data.split_supplied, ".rat(rolling, command) requires .split(fraction)")?;
+			require(data.split.is_finite() && data.split > 0.0 && data.split <= 1.0, "RAT window fraction must be greater than zero and at most one")
+		} else {
+			require(!data.split_supplied, ".split() controls only the rolling RAT window")
+		}
+	}
+	fn capacity(self, data: &Data, rows: usize) -> Result<usize> {
+		self.validate(data)?;
+		if self == Self::Rolling {
+			Ok(((rows as f64 * data.split).floor() as usize).max(1))
+		} else {
+			Ok(match self {
+				Self::Online => 1,
+				Self::Full => rows,
+				_ => usize::MAX,
+			})
+		}
+	}
+}
+#[derive(Clone)]
+struct RatCommand {
+	path: PathBuf,
+	policy: RatPolicy,
+}
+impl RatCommand {
+	/// Scores `proposals`, one record per row of `names` values, with one
+	/// invocation: each record is a line of `name=value` fields on stdin, and the
+	/// command answers one finite score per line on stdout. Any stderr bytes or
+	/// an unsuccessful exit stop the run before a score is accepted.
+	fn evaluate(&self, names: &[String], proposals: &[f64]) -> Result<Vec<f64>> {
+		require(!names.is_empty(), "RAT requires named inputs")?;
+		require(!proposals.is_empty() && proposals.len() % names.len() == 0, "RAT evaluator requires complete nonempty sample records")?;
+		let rows = proposals.len() / names.len();
+		require(names.iter().collect::<BTreeSet<_>>().len() == names.len(), "RAT feature and target names must be distinct")?;
+		for name in names {
+			require(!name.is_empty() && !name.bytes().any(|byte| matches!(byte, b',' | b'=' | b'\r' | b'\n')), format!("RAT input name {name:?} cannot be encoded"))?;
+		}
+		require(proposals.iter().all(|value| value.is_finite()), "RAT input contains a nonfinite value")?;
+		let mut child = Command::new(&self.path)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", self.path.display())))?;
+		let input = child.stdin.take().ok_or_else(|| RecipeError::new("RAT evaluator stdin is unavailable"))?;
+		// Drain output while sending input: either side can exceed pipe capacity.
+		let (output, write) = std::thread::scope(|scope| {
+			let writer = scope.spawn(move || -> std::io::Result<()> {
+				let mut input = std::io::BufWriter::new(input);
+				for row in proposals.chunks_exact(names.len()) {
+					for (index, (name, value)) in names.iter().zip(row).enumerate() {
+						if index != 0 {
+							input.write_all(b",")?;
+						}
+						write!(input, "{name}={value}")?;
+					}
+					input.write_all(b"\n")?;
+				}
+				input.flush()
+			});
+			let output = child.wait_with_output();
+			(output, writer.join())
+		});
+		let output = output.map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
+		if !output.status.success() || !output.stderr.is_empty() {
+			let error = if output.stderr.is_empty() { output.status.to_string() } else { String::from_utf8_lossy(&output.stderr).trim().to_owned() };
+			return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display())));
+		}
+		write
+			.map_err(|_| RecipeError::new("RAT input writer panicked"))?
+			.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())))?;
+		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
+		let scores = stdout
+			.lines()
+			.map(|line| {
+				let value = line.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
+				require(value.is_finite(), format!("RAT evaluator {} score must be finite", self.path.display()))?;
+				Ok(value)
+			})
+			.collect::<Result<Vec<_>>>()?;
+		require(scores.len() == rows, format!("RAT evaluator {} returned {} scores for {rows} samples", self.path.display(), scores.len()))?;
+		Ok(scores)
+	}
+}
+enum RatEvent {
+	Line(String),
+	Error(String),
+	Closed,
+	ErrorsClosed,
+}
+/// One decision state of a stateful evaluator: the named state values, the
+/// action names, and every complete valid choice.
+struct RatState {
+	names: Vec<String>,
+	values: Vec<f64>,
+	outputs: Vec<String>,
+	choices: Vec<Vec<f64>>,
+}
+enum RatFrame {
+	State(RatState),
+	Score(f64),
+}
+/// A stateful evaluator started once with `RECIPE_RAT_PROTOCOL=1`: requests and
+/// replies are newline-delimited, `reset` opens an episode, `choose` sends one
+/// action, and `score` ends the episode.
+struct RatSession {
+	child: std::process::Child,
+	input: Option<std::process::ChildStdin>,
+	events: std::sync::mpsc::Receiver<RatEvent>,
+	path: PathBuf,
+	errors_closed: bool,
+}
+impl Drop for RatSession {
+	fn drop(&mut self) {
+		self.input.take();
+		self.child.kill().ok();
+		self.child.wait().ok();
+	}
+}
+fn rat_number(value: &str) -> Result<f64> {
+	let value = value.parse::<f64>().map_err(|_| RecipeError::new("RAT protocol expected a number"))?;
+	require(value.is_finite(), "RAT protocol number must be finite")?;
+	Ok(value)
+}
+fn rat_names(names: &[String]) -> Result<()> {
+	require(!names.is_empty() && names.iter().collect::<BTreeSet<_>>().len() == names.len(), "RAT protocol names must be nonempty and unique")?;
+	require(names.iter().all(|name| !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'='))), "RAT protocol names contain a separator")
+}
+impl RatSession {
+	fn open(command: &RatCommand) -> Result<Self> {
+		let mut child = Command::new(&command.path)
+			.env("RECIPE_RAT_PROTOCOL", "1")
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", command.path.display())))?;
+		let input = child.stdin.take();
+		let output = child.stdout.take().ok_or_else(|| RecipeError::new("RAT evaluator stdout is absent"))?;
+		let mut errors = child.stderr.take().ok_or_else(|| RecipeError::new("RAT evaluator stderr is absent"))?;
+		let (send, events) = std::sync::mpsc::channel();
+		let stderr_send = send.clone();
+		std::thread::spawn(move || {
+			use std::io::BufRead;
+			for line in std::io::BufReader::new(output).lines() {
+				let event = match line {
+					Ok(line) => RatEvent::Line(line),
+					Err(error) => RatEvent::Error(error.to_string()),
+				};
+				if send.send(event).is_err() {
+					return;
+				}
+			}
+			send.send(RatEvent::Closed).ok();
+		});
+		std::thread::spawn(move || {
+			let mut bytes = [0_u8; 4096];
+			loop {
+				match std::io::Read::read(&mut errors, &mut bytes) {
+					Ok(0) => {
+						stderr_send.send(RatEvent::ErrorsClosed).ok();
+						return;
+					}
+					Ok(n) => {
+						if stderr_send.send(RatEvent::Error(String::from_utf8_lossy(&bytes[..n]).into_owned())).is_err() {
+							return;
+						}
+					}
+					Err(error) => {
+						stderr_send.send(RatEvent::Error(error.to_string())).ok();
+						return;
+					}
+				}
+			}
+		});
+		Ok(Self { child, input, events, path: command.path.clone(), errors_closed: false })
+	}
+	fn send(&mut self, line: &str) -> Result<()> {
+		let input = self.input.as_mut().ok_or_else(|| RecipeError::new("RAT evaluator input is closed"))?;
+		writeln!(input, "{line}").and_then(|_| input.flush()).map_err(|error| RecipeError::new(format!("{} failed writing request: {error}", self.path.display())))
+	}
+	fn frame(&mut self) -> Result<RatFrame> {
+		let (mut names, mut values, mut outputs, mut choices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+		loop {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted while waiting for RAT evaluator")?;
+			let event = match self.events.recv_timeout(Duration::from_millis(100)) {
+				Ok(event) => event,
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+				Err(_) => return Err(RecipeError::new(format!("{} failed: evaluator streams closed", self.path.display()))),
+			};
+			let line = match event {
+				RatEvent::Line(line) => line,
+				RatEvent::Error(error) => return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display()))),
+				RatEvent::Closed => return Err(RecipeError::new(format!("{} failed: evaluator closed stdout before completing a frame", self.path.display()))),
+				RatEvent::ErrorsClosed => {
+					self.errors_closed = true;
+					continue;
+				}
+			};
+			if let Some(raw_score) = line.strip_prefix("score ") {
+				require(names.is_empty() && outputs.is_empty() && choices.is_empty(), "RAT score cannot accompany an unfinished state frame")?;
+				return Ok(RatFrame::Score(rat_number(raw_score)?));
+			} else if let Some(state) = line.strip_prefix("state ") {
+				require(names.is_empty() && outputs.is_empty(), "RAT state frame is duplicated or out of order")?;
+				for field in state.split(',') {
+					let (name, value) = field.split_once('=').ok_or_else(|| RecipeError::new("RAT state requires name=value fields"))?;
+					names.push(name.to_owned());
+					values.push(rat_number(value)?);
+				}
+				rat_names(&names)?;
+			} else if let Some(fields) = line.strip_prefix("actions ") {
+				require(!names.is_empty() && outputs.is_empty(), "RAT actions require one preceding state")?;
+				outputs = fields.split(',').map(str::to_owned).collect();
+				rat_names(&outputs)?;
+				require(!outputs.iter().any(|name| names.contains(name)), "RAT state and action names must differ")?;
+			} else if let Some(fields) = line.strip_prefix("choice ") {
+				require(!outputs.is_empty(), "RAT choice has no action schema")?;
+				let choice = fields.split(',').map(rat_number).collect::<Result<Vec<_>>>()?;
+				require(choice.len() == outputs.len(), "RAT choice width differs from action schema")?;
+				choices.push(choice);
+			} else if line == "ready" {
+				require(!names.is_empty() && !outputs.is_empty() && !choices.is_empty(), "RAT state requires values, action names, and at least one valid choice")?;
+				return Ok(RatFrame::State(RatState { names, values, outputs, choices }));
+			} else {
+				return Err(RecipeError::new(format!("{} failed: unknown RAT protocol record {line:?}", self.path.display())));
+			}
+		}
+	}
+	fn finish(&mut self) -> Result<()> {
+		self.send("close")?;
+		self.input.take();
+		let mut output_closed = false;
+		while !output_closed || !self.errors_closed {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted while closing RAT evaluator")?;
+			match self.events.recv_timeout(Duration::from_millis(100)) {
+				Ok(RatEvent::Closed) => output_closed = true,
+				Ok(RatEvent::ErrorsClosed) => self.errors_closed = true,
+				Ok(RatEvent::Error(error)) => return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display()))),
+				Ok(RatEvent::Line(_)) => return Err(RecipeError::new("RAT evaluator wrote an extra record after its last response")),
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+				Err(_) => return Err(RecipeError::new("RAT evaluator streams closed unexpectedly")),
+			}
+		}
+		let status = self.child.wait().map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator: {error}")))?;
+		require(status.success(), format!("{} failed with {status}", self.path.display()))
+	}
+}
+impl RatState {
+	/// The valid choice nearest the proposal, each column scaled by the range
+	/// the choices span in it.
+	fn select(&self, proposal: &[f64]) -> Result<Vec<f64>> {
+		require(proposal.len() == self.outputs.len() && proposal.iter().all(|value| value.is_finite()), "RAT proposal shape or values are invalid")?;
+		let ranges = (0..proposal.len())
+			.map(|column| {
+				let low = self.choices.iter().map(|row| row[column]).fold(f64::INFINITY, f64::min);
+				let high = self.choices.iter().map(|row| row[column]).fold(f64::NEG_INFINITY, f64::max);
+				(low, high)
+			})
+			.collect::<Vec<_>>();
+		let mut best = None;
+		for choice in &self.choices {
+			let mut distance = 0.0;
+			for (column, (low, high)) in ranges.iter().copied().enumerate() {
+				if low == high {
+					continue;
+				}
+				let scale = low.abs().max(high.abs()).max(1.0);
+				let difference = (proposal[column] / scale - choice[column] / scale) / (high / scale - low / scale);
+				distance += difference * difference;
+			}
+			require(distance.is_finite(), "RAT candidate distance overflow")?;
+			if best.as_ref().is_none_or(|(previous, _)| distance < *previous) {
+				best = Some((distance, choice));
+			}
+		}
+		Ok(best.ok_or_else(|| RecipeError::new("RAT has no valid choice"))?.1.clone())
+	}
+}
+struct RatEpisode {
+	observations: Vec<Vec<f64>>,
+	score: f64,
+	action: Vec<f64>,
+}
+/// One episode of a stateful evaluator: the proposer answers every state with
+/// the nearest valid choice until the evaluator scores the episode. Every
+/// observation is the state followed by the raw proposal.
+fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outputs: &[String], tape: &mut NativeTape, proposal_node: usize) -> Result<RatEpisode> {
+	let mut state = first;
+	let mut observations = Vec::new();
+	loop {
+		require(state.names == names && state.outputs == outputs, "RAT evaluator changed state or action schema")?;
+		tape.samples.write_float_bytes(0, &state.values, tape.precision.model)?;
+		tape.forward(ForwardMode::Inference)?;
+		let proposal = tape.predictions_at(proposal_node as i32, outputs.len())?;
+		let action = state.select(&proposal)?;
+		observations.push(state.values.iter().chain(&proposal).copied().collect());
+		session.send(&format!("choose {}", outputs.iter().zip(&action).map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(",")))?;
+		match session.frame()? {
+			RatFrame::State(next) => state = next,
+			RatFrame::Score(raw_score) => return Ok(RatEpisode { observations, score: raw_score, action }),
+		}
+	}
+}
+/// The proposer, the evaluator, and their composition: the proposer's output
+/// beside its input feeds the frozen evaluator, whose one output the loss
+/// drives toward the run's target.
+struct CommandRatComposition {
+	graph: Graph,
+	proposer: Graph,
+	storage_model: Model,
+	evaluator: Graph,
+	loss: LossFunction,
+	proposal: usize,
+	offset: usize,
+}
+fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
+	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
+	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
+	let mut proposer_model = model.clone();
+	proposer_model.downstream = None;
+	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, rows, gpu, config, true)?;
+	proposer.refresh_storage(config)?;
+	let observation_width = checked_add(prepared.features, prepared.target_width, "RAT evaluator input width")?;
+	let observations = Prepared::matrix(vec![0.0; observation_width], vec![0.0], 1, 1)?;
+	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
+	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
+	let proposal = proposer.nodes.len() - 1;
+	let (graph, offset) = compose_scored_graph(&proposer, &evaluator, config)?;
+	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset })
+}
+/// Route input channels to output channels through a frozen projection whose
+/// only nonzero weights are ones: `channels[output]` names the input channel
+/// output `output` copies, or none for a zero.
+fn embed(graph: &mut Graph, source: i32, shape: Shape, channels: impl IntoIterator<Item = Option<usize>>) -> Result<i32> {
+	let channels = channels.into_iter().collect::<Vec<_>>();
+	reset(graph, source, shape);
+	lower_project(graph, channels.len())?;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("channel embedding node is absent"))?;
+	let (offset, inputs, count) = (node.offset, node.input.channels, node.parameters);
+	for (output, input) in channels.into_iter().enumerate() {
+		if let Some(input) = input {
+			require(input < inputs, "channel embedding exceeds its input")?;
+			graph.parameters[offset + output * inputs + input] = 1.0;
+		}
+	}
+	graph.frozen[offset..offset + count].fill(1);
+	Ok(graph.source)
+}
+/// The proposer followed by the frozen scorer over `[input ; proposal]`. Returns
+/// the composed graph and the parameter offset where the scorer's weights start.
+fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, config: Config) -> Result<(Graph, usize)> {
+	let (features, targets) = if scorer_graph.input.length == 1 {
+		(Shape { channels: proposer.input.elements(), length: 1 }, Shape { channels: proposer.output.elements(), length: 1 })
+	} else {
+		(proposer.input, proposer.output)
+	};
+	require(features.length == targets.length, "RAT feature and proposal lengths differ")?;
+	let wide = Shape { channels: checked_add(features.channels, targets.channels, "RAT composition width")?, length: features.length };
+	require(scorer_graph.input == wide && scorer_graph.output.elements() == 1, "RAT score model has an incompatible shape")?;
+	let mut graph = proposer.clone();
+	let tail = graph.source;
+	let carried = embed(&mut graph, -1, features, (0..features.channels).map(Some).chain(std::iter::repeat_n(None, targets.channels)))?;
+	let proposed = embed(&mut graph, tail, targets, std::iter::repeat_n(None, features.channels).chain((0..targets.channels).map(Some)))?;
+	binary(&mut graph, carried, proposed, wide, ScalarOpcode::Add)?;
+	let offset = graph.parameters.len();
+	append_graph(&mut graph, scorer_graph.clone())?;
+	graph.frozen[offset..].fill(1);
+	graph.state.moments.resize(graph.parameters.len(), 0.0);
+	graph.state.variances.resize(graph.parameters.len(), 0.0);
+	graph.refresh_storage(config)?;
+	Ok((graph, offset))
+}
+/// The proposer's weights and optimizer state, read back out of the composition.
+fn extract_rat_proposer(composed: &Graph, proposer: &mut Graph, proposer_parameters: usize) {
+	proposer.parameters.copy_from_slice(&composed.parameters[..proposer_parameters]);
+	proposer.state = composed.state.clone();
+	proposer.state.moments.truncate(proposer_parameters);
+	proposer.state.variances.truncate(proposer_parameters);
+}
+/// The scored observations a policy retains: each row is `[input ; proposal]`
+/// and its raw score.
+struct RatReplay {
+	width: usize,
+	capacity: usize,
+	rows: VecDeque<Vec<f64>>,
+	raw: VecDeque<f64>,
+}
+impl RatReplay {
+	fn new(width: usize, capacity: usize) -> Result<Self> {
+		require(width != 0 && capacity != 0, "RAT replay dimensions must be positive")?;
+		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new() })
+	}
+	fn observe(&mut self, input: &[f64], value: f64) -> Result<f64> {
+		require(input.len() == self.width && input.iter().all(|entry| entry.is_finite()), "RAT observation has invalid features")?;
+		require(value.is_finite(), "RAT score must be finite")?;
+		if self.rows.len() == self.capacity {
+			self.rows.pop_front();
+			self.raw.pop_front();
+		}
+		self.rows.push_back(input.to_vec());
+		self.raw.push_back(value);
+		Ok(value)
+	}
+	fn snapshot(&self) -> (Vec<f64>, Vec<f64>) {
+		(self.rows.iter().flatten().copied().collect(), self.raw.iter().copied().collect())
+	}
+}
+fn rat_fit_steps(tape: &mut NativeTape, steps: usize, rate: f64, config: Config) -> Result<()> {
+	for _ in 0..steps {
+		tape.advance()?;
+		tape.epoch_launch(rate, config, EpochOperation::Full)?;
+	}
+	Ok(())
+}
+/// The evaluator under its own tape. A tape holds a fixed row count, so a
+/// different batch rebuilds the tape from the graph the previous tape wrote
+/// its weights and optimizer state back into.
+struct RatFit {
+	tape: NativeTape,
+	graph: Graph,
+	width: usize,
+	rows: usize,
+	gpu: &'static Gpu,
+	loss: LossFunction,
+	precision: Compute,
+}
+impl RatFit {
+	fn new(graph: &Graph, gpu: &'static Gpu, loss: LossFunction, config: Config) -> Result<Self> {
+		require(graph.output.elements() == 1, "RAT scoring model must emit one value")?;
+		let width = graph.input.elements();
+		let tape = NativeTape::new(graph, TapeInput::Values(&vec![0.0; width]), &vec![0.0; width], &[0.0], gpu, config.precision, Some(loss))?;
+		Ok(Self { tape, graph: graph.clone(), width, rows: 1, gpu, loss, precision: config.precision })
+	}
+	fn reserve(&mut self, rows: usize) -> Result<()> {
+		require(rows != 0, "RAT active row count must be positive")?;
+		if rows == self.rows {
+			return Ok(());
+		}
+		self.tape.capture(&mut self.graph)?;
+		let samples = vec![0.0; checked_mul(rows, self.width, "RAT fitting batch")?];
+		self.tape = NativeTape::new(&self.graph, TapeInput::Values(&samples), &samples, &vec![0.0; rows], self.gpu, self.precision, Some(self.loss))?;
+		self.rows = rows;
+		Ok(())
+	}
+	fn fit(&mut self, samples: &[f64], targets: &[f64], indices: &[usize], steps: usize, rate: f64, config: Config) -> Result<Option<f64>> {
+		require(samples.len() == checked_mul(targets.len(), self.width, "RAT fitting shape")?, "RAT fitting shape is invalid")?;
+		require(indices.iter().all(|index| *index < targets.len()), "RAT selected observation is absent")?;
+		if indices.is_empty() || steps == 0 {
+			return Ok(None);
+		}
+		self.reserve(indices.len())?;
+		let (selected_samples, selected_targets) = if indices.iter().copied().eq(0..targets.len()) {
+			(std::borrow::Cow::Borrowed(samples), std::borrow::Cow::Borrowed(targets))
+		} else {
+			(
+				std::borrow::Cow::Owned(indices.iter().flat_map(|&index| samples[index * self.width..(index + 1) * self.width].iter().copied()).collect::<Vec<_>>()),
+				std::borrow::Cow::Owned(indices.iter().map(|&index| targets[index]).collect::<Vec<_>>()),
+			)
+		};
+		self.tape.samples.write_float_bytes(0, &selected_samples, self.tape.precision.model)?;
+		self.tape.targets.write_float_bytes(0, &selected_targets, self.tape.precision.model)?;
+		rat_fit_steps(&mut self.tape, steps, rate, config)?;
+		self.tape.objective().map(Some)
+	}
+	fn predict(&mut self, samples: &[f64]) -> Result<Vec<f64>> {
+		require(samples.len() % self.width == 0, "RAT prediction shape is invalid")?;
+		if samples.is_empty() {
+			return Ok(Vec::new());
+		}
+		self.reserve(samples.len() / self.width)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.forward(ForwardMode::Inference)?;
+		self.tape.predictions()
+	}
+	fn weights(&self) -> Result<Vec<f64>> {
+		self.tape.weights()
+	}
+	/// One step over a single sequence-shaped row toward `target`.
+	fn fit_sequence(&mut self, samples: &[f64], target: f64, rate: f64, config: Config) -> Result<()> {
+		require(samples.len() == self.width, "RAT sequence input has the wrong shape")?;
+		self.reserve(1)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.targets.write_float_bytes(0, &[target], self.tape.precision.model)?;
+		rat_fit_steps(&mut self.tape, 1, rate, config)
+	}
+}
+/// One proposer update: the evaluator's current weights enter the composition
+/// at `offset`, the sample enters the input, and one epoch moves the proposer
+/// toward the target through the frozen evaluator.
+fn rat_backward(tape: &mut NativeTape, offset: usize, teacher_weights: &[f64], input: &[f64], rate: f64, config: Config) -> Result<()> {
+	tape.weights.write_float_bytes(checked_mul(offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?, teacher_weights, tape.precision.model)?;
+	tape.samples.write_float_bytes(0, input, tape.precision.model)?;
+	rat_fit_steps(tape, 1, rate, config)
+}
+/// The models of the learned replay policy. A selector reads the sequence of
+/// observations, each with its score and the evaluator's current prediction
+/// for it, and emits one selection value per observation; a selection scorer
+/// reads the same sequence beside the selection and predicts the evaluator's
+/// R-squared after fitting the selected observations; the actor composes the
+/// selector with the frozen scorer so the selector trains toward the highest
+/// predicted quality. Every graph is compiled for the exact number of
+/// observations; when the number changes, the graphs are compiled again and
+/// the convolution, pooling and output weights, which do not depend on the
+/// length, carry over with their optimizer state.
+struct LearnedSelector {
+	graph: Graph,
+	length: usize,
+}
+struct LearnedSelectionScore {
+	graph: Graph,
+	fit: RatFit,
+	length: usize,
+}
+struct LearnedActor {
+	graph: Graph,
+	tape: NativeTape,
+	selector_node: usize,
+	selector_parameters: usize,
+	score_offset: usize,
+	length: usize,
+}
+struct LearnedReplay {
+	width: usize,
+	context_width: usize,
+	gpu: &'static Gpu,
+	selector: Option<LearnedSelector>,
+	selection_score: Option<LearnedSelectionScore>,
+	actor: Option<LearnedActor>,
+}
+impl LearnedReplay {
+	fn new(width: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
+		require(width != 0, "learned RAT observation width must be positive")?;
+		require(config.surrogate_width != 0, "learned RAT hidden width must be positive")?;
+		Ok(Self { width, context_width: checked_add(width, 2, "learned RAT context width")?, gpu, selector: None, selection_score: None, actor: None })
+	}
+	/// Compile `model` over one row of a `shape` sequence with no output
+	/// projection: the model's own last block is its output.
+	fn compile_sequence(model: &Model, shape: Shape, gpu: &'static Gpu, config: Config) -> Result<Graph> {
+		let mut data = Prepared::matrix(vec![0.0; checked_mul(shape.channels, shape.length, "learned RAT sequence")?], Vec::new(), 1, 1)?;
+		data.sequence = Some((shape, shape));
+		data.target_width = 0;
+		compile(model, &data, &[], 1, gpu, config, true)
+	}
+	fn ensure_actor(&mut self, length: usize, config: Config) -> Result<()> {
+		require(length != 0, "learned RAT selection needs an observation")?;
+		if self.actor.as_ref().is_some_and(|actor| actor.length == length) {
+			return Ok(());
+		}
+		let mut previous = self.actor.take();
+		if let Some(actor) = previous.as_mut() {
+			actor.tape.capture(&mut actor.graph)?;
+			let selector = self.selector.as_mut().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
+			extract_rat_proposer(&actor.graph, &mut selector.graph, actor.selector_parameters);
+			selector.graph.refresh_storage(config)?;
+		}
+		self.ensure_selector(length, config)?;
+		self.ensure_selection_score(length, config)?;
+		let selector = self.selector.as_ref().ok_or_else(|| RecipeError::new("learned RAT selector is absent"))?;
+		let scorer = self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
+		let selector_node = selector.graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
+		let selector_parameters = selector.graph.parameters.len();
+		let (mut graph, score_offset) = compose_scored_graph(&selector.graph, &scorer.graph, config)?;
+		if let Some(previous) = previous {
+			copy_learned_state(&previous.graph, &mut graph)?;
+			graph.refresh_storage(config)?;
+		}
+		let input = vec![0.0; graph.input.elements()];
+		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[1.0], self.gpu, config.precision, Some(mse))?;
+		self.actor = Some(LearnedActor { graph, tape, selector_node, selector_parameters, score_offset, length });
+		Ok(())
+	}
+	fn ensure_selector(&mut self, length: usize, config: Config) -> Result<()> {
+		if self.selector.as_ref().is_some_and(|model| model.length == length) {
+			return Ok(());
+		}
+		let previous = self.selector.take();
+		let shape = Shape { channels: self.context_width, length };
+		let model = recipe.model().conv(config.surrogate_width, 1).tanh().conv(1, 1).sigmoid();
+		let mut graph = Self::compile_sequence(&model, shape, self.gpu, config)?;
+		require(graph.output == Shape { channels: 1, length }, "learned RAT selector emits one value per observation")?;
+		if let Some(previous) = previous {
+			copy_learned_state(&previous.graph, &mut graph)?;
+			graph.refresh_storage(config)?;
+		}
+		self.selector = Some(LearnedSelector { graph, length });
+		Ok(())
+	}
+	fn ensure_selection_score(&mut self, length: usize, config: Config) -> Result<()> {
+		if self.selection_score.as_ref().is_some_and(|model| model.length == length) {
+			return Ok(());
+		}
+		let previous = self.selection_score.take();
+		let shape = Shape { channels: checked_add(self.context_width, 1, "learned RAT selection channels")?, length };
+		let model = recipe.model().conv(config.surrogate_width, 1).tanh().pool(length).layer(1);
+		let mut graph = Self::compile_sequence(&model, shape, self.gpu, config)?;
+		require(graph.output == Shape { channels: 1, length: 1 }, "learned RAT selection scorer emits one value")?;
+		if let Some(mut previous) = previous {
+			previous.fit.tape.capture(&mut previous.graph)?;
+			copy_learned_state(&previous.graph, &mut graph)?;
+			graph.refresh_storage(config)?;
+		}
+		let fit = RatFit::new(&graph, self.gpu, mse, config)?;
+		self.selection_score = Some(LearnedSelectionScore { graph, fit, length });
+		Ok(())
+	}
+	/// Fit `target` on the observations the selector picks, then move the
+	/// scorer toward the quality that fit reached and the selector toward the
+	/// highest quality the scorer predicts. Returns the quality and the number
+	/// of observations fitted.
+	fn fit_selected(&mut self, target: &mut RatFit, samples: &[f64], targets: &[f64], steps: usize, rate: f64, selector_rate: f64, config: Config) -> Result<(f64, usize)> {
+		require(target.width == self.width, format!("learned RAT target width is {}, expected {}", target.width, self.width))?;
+		require(samples.len() == checked_mul(targets.len(), self.width, "learned RAT observations")?, "learned RAT observations have the wrong shape")?;
+		require(targets.iter().all(|value| value.is_finite()), "learned RAT observations contain a nonfinite score")?;
+		if targets.is_empty() {
+			require(samples.is_empty(), "learned RAT empty observations have nonempty samples")?;
+			return Ok((f64::NAN, 0));
+		}
+		let length = targets.len();
+		self.ensure_actor(length, config)?;
+		let before = target.predict(samples)?;
+		require(before.iter().all(|value| value.is_finite()), "learned RAT training context is not finite")?;
+		let context = samples.chunks_exact(self.width).zip(targets).zip(&before).flat_map(|((row, target), prediction)| row.iter().copied().chain([*target, *prediction])).collect::<Vec<_>>();
+		let selector_input = learned_channels(&context, self.context_width, length)?;
+		let actor = self.actor.as_mut().ok_or_else(|| RecipeError::new("learned RAT actor is absent"))?;
+		actor.tape.samples.write_float_bytes(0, &selector_input, actor.tape.precision.model)?;
+		let selector_node = actor.selector_node;
+		let score_offset = actor.score_offset;
+		let selector_tape = &mut actor.tape;
+		selector_tape.forward(ForwardMode::Inference)?;
+		let proposals = selector_tape.predictions_at(selector_node as i32, length)?;
+		require(proposals.len() == length && proposals.iter().all(|value| value.is_finite()), "learned RAT selector emitted invalid values")?;
+		let selected = proposals.iter().enumerate().filter_map(|(index, value)| (*value >= 0.5).then_some(index)).collect::<Vec<_>>();
+		// An empty selection is a valid outcome: the fit performs no optimizer
+		// step for it, and no fallback or rank heuristic stands in.
+		target.fit(samples, targets, &selected, steps, rate, config)?;
+		let predictions = target.predict(samples)?;
+		require(predictions.len() == targets.len(), "learned RAT target prediction count differs from observations")?;
+		let quality = coefficient(targets, &predictions);
+		require(quality.is_finite(), "learned RAT primary surrogate R2 is not finite")?;
+		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
+		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
+		scorer.fit.fit_sequence(&score_input, quality, rate, config)?;
+		let teacher_weights = scorer.fit.weights()?;
+		// The scorer is a frozen teacher in the composition: only the selector's
+		// parameters train, toward the highest predicted quality, the fixed 1.0.
+		if steps != 0 {
+			rat_backward(selector_tape, score_offset, &teacher_weights, &selector_input, selector_rate, config)?;
+		}
+		Ok((quality, if steps == 0 { 0 } else { selected.len() }))
+	}
+}
+/// Row-major observations to the channel-major sequence layout convolution
+/// nodes read.
+fn learned_channels(samples: &[f64], width: usize, length: usize) -> Result<Vec<f64>> {
+	require(samples.len() == checked_mul(width, length, "learned RAT channel layout")?, "learned RAT channel layout is invalid")?;
+	let mut channels = vec![0.0; samples.len()];
+	for channel in 0..width {
+		for row in 0..length {
+			channels[channel * length + row] = samples[row * width + channel];
+		}
+	}
+	Ok(channels)
+}
+fn learned_selection_input(samples: &[f64], width: usize, selection: &[f64]) -> Result<Vec<f64>> {
+	let length = selection.len();
+	let mut input = learned_channels(samples, width, length)?;
+	input.extend_from_slice(selection);
+	Ok(input)
+}
+/// Carry parameters and optimizer state across a sequence-length change; any
+/// other change of the parameter layout is refused rather than reset.
+fn copy_learned_state(old: &Graph, new: &mut Graph) -> Result<()> {
+	require(
+		old.parameters.len() == new.parameters.len()
+			&& old.nodes.len() == new.nodes.len()
+			&& old.nodes.iter().zip(&new.nodes).all(|(a, b)| a.op == b.op && a.input.channels == b.input.channels && a.output.channels == b.output.channels && a.parameters == b.parameters),
+		"learned RAT parameter layout changed",
+	)?;
+	new.parameters.clone_from(&old.parameters);
+	new.frozen.clone_from(&old.frozen);
+	new.state = old.state.clone();
+	Ok(())
+}
+/// The observations a command-RAT run proposes over: every source row as
+/// features, the declared targets as the proposal's names, no held-out split.
+fn prepare_command_data(data: &Data) -> Result<Prepared> {
+	require(!data.autoregressive, "command RAT requires tabular observations")?;
+	require(!data.target.is_empty(), "command RAT requires named proposal outputs")?;
+	let observations = Data {
+		sources: data.sources.clone(),
+		tests: data.tests.clone(),
+		autoregressive: false,
+		target: Vec::new(),
+		features: data.features.clone(),
+		normalize: data.normalize,
+		split: 1.0,
+		split_supplied: false,
+		prepared: OnceLock::new(),
+	};
+	let mut prepared = prepare_data(&observations)?;
+	prepared.target_width = data.target.len();
+	prepared.targets.clear();
+	prepared.schema.extend(data.target.iter().cloned().map(|name| ("target".to_owned(), name)));
+	Ok(prepared)
+}
 pub struct Train {
 	epochs: usize,
 	learning_rate: f64,
@@ -21689,6 +22487,8 @@ pub struct Train {
 	save: Option<PathBuf>,
 	seed: Option<usize>,
 	precision: Compute,
+	rat: Option<RatCommand>,
+	rat_target: Option<f64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -21855,15 +22655,374 @@ impl Train {
 		})
 	}
 	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport {
-		let evaluation = data.split < 1.0 || !data.tests.is_empty();
+		let evaluation = self.rat.is_none() && (data.split < 1.0 || !data.tests.is_empty());
 		let report = self.execute(model, data, evaluation);
 		if evaluation {
 			self.print_evaluation(model, &report)
 		}
 		report
 	}
+	/// Train the proposer against an external evaluator: `command` scores each
+	/// proposal, `policy` selects which scored observations fit the evaluator
+	/// model named by `.loss(&evaluator)`, and every epoch updates the proposer
+	/// once through the fitted evaluator. History fits all scored observations;
+	/// rolling retains the newest `floor(source_rows * split)`; online fits only
+	/// the newest one; full scores every source row each epoch. For command RAT,
+	/// `.split()` is required only by rolling and never creates a holdout.
+	pub fn rat(mut self, policy: RatPolicy, command: impl AsRef<Path>) -> Self {
+		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")), policy });
+		self
+	}
+	/// Desired raw command score for proposer optimization. Defaults to zero.
+	/// This does not replace the measured scores used to fit the evaluator.
+	pub fn target(mut self, value: f64) -> Self {
+		assert!(value.is_finite(), "RAT target must be finite");
+		self.rat_target = Some(value);
+		self
+	}
+	fn print_rat(&self, model: &Model, loss: &str, run: u64, epoch: usize, epochs: usize, value: f64, r2: f64, seconds: f64, schedule: &str, score: f64, window: usize, choices: usize) -> Result<()> {
+		if self.log_metrics.is_empty() {
+			return Ok(());
+		}
+		Self::write_progress(
+			&Self::metric_line(
+				loss,
+				&model.description(&self.log_metrics),
+				&self.log_metrics,
+				epochs,
+				schedule,
+				Metrics { run, epoch, loss: Some(value), r2: Some(r2), seconds, checkpoint: None, evaluation: false, score: Some(score), window: Some(window), choices: Some(choices) },
+			),
+			false,
+			true,
+		)
+	}
+	fn try_run_rat(&self, model: &Model, data: &Data, prepared: &Prepared, command: &RatCommand, gpu: &'static Gpu, config: Config, started: Instant) -> Result<TrainingReport> {
+		let capacity = command.policy.capacity(data, prepared.source_rows)?;
+		require(data.tests.is_empty(), "command RAT does not use held-out sources")?;
+		require(self.resume.is_none(), "a command RAT run does not support .resume()")?;
+		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
+		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
+		let proposal_width = prepared.target_width;
+		let observation_width = checked_add(prepared.features, proposal_width, "RAT evaluator input width")?;
+		let mut input_names = Vec::new();
+		for (_, field) in prepared.schema.iter().filter(|(kind, _)| kind == "feature") {
+			let (width, name) = field.split_once(' ').ok_or_else(|| RecipeError::new("RAT feature schema has no width"))?;
+			let width = width.parse::<usize>().map_err(|_| RecipeError::new("RAT feature schema has an invalid width"))?;
+			for index in 0..width {
+				input_names.push(if width == 1 { name.to_owned() } else { format!("{name}.{index}") });
+			}
+		}
+		require(input_names.len() == prepared.features, "RAT feature names do not match the sample width")?;
+		input_names.extend_from_slice(&data.target);
+		let source_rows = prepared.source_rows;
+		let full_set = command.policy == RatPolicy::Full;
+		let proposal_rows = if full_set { source_rows } else { 1 };
+		let proposals = Prepared::matrix(prepared.samples[..prepared.features].to_vec(), vec![0.0; proposal_width], 1, proposal_width)?;
+		let samples = if full_set { &prepared.samples[..checked_mul(source_rows, prepared.features, "RAT proposal inputs")?] } else { proposals.samples.as_slice() };
+		let mut composition = command_rat_graph(model, &proposals, 1, gpu, config)?;
+		composition.graph.state.training_rows = 1;
+		composition.proposer.state.training_rows = 1;
+		let proposer_parameters = composition.proposer.parameters.len();
+		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
+		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
+		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(samples), samples, &objectives, gpu, config.precision, Some(composition.loss))?;
+		tape.forward(ForwardMode::Inference)?;
+		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
+		let node_values = |tape: &NativeTape| -> Result<Vec<f64>> {
+			let values = tape.predictions_at(composition.proposal as i32, proposal_width)?;
+			Ok(values[..prediction_count.min(values.len())].to_vec())
+		};
+		let initial_predictions = node_values(&tape)?;
+		let observation = |sample: &[f64], proposal: &[f64]| -> Result<Vec<f64>> {
+			require(sample.len() == prepared.features && proposal.len() == proposal_width, "RAT sample or proposal has the wrong shape")?;
+			Ok(sample.iter().chain(proposal).copied().collect())
+		};
+		let mut replay = RatReplay::new(observation_width, capacity)?;
+		let initial_reward = if full_set {
+			f64::NAN
+		} else {
+			let initial_observation = observation(samples, &initial_predictions)?;
+			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
+		};
+		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+		// The `Loss` field reports the evaluator model's loss. The external
+		// command score is reported separately through `Score`; it is not a
+		// substitute for the evaluator's loss.
+		let mut initial_loss = f64::NAN;
+		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
+		let mut measured_reward = initial_reward;
+		let mut measured_predictions = initial_predictions.clone();
+		let mut last_evaluator_r2 = None;
+		let mut last_evaluator_loss = f64::NAN;
+		let tolerance = self.stop.unwrap_or(0.0);
+		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		let mut epoch_seconds = 0.0;
+		for iteration in 0..self.epochs {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted")?;
+			let epoch_started = Instant::now();
+			let row = iteration % source_rows;
+			let sample = if full_set { samples } else { &prepared.samples[row * prepared.features..(row + 1) * prepared.features] };
+			if full_set {
+				replay.rows.clear();
+				replay.raw.clear();
+				// One invocation scores the whole set before either optimizer update.
+				let observed = sample
+					.chunks_exact(prepared.features)
+					.zip(measured_predictions.chunks_exact(proposal_width))
+					.flat_map(|(features, prediction)| features.iter().chain(prediction).copied())
+					.collect::<Vec<_>>();
+				let scores = command.evaluate(&input_names, &observed)?;
+				for (row, value) in observed.chunks_exact(observation_width).zip(scores) {
+					replay.observe(row, value)?;
+				}
+			}
+			let (evaluation_samples, evaluation_targets) = replay.snapshot();
+			let fitted_rows = if let Some(selector) = &mut selector {
+				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
+			} else {
+				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
+				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
+				indices.len()
+			};
+			let evaluator_predictions = fitting.predict(&evaluation_samples)?;
+			let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
+			let evaluator_loss = model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7]);
+			last_evaluator_r2 = Some(evaluator_r2);
+			last_evaluator_loss = evaluator_loss;
+			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
+			tape.forward(ForwardMode::Inference)?;
+			let predictions = node_values(&tape)?;
+			let (measured_score, reward) = if full_set {
+				(replay.raw.iter().sum::<f64>() / replay.raw.len() as f64, mean(&evaluation_targets))
+			} else {
+				let observed = observation(sample, &predictions)?;
+				let raw_score = command.evaluate(&input_names, &observed)?[0];
+				(raw_score, replay.observe(&observed, raw_score)?)
+			};
+			if iteration == 0 {
+				initial_loss = evaluator_loss;
+			}
+			measured_reward = reward;
+			measured_predictions = predictions;
+			let seconds = epoch_started.elapsed().as_secs_f64();
+			epoch_seconds += seconds;
+			self.print_rat(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, &tape.schedule(), measured_score, fitted_rows, proposal_rows)?;
+		}
+		// Full evaluates the proposals that fed each update. The last update
+		// creates a fresh proposal set, so score that saved set once before
+		// returning: one evaluation per training epoch and one final evaluation.
+		if full_set {
+			let observed = samples
+				.chunks_exact(prepared.features)
+				.zip(measured_predictions.chunks_exact(proposal_width))
+				.flat_map(|(features, prediction)| features.iter().chain(prediction).copied())
+				.collect::<Vec<_>>();
+			let scores = command.evaluate(&input_names, &observed)?;
+			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
+				replay.observe(row, value)?;
+			}
+			let (_, final_targets) = replay.snapshot();
+			measured_reward = mean(&final_targets);
+		}
+		let (evaluation_samples, evaluation_targets) = replay.snapshot();
+		let evaluator_predictions = fitting.predict(&evaluation_samples)?;
+		let evaluator_r2 = last_evaluator_r2.or_else(|| (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions)));
+		let predicted_reward = if evaluation_targets.is_empty() {
+			None
+		} else if full_set {
+			Some(mean(&evaluator_predictions))
+		} else {
+			Some(mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?))
+		};
+		let final_loss = if last_evaluator_loss.is_finite() {
+			last_evaluator_loss
+		} else if evaluator_r2.is_some() {
+			model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7])
+		} else {
+			f64::NAN
+		};
+		let selected_tile = tape.tile();
+		let schedule = tape.schedule();
+		tape.capture(&mut composition.graph)?;
+		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
+		composition.proposer.state.training_rows = proposal_rows;
+		let seen_rows = if full_set {
+			if self.epochs == 0 { 0 } else { source_rows }
+		} else {
+			self.epochs.max(1).min(source_rows)
+		};
+		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..seen_rows]);
+		composition.proposer.state.trained_samples.sort_unstable();
+		composition.proposer.state.trained_samples.dedup();
+		if let Some(path) = &self.save {
+			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, data, None, config.precision, native_target_label(&gpu.native_target));
+			stored.bn_stats = tape.extract_bn_stats()?;
+			stored.bn_stats.truncate(proposer_bn);
+			stored.norm_mean.clone_from(&prepared.norm_mean);
+			stored.norm_scale.clone_from(&prepared.norm_scale);
+			stored.outputs.clone_from(&data.target);
+			stored.artifact = bundle::artifact_key(&composition.storage_model, &prepared.schema, config.precision, &composition.proposer, native_target_label(&gpu.native_target));
+			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
+		}
+		Ok(TrainingReport {
+			initial_loss,
+			final_loss,
+			initial_predictions,
+			predictions: measured_predictions,
+			r2: f64::NAN,
+			evaluator_r2,
+			validation_r2: None,
+			predicted_reward,
+			measured_reward: measured_reward.is_finite().then_some(measured_reward),
+			tile: selected_tile,
+			schedule,
+			run,
+			epoch: tape.step as usize,
+			seconds: started.elapsed().as_secs_f64(),
+			epoch_seconds,
+		})
+	}
+	fn try_run_stateful_rat(&self, model: &Model, data: &Data, command: &RatCommand, started: Instant) -> Result<TrainingReport> {
+		require(
+			data.sources.is_empty() && data.tests.is_empty() && data.target.is_empty() && matches!(data.features, FeatureSelection::All) && !data.normalize,
+			"stateful RAT takes its state and action schema from the evaluator; data selectors and normalization are unsupported",
+		)?;
+		require(self.resume.is_none(), "stateful RAT does not support resume")?;
+		require(self.stop.is_none_or(|value| value == 1.0), "stateful RAT terminates episodes using evaluator scores, not .stop()")?;
+		require(self.epochs != 0, "stateful RAT requires at least one update")?;
+		command.policy.capacity(data, 1)?;
+		let mut session = RatSession::open(command)?;
+		session.send("reset")?;
+		let first = match session.frame()? {
+			RatFrame::State(state) => state,
+			RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT requires an initial decision state")),
+		};
+		let names = first.names.clone();
+		let outputs = first.outputs.clone();
+		let mut prepared = Prepared::matrix(first.values.clone(), vec![0.0; outputs.len()], 1, outputs.len())?;
+		prepared.schema = names.iter().map(|name| ("feature".to_owned(), format!("1 {name}"))).chain(outputs.iter().map(|name| ("target".to_owned(), name.clone()))).collect();
+		let gpu = selected_gpu()?;
+		let mut config = Config::load()?;
+		config.precision = self.precision;
+		if let Some(seed) = self.seed {
+			config.random_seed = seed;
+		}
+		let mut composition = command_rat_graph(model, &prepared, 1, gpu, config)?;
+		let proposer_parameters = composition.proposer.parameters.len();
+		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(&first.values), &first.values, &[self.rat_target.unwrap_or(0.0)], gpu, config.precision, Some(composition.loss))?;
+		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let width = names.len() + outputs.len();
+		let mut replay = RatReplay::new(width, usize::MAX)?;
+		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
+		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+		let initial_predictions = episode.action.clone();
+		let (mut initial_loss, mut final_loss, mut evaluator_r2, mut epoch_seconds) = (f64::NAN, f64::NAN, f64::NAN, 0.0);
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		for iteration in 0..self.epochs {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during stateful RAT training")?;
+			let epoch_started = Instant::now();
+			replay.capacity = command.policy.capacity(data, episode.observations.len())?;
+			if command.policy == RatPolicy::Full {
+				replay.rows.clear();
+				replay.raw.clear();
+			}
+			while replay.rows.len() > replay.capacity {
+				replay.rows.pop_front();
+				replay.raw.pop_front();
+			}
+			for observation in &episode.observations {
+				replay.observe(observation, episode.score)?;
+			}
+			let (samples, targets) = replay.snapshot();
+			let fitted_rows = if let Some(selector) = &mut selector {
+				selector.fit_selected(&mut fitting, &samples, &targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
+			} else {
+				fitting.fit(&samples, &targets, &(0..targets.len()).collect::<Vec<_>>(), 1, config.surrogate_rate, config)?;
+				targets.len()
+			};
+			let predictions = fitting.predict(&samples)?;
+			final_loss = model_loss(&predictions, &targets, composition.loss, config.activation[7]);
+			evaluator_r2 = coefficient(&targets, &predictions);
+			if iteration == 0 {
+				initial_loss = final_loss;
+			}
+			// One proposer update uses a retained decision state. All labels are
+			// the evaluator's terminal score, never a fabricated intermediate score.
+			let row = iteration % targets.len();
+			rat_backward(&mut tape, composition.offset, &fitting.weights()?, &samples[row * width..row * width + names.len()], self.learning_rate, config)?;
+			session.send("reset")?;
+			let first = match session.frame()? {
+				RatFrame::State(state) => state,
+				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
+			};
+			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			let seconds = epoch_started.elapsed().as_secs_f64();
+			epoch_seconds += seconds;
+			self.print_rat(model, composition.loss.name(), run, iteration + 1, self.epochs, final_loss, evaluator_r2, seconds, &tape.schedule(), episode.score, fitted_rows, episode.observations.len())?;
+		}
+		session.finish()?;
+		let reward = episode.score;
+		let final_observation = episode.observations.last().ok_or_else(|| RecipeError::new("stateful RAT episode has no decisions"))?;
+		let predicted_reward = fitting.predict(final_observation)?[0];
+		tape.capture(&mut composition.graph)?;
+		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
+		if let Some(path) = &self.save {
+			let saved_data = Data {
+				sources: Vec::new(),
+				tests: Vec::new(),
+				autoregressive: false,
+				target: Vec::new(),
+				features: FeatureSelection::All,
+				normalize: false,
+				split: 1.0,
+				split_supplied: false,
+				prepared: OnceLock::new(),
+			};
+			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, &saved_data, None, config.precision, native_target_label(&gpu.native_target));
+			stored.outputs = outputs;
+			stored.bn_stats = tape.extract_bn_stats()?;
+			let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
+			stored.bn_stats.truncate(proposer_bn);
+			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
+		}
+		Ok(TrainingReport {
+			initial_loss,
+			final_loss,
+			initial_predictions,
+			predictions: episode.action,
+			r2: f64::NAN,
+			evaluator_r2: Some(evaluator_r2),
+			validation_r2: None,
+			predicted_reward: Some(predicted_reward),
+			measured_reward: Some(reward),
+			tile: tape.tile(),
+			schedule: tape.schedule(),
+			run,
+			epoch: self.epochs,
+			seconds: started.elapsed().as_secs_f64(),
+			epoch_seconds,
+		})
+	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
+		require(self.rat.is_some() || model.downstream.is_none(), ".loss(&model) requires .rat(policy, command)")?;
+		require(self.rat.is_some() || self.rat_target.is_none(), "Train::target requires command RAT")?;
+		if let Some(command) = &self.rat {
+			command.policy.validate(data)?;
+			if data.autoregressive && data.sources.is_empty() {
+				return self.try_run_stateful_rat(model, data, command, started);
+			}
+			let prepared = prepare_command_data(data)?;
+			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+			config.precision = self.precision;
+			if let Some(seed) = self.seed {
+				config.random_seed = seed;
+			}
+			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
+		}
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
@@ -22008,6 +23167,10 @@ impl Train {
 			initial_predictions,
 			predictions,
 			r2,
+			evaluator_r2: None,
+			validation_r2: None,
+			predicted_reward: None,
+			measured_reward: None,
 			tile: tape.tile(),
 			schedule: tape.schedule(),
 			run,
@@ -22042,7 +23205,7 @@ impl Train {
 				&self.log_metrics,
 				epochs,
 				schedule,
-				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false },
+				Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false, score: None, window: None, choices: None },
 			),
 			live,
 			true,
@@ -22058,7 +23221,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
 			),
 			false,
 			true,
@@ -22090,6 +23253,11 @@ impl Train {
 				8 => continue,
 				10 if schedule.is_empty() => continue,
 				10 => format!("tile \x1b[38\x3b2\x3b135\x3b90\x3b251m{schedule}\x1b[0m"),
+				11 => match measurement.score {
+					Some(value) => format!("score \x1b[38\x3b2\x3b135\x3b90\x3b251m{value:.9}\x1b[0m"),
+					None => continue,
+				},
+				12 | 13 => continue,
 				_ => unreachable!(),
 			};
 			values.push(value);
@@ -22100,6 +23268,16 @@ impl Train {
 				CheckpointStatus::Kept => "kept",
 			}
 			.to_owned())
+		}
+		if metrics.iter().any(|metric| metric.0 == Choices.0)
+			&& let Some(count) = measurement.choices
+		{
+			values.push(format!("choices {count}"));
+		}
+		if metrics.iter().any(|metric| metric.0 == Window.0)
+			&& let Some(count) = measurement.window
+		{
+			values.push(format!("window {count}"));
 		}
 		values.join("  ")
 	}
@@ -22125,7 +23303,7 @@ impl Train {
 	}
 	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now();
-		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false };
+		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false, score: None, window: None, choices: None };
 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live {
@@ -22182,6 +23360,11 @@ struct Metrics {
 	seconds: f64,
 	checkpoint: Option<CheckpointStatus>,
 	evaluation: bool,
+	/// The external command's raw score, the observations fitted, and the
+	/// decisions scored, on a command-RAT epoch.
+	score: Option<f64>,
+	window: Option<usize>,
+	choices: Option<usize>,
 }
 pub struct TrainingReport {
 	initial_loss: f64,
@@ -22189,6 +23372,14 @@ pub struct TrainingReport {
 	initial_predictions: Vec<f64>,
 	predictions: Vec<f64>,
 	r2: f64,
+	/// On a command-RAT run: the evaluator's R-squared over the observations it
+	/// fitted, over measured proposals withheld from fitting when there are any,
+	/// its predicted raw score for the last proposal, and the command's measured
+	/// raw score for it.
+	evaluator_r2: Option<f64>,
+	validation_r2: Option<f64>,
+	predicted_reward: Option<f64>,
+	measured_reward: Option<f64>,
 	tile: Tile,
 	schedule: String,
 	run: u64,
@@ -22211,6 +23402,22 @@ impl TrainingReport {
 	}
 	pub const fn r2(&self) -> f64 {
 		self.r2
+	}
+	/// The evaluator's R-squared over the observations it fitted, on a command-RAT run.
+	pub const fn evaluator_r2(&self) -> Option<f64> {
+		self.evaluator_r2
+	}
+	/// R-squared over measured proposals withheld from evaluator fitting, when there are any.
+	pub const fn validation_r2(&self) -> Option<f64> {
+		self.validation_r2
+	}
+	/// The evaluator's predicted raw command score for the last proposal.
+	pub const fn predicted_reward(&self) -> Option<f64> {
+		self.predicted_reward
+	}
+	/// The raw command score measured for the last proposal.
+	pub const fn measured_reward(&self) -> Option<f64> {
+		self.measured_reward
 	}
 	pub const fn tile(&self) -> [u32; 3] {
 		[self.tile.m, self.tile.n, self.tile.k]
