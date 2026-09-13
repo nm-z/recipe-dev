@@ -5,13 +5,9 @@ name: os/device check
 # uploads machine-readable evidence for the exact source snapshot it ran.
 
 on:
-  pull_request:
-    branches:
-      - minimal
-    # No path filters: a required check must never be omitted by a path rule.
   push:
     branches:
-      - minimal
+      - '**'
   workflow_dispatch:
     inputs:
       request_id:
@@ -37,10 +33,9 @@ permissions:
 concurrency:
   # Provider jobs are not cancelled in place. Camber's current CLI has no
   # cancellation operation, and cancelling a run can leave a pending provider
-  # job alive after GitHub has forgotten its cleanup context. GitHub still
-  # keeps one running and one pending candidate per pull request; a newer
-  # pending candidate replaces only an older pending candidate.
-  group: recipe-runtime-${{ inputs.request_id || github.event.pull_request.number || github.ref }}
+  # job alive after GitHub has forgotten its cleanup context. Give every push
+  # its own group so rapid pushes cannot replace an older pending run.
+  group: recipe-runtime-${{ inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
 env:
@@ -48,33 +43,21 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. linux/cpu -- Arch userspace on a GitHub runner, CPU backend. This check
-  # also publishes its immutable source snapshot for the other platform jobs.
+  # 0. prepare -- resolves the candidate commit and publishes the immutable
+  # source snapshot every platform check consumes. Nothing else waits on a
+  # platform check.
   # ---------------------------------------------------------------------------
-  linux-cpu:
-    name: linux/cpu
+  prepare:
+    name: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    container:
-      image: archlinux:base-devel
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
-    env:
-      CELL: recipe/linux-cpu
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
       snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
     steps:
-      - name: Install the Arch toolchain
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            pacman -S --noconfirm --needed azure-cli
-          fi
-          echo "pacman toolchain installed"
-
       - name: Check out the controller
         uses: actions/checkout@v4
         with:
@@ -120,7 +103,7 @@ jobs:
               exit 1
             fi
             echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-            echo "candidate $candidate_sha supplied by the minimal push"
+            echo "candidate $candidate_sha supplied by the branch push"
             exit 0
           fi
           if [ "$EVENT_NAME" != "pull_request" ]; then
@@ -237,13 +220,46 @@ jobs:
           path: /tmp/recipe-source.tar.gz
           retention-days: 5
 
+  # ---------------------------------------------------------------------------
+  # 1. linux/cpu -- Arch userspace on a GitHub runner, CPU backend.
+  # ---------------------------------------------------------------------------
+  linux-cpu:
+    name: linux/cpu
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: archlinux:base-devel
+    permissions:
+      contents: read
+    env:
+      CELL: recipe/linux-cpu
+    steps:
+      - name: Install the Arch toolchain
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip
+          echo "pacman toolchain installed"
+
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable source snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
       - name: Verify and extract the source snapshot
         run: |
           set -euo pipefail
-          actual="$(sha256sum /tmp/recipe-source.tar.gz | cut -d' ' -f1)"
-          [ "$actual" = "${{ steps.snapshot.outputs.sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/candidate"
-          tar -xzf /tmp/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           echo "snapshot verified and extracted to candidate sha256=$actual"
 
       - name: Record the toolchain
@@ -310,7 +326,7 @@ jobs:
           cat > candidate/evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ steps.resolve.outputs.candidate_sha }}",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "os": "$(. /etc/os-release && echo "$PRETTY_NAME")",
@@ -325,7 +341,7 @@ jobs:
               "cargo": "$(cargo --version 2>/dev/null || echo unknown)",
               "clang": "$(clang --version 2>/dev/null | head -1 || echo unknown)"
             },
-            "snapshot_sha256": "${{ steps.snapshot.outputs.sha256 }}"
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
           }
           JSON
           cat candidate/evidence/cell.json
@@ -344,8 +360,7 @@ jobs:
   # ---------------------------------------------------------------------------
   linux-gpu:
     name: linux/nv
-    needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -369,7 +384,7 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
-          [ "$actual" = "${{ needs.linux-cpu.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/candidate"
           tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           echo "snapshot verified and extracted to candidate sha256=$actual"
@@ -397,9 +412,9 @@ jobs:
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
         env:
-          CANDIDATE_SHA: ${{ needs.linux-cpu.outputs.candidate_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
-          SNAPSHOT_SHA256: ${{ needs.linux-cpu.outputs.snapshot_sha256 }}
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
 
       - name: Terminate the Camber job
@@ -421,13 +436,13 @@ jobs:
             cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.linux-cpu.outputs.candidate_sha }}",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "backend": "unavailable",
             "device": "unavailable",
             "gpu_execution": false,
-            "snapshot_sha256": "${{ needs.linux-cpu.outputs.snapshot_sha256 }}"
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
           }
           JSON
           fi
@@ -449,8 +464,7 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-cpu:
     name: win/cpu
-    needs: linux-cpu
-    if: ${{ always() && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    needs: prepare
     runs-on: windows-2025
     timeout-minutes: 45
     env:
@@ -475,7 +489,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $archive = Join-Path $env:GITHUB_WORKSPACE "snapshot\recipe-source.tar.gz"
           $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
-          if ($actual -ne "${{ needs.linux-cpu.outputs.snapshot_sha256 }}".ToLower()) { throw "snapshot checksum mismatch: $actual" }
+          if ($actual -ne "${{ needs.prepare.outputs.snapshot_sha256 }}".ToLower()) { throw "snapshot checksum mismatch: $actual" }
           $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
           New-Item -ItemType Directory -Force -Path $candidate | Out-Null
           tar.exe -xzf $archive -C $candidate
@@ -684,7 +698,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path evidence | Out-Null
           $document = [ordered]@{
             cell           = $env:CELL
-            commit         = "${{ needs.linux-cpu.outputs.candidate_sha }}"
+            commit         = "${{ needs.prepare.outputs.candidate_sha }}"
             run_id         = "${{ github.run_id }}"
             run_attempt    = "${{ github.run_attempt }}"
             os             = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -698,7 +712,7 @@ jobs:
               cargo = (cargo --version)
               clang = (& (Join-Path $env:ProgramFiles "LLVM\bin\clang.exe") --version | Select-Object -First 1)
             }
-            snapshot_sha256 = "${{ needs.linux-cpu.outputs.snapshot_sha256 }}"
+            snapshot_sha256 = "${{ needs.prepare.outputs.snapshot_sha256 }}"
           }
           $document | ConvertTo-Json -Depth 5 | Set-Content -Path evidence\cell.json -Encoding utf8
           Get-Content evidence\cell.json
@@ -718,17 +732,15 @@ jobs:
   # ---------------------------------------------------------------------------
   windows-gpu:
     name: win/nv
-    needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    needs: prepare
     runs-on: ubuntu-24.04
+    environment: recipe-windows-gpu
     timeout-minutes: 90
     concurrency:
-      # Keep one Windows GPU worker per pull request, rather than one global
-      # pending slot for the repository. GitHub retains only one running and
-      # one pending job in a concurrency group, so a global group silently
-      # cancelled every older PR's queued job before it ran. azure-run.sh
-      # still admits only one worker at a time through the Azure lease.
-      group: recipe-windows-nvidia-${{ github.event.pull_request.number || github.run_id }}
+      # Keep one Windows GPU worker per push run rather than one global pending
+      # slot. azure-run.sh still admits only one worker at a time through the
+      # Azure lease.
+      group: recipe-windows-nvidia-${{ github.run_id }}
       cancel-in-progress: false
     permissions:
       actions: read
@@ -760,7 +772,7 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
-          [ "$actual" = "${{ needs.linux-cpu.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/candidate"
           tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           echo "snapshot verified and extracted to candidate sha256=$actual"
@@ -794,9 +806,9 @@ jobs:
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
         env:
-          CANDIDATE_SHA: ${{ needs.linux-cpu.outputs.candidate_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
-          SNAPSHOT_SHA256: ${{ needs.linux-cpu.outputs.snapshot_sha256 }}
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -823,13 +835,13 @@ jobs:
             cat > evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.linux-cpu.outputs.candidate_sha }}",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "backend": "unavailable",
             "device": "unavailable",
             "gpu_execution": false,
-            "snapshot_sha256": "${{ needs.linux-cpu.outputs.snapshot_sha256 }}"
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
           }
           JSON
           fi
@@ -849,8 +861,7 @@ jobs:
   # ---------------------------------------------------------------------------
   macos-cpu:
     name: mac/cpu
-    needs: linux-cpu
-    if: ${{ always() && github.event_name != 'push' && needs.linux-cpu.outputs.snapshot_sha256 != '' }}
+    needs: prepare
     runs-on: macos-15
     timeout-minutes: 45
     env:
@@ -874,7 +885,7 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(shasum -a 256 snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
-          [ "$actual" = "${{ needs.linux-cpu.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/candidate"
           tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           [ "$(uname -m)" = "arm64" ] || { echo "this cell requires an ARM64 runner, got $(uname -m)" >&2; exit 1; }
@@ -937,7 +948,7 @@ jobs:
           cat > candidate/evidence/cell.json <<JSON
           {
             "cell": "$CELL",
-            "commit": "${{ needs.linux-cpu.outputs.candidate_sha }}",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
             "run_id": "${{ github.run_id }}",
             "run_attempt": "${{ github.run_attempt }}",
             "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
@@ -953,7 +964,7 @@ jobs:
               "clang_path": "${{ steps.toolchain.outputs.clang_path }}",
               "ld_path": "${{ steps.toolchain.outputs.ld_path }}"
             },
-            "snapshot_sha256": "${{ needs.linux-cpu.outputs.snapshot_sha256 }}"
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
           }
           JSON
           cat candidate/evidence/cell.json

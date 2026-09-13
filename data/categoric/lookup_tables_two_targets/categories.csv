@@ -1,0 +1,17 @@
+input,label,weight
+red,accept,0.5000
+green,review,0.5500
+blue,accept,0.6000
+amber,review,0.6500
+red,accept,0.7000
+green,review,0.7500
+blue,accept,0.8000
+amber,review,0.8500
+red,accept,0.9000
+green,review,0.9500
+blue,accept,1.0000
+amber,review,0.5000
+red,accept,0.5500
+green,review,0.6000
+blue,accept,0.6500
+amber,review,0.7000

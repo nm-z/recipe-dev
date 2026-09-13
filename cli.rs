@@ -1,17 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [argument | export]\n       recipe --worker <device>";
-#[cfg(target_os = "linux")]
-const PR_SET_PDEATHSIG: i32 = 1;
-#[cfg(target_os = "linux")]
-const SIGTERM: usize = 15;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-	fn prctl(option: i32, argument: usize, third: usize, fourth: usize, fifth: usize) -> i32;
-}
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -69,7 +58,7 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
-fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
+fn run(source: &Path, device: Option<&str>) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -96,26 +85,7 @@ fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
-	if let Some(argument) = argument {
-		command.arg(argument);
-	}
-	#[cfg(target_os = "linux")]
-	unsafe {
-		command.pre_exec(|| {
-			if prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) == 0 {
-				Ok(())
-			} else {
-				Err(std::io::Error::last_os_error())
-			}
-		});
-	}
-	// The running child holds the inode, so unlinking now leaves nothing behind
-	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| {
-		#[cfg(unix)]
-		fs::remove_file(&output).ok();
-		child.wait()
-	});
+	let status = command.status();
 	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	#[cfg(unix)]
@@ -169,13 +139,14 @@ fn main() {
 	let source = source.unwrap_or_else(|| invalid(USAGE));
 	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
 	let device = device.as_deref();
-	let source = PathBuf::from(source);
+	let source = Path::new(&source);
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
+		None => run(source, device),
 		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
-		Some("export") => export(&source, device),
-		values => run(&source, device, values),
+		Some("export") => export(source, device),
+		Some(_) => invalid(USAGE),
 	}
 }

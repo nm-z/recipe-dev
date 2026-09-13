@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RNJ-1 · Local chat</title>
+<style>
+:root{color-scheme:dark;font:16px/1.6 system-ui;background:#111413;color:#e7ebe7}*{box-sizing:border-box}body{margin:0}main{max-width:880px;margin:auto;padding:28px 24px 190px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #343a36;padding-bottom:20px}h1{font-size:23px;margin:0}small,#status{color:#aab8ad}button,select,textarea{font:inherit;color:inherit;background:#222923;border:1px solid #49554b;border-radius:10px}button{padding:9px 16px;cursor:pointer}button:disabled{opacity:.45;cursor:default}#empty{margin:90px 0;text-align:center;color:#aab8ad}article{padding:22px 0;border-bottom:1px solid #29312b}article b{font-size:12px;letter-spacing:.1em;color:#a9c7af}article.user b{color:#b5bfff}.content{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}footer{position:fixed;bottom:0;background:#111413f5;width:100%;padding:16px 24px;border-top:1px solid #343a36}form{max-width:832px;margin:auto}textarea{width:100%;resize:vertical;padding:12px;min-height:70px;max-height:200px}.controls{display:flex;gap:12px;align-items:center;margin-top:8px;font-size:13px}#status{flex:1;white-space:pre-line}#send{background:#bedbc4;color:#112416;border:0}select{padding:5px}#stop{display:none}.error{color:#ffb4ab}
+</style>
+<main><header><div><h1>RNJ-1</h1><small>Local · Q4 · 32,768-token context</small></div><button id="reset">New chat</button></header><div id="messages"></div><div id="empty">Talk to RNJ-1 on your GPU.<br>Your conversation stays in this browser.</div></main>
+<footer><form id="form"><textarea id="prompt" placeholder="Message RNJ-1…" required autofocus></textarea><div class="controls"><span id="status">Ready</span><label>Reply <select id="tokens"><option>128</option><option selected>512</option><option>1024</option><option>2048</option><option>4096</option></select></label><button type="button" id="stop">Stop</button><button id="send">Send</button></div></form></footer>
+<script>
+const $ = id => document.getElementById(id);
+let messages = []; try { messages = JSON.parse(localStorage.getItem('rnj-chat') || '[]'); } catch {}
+let controller;
+function save(){localStorage.setItem('rnj-chat',JSON.stringify(messages))}
+function bubble(m){const a=document.createElement('article');a.className=m.role;const b=document.createElement('b');b.textContent=m.role==='user'?'YOU':'RNJ-1';const c=document.createElement('div');c.className='content';c.textContent=m.content;a.append(b,c);$('messages').append(a);return c}
+function render(){$('messages').replaceChildren();messages.forEach(bubble);$('empty').hidden=!!messages.length}render();
+$('reset').onclick=()=>{messages=[];save();render();$('status').textContent='Ready';$('prompt').focus()};
+$('stop').onclick=()=>controller?.abort();
+$('prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!$('send').disabled)$('form').requestSubmit()}};
+$('form').onsubmit=async e=>{
+ e.preventDefault();const content=$('prompt').value.trim();if(!content)return;
+ messages.push({role:'user',content});save();render();$('prompt').value='';
+ const reply={role:'assistant',content:''};const node=bubble(reply);controller=new AbortController();
+ $('send').disabled=$('reset').disabled=true;$('stop').style.display='block';$('status').className='';$('status').textContent='Connecting…';
+ let completed=false, count=0;
+ try{
+  const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages,tokens:Number($('tokens').value)}),signal:controller.signal});
+  if(!r.ok)throw Error(await r.text());const reader=r.body.getReader(),decoder=new TextDecoder();let buffer='';
+  while(true){const {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let end;
+   while((end=buffer.indexOf('\n'))>=0){const event=JSON.parse(buffer.slice(0,end));buffer=buffer.slice(end+1);
+    if(event.error)throw Error(event.error);
+    if(event.promptTokens){count=event.promptTokens;$('status').textContent=`${count.toLocaleString()} / 32,768 prompt tokens · Preparing reply…`}
+    if(event.status)$('status').textContent=event.status;
+    if(event.text){reply.content+=event.text;node.textContent=reply.content;$('status').textContent=`${count.toLocaleString()} prompt tokens · Generating…`;window.scrollTo(0,document.body.scrollHeight)}
+    if(event.done){completed=true;const speed=event.stats.match(/([\d.]+) tok\/s/), prefill=event.stats.match(/prefill ([\d.]+) s/);$('status').textContent=`${count.toLocaleString()} / 32,768 prompt tokens${speed ? ' · '+Number(speed[1]).toFixed(1)+' tok/s' : ''}${prefill ? ' · '+Number(prefill[1]).toFixed(1)+'s prefill' : ''}`}
+   }
+  }
+  if(!completed)throw Error('Generation ended before completion.');
+ }catch(error){$('status').className='error';$('status').textContent=error.name==='AbortError'?'Stopped':error.message}
+ finally{if(reply.content){messages.push(reply);save()}else {node.parentElement.remove();messages.pop();save();render();$('prompt').value=content;}$('send').disabled=$('reset').disabled=false;$('stop').style.display='none';$('prompt').focus()}
+};
+</script></html>

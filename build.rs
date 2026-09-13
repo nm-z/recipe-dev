@@ -120,107 +120,147 @@ impl IntFormat {
 	}
 }
 type BuildResult<T> = Result<T, Box<dyn Error>>;
-const PARALLEL: &str = r#"declare i32 @llvm.amdgcn.workitem.id.y()
-declare i32 @llvm.amdgcn.workitem.id.z()
-declare i32 @llvm.amdgcn.workgroup.id.x()
-declare i32 @llvm.amdgcn.workgroup.id.y()
-declare i32 @llvm.amdgcn.workgroup.id.z()
-@RECIPE_GEOMETRY@
-declare <3 x i32> @llvm.umin.v3i32(<3 x i32>, <3 x i32>)
-define internal <3 x i32> @recipe.local.shape() #1 { entry:
-%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
-%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y() %gz = call i32 @recipe.grid.size.z()
-%bx = call i32 @llvm.amdgcn.workgroup.id.x() %by = call i32 @llvm.amdgcn.workgroup.id.y() %bz = call i32 @llvm.amdgcn.workgroup.id.z()
-%w0 = insertelement <3 x i32> poison, i32 %wx, i32 0 %w1 = insertelement <3 x i32> %w0, i32 %wy, i32 1 %width = insertelement <3 x i32> %w1, i32 %wz, i32 2
-%g0 = insertelement <3 x i32> poison, i32 %gx, i32 0 %g1 = insertelement <3 x i32> %g0, i32 %gy, i32 1 %grid = insertelement <3 x i32> %g1, i32 %gz, i32 2
-%b0 = insertelement <3 x i32> poison, i32 %bx, i32 0 %b1 = insertelement <3 x i32> %b0, i32 %by, i32 1 %group = insertelement <3 x i32> %b1, i32 %bz, i32 2
-%base = mul <3 x i32> %group, %width %remaining = sub <3 x i32> %grid, %base
-%shape = call <3 x i32> @llvm.umin.v3i32(<3 x i32> %width, <3 x i32> %remaining) ret <3 x i32> %shape }
-define internal i32 @recipe.local.id() #1 { entry:
-%x = call i32 @llvm.amdgcn.workitem.id.x() %y = call i32 @llvm.amdgcn.workitem.id.y() %z = call i32 @llvm.amdgcn.workitem.id.z()
-%shape = call <3 x i32> @recipe.local.shape() %sx = extractelement <3 x i32> %shape, i32 0 %sy = extractelement <3 x i32> %shape, i32 1
-%zy = mul i32 %z, %sy %row = add i32 %zy, %y %base = mul i32 %row, %sx %id = add i32 %base, %x ret i32 %id }
-define internal i32 @recipe.workgroup.size() #1 { entry:
-%shape = call <3 x i32> @recipe.local.shape() %x = extractelement <3 x i32> %shape, i32 0 %y = extractelement <3 x i32> %shape, i32 1 %z = extractelement <3 x i32> %shape, i32 2
-%xy = mul i32 %x, %y %size = mul i32 %xy, %z ret i32 %size }
-define internal i64 @recipe.grid.groups() #1 { entry:
-%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y() %gz = call i32 @recipe.grid.size.z()
-%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
-%gxa = add i32 %gx, %wx %gxn = sub i32 %gxa, 1 %nx = udiv i32 %gxn, %wx
-%gya = add i32 %gy, %wy %gyn = sub i32 %gya, 1 %ny = udiv i32 %gyn, %wy
-%gza = add i32 %gz, %wz %gzn = sub i32 %gza, 1 %nz = udiv i32 %gzn, %wz
-%nx.wide = zext i32 %nx to i64 %ny.wide = zext i32 %ny to i64 %nz.wide = zext i32 %nz to i64
-%nxy = mul i64 %nx.wide, %ny.wide %groups = mul i64 %nxy, %nz.wide ret i64 %groups }
-define internal i64 @recipe.group.id() #1 { entry:
-%x.raw = call i32 @llvm.amdgcn.workgroup.id.x() %y.raw = call i32 @llvm.amdgcn.workgroup.id.y() %z.raw = call i32 @llvm.amdgcn.workgroup.id.z()
-%x = zext i32 %x.raw to i64 %y = zext i32 %y.raw to i64 %z = zext i32 %z.raw to i64
-%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y()
-%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y()
-%gxa = add i32 %gx, %wx %gxn = sub i32 %gxa, 1 %nx = udiv i32 %gxn, %wx
-%gya = add i32 %gy, %wy %gyn = sub i32 %gya, 1 %ny = udiv i32 %gyn, %wy
-%nx.wide = zext i32 %nx to i64 %ny.wide = zext i32 %ny to i64
-%zy = mul i64 %z, %ny.wide %row = add i64 %zy, %y %base = mul i64 %row, %nx.wide %id = add i64 %base, %x ret i64 %id }
-define internal i64 @global_id() #1 { entry:
-%lx = call i32 @llvm.amdgcn.workitem.id.x() %ly = call i32 @llvm.amdgcn.workitem.id.y() %lz = call i32 @llvm.amdgcn.workitem.id.z()
-%bx = call i32 @llvm.amdgcn.workgroup.id.x() %by = call i32 @llvm.amdgcn.workgroup.id.y() %bz = call i32 @llvm.amdgcn.workgroup.id.z()
-%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
-%gx = mul i32 %bx, %wx %x = add i32 %gx, %lx %gy = mul i32 %by, %wy %y = add i32 %gy, %ly %gz = mul i32 %bz, %wz %z = add i32 %gz, %lz
-%sx = call i32 @recipe.grid.size.x() %sy = call i32 @recipe.grid.size.y()
-%x.wide = zext i32 %x to i64 %y.wide = zext i32 %y to i64 %z.wide = zext i32 %z to i64
-%sx.wide = zext i32 %sx to i64 %sy.wide = zext i32 %sy to i64
-%zy = mul i64 %z.wide, %sy.wide %row = add i64 %zy, %y.wide %base = mul i64 %row, %sx.wide %id = add i64 %base, %x.wide ret i64 %id }
+const PARALLEL: &str = r#"declare i32 @llvm.amdgcn.workgroup.id.x()
+declare i32 @recipe.workgroup.size.x()
+define internal i32 @global_id() #1 { entry:
+%lane = call i32 @llvm.amdgcn.workitem.id.x() %group = call i32 @llvm.amdgcn.workgroup.id.x()
+%width = call i32 @recipe.workgroup.size.x() %base = mul i32 %group, %width %id = add i32 %base, %lane ret i32 %id }
 @RECIPE_GRID_BARRIER@"#;
 const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
-define internal void @grid_barrier(i64 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
+define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
 // PTX only accepts ordered atomics on sm_70 and newer, so the counting barrier uses
 // relaxed atomics with explicit fences. A release fence before each arrival publishes the
 // block's writes; the last arriver acquires them, republishes with a release fence, and
 // flips the phase; each waiter acquires after it observes the flip. The fences lower to
 // membar, which every NVIDIA architecture supports, so one barrier serves them all.
-const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i64 0, align 8
+const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
-define internal void @grid_barrier(i64 %threads) #1 { entry:
-call void @llvm.amdgcn.s.barrier() %lane = call i32 @recipe.local.id()
+define internal void @grid_barrier(i32 %threads) #1 { entry:
+call void @llvm.amdgcn.s.barrier() %lane = call i32 @llvm.amdgcn.workitem.id.x()
 %leader = icmp eq i32 %lane, 0 br i1 %leader, label %arrive, label %joined arrive:
-%groups = call i64 @recipe.grid.groups()
+%width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
 %phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
 fence release
-%prior = atomicrmw add ptr addrspace(1) @grid.count, i64 1 monotonic %limit = sub i64 %groups, 1
-%last = icmp eq i64 %prior, %limit br i1 %last, label %release, label %wait release:
+%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
+%last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
 fence acquire
-store atomic i64 0, ptr addrspace(1) @grid.count monotonic, align 8 %next = xor i32 %phase, 1
+store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
 fence release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %joined wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %waited, label %wait waited:
 fence acquire br label %joined joined: call void @llvm.amdgcn.s.barrier() ret void }"#;
-const AMD_GEOMETRY: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
-define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
-define internal i32 @recipe.workgroup.size.y() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 6 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
-define internal i32 @recipe.workgroup.size.z() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 8 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
-define internal i32 @recipe.grid.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 12 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }
-define internal i32 @recipe.grid.size.y() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 16 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }
-define internal i32 @recipe.grid.size.z() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 20 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }"#;
-const NVIDIA_GEOMETRY: &str = r#"declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-declare i32 @llvm.nvvm.read.ptx.sreg.ntid.y()
-declare i32 @llvm.nvvm.read.ptx.sreg.ntid.z()
-declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
-declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
-declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
-define internal i32 @recipe.workgroup.size.x() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() ret i32 %value }
-define internal i32 @recipe.workgroup.size.y() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.y() ret i32 %value }
-define internal i32 @recipe.workgroup.size.z() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.z() ret i32 %value }
-define internal i32 @recipe.grid.size.x() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() %value = mul i32 %groups, %width ret i32 %value }
-define internal i32 @recipe.grid.size.y() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.y() %value = mul i32 %groups, %width ret i32 %value }
-define internal i32 @recipe.grid.size.z() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.z() %value = mul i32 %groups, %width ret i32 %value }"#;
-fn parallel_ir(ir: String, geometry: &str, grid_barrier: &str) -> String {
-	let mut ir = ir
-		.replace("call i32 @recipe.local.id.x()", "call i32 @recipe.local.id()")
-		.replace("call i32 @recipe.workgroup.size.x()", "call i32 @recipe.workgroup.size()")
-		.replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i64 %threads)");
+const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+%address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
+%width = zext i16 %value to i32 ret i32 %width }"#;
+const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.wavefrontsize()
+define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
+define internal float @recipe.wave.partner(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
+const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.wavefrontsize()
+define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
+define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
+const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
+define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }
+define internal RECIPE_STATE @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) ret RECIPE_STATE %zero }
+define internal RECIPE_STATE @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) ret RECIPE_STATE %zero }"#;
+/// One 16-value Q4_K slice. The caller assigns adjacent slices to the lanes
+/// of a wave, so this helper keeps only four dot4 words live at once.
+fn amd_q4_slice_helper(state: &str, full: bool) -> String {
+	if !full {
+		return format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+	}
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
+	ir.push_str("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 0\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%dmin.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%dmin.bits = load half, ptr addrspace(1) %dmin.ptr, align 2\n%dmin = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %dmin.bits)\n%group = udiv i32 %slice, 2\n%group.wide = zext i32 %group to i64\n%half = and i32 %slice, 1\n%group.low = icmp ult i32 %group, 4\n%group.plus = add i32 %group, 4\n%group.minus = sub i32 %group, 4\n%scale.index = select i1 %group.low, i32 %group, i32 %group.plus\n%other.index = select i1 %group.low, i32 %group.plus, i32 %group.minus\n%scale.index.wide = zext i32 %scale.index to i64\n%other.index.wide = zext i32 %other.index to i64\n%scale.offset = add i64 4, %scale.index.wide\n%other.offset = add i64 4, %other.index.wide\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%other.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %other.offset\n%other.byte = load i8, ptr addrspace(1) %other.ptr, align 1\n%scale.raw = zext i8 %scale.byte to i32\n%other.raw = zext i8 %other.byte to i32\n%scale.low = and i32 %scale.raw, 63\n%minimum.low = and i32 %other.raw, 63\n%scale.high.low = and i32 %scale.raw, 15\n%minimum.high.low = lshr i32 %scale.raw, 4\n%high.bits = and i32 %other.raw, 192\n%high = lshr i32 %high.bits, 2\n%scale.high = or i32 %scale.high.low, %high\n%minimum.high.offset = add i64 4, %group.wide\n%minimum.high.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %minimum.high.offset\n%minimum.high.byte = load i8, ptr addrspace(1) %minimum.high.ptr, align 1\n%minimum.high.raw = zext i8 %minimum.high.byte to i32\n%minimum.high.bits = and i32 %minimum.high.raw, 192\n%minimum.high.top = lshr i32 %minimum.high.bits, 2\n%minimum.high = or i32 %minimum.high.low, %minimum.high.top\n%minimum = select i1 %group.low, i32 %minimum.low, i32 %minimum.high\n%scale.code = select i1 %group.low, i32 %scale.low, i32 %scale.high\n%scale.value = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.u32(i32 %scale.code)\n%minimum.value = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.u32(i32 %minimum)\n%group.d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.mul(");
+	ir.push_str(state);
+	ir.push_str(" %d, ");
+	ir.push_str(state);
+	ir.push_str(" %scale.value)\n%group.dmin = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.mul(");
+	ir.push_str(state);
+	ir.push_str(" %dmin, ");
+	ir.push_str(state);
+	ir.push_str(" %minimum.value)\n%pair = udiv i32 %group, 2\n%pair.wide = zext i32 %pair to i64\n%q4.base.part = mul i64 %pair.wide, 32\n%q4.base = add i64 %q4.base.part, 16\n%group.shift = and i32 %group, 1\n%q4.shift = mul i32 %group.shift, 4\n%half.wide = zext i32 %half to i64\n%q4.half.offset = mul i64 %half.wide, 16\n%q4.base.half = add i64 %q4.base, %q4.half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load half, ptr addrspace(3) %q8.d.ptr, align 2\n%q8.d.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %q8.d)\n");
+	let mut dot_sum = "%dot.zero".to_owned();
+	let mut q8_sum = "%q8.zero".to_owned();
+	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
+	for word in 0..4 {
+		let q8_offset = 4 + word * 4;
+		let word_offset = word * 4;
+		ir.push_str(&format!(
+			"%w{word}.q4.offset = add i64 %q4.base.half, {word_offset}\n%w{word}.q4.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.q4.offset\n%w{word}.q4.word = load i32, ptr addrspace(1) %w{word}.q4.ptr, align 2\n%w{word}.q4.shifted = lshr i32 %w{word}.q4.word, %q4.shift\n%w{word}.q4.codes = and i32 %w{word}.q4.shifted, 252645135\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8.word = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot = call i32 @llvm.amdgcn.sudot4(i1 false, i32 %w{word}.q4.codes, i1 true, i32 %w{word}.q8.word, i32 0, i1 false)\n%w{word}.sum = call i32 @llvm.amdgcn.sudot4(i1 false, i32 16843009, i1 true, i32 %w{word}.q8.word, i32 0, i1 false)\n",
+			q8_offset = q8_offset,
+			word_offset = word_offset,
+		));
+		let next_dot = format!("%w{word}.dot.sum");
+		let next_q8 = format!("%w{word}.q8.sum");
+		ir.push_str(&format!("{next_dot} = add i32 {dot_sum}, %w{word}.dot\n{next_q8} = add i32 {q8_sum}, %w{word}.sum\n", next_dot = next_dot, next_q8 = next_q8));
+		dot_sum = next_dot;
+		q8_sum = next_q8;
+	}
+	ir.push_str(&format!("%dot.value = call {state} @recipe.state.from.s32(i32 {dot_sum})\n%q8.value = call {state} @recipe.state.from.s32(i32 {q8_sum})\n%dot.scaled = call {state} @recipe.state.mul({state} %group.d, {state} %dot.value)\n%minimum.scaled = call {state} @recipe.state.mul({state} %group.dmin, {state} %q8.value)\n%value = call {state} @recipe.state.sub({state} %dot.scaled, {state} %minimum.scaled)\n%result = call {state} @recipe.state.mul({state} %q8.d.state, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
+	ir
+}
+/// One 16-value Q6_K slice. Q6 scales are already 16 values wide, so the
+/// slice index names the scale directly; the two adjacent slices share one
+/// Q8_1 activation block.
+fn amd_q6_slice_helper(state: &str, full: bool) -> String {
+	if !full {
+		return format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+	}
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
+	ir.push_str("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 208\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%chunk = udiv i32 %slice, 8\n%group = udiv i32 %slice, 2\n%local = urem i32 %group, 4\n%half = and i32 %slice, 1\n%chunk.wide = zext i32 %chunk to i64\n%local.wide = zext i32 %local to i64\n%half.wide = zext i32 %half to i64\n%low.group = and i32 %local, 1\n%low.group.wide = zext i32 %low.group to i64\n%ql.extra = mul i64 %low.group.wide, 32\n%ql.base.part = mul i64 %chunk.wide, 64\n%ql.base = add i64 %ql.base.part, %ql.extra\n%qh.base.part = mul i64 %chunk.wide, 32\n%qh.base = add i64 %qh.base.part, 128\n%ql.shift.group = udiv i32 %local, 2\n%ql.shift = mul i32 %ql.shift.group, 4\n%qh.shift = mul i32 %local, 2\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load half, ptr addrspace(3) %q8.d.ptr, align 2\n%q8.d.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %q8.d)\n%scale.offset = add i32 %slice, 192\n%scale.offset.wide = zext i32 %scale.offset to i64\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset.wide\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%scale = sext i8 %scale.byte to i32\n%scale.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.s32(i32 %scale)\n%half.offset = mul i64 %half.wide, 16\n%half.ql.base = add i64 %ql.base, %half.offset\n%half.qh.base = add i64 %qh.base, %half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n");
+	let mut dot_sum = "%dot.zero".to_owned();
+	let mut q8_sum = "%q8.zero".to_owned();
+	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
+	for word in 0..4 {
+		let q_offset = word * 4;
+		let q8_offset = 4 + word * 4;
+		ir.push_str(&format!(
+			"%w{word}.ql.offset = add i64 %half.ql.base, {q_offset}\n%w{word}.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.ql.offset\n%w{word}.ql = load i32, ptr addrspace(1) %w{word}.ql.ptr, align 2\n%w{word}.ql.shifted = lshr i32 %w{word}.ql, %ql.shift\n%w{word}.ql.codes = and i32 %w{word}.ql.shifted, 252645135\n%w{word}.qh.offset = add i64 %half.qh.base, {q_offset}\n%w{word}.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.qh.offset\n%w{word}.qh = load i32, ptr addrspace(1) %w{word}.qh.ptr, align 2\n%w{word}.qh.shifted = lshr i32 %w{word}.qh, %qh.shift\n%w{word}.qh.codes = and i32 %w{word}.qh.shifted, 50529027\n%w{word}.qh.bits = shl i32 %w{word}.qh.codes, 4\n%w{word}.codes = or i32 %w{word}.ql.codes, %w{word}.qh.bits\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8 = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot.raw = call i32 @llvm.amdgcn.sudot4(i1 false, i32 %w{word}.codes, i1 true, i32 %w{word}.q8, i32 0, i1 false)\n%w{word}.sum.raw = call i32 @llvm.amdgcn.sudot4(i1 false, i32 16843009, i1 true, i32 %w{word}.q8, i32 0, i1 false)\n",
+			q_offset = q_offset,
+			q8_offset = q8_offset,
+		));
+		let next_dot = format!("%w{word}.dot.sum");
+		let next_q8 = format!("%w{word}.q8.sum");
+		ir.push_str(&format!("{next_dot} = add i32 {dot_sum}, %w{word}.dot.raw\n{next_q8} = add i32 {q8_sum}, %w{word}.sum.raw\n", next_dot = next_dot, next_q8 = next_q8));
+		dot_sum = next_dot;
+		q8_sum = next_q8;
+	}
+	ir.push_str(&format!("%dot.offset = mul i32 {q8_sum}, 32\n%dot.signed = sub i32 {dot_sum}, %dot.offset\n%dot.value = call {state} @recipe.state.from.s32(i32 %dot.signed)\n%scaled = call {state} @recipe.state.mul({state} %scale.state, {state} %dot.value)\n%value = call {state} @recipe.state.mul({state} %q8.d.state, {state} %scaled)\n%result = call {state} @recipe.state.mul({state} %d, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
+	ir
+}
+fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
+	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
-	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("@RECIPE_GEOMETRY@", geometry).replace("@RECIPE_GRID_BARRIER@", grid_barrier)));
-	ir.replace("recipe.local.barrier", "llvm.amdgcn.s.barrier")
+	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("declare i32 @recipe.workgroup.size.x()", width).replace("@RECIPE_GRID_BARRIER@", grid_barrier)));
+	ir.replace("recipe.local.id.x", "llvm.amdgcn.workitem.id.x").replace("recipe.group.id.x", "llvm.amdgcn.workgroup.id.x").replace("recipe.local.barrier", "llvm.amdgcn.s.barrier")
 }
 fn word(text: String, from: &str, to: &str) -> String {
 	let (mut output, mut rest) = (String::with_capacity(text.len()), text.as_str());
@@ -384,7 +424,7 @@ fn native_codec(ty: &str, rounded: bool) -> String {
 	)
 }
 
-fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool) -> String {
+fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool, vector: Option<bool>) -> String {
 	let intrinsic = if arithmetic == "double" { "f64" } else { "f32" };
 	let math = MATH_NAMES;
 	let mut block = String::new();
@@ -399,6 +439,25 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %sum.wide = call {arithmetic} @recipe.decode({value} %sum) %left.wide = call {arithmetic} @recipe.decode({value} %left) %right.wide = call {arithmetic} @recipe.decode({value} %right) %wide = call {arithmetic} @llvm.fma.{intrinsic}({arithmetic} %left.wide, {arithmetic} %right.wide, {arithmetic} %sum.wide) %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"));
 	} else {
 		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %result = call {value} @llvm.fma.{intrinsic}({value} %left, {value} %right, {value} %sum) ret {value} %result }}\n"));
+	}
+	if let Some(declare) = vector {
+		if let Some(intrinsic) = match value {
+			"half" => Some("f16"),
+			"float" => Some("f32"),
+			"double" => Some("f64"),
+			_ => None,
+		} {
+			// The state family reuses the model family's intrinsic when both name the
+			// same type, so the declaration is emitted once.
+			if declare {
+				block.push_str(&format!(
+					"declare <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>)\n"
+				));
+			}
+			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @{prefix}.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\n%result = call <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right, <RECIPE_REGISTER_M x {value}> %sum)\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
+		} else {
+			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @{prefix}.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\nbr label %loop\nloop:\n%p = phi i32 [ 0, %entry ], [ %p.next, %step ]\n%result = phi <RECIPE_REGISTER_M x {value}> [ poison, %entry ], [ %next, %step ]\n%more = icmp ult i32 %p, RECIPE_REGISTER_M\nbr i1 %more, label %step, label %done\nstep:\n%sum.value = extractelement <RECIPE_REGISTER_M x {value}> %sum, i32 %p\n%left.value = extractelement <RECIPE_REGISTER_M x {value}> %left, i32 %p\n%right.value = extractelement <RECIPE_REGISTER_M x {value}> %right, i32 %p\n%value = call {value} @{prefix}.madd({value} %sum.value, {value} %left.value, {value} %right.value)\n%next = insertelement <RECIPE_REGISTER_M x {value}> %result, {value} %value, i32 %p\n%p.next = add i32 %p, 1\nbr label %loop\ndone:\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
+		}
 	}
 	if encoded {
 		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %negative = fneg {arithmetic} %wide %result = call {value} @recipe.encode({arithmetic} %negative) ret {value} %result }}\n"));
@@ -477,13 +536,13 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 	};
 	block.push_str(&format!("\ndeclare {arithmetic} @llvm.fma.{intrinsic}({arithmetic}, {arithmetic}, {arithmetic})\n"));
 	block.push_str(&shared_math(arithmetic));
-	block.push_str(&numeric_operations("recipe", value, arithmetic, true));
+	block.push_str(&numeric_operations("recipe", value, arithmetic, true, Some(true)));
 	// No floating-point atomic is emitted. Every reduction names its own owner and
 	// a fixed order, so a read-modify-write race has nowhere left to happen.
 	if !codec.contains("@recipe.set.format") {
 		block.push_str("define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }\n")
 	}
-	block.push_str(&numeric_operations("recipe.state", arithmetic, arithmetic, false));
+	block.push_str(&numeric_operations("recipe.state", arithmetic, arithmetic, false, Some(value != arithmetic)));
 	block.push_str(&format!("define internal {arithmetic} @recipe.state.from.model({value} %value) #1 {{ entry: %result = call {arithmetic} @recipe.decode({value} %value) ret {arithmetic} %result }}\ndefine internal {value} @recipe.model.from.state({arithmetic} %value) #1 {{ entry: %result = call {value} @recipe.encode({arithmetic} %value) ret {value} %result }}\n; NUMERIC END"));
 	block
 }
@@ -669,14 +728,13 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 		"@contraction_tile = internal thread_local global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16",
 	),
 	(" addrspace(3)", ""),
-	("call i64 @global_id()", "call i64 @recipe.cpu.thread.wide()"),
+	("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @recipe.cpu.thread.id()"),
 	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
-	("call i64 @recipe.group.id()", "call i64 @recipe.cpu.thread.wide()"),
-	("call i64 @recipe.grid.groups()", "add i64 %threads, 0"),
+	("call i32 @recipe.group.id.x()", "call i32 @recipe.cpu.thread.id()"),
 	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
 	("call void @llvm.amdgcn.s.barrier()", ""),
 	("call void @recipe.local.barrier()", ""),
-	("call void @grid_barrier(i64 %threads)", "call void @recipe.cpu.barrier()"),
+	("call void @grid_barrier(i32 %threads)", "call void @recipe.cpu.barrier()"),
 	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
 	("declare void @llvm.amdgcn.s.barrier()", ""),
 	("declare i64 @__ockl_steadyctr_u64()", ""),
@@ -687,9 +745,25 @@ const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global 
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
 define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
-define internal i64 @recipe.cpu.thread.wide() #1 { entry: %thread = call i32 @recipe.cpu.thread.id() %wide = zext i32 %thread to i64 ret i64 %wide }
 define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
-fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
+/// Compile-time contraction shape. A reverse K extent is cut into one contiguous
+/// partition per `split_span` elements, capped at `partitions`, so the summation
+/// order is a property of the program rather than of the device it runs on.
+#[derive(Clone, Copy)]
+struct Schedule {
+	swizzle_m: u32,
+	partitions: u32,
+	split_span: u32,
+	matrix_split_span: u32,
+	local_chunks: u32,
+}
+fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String); 10]> {
+	let ir = ir
+		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
+		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
+		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
+		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
+		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -703,8 +777,8 @@ fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
 		("-f", custom_ir(ir, "_f")?),
 	])
 }
-fn native_source(source: &str) -> String {
-	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ") && !line.contains("@recipe_wave_probe(")).collect::<Vec<_>>().join("\n")
+fn wmma_source(source: &str) -> String {
+	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n")
 }
 fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> {
 	let marker = format!("{key} ");
@@ -737,15 +811,16 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
-fn compile_amd(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
-	let probe = source.lines().find(|line| line.starts_with("define protected amdgpu_kernel void @recipe_wave_probe(")).ok_or_else(|| io::Error::other("AMD wave probe method is absent"))?;
-	let probe_path = out.join("recipe-amd-wave-probe.ll");
-	fs::write(&probe_path, format!("target triple = \"amdgcn-amd-amdhsa\"\n{probe}\n"))?;
-	println!("cargo:rustc-env=RECIPE_HSA_WAVE_PROBE={}", probe_path.display());
-	let ir = parallel_ir(native_source(&source), AMD_GEOMETRY, AMD_GRID_BARRIER);
+	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir)? {
+	for (suffix, contents) in precision_sources(ir, schedule)? {
+		let helpers = if suffix.is_empty() || suffix == "-f" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
+		let state = if suffix.is_empty() || suffix == "-f" { "double" } else { "float" };
+		let dot = (state == "float").then_some("declare i32 @llvm.amdgcn.sudot4(i1, i32, i1, i32, i32, i1)\n").unwrap_or_default();
+		let helpers = format!("{}\n{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"));
+		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -763,7 +838,6 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	for (key, environment) in [
 		("hsa-compiler", "RECIPE_HSA_COMPILER"),
 		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
-		("hsa-occupancy-runtime", "RECIPE_HSA_OCCUPANCY_RUNTIME"),
 		("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"),
 		("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"),
 		("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"),
@@ -775,28 +849,27 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
-	let ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?);
-	let ir = parallel_ir(ir, NVIDIA_GEOMETRY, NVIDIA_GRID_BARRIER)
+fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
+	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
+	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
+		.replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
-		.replace("llvm.amdgcn.workitem.id.y", "llvm.nvvm.read.ptx.sreg.tid.y")
-		.replace("llvm.amdgcn.workitem.id.z", "llvm.nvvm.read.ptx.sreg.tid.z")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
-		.replace("llvm.amdgcn.workgroup.id.y", "llvm.nvvm.read.ptx.sreg.ctaid.y")
-		.replace("llvm.amdgcn.workgroup.id.z", "llvm.nvvm.read.ptx.sreg.ctaid.z")
+		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
 		.replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0")
 		.replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")
 		.replace(", addrspace(5)", "")
 		.replace(" addrspace(5)", "");
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir)? {
+	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
+	println!("cargo:rustc-env=RECIPE_NV_CODEGEN={}", platform(manifest, "nvidia-codegen", os)?);
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	println!(
 		"cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}",
@@ -805,9 +878,9 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
+	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -820,7 +893,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 		}
 	}
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir)? {
+	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let contents = contents
 			.replace(" addrspace(1)", "")
 			.replace(" addrspace(3)", "")
@@ -849,6 +922,16 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str) -> BuildResult<()> {
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
+	let positive = |key: &str| -> BuildResult<u32> {
+		setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into())
+	};
+	let schedule = Schedule {
+		swizzle_m: positive("contraction-swizzle-m-tiles")?,
+		partitions: positive("contraction-k-partitions")?,
+		split_span: positive("contraction-split-span")?,
+		matrix_split_span: positive("contraction-matrix-split-span")?,
+		local_chunks: positive("contraction-local-chunks")?,
+	};
 	for (key, environment) in [
 		("epochs", "RECIPE_TRAIN_EPOCHS"),
 		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),
@@ -880,6 +963,11 @@ fn main() -> BuildResult<()> {
 		("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"),
 		("surrogate-rate", "RECIPE_SURROGATE_RATE"),
 		("surrogate-width", "RECIPE_SURROGATE_WIDTH"),
+		("schedule-candidates", "RECIPE_SCHEDULE_CANDIDATES"),
+		("schedule-measurements", "RECIPE_SCHEDULE_MEASUREMENTS"),
+		("schedule-budget", "RECIPE_SCHEDULE_BUDGET"),
+		("schedule-warmups", "RECIPE_SCHEDULE_WARMUPS"),
+		("schedule-minimum-improvement", "RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"),
 		("random-seed", "RECIPE_RANDOM_SEED"),
 		("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"),
 		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),
@@ -899,7 +987,6 @@ fn main() -> BuildResult<()> {
 		("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"),
 		("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N"),
 		("contraction-fragment-k", "RECIPE_CONTRACTION_FRAGMENT_K"),
-		("contraction-swizzle-m-tiles", "RECIPE_CONTRACTION_SWIZZLE_M"),
 		("contraction-k-partitions", "RECIPE_CONTRACTION_K_PARTITIONS"),
 		("contraction-split-span", "RECIPE_CONTRACTION_SPLIT_SPAN"),
 		("contraction-matrix-split-span", "RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"),
@@ -907,25 +994,12 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
-		("rat-invalid-time-ms", "RECIPE_RAT_INVALID_TIME_MS"),
-		("hsa-queue-packets", "RECIPE_HSA_QUEUE_PACKETS"),
-		("rat-learning-rate", "RECIPE_RAT_LEARNING_RATE"),
-		("rat-initial-epochs", "RECIPE_RAT_INITIAL_EPOCHS"),
-		("rat-shuffles", "RECIPE_RAT_SHUFFLES"),
-		("rat-prediction-shuffles", "RECIPE_RAT_PREDICTION_SHUFFLES"),
-		("rat-observation-epochs", "RECIPE_RAT_OBSERVATION_EPOCHS"),
+		("delta-chunk", "RECIPE_DELTA_CHUNK"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
-	}
-	let rat_enabled = setting(&manifest, "rat-enabled")?;
-	if !matches!(rat_enabled, "true" | "false") {
-		return Err(io::Error::other(format!("rat-enabled must be true or false, not {rat_enabled}")).into());
-	}
-	println!("cargo:rustc-env=RECIPE_RAT_ENABLED={rat_enabled}");
-	for (key, environment) in [("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"), ("rat-knob-model", "RECIPE_RAT_KNOB_MODEL")] {
-		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
 	let placement = setting(&manifest, "multi-device")?;
 	println!(
@@ -942,7 +1016,7 @@ fn main() -> BuildResult<()> {
 	let os = env::var("CARGO_CFG_TARGET_OS")?;
 	println!("cargo:rustc-env=RECIPE_NATIVE_CONFIGURATION={:016x}", native_configuration(&manifest, &os));
 	let installed = |key: &str| -> BuildResult<bool> { Ok(configured(&manifest, key, &os)?.is_some_and(|path| Path::new(&path).exists())) };
-	compile_cpu(&manifest, &out, &os)?;
+	compile_cpu(&manifest, &out, &os, schedule)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && installed("hsa-compiler")? && installed("hsa-device-library")?;
@@ -956,11 +1030,11 @@ fn main() -> BuildResult<()> {
 	let nvidia = native && installed("nvidia-compiler")? && toolkit.as_ref().is_some_and(|toolkit| toolkit.device_library.exists());
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out, &os)?;
+		compile_amd(&manifest, &out, &os, schedule)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out, &os)?;
+		compile_nvidia(&manifest, &out, &os, schedule)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
