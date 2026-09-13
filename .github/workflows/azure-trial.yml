@@ -14,7 +14,7 @@ on:
         required: true
         default: "40000"
       count:
-        description: number of compositions
+        description: number of compositions, 1 through 40
         required: true
         default: "40"
 
