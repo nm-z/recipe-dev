@@ -196,6 +196,7 @@ if [ "${RECIPE_WORKLOAD:-suite}" = trial ]; then
 	nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 	# The snapshot has no history, so the harness base line carries no commit; the candidate stands in.
 	awk -v sha="$CANDIDATE_SHA" '{ sub(/^base=commit=[0-9a-f]*/, "base=commit=" sha); print }' "$work/trial/harness.log" > "$root/evidence/trial.log"
+	[ -s "$root/evidence/trial.log" ] || { echo "the harness wrote no evidence" >&2; exit 1; }
 	printf '%s\n' "RECIPE_TRIAL_LOG_BEGIN"
 	base64 -w0 "$root/evidence/trial.log"
 	printf '\n%s\n' "RECIPE_TRIAL_LOG_END"
