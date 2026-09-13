@@ -37,6 +37,21 @@ COMPUTER_NAME="rgpu$(printf '%s' "$WORKER" | sha256sum | cut -c1-11)"
 TRANSFER_ROOT="runtime/windows/${RUN_ID}-${RUN_ATTEMPT}"
 SNAPSHOT_BLOB="$TRANSFER_ROOT/snapshot.tar.gz"
 RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
+# The guest runs one workload: the suite (default), or the composition harness over
+# RECIPE_TRIAL_COUNT cursors from RECIPE_TRIAL_CURSOR, whose stderr packets are the evidence.
+RECIPE_WORKLOAD="${RECIPE_WORKLOAD:-suite}"
+case "$RECIPE_WORKLOAD" in
+	suite) ;;
+	trial)
+		: "${RECIPE_TRIAL_CURSOR:?RECIPE_TRIAL_CURSOR is required}"
+		: "${RECIPE_TRIAL_COUNT:?RECIPE_TRIAL_COUNT is required}"
+		case "$RECIPE_TRIAL_CURSOR$RECIPE_TRIAL_COUNT" in
+			''|*[!0-9]*) echo "the trial cursor and count must be integers" >&2; exit 1 ;;
+		esac
+		;;
+	*) echo "RECIPE_WORKLOAD must be suite or trial" >&2; exit 1 ;;
+esac
+TRIAL_BLOB="$TRANSFER_ROOT/trial.txt"
 PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-2700}"
 ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
@@ -455,9 +470,14 @@ echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with explicit outbound acc
 echo "== transferring the immutable snapshot =="
 # Upload each archive once to the existing private container. The guest gets
 # only short-lived read URLs and never receives a cloud-management credential.
-[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
-[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
-tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	[ -f "$TRUSTED_RUNTIME/harness.rs" ] || { echo "the trial harness is absent" >&2; exit 1; }
+	tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" harness.rs
+else
+	[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
+	[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
+	tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
+fi
 runtime_sha256="$(sha256sum trusted-runtime.tar.gz | cut -d' ' -f1)"
 snapshot_actual="$(sha256sum "$SNAPSHOT" | cut -d' ' -f1)"
 [ "$snapshot_actual" = "$SNAPSHOT_SHA256" ] || { echo "snapshot checksum mismatch before upload" >&2; exit 1; }
@@ -508,6 +528,20 @@ fi
 snapshot_uri_encoded="$(printf '%s' "$SNAPSHOT_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 runtime_uri_encoded="$(printf '%s' "$RUNTIME_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 echo "uploaded and verified the private per-run archives"
+# A trial returns its harness stderr through the same private container: the guest gets a
+# short-lived create/write URL for one blob, since Run Command output is capped.
+trial_uri_encoded=""
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	TRIAL_URI="$(az storage blob generate-sas \
+		--auth-mode login --as-user --full-uri --https-only \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--name "$TRIAL_BLOB" \
+		--permissions cw --start "$sas_start" --expiry "$sas_expiry" \
+		-o tsv --only-show-errors)"
+	case "$TRIAL_URI" in https://*\?*) ;; *) echo "trial write URL generation failed" >&2; exit 1 ;; esac
+	trial_uri_encoded="$(printf '%s' "$TRIAL_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+fi
 
 echo "== executing the native Windows GPU suite in the guest =="
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -527,7 +561,7 @@ invoke_guest() {
 			--resource-group "$GROUP" --name "$WORKER" \
 			--command-id RunPowerShellScript \
 			--scripts "@guest.ps1" \
-			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" \
+			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" "workload=$RECIPE_WORKLOAD" "trialCursor=${RECIPE_TRIAL_CURSOR:-0}" "trialCount=${RECIPE_TRIAL_COUNT:-0}" "trialUriEncoded=$trial_uri_encoded" \
 			--only-show-errors -o json > "$document"
 	status=$?
 	set -e
@@ -555,6 +589,26 @@ invoke_guest "preflight" "$PREFLIGHT_DEADLINE_SECONDS" "PREFLIGHT EXIT 0"
 echo "== building and executing Recipe on the DSVM =="
 invoke_guest "execute" "$DEADLINE_SECONDS" "GUEST EXIT 0"
 cp evidence/execute.log evidence/guest.log
+
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	# The trial's evidence is the harness stderr the guest uploaded, named the way the issue
+	# machine's inbox expects (device prefix before "-run", then the cursor span).
+	trial_file="evidence/azure-t4-run-${RECIPE_TRIAL_CURSOR}-$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1)).txt"
+	az storage blob download \
+		--auth-mode login \
+		--account-name "$AZURE_STORAGE_ACCOUNT" \
+		--container-name "$AZURE_STORAGE_CONTAINER" \
+		--name "$TRIAL_BLOB" \
+		--file "$trial_file" \
+		--only-show-errors --no-progress -o none
+	[ -s "$trial_file" ] || { echo "the guest uploaded no trial log" >&2; exit 1; }
+	# The snapshot has no history, so the harness base line carries no commit; the candidate stands in.
+	awk -v sha="$CANDIDATE_SHA" '{ sub(/^base=commit=[0-9a-f]*/, "base=commit=" sha); print }' "$trial_file" > "$trial_file.tmp" && mv "$trial_file.tmp" "$trial_file"
+	grep -E '^TRIAL EXIT' evidence/guest.log
+	echo "compositions: $(grep -c '^composition [0-9]*:' "$trial_file" || true), packets: $(grep -c '^RECIPE FAILURE BEGIN$' "$trial_file" || true), file: $trial_file"
+	echo "recipe/windows-gpu trial completed for cursors $RECIPE_TRIAL_CURSOR..$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1))"
+	exit 0
+fi
 
 awk '
 	/^SUITE-EVIDENCE-BEGIN$/ { capture = 1; next }
