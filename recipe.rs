@@ -3132,6 +3132,14 @@ mod quantized {
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
+	/// Return the declared recurrent cell activation, if this scan carries one.
+	fn cell_activation(&self, node: &Node) -> Result<(bool, usize)> {
+		if node.program_count == 0 {
+			return Ok((false, 0));
+		}
+		let code = self.graph.programs.get(node.program_offset).ok_or_else(|| RecipeError::new("recurrent cell activation is absent"))?;
+		Ok((true, integer_argument(*code, "recurrent cell activation")? as usize))
+	}
 	/// Emits loads of a runtime schedule slot from the context arena. Keeping
 	/// the slot outside each node's work context prevents schedule words from
 	/// aliasing mutable scan, attention, or normalization state.
@@ -3541,7 +3549,9 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i1 {bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode} )\n", decode = plan.decode(index), pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, bias = node.argument[2] == 0.0, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
+					require(node.argument[1] == 0.0, "a recurrent body of more than one stage needs the staged cell, which is not emitted yet")?;
+					let (coded, cell) = self.cell_activation(node)?;
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i1 {bias}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i64 0, i32 {decode}, i1 {coded}, i32 {cell} )\n", decode = plan.decode(index), coded = coded, cell = cell, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, bias = node.argument[2] == 0.0, tile_m = tiles[0], tile_n = tiles[1], tile_k = tiles[2]));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -3946,7 +3956,9 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
-					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+					require(node.argument[1] == 0.0, "a recurrent body of more than one stage needs the staged cell, which is not emitted yet")?;
+					let (coded, cell) = self.cell_activation(node)?;
+					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", coded = coded, cell = cell, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -7500,6 +7512,7 @@ mod bundle {
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
 			Operation::Lstm(width) => format!("lstm,{width}"),
+			Operation::Recur(parts) => format!("recur,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
@@ -7616,6 +7629,7 @@ mod bundle {
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
+			"recur" => Ok(Operation::Recur(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
 			"identity" => Ok(Operation::Identity),
 			"last" => Ok(Operation::Last),
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { split_escaped(rest, ';').iter().map(String::as_str).map(residual).collect::<Result<Vec<_>>>()? })),
@@ -8428,6 +8442,11 @@ pub fn gru(width: usize) -> Block {
 pub fn lstm(width: usize) -> Block {
 	Block::of(Operation::Lstm(width))
 }
+/// A recurrent body applied at every sequence position with one shared
+/// parameter set. The body reads the current input and the previous output.
+pub fn recur<const N: usize>(parts: [Block; N]) -> Block {
+	Block::of(Operation::Recur(parts.into()))
+}
 pub fn perc(width: usize) -> Block {
 	Block::of(Operation::Perceptron(width))
 }
@@ -8611,6 +8630,9 @@ enum Operation {
 	Rnn(usize),
 	Gru(usize),
 	Lstm(usize),
+	/// A recurrent body applied at every sequence position with one shared
+	/// parameter set.
+	Recur(Vec<Block>),
 	Residual(Vec<Block>),
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
@@ -8994,6 +9016,9 @@ impl Model {
 	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
+	}
+	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.push(Operation::Recur(parts.into()))
 	}
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
 		self.push(Operation::Ensemble(members.into()))
@@ -10577,6 +10602,7 @@ impl Operation {
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
 			Self::Lstm(_) => "lstm",
+			Self::Recur(_) => "recur",
 			Self::Residual(_) => "residual",
 			Self::Product(..) => "product",
 			Self::Ensemble(_) => "ensemble",
@@ -12398,7 +12424,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 }
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last => true,
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
 		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
@@ -12600,6 +12626,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
+		Operation::Recur(parts) => lower_recur(graph, parts)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
@@ -13434,6 +13461,62 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	let stride = if graph.bias { checked_add(matrices, channels, "scan bias")? } else { matrices };
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Scan, output, checked_mul(gates, stride, "scan parameters")?, [gates as f64, 0.0, f64::from(!graph.bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
+}
+/// The activation code emitted for a declared recurrent cell. The native scan
+/// ABI keeps these four codes independent from the public activation enum.
+fn recur_activation(activation: Activation) -> Result<usize> {
+	match activation {
+		Activation::Linear => Ok(0),
+		Activation::Relu => Ok(1),
+		Activation::Tanh => Ok(2),
+		Activation::Sigmoid => Ok(3),
+		other => Err(RecipeError::new(format!("a recurrent body's activation must be linear, relu, tanh or sigmoid, not {}", other.name()))),
+	}
+}
+fn recur_stages(parts: &[Block]) -> Result<Vec<(usize, usize)>> {
+	require(!parts.is_empty(), "a recurrence must contain an operation")?;
+	let mut stages = Vec::new();
+	for block in parts {
+		require(block.normalization.is_none(), "a recurrent body step cannot carry its own normalization yet")?;
+		require(block.qk.is_none(), "a recurrent body step cannot carry a query-key normalization")?;
+		require(block.quantization == 0, "a recurrent body step cannot carry its own quantization yet")?;
+		match block.operation {
+			Operation::Layer(width) => {
+				require(width != 0, "recurrent width must be positive")?;
+				require(stages.first().is_none_or(|(first, _)| *first == width), "every layer of a recurrent body carries the recurrent width")?;
+				stages.push((width, recur_activation(block.activation)?));
+			}
+			Operation::Identity => {
+				let last = stages.last_mut().ok_or_else(|| RecipeError::new("a recurrent body must open with a layer"))?;
+				require(last.1 == 0, "a recurrent body stage declares one activation")?;
+				last.1 = recur_activation(block.activation)?;
+			}
+			ref other => return Err(RecipeError::new(format!("a recurrent body holds layers and activations; {} is unsupported", other.name()))),
+		}
+	}
+	require(!stages.is_empty(), "a recurrent body must contain a layer")?;
+	Ok(stages)
+}
+fn lower_recur(graph: &mut Graph, parts: &[Block]) -> Result<()> {
+	let stages = recur_stages(parts)?;
+	let width = stages[0].0;
+	let extra = stages.len() - 1;
+	let has_bias = graph.bias;
+	let cell_matrix = checked_add(checked_mul(graph.output.channels, width, "recurrent input matrix")?, checked_mul(width, width, "recurrent state matrix")?, "recurrent cell")?;
+	let cell = if has_bias { checked_add(cell_matrix, width, "recurrent bias")? } else { cell_matrix };
+	let stage_matrix = checked_mul(width, width, "recurrent stage matrix")?;
+	let stage = if has_bias { checked_add(stage_matrix, width, "recurrent stage bias")? } else { stage_matrix };
+	let parameters = checked_add(cell, checked_mul(extra, stage, "recurrent stages")?, "recurrent parameters")?;
+	let program_offset = graph.programs.len();
+	for (_, activation) in &stages {
+		graph.programs.extend([*activation as f64, 0.0, 0.0]);
+	}
+	let output = Shape { channels: width, length: graph.output.length };
+	push_node(graph, Primitive::Scan, output, parameters, [1.0, extra as f64, f64::from(!has_bias), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("recurrent node is absent"))?;
+	node.program_offset = program_offset;
+	node.program_count = stages.len();
+	Ok(())
 }
 /// Counts estimator blocks at every nesting level. Saved predictor programs are
 /// stored once for each estimator and output target channel, so this count must
@@ -15267,7 +15350,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
 			let state_spans = if inference { gates.checked_add(1).ok_or_else(|| RecipeError::new("scan state spans overflow"))? } else { 2 * gates + 1 };
-			let states = checked_mul(state_spans, state_count, "scan states")?;
+			let states = checked_mul(state_spans.checked_add(node.argument[1] as usize).ok_or_else(|| RecipeError::new("scan state spans overflow"))?, state_count, "scan states")?;
 			let gradients = if inference { 0 } else { checked_mul(rows, node.parameters, "scan gradients")? };
 			let scratch = if inference { 0 } else { checked_mul(2, checked_mul(rows, node.output.channels, "scan scratch rows")?, "scan scratch")? };
 			checked_add(states, checked_add(gradients, scratch, "scan scratch")?, "scan")?
