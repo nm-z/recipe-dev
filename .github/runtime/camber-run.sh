@@ -11,7 +11,12 @@ set -euo pipefail
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
 
-QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
+# A queued job costs nothing but the wait, while a job the controller gives up
+# on keeps its queue place and runs the whole worker for nobody; so the queue
+# wait is bounded by the room the 60-minute job leaves after the worker's own
+# 1500 s, and the execution deadline counts from the first poll that finds the
+# job running rather than from submission.
+QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-1500}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 WORKER_EXECUTION_TIMEOUT_SECONDS="${WORKER_EXECUTION_TIMEOUT_SECONDS:-1500}"
@@ -233,6 +238,7 @@ for provider_attempt in 1 2; do
 
 	echo "== polling the Camber job =="
 	started="$(date +%s)"
+	running_since=""
 	state=""
 	while :; do
 		now="$(date +%s)"
@@ -251,7 +257,11 @@ for provider_attempt in 1 2; do
 			fi
 			;;
 		*)
-			if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
+			if [ -z "$running_since" ]; then
+				running_since="$now"
+				echo "  running after ${elapsed}s in the queue"
+			fi
+			if [ $((now - running_since)) -ge "$RUN_DEADLINE_SECONDS" ]; then
 				echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
 				exit 1
 			fi
