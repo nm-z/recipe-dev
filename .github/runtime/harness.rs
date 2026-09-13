@@ -77,12 +77,18 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
+	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
+	// other source, the two-input and two-target folders included, is one value or one row per
+	// sample, so a convolution or pool there only asks Recipe for a kernel longer than the
+	// sequence (#214).
+	let sequential = dataset(cursor) == "data/numeric/sample_subfolders";
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
 		0 => format!("layer({width})"),
 		1 => format!("rnn({width})"),
 		2 => format!("gru({width})"),
 		3 if member => format!("lstm({width})"),
 		4 if member => format!("perc({width})"),
+		3 if !sequential => format!("layer({width})"),
 		3 => format!("conv({width}, {})", 2 + (bits >> 8) % 4),
 		4 => format!("rnn({width})"),
 		5 => format!("gru({width})"),
@@ -91,6 +97,7 @@ fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<us
 		8 if AVOID_FILED => format!("layer({width})"),
 		8 => format!("attn({}).width({width}){}", 1 + (bits >> 8) % 4, pick(cursor, salt + 4, &ATTENTION_OPTIONS).replace("{width}", &width.to_string())),
 		9 => return pick(cursor, salt + 5, &ESTIMATORS).to_owned(),
+		_ if !sequential => format!("layer({width})"),
 		_ => format!("pool({})", 2 + (bits >> 8) % 3),
 	};
 	let norms: &[&str] = if AVOID_FILED { &NORMS_FILED } else { &NORMS };
@@ -175,17 +182,26 @@ fn run(path: &Path) -> Result<(), Failure> {
 	if output.status.success() {
 		return Ok(());
 	}
+	let output_status = output.status;
 	let output = diagnostic(&output);
 	let phase = std::fs::read_to_string(phase_file(path)).unwrap_or_else(|_| "compilation".to_owned());
 	// A panic message follows its "panicked at" line; the trailing backtrace note is never the failure.
 	let lines = output.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+	// A candidate the kernel killed left no panic line; its last line is a progress line that
+	// names no failure, so the signal is the message.
+	#[cfg(unix)]
+	let signal = std::os::unix::process::ExitStatusExt::signal(&output_status).map(|signal| format!("terminated by signal {signal}"));
+	#[cfg(not(unix))]
+	let signal = None::<String>;
 	let message = lines
 		.iter()
 		.position(|line| line.contains("panicked at"))
 		.and_then(|index| lines.get(index + 1))
-		.or_else(|| lines.iter().rev().find(|line| !line.starts_with("note:")))
-		.map_or("candidate failed", |line| line);
-	Err(Failure { phase, message: normalize(message), output })
+		.map(|line| (*line).to_owned())
+		.or(signal)
+		.or_else(|| lines.iter().rev().find(|line| !line.starts_with("note:")).map(|line| (*line).to_owned()))
+		.unwrap_or_else(|| "candidate failed".to_owned());
+	Err(Failure { phase, message: normalize(&message), output })
 }
 
 // Panic messages embed per-process temp paths; keep each file name's shape and line, drop the digits that change per run.
@@ -236,7 +252,9 @@ fn emit(cursor: u64, source: &str, path: &Path, failure: &Failure, replay: &Fail
 	eprintln!("id={id:016x}");
 	eprintln!("base={}", base());
 	eprintln!("cursor=cursor:{cursor} next:{} composition:{cursor}", cursor + 1);
-	eprintln!("data=path:{}", dataset(cursor));
+	// A replayed source names its own data; the generated one is the cursor's.
+	let data = source.lines().find_map(|line| line.split_once("recipe.data(\"").and_then(|(_, rest)| rest.split_once('"')).map(|(path, _)| path.to_owned())).unwrap_or_else(|| dataset(cursor));
+	eprintln!("data=path:{data}");
 	eprintln!("configuration=cursor:{cursor} seed:{seed}");
 	eprintln!("expected=the generated public Recipe composition trains and infers with finite values");
 	eprintln!("observed=phase:{} message:{}", failure.phase, failure.message);
@@ -252,11 +270,18 @@ fn main() {
 	let start = number("RECIPE_COMPOSITION_CURSOR", 0);
 	let end = start.saturating_add(number("RECIPE_COMPOSITION_COUNT", 1));
 	let seed = number("RECIPE_COMPOSITION_REPLAY_SEED", 17);
+	// RECIPE_COMPOSITION_SOURCE names a reproduction to run as it is, in place of the generated
+	// one: a failure recorded against an earlier Recipe source is checked again at the current one.
+	let given = env("RECIPE_COMPOSITION_SOURCE").map(|path| std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("cannot read {path}: {error}")));
 	for cursor in start..end {
-		let source = source(cursor, seed);
+		let (source, kind) = match &given {
+			Some(source) => (source.clone(), "replayed"),
+			None => (source(cursor, seed), "generated"),
+		};
 		let path = reproduction();
 		std::fs::write(&path, &source).expect("cannot write reproduction");
-		eprintln!("composition {cursor}: kind=generated body={}", model(cursor));
+		let body = source.lines().find_map(|line| line.trim().strip_prefix("let model = ")).map_or_else(|| model(cursor), |line| line.trim_end_matches(';').to_owned());
+		eprintln!("composition {cursor}: kind={kind} body={body}");
 		if let Err(failure) = run(&path) {
 			let replay = run(&path).err().unwrap_or(Failure { phase: "replay".to_owned(), message: "replay passed".to_owned(), output: "replay passed".to_owned() });
 			emit(cursor, &source, &path, &failure, &replay, seed);
