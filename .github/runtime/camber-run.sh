@@ -195,6 +195,7 @@ if [ "${RECIPE_WORKLOAD:-suite}" = trial ]; then
 	trial_started="$(date +%s)"
 	# The harness prints one composition line per cursor and a failure packet per defect on
 	# stderr; that stream is the evidence, so a nonzero exit is recorded rather than fatal.
+	set +e
 	timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" env \
 		RECIPE_DEVICE=nv0 \
 		RECIPE_COMPOSITION_RUNNER="$work/target/release/recipe" \
@@ -205,6 +206,7 @@ if [ "${RECIPE_WORKLOAD:-suite}" = trial ]; then
 		RECIPE_TRIAL_DIRECTORY="$work/trial" \
 		"$work/target/release/recipe" harness.rs > "$work/trial/harness.out" 2> "$work/trial/harness.log"
 	harness_status=$?
+	set -e
 	echo "== worker: harness exit $harness_status after $(( $(date +%s) - trial_started ))s =="
 	nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 	# The snapshot has no history, so the harness base line carries no commit; the candidate stands in.
