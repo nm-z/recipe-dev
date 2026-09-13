@@ -149,7 +149,7 @@ recipe.train()
 ```rust
 .seed(value)
 .resume(path)
-.rat(history|rolling|online|full, "./evaluate")
+.rat(history|rolling|online|learned|full, "./evaluate")
 .target(value)
 precisions
 	.fp(8|16|32|64)
