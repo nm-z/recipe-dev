@@ -1,0 +1,1 @@
+The engine responds under load and holds its rated output. | stable neutral observation with a declared sample boundary

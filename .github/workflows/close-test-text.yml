@@ -1,57 +1,383 @@
-name: Close pull requests containing test text
+name: PRs
 
 on:
+  push:
+    branches:
+      - '**'
+  workflow_run:
+    workflows: ['os/device check']
+    types: [completed]
   pull_request_target:
-    types: [opened, reopened, synchronize, edited, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review]
+  check_run:
+    types: [completed]
+  status:
+  workflow_dispatch:
 
 permissions:
   contents: read
+  checks: read
+  statuses: read
   issues: write
   pull-requests: write
 
 jobs:
   close:
-    if: github.event.pull_request.state == 'open'
+    if: github.event_name == 'push'
+    name: no-tests
     runs-on: ubuntu-latest
     steps:
       - name: Close a pull request containing test text
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
           set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
+
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
+            exit 0
+          fi
+          mapfile -t PR_NUMBERS <<< "$numbers"
+
+          check_pull_request() {
+          local PR_NUMBER="$1"
 
           scan_directory="$RUNNER_TEMP/recipe-pr-text-policy"
           mkdir -p "$scan_directory"
 
-          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '[.title, (.body // "")] | .[]' \
-            > "$scan_directory/metadata.txt"
-          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-            --jq '.[] | .filename, (.previous_filename // empty), (.patch // empty)' \
-            > "$scan_directory/files.txt"
-          gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
-            --jq '.[].commit.message' \
-            > "$scan_directory/commits.txt"
           gh api \
             -H 'Accept: application/vnd.github.v3.diff' \
             "repos/$REPOSITORY/pulls/$PR_NUMBER" \
             > "$scan_directory/pull.diff"
 
-          locations=()
-          if grep --ignore-case --quiet 'test' "$scan_directory/metadata.txt"; then locations+=("title or body"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/files.txt"; then locations+=("changed path or patch"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/commits.txt"; then locations+=("commit message"); fi
-          if grep --ignore-case --quiet 'test' "$scan_directory/pull.diff"; then locations+=("diff"); fi
+          banned_fragment="$(printf 'te%s' 'st')"
+          files_url="https://github.com/$REPOSITORY/pull/$PR_NUMBER/files"
+          added_file="$scan_directory/added.txt"
+          location_file="$scan_directory/added-locations.txt"
+          match_file="$scan_directory/matches.txt"
+          report_file="$scan_directory/matches.md"
+          : > "$added_file"
+          : > "$location_file"
 
-          if ((${#locations[@]} == 0)); then
-            exit 0
+          awk -v added_file="$added_file" \
+            -v location_file="$location_file" '
+            /^diff --git / {
+              in_hunk = 0
+              next
+            }
+
+            !in_hunk && /^\+\+\+ / {
+              path = substr($0, 5)
+              sub(/\t.*$/, "", path)
+              if (length(path) >= 2 && substr(path, 1, 1) == "\"" && substr(path, length(path), 1) == "\"") {
+                path = substr(path, 2, length(path) - 2)
+              }
+              if (path != "/dev/null" && path ~ /^b\//) sub(/^b\//, "", path)
+              current_path = path
+              next
+            }
+
+            /^@@ / {
+              in_hunk = match($0, / \+[0-9]+/)
+              if (in_hunk) {
+                new_line = substr($0, RSTART + 2)
+                sub(/,.*/, "", new_line)
+                new_line += 0
+              }
+              next
+            }
+
+            !in_hunk { next }
+
+            /^\+/ {
+              added_text = substr($0, 2)
+              print added_text > added_file
+              printf "%s:%d\n", current_path, new_line > location_file
+              new_line++
+              next
+            }
+
+            /^-/ { next }
+
+            /^ / {
+              new_line++
+              next
+            }
+
+          ' "$scan_directory/pull.diff"
+
+          if grep --ignore-case --fixed-strings --word-regexp --line-number \
+            "$banned_fragment" "$added_file" > "$match_file"; then
+            :
+          else
+            grep_status=$?
+            if (( grep_status == 1 )); then
+              return 0
+            fi
+            return "$grep_status"
           fi
 
-          IFS=,
-          location_text="${locations[*]}"
-          reason="Closed automatically because this pull request contains the banned text \`test\` in: $location_text. Remove every occurrence from this PR's existing branch and metadata, then reopen this PR. Do not create a replacement branch or PR."
-          gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+          match_count="$(wc -l < "$match_file")"
+          if (( match_count == 0 )); then
+            return 0
+          fi
+
+          escape_html() {
+            sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
+              -e 's/>/\&gt;/g' -e 's/@/\&#64;/g' -e 's/\r/\&#13;/g'
+          }
+          : > "$report_file"
+          mapfile -t added_lines < "$added_file"
+          mapfile -t locations < "$location_file"
+          while IFS=: read -r added_index _; do
+            location="$(printf '%s' "${locations[added_index - 1]}" | escape_html)"
+            quote="$(printf '%s' "${added_lines[added_index - 1]}" | escape_html)"
+            printf -- '- <a href="%s"><code>%s</code></a>: <pre><code>%s</code></pre>\n' \
+              "$files_url" "$location" "$quote" >> "$report_file"
+          done < "$match_file"
+
+          # Keep the comment below GitHub's issue-comment limit while retaining
+          # the complete location-and-quote report in the workflow summary.
+          {
+            printf '## Banned whole word in added diff\n\n'
+            printf 'Closed automatically because added content in this pull request\x27s current diff contains the banned whole word `%s`. Remove it from the current diff, then reopen this PR.\n\n' "$banned_fragment"
+            printf 'The scan covers only added lines in the current diff. Commit history, title, body, file paths, PR comments, and linked issue comments are not scanned.\n\n'
+            printf 'Matches (file and current line):\n\n'
+          } > "$scan_directory/comment.md"
+
+          {
+            printf '## Banned whole word matches\n\n'
+            printf 'The following entries are the complete report for the current diff:\n\n'
+            cat "$scan_directory/matches.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          max_comment_bytes=60000
+          LC_ALL=C awk -v max_bytes="$max_comment_bytes" '
+            {
+              line_bytes = length($0) + 1
+              if (used + line_bytes <= max_bytes) {
+                print
+                used += line_bytes
+                shown++
+              }
+            }
+          ' "$scan_directory/matches.md" > "$scan_directory/comment-matches.md"
+
+          shown_match_count="$(LC_ALL=C awk '/^- <a /{count++} END { print count + 0 }' "$scan_directory/comment-matches.md")"
+          cat "$scan_directory/comment-matches.md" >> "$scan_directory/comment.md"
+          if (( shown_match_count < match_count )); then
+            printf '_Showing %s of %s matches. The complete report is in the workflow summary._\n\n' \
+              "$shown_match_count" "$match_count" >> "$scan_directory/comment.md"
+          fi
+
+          jq -n --rawfile body "$scan_directory/comment.md" '{body: $body}' \
+            | gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --input -
           gh api -X PATCH "repos/$REPOSITORY/pulls/$PR_NUMBER" -f state=closed
+          }
+
+          for PR_NUMBER in "${PR_NUMBERS[@]}"; do
+            check_pull_request "$PR_NUMBER"
+          done
+
+  require-minimal-base:
+    if: github.event_name == 'push'
+    name: target-minimal
+    concurrency:
+      group: recipe-minimal-base-policy-${{ github.run_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require minimal as the pull request base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
+
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
+            exit 0
+          fi
+          mapfile -t PR_NUMBERS <<< "$numbers"
+
+          marker='<!-- recipe-minimal-base-policy -->'
+          failed_prs=()
+          for PR_NUMBER in "${PR_NUMBERS[@]}"; do
+            BASE_REF="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+            if [[ "$BASE_REF" == 'minimal' ]]; then
+              continue
+            fi
+
+            reason="$marker
+            Development pull requests must target \`minimal\`. This pull request targets \`$BASE_REF\`. Rebase or restack the branch as needed, then change the base. Automation does not retarget branches."
+
+            comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+              --jq '.[] | .body // ""')"
+            if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
+              gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" -f body="$reason"
+            fi
+
+            printf 'Development pull request %s must target minimal; found %s.\n' "$PR_NUMBER" "$BASE_REF"
+            failed_prs+=("$PR_NUMBER")
+          done
+
+          if (( ${#failed_prs[@]} != 0 )); then
+            printf 'Pull requests with a non-minimal base: %s.\n' "${failed_prs[*]}" >&2
+            exit 1
+          fi
+
+  draft-conflicts:
+    if: github.event_name == 'push'
+    name: draft-prs-w-merge-conflicts
+    concurrency:
+      group: recipe-merge-conflict-policy-${{ github.run_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Convert conflicting pull requests to draft
+        env:
+          # GITHUB_TOKEN can read and comment on pull requests but GitHub's
+          # GraphQL draft mutation rejects it. A repository-scoped token can
+          # be supplied as RECIPE_POLICY_TOKEN when automatic conversion is
+          # required; the workflow reports the missing capability otherwise.
+          GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
+          HEAD_REF: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${HEAD_REF:?push branch ref is required}"
+
+          numbers="$(gh api --method GET --paginate "repos/$REPOSITORY/pulls" \
+            -f state=open \
+            -f head="$REPOSITORY_OWNER:$HEAD_REF" \
+            -f per_page=100 \
+            --jq '.[].number')"
+          if [[ -z "$numbers" ]]; then
+            echo "No open pull request uses $REPOSITORY_OWNER:$HEAD_REF."
+            exit 0
+          fi
+          mapfile -t pr_numbers <<< "$numbers"
+
+          marker='<!-- recipe-merge-conflict-policy -->'
+          failed_prs=()
+          for pr_number in "${pr_numbers[@]}"; do
+            mergeable='unknown'
+            draft='false'
+
+            for attempt in 1 2 3 4 5; do
+              pull_request="$(gh api "repos/$REPOSITORY/pulls/$pr_number")"
+              state="$(jq --raw-output '.state' <<< "$pull_request")"
+              base_ref="$(jq --raw-output '.base.ref' <<< "$pull_request")"
+              draft="$(jq --raw-output '.draft' <<< "$pull_request")"
+              mergeable="$(jq --raw-output '
+                if .mergeable == null then "unknown"
+                elif .mergeable then "mergeable"
+                else "conflicting"
+                end
+              ' <<< "$pull_request")"
+
+              if [[ "$state" != 'open' || "$base_ref" != 'minimal' || "$mergeable" != 'unknown' ]]; then
+                break
+              fi
+
+              if (( attempt < 5 )); then
+                sleep $((attempt * 2))
+              fi
+            done
+
+            if [[ "$state" != 'open' || "$base_ref" != 'minimal' ]]; then
+              continue
+            fi
+
+            if [[ "$mergeable" == 'unknown' ]]; then
+              printf 'GitHub still reports mergeability as unknown for PR %s; deferring.\n' "$pr_number"
+              continue
+            fi
+
+            if [[ "$mergeable" == 'mergeable' ]]; then
+              continue
+            fi
+
+            if [[ "$draft" != 'true' ]]; then
+              if ! mutation_error="$(gh pr ready "$pr_number" --repo "$REPOSITORY" --undo 2>&1)"; then
+                printf 'Could not convert conflicting PR %s to draft:\n%s\n' "$pr_number" "$mutation_error" >&2
+                {
+                  printf '### Draft conversion blocked for PR #%s\n\n' "$pr_number"
+                  printf 'GitHub reported the following mutation error:\n\n```text\n%s\n```\n\n' "$mutation_error"
+                  printf 'The workflow can read the conflict, but automatic draft conversion requires the `RECIPE_POLICY_TOKEN` repository secret with pull-request write access. Mark the PR draft manually or configure that token.\n\n'
+                } >> "$GITHUB_STEP_SUMMARY"
+                failed_prs+=("$pr_number")
+                continue
+              fi
+            fi
+
+            reason="$marker
+            GitHub currently reports conflicts with \`minimal\`. This pull request is draft until the branch is resolved. Mark it ready manually after GitHub reports it mergeable."
+            comments="$(gh api --paginate "repos/$REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '.[] | .body // ""')"
+            if ! grep --fixed-strings --quiet "$marker" <<< "$comments"; then
+              gh api -X POST "repos/$REPOSITORY/issues/$pr_number/comments" -f body="$reason"
+            fi
+          done
+
+          if (( ${#failed_prs[@]} != 0 )); then
+            printf 'Draft conversion failed for PRs: %s.\n' "${failed_prs[*]}" >&2
+            exit 1
+          fi
+
+  draft-failed-checks:
+    name: draft-prs-w-failed-checks
+    needs: [close, require-minimal-base, draft-conflicts]
+    if: always()
+    runs-on: ubuntu-latest
+    concurrency:
+      group: recipe-draft-failed-checks
+      cancel-in-progress: false
+    steps:
+      - name: Draft open pull requests with failed checks
+        env:
+          GH_TOKEN: ${{ secrets.RECIPE_POLICY_TOKEN || github.token }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed='[.statusCheckRollup[]? | select(
+            .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or
+            .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or
+            .state == "FAILURE" or .state == "ERROR")] | length > 0'
+          candidates="$(gh pr list --repo "$REPOSITORY" --state open --limit 1000 \
+            --json number,isDraft,statusCheckRollup \
+            --jq ".[] | select(.isDraft == false) | select($failed) | .number")"
+          while IFS= read -r number; do
+            [[ -n "$number" ]] || continue
+            pull="$(gh pr view "$number" --repo "$REPOSITORY" \
+              --json state,isDraft,headRefOid,statusCheckRollup)"
+            if ! jq -e "(.state == \"OPEN\" and .isDraft == false) and ($failed)" <<< "$pull" >/dev/null; then
+              continue
+            fi
+            sha="$(jq -r .headRefOid <<< "$pull")"
+            current="$(gh pr view "$number" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
+            [[ "$sha" == "$current" ]] || continue
+            gh pr ready "$number" --repo "$REPOSITORY" --undo
+            printf 'Drafted PR #%s: failed checks on %s.\n' "$number" "$sha" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$candidates"

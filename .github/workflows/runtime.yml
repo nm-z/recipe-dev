@@ -1,0 +1,979 @@
+name: os/device check
+
+# Every platform check executes the same checked-in suite
+# (.github/runtime/suite.rs) against one explicitly selected backend and
+# uploads machine-readable evidence for the exact source snapshot it ran.
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Gateway request identifier used to isolate this run
+        required: true
+        type: string
+      candidate_sha:
+        description: Incoming commit SHA accepted by the gateway
+        required: true
+        type: string
+      snapshot_sha256:
+        description: SHA-256 of the private source archive
+        required: true
+        type: string
+      blob_name:
+        description: Private Blob Storage object containing the source archive
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Provider jobs are not cancelled in place. Camber's current CLI has no
+  # cancellation operation, and cancelling a run can leave a pending provider
+  # job alive after GitHub has forgotten its cleanup context. Give every push
+  # its own group so rapid pushes cannot replace an older pending run.
+  group: recipe-runtime-${{ inputs.request_id || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SUITE_SEED: "17"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. prepare -- resolves the candidate commit and publishes the immutable
+  # source snapshot every platform check consumes. Nothing else waits on a
+  # platform check.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+      snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
+    steps:
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+
+      - name: Resolve the candidate SHA
+        id: resolve
+        working-directory: controller
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "${GITHUB_REF:-}" != "refs/heads/minimal" ]; then
+              echo "workflow_dispatch must target refs/heads/minimal" >&2
+              exit 1
+            fi
+            candidate_sha="${INPUT_CANDIDATE_SHA:-}"
+            if [[ ! "$candidate_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "candidate_sha must be a 40-character commit SHA" >&2
+              exit 1
+            fi
+            candidate_sha="${candidate_sha,,}"
+            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+            echo "candidate $candidate_sha supplied by the gateway dispatch"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "push" ]; then
+            candidate_sha="${PUSH_SHA:-}"
+            if [[ ! "$candidate_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "push SHA must be a 40-character commit SHA" >&2
+              exit 1
+            fi
+            candidate_sha="${candidate_sha,,}"
+            checkout_sha="$(git rev-parse HEAD)"
+            if [ "$checkout_sha" != "$candidate_sha" ]; then
+              echo "checked-out commit $checkout_sha does not match push SHA $candidate_sha" >&2
+              exit 1
+            fi
+            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+            echo "candidate $candidate_sha supplied by the branch push"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "unsupported event: $EVENT_NAME" >&2
+            exit 1
+          fi
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "the pull request head SHA is absent" >&2
+            exit 1
+          fi
+          # The merge commit in the event payload lags the head it is supposed
+          # to incorporate, so it is not used. refs/pull/N/merge is the live
+          # ref; GitHub recomputes it a moment after a push, so it is polled.
+          merged=""
+          for attempt in 1 2 3 4 5 6; do
+            git fetch --quiet --force origin "refs/pull/${PR_NUMBER}/merge:refs/candidate" || true
+            if git rev-parse --verify --quiet refs/candidate >/dev/null; then
+              if git cat-file -p refs/candidate | grep -Fqx "parent $HEAD_SHA"; then
+                merged="yes"
+                break
+              fi
+            fi
+            echo "attempt $attempt: the merge ref does not yet incorporate $HEAD_SHA"
+            sleep 10
+          done
+          if [ -z "$merged" ]; then
+            # Fail closed: a candidate without the current head would let the
+            # platform jobs agree on stale code.
+            echo "refs/pull/${PR_NUMBER}/merge never incorporated head $HEAD_SHA" >&2
+            exit 1
+          fi
+          git checkout --quiet --detach refs/candidate
+          candidate_sha="$(git rev-parse HEAD)"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "candidate $candidate_sha merges head $HEAD_SHA (event=${{ github.event_name }})"
+
+      - name: Authenticate to Azure for a gateway dispatch
+        if: github.event_name == 'workflow_dispatch'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download the private gateway snapshot
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+          BLOB_NAME: ${{ inputs.blob_name }}
+        run: |
+          set -euo pipefail
+          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT repository value is required}"
+          : "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER repository value is required}"
+          : "${BLOB_NAME:?blob_name input is required}"
+          case "$BLOB_NAME" in
+            *$'\n'*|*$'\r'*)
+              echo "blob_name contains a line break" >&2
+              exit 1
+              ;;
+          esac
+          az storage blob download \
+            --auth-mode login \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_STORAGE_CONTAINER" \
+            --name "$BLOB_NAME" \
+            --file /tmp/recipe-source-dispatch.tar.gz \
+            --overwrite false \
+            --only-show-errors
+          stat -c 'downloaded snapshot bytes=%s' /tmp/recipe-source-dispatch.tar.gz
+
+      - name: Build or accept the immutable source snapshot
+        id: snapshot
+        working-directory: controller
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_COMMIT: ${{ steps.resolve.outputs.candidate_sha }}
+          EXPECTED_SHA256: ${{ inputs.snapshot_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            expected="${EXPECTED_SHA256:-}"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "snapshot_sha256 must be a 64-character SHA-256" >&2
+              exit 1
+            fi
+            cp /tmp/recipe-source-dispatch.tar.gz /tmp/recipe-source.tar.gz
+          else
+            # A reproducible archive of the exact candidate tree. External
+            # workers receive this, never an instruction to clone newer code.
+            git archive --format=tar HEAD | gzip -n > /tmp/recipe-source.tar.gz
+            expected=""
+          fi
+          sha256="$(sha256sum /tmp/recipe-source.tar.gz | cut -d' ' -f1)"
+          if [ -n "$expected" ] && [ "$sha256" != "${expected,,}" ]; then
+            echo "snapshot checksum mismatch: $sha256 != $expected" >&2
+            exit 1
+          fi
+          archive_tar="$(mktemp /tmp/recipe-source.XXXXXX.tar)"
+          trap 'rm -f "$archive_tar"' EXIT
+          gzip -dc /tmp/recipe-source.tar.gz > "$archive_tar"
+          archive_commit="$(git get-tar-commit-id < "$archive_tar")"
+          [ "$archive_commit" = "$EXPECTED_COMMIT" ] || {
+            echo "snapshot commit mismatch: $archive_commit != $EXPECTED_COMMIT" >&2
+            exit 1
+          }
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "snapshot bytes=$(stat -c%s /tmp/recipe-source.tar.gz) sha256=$sha256 commit=$archive_commit"
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: /tmp/recipe-source.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # 1. linux/cpu -- Arch userspace on a GitHub runner, CPU backend.
+  # ---------------------------------------------------------------------------
+  linux-cpu:
+    name: linux/cpu
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: archlinux:base-devel
+    permissions:
+      contents: read
+    env:
+      CELL: recipe/linux-cpu
+    steps:
+      - name: Install the Arch toolchain
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed git rust clang llvm lld tar gzip
+          echo "pacman toolchain installed"
+
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable source snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify and extract the source snapshot
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
+
+      - name: Record the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          clang --version | head -1
+          ld.lld --version || true
+          {
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "clang=$(clang --version | head -1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the library and CLI
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          cargo build --release --lib --bin recipe
+          file target/release/recipe
+
+      - name: Execute the runtime suite on the CPU backend
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          mkdir -p evidence work
+          # RECIPE_FORCE_CPU is Recipe's unconditional CPU selection: it short
+          # circuits device discovery before any AMD or NVIDIA probe runs.
+          RECIPE_FORCE_CPU=1 \
+          RECIPE_SUITE_ROOT="$GITHUB_WORKSPACE/controller/.github/runtime" \
+          RECIPE_SUITE_WORK="$PWD/work" \
+          RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
+            ./target/release/recipe "$GITHUB_WORKSPACE/controller/.github/runtime/suite.rs" 2>&1 | tee evidence/run.log
+          grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          # Recipe prints the route it selected; this is the fallback detector.
+          # One awk process rather than a pipeline, so pipefail cannot turn an
+          # early-exiting match into a step failure, and the behaviour is the
+          # same on the BSD and GNU userlands.
+          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          if [ -z "$route" ]; then
+            echo "no route line: the suite did not dispatch" >&2
+            tail -40 evidence/run.log >&2
+            exit 1
+          fi
+          device="${route##*:}"
+          [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
+          grep -q '\.fp32 rows ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
+          echo "device=$device" >> "$GITHUB_OUTPUT"
+          echo "executed on $route"
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/evidence
+          cat > candidate/evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "os": "$(. /etc/os-release && echo "$PRETTY_NAME")",
+            "arch": "$(uname -m)",
+            "kernel": "$(uname -r)",
+            "runner": "ubuntu-24.04 container archlinux:base-devel",
+            "backend": "cpu",
+            "device": "${{ steps.device.outputs.device || 'unknown' }}",
+            "gpu_execution": false,
+            "toolchain": {
+              "rustc": "$(rustc --version 2>/dev/null || echo unknown)",
+              "cargo": "$(cargo --version 2>/dev/null || echo unknown)",
+              "clang": "$(clang --version 2>/dev/null | head -1 || echo unknown)"
+            },
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          cat candidate/evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-linux-cpu
+          path: candidate/evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
+  # ---------------------------------------------------------------------------
+  linux-gpu:
+    name: linux/nv
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CELL: recipe/linux-gpu
+      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
+
+      - name: Require the Camber control credential
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${CAMBER_API_KEY:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "camber-credential-absent",
+            "detail": "CAMBER_API_KEY is not available to this run. A fork pull request never receives it, and it has not been configured for this repository. The Camber student GPU allowance must be redeemed and the control credential stored as a repository secret before this cell can execute.",
+            "resolution": "Redeem the Camber Student Pack offer, confirm the workspace has the student GPU allowance, then store the API key as the CAMBER_API_KEY repository secret."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/linux-gpu is blocked: the Camber control credential is absent" >&2
+            exit 1
+          fi
+
+      - name: Submit, poll and collect the Camber GPU job
+        id: camber
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+
+      - name: Terminate the Camber job
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
+          else
+            echo "no Camber job to terminate"
+          fi
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-linux-gpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. recipe/windows-cpu -- native MSVC Windows, CPU backend. This runs the
+  #    shared suite and preserves the train/save/resume/infer lifecycle
+  #    coverage from windows-native-lifecycle.yml.
+  # ---------------------------------------------------------------------------
+  windows-cpu:
+    name: win/cpu
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CELL: recipe/windows-cpu
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable source snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify and extract the source snapshot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:GITHUB_WORKSPACE "snapshot\recipe-source.tar.gz"
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
+          if ($actual -ne "${{ needs.prepare.outputs.snapshot_sha256 }}".ToLower()) { throw "snapshot checksum mismatch: $actual" }
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          New-Item -ItemType Directory -Force -Path $candidate | Out-Null
+          tar.exe -xzf $archive -C $candidate
+          $clang = Join-Path $env:ProgramFiles "LLVM\bin\clang.exe"
+          $linker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+          if (![IO.File]::Exists($clang)) { throw "native clang is absent: $clang" }
+          if (![IO.File]::Exists($linker)) { throw "native linker is absent: $linker" }
+          rustc --version
+          cargo --version
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { throw "clang failed with exit code $LASTEXITCODE" }
+          "snapshot verified and extracted sha256=$actual"
+
+      - name: Build the native release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          Push-Location $candidate
+          cargo build --locked --release --lib --bin recipe
+          $buildExit = $LASTEXITCODE
+          Pop-Location
+          if ($buildExit -ne 0) { throw "native release build failed with exit code $buildExit" }
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
+          $bytes = [IO.File]::ReadAllBytes($recipe)
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "recipe.exe is not a PE executable" }
+          "recipe.exe size=$($bytes.Length) sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $recipe).Hash) magic=MZ"
+
+      - name: Execute the runtime suite on the CPU backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          New-Item -ItemType Directory -Force -Path evidence, work | Out-Null
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          $env:RECIPE_FORCE_CPU = "1"
+          $env:RECIPE_SUITE_ROOT = Join-Path $env:GITHUB_WORKSPACE "controller\.github\runtime"
+          $env:RECIPE_SUITE_WORK = Join-Path $candidate "work"
+          $env:RECIPE_EVIDENCE = Join-Path $env:GITHUB_WORKSPACE "evidence\suite.json"
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE "controller\.github\runtime\suite.rs"
+          # A native failure must not be masked by a later successful command.
+          & $recipe $source 2>&1 | Tee-Object -FilePath evidence\run.log
+          if ($LASTEXITCODE -ne 0) { throw "the runtime suite failed with exit code $LASTEXITCODE" }
+          if (!(Select-String -Path evidence\run.log -SimpleMatch "SUITE PASS" -Quiet)) { throw "the suite did not report SUITE PASS" }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $line = Select-String -Path evidence\run.log -Pattern '^selected route ' | Select-Object -First 1
+          if (!$line) { throw "no route line: the suite did not dispatch" }
+          $route = ($line.Line -split '\s+')[2]
+          $device = $route.Split(':')[-1]
+          if ($device -ne "cpu") { throw "expected the cpu device, got $device" }
+          "device=$device" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "executed on $route"
+
+      - name: Preserve the public train/save/resume/infer lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CUDA_PATH = $null
+          $env:RECIPE_FORCE_CPU = "1"
+
+          function Read-FiniteEvidence([string] $Path, [int] $MinimumValues) {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            $doubleBytes = [BitConverter]::GetBytes([double] 0).Length
+            if ($bytes.Length % $doubleBytes -ne 0) {
+              throw "evidence length $($bytes.Length) is not a sequence of f64 values"
+            }
+            $count = [int] ($bytes.Length / $doubleBytes)
+            if ($count -lt $MinimumValues) {
+              throw "evidence contains $count values, expected at least $MinimumValues"
+            }
+            $values = [double[]]::new($count)
+            for ($index = 0; $index -lt $count; $index++) {
+              $value = [BitConverter]::ToDouble($bytes, $index * $doubleBytes)
+              if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+                throw "evidence value $index is not finite"
+              }
+              $values[$index] = $value
+            }
+            return $values
+          }
+
+          function Get-SourceManifest([string] $Root) {
+            $manifest = @(
+              Get-ChildItem -LiteralPath $Root -Recurse -File |
+                ForEach-Object {
+                  $relative = [IO.Path]::GetRelativePath($Root, $_.FullName)
+                  if ($relative -notmatch '^(target|work)[\\/]') {
+                    "$relative`t$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash)"
+                  }
+                } |
+                Sort-Object
+            )
+            return $manifest
+          }
+
+          $candidate = Join-Path $env:GITHUB_WORKSPACE "candidate"
+          $state = Join-Path $env:RUNNER_TEMP "recipe-windows-cpu-lifecycle"
+          if ([IO.Directory]::Exists($state)) {
+            throw "lifecycle state already exists: $state"
+          }
+          New-Item -ItemType Directory -Path $state | Out-Null
+          $profile = Join-Path $state "profile"
+          New-Item -ItemType Directory -Path $profile | Out-Null
+
+          $rustupHome = (rustup show home).Trim()
+          if ($LASTEXITCODE -ne 0 -or ![IO.Directory]::Exists($rustupHome)) {
+            throw "rustup home is unavailable: $rustupHome"
+          }
+          $env:RUSTUP_HOME = $rustupHome
+          $env:USERPROFILE = $profile
+          $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE = Join-Path $state "model.ogdl"
+          $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE = Join-Path $state "evidence.bin"
+
+          $nativeCache = Join-Path $profile ".cache\recipe\native"
+          if ([IO.Directory]::Exists($nativeCache)) {
+            throw "native cache is not cold: $nativeCache"
+          }
+
+          $recipe = Join-Path $candidate "target\release\recipe.exe"
+          $source = Join-Path $candidate ".github\windows-native\lifecycle.rs"
+          $sourceBefore = @(Get-SourceManifest $candidate)
+          Push-Location $candidate
+
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "train"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public training invocation failed with exit code $LASTEXITCODE"
+          }
+          $train = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          if (![IO.File]::Exists($env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE)) {
+            throw "training did not save the model bundle"
+          }
+          $trainedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($trainedBundle.Length -eq 0) {
+            throw "training saved an empty model bundle"
+          }
+          $trainedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $trainedBundle.FullName).Hash
+          $trainFinalBits = [BitConverter]::DoubleToInt64Bits($train[1])
+          "train initial=$($train[0]) final=$($train[1]) final_bits=$([Convert]::ToString($trainFinalBits, 16)) predictions=$($train.Count - 2)"
+          "trained bundle size=$($trainedBundle.Length) sha256=$trainedHash"
+
+          $artifacts = @(Get-ChildItem -LiteralPath $nativeCache -Recurse -Filter artifact.dll -File)
+          if ($artifacts.Count -eq 0) {
+            throw "cold-cache training produced no native CPU artifact"
+          }
+          foreach ($artifact in $artifacts) {
+            $bytes = [IO.File]::ReadAllBytes($artifact.FullName)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "native artifact is not a PE DLL: $($artifact.FullName)"
+            }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash
+            "native artifact path=$($artifact.FullName) size=$($bytes.Length) sha256=$hash magic=MZ"
+          }
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "resume"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public resume invocation failed with exit code $LASTEXITCODE"
+          }
+          $resume = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 3)
+          $resumeInitialBits = [BitConverter]::DoubleToInt64Bits($resume[0])
+          if ($resumeInitialBits -ne $trainFinalBits) {
+            throw "resume initial loss does not match the saved training state"
+          }
+          $resumedBundle = Get-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE
+          if ($resumedBundle.Length -eq 0) {
+            throw "resume saved an empty model bundle"
+          }
+          $resumedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resumedBundle.FullName).Hash
+          "resume initial=$($resume[0]) final=$($resume[1]) initial_bits=$([Convert]::ToString($resumeInitialBits, 16)) predictions=$($resume.Count - 2)"
+          "resumed bundle size=$($resumedBundle.Length) sha256=$resumedHash"
+
+          Remove-Item -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE
+          $env:RECIPE_WINDOWS_LIFECYCLE_PHASE = "infer"
+          & $recipe $source
+          if ($LASTEXITCODE -ne 0) {
+            throw "public inference invocation failed with exit code $LASTEXITCODE"
+          }
+          $inference = @(Read-FiniteEvidence $env:RECIPE_WINDOWS_LIFECYCLE_EVIDENCE 1)
+          $inferredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:RECIPE_WINDOWS_LIFECYCLE_BUNDLE).Hash
+          if ($inferredHash -ne $resumedHash) {
+            throw "public inference mutated the saved model bundle"
+          }
+          "inference values=$($inference.Count) first=$($inference[0]) bundle_sha256=$inferredHash"
+
+          Pop-Location
+          $sourceAfter = @(Get-SourceManifest $candidate)
+          if (@(Compare-Object -ReferenceObject $sourceBefore -DifferenceObject $sourceAfter).Count -ne 0) {
+            throw "the public lifecycle changed source files"
+          }
+          "PASS native_build=PE train=finite save=present resume=saved_state infer=finite source=unchanged"
+
+      - name: Write the cell evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          $document = [ordered]@{
+            cell           = $env:CELL
+            commit         = "${{ needs.prepare.outputs.candidate_sha }}"
+            run_id         = "${{ github.run_id }}"
+            run_attempt    = "${{ github.run_attempt }}"
+            os             = (Get-CimInstance Win32_OperatingSystem).Caption
+            arch           = $env:PROCESSOR_ARCHITECTURE
+            runner         = "windows-2025"
+            backend        = "cpu"
+            device         = "${{ steps.device.outputs.device }}"
+            gpu_execution  = $false
+            toolchain      = [ordered]@{
+              rustc = (rustc --version)
+              cargo = (cargo --version)
+              clang = (& (Join-Path $env:ProgramFiles "LLVM\bin\clang.exe") --version | Select-Object -First 1)
+            }
+            snapshot_sha256 = "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          $document | ConvertTo-Json -Depth 5 | Set-Content -Path evidence\cell.json -Encoding utf8
+          Get-Content evidence\cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-windows-cpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. recipe/windows-gpu -- native Windows NVIDIA VM in Azure, driven through
+  #    GitHub OIDC and managed Run Command.
+  # ---------------------------------------------------------------------------
+  windows-gpu:
+    name: win/nv
+    needs: prepare
+    runs-on: ubuntu-24.04
+    environment: recipe-windows-gpu
+    timeout-minutes: 90
+    concurrency:
+      # Keep one Windows GPU worker per push run rather than one global pending
+      # slot. azure-run.sh still admits only one worker at a time through the
+      # Azure lease.
+      group: recipe-windows-nvidia-${{ github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      CELL: recipe/windows-gpu
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          echo "snapshot verified and extracted to candidate sha256=$actual"
+
+      - name: Require the Azure federation
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${AZURE_CLIENT_ID:-}" ] || [ -z "${AZURE_TENANT_ID:-}" ] || [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "azure-federation-absent",
+            "detail": "AZURE_GPU_CLIENT_ID, AZURE_TENANT_ID, or AZURE_SUBSCRIPTION_ID is unavailable to this run.",
+            "resolution": "Configure the GPU controller identity and subscription secrets for the minimal branch."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/windows-gpu is blocked: the Azure federation is absent" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision, execute and collect the Windows GPU worker
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Deallocate and clean up the worker
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-cleanup.sh"
+          else
+            echo "no Azure resources to clean up"
+          fi
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-windows-gpu
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 5. recipe/macos-cpu -- native ARM64 macOS, CPU backend.
+  # ---------------------------------------------------------------------------
+  macos-cpu:
+    name: mac/cpu
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CELL: recipe/macos-cpu
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable source snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify and extract the source snapshot
+        id: toolchain
+        run: |
+          set -euo pipefail
+          actual="$(shasum -a 256 snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/candidate"
+          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
+          [ "$(uname -m)" = "arm64" ] || { echo "this cell requires an ARM64 runner, got $(uname -m)" >&2; exit 1; }
+          # Discover the real paths rather than assuming Linux locations.
+          clang_path="$(xcrun --find clang)"
+          ld_path="$(xcrun --find ld)"
+          echo "clang_path=$clang_path" >> "$GITHUB_OUTPUT"
+          echo "ld_path=$ld_path" >> "$GITHUB_OUTPUT"
+          rustc --version
+          cargo --version
+          "$clang_path" --version | head -1
+          echo "snapshot verified and extracted sha256=$actual arch=$(uname -m) clang=$clang_path ld=$ld_path"
+
+      - name: Build the native library and CLI
+        run: |
+          set -euo pipefail
+          # Cargo.toml declares /usr/bin/clang and /usr/bin/ld for macos, which
+          # are the Xcode shims present on this image.
+          cd "$GITHUB_WORKSPACE/candidate"
+          cargo build --release --lib --bin recipe
+          file target/release/recipe
+
+      - name: Execute the runtime suite on the CPU backend
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          mkdir -p evidence work
+          RECIPE_FORCE_CPU=1 \
+          RECIPE_SUITE_ROOT="$GITHUB_WORKSPACE/controller/.github/runtime" \
+          RECIPE_SUITE_WORK="$PWD/work" \
+          RECIPE_EVIDENCE="$PWD/evidence/suite.json" \
+            ./target/release/recipe "$GITHUB_WORKSPACE/controller/.github/runtime/suite.rs" 2>&1 | tee evidence/run.log
+          grep -q "SUITE PASS" evidence/run.log || { echo "the suite did not report SUITE PASS" >&2; exit 1; }
+
+      - name: Assert the CPU backend actually executed
+        id: device
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          # A Metal device being present must not turn this cell into a GPU cell.
+          # One awk process rather than a pipeline, so pipefail cannot turn an
+          # early-exiting match into a step failure, and the behaviour is the
+          # same on the BSD and GNU userlands.
+          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          if [ -z "$route" ]; then
+            echo "no route line: the suite did not dispatch" >&2
+            tail -40 evidence/run.log >&2
+            exit 1
+          fi
+          device="${route##*:}"
+          [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
+          echo "device=$device" >> "$GITHUB_OUTPUT"
+          echo "executed on $route"
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/evidence
+          cat > candidate/evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "os": "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion)",
+            "arch": "$(uname -m)",
+            "runner": "macos-15",
+            "backend": "cpu",
+            "device": "${{ steps.device.outputs.device || 'unknown' }}",
+            "gpu_execution": false,
+            "toolchain": {
+              "rustc": "$(rustc --version 2>/dev/null || echo unknown)",
+              "cargo": "$(cargo --version 2>/dev/null || echo unknown)",
+              "clang": "$(${{ steps.toolchain.outputs.clang_path }} --version 2>/dev/null | head -1 || echo unknown)",
+              "clang_path": "${{ steps.toolchain.outputs.clang_path }}",
+              "ld_path": "${{ steps.toolchain.outputs.ld_path }}"
+            },
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          cat candidate/evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-macos-cpu
+          path: candidate/evidence/
+          retention-days: 14
+          if-no-files-found: error
