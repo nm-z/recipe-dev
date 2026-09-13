@@ -367,7 +367,17 @@ if [ "$RECIPE_WORKLOAD" = trial ]; then
 		exit 1
 	}
 	grep -E '^== worker: harness exit' evidence/worker-run.log
-	echo "compositions: $(grep -c '^composition [0-9]*:' "$trial_file" || true), packets: $(grep -c '^RECIPE FAILURE BEGIN$' "$trial_file" || true), file: $trial_file"
+	harness_status="$(sed -n 's/^== worker: harness exit \([0-9][0-9]*\).*/\1/p' evidence/worker-run.log | head -1)"
+	case "$harness_status" in
+		''|*[!0-9]*) echo "the worker log has no valid harness exit status" >&2; exit 1 ;;
+	esac
+	compositions="$(grep -c '^composition [0-9]*:' "$trial_file" || true)"
+	packets="$(grep -c '^RECIPE FAILURE BEGIN$' "$trial_file" || true)"
+	echo "compositions: $compositions, packets: $packets, file: $trial_file"
+	if [ "$harness_status" -ne 0 ] || [ "$compositions" -ne "$RECIPE_TRIAL_COUNT" ]; then
+		echo "the Camber trial returned partial evidence: status=$harness_status compositions=$compositions expected=$RECIPE_TRIAL_COUNT" >&2
+		exit 1
+	fi
 	echo "recipe/camber-trial completed for cursors $RECIPE_TRIAL_CURSOR..$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1))"
 	exit 0
 fi
