@@ -5,18 +5,9 @@ name: camber trial
 # RECIPE_COMPOSITION_CURSOR, and return the harness's stderr as the evidence.
 
 on:
-  workflow_dispatch:
-    inputs:
-      cursor:
-        description: First composition cursor
-        required: true
-        default: "20000"
-        type: string
-      count:
-        description: Number of compositions
-        required: true
-        default: "20"
-        type: string
+  push:
+    branches:
+      - "camber/**"
 
 permissions:
   contents: read
@@ -59,14 +50,16 @@ jobs:
       - name: Submit, poll and collect the Camber trial job
         run: |
           set -euo pipefail
+          # The cursor and count come from the branch, so a trial is one push.
+          set -a
+          . "$GITHUB_WORKSPACE/controller/.github/runtime/trial.env"
+          set +a
           bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-trial.sh"
         env:
           CANDIDATE_SHA: ${{ steps.snapshot.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ steps.snapshot.outputs.sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
-          RECIPE_TRIAL_CURSOR: ${{ inputs.cursor }}
-          RECIPE_TRIAL_COUNT: ${{ inputs.count }}
 
       - name: Terminate the Camber job
         if: always()
