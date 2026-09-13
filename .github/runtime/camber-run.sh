@@ -237,7 +237,14 @@ camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
 camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
 
-job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS RECIPE_WORKLOAD=$RECIPE_WORKLOAD RECIPE_TRIAL_CURSOR=${RECIPE_TRIAL_CURSOR:-0} RECIPE_TRIAL_COUNT=${RECIPE_TRIAL_COUNT:-0} bash worker.sh"
+# A trial job the controller stops waiting for cannot be cancelled (the CLI has no cancel), so the
+# worker itself carries a hard wall-clock budget: toolchain, build and harness together end within it.
+TRIAL_BUDGET_SECONDS="${TRIAL_BUDGET_SECONDS:-2400}"
+worker_launch="bash worker.sh"
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	worker_launch="timeout --signal=TERM --kill-after=30s ${TRIAL_BUDGET_SECONDS}s bash worker.sh"
+fi
+job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS RECIPE_WORKLOAD=$RECIPE_WORKLOAD RECIPE_TRIAL_CURSOR=${RECIPE_TRIAL_CURSOR:-0} RECIPE_TRIAL_COUNT=${RECIPE_TRIAL_COUNT:-0} $worker_launch"
 for provider_attempt in 1 2; do
 	echo "== creating the Camber L4 job, attempt $provider_attempt of 2 =="
 	create_output="$(printf 'y\n' | camber job create \
