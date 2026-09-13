@@ -2991,7 +2991,7 @@ define internal i1 @attention_selected(ptr addrspace(1) nocapture readonly %cont
 %flag.index = add i64 %start, %flag.local.wide
 %flag.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %flag.index
 %flag = load double, ptr addrspace(1) %flag.ptr, align 8
-%result = call i1 @recipe.ogt(double %flag, double 5.000000e-01)
+%result = call i1 @recipe.ogt(double %flag, double 0.5)
 ret i1 %result
 }
 ; The indexer planes live in their own arena, the side projection's output: one
@@ -3386,7 +3386,7 @@ rank.decide:
 %rank.admit = icmp ult i32 %rank.ahead, %keep
 br label %rank.store
 rank.store:
-%rank.flag = select i1 %rank.admit, double 1.000000e+00, double 0.000000e+00
+%rank.flag = select i1 %rank.admit, double 1.0, double 0.0
 %rank.store.b.wide = zext i32 %rank.b to i64 %rank.flag.index = add i64 %flag.base, %rank.store.b.wide
 %rank.flag.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %rank.flag.index
 store double %rank.flag, ptr addrspace(1) %rank.flag.ptr, align 8
