@@ -44,6 +44,15 @@ case "$state" in
 	*)
 		echo "Camber job $job_id is still ${state:-unknown}; the current CLI has no stop or cancel command" >&2
 		if [ -n "$stash_root" ]; then
+			# The worker returns at once when it finds this marker, so a job that
+			# is still queued frees its place as soon as it starts. The inputs
+			# stay for a job that is already running.
+			printf 'run %s attempt %s at %s\n' "${GITHUB_RUN_ID:-manual}" "${GITHUB_RUN_ATTEMPT:-1}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > abandoned
+			if camber stash cp abandoned "$stash_root/abandoned"; then
+				echo "marked $stash_root abandoned; the worker exits at once when it starts" >&2
+			else
+				echo "could not mark $stash_root abandoned" >&2
+			fi
 			echo "leaving $stash_root so an active job keeps its inputs" >&2
 		fi
 		;;

@@ -25,7 +25,12 @@ case "$RECIPE_WORKLOAD" in
 	*) echo "RECIPE_WORKLOAD must be suite or trial" >&2; exit 1 ;;
 esac
 
-QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
+# A queued job costs nothing but the wait, while a job the controller gives up
+# on keeps its queue place and runs the whole worker for nobody; so the queue
+# wait is bounded by the room the 60-minute job leaves after the worker's own
+# 1500 s, and the execution deadline counts from the first poll that finds the
+# job running rather than from submission.
+QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-1500}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 WORKER_EXECUTION_TIMEOUT_SECONDS="${WORKER_EXECUTION_TIMEOUT_SECONDS:-1500}"
@@ -89,6 +94,14 @@ printf '%s\n' "$stash_root" > camber-stash-root
 cat > worker.sh <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# The controller marks the run directory abandoned when it stops waiting for
+# this job (queue deadline, cancellation); a job that starts afterwards has no
+# reader, so it returns at once instead of building and running the suite.
+if [ -f abandoned ]; then
+	echo "the controller abandoned this job before it started: $(cat abandoned)"
+	exit 0
+fi
 
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
@@ -237,6 +250,21 @@ camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
 camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
 
+echo "== jobs of this workflow still queued ahead =="
+# Jobs an earlier run abandoned keep their queue place until they start; the
+# count says how many of them this job waits behind. The list pages oldest
+# first (page 1 is the account's first jobs), so the newest jobs are on the
+# last page, found from the total the first page reports.
+if queued_json="$(camber job list --size 50 --output json 2>/dev/null)"; then
+	last_page="$(printf '%s' "$queued_json" | jq -r '(((.total // 0) + 49) / 50 | floor) | if . < 1 then 1 else . end' 2>/dev/null || echo 1)"
+	if [ "$last_page" -gt 1 ]; then
+		queued_json="$(camber job list --size 50 --page "$last_page" --output json 2>/dev/null || printf '%s' "$queued_json")"
+	fi
+	printf '%s' "$queued_json" | jq -r '[.. | objects | select(has("job_id") and has("mount_dir")) | select((.mount_dir // "") | startswith("recipe-runtime/") or startswith("recipe-trial/")) | select(((.job_status // "") | ascii_upcase) as $s | $s == "PENDING" or $s == "QUEUED" or $s == "SUBMITTED" or $s == "RUNNING")] | "\(length) queued or running: \([.[] | "\(.job_id):\(.job_status):\(.mount_dir)"] | join(" "))"' || echo "could not summarize the job list"
+else
+	echo "could not list jobs"
+fi
+
 # A trial job the controller stops waiting for cannot be cancelled (the CLI has no cancel), so the
 # worker itself carries a hard wall-clock budget: toolchain, build and harness together end within it.
 TRIAL_BUDGET_SECONDS="${TRIAL_BUDGET_SECONDS:-2400}"
@@ -270,6 +298,7 @@ for provider_attempt in 1 2; do
 
 	echo "== polling the Camber job =="
 	started="$(date +%s)"
+	running_since=""
 	state=""
 	while :; do
 		now="$(date +%s)"
@@ -288,7 +317,11 @@ for provider_attempt in 1 2; do
 			fi
 			;;
 		*)
-			if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
+			if [ -z "$running_since" ]; then
+				running_since="$now"
+				echo "  running after ${elapsed}s in the queue"
+			fi
+			if [ $((now - running_since)) -ge "$RUN_DEADLINE_SECONDS" ]; then
 				echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
 				exit 1
 			fi
