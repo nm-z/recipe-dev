@@ -1,0 +1,87 @@
+name: camber trial
+
+# One bounded run of the composition harness on a Camber L4: build the
+# candidate on the worker, run `count` compositions from `cursor`, and return
+# the harness's stderr (composition lines and failure packets) as the evidence.
+# Dispatched by hand so every run is a counted allowance decision.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cursor:
+        description: first composition cursor
+        required: true
+        default: "20000"
+      count:
+        description: number of compositions
+        required: true
+        default: "20"
+permissions:
+  contents: read
+
+concurrency:
+  group: camber-trial-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  trial:
+    name: camber/l4 trial
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+    steps:
+      - name: Check out the controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+
+      - name: Build the immutable source snapshot
+        id: snapshot
+        working-directory: controller
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/snapshot"
+          git archive --format=tar HEAD | gzip -n > "$GITHUB_WORKSPACE/snapshot/recipe-source.tar.gz"
+          sha256="$(sha256sum "$GITHUB_WORKSPACE/snapshot/recipe-source.tar.gz" | cut -d' ' -f1)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "snapshot sha256=$sha256"
+
+      - name: Require the Camber control credential
+        run: |
+          set -euo pipefail
+          [ -n "${CAMBER_API_KEY:-}" ] || { echo "CAMBER_API_KEY is not available to this run" >&2; exit 1; }
+
+      - name: Submit, poll and collect the Camber trial job
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+        env:
+          RECIPE_WORKLOAD: trial
+          RECIPE_TRIAL_CURSOR: ${{ inputs.cursor }}
+          RECIPE_TRIAL_COUNT: ${{ inputs.count }}
+          CANDIDATE_SHA: ${{ steps.snapshot.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ steps.snapshot.outputs.sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+
+      - name: Terminate the Camber job
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
+          else
+            echo "no Camber job to terminate"
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camber-trial
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: warn
