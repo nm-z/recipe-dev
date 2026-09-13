@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 // Every numeric source the loader accepts with a "target" column, plus the README data options.
@@ -40,6 +42,19 @@ fn reproduction() -> PathBuf {
 
 fn phase_file(path: &Path) -> PathBuf {
 	path.with_extension("phase")
+}
+
+fn kill_process_tree(child: &mut Child) -> std::io::Result<()> {
+	let pid = child.id().to_string();
+	#[cfg(unix)]
+	if Command::new("kill").args(["-KILL", &format!("-{pid}")]).status().is_ok_and(|status| status.success()) {
+		return Ok(());
+	}
+	#[cfg(windows)]
+	if Command::new("taskkill").args(["/PID", &pid, "/T", "/F"]).status().is_ok_and(|status| status.success()) {
+		return Ok(());
+	}
+	child.kill()
 }
 
 const WIDTHS: [usize; 5] = [4, 8, 16, 24, 32];
@@ -191,8 +206,10 @@ fn run(path: &Path) -> Result<(), Failure> {
 	let harness = |error: std::io::Error| Failure { phase: "harness".to_owned(), message: error.to_string(), output: error.to_string() };
 	let timeout_seconds = number("RECIPE_COMPOSITION_TIMEOUT_SECONDS", 180);
 	assert!(timeout_seconds > 0, "RECIPE_COMPOSITION_TIMEOUT_SECONDS must be greater than zero");
-	let mut child = Command::new(runner())
-		.arg(path)
+	let mut command = Command::new(runner());
+	#[cfg(unix)]
+	command.process_group(0);
+	let mut child = command.arg(path)
 		.env("RECIPE_COMPOSITION_PHASE_PATH", phase_file(path))
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
@@ -231,7 +248,7 @@ fn run(path: &Path) -> Result<(), Failure> {
 		}
 		if started.elapsed() >= Duration::from_secs(timeout_seconds) {
 			timed_out = true;
-			match child.kill() {
+			match kill_process_tree(&mut child) {
 				Ok(()) => break child.wait().map_err(harness)?,
 				Err(error) => match child.try_wait().map_err(harness)? {
 					Some(status) => break status,
