@@ -3255,10 +3255,12 @@ impl NativeModelIr {
 					let context = native_literal(self.precision.model, ty, node.argument[6]);
 					let fast = native_literal(self.precision.model, ty, node.argument[7]);
 					let slow = native_literal(self.precision.model, ty, node.argument[8]);
+					let sectioned = rope_sections(node, &self.graph.programs)?.is_some();
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @rope_body( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, {pointer} {table}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
+							table = pointers.context,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -7478,7 +7480,7 @@ mod bundle {
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
-				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let (layout, dims, base) = attention.rope.map_or(("0".to_owned(), 0, 0.0), |(layout, dims, base)| (layout.text(), dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer::NONE);
 				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
@@ -7576,10 +7578,7 @@ mod bundle {
 				let score_normalization = fields.next().map(|field| normalization(Some(field), "indexer scoring normalization")).transpose()?.flatten();
 				let score_dims = fields.next().map(|field| value_at(Some(field), "indexer rotary dimensions")).transpose()?.unwrap_or(0);
 				index.score = score_normalization.map(|normalization| (normalization, score_dims));
-				let layout = match fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(1) {
-					0 | 1 => RopeLayout::Neox,
-					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
-				};
+				let layout = fields.next().map(RopeLayout::parse).transpose()?.unwrap_or(RopeLayout::Neox);
 				// The four yarn values follow the head width, all four or none. A
 				// value-head marker may appear immediately after width when YaRN is
 				// absent, so it cannot be mistaken for a yarn factor.
@@ -8372,17 +8371,124 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// The most position axes a rotary layout can section its pairs over.
+pub const ROPE_AXES: usize = 4;
 /// The rotary pairing declared by an attention block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeLayout {
 	Neox,
+	/// The rotated pairs sectioned over position axes, as the multi-axis rotary
+	/// of the vision-language checkpoints: pair `i` takes its position from one
+	/// axis and its frequency from `i` as before. `Blocked` gives the first
+	/// `sizes[0]` pairs axis 0, the next `sizes[1]` axis 1, and so on;
+	/// `Interleaved` gives pair `i` axis `i % axes` while that axis has pairs
+	/// left, and the last axis after that. Both take the pair modulo the total
+	/// when the sizes cover fewer pairs than the rotated dimensions. A token's
+	/// positions default to its index on every axis, which is the plain rotary.
+	Sections {
+		sizes: [u16; ROPE_AXES],
+		axes: u8,
+		interleaved: bool,
+	},
 }
 impl RopeLayout {
-	const fn code(self) -> u8 {
+	/// The layout as the block record spells it: `1` for neox, `s`/`i` and the
+	/// axis sizes for the sectioned forms.
+	fn text(self) -> String {
 		match self {
-			Self::Neox => 1,
+			Self::Neox => "1".to_owned(),
+			Self::Sections { sizes, axes, interleaved } => {
+				let sizes = sizes[..usize::from(axes)].iter().map(|size| size.to_string()).collect::<Vec<_>>().join(".");
+				format!("{}{sizes}", if interleaved { 'i' } else { 's' })
+			}
 		}
 	}
+	fn parse(field: &str) -> Result<Self> {
+		match field {
+			"0" | "1" => Ok(Self::Neox),
+			_ => {
+				let (kind, rest) = field.split_at(1);
+				let interleaved = match kind {
+					"s" => false,
+					"i" => true,
+					_ => return Err(RecipeError::new(format!("invalid rotary layout {field}"))),
+				};
+				let listed = rest.split('.').map(|size| size.parse::<u16>().map_err(|_| RecipeError::new(format!("invalid rotary layout {field}")))).collect::<Result<Vec<_>>>()?;
+				Self::sections(&listed, interleaved)
+			}
+		}
+	}
+	fn sections(listed: &[u16], interleaved: bool) -> Result<Self> {
+		require(!listed.is_empty() && listed.len() <= ROPE_AXES, format!("rotary sections name 1 to {ROPE_AXES} axes"))?;
+		require(listed.iter().any(|size| *size != 0), "rotary sections must cover at least one pair")?;
+		let mut sizes = [0; ROPE_AXES];
+		sizes[..listed.len()].copy_from_slice(listed);
+		Ok(Self::Sections { sizes, axes: listed.len() as u8, interleaved })
+	}
+	/// How many position axes a token carries under this layout.
+	pub fn axes(self) -> usize {
+		match self {
+			Self::Neox => 1,
+			Self::Sections { axes, .. } => usize::from(axes),
+		}
+	}
+}
+/// The i32 words a sectioned rotary node's context holds: its program words,
+/// then the position of every row, axis and sequence position.
+fn rope_context_words(layout: RopeLayout, rows: usize, length: usize) -> Result<usize> {
+	checked_add(2 + ROPE_AXES, checked_mul(checked_mul(rows, layout.axes(), "rotary position axes")?, length, "rotary positions")?, "rotary context")
+}
+/// The bytes a sectioned rotary node's context holds: its words, then the
+/// position of every row, axis and sequence position, as i32. `positions` lists
+/// every token's axes in turn, `[row][position][axis]`; absent, every token
+/// sits at its index on every axis.
+fn rope_context_region(layout: RopeLayout, rows: usize, length: usize, positions: Option<&[u32]>) -> Result<Vec<u8>> {
+	let RopeLayout::Sections { sizes, axes, interleaved } = layout else { return Err(RecipeError::new("the plain rotary keeps no position table")) };
+	let axes = usize::from(axes);
+	if let Some(positions) = positions {
+		require(
+			positions.len() == rows * length * axes,
+			format!("rotary positions expected {} values ({rows} rows of {length} positions with {axes} axes), received {}", rows * length * axes, positions.len()),
+		)?;
+	}
+	let mut words = Vec::with_capacity(rope_context_words(layout, rows, length)?);
+	words.push(axes as i32);
+	words.push(i32::from(interleaved));
+	words.extend(sizes.iter().map(|size| i32::from(*size)));
+	for row in 0..rows {
+		for axis in 0..axes {
+			for position in 0..length {
+				let value = match positions {
+					Some(positions) => positions[(row * length + position) * axes + axis],
+					None => position as u32,
+				};
+				words.push(i32::try_from(value).map_err(|_| RecipeError::new(format!("rotary position {value} exceeds i32")))?);
+			}
+		}
+	}
+	Ok(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+}
+/// The program words a sectioned rotary node carries: axes, interleave flag,
+/// then the `ROPE_AXES` sizes.
+fn rope_words(sizes: [u16; ROPE_AXES], axes: u8, interleaved: bool) -> Vec<f64> {
+	let mut words = vec![f64::from(axes), f64::from(u8::from(interleaved))];
+	words.extend(sizes.iter().map(|size| f64::from(*size)));
+	words
+}
+/// The sectioned layout a rotary node declares through its program words, or
+/// `None` for the plain rotary.
+fn rope_sections(node: &Node, programs: &[f64]) -> Result<Option<RopeLayout>> {
+	if node.op != Primitive::Rope || node.program_count == 0 {
+		return Ok(None);
+	}
+	let words = programs.get(node.program_offset..node.program_offset + 2 + ROPE_AXES).ok_or_else(|| RecipeError::new("rotary section words are absent"))?;
+	let axes = integer_argument(words[0], "rotary axes")? as usize;
+	require((1..=ROPE_AXES).contains(&axes), "rotary axes are invalid")?;
+	let mut sizes = [0; ROPE_AXES];
+	for (size, word) in sizes.iter_mut().zip(&words[2..]) {
+		*size = u16::try_from(integer_argument(*word, "rotary section")?).map_err(|_| RecipeError::new("rotary section exceeds u16"))?;
+	}
+	Ok(Some(RopeLayout::Sections { sizes, axes: axes as u8, interleaved: words[1] != 0.0 }))
 }
 pub trait RopeSelector {
 	fn layout(self) -> RopeLayout;
@@ -8392,6 +8498,20 @@ pub const neox: Neox = Neox;
 impl RopeSelector for Neox {
 	fn layout(self) -> RopeLayout {
 		RopeLayout::Neox
+	}
+}
+/// A sectioned rotary layout: `sections([16, 24, 24])` blocks the pairs by axis
+/// in order, `interleaved([24, 20, 20, 0])` alternates the axes pair by pair.
+pub struct Sections(RopeLayout);
+pub fn sections<const N: usize>(sizes: [usize; N]) -> Sections {
+	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), false).unwrap_or_else(|error| panic!("{error}")))
+}
+pub fn interleaved<const N: usize>(sizes: [usize; N]) -> Sections {
+	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), true).unwrap_or_else(|error| panic!("{error}")))
+}
+impl RopeSelector for Sections {
+	fn layout(self) -> RopeLayout {
+		self.0
 	}
 }
 /// A step of a model, and equally a step of a fragment inside one. `res`,
@@ -10889,7 +11009,14 @@ impl Gguf {
 	/// is an ordinary node whose weight is a view of the file, and a contraction
 	/// bound to a weight without a bias row lowers and runs without one.
 	pub fn infer(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Vec<f64> {
-		infer_gguf(self, blocks, plan, input, channels).unwrap_or_else(|error| panic!("{error}"))
+		infer_gguf(self, blocks, plan, input, channels, None).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// `infer` with every token's position on every rotary axis given by the
+	/// caller: `positions` lists each row's positions in turn, each as its axes,
+	/// so a sectioned rotary (`sections`, `interleaved`) reads a token's axis
+	/// positions instead of its index. Without it every axis is the index.
+	pub fn infer_at(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, positions: &[u32]) -> Vec<f64> {
+		infer_gguf(self, blocks, plan, input, channels, Some(positions)).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Autoregressive decode over `blocks` bound from `plan`, as `recipe.decode`
 	/// runs a saved model: one tape of `sequence` id positions holds every block's
@@ -10897,11 +11024,18 @@ impl Gguf {
 	/// the positions it reaches. The logits are the model's output after the last
 	/// forward.
 	pub fn decode(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, None, sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// `decode` with the prompt's rotary positions given by the caller, one set
+	/// of axes per prompt id. Every generated id takes the axes of the id before
+	/// it, all raised to one past their largest, the way text continues after an
+	/// image in the multi-axis checkpoints.
+	pub fn decode_at(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], positions: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		decode_gguf(self, blocks, plan, sequence, prompt, Some(positions), sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Emits each sampled token while generating from bound GGUF weights.
 	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, None, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
@@ -10968,13 +11102,34 @@ impl Binding {
 /// Compiles `blocks` over `input` with every parameterized node bound from
 /// `plan`, and runs one forward. `channels` names the input's channel axis, so
 /// the rest of its length is the sequence the blocks walk.
-fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
+fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, positions: Option<&[u32]>) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
 	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, model.precision, None)?;
+	if let Some(positions) = positions {
+		tape.set_rope_positions(positions)?;
+	}
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
-fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32)) -> Result<Generation> {
+/// The rotary positions of every slot of a decode: the caller's for the prompt,
+/// then each later slot at one past the largest axis of the slot before it,
+/// on every axis.
+fn decode_positions(prompt_positions: &[u32], prompt: usize, sequence: usize, axes: usize) -> Result<Vec<u32>> {
+	require(
+		axes != 0 && prompt_positions.len() == prompt * axes,
+		format!("decode positions expected {} values for {prompt} prompt ids with {axes} axes, received {}", prompt * axes, prompt_positions.len()),
+	)?;
+	let mut positions = prompt_positions.to_vec();
+	for _ in prompt..sequence {
+		let last = &positions[positions.len() - axes..];
+		let next = last.iter().copied().max().unwrap_or(0).checked_add(1).ok_or_else(|| RecipeError::new("decode position overflows"))?;
+		positions.extend(std::iter::repeat_n(next, axes));
+	}
+	Ok(positions)
+}
+fn decode_gguf(
+	model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], positions: Option<&[u32]>, sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32),
+) -> Result<Generation> {
 	let load_started = std::time::Instant::now();
 	require(!prompt.is_empty(), "decode prompt is empty")?;
 	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the sequence of {sequence}", prompt.len()))?;
@@ -10984,6 +11139,10 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, model.precision, None)?;
+	if let Some(positions) = positions {
+		let axes = tape.rope_axes()?;
+		tape.set_rope_positions(&decode_positions(positions, prompt.len(), sequence, axes)?)?;
+	}
 	if std::env::var_os("RECIPE_TIMINGS").is_some() { eprintln!("model preparation {} s", load_started.elapsed().as_secs_f64()); }
 	decode_steps(
 		&mut tape,
@@ -11124,6 +11283,11 @@ impl Bound {
 	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
 		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
 		self.file.infer(&self.model, &self.plan, &input, 1)
+	}
+	/// `infer` with each id's position on every rotary axis, as `Gguf::infer_at`.
+	pub fn infer_at(&self, ids: &[u32], positions: &[u32]) -> Vec<f64> {
+		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+		self.file.infer_at(&self.model, &self.plan, &input, 1, positions)
 	}
 	/// Place this bound model across the selected devices for a sequence of
 	/// `positions` token ids. `split` names the Recipe blocks each device takes;
@@ -13132,8 +13296,9 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	if let Some((layout, dims, base)) = rope {
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
-		match layout {
-			RopeLayout::Neox => {}
+		if let RopeLayout::Sections { sizes, axes, .. } = layout {
+			let covered = sizes[..usize::from(axes)].iter().map(|size| usize::from(*size)).sum::<usize>();
+			require(covered <= dims / 2, format!("rotary sections cover {covered} pairs, more than the {} rotated pairs", dims / 2))?;
 		}
 		let rotated = checked_mul(width, checked_add(heads, keys, "rotary head partition")?, "rotary width")?;
 		let (mscale, factor, context, low, high) = match yarn {
@@ -13145,6 +13310,18 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			}
 		};
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
+		// A sectioned layout rides beside the node as program words: the axis
+		// count, the interleave flag and the axis sizes, which the context of the
+		// node repeats ahead of its position table.
+		if let RopeLayout::Sections { sizes, axes, interleaved } = layout {
+			let (program_offset, words) = (graph.programs.len(), rope_words(sizes, axes, interleaved));
+			let program_count = words.len().div_ceil(3);
+			graph.programs.extend(words);
+			graph.programs.resize(program_offset + program_count * 3, 0.0);
+			if let Some(node) = graph.nodes.last_mut() {
+				(node.program_offset, node.program_count) = (program_offset, program_count);
+			}
+		}
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -14012,6 +14189,8 @@ struct NativeTape {
 	input: Shape,
 	output: Shape,
 	nodes: Vec<Node>,
+	/// The program words the nodes reference: a sectioned rotary reads its axes there.
+	programs: Vec<f64>,
 	capacity: usize,
 	positions: u32,
 	vocabulary: f64,
@@ -14169,7 +14348,9 @@ impl NativeTape {
 		// tables and saved evaluation statistics remain unchanged.
 		let mut context_resets = Vec::<(usize, usize)>::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
-			let persistent = node.op == Primitive::Gather || (node.op == Primitive::Normalize && normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Evaluation);
+			let persistent = node.op == Primitive::Gather
+				|| (node.op == Primitive::Normalize && normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Evaluation)
+				|| rope_sections(node, &graph.programs)?.is_some();
 			if persistent {
 				continue;
 			}
@@ -14184,6 +14365,13 @@ impl NativeTape {
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
 			contexts.write_bytes(offset, &region)?;
+		}
+		// A sectioned rotary starts every row at the plain rotary: each token's
+		// position on every axis is its index.
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if let Some(rope) = rope_sections(node, &graph.programs)? {
+				contexts.write_bytes(layout.contexts[index], &rope_context_region(rope, rows, node.output.length, None)?)?;
+			}
 		}
 		debug(&format!(
 			"native tape device={} mode={} rows={rows} values={} contexts={} weights={} adjoints={adjoints_bytes}",
@@ -14220,6 +14408,7 @@ impl NativeTape {
 			input: graph.input,
 			output: graph.output,
 			nodes: graph.nodes.clone(),
+			programs: graph.programs.clone(),
 			capacity: rows,
 			positions: narrow(positions, "native input positions")? as u32,
 			vocabulary,
@@ -14567,6 +14756,31 @@ impl NativeTape {
 	}
 	fn upload_weights(&self, weights: &[f64]) -> Result<()> {
 		self.weights.write_float_bytes(0, weights, self.precision.model)
+	}
+	/// The axes of the model's sectioned rotary blocks, which all share one count.
+	fn rope_axes(&self) -> Result<usize> {
+		let mut axes = None;
+		for node in &self.nodes {
+			if let Some(layout) = rope_sections(node, &self.programs)? {
+				require(axes.is_none_or(|axes| axes == layout.axes()), "the sectioned rotary blocks disagree on their axes")?;
+				axes = Some(layout.axes());
+			}
+		}
+		axes.ok_or_else(|| RecipeError::new("the model has no sectioned rotary block to take positions"))
+	}
+	/// The position of every token on every rotary axis, `[row][position][axis]`
+	/// over this tape's rows and the sequence, written to every sectioned rotary
+	/// node. A tape without one is an error, since the positions would be lost.
+	fn set_rope_positions(&self, positions: &[u32]) -> Result<()> {
+		let mut written = false;
+		for (index, node) in self.nodes.iter().enumerate() {
+			if let Some(layout) = rope_sections(node, &self.programs)? {
+				let region = rope_context_region(layout, self.rows as usize, node.output.length, Some(positions))?;
+				self.contexts.write_bytes(self.program.artifact.layout.contexts[index], &region)?;
+				written = true;
+			}
+		}
+		require(written, "the model has no sectioned rotary block to take positions")
 	}
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
@@ -15285,6 +15499,14 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		}
 		Primitive::Pool if inference => return Ok(0),
 		Primitive::Pool => return checked_mul(state, size_of::<u64>(), "pool context bytes"),
+		// A sectioned rotary keeps its axis words and one position per row, axis
+		// and sequence position; the plain rotary keeps nothing.
+		Primitive::Rope => {
+			return match rope_sections(node, &graph.programs)? {
+				Some(layout) => checked_mul(rope_context_words(layout, rows, node.output.length)?, size_of::<i32>(), "rotary context bytes"),
+				None => Ok(size_of::<i32>()),
+			};
+		}
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),

@@ -70,7 +70,7 @@ blck:
 			.width(d)
 			.kv(heads)
 			.qk(rms|l2)
-			.rope(neox, dims, base)
+			.rope(neox|sections([...])|interleaved([...]), dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 			.gate()
