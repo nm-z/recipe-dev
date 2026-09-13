@@ -13262,13 +13262,19 @@ fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: us
 /// Adapt one branch to the canonical shape selected by the first MoE expert.
 /// The projection is learned over the flattened row, so it preserves every
 /// declared expert even when its sequence is shorter or longer.
+/// Adapt an expert's output to the mixture's shape: a per-position projection
+/// when only the channel count differs, and a projection over every element
+/// of the row only when the lengths differ, as the routers project.
 fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape) -> Result<i32> {
+	reset(graph, source, from);
 	if from == target {
-		reset(graph, source, from);
 		return Ok(source);
 	}
-	reset(graph, source, from);
-	lower_flatten_project(graph, target)?;
+	if from.length == target.length {
+		lower_project(graph, target.channels)?;
+	} else {
+		lower_flatten_project(graph, target)?;
+	}
 	Ok(graph.source)
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
