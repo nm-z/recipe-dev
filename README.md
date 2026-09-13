@@ -160,4 +160,7 @@ observe:
 
 ```rust
 let prediction = recipe.infer("model.ogdl", &input);
+let generation = recipe.decode("model.ogdl", &prompt, &mut recipe.sampler(), &stop, budget);
+let mut draft = recipe.draft("head.ogdl");
+let generation = recipe.speculate("model.ogdl", &mut draft, &prompt, &mut recipe.sampler(), &stop, budget);
 ```

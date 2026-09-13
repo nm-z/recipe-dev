@@ -10903,6 +10903,15 @@ impl Gguf {
 	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
 		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
 	}
+	/// Place `blocks` bound from `plan` across the selected devices, as
+	/// [`Bound::place`] places the model the file describes: the input holds
+	/// `channels` values at each of `positions`, and `split` names the blocks
+	/// each device takes, measured from free memory when empty. A draft head
+	/// for [`Placed::speculate`] is placed this way over one position whose
+	/// channels are the embedding row and the hidden state.
+	pub fn place(&self, blocks: &Model, plan: &Binding, channels: usize, positions: usize, split: &[usize]) -> Placed {
+		selected_gpus().and_then(|devices| place_bound(self, blocks, plan, channels, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
 		Binding::default()
@@ -11129,7 +11138,7 @@ impl Bound {
 	/// `positions` token ids. `split` names the Recipe blocks each device takes;
 	/// an empty split is measured from each device's free memory.
 	pub fn place(&self, positions: usize, split: &[usize]) -> Placed {
-		selected_gpus().and_then(|devices| place_bound(self, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+		self.file.place(&self.model, &self.plan, 1, positions, split)
 	}
 	/// Decode through this bound model after placing it across the selected devices.
 	pub fn decode(&self, positions: usize, split: &[usize], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
@@ -11698,6 +11707,39 @@ pub struct Generation {
 	pub logits: Vec<f64>,
 	pub prefill_seconds: f64,
 	pub step_seconds: Vec<f64>,
+	/// The ids a draft head proposed and a later step verified, and how many of
+	/// them the model's own id confirmed. A decode without a draft has none.
+	pub proposed: usize,
+	pub accepted: usize,
+}
+/// A draft head for speculative decoding: a placed model whose input is the
+/// embedding of the id the decode just produced followed by the decoded
+/// model's final hidden state at that position — the vector its output head
+/// read — and whose output is one logit per id. After each step the head
+/// proposes the next id, and the step after it counts the proposal accepted
+/// when the model's own id is the same. The ids are the model's either way.
+pub struct Draft {
+	model: Placed,
+	proposal: Option<u32>,
+}
+impl Draft {
+	/// A draft head from a placed model, saved or bound.
+	pub fn new(model: Placed) -> Self {
+		Self { model, proposal: None }
+	}
+	/// The id the head proposes after `embedding`, the row of the id just
+	/// produced, and `hidden`, the model's final hidden state at it. Ties go
+	/// to the lower id, as a greedy sampler resolves them.
+	fn propose(&self, embedding: &[f64], hidden: &[f64]) -> Result<u32> {
+		let input = embedding.iter().chain(hidden).copied().collect::<Vec<_>>();
+		let tape = self.model.tapes.first().and_then(|ranges| ranges.first()).ok_or_else(|| RecipeError::new("draft head has no placed range"))?;
+		require(tape.input.elements() == input.len(), format!("draft head takes {} input values, the embedding and hidden state hold {}", tape.input.elements(), input.len()))?;
+		let logits = self.model.run_window(&input, 0, tape.positions)?;
+		let output = self.model.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("draft head has no output range"))?.output;
+		let last = select_last_logits(&logits, output, output.length.checked_sub(1).ok_or_else(|| RecipeError::new("draft head writes no position"))?)?;
+		let proposal = last.iter().enumerate().max_by(|left, right| left.1.total_cmp(right.1).then(right.0.cmp(&left.0)));
+		Ok(narrow(proposal.ok_or_else(|| RecipeError::new("draft head produced no logits"))?.0, "draft head proposal")? as u32)
+	}
 }
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
@@ -11706,7 +11748,18 @@ impl Recipe {
 	/// Autoregressive decode over a saved model on the primary device: the
 	/// model placed as one range, decoded by [`Placed::decode`] over one tape.
 	pub fn decode(&self, path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		self.place_primary(path).try_decode(prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		self.place_primary(path).try_decode(prompt, sampler, stop, budget, None, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// A draft head from a saved model on the primary device, for `speculate`.
+	pub fn draft(&self, path: impl AsRef<Path>) -> Draft {
+		Draft::new(self.place_primary(path))
+	}
+	/// The same decode with a draft head: after each step the head proposes the
+	/// next id, the step after it verifies the proposal, and the generation
+	/// counts the proposals and the accepted ones. The draft's seconds join
+	/// the step's.
+	pub fn speculate(&self, path: impl AsRef<Path>, draft: &mut Draft, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.place_primary(path).try_decode(prompt, sampler, stop, budget, Some(draft), |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP on the primary device, as
 	/// [`Placed::serve`] does over a placement.
@@ -11787,7 +11840,7 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
 	};
 	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-	placed.try_decode(&prompt, &mut sampler, &stop, budget, |id| {
+	placed.try_decode(&prompt, &mut sampler, &stop, budget, None, |id| {
 		let chunk = format!("{id}\n");
 		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
 	})?;
@@ -11800,7 +11853,7 @@ fn decode_steps(
 	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new(), proposed: 0, accepted: 0 };
 	let mut settled = 0;
 	let mut started = std::time::Instant::now();
 	for step in 0..=budget {
@@ -12027,10 +12080,11 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
-fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
+fn place_bound(file: &Gguf, blocks: &Model, plan: &Binding, channels: usize, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
 	require(positions != 0, "a placed bound model has no positions")?;
-	let samples = vec![0.0; positions];
-	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
+	require(channels != 0, "a placed bound model has no input channels")?;
+	let samples = vec![0.0; checked_mul(channels, positions, "placed input")?];
+	let graph = bound_graph_on(file, blocks, plan, &samples, channels, devices[0])?;
 	let input = graph.input;
 	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Compute::FP64, &[])?;
 	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
@@ -12048,7 +12102,11 @@ impl Placed {
 	/// a `stop` id, after `budget` ids, or when the ids fill the model's
 	/// sequence.
 	pub fn decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		self.try_decode(prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+		self.try_decode(prompt, sampler, stop, budget, None, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// `decode` with a draft head, as `Recipe::speculate`.
+	pub fn speculate(&self, prompt: &[u32], draft: &mut Draft, sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.try_decode(prompt, sampler, stop, budget, Some(draft), |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP and return. A request names its prompt
 	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
@@ -12069,7 +12127,7 @@ impl Placed {
 	pub fn moved_bytes(&self) -> usize {
 		self.moved
 	}
-	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut draft: Option<&mut Draft>, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 		let sequence = match &self.source {
 			PlacedSource::Saved(graphs) => match graphs.as_slice() {
 				[only] => {
@@ -12090,25 +12148,42 @@ impl Placed {
 		for (slot, id) in samples.iter_mut().zip(prompt) {
 			*slot = f64::from(*id);
 		}
-		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new(), proposed: 0, accepted: 0 };
+		if let Some(draft) = draft.as_deref_mut() {
+			draft.proposal = None;
+		}
 		let mut settled = 0;
 		for step in 0..=budget {
 			let reached = narrow(generation.ids.len(), "decode position")? as u32;
 			let started = std::time::Instant::now();
 			let predictions = self.run_window(&samples, settled, reached)?;
 			let sample_logits = self.last_logits(&predictions, settled, reached)?;
+			let window = (settled, reached);
+			settled = reached;
+			generation.logits = predictions;
+			let id = (step != budget).then(|| sampler.sample(&sample_logits, &generation.ids));
+			if let (Some(draft), Some(id)) = (draft.as_deref_mut(), id) {
+				if let Some(proposal) = draft.proposal.take() {
+					generation.proposed += 1;
+					generation.accepted += usize::from(proposal == id);
+				}
+				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?;
+				let (first, last) = ranges.first().zip(ranges.last()).ok_or_else(|| RecipeError::new("placement has no range"))?;
+				let (mut begin, mut end) = window;
+				for tape in &ranges[..ranges.len() - 1] {
+					(begin, end) = tape.output_window(begin, end)?;
+				}
+				let hidden = last.hidden_state(begin, end)?;
+				let embedding = first.embedding_row(id)?;
+				draft.proposal = Some(draft.propose(&embedding, &hidden)?);
+			}
 			let seconds = started.elapsed().as_secs_f64();
 			if step == 0 {
 				generation.prefill_seconds = seconds;
 			} else {
 				generation.step_seconds.push(seconds);
 			}
-			settled = reached;
-			generation.logits = predictions;
-			if step == budget {
-				break;
-			}
-			let id = sampler.sample(&sample_logits, &generation.ids);
+			let Some(id) = id else { break };
 			emit(id)?;
 			samples[generation.ids.len()] = f64::from(id);
 			generation.ids.push(id);
@@ -14407,6 +14482,10 @@ impl NativeTape {
 	/// every node derives from its source, as the emitted forward derives it,
 	/// carried to the last node.
 	fn output_window(&self, begin: u32, end: u32) -> Result<(u32, u32)> {
+		self.node_windows(begin, end)?.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
+	}
+	/// The positions every node writes for the input window `begin..end`.
+	fn node_windows(&self, begin: u32, end: u32) -> Result<Vec<(u32, u32)>> {
 		let mut windows = Vec::with_capacity(self.nodes.len());
 		for node in &self.nodes {
 			let (begin, end) = usize::try_from(node.source).map_or((begin, end), |source| windows[source]);
@@ -14426,7 +14505,29 @@ impl NativeTape {
 				_ => (begin, end),
 			});
 		}
-		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
+		Ok(windows)
+	}
+	/// The model's final hidden state at the newest position an input window
+	/// `begin..end` reaches: the output the last node reads, one value per channel.
+	fn hidden_state(&self, begin: u32, end: u32) -> Result<Vec<f64>> {
+		let head = self.nodes.last().ok_or_else(|| RecipeError::new("native model has no node"))?;
+		let index = usize::try_from(head.source).map_err(|_| RecipeError::new("the model's head reads no hidden state"))?;
+		let hidden = self.nodes.get(index).ok_or_else(|| RecipeError::new("the model's hidden state node is absent"))?;
+		let (_, reached) = self.node_windows(begin, end)?[index];
+		require(reached != 0, "decode window reaches no hidden position")?;
+		let values = self.predictions_at(head.source, hidden.output.elements())?;
+		select_last_logits(&values, hidden.output, reached as usize - 1)
+	}
+	/// Row `id` of the model's embedding table, decoded from the packed table
+	/// the leading gather node keeps in its context.
+	fn embedding_row(&self, id: u32) -> Result<Vec<f64>> {
+		let node = self.nodes.first().filter(|node| node.op == Primitive::Gather).ok_or_else(|| RecipeError::new("the model does not begin with an embedding"))?;
+		let (layout, bytes) = embedding_row(node)?;
+		let vocabulary = integer_argument(node.argument[0], "embedding vocabulary")? as usize;
+		require((id as usize) < vocabulary, format!("id {id} is outside the embedding of {vocabulary}"))?;
+		let offset = checked_add(self.program.artifact.layout.contexts[0], checked_mul(id as usize, bytes, "embedding row offset")?, "embedding row")?;
+		let packed = self.contexts.download_range::<u8>(offset, bytes)?;
+		layout.codec.dequantize(&packed, &[], node.output.channels)
 	}
 	/// Restore the token, input, and mutable arenas before a new sequence, while
 	/// retaining packed tables and saved evaluation statistics.
