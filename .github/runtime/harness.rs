@@ -1,5 +1,6 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 // Every numeric source the loader accepts with a "target" column, plus the README data options.
 const DATASETS: [&str; 15] = ["sample_subfolders", "sample_subfolders", "sample_subfolders", "sample_subfolders_two_inputs", "sample_subfolders_two_targets", "sample_subfolders_two_inputs_two_targets", "single_csv_two_targets.csv", "single_csv.csv", "sharded_csv", "split_files", "compressed_csv.csv.gz", "arrays_npz.npz", "arrays_hdf5.h5", "records_jsonl.jsonl", "samples_sqlite.sqlite"];
@@ -52,8 +53,11 @@ const QUANTS: [&str; 7] = ["", "", "", ".qi(8).q0", ".qi(4).q1", ".qi(5).q0", ".
 // The model builder spells the same quantization suffixes as tuple fields.
 const MODEL_QUANTS: [&str; 10] = ["", "", "", ".qi(8).0", ".qi(4).1", ".qi(5).0", ".qi(4).nf", ".qi(2).k", ".qi(3).k.s", ".iq(2).xxs"];
 const LOSSES: [&str; 6] = ["mse", "rmse", "huber", "mae", "bce", "focal"];
-const PRECISIONS: [&str; 7] = [".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)"];
-const PRECISIONS_FILED: [&str; 6] = [".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)"];
+// Every README precision: fp(8|16|32|64), int(1|4|8), bf(16), tf(32) and two computed formats
+// f(exp, mantissa), the e5m2 and e4m3 layouts of an 8-bit float. fp(32) keeps three entries so
+// a third of the trials stay at the reference precision.
+const PRECISIONS: [&str; 13] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(1)", ".f(5, 2)", ".f(4, 3)"];
+const PRECISIONS_FILED: [&str; 12] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(1)", ".f(5, 2)", ".f(4, 3)"];
 const ATTENTION_OPTIONS: [&str; 6] = ["", ".kv(1)", ".qk(rms)", ".qk(l2)", ".gate()", ".rope(neox, {width}, 10000.0)"];
 // Estimators take no activation, normalization or quantization.
 const ESTIMATORS: [&str; 7] = ["svm()", "bayes()", "cbst(8)", "xgbst(8)", "lgbm(8)", "kmeans(4)", "knn(3)"];
@@ -74,14 +78,10 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 
 // One README block in grammar order: operation, activation, normalization, quantization.
 // `member` restricts the operation to length-preserving ones and `width` pins its width for branch members.
-fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>) -> String {
+// `sequential` says whether a sequence still reaches this block, see `model`.
+fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>, sequential: bool) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
-	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
-	// other source, the two-input and two-target folders included, is one value or one row per
-	// sample, so a convolution or pool there only asks Recipe for a kernel longer than the
-	// sequence (#214).
-	let sequential = dataset(cursor) == "data/numeric/sample_subfolders";
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
 		0 => format!("layer({width})"),
 		1 => format!("rnn({width})"),
@@ -105,7 +105,7 @@ fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<us
 }
 
 fn branch(cursor: u64, salt: u64, count: usize, width: Option<usize>) -> String {
-	(0..count).map(|index| block(cursor, salt + 10 * index as u64, &QUANTS, AVOID_FILED, width)).collect::<Vec<_>>().join(", ")
+	(0..count).map(|index| block(cursor, salt + 10 * index as u64, &QUANTS, AVOID_FILED, width, false)).collect::<Vec<_>>().join(", ")
 }
 
 fn composition(cursor: u64, salt: u64) -> String {
@@ -123,16 +123,25 @@ fn composition(cursor: u64, salt: u64) -> String {
 fn model(cursor: u64) -> String {
 	let bits = mix(cursor, 1);
 	let mut text = "recipe.model()".to_owned();
-	for index in 0..1 + bits % 2 {
+	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
+	// other source, the two-input and two-target folders included, is one value or one row per
+	// sample. An estimator leaves one value per sample as well. A convolution or pool after
+	// either only asks Recipe for a kernel longer than the sequence (#214).
+	let mut sequential = dataset(cursor) == "data/numeric/sample_subfolders";
+	let mut push = |text: &mut String, salt: u64| {
+		let block = block(cursor, salt, &MODEL_QUANTS, false, None, sequential);
+		sequential &= !ESTIMATORS.iter().any(|estimator| block.starts_with(estimator));
 		text.push('.');
-		text.push_str(&block(cursor, 200 + 10 * index, &MODEL_QUANTS, false, None));
+		text.push_str(&block);
+	};
+	for index in 0..1 + bits % 2 {
+		push(&mut text, 200 + 10 * index);
 	}
 	if (bits >> 8) % 4 != 0 {
 		text.push_str(&composition(cursor, 300));
 	}
 	if (bits >> 12) % 3 == 0 {
-		text.push('.');
-		text.push_str(&block(cursor, 400, &MODEL_QUANTS, false, None));
+		push(&mut text, 400);
 	}
 	format!("{text}.layer(1).loss({})", pick(cursor, 5, &LOSSES))
 }
@@ -178,7 +187,41 @@ fn main() {{
 }
 
 fn run(path: &Path) -> Result<(), Failure> {
-	let output = Command::new(runner()).arg(path).env("RECIPE_COMPOSITION_PHASE_PATH", phase_file(path)).output().map_err(|error| Failure { phase: "harness".to_owned(), message: error.to_string(), output: error.to_string() })?;
+	let harness = |error: std::io::Error| Failure { phase: "harness".to_owned(), message: error.to_string(), output: error.to_string() };
+	let mut child = Command::new(runner())
+		.arg(path)
+		.env("RECIPE_COMPOSITION_PHASE_PATH", phase_file(path))
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(harness)?;
+	let mut stdout = child.stdout.take().expect("candidate stdout is absent");
+	let mut stderr = child.stderr.take().expect("candidate stderr is absent");
+	// The candidate's stderr is copied to `<reproduction>.output` as it arrives, so a watchdog that
+	// ends the trial can read how far it got (epoch lines) before the kill.
+	let progress = path.with_extension("output");
+	let stderr_thread = std::thread::spawn(move || {
+		let mut bytes = Vec::new();
+		let mut file = std::fs::File::create(progress).ok();
+		let mut buffer = [0_u8; 4096];
+		while let Ok(count) = stderr.read(&mut buffer) {
+			if count == 0 {
+				break;
+			}
+			bytes.extend_from_slice(&buffer[..count]);
+			if let Some(file) = file.as_mut() {
+				let _ = file.write_all(&buffer[..count]);
+			}
+		}
+		bytes
+	});
+	let stdout_thread = std::thread::spawn(move || {
+		let mut bytes = Vec::new();
+		let _ = stdout.read_to_end(&mut bytes);
+		bytes
+	});
+	let status = child.wait().map_err(harness)?;
+	let output = Output { status, stdout: stdout_thread.join().unwrap_or_default(), stderr: stderr_thread.join().unwrap_or_default() };
 	if output.status.success() {
 		return Ok(());
 	}
@@ -188,18 +231,24 @@ fn run(path: &Path) -> Result<(), Failure> {
 	// A panic message follows its "panicked at" line; the trailing backtrace note is never the failure.
 	let lines = output.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
 	// A candidate the kernel killed left no panic line; its last line is a progress line that
-	// names no failure, so the signal is the message.
+	// names no failure, so the signal is the message. A candidate that exits with a code and no
+	// panic line names that code and the last line it printed (#878 ended in inference this way).
 	#[cfg(unix)]
 	let signal = std::os::unix::process::ExitStatusExt::signal(&output_status).map(|signal| format!("terminated by signal {signal}"));
 	#[cfg(not(unix))]
 	let signal = None::<String>;
+	let last = lines.iter().rev().find(|line| !line.starts_with("note:")).map(|line| (*line).to_owned());
 	let message = lines
 		.iter()
 		.position(|line| line.contains("panicked at"))
 		.and_then(|index| lines.get(index + 1))
 		.map(|line| (*line).to_owned())
 		.or(signal)
-		.or_else(|| lines.iter().rev().find(|line| !line.starts_with("note:")).map(|line| (*line).to_owned()))
+		.or_else(|| output_status.code().map(|code| match &last {
+			Some(last) => format!("exited with code {code} without a failure line, after: {last}"),
+			None => format!("exited with code {code} without output"),
+		}))
+		.or(last)
 		.unwrap_or_else(|| "candidate failed".to_owned());
 	Err(Failure { phase, message: normalize(&message), output })
 }
