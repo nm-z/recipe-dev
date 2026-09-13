@@ -40,6 +40,7 @@ RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
 # The guest runs one workload: the suite (default), or the composition harness over
 # RECIPE_TRIAL_COUNT cursors from RECIPE_TRIAL_CURSOR, whose stderr packets are the evidence.
 RECIPE_WORKLOAD="${RECIPE_WORKLOAD:-suite}"
+AZURE_TRIAL_MAX_COUNT=40
 case "$RECIPE_WORKLOAD" in
 	suite) ;;
 	trial)
@@ -48,6 +49,10 @@ case "$RECIPE_WORKLOAD" in
 		case "$RECIPE_TRIAL_CURSOR$RECIPE_TRIAL_COUNT" in
 			''|*[!0-9]*) echo "the trial cursor and count must be integers" >&2; exit 1 ;;
 		esac
+		if [ "$RECIPE_TRIAL_COUNT" -lt 1 ] || [ "$RECIPE_TRIAL_COUNT" -gt "$AZURE_TRIAL_MAX_COUNT" ]; then
+			echo "the Azure trial count must be between 1 and $AZURE_TRIAL_MAX_COUNT" >&2
+			exit 1
+		fi
 		;;
 	*) echo "RECIPE_WORKLOAD must be suite or trial" >&2; exit 1 ;;
 esac
