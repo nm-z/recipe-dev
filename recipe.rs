@@ -6413,14 +6413,116 @@ mod tokenizer {
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
 	//! special ids, and the chat template.
 	use super::{Gguf, GgufValue, RecipeError, Result, require};
-	use std::collections::HashMap;
+	use std::{cmp::Ordering, collections::HashMap};
 
-	/// The pre-tokenizer alternation that cuts text into words before merging.
+	/// The pre-tokenizer `tokenizer.ggml.pre` names: the passes that cut text
+	/// into words before merging. Each pass cuts every piece the previous one
+	/// left into the spans it matches and the gaps between them, as llama.cpp
+	/// applies the same expressions in sequence.
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	enum Family {
 		Gpt2,
 		Llama3,
 		Qwen2,
+		/// Every digit on its own, then the GPT-2 words.
+		Digits,
+		/// Punctuation runs, the GPT-2 words, then digits in threes.
+		Falcon,
+		DeepseekCoder,
+		DeepseekLlm,
+	}
+	/// The byte table entry of a byte the vocabulary never spelled.
+	const ABSENT: u32 = u32::MAX;
+	/// One splitting pass over a piece of text.
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum Pass {
+		/// The family's word alternation, which covers the whole piece.
+		Words(Family),
+		/// `\p{N}`
+		Digit,
+		/// `\p{N}+`
+		DigitRun,
+		/// `[\r\n]`
+		Newline,
+		/// `[\p{P}$+<=>^~|`]+`
+		Punctuation,
+		/// `[0-9][0-9][0-9]`
+		TripleDigits,
+		/// `\s?\p{L}+`
+		SpaceLetters,
+		/// `\s?\p{P}+`
+		SpacePunctuation,
+		/// `[一-龥ࠀ-一가-퟿]+`
+		Cjk,
+		/// `\s+$`
+		TrailingSpace,
+		/// `\s?[A-Za-z…]+` over the letter ranges the deepseek-llm expression lists
+		LatinLetters,
+		/// `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+		AsciiPunctuation,
+	}
+	/// Unicode general category P, as ranges of code points.
+	#[rustfmt::skip]
+	const PUNCTUATION: &[(u32, u32)] = &[
+		(0x21, 0x23), (0x25, 0x2a), (0x2c, 0x2f), (0x3a, 0x3b), (0x3f, 0x40), (0x5b, 0x5d), (0x5f, 0x5f), (0x7b, 0x7b),
+		(0x7d, 0x7d), (0xa1, 0xa1), (0xa7, 0xa7), (0xab, 0xab), (0xb6, 0xb7), (0xbb, 0xbb), (0xbf, 0xbf), (0x37e, 0x37e),
+		(0x387, 0x387), (0x55a, 0x55f), (0x589, 0x58a), (0x5be, 0x5be), (0x5c0, 0x5c0), (0x5c3, 0x5c3), (0x5c6, 0x5c6), (0x5f3, 0x5f4),
+		(0x609, 0x60a), (0x60c, 0x60d), (0x61b, 0x61b), (0x61d, 0x61f), (0x66a, 0x66d), (0x6d4, 0x6d4), (0x700, 0x70d), (0x7f7, 0x7f9),
+		(0x830, 0x83e), (0x85e, 0x85e), (0x964, 0x965), (0x970, 0x970), (0x9fd, 0x9fd), (0xa76, 0xa76), (0xaf0, 0xaf0), (0xc77, 0xc77),
+		(0xc84, 0xc84), (0xdf4, 0xdf4), (0xe4f, 0xe4f), (0xe5a, 0xe5b), (0xf04, 0xf12), (0xf14, 0xf14), (0xf3a, 0xf3d), (0xf85, 0xf85),
+		(0xfd0, 0xfd4), (0xfd9, 0xfda), (0x104a, 0x104f), (0x10fb, 0x10fb), (0x1360, 0x1368), (0x1400, 0x1400), (0x166e, 0x166e), (0x169b, 0x169c),
+		(0x16eb, 0x16ed), (0x1735, 0x1736), (0x17d4, 0x17d6), (0x17d8, 0x17da), (0x1800, 0x180a), (0x1944, 0x1945), (0x1a1e, 0x1a1f), (0x1aa0, 0x1aa6),
+		(0x1aa8, 0x1aad), (0x1b4e, 0x1b4f), (0x1b5a, 0x1b60), (0x1b7d, 0x1b7f), (0x1bfc, 0x1bff), (0x1c3b, 0x1c3f), (0x1c7e, 0x1c7f), (0x1cc0, 0x1cc7),
+		(0x1cd3, 0x1cd3), (0x2010, 0x2027), (0x2030, 0x2043), (0x2045, 0x2051), (0x2053, 0x205e), (0x207d, 0x207e), (0x208d, 0x208e), (0x2308, 0x230b),
+		(0x2329, 0x232a), (0x2768, 0x2775), (0x27c5, 0x27c6), (0x27e6, 0x27ef), (0x2983, 0x2998), (0x29d8, 0x29db), (0x29fc, 0x29fd), (0x2cf9, 0x2cfc),
+		(0x2cfe, 0x2cff), (0x2d70, 0x2d70), (0x2e00, 0x2e2e), (0x2e30, 0x2e4f), (0x2e52, 0x2e5d), (0x3001, 0x3003), (0x3008, 0x3011), (0x3014, 0x301f),
+		(0x3030, 0x3030), (0x303d, 0x303d), (0x30a0, 0x30a0), (0x30fb, 0x30fb), (0xa4fe, 0xa4ff), (0xa60d, 0xa60f), (0xa673, 0xa673), (0xa67e, 0xa67e),
+		(0xa6f2, 0xa6f7), (0xa874, 0xa877), (0xa8ce, 0xa8cf), (0xa8f8, 0xa8fa), (0xa8fc, 0xa8fc), (0xa92e, 0xa92f), (0xa95f, 0xa95f), (0xa9c1, 0xa9cd),
+		(0xa9de, 0xa9df), (0xaa5c, 0xaa5f), (0xaade, 0xaadf), (0xaaf0, 0xaaf1), (0xabeb, 0xabeb), (0xfd3e, 0xfd3f), (0xfe10, 0xfe19), (0xfe30, 0xfe52),
+		(0xfe54, 0xfe61), (0xfe63, 0xfe63), (0xfe68, 0xfe68), (0xfe6a, 0xfe6b), (0xff01, 0xff03), (0xff05, 0xff0a), (0xff0c, 0xff0f), (0xff1a, 0xff1b),
+		(0xff1f, 0xff20), (0xff3b, 0xff3d), (0xff3f, 0xff3f), (0xff5b, 0xff5b), (0xff5d, 0xff5d), (0xff5f, 0xff65), (0x10100, 0x10102), (0x1039f, 0x1039f),
+		(0x103d0, 0x103d0), (0x1056f, 0x1056f), (0x10857, 0x10857), (0x1091f, 0x1091f), (0x1093f, 0x1093f), (0x10a50, 0x10a58), (0x10a7f, 0x10a7f), (0x10af0, 0x10af6),
+		(0x10b39, 0x10b3f), (0x10b99, 0x10b9c), (0x10d6e, 0x10d6e), (0x10ead, 0x10ead), (0x10f55, 0x10f59), (0x10f86, 0x10f89), (0x11047, 0x1104d), (0x110bb, 0x110bc),
+		(0x110be, 0x110c1), (0x11140, 0x11143), (0x11174, 0x11175), (0x111c5, 0x111c8), (0x111cd, 0x111cd), (0x111db, 0x111db), (0x111dd, 0x111df), (0x11238, 0x1123d),
+		(0x112a9, 0x112a9), (0x113d4, 0x113d5), (0x113d7, 0x113d8), (0x1144b, 0x1144f), (0x1145a, 0x1145b), (0x1145d, 0x1145d), (0x114c6, 0x114c6), (0x115c1, 0x115d7),
+		(0x11641, 0x11643), (0x11660, 0x1166c), (0x116b9, 0x116b9), (0x1173c, 0x1173e), (0x1183b, 0x1183b), (0x11944, 0x11946), (0x119e2, 0x119e2), (0x11a3f, 0x11a46),
+		(0x11a9a, 0x11a9c), (0x11a9e, 0x11aa2), (0x11b00, 0x11b09), (0x11be1, 0x11be1), (0x11c41, 0x11c45), (0x11c70, 0x11c71), (0x11ef7, 0x11ef8), (0x11f43, 0x11f4f),
+		(0x11fff, 0x11fff), (0x12470, 0x12474), (0x12ff1, 0x12ff2), (0x16a6e, 0x16a6f), (0x16af5, 0x16af5), (0x16b37, 0x16b3b), (0x16b44, 0x16b44), (0x16d6d, 0x16d6f),
+		(0x16e97, 0x16e9a), (0x16fe2, 0x16fe2), (0x1bc9f, 0x1bc9f), (0x1da87, 0x1da8b), (0x1e5ff, 0x1e5ff), (0x1e95e, 0x1e95f),
+	];
+	/// The letter ranges the deepseek-llm expression spells out instead of `\p{L}`.
+	#[rustfmt::skip]
+	const DEEPSEEK_LETTERS: &[(u32, u32)] = &[
+		(0x41, 0x5a), (0x61, 0x7a), (0xb5, 0xb5), (0xc0, 0xd6), (0xd8, 0xf6), (0xf8, 0x1ba), (0x1bc, 0x1bf), (0x1c4, 0x293),
+		(0x295, 0x2af), (0x370, 0x373), (0x376, 0x376), (0x377, 0x377), (0x37b, 0x37d), (0x37f, 0x37f), (0x386, 0x386), (0x388, 0x38a),
+		(0x38c, 0x38c), (0x38e, 0x3a1), (0x3a3, 0x3f5), (0x3f7, 0x481), (0x48a, 0x52f), (0x531, 0x556), (0x10a0, 0x10c5), (0x13a0, 0x13f5),
+		(0x13f8, 0x13fd), (0x1c90, 0x1cba), (0x1cbd, 0x1cbf), (0x1d00, 0x1d2b), (0x1d6b, 0x1d77), (0x1d79, 0x1d9a), (0x1e00, 0x1f15), (0x1f18, 0x1f1d),
+		(0x1f20, 0x1f45), (0x1f48, 0x1f4d), (0x1f50, 0x1f57), (0x1f59, 0x1f59), (0x1f5b, 0x1f5b), (0x1f5d, 0x1f5d), (0x1f5f, 0x1f7d), (0x1f80, 0x1fb4),
+		(0x1fb6, 0x1fbc), (0x1fbe, 0x1fbe), (0x1fc2, 0x1fc4), (0x1fc6, 0x1fcc), (0x1fd0, 0x1fd3), (0x1fd6, 0x1fdb), (0x1fe0, 0x1fec), (0x1ff2, 0x1ff4),
+		(0x1ff6, 0x1ffc), (0x2102, 0x2102), (0x2107, 0x2107), (0x210a, 0x2113), (0x2115, 0x2115), (0x2119, 0x211d), (0x2124, 0x2124), (0x2126, 0x2126),
+		(0x2128, 0x2128), (0x212a, 0x212d), (0x212f, 0x2134), (0x2139, 0x2139), (0x213c, 0x213f), (0x2145, 0x2149), (0x214e, 0x214e), (0x2183, 0x2183),
+		(0x2184, 0x2184), (0x2c00, 0x2c7b), (0x2c7e, 0x2ce4), (0x2ceb, 0x2cee), (0x2cf2, 0x2cf2), (0x2cf3, 0x2cf3), (0xa640, 0xa66d), (0xa680, 0xa69b),
+		(0xa722, 0xa76f), (0xa771, 0xa787), (0xa78b, 0xa78e), (0xab70, 0xabbf), (0xfb00, 0xfb06), (0xfb13, 0xfb17), (0xff21, 0xff3a), (0xff41, 0xff5a),
+		(0x10400, 0x1044f), (0x104b0, 0x104d3), (0x104d8, 0x104fb), (0x10c80, 0x10cb2), (0x10cc0, 0x10cf2), (0x118a0, 0x118df), (0x1e900, 0x1e943),
+	];
+	fn within(ranges: &[(u32, u32)], value: char) -> bool {
+		let value = value as u32;
+		ranges.binary_search_by(|(low, high)| if *high < value { Ordering::Less } else { low.cmp(&value).max(Ordering::Equal) }).is_ok()
+	}
+	fn punctuation(value: char) -> bool {
+		within(PUNCTUATION, value)
+	}
+	fn symbol_punctuation(value: char) -> bool {
+		punctuation(value) || matches!(value, '$' | '+' | '<' | '=' | '>' | '^' | '~' | '|' | '`')
+	}
+	fn cjk(value: char) -> bool {
+		matches!(value as u32, 0x0800..=0x9FA5 | 0xAC00..=0xD7FF)
+	}
+	fn deepseek_letter(value: char) -> bool {
+		within(DEEPSEEK_LETTERS, value)
+	}
+	fn ascii_punctuation(value: char) -> bool {
+		matches!(value, '!'..='/' | ':'..='~' | '！'..='／' | '：'..='～' | '‘'..='‟' | '　'..='。')
 	}
 
 	fn letter(value: char) -> bool {
@@ -6438,8 +6540,37 @@ mod tokenizer {
 	fn other(value: char) -> bool {
 		!space(value) && !letter(value) && !number(value)
 	}
-	fn run(chars: &[char], at: usize, class: fn(char) -> bool) -> usize {
+	fn run(chars: &[char], at: usize, class: impl Fn(char) -> bool) -> usize {
 		chars[at.min(chars.len())..].iter().take_while(|value| class(**value)).count()
+	}
+	impl Pass {
+		/// The next span this pass matches in `chars` at or after `at`.
+		fn next(self, chars: &[char], at: usize) -> Option<(usize, usize)> {
+			let find = |class: fn(char) -> bool| (at..chars.len()).find(|index| class(chars[*index]));
+			let run_from = |start: usize, class: fn(char) -> bool| (start, start + run(chars, start, class));
+			// `\s?class+`: a run of the class, with the one whitespace character before it.
+			let spaced = |class: fn(char) -> bool| {
+				let start = (at..chars.len()).find(|index| class(chars[*index]) || (space(chars[*index]) && chars.get(index + 1).is_some_and(|next| class(*next))))?;
+				Some((start, run_from(start + usize::from(!class(chars[start])), class).1))
+			};
+			match self {
+				Self::Words(family) => (at < chars.len()).then(|| (at, at + family.word(chars, at))),
+				Self::Digit => find(number).map(|index| (index, index + 1)),
+				Self::DigitRun => find(number).map(|index| run_from(index, number)),
+				Self::Newline => find(newline).map(|index| (index, index + 1)),
+				Self::Punctuation => find(symbol_punctuation).map(|index| run_from(index, symbol_punctuation)),
+				Self::TripleDigits => (at..chars.len().saturating_sub(2)).find(|index| chars[*index..*index + 3].iter().all(char::is_ascii_digit)).map(|index| (index, index + 3)),
+				Self::SpaceLetters => spaced(letter),
+				Self::SpacePunctuation => spaced(punctuation),
+				Self::Cjk => find(cjk).map(|index| run_from(index, cjk)),
+				Self::TrailingSpace => {
+					let start = chars.len() - chars.iter().rev().take_while(|value| space(**value)).count();
+					(start < chars.len() && start >= at).then_some((start, chars.len()))
+				}
+				Self::LatinLetters => spaced(deepseek_letter),
+				Self::AsciiPunctuation => spaced(ascii_punctuation),
+			}
+		}
 	}
 	/// `'s|'t|'re|'ve|'m|'ll|'d`, case-insensitive for the newer families.
 	fn contraction(chars: &[char], at: usize, insensitive: bool) -> usize {
@@ -6465,11 +6596,28 @@ mod tokenizer {
 	impl Family {
 		fn named(pre: &str) -> Result<Self> {
 			Ok(match pre {
-				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
+				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" | "mpt" | "jais" | "trillion" => Self::Gpt2,
+				"granite-docling" => Self::Gpt2,
 				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
 				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
+				"starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone" | "minerva" => Self::Digits,
+				"falcon" => Self::Falcon,
+				"deepseek-coder" => Self::DeepseekCoder,
+				"deepseek-llm" => Self::DeepseekLlm,
 				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
 			})
+		}
+		/// The passes llama.cpp applies for this family, in order.
+		fn passes(self) -> &'static [Pass] {
+			match self {
+				Self::Gpt2 => &[Pass::Words(Self::Gpt2)],
+				Self::Llama3 => &[Pass::Words(Self::Llama3)],
+				Self::Qwen2 => &[Pass::Words(Self::Qwen2)],
+				Self::Digits => &[Pass::Digit, Pass::Words(Self::Gpt2)],
+				Self::Falcon => &[Pass::Punctuation, Pass::Words(Self::Gpt2), Pass::TripleDigits],
+				Self::DeepseekCoder => &[Pass::Newline, Pass::SpaceLetters, Pass::SpacePunctuation, Pass::Cjk, Pass::Digit],
+				Self::DeepseekLlm => &[Pass::Newline, Pass::LatinLetters, Pass::AsciiPunctuation, Pass::TrailingSpace, Pass::Cjk, Pass::DigitRun],
+			}
 		}
 		/// The length in characters of the word that starts at `at`.
 		fn word(self, chars: &[char], at: usize) -> usize {
@@ -6524,13 +6672,26 @@ mod tokenizer {
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
 			let (offsets, chars): (Vec<usize>, Vec<char>) = text.char_indices().unzip();
-			let (mut at, mut words) = (0, Vec::new());
-			while at < chars.len() {
-				let next = at + self.word(&chars, at);
-				words.push(&text[offsets[at]..offsets.get(next).copied().unwrap_or(text.len())]);
-				at = next;
+			let mut pieces = vec![(0, chars.len())];
+			for pass in self.passes() {
+				let mut cut = Vec::new();
+				for (start, end) in pieces {
+					let (piece, mut at) = (&chars[start..end], 0);
+					while at < piece.len() {
+						let Some((from, to)) = pass.next(piece, at) else {
+							cut.push((start + at, end));
+							break;
+						};
+						if from > at {
+							cut.push((start + at, start + from));
+						}
+						cut.push((start + from, start + to));
+						at = to;
+					}
+				}
+				pieces = cut;
 			}
-			words
+			pieces.into_iter().map(|(start, end)| &text[offsets[start]..offsets.get(end).copied().unwrap_or(text.len())]).collect()
 		}
 	}
 
@@ -6584,7 +6745,11 @@ mod tokenizer {
 		ranks: Ranks,
 		added: Vec<(String, u32)>,
 		is_added: Vec<bool>,
+		/// The token of each byte's alphabet symbol, or `ABSENT` where the
+		/// vocabulary never spelled that byte: some tables omit the bytes no
+		/// UTF-8 text contains, and an encode drops such a byte as llama.cpp does.
 		bytes: [u32; 256],
+		alphabet: [char; 256],
 		byte_of: HashMap<char, u8>,
 		family: Family,
 		template: Option<String>,
@@ -6625,10 +6790,11 @@ mod tokenizer {
 				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
 			};
 			let map = byte_map();
-			let mut bytes = [0; 256];
+			let mut bytes = [ABSENT; 256];
 			for (byte, symbol) in map.iter().enumerate() {
-				bytes[byte] = id(&symbol.to_string())?;
+				bytes[byte] = ids.get(&symbol.to_string()).copied().unwrap_or(ABSENT);
 			}
+			require(bytes.iter().any(|token| *token != ABSENT), "the vocabulary spells no byte of the alphabet")?;
 			// Control and user-defined tokens are the added tokens: `encode` matches
 			// them whole and no merge ever spells one out of ordinary pieces.
 			let types = array("tokenizer.ggml.token_type").ok();
@@ -6643,6 +6809,7 @@ mod tokenizer {
 			let flag = |key: &str| matches!(model.value(key), Some(GgufValue::Bool(true)));
 			Ok(Self {
 				byte_of: map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect(),
+				alphabet: map,
 				ids,
 				ranks,
 				added,
@@ -6708,7 +6875,7 @@ mod tokenizer {
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
 			for word in self.family.split(text) {
-				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>();
+				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).filter(|token| *token != ABSENT).collect::<Vec<_>>();
 				// Llama 3 vocabularies take a whole word that is already a token as is.
 				if self.family == Family::Llama3
 					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
@@ -6728,13 +6895,18 @@ mod tokenizer {
 			}
 		}
 		fn byte_of_token(&self, byte: u8) -> char {
-			self.tokens[self.bytes[usize::from(byte)] as usize].chars().next().unwrap()
+			self.alphabet[usize::from(byte)]
 		}
 		/// The text the ids spell. Bytes split across tokens rejoin before the
-		/// UTF-8 decode, and a token outside the byte alphabet keeps its own text.
+		/// UTF-8 decode; an added token, and a symbol outside the byte alphabet,
+		/// keep their own text.
 		pub fn decode(&self, ids: &[u32]) -> String {
 			let mut bytes = Vec::new();
 			for id in ids {
+				if self.is_added[*id as usize] {
+					bytes.extend(self.tokens[*id as usize].as_bytes());
+					continue;
+				}
 				for symbol in self.tokens[*id as usize].chars() {
 					match self.byte_of.get(&symbol) {
 						Some(byte) => bytes.push(*byte),
