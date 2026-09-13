@@ -252,9 +252,15 @@ camber stash cp worker.sh "$stash_root/worker.sh"
 
 echo "== jobs of this workflow still queued ahead =="
 # Jobs an earlier run abandoned keep their queue place until they start; the
-# count says how many of them this job waits behind.
+# count says how many of them this job waits behind. The list pages oldest
+# first (page 1 is the account's first jobs), so the newest jobs are on the
+# last page, found from the total the first page reports.
 if queued_json="$(camber job list --size 50 --output json 2>/dev/null)"; then
-	printf '%s' "$queued_json" | jq -r '[.. | objects | select(has("job_id") and has("mount_dir")) | select((.mount_dir // "") | startswith("recipe-runtime/")) | select(((.job_status // "") | ascii_upcase) as $s | $s == "PENDING" or $s == "QUEUED" or $s == "SUBMITTED" or $s == "RUNNING")] | "\(length) queued or running: \([.[] | "\(.job_id):\(.job_status):\(.mount_dir)"] | join(" "))"' || echo "could not summarize the job list"
+	last_page="$(printf '%s' "$queued_json" | jq -r '(((.total // 0) + 49) / 50 | floor) | if . < 1 then 1 else . end' 2>/dev/null || echo 1)"
+	if [ "$last_page" -gt 1 ]; then
+		queued_json="$(camber job list --size 50 --page "$last_page" --output json 2>/dev/null || printf '%s' "$queued_json")"
+	fi
+	printf '%s' "$queued_json" | jq -r '[.. | objects | select(has("job_id") and has("mount_dir")) | select((.mount_dir // "") | startswith("recipe-runtime/") or startswith("recipe-trial/")) | select(((.job_status // "") | ascii_upcase) as $s | $s == "PENDING" or $s == "QUEUED" or $s == "SUBMITTED" or $s == "RUNNING")] | "\(length) queued or running: \([.[] | "\(.job_id):\(.job_status):\(.mount_dir)"] | join(" "))"' || echo "could not summarize the job list"
 else
 	echo "could not list jobs"
 fi
