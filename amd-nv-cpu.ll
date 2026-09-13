@@ -1375,7 +1375,7 @@ ret void }
 ; each head the channel pairs (i, i + dims/2) below %dims rotate by
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
-define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
+define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context, i1 %sectioned, i64 %p, i32 %channels, i32 %length,
  i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %yarn.context, double %yarn.low, double %yarn.high, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
@@ -1411,14 +1411,44 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
 %blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
 %frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.raw
-%position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
+%position.i32 = trunc i64 %position to i32
+br i1 %sectioned, label %axis.pick, label %angle.ready
+; The sectioned rotary: the context holds the axis count, the interleave flag and
+; the four section sizes, then one position per row, axis and sequence position.
+axis.pick:
+%axes.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 0 %axes = load i32, ptr addrspace(1) %axes.ptr, align 4
+%interleave.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 1 %interleave.word = load i32, ptr addrspace(1) %interleave.ptr, align 4 %interleave = icmp ne i32 %interleave.word, 0
+%size.0.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 2 %size.0 = load i32, ptr addrspace(1) %size.0.ptr, align 4
+%size.1.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 3 %size.1 = load i32, ptr addrspace(1) %size.1.ptr, align 4
+%size.2.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 4 %size.2 = load i32, ptr addrspace(1) %size.2.ptr, align 4
+%size.3.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 5 %size.3 = load i32, ptr addrspace(1) %size.3.ptr, align 4
+%bound.1 = add i32 %size.0, %size.1 %bound.2 = add i32 %bound.1, %size.2 %total = add i32 %bound.2, %size.3
+%total.empty = icmp eq i32 %total, 0 %total.safe = select i1 %total.empty, i32 1, i32 %total
+%sector = urem i32 %index.i32, %total.safe
+%last.axis = sub i32 %axes, 1
+%blocked.in.0 = icmp ult i32 %sector, %size.0 %blocked.in.1 = icmp ult i32 %sector, %bound.1 %blocked.in.2 = icmp ult i32 %sector, %bound.2
+%blocked.from.2 = select i1 %blocked.in.2, i32 2, i32 3 %blocked.from.1 = select i1 %blocked.in.1, i32 1, i32 %blocked.from.2 %blocked.raw = select i1 %blocked.in.0, i32 0, i32 %blocked.from.1
+%blocked.over = icmp ugt i32 %blocked.raw, %last.axis %blocked.axis = select i1 %blocked.over, i32 %last.axis, i32 %blocked.raw
+%turn = urem i32 %sector, %axes
+%turn.is.0 = icmp eq i32 %turn, 0 %turn.is.1 = icmp eq i32 %turn, 1 %turn.is.2 = icmp eq i32 %turn, 2
+%turn.size.high = select i1 %turn.is.2, i32 %size.2, i32 %size.3 %turn.size.low = select i1 %turn.is.0, i32 %size.0, i32 %size.1 %turn.size = select i1 %turn.is.1, i32 %size.1, i32 %turn.size.high
+%turn.size.pick = select i1 %turn.is.0, i32 %turn.size.low, i32 %turn.size
+%turn.limit = mul i32 %axes, %turn.size.pick %turn.inside = icmp ult i32 %sector, %turn.limit %interleaved.axis = select i1 %turn.inside, i32 %turn, i32 %last.axis
+%axis = select i1 %interleave, i32 %interleaved.axis, i32 %blocked.axis
+%row = udiv i64 %p, %per.row %axes.wide = zext i32 %axes to i64 %axis.wide = zext i32 %axis to i64
+%row.axes = mul i64 %row, %axes.wide %row.axis = add i64 %row.axes, %axis.wide %row.axis.base = mul i64 %row.axis, %length.wide %table.local = add i64 %row.axis.base, %position
+%table.index = add i64 %table.local, 6 %table.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 %table.index %axis.position = load i32, ptr addrspace(1) %table.ptr, align 4
+br label %angle.ready
+angle.ready:
+%position.chosen = phi i32 [ %position.i32, %rotate ], [ %axis.position, %axis.pick ]
+%position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.chosen) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
 %cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
 %sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
 %sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
 %cos.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %cos) %sin.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %sin.term)
 %rotated.raw = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.part)
 %rotated.value = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %rotated.raw, RECIPE_STATE %mscale.wide) %rotated.model = call double @recipe.encode(RECIPE_STATE %rotated.value) br label %finish finish:
-%result = phi double [ %unrotated.model, %entry ], [ %rotated.model, %rotate ]
+%result = phi double [ %unrotated.model, %entry ], [ %rotated.model, %angle.ready ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
 br i1 %reverse, label %accumulate, label %assign accumulate: %prior.model = load double, ptr addrspace(1) %output.ptr, align 8
 %prior = call RECIPE_STATE @recipe.decode(double %prior.model) %result.wide = call RECIPE_STATE @recipe.decode(double %result) %sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %prior, RECIPE_STATE %result.wide) %sum.model = call double @recipe.encode(RECIPE_STATE %sum) store double %sum.model, ptr addrspace(1) %output.ptr, align 8 ret void
