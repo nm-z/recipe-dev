@@ -13451,13 +13451,14 @@ fn lower_ensemble(graph: &mut Graph, members: &[Block], total: usize, data: &Pre
 	let (source, input, mut output, mut sum) = (graph.source, graph.output, None, None);
 	for member in members {
 		let (branch, shape) = expert(graph, source, input, member, total, data, targets, rows, gpu, config)?;
-		if let Some(expected) = output {
-			require(shape == expected, format!("ensemble members produce {}x{} and {}x{}", expected.channels, expected.length, shape.channels, shape.length))?;
-		} else {
-			output = Some(shape)
-		}
+		// The first member's shape is the ensemble's; a member of another shape
+		// takes the learned projection an MoE expert takes, so the mean is over
+		// equal shapes without asking every member for the same width.
+		let canonical = output.unwrap_or(shape);
+		let branch = project_moe_shape(graph, branch, shape, canonical)?;
+		output = Some(canonical);
 		sum = Some(match sum {
-			Some(previous) => binary(graph, previous, branch, shape, ScalarOpcode::Add)?,
+			Some(previous) => binary(graph, previous, branch, canonical, ScalarOpcode::Add)?,
 			None => branch,
 		});
 	}
