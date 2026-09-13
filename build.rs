@@ -154,6 +154,108 @@ const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
 %width = zext i16 %value to i32 ret i32 %width }"#;
+const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.wavefrontsize()
+define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
+define internal float @recipe.wave.partner(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
+const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.wavefrontsize()
+define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
+define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
+const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
+define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
+define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }
+define internal RECIPE_STATE @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) ret RECIPE_STATE %zero }
+define internal RECIPE_STATE @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) ret RECIPE_STATE %zero }"#;
+/// One 16-value Q4_K slice. The caller assigns adjacent slices to the lanes
+/// of a wave, so this helper keeps only four dot4 words live at once.
+fn amd_q4_slice_helper(state: &str, full: bool) -> String {
+	if !full {
+		return format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+	}
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
+	ir.push_str("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 0\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%dmin.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%dmin.bits = load half, ptr addrspace(1) %dmin.ptr, align 2\n%dmin = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %dmin.bits)\n%group = udiv i32 %slice, 2\n%group.wide = zext i32 %group to i64\n%half = and i32 %slice, 1\n%group.low = icmp ult i32 %group, 4\n%group.plus = add i32 %group, 4\n%group.minus = sub i32 %group, 4\n%scale.index = select i1 %group.low, i32 %group, i32 %group.plus\n%other.index = select i1 %group.low, i32 %group.plus, i32 %group.minus\n%scale.index.wide = zext i32 %scale.index to i64\n%other.index.wide = zext i32 %other.index to i64\n%scale.offset = add i64 4, %scale.index.wide\n%other.offset = add i64 4, %other.index.wide\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%other.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %other.offset\n%other.byte = load i8, ptr addrspace(1) %other.ptr, align 1\n%scale.raw = zext i8 %scale.byte to i32\n%other.raw = zext i8 %other.byte to i32\n%scale.low = and i32 %scale.raw, 63\n%minimum.low = and i32 %other.raw, 63\n%scale.high.low = and i32 %scale.raw, 15\n%minimum.high.low = lshr i32 %scale.raw, 4\n%high.bits = and i32 %other.raw, 192\n%high = lshr i32 %high.bits, 2\n%scale.high = or i32 %scale.high.low, %high\n%minimum.high.offset = add i64 4, %group.wide\n%minimum.high.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %minimum.high.offset\n%minimum.high.byte = load i8, ptr addrspace(1) %minimum.high.ptr, align 1\n%minimum.high.raw = zext i8 %minimum.high.byte to i32\n%minimum.high.bits = and i32 %minimum.high.raw, 192\n%minimum.high.top = lshr i32 %minimum.high.bits, 2\n%minimum.high = or i32 %minimum.high.low, %minimum.high.top\n%minimum = select i1 %group.low, i32 %minimum.low, i32 %minimum.high\n%scale.code = select i1 %group.low, i32 %scale.low, i32 %scale.high\n%scale.value = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.u32(i32 %scale.code)\n%minimum.value = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.u32(i32 %minimum)\n%group.d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.mul(");
+	ir.push_str(state);
+	ir.push_str(" %d, ");
+	ir.push_str(state);
+	ir.push_str(" %scale.value)\n%group.dmin = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.mul(");
+	ir.push_str(state);
+	ir.push_str(" %dmin, ");
+	ir.push_str(state);
+	ir.push_str(" %minimum.value)\n%pair = udiv i32 %group, 2\n%pair.wide = zext i32 %pair to i64\n%q4.base.part = mul i64 %pair.wide, 32\n%q4.base = add i64 %q4.base.part, 16\n%group.shift = and i32 %group, 1\n%q4.shift = mul i32 %group.shift, 4\n%half.wide = zext i32 %half to i64\n%q4.half.offset = mul i64 %half.wide, 16\n%q4.base.half = add i64 %q4.base, %q4.half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load half, ptr addrspace(3) %q8.d.ptr, align 2\n%q8.d.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %q8.d)\n");
+	let mut dot_sum = "%dot.zero".to_owned();
+	let mut q8_sum = "%q8.zero".to_owned();
+	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
+	for word in 0..4 {
+		let q8_offset = 4 + word * 4;
+		let word_offset = word * 4;
+		ir.push_str(&format!(
+			"%w{word}.q4.offset = add i64 %q4.base.half, {word_offset}\n%w{word}.q4.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.q4.offset\n%w{word}.q4.word = load i32, ptr addrspace(1) %w{word}.q4.ptr, align 2\n%w{word}.q4.shifted = lshr i32 %w{word}.q4.word, %q4.shift\n%w{word}.q4.codes = and i32 %w{word}.q4.shifted, 252645135\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8.word = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot = call i32 @llvm.amdgcn.sudot4(i1 false, i32 %w{word}.q4.codes, i1 true, i32 %w{word}.q8.word, i32 0, i1 false)\n%w{word}.sum = call i32 @llvm.amdgcn.sudot4(i1 false, i32 16843009, i1 true, i32 %w{word}.q8.word, i32 0, i1 false)\n",
+			q8_offset = q8_offset,
+			word_offset = word_offset,
+		));
+		let next_dot = format!("%w{word}.dot.sum");
+		let next_q8 = format!("%w{word}.q8.sum");
+		ir.push_str(&format!("{next_dot} = add i32 {dot_sum}, %w{word}.dot\n{next_q8} = add i32 {q8_sum}, %w{word}.sum\n", next_dot = next_dot, next_q8 = next_q8));
+		dot_sum = next_dot;
+		q8_sum = next_q8;
+	}
+	ir.push_str(&format!("%dot.value = call {state} @recipe.state.from.s32(i32 {dot_sum})\n%q8.value = call {state} @recipe.state.from.s32(i32 {q8_sum})\n%dot.scaled = call {state} @recipe.state.mul({state} %group.d, {state} %dot.value)\n%minimum.scaled = call {state} @recipe.state.mul({state} %group.dmin, {state} %q8.value)\n%value = call {state} @recipe.state.sub({state} %dot.scaled, {state} %minimum.scaled)\n%result = call {state} @recipe.state.mul({state} %q8.d.state, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
+	ir
+}
+/// One 16-value Q6_K slice. Q6 scales are already 16 values wide, so the
+/// slice index names the scale directly; the two adjacent slices share one
+/// Q8_1 activation block.
+fn amd_q6_slice_helper(state: &str, full: bool) -> String {
+	if !full {
+		return format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+	}
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
+	ir.push_str("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 208\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%chunk = udiv i32 %slice, 8\n%group = udiv i32 %slice, 2\n%local = urem i32 %group, 4\n%half = and i32 %slice, 1\n%chunk.wide = zext i32 %chunk to i64\n%local.wide = zext i32 %local to i64\n%half.wide = zext i32 %half to i64\n%low.group = and i32 %local, 1\n%low.group.wide = zext i32 %low.group to i64\n%ql.extra = mul i64 %low.group.wide, 32\n%ql.base.part = mul i64 %chunk.wide, 64\n%ql.base = add i64 %ql.base.part, %ql.extra\n%qh.base.part = mul i64 %chunk.wide, 32\n%qh.base = add i64 %qh.base.part, 128\n%ql.shift.group = udiv i32 %local, 2\n%ql.shift = mul i32 %ql.shift.group, 4\n%qh.shift = mul i32 %local, 2\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load half, ptr addrspace(3) %q8.d.ptr, align 2\n%q8.d.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.f16(half %q8.d)\n%scale.offset = add i32 %slice, 192\n%scale.offset.wide = zext i32 %scale.offset to i64\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset.wide\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%scale = sext i8 %scale.byte to i32\n%scale.state = call ");
+	ir.push_str(state);
+	ir.push_str(" @recipe.state.from.s32(i32 %scale)\n%half.offset = mul i64 %half.wide, 16\n%half.ql.base = add i64 %ql.base, %half.offset\n%half.qh.base = add i64 %qh.base, %half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n");
+	let mut dot_sum = "%dot.zero".to_owned();
+	let mut q8_sum = "%q8.zero".to_owned();
+	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
+	for word in 0..4 {
+		let q_offset = word * 4;
+		let q8_offset = 4 + word * 4;
+		ir.push_str(&format!(
+			"%w{word}.ql.offset = add i64 %half.ql.base, {q_offset}\n%w{word}.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.ql.offset\n%w{word}.ql = load i32, ptr addrspace(1) %w{word}.ql.ptr, align 2\n%w{word}.ql.shifted = lshr i32 %w{word}.ql, %ql.shift\n%w{word}.ql.codes = and i32 %w{word}.ql.shifted, 252645135\n%w{word}.qh.offset = add i64 %half.qh.base, {q_offset}\n%w{word}.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.qh.offset\n%w{word}.qh = load i32, ptr addrspace(1) %w{word}.qh.ptr, align 2\n%w{word}.qh.shifted = lshr i32 %w{word}.qh, %qh.shift\n%w{word}.qh.codes = and i32 %w{word}.qh.shifted, 50529027\n%w{word}.qh.bits = shl i32 %w{word}.qh.codes, 4\n%w{word}.codes = or i32 %w{word}.ql.codes, %w{word}.qh.bits\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8 = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot.raw = call i32 @llvm.amdgcn.sudot4(i1 false, i32 %w{word}.codes, i1 true, i32 %w{word}.q8, i32 0, i1 false)\n%w{word}.sum.raw = call i32 @llvm.amdgcn.sudot4(i1 false, i32 16843009, i1 true, i32 %w{word}.q8, i32 0, i1 false)\n",
+			q_offset = q_offset,
+			q8_offset = q8_offset,
+		));
+		let next_dot = format!("%w{word}.dot.sum");
+		let next_q8 = format!("%w{word}.q8.sum");
+		ir.push_str(&format!("{next_dot} = add i32 {dot_sum}, %w{word}.dot.raw\n{next_q8} = add i32 {q8_sum}, %w{word}.sum.raw\n", next_dot = next_dot, next_q8 = next_q8));
+		dot_sum = next_dot;
+		q8_sum = next_q8;
+	}
+	ir.push_str(&format!("%dot.offset = mul i32 {q8_sum}, 32\n%dot.signed = sub i32 {dot_sum}, %dot.offset\n%dot.value = call {state} @recipe.state.from.s32(i32 %dot.signed)\n%scaled = call {state} @recipe.state.mul({state} %scale.state, {state} %dot.value)\n%value = call {state} @recipe.state.mul({state} %q8.d.state, {state} %scaled)\n%result = call {state} @recipe.state.mul({state} %d, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
+	ir
+}
 fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
 	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
@@ -714,6 +816,11 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
+		let helpers = if suffix.is_empty() || suffix == "-f" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
+		let state = if suffix.is_empty() || suffix == "-f" { "double" } else { "float" };
+		let dot = (state == "float").then_some("declare i32 @llvm.amdgcn.sudot4(i1, i32, i1, i32, i32, i1)\n").unwrap_or_default();
+		let helpers = format!("{}\n{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"));
+		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -745,6 +852,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
+		.replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
@@ -772,7 +880,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
+	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -886,7 +994,9 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("delta-chunk", "RECIPE_DELTA_CHUNK"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
