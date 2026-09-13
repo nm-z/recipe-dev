@@ -13487,6 +13487,14 @@ fn estimator_count(block: &Block) -> usize {
 		_ => 0,
 	}
 }
+fn first_estimator(block: &Block) -> Option<&Estimator> {
+	match &block.operation {
+		Operation::Estimator(estimator) => Some(estimator),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
+		_ => None,
+	}
+}
 fn lower_ensemble(graph: &mut Graph, members: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!members.is_empty(), "ensemble requires a member")?;
 	let (source, input, mut output, mut sum) = (graph.source, graph.output, None, None);
@@ -23012,6 +23020,12 @@ impl Train {
 		require(self.rat.is_some() || self.rat_target.is_none(), "Train::target requires command RAT")?;
 		if let Some(command) = &self.rat {
 			command.policy.validate(data)?;
+			// A proposal has no labels: the proposer learns through the frozen
+			// evaluator, so a fitted estimator would only see the one-row
+			// initialization placeholder.
+			if let Some(estimator) = model.blocks.iter().find_map(first_estimator) {
+				return Err(RecipeError::new(format!("a RAT proposer cannot contain {}: estimators fit labeled rows, and a proposal has no labels", estimator.name)));
+			}
 			if data.autoregressive && data.sources.is_empty() {
 				return self.try_run_stateful_rat(model, data, command, started);
 			}
