@@ -4669,6 +4669,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %head.jobs = mul i32 %rows, %heads
 %statistics.rows = mul i32 %head.jobs, %length
 %statistics.denominator.base = add i32 0, %statistics.rows
+%statistics.denominator.base.wide = zext i32 %statistics.denominator.base to i64
 %representative.base = mul i32 %statistics.rows, 2
 %representative.stride = mul i32 %blocks, %index.width
 %representative.total = mul i32 %representative.stride, %rows
@@ -4872,7 +4873,7 @@ call void @attention_tile_derivatives(ptr addrspace(1) %context, i32 0, i32 %dq.
 i32 %dq.delta.base.shared, i32 %dq.value.base.shared, i32 %dq.probability.base.shared,
 i32 %dq.derivative.base.shared, i32 %dq.product.base.shared, i32 %dq.query.base,
 i32 %dq.key.tile.base, i32 %dq.query.count, i32 %dq.key.count, i32 %tile.n,
-i32 %dq.head.job, i32 %length, i32 %statistics.denominator.base, i32 %head.width,
+i64 %dq.head.job.wide, i64 %attn.length.wide, i64 %statistics.denominator.base.wide, i32 %head.width,
 double %scale, i32 %lid, i32 %block, i64 %dq.score.row.base, i32 %blocks, i32 %select.block, i1 %select)
 call void @recipe.local.barrier()
 br label %dq.accumulate.loop
@@ -4983,6 +4984,7 @@ dkv.job.prepare:
 %dkv.store.value.head.start = mul i32 %dkv.fixed.value.head, %head.width
 %dkv.input.row = mul i32 %dkv.row, %row.stride
 %dkv.output.row = mul i32 %dkv.row, %from
+%dkv.output.row.wide = zext i32 %dkv.output.row to i64
 %dkv.score.row = mul i32 %dkv.row, %score.row.stride
 %dkv.score.row.base.narrow = add i32 %score.base, %dkv.score.row
 %dkv.score.row.base = zext i32 %dkv.score.row.base.narrow to i64
@@ -5017,6 +5019,7 @@ dkv.head.prepare:
 %dkv.head = add i32 %dkv.head.base, %dkv.head.slot
 %dkv.head.start = mul i32 %dkv.head, %head.width
 %dkv.head.job = add i32 %dkv.head.row, %dkv.head
+%dkv.head.job.wide = zext i32 %dkv.head.job to i64
 ; The tiles restage per query head: a key job reads that head's value head, a value job that head's key head.
 %dkv.head.key.head.query = udiv i32 %dkv.head, %kv.group
 %dkv.head.value.head.query = udiv i32 %dkv.head, %value.group
@@ -5128,7 +5131,7 @@ store double %dkv.delta.value, ptr addrspace(3) %dkv.delta.shared.ptr, align 8
 br label %dkv.query.stage.loop
 dkv.query.stage.done:
 call void @recipe.local.barrier()
-call void @attention_tile_products(ptr addrspace(1) %output, i32 %dkv.output.row, i32 %dkv.delta.base.shared,
+call void @attention_tile_products(ptr addrspace(1) %output, i64 %dkv.output.row.wide, i32 %dkv.delta.base.shared,
 i32 %dkv.product.base.shared, i32 %dkv.query.base, i32 %dkv.query.count, i32 %dkv.head.start,
 i32 %head.width, i32 %length, i32 %lid, i32 %block)
 call void @recipe.local.barrier()
@@ -5166,7 +5169,7 @@ call void @attention_tile_derivatives(ptr addrspace(1) %context, i32 %dkv.query.
 i32 %dkv.delta.base.shared, i32 %dkv.value.base.shared, i32 %dkv.probability.base.shared,
 i32 %dkv.derivative.base.shared, i32 %dkv.product.base.shared, i32 %dkv.query.base,
 i32 %dkv.key.base, i32 %dkv.query.count, i32 %dkv.key.count, i32 %tile.n,
-i32 %dkv.head.job, i32 %length, i32 %statistics.denominator.base, i32 %head.width,
+i64 %dkv.head.job.wide, i64 %attn.length.wide, i64 %statistics.denominator.base.wide, i32 %head.width,
 double %scale, i32 %lid, i32 %block, i64 %dkv.score.row.base, i32 %blocks, i32 %select.block, i1 %select)
 call void @recipe.local.barrier()
 br label %dkv.accumulate.loop
