@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - '**'
+      - '!camber/**'
   workflow_dispatch:
     inputs:
       request_id:
