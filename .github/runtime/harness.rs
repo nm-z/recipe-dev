@@ -77,10 +77,11 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
-	// A tabular source has one row per sample, so a convolution or pool over its handful of
-	// features only asks Recipe for a kernel longer than the sequence (#214); those blocks
-	// belong to the sequence sources.
-	let sequential = dataset(cursor).contains("sample_subfolders");
+	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
+	// other source, the two-input and two-target folders included, is one value or one row per
+	// sample, so a convolution or pool there only asks Recipe for a kernel longer than the
+	// sequence (#214).
+	let sequential = dataset(cursor) == "data/numeric/sample_subfolders";
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
 		0 => format!("layer({width})"),
 		1 => format!("rnn({width})"),
