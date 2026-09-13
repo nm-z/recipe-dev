@@ -71,6 +71,14 @@ cat > worker.sh <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The controller marks the run directory abandoned when it stops waiting for
+# this job (queue deadline, cancellation); a job that starts afterwards has no
+# reader, so it returns at once instead of building and running the suite.
+if [ -f abandoned ]; then
+	echo "the controller abandoned this job before it started: $(cat abandoned)"
+	exit 0
+fi
+
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${WORKER_EXECUTION_TIMEOUT_SECONDS:?worker execution timeout is required}"
@@ -189,6 +197,15 @@ echo "== uploading the archive and worker to Stash =="
 camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
 camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
+
+echo "== jobs of this workflow still queued ahead =="
+# Jobs an earlier run abandoned keep their queue place until they start; the
+# count says how many of them this job waits behind.
+if queued_json="$(camber job list --size 50 --output json 2>/dev/null)"; then
+	printf '%s' "$queued_json" | jq -r '[.. | objects | select(has("job_id") and has("mount_dir")) | select((.mount_dir // "") | startswith("recipe-runtime/")) | select(((.job_status // "") | ascii_upcase) as $s | $s == "PENDING" or $s == "QUEUED" or $s == "SUBMITTED" or $s == "RUNNING")] | "\(length) queued or running: \([.[] | "\(.job_id):\(.job_status):\(.mount_dir)"] | join(" "))"' || echo "could not summarize the job list"
+else
+	echo "could not list jobs"
+fi
 
 job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS bash worker.sh"
 for provider_attempt in 1 2; do
