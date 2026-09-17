@@ -42,13 +42,27 @@ let model = recipe.model()
 	.loss(mae|mse|...)|.loss(&evaluator)
 ```
 ```r
-frozen.packed.blck.atvn.norm.quant = block
-  │      │      │    │    │    └─ quantization
-  │      │      │    │    └────── normalization
-  │      │      │    └─────────── activation
-  │      │      └──────────────── ""
-  │      └─────────────────────── packed qualifier
-  └────────────────────────────── frozen qualifier
+frozen.packed.blck.atvn.norm.quant.prec = block
+  │      │      │    │    │    │     └─ precision it computes in
+  │      │      │    │    │    └─────── quantization it is stored in
+  │      │      │    │    └──────────── normalization
+  │      │      │    └───────────────── activation
+  │      │      └────────────────────── ""
+  │      └───────────────────────────── packed qualifier
+  └──────────────────────────────────── frozen qualifier
+```
+
+Every block may name its own `quant` and `prec`; train writes the `quant` and infer reads it, both compute in the `prec`. A block that names neither takes the run's `.qi(...)` / `.fp(...)` default.
+
+```rust
+let model = recipe.model()
+	.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
+	.layer(gemma3.feed_forward_length).gelu().qi(4).k.m.int(4)
+	.layer(gemma3.embedding_length).qi(8).0.fp(16)
+	.layer(tokenizer.ggml.tokens).qi(6).k.int(8);
+
+recipe.train().qi(4).k.m.fp(16).run(&model, &data);   // defaults for blocks that named none
+recipe.infer().int(4).run(&model, &data);
 ```
 
 **blocks:**
@@ -69,7 +83,7 @@ blck:
 		xgbst(trees)
 		lgbm(trees)
 	attention:
-		attn(heads)
+		attn(heads, keys, values)
 			.width(d)
 			.kv(heads)
 			.qk(rms|l2)
@@ -118,6 +132,12 @@ loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
 	.no(bias)
+prec:
+	.fp(8|16|32|64)
+	.int(1|4|8)
+	.bf(16)
+	.tf(32)
+	.f(exp, mantissa)
 ```
 
 **compositions**
@@ -152,18 +172,27 @@ recipe.train()
 .resume(path)
 .rat(history|rolling|online|learned|full, "./evaluate")
 .target(value)
-precisions
+defaults for blocks that named none
+	.qi(...)|.iq(...)
 	.fp(8|16|32|64)
 	.int(1|4|8)
 	.bf(16)
 	.tf(32)
 	.f(exp, mantissa)
 observe:
-	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|all|dev)
+	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|chat|debug|all|dev)
 ```
 
 ## **Infer**
 
 ```rust
-let prediction = recipe.infer("model.ogdl", &input);
+let prediction = recipe.predict("model.ogdl", &input);
+recipe.infer().int(4).log([chat]).run(&model, &data);
+```
+
+```rust
+defaults for blocks that named none
+	.qi(...)|.iq(...)
+	.fp(8|16|32|64)|.int(1|4|8)|.bf(16)|.tf(32)|.f(exp, mantissa)
+.tokens(count)
 ```
