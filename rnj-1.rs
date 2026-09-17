@@ -7,18 +7,15 @@ fn main() {
 
 	let mut model = recipe.model()
 		.no(bias)
-		.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
+		.embed(tokenizer.ggml.tokens, gemma3.embedding_length).bf(16)
 		.scale(gemma3.embedding_length.sqrt());
 
 	for _ in 0..gemma3.block_count {
 		model = model
-			.packed.res([
+			.res([
 				norm(rms),
-				attn(
-					gemma3.attention.head_count,
-					gemma3.attention.head_count_kv,
-					gemma3.attention.head_count_kv
-				)
+				attn(gemma3.attention.head_count)
+				.kv(gemma3.attention.head_count_kv)
 				.qk(rms)
 				.rope(
 					neox,
@@ -32,19 +29,19 @@ fn main() {
 					gemma3.rope.scaling.yarn_beta_slow
 				),
 				norm(rms),
-			])
-			.packed.res([
+			]).bf(16)
+			.res([
 				norm(rms),
-				packed.layer(gemma3.feed_forward_length).gelu()
-					* packed.layer(gemma3.feed_forward_length),
+				layer(gemma3.feed_forward_length).gelu()
+					* layer(gemma3.feed_forward_length),
 				layer(gemma3.embedding_length),
 				norm(rms),
-			]);
+			]).bf(16);
 	}
 
 	model = model
 		.norm(rms)
-		.packed.layer(tokenizer.ggml.tokens)
+		.layer(tokenizer.ggml.tokens).bf(16)
 		.scale(1.0 / gemma3.final_logit_softcapping)
 		.tanh()
 		.scale(gemma3.final_logit_softcapping);

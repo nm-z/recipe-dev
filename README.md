@@ -83,7 +83,7 @@ blck:
 		xgbst(trees)
 		lgbm(trees)
 	attention:
-		attn(heads, keys, values)
+		attn(heads)
 			.width(d)
 			.kv(heads)
 			.qk(rms|l2)

@@ -10571,17 +10571,15 @@ pub fn norm(normalization: impl NormalizationSelector) -> Block {
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
 }
-/// An attention step of query, key and value heads, `attn(heads, kv, kv)`
-/// inside a fragment, taking the same selectors as the model's `.attn`.
+/// An attention step of `heads` query heads, `attn(heads)` inside a
+/// fragment, taking the same selectors as the model's `.attn`; `.kv(heads)`
+/// names its key and value heads.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
-pub struct attn(pub usize, pub usize, pub usize);
+pub struct attn(pub usize);
 impl From<attn> for Block {
 	fn from(heads: attn) -> Self {
-		let mut attention = AttentionBlock::new(heads.0);
-		attention.keys = heads.1;
-		attention.values = heads.2;
-		Block::of(Operation::Attention(attention))
+		Block::of(Operation::Attention(AttentionBlock::new(heads.0)))
 	}
 }
 impl attn {
@@ -10693,19 +10691,6 @@ impl Indexer {
 /// The attention head counts: one count for all three, or explicit query, key,
 /// and value counts. The array form is the typed Rust spelling of the three
 /// count API; the scalar form remains the equal-head shorthand.
-pub trait HeadCounts {
-	fn counts(self) -> [usize; 3];
-}
-impl HeadCounts for usize {
-	fn counts(self) -> [usize; 3] {
-		[self, self, self]
-	}
-}
-impl HeadCounts for [usize; 3] {
-	fn counts(self) -> [usize; 3] {
-		self
-	}
-}
 /// One attention block: query, key, and value heads, plus the rotary, indexer,
 /// and output-gate selectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10716,8 +10701,8 @@ struct AttentionBlock {
 	/// inferred width rounds up when the residual width is not divisible by the
 	/// query count.
 	width: usize,
-	/// The key and value head counts. They may differ, while each must divide
-	/// the query count so grouped-query/value attention has an unambiguous map.
+	/// The key and value head counts, equal, set by `.kv(heads)`; they divide
+	/// the query count so grouped-query attention has an unambiguous map.
 	keys: usize,
 	values: usize,
 	/// The rotary layout, the rotated channel count, and the base as its bits.
@@ -11194,7 +11179,7 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn perc(&self, width: usize) -> Model { self.model().perc(width) }
 	pub fn dconv(&self, kernel: usize) -> Model { self.model().dconv(kernel) }
 	pub fn delta(&self, heads: usize, kernel: usize) -> Model { self.model().delta(heads, kernel) }
-	pub fn attn(&self, heads: impl HeadCounts) -> Model { self.model().attn(heads) }
+	pub fn attn(&self, heads: usize) -> Model { self.model().attn(heads) }
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Model { self.model().glu(hidden, activation) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().res(parts) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
@@ -11204,7 +11189,7 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 })+ }; }
 qualified_blocks! { Packed, Frozen }
 /// `packed` before a part inside a composition: `packed.layer(n)`,
-/// `packed.attn(q, k, v)`. The part keeps its stored bytes packed.
+/// `packed.attn(heads)`. The part keeps its stored bytes packed.
 pub struct PackedBlock {
 	frozen: bool,
 }
@@ -11221,7 +11206,7 @@ macro_rules! qualified_parts { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn gru(&self, width: usize) -> Block { self.qualify(gru(width)) }
 	pub fn lstm(&self, width: usize) -> Block { self.qualify(lstm(width)) }
 	pub fn perc(&self, width: usize) -> Block { self.qualify(perc(width)) }
-	pub fn attn(&self, heads: usize, keys: usize, values: usize) -> Block { self.qualify(Block::from(attn(heads, keys, values))) }
+	pub fn attn(&self, heads: usize) -> Block { self.qualify(Block::from(attn(heads))) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Block { self.qualify(res(parts)) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Block { self.qualify(recur(parts)) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Block { self.qualify(ensemble(members)) }
@@ -11328,12 +11313,8 @@ impl Model {
 	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
 	/// Attention over query heads. The scalar form gives keys and values the
 	/// same count; the array form states query, key, and value counts separately.
-	pub fn attn(&self, heads: impl HeadCounts) -> Self {
-		let [query, keys, values] = heads.counts();
-		let mut attention = AttentionBlock::new(query);
-		attention.keys = keys;
-		attention.values = values;
-		self.push(Operation::Attention(attention))
+	pub fn attn(&self, heads: usize) -> Self {
+		self.push(Operation::Attention(AttentionBlock::new(heads)))
 	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
