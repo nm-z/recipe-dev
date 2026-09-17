@@ -13,7 +13,7 @@ fn main() {
 	for _ in 0..gemma3.block_count {
 		model = model
 			.res([
-				norm(rms),
+				norm(rms).bf(16),
 				attn(gemma3.attention.head_count)
 					.kv(gemma3.attention.head_count_kv).fp(16)
 					.qk(rms)
@@ -27,20 +27,20 @@ fn main() {
 						gemma3.rope.scaling.original_context_length,
 						gemma3.rope.scaling.yarn_beta_fast,
 						gemma3.rope.scaling.yarn_beta_slow
-					),
-				norm(rms),
+					).bf(16),
+				norm(rms).bf(16),
 			]).bf(16)
 			.res([
-				norm(rms),
-				layer(gemma3.feed_forward_length).gelu()
-					* layer(gemma3.feed_forward_length),
-				layer(gemma3.embedding_length),
-				norm(rms),
+				norm(rms).bf(16),
+				layer(gemma3.feed_forward_length).gelu().bf(16)
+					* layer(gemma3.feed_forward_length).bf(16),
+				layer(gemma3.embedding_length).bf(16),
+				norm(rms).bf(16),
 			]).bf(16);
 	}
 
 	model = model
-		.norm(rms)
+		.norm(rms).bf(16)
 		.layer(tokenizer.ggml.tokens).bf(16)
 		.scale(1.0 / gemma3.final_logit_softcapping)
 		.tanh()

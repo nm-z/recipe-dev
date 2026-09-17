@@ -52,7 +52,7 @@ frozen.packed.blck.atvn.norm.quant.prec = block
   └──────────────────────────────────── frozen qualifier
 ```
 
-Every block may name its own `quant` and `prec`: train writes the `quant`, infer reads what the file holds unless the block names another, and both compute in the `prec`. Only blocks name them; train and infer take no default.
+Every block may name its own `quant` and `prec`: train writes the `quant`, infer reads what the file holds unless the block names another, and both compute in the `prec`. Only blocks name them; train and infer take no default. A precision on `res([...])` is the add's alone; each part inside names its own.
 
 ```rust
 let model = recipe.model()

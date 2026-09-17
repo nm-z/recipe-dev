@@ -6972,6 +6972,10 @@ struct NativeTemporaryFiles {
 
 impl Drop for NativeTemporaryFiles {
 	fn drop(&mut self) {
+		// A traced run keeps its module beside the cache for reading.
+		if tracing() {
+			return;
+		}
 		for path in &self.paths {
 			let _ = fs::remove_file(path);
 		}
@@ -15453,7 +15457,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		graph.block_kind = block.operation.name();
 		graph.block_frozen = block.frozen;
 		graph.block_packed = block.packed;
-		graph.block_precision = block.precision.or(model.precision).unwrap_or(config.precision);
+		// A residual's own precision is its add's; its parts start from the model's.
+		let precision = if matches!(block.operation, Operation::Residual(_)) { model.precision } else { block.precision.or(model.precision) };
+		graph.block_precision = precision.unwrap_or(config.precision);
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	graph.block_frozen = false;
@@ -15622,7 +15628,10 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	let outer = (graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_kv_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_packed |= block.packed;
-	if let Some(precision) = block.precision {
+	// A residual's precision is the add's alone: its parts name their own.
+	if let Some(precision) = block.precision
+		&& !matches!(block.operation, Operation::Residual(_))
+	{
 		graph.block_precision = precision;
 	}
 	if block.kv_precision.is_some() {
@@ -15642,7 +15651,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
-		Operation::Residual(parts) => lower_residual(graph, parts, skip, total, data, targets, rows, gpu, config)?,
+		Operation::Residual(parts) => lower_residual(graph, parts, block.precision, skip, total, data, targets, rows, gpu, config)?,
 		Operation::Recur(parts) => lower_recur(graph, parts, total, data, targets, rows, gpu, config)?,
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
@@ -16671,11 +16680,15 @@ fn lower_ensemble(graph: &mut Graph, members: &[Block], total: usize, data: &Pre
 	}
 	Ok(())
 }
-fn lower_residual(graph: &mut Graph, parts: &[Block], skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>, skip: i32, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let shape = graph.output;
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
 		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
+	}
+	// The add, and any projection the skip path needs, run in the residual's own precision.
+	if let Some(precision) = precision {
+		graph.block_precision = precision;
 	}
 	let branch = graph.source;
 	let branch_shape = graph.output;
