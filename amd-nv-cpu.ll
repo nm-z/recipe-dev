@@ -3029,7 +3029,7 @@ define internal i1 @attention_selected(ptr addrspace(1) nocapture readonly %cont
 %flag.index = add i64 %start, %flag.local.wide
 %flag.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %flag.index
 %flag = load double, ptr addrspace(1) %flag.ptr, align 8
-%result = call i1 @recipe.ogt(double %flag, double 5.000000e-01)
+%result = call i1 @recipe.ogt(double %flag, double 0.5)
 ret i1 %result
 }
 ; The indexer planes live in their own arena, the side projection's output: one

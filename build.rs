@@ -799,6 +799,10 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String 
 		"i16" => format!("%{name}.bits = bitcast float %{from} to i32\n%{name}.low = lshr i32 %{name}.bits, 16\n%{name}.odd = and i32 %{name}.low, 1\n%{name}.bias = add i32 %{name}.odd, 32767\n%{name}.rounded = add i32 %{name}.bits, %{name}.bias\n%{name}.high = lshr i32 %{name}.rounded, 16\n%{name} = trunc i32 %{name}.high to i16\n"),
 		_ => format!("%{name} = fadd float %{from}, 0.0\n"),
 	};
+	// The cache in the model's own type: the bytes pass through untouched.
+	if kv == model {
+		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
+	}
 	let mut ir = String::new();
 	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "state"), from_float("result", "narrowed")));
 	ir.push_str(&format!("define internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\n{}{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {model} %result\n}}\n", to_float("wide", "value"), widen("state", "wide")));
