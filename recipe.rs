@@ -7758,7 +7758,7 @@ mod gguf {
 		/// On AMD, a packed Q4_K or Q6_K contraction takes Q8 activation dot
 		/// products, which can change numerical results.
 		pub fn fp(mut self, bits: u8) -> Self {
-			self.precision = super::recipe.train().fp(bits).precision;
+			self.precision = super::fp_format(bits);
 			self
 		}
 		pub fn value(&self, key: &str) -> Option<&GgufValue> {
@@ -10943,6 +10943,15 @@ pub mod atv {
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 /// The arithmetic suffixes every builder shares. `$carrier` names the receiver
 /// and `$target` what the chain continues as.
+fn fp_format(bits: u8) -> Compute {
+	match bits {
+		8 => Compute::FP8,
+		16 => Compute::FP16,
+		32 => Compute::FP32,
+		64 => Compute::FP64,
+		_ => panic!("fp bits must be 8, 16, 32, or 64"),
+	}
+}
 macro_rules! precision_methods {
 	($carrier:ty => $target:ty) => {
 		impl $carrier {
@@ -10951,14 +10960,7 @@ macro_rules! precision_methods {
 				self.arithmetic(Compute::F(FloatFormat::computed(exp, man)))
 			}
 			pub fn fp(&self, bits: u8) -> $target {
-				let format = match bits {
-					8 => Compute::FP8,
-					16 => Compute::FP16,
-					32 => Compute::FP32,
-					64 => Compute::FP64,
-					_ => panic!("fp bits must be 8, 16, 32, or 64"),
-				};
-				self.arithmetic(format)
+				self.arithmetic(fp_format(bits))
 			}
 			pub fn int(&self, bits: u8) -> $target {
 				let format = match bits {
@@ -13297,7 +13299,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, pending_packed: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, quantization: 0, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None, rat_target: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -14287,28 +14289,13 @@ fn arm_trace(metrics: &[Metric]) {
 #[derive(Clone)]
 pub struct Infer {
 	log: Vec<Metric>,
+	/// The arithmetic of a block that names none and whose model names none.
 	precision: Compute,
-	/// The storage format for blocks that name none, 0 to keep the file's.
-	quantization: u16,
 	tokens: usize,
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), precision: Compute::FP16, quantization: 0, tokens: 32 }
-	}
-}
-precision_methods!(Infer => Infer);
-precision_methods!(Qk<Infer> => Infer);
-impl Qk<Infer> {
-	fn arithmetic(&self, format: Compute) -> Infer {
-		self.model.arithmetic(format)
-	}
-}
-impl Quantized for Infer {
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
-		let mut run = self.clone();
-		run.quantization = family << 12 | variant << 8 | u16::from(bits);
-		run
+		Infer { log: Vec::new(), precision: Compute::FP16, tokens: 32 }
 	}
 }
 impl Infer {
@@ -14316,19 +14303,6 @@ impl Infer {
 		self.log = metrics.into_metrics();
 		arm_trace(&self.log);
 		self
-	}
-	/// The arithmetic for blocks that name none, 16 unless chosen.
-	fn arithmetic(&self, format: Compute) -> Self {
-		let mut run = self.clone();
-		run.precision = format;
-		run
-	}
-	/// The storage format for blocks that name none.
-	pub fn qi(&self, bits: u8) -> Qi<Self> {
-		qi_of(self, bits)
-	}
-	pub fn iq(&self, bits: u8) -> Iq<Self> {
-		iq_of(self, bits)
 	}
 	/// The reply length in ids, 32 unless chosen.
 	pub const fn tokens(mut self, count: usize) -> Self {
@@ -14341,7 +14315,6 @@ impl Infer {
 	fn try_run(&self, model: &Model, data: &Data) -> Result<Generation> {
 		let mut file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		file.precision = self.precision;
-		file.quantization = self.quantization;
 		let model = with_last_projection(model);
 		let plan = conventional_plan(&file, &model)?;
 		let device = selected_gpu()?;
@@ -25790,9 +25763,8 @@ pub struct Train {
 	resume: Option<PathBuf>,
 	save: Option<PathBuf>,
 	seed: Option<usize>,
+	/// The arithmetic of a block that names none and whose model names none.
 	precision: Compute,
-	/// The storage format for blocks that name none, 0 for unquantized.
-	quantization: u16,
 	rat: Option<RatCommand>,
 	rat_target: Option<f64>,
 }
@@ -25879,33 +25851,7 @@ impl Compute {
 		}
 	}
 }
-precision_methods!(Train => Train);
-precision_methods!(Qk<Train> => Train);
-impl Qk<Train> {
-	fn arithmetic(&self, format: Compute) -> Train {
-		self.model.arithmetic(format)
-	}
-}
-impl Quantized for Train {
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
-		let mut run = self.clone();
-		run.quantization = family << 12 | variant << 8 | u16::from(bits);
-		run
-	}
-}
 impl Train {
-	fn arithmetic(&self, format: Compute) -> Self {
-		let mut run = self.clone();
-		run.precision = format;
-		run
-	}
-	/// The storage format for blocks that name none.
-	pub fn qi(&self, bits: u8) -> Qi<Self> {
-		qi_of(self, bits)
-	}
-	pub fn iq(&self, bits: u8) -> Iq<Self> {
-		iq_of(self, bits)
-	}
 	pub const fn seed(mut self, value: usize) -> Self {
 		self.seed = Some(value);
 		self
@@ -26205,7 +26151,6 @@ impl Train {
 		let gpu = selected_gpu()?;
 		let mut config = Config::load()?;
 		config.precision = self.precision;
-		config.quantization = self.quantization;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}
@@ -26324,7 +26269,6 @@ impl Train {
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
 			config.precision = self.precision;
-		config.quantization = self.quantization;
 			if let Some(seed) = self.seed {
 				config.random_seed = seed;
 			}

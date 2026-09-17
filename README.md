@@ -52,7 +52,7 @@ frozen.packed.blck.atvn.norm.quant.prec = block
   └──────────────────────────────────── frozen qualifier
 ```
 
-Every block may name its own `quant` and `prec`; train writes the `quant` and infer reads it, both compute in the `prec`. A block that names neither takes the run's `.qi(...)` / `.fp(...)` default.
+Every block may name its own `quant` and `prec`: train writes the `quant`, infer reads what the file holds unless the block names another, and both compute in the `prec`. Only blocks name them; train and infer take no default.
 
 ```rust
 let model = recipe.model()
@@ -61,8 +61,8 @@ let model = recipe.model()
 	.layer(gemma3.embedding_length).qi(8).0.fp(16)
 	.layer(tokenizer.ggml.tokens).qi(6).k.int(8);
 
-recipe.train().qi(4).k.m.fp(16).run(&model, &data);   // defaults for blocks that named none
-recipe.infer().int(4).run(&model, &data);
+recipe.train().run(&model, &data);
+recipe.infer().run(&model, &data);
 ```
 
 **blocks:**
@@ -159,7 +159,6 @@ left * right
 
 ```rust
 recipe.train()
-	.fp(32)
 	.lr(0.0001)
 	.stop(0.1)
 	.epochs(100000)
@@ -172,13 +171,6 @@ recipe.train()
 .resume(path)
 .rat(history|rolling|online|learned|full, "./evaluate")
 .target(value)
-defaults for blocks that named none
-	.qi(...)|.iq(...)
-	.fp(8|16|32|64)
-	.int(1|4|8)
-	.bf(16)
-	.tf(32)
-	.f(exp, mantissa)
 observe:
 	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|chat|debug|all|dev)
 ```
@@ -187,12 +179,9 @@ observe:
 
 ```rust
 let prediction = recipe.predict("model.ogdl", &input);
-recipe.infer().int(4).log([chat]).run(&model, &data);
+recipe.infer().log([chat]).run(&model, &data);
 ```
 
 ```rust
-defaults for blocks that named none
-	.qi(...)|.iq(...)
-	.fp(8|16|32|64)|.int(1|4|8)|.bf(16)|.tf(32)|.f(exp, mantissa)
 .tokens(count)
 ```
