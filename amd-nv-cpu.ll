@@ -916,7 +916,15 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %q4.available = and i1 %q4.selector, %q4.width.ok
 %q6.selector = call i1 @recipe.model.q6k(i32 %decode)
 %q6.available = and i1 %q6.selector, %q4.width.ok
-%q8.available = or i1 %q4.available, %q6.available
+%b32.kind = call i32 @recipe.model.block32(i32 %decode)
+%b32.stride = call i64 @recipe.model.block32.stride(i32 %decode)
+%b32.selector = icmp ne i32 %b32.kind, 0
+%b32.remainder = urem i32 %terms, 32
+%b32.aligned = icmp eq i32 %b32.remainder, 0
+%b32.width.ok = and i1 %q4.width, %b32.aligned
+%b32.available = and i1 %b32.selector, %b32.width.ok
+%q8.k = or i1 %q4.available, %q6.available
+%q8.available = or i1 %q8.k, %b32.available
 %q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
 br i1 %q8.available, label %q8.entry, label %job.loop
 q8.entry:
@@ -1050,7 +1058,7 @@ br label %q4.sum.loop
 q4.sum.done:
 br label %sum.done
 q6.check:
-br i1 %q6.available, label %q6.sum.loop, label %sum.loop
+br i1 %q6.available, label %q6.sum.loop, label %b32.check
 q6.sum.loop:
 %q6.slice = phi i32 [ %lane, %q6.check ], [ %q6.slice.next, %q6.slice.ready ]
 %q6.sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6.sum.next, %q6.slice.ready ]
@@ -1077,9 +1085,37 @@ q6.slice.ready:
 br label %q6.sum.loop
 q6.sum.done:
 br label %sum.done
+b32.check:
+br i1 %b32.available, label %b32.sum.loop, label %sum.loop
+b32.sum.loop:
+%b32.slice = phi i32 [ %lane, %b32.check ], [ %b32.slice.next, %b32.slice.ready ]
+%b32.sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %b32.sum.next, %b32.slice.ready ]
+%b32.slices = udiv i32 %terms, 16
+%b32.slice.more = icmp ult i32 %b32.slice, %b32.slices
+br i1 %b32.slice.more, label %b32.sum.step, label %b32.sum.done
+b32.sum.step:
+%b32.row.blocks = udiv i32 %terms, 32
+%b32.row.blocks.wide = zext i32 %b32.row.blocks to i64
+%b32.channel.row = mul i64 %channel.wide, %b32.row.blocks.wide
+%b32.block = udiv i32 %b32.slice, 2
+%b32.slice.local = urem i32 %b32.slice, 2
+%b32.block.wide = zext i32 %b32.block to i64
+%b32.block.index = add i64 %b32.channel.row, %b32.block.wide
+%b32.byte.offset = mul i64 %b32.block.index, %b32.stride
+%b32.q8.offset = mul i64 %b32.block.wide, 36
+%b32.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %b32.q8.offset
+%b32.loaded = call RECIPE_STATE @recipe.block32.slice(i32 %b32.kind, ptr addrspace(1) %weights, i64 %b32.byte.offset, ptr addrspace(3) %b32.q8.ptr, i32 %b32.slice.local)
+%b32.value.active = select i1 %channel.active, RECIPE_STATE %b32.loaded, RECIPE_STATE %state.zero
+%b32.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %b32.sum, RECIPE_STATE %b32.value.active)
+%b32.slice.next = add i32 %b32.slice, %width
+br label %b32.slice.ready
+b32.slice.ready:
+br label %b32.sum.loop
+b32.sum.done:
+br label %sum.done
 sum.loop:
-%k = phi i32 [ %lane, %q6.check ], [ %k.next, %weight.ready ]
-%sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %sum.next, %weight.ready ]
+%k = phi i32 [ %lane, %b32.check ], [ %k.next, %weight.ready ]
+%sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %sum.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
 sum.step:
@@ -1110,7 +1146,7 @@ weight.ready:
 %k.next = add i32 %k, %width
 br label %sum.loop
 sum.done:
-%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ]
+%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %b32.sum, %b32.sum.done ]
 %reduce.offset.initial = udiv i32 %width, 2
 br label %reduce.loop
 reduce.loop:

@@ -2171,6 +2171,8 @@ struct NodePlan {
 	attention_kv: Option<usize>,
 	adjoint: usize,
 	stored: Option<StoredWeight>,
+	/// The file bytes the load kernel requantizes into `stored`'s format.
+	requantize: Option<StoredWeight>,
 	storage_offset: usize,
 	weight_offset: usize,
 	packed: bool,
@@ -2271,8 +2273,13 @@ impl NativeModelIr {
 			if let Some(weight) = &stored {
 				require(weight.count == node.weights(), format!("{} stored weight count {} does not match tensor count {}", id(), weight.count, node.weights()))?;
 			}
+			let requantize = graph.requantize.get(index).cloned().unwrap_or(None);
 			let storage_offset = align(storage_bytes, alignment("float"))?;
-			if let Some(weight) = arena_weight(&node, &stored).filter(|_| !kept) {
+			// The storage arena holds what the load kernel reads: a weight it
+			// expands, or the file bytes it requantizes into the block's format.
+			if let Some(source) = &requantize {
+				storage_bytes = checked_add(storage_offset, source.bytes.len(), "native storage arena")?;
+			} else if let Some(weight) = arena_weight(&node, &stored).filter(|_| !kept) {
 				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
 			}
 			plans.push(NodePlan {
@@ -2282,6 +2289,7 @@ impl NativeModelIr {
 				attention_kv: layout.attention_kv[index],
 				adjoint: layout.adjoints[index],
 				stored,
+				requantize,
 				storage_offset,
 				weight_offset: weight_offsets[index],
 				packed: kept,
@@ -2314,7 +2322,13 @@ impl NativeModelIr {
 		let segments = self
 			.plans
 			.iter()
-			.filter_map(|plan| arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed).map(|weight| (plan.storage_offset, weight.bytes.clone())))
+			.filter_map(|plan| {
+				let bytes = match &plan.requantize {
+					Some(source) => &source.bytes,
+					None => &arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed)?.bytes,
+				};
+				Some((plan.storage_offset, bytes.clone()))
+			})
 			.collect();
 		StorageImage { bytes: self.storage_bytes, segments }
 	}
@@ -5850,7 +5864,11 @@ impl NativeModelIr {
 				continue;
 			}
 			// A lookup's table decodes on the host, so the device needs no decoder for it.
-			let Some(stored) = plan.stored.as_ref().filter(|_| plan.node.op != Primitive::Lookup) else { continue };
+			if plan.node.op == Primitive::Lookup {
+				continue;
+			}
+			// A requantized node decodes its file bytes and its own format.
+			for stored in plan.stored.iter().chain(plan.requantize.iter()) {
 			let segments = stored.format_segments();
 			for (segment, _) in &segments {
 				let spec = segment.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", segment.0)))?;
@@ -5872,6 +5890,7 @@ impl NativeModelIr {
 				}
 				emitted.push_str(&self.emit_native_quantization(backend, format, native, precision, &suffix)?);
 				seen.push(spec.codec);
+			}
 			}
 		}
 		}
@@ -5922,8 +5941,49 @@ impl NativeModelIr {
 		format!("define internal i1 @recipe.model.q6k(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q6k.no [\n{arms}]\nq6k.yes:\nret i1 true\nq6k.no:\nret i1 false\n}}\n")
 	}
 
+	/// The 32-value block formats the step kernel dots against a Q8_1 activation
+	/// block: the kind the slice helper switches on and the block's byte stride.
+	/// Every other packed format takes the per-value decoder.
+	fn emit_block32_support(&self, backend: Backend) -> String {
+		let (mut kinds, mut strides) = (String::new(), String::new());
+		if self.inference && backend == Backend::Amd {
+			for (index, plan) in self.plans.iter().enumerate() {
+				let precision = self.node_precision(&plan.node);
+				if precision.state_type != "float" || precision.model.bytes() < 2 {
+					continue;
+				}
+				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed && plan.node.op == Primitive::Contraction) else { continue };
+				let segments = stored.format_segments();
+				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * precision.model.bytes() {
+					continue;
+				}
+				let Some(spec) = segments[0].0.spec() else { continue };
+				let kind = match device_quantizer(spec.codec) {
+					Some(DeviceQuantizer::Iq4Nl) => 1,
+					Some(DeviceQuantizer::Q4_0) => 2,
+					Some(DeviceQuantizer::Q4_1) => 3,
+					Some(DeviceQuantizer::Q8_0) => 4,
+					None => continue,
+				};
+				kinds.push_str(&format!("i32 {}, label %kind.{kind}\n", index + 1));
+				strides.push_str(&format!("i32 {}, label %stride.{}\n", index + 1, spec.stride));
+			}
+		}
+		let kind_arms = (1..=4).map(|kind| format!("kind.{kind}:\nret i32 {kind}\n")).collect::<String>();
+		let stride_arms = [18, 20, 34].iter().map(|stride| format!("stride.{stride}:\nret i64 {stride}\n")).collect::<String>();
+		format!("define internal i32 @recipe.model.block32(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %kind.0 [\n{kinds}]\n{kind_arms}kind.0:\nret i32 0\n}}\ndefine internal i64 @recipe.model.block32.stride(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %stride.0 [\n{strides}]\n{stride_arms}stride.0:\nret i64 0\n}}\n")
+	}
+
 	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
+		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
+	}
+	/// Selects one requantized node's file-bytes decoder so the load kernel reads them.
+	fn emit_source_decode(&self, backend: Backend) -> Result<String> {
+		self.emit_decode_switch(backend, "recipe.model.source.decode", |plan| plan.requantize.as_ref())
+	}
+	fn emit_decode_switch(&self, backend: Backend, name: &str, select: impl Fn(&NodePlan) -> Option<&StoredWeight>) -> Result<String> {
 		let mut decoders = String::new();
 		for (precision, suffix) in self.precisions() {
 		let (pointer, ty) = (pointer_type(backend), precision.model_type);
@@ -5932,7 +5992,7 @@ impl NativeModelIr {
 			if self.variant(&plan.node) != suffix {
 				continue;
 			}
-			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
+			let Some(stored) = select(plan) else { continue };
 			let segments = stored.format_segments();
 			let mut bytes = 0usize;
 			let mut elements = 0usize;
@@ -5969,9 +6029,159 @@ impl NativeModelIr {
 				}
 			}
 		}
-		decoders.push_str(&format!("define internal {ty} @recipe.model.decode{suffix}({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"));
+		decoders.push_str(&format!("define internal {ty} @{name}{suffix}({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"));
 		}
 		Ok(decoders)
+	}
+
+	/// One node's requantize inside the load kernel: every thread takes blocks of
+	/// the block's format in grid stride, decodes each value from the file bytes
+	/// through the source decoder, fits the block as the host encoder does, and
+	/// writes it packed, or writes its decoded values when the node keeps its
+	/// weights unpacked.
+	fn requantize_function(&self, plan: &NodePlan) -> Result<(DeviceQuantizer, StorageSpec, String)> {
+		let target = plan.stored.as_ref().ok_or_else(|| RecipeError::new("requantized node names no format"))?;
+		let spec = target.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", target.format.0)))?;
+		let quantizer = device_quantizer(spec.codec).ok_or_else(|| RecipeError::new(format!("{} has no device encoder", quantization(target.format.0))))?;
+		require(spec.block == 32, "the device encoders take 32-value blocks")?;
+		let name = format!("recipe.requantize.{}{}{}", spec.codec.quantization().name, if plan.packed { ".packed" } else { "" }, self.variant(&plan.node));
+		Ok((quantizer, spec, name))
+	}
+	/// The call that requantizes one node inside the load kernel.
+	fn emit_requantize_call(&self, backend: Backend, index: usize, plan: &NodePlan, source: &StoredWeight) -> Result<String> {
+		let (_, _, name) = self.requantize_function(plan)?;
+		let pointer = pointer_type(backend);
+		let blocks = i32::try_from(source.count.div_ceil(32)).map_err(|_| RecipeError::new("requantized block count exceeds i32"))?;
+		Ok(format!("%rq.n{index}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%rq.n{index}.target = getelementptr i8, {pointer} %weights, i64 {weight}\ncall void @{name}({pointer} %rq.n{index}.storage, {pointer} %rq.n{index}.target, i32 {node}, i64 {count}, i32 {blocks}, i32 %tid, i32 %threads)\n", storage = plan.storage_offset, weight = plan.weight_offset, node = index + 1, count = source.count))
+	}
+	/// Every requantize function the load kernel calls, one per format, precision
+	/// and packing among the requantized nodes.
+	fn emit_requantize_functions(&self, backend: Backend) -> Result<String> {
+		let mut names: Vec<String> = Vec::new();
+		let mut ir = String::new();
+		for plan in &self.plans {
+			if plan.requantize.is_none() {
+				continue;
+			}
+			let (_, _, name) = self.requantize_function(plan)?;
+			if names.contains(&name) {
+				continue;
+			}
+			ir.push_str(&self.emit_requantize(backend, plan)?);
+			names.push(name);
+		}
+		Ok(ir)
+	}
+	fn emit_requantize(&self, backend: Backend, plan: &NodePlan) -> Result<String> {
+		let (quantizer, _, name) = self.requantize_function(plan)?;
+		let precision = self.node_precision(&plan.node);
+		let (pointer, ty, state, v) = (pointer_type(backend), precision.model_type, precision.state_type, self.variant(&plan.node));
+		let p = "rq".to_owned();
+		let lit = |value: f32| type_literal("float", f64::from(value));
+		let abs = |name: &str, from: &str| format!("%{name}.neg = fneg float %{from}\n%{name}.lt = fcmp olt float %{from}, {zero}\n%{name} = select i1 %{name}.lt, float %{name}.neg, float %{from}\n", zero = lit(0.0));
+		// Round half away from zero, as the host encoder's `round` does.
+		let round = |name: &str, from: &str| format!("%{name}.nn = fcmp oge float %{from}, {zero}\n%{name}.h = select i1 %{name}.nn, float {half}, float {mhalf}\n%{name}.r = fadd float %{from}, %{name}.h\n%{name} = fptosi float %{name}.r to i32\n", zero = lit(0.0), half = lit(0.5), mhalf = lit(-0.5));
+		let clamp_float = |name: &str, from: &str, low: f32, high: f32| format!("%{name}.lo = fcmp olt float %{from}, {low}\n%{name}.l = select i1 %{name}.lo, float {low}, float %{from}\n%{name}.hi = fcmp ogt float %{name}.l, {high}\n%{name} = select i1 %{name}.hi, float {high}, float %{name}.l\n", low = lit(low), high = lit(high));
+		let clamp_int = |name: &str, from: &str, low: i32, high: i32| format!("%{name}.lo = icmp slt i32 %{from}, {low}\n%{name}.l = select i1 %{name}.lo, i32 {low}, i32 %{from}\n%{name}.hi = icmp sgt i32 %{name}.l, {high}\n%{name} = select i1 %{name}.hi, i32 {high}, i32 %{name}.l\n");
+		let mut ir = format!("define internal void @{name}({pointer} %{p}.storage, {pointer} %{p}.target, i32 %{p}.node, i64 %{p}.count, i32 %{p}.blocks, i32 %tid, i32 %threads) #1 {{\nentry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.b = phi i32 [ %tid, %entry ], [ %{p}.next, %{p}.block.done ]\n%{p}.more = icmp ult i32 %{p}.b, %{p}.blocks\nbr i1 %{p}.more, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.b.wide = zext i32 %{p}.b to i64\n%{p}.base = mul i64 %{p}.b.wide, 32\n");
+		// The block's values through the source decoder; a tail past the weight's
+		// end reads index zero and contributes zero.
+		for i in 0..32 {
+			ir.push_str(&format!("%{p}.i{i} = add i64 %{p}.base, {i}\n%{p}.in{i} = icmp ult i64 %{p}.i{i}, %{p}.count\n%{p}.safe{i} = select i1 %{p}.in{i}, i64 %{p}.i{i}, i64 0\n%{p}.m{i} = call {ty} @recipe.model.source.decode{v}({pointer} %{p}.storage, i64 %{p}.safe{i}, i32 %{p}.node)\n%{p}.s{i} = call {state} @recipe.state.from.model{v}({ty} %{p}.m{i})\n"));
+			if state == "double" {
+				ir.push_str(&format!("%{p}.f{i} = fptrunc double %{p}.s{i} to float\n"));
+			} else {
+				ir.push_str(&format!("%{p}.f{i} = fadd float %{p}.s{i}, {}\n", lit(0.0)));
+			}
+			ir.push_str(&format!("%{p}.v{i} = select i1 %{p}.in{i}, float %{p}.f{i}, float {}\n", lit(0.0)));
+		}
+		// The value of largest magnitude, signed, and the block's range.
+		ir.push_str(&format!("%{p}.e0 = fadd float {zero}, {zero}\n%{p}.mn0 = fadd float %{p}.v0, {zero}\n%{p}.mx0 = fadd float %{p}.v0, {zero}\n", zero = lit(0.0)));
+		for i in 0..32 {
+			ir.push_str(&abs(&format!("{p}.a{i}"), &format!("{p}.v{i}")));
+			ir.push_str(&abs(&format!("{p}.ea{i}"), &format!("{p}.e{i}")));
+			ir.push_str(&format!("%{p}.eg{i} = fcmp ogt float %{p}.a{i}, %{p}.ea{i}\n%{p}.e{next} = select i1 %{p}.eg{i}, float %{p}.v{i}, float %{p}.e{i}\n%{p}.lt{i} = fcmp olt float %{p}.v{i}, %{p}.mn{i}\n%{p}.mn{next} = select i1 %{p}.lt{i}, float %{p}.v{i}, float %{p}.mn{i}\n%{p}.gt{i} = fcmp ogt float %{p}.v{i}, %{p}.mx{i}\n%{p}.mx{next} = select i1 %{p}.gt{i}, float %{p}.v{i}, float %{p}.mx{i}\n", next = i + 1));
+		}
+		ir.push_str(&abs(&format!("{p}.ext"), &format!("{p}.e32")));
+		// The scale, its guarded inverse, the code of every value, and the value
+		// the block's decoder gives that code back, exactly as the host encoders.
+		let (stride, data, nibbles) = match quantizer {
+			DeviceQuantizer::Iq4Nl => (18, 2, true),
+			DeviceQuantizer::Q4_0 => (18, 2, true),
+			DeviceQuantizer::Q4_1 => (20, 4, true),
+			DeviceQuantizer::Q8_0 => (34, 2, false),
+		};
+		match quantizer {
+			DeviceQuantizer::Iq4Nl => {
+				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).table().map(NativeQuantTable::name).unwrap_or("iq4");
+				ir.push_str(&format!("%{p}.tiny = fcmp olt float %{p}.ext, {tiny}\n%{p}.inv.raw = fdiv float {first}, %{p}.e32\n%{p}.inv = select i1 %{p}.tiny, float {zero}, float %{p}.inv.raw\n%{p}.num0 = fadd float {zero}, {zero}\n%{p}.den0 = fadd float {zero}, {zero}\n", tiny = lit(1.0e-15), first = lit(f32::from(IQ4[0])), zero = lit(0.0)));
+				for i in 0..32 {
+					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n%{p}.c{i}.0 = add i32 0, 0\n"));
+					for (k, mid) in IQ4_MID.iter().enumerate() {
+						ir.push_str(&format!("%{p}.c{i}.k{k} = fcmp ogt float %{p}.q{i}, {mid}\n%{p}.c{i}.z{k} = zext i1 %{p}.c{i}.k{k} to i32\n%{p}.c{i}.{next} = add i32 %{p}.c{i}.{k}, %{p}.c{i}.z{k}\n", mid = lit(*mid), next = k + 1));
+					}
+					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr %{p}.l{i}.ptr, align 1\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
+				}
+				ir.push_str(&format!("%{p}.den.pos = fcmp ogt float %{p}.den32, {zero}\n%{p}.scale.raw = fdiv float %{p}.num32, %{p}.den32\n%{p}.scale.fit = select i1 %{p}.den.pos, float %{p}.scale.raw, float {zero}\n%{p}.scale = select i1 %{p}.tiny, float {zero}, float %{p}.scale.fit\n", zero = lit(0.0)));
+				for i in 0..32 {
+					ir.push_str(&format!("%{p}.x{i} = fmul float %{p}.scale, %{p}.l{i}\n"));
+				}
+			}
+			DeviceQuantizer::Q8_0 => {
+				ir.push_str(&format!("%{p}.scale = fdiv float %{p}.ext, {}\n%{p}.zero = fcmp oeq float %{p}.scale, {zero}\n%{p}.inv.raw = fdiv float {one}, %{p}.scale\n%{p}.inv = select i1 %{p}.zero, float {zero}, float %{p}.inv.raw\n", lit(127.0), zero = lit(0.0), one = lit(1.0)));
+				for i in 0..32 {
+					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n"));
+					ir.push_str(&round(&format!("{p}.r{i}"), &format!("{p}.q{i}")));
+					ir.push_str(&clamp_int(&format!("{p}.c{i}"), &format!("{p}.r{i}"), -128, 127));
+					ir.push_str(&format!("%{p}.cf{i} = sitofp i32 %{p}.c{i} to float\n%{p}.x{i} = fmul float %{p}.scale, %{p}.cf{i}\n"));
+				}
+			}
+			DeviceQuantizer::Q4_0 => {
+				ir.push_str(&format!("%{p}.scale = fdiv float %{p}.e32, {}\n%{p}.zero = fcmp oeq float %{p}.scale, {zero}\n%{p}.inv.raw = fdiv float {one}, %{p}.scale\n%{p}.inv = select i1 %{p}.zero, float {zero}, float %{p}.inv.raw\n", lit(-8.0), zero = lit(0.0), one = lit(1.0)));
+				for i in 0..32 {
+					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n%{p}.sh{i} = fadd float %{p}.q{i}, {}\n", lit(8.5)));
+					ir.push_str(&clamp_float(&format!("{p}.cl{i}"), &format!("{p}.sh{i}"), 0.0, 15.0));
+					ir.push_str(&format!("%{p}.c{i} = fptoui float %{p}.cl{i} to i32\n%{p}.cf{i} = uitofp i32 %{p}.c{i} to float\n%{p}.cm{i} = fsub float %{p}.cf{i}, {}\n%{p}.x{i} = fmul float %{p}.scale, %{p}.cm{i}\n", lit(8.0)));
+				}
+			}
+			DeviceQuantizer::Q4_1 => {
+				ir.push_str(&format!("%{p}.range = fsub float %{p}.mx32, %{p}.mn32\n%{p}.scale = fdiv float %{p}.range, {}\n%{p}.zero = fcmp oeq float %{p}.scale, {zero}\n%{p}.inv.raw = fdiv float {one}, %{p}.scale\n%{p}.inv = select i1 %{p}.zero, float {zero}, float %{p}.inv.raw\n", lit(15.0), zero = lit(0.0), one = lit(1.0)));
+				for i in 0..32 {
+					ir.push_str(&format!("%{p}.off{i} = fsub float %{p}.v{i}, %{p}.mn32\n%{p}.q{i} = fmul float %{p}.off{i}, %{p}.inv\n%{p}.sh{i} = fadd float %{p}.q{i}, {}\n", lit(0.5)));
+					ir.push_str(&clamp_float(&format!("{p}.cl{i}"), &format!("{p}.sh{i}"), 0.0, 15.0));
+					ir.push_str(&format!("%{p}.c{i} = fptoui float %{p}.cl{i} to i32\n%{p}.cf{i} = uitofp i32 %{p}.c{i} to float\n%{p}.sc{i} = fmul float %{p}.scale, %{p}.cf{i}\n%{p}.x{i} = fadd float %{p}.sc{i}, %{p}.mn32\n"));
+				}
+			}
+		}
+		if plan.packed {
+			// The block, packed as the file would hold it: scale (and minimum),
+			// then the codes, two to a byte for the four-bit formats.
+			ir.push_str(&format!("%{p}.blk.off = mul i64 %{p}.b.wide, {stride}\n%{p}.blk = getelementptr i8, {pointer} %{p}.target, i64 %{p}.blk.off\n%{p}.scale.h = fptrunc float %{p}.scale to half\nstore half %{p}.scale.h, {pointer} %{p}.blk, align 2\n"));
+			if quantizer == DeviceQuantizer::Q4_1 {
+				ir.push_str(&format!("%{p}.min.h = fptrunc float %{p}.mn32 to half\n%{p}.min.ptr = getelementptr i8, {pointer} %{p}.blk, i64 2\nstore half %{p}.min.h, {pointer} %{p}.min.ptr, align 2\n"));
+			}
+			let bytes = if nibbles { 16 } else { 32 };
+			for i in 0..bytes {
+				if nibbles {
+					ir.push_str(&format!("%{p}.by{i}.lo = trunc i32 %{p}.c{i} to i8\n%{p}.by{i}.hi = trunc i32 %{p}.c{high} to i8\n%{p}.by{i}.sh = shl i8 %{p}.by{i}.hi, 4\n%{p}.by{i} = or i8 %{p}.by{i}.lo, %{p}.by{i}.sh\n", high = i + 16));
+				} else {
+					ir.push_str(&format!("%{p}.by{i} = trunc i32 %{p}.c{i} to i8\n"));
+				}
+				ir.push_str(&format!("%{p}.by{i}.ptr = getelementptr i8, {pointer} %{p}.blk, i64 {at}\nstore i8 %{p}.by{i}, {pointer} %{p}.by{i}.ptr, align 1\n", at = data + i));
+			}
+		} else {
+			// The values the block's decoder would give, in the node's own type.
+			for i in 0..32 {
+				if state == "double" {
+					ir.push_str(&format!("%{p}.w{i}.st = fpext float %{p}.x{i} to double\n"));
+				} else {
+					ir.push_str(&format!("%{p}.w{i}.st = fadd float %{p}.x{i}, {}\n", lit(0.0)));
+				}
+				ir.push_str(&format!("%{p}.w{i}.m = call {ty} @recipe.model.from.state{v}({state} %{p}.w{i}.st)\n%{p}.w{i}.ptr = getelementptr {ty}, {pointer} %{p}.target, i64 %{p}.i{i}\nbr i1 %{p}.in{i}, label %{p}.w{i}.store, label %{p}.w{i}.next\n{p}.w{i}.store:\nstore {ty} %{p}.w{i}.m, {pointer} %{p}.w{i}.ptr, align {align}\nbr label %{p}.w{i}.next\n{p}.w{i}.next:\n", align = alignment(ty)));
+			}
+		}
+		ir.push_str(&format!("br label %{p}.block.done\n{p}.block.done:\n%{p}.next = add i32 %{p}.b, %threads\nbr label %{p}.loop\n{p}.done:\nret void\n}}\n"));
+		Ok(ir)
 	}
 
 	fn emit_model_load(&self, backend: Backend) -> Result<String> {
@@ -5980,14 +6190,19 @@ impl NativeModelIr {
 		}
 		let pointer = pointer_type(backend);
 		let (kernel, thread) = native_entry(backend)?;
-		let mut ir = format!(
+		let mut ir = self.emit_requantize_functions(backend)?;
+		ir.push_str(&format!(
 			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
 			kernel = kernel,
 			pointer = pointer,
 			thread = thread
-		);
+		));
 		let mut predecessor = "entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
+			if let Some(source) = &plan.requantize {
+				ir.push_str(&self.emit_requantize_call(backend, index, plan, source)?);
+				continue;
+			}
 			let Some(stored) = arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed) else { continue };
 			let (ty, v) = (self.node_precision(&plan.node).model_type, self.variant(&plan.node));
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
@@ -6036,15 +6251,19 @@ impl NativeModelIr {
 		}
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
+		let source_decode = self.emit_source_decode(backend)?;
 		let q4k_support = self.emit_q4k_support(backend);
 		let q6k_support = self.emit_q6k_support(backend);
+		let block32_support = self.emit_block32_support(backend);
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&self.emit_recurrent_stage_metadata()?);
 		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
+		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
 		ir.push_str(&q6k_support);
+		ir.push_str(&block32_support);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
 		let state_ty = self.precision.state_type;
@@ -10009,7 +10228,7 @@ mod bundle {
 			field(&mut document, "shape", &format!("{} {} {} {}", semantic.input.channels, semantic.input.length, semantic.output.channels, semantic.output.length));
 			for tensor in &semantic.tensors {
 				let metadata = if tensor.codebook.is_empty() { "-".to_owned() } else { tensor.codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
-				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes.to_vec())));
+				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes.to_vec()?)));
 			}
 			for predictor in &semantic.predictors {
 				field(&mut document, "predictor", &format!("{} {} {} {}", predictor.locals, predictor.stack, predictor.table.len(), join(&predictor.code)));
@@ -11893,14 +12112,39 @@ fn qp_scale(values: &[f32], weights: &[f32], nmax: i8) -> f32 {
 		if maximum==0.0 {put_half(&mut output,0.0);output.extend(block_bytes);continue} let scale=maximum/31.0; for pair in 0..4 {let low=qround(0.5*(scales[pair*2]/scale-1.0)).max(0.0).min(15.0)as u8;let high=qround(0.5*(scales[pair*2+1]/scale-1.0)).max(0.0).min(15.0)as u8;block_bytes[104+pair]=low|high<<4} put_half(&mut output,scale*1.033);output.extend(block_bytes)
 	} output
 }
+/// The block formats the load kernel encodes on the device, so a bound weight
+/// reaches one of them without a host pass over its values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceQuantizer {
+	Iq4Nl,
+	Q4_0,
+	Q4_1,
+	Q8_0,
+}
+fn device_quantizer(codec: StorageCodec) -> Option<DeviceQuantizer> {
+	match codec {
+		StorageCodec::IQ4NL => Some(DeviceQuantizer::Iq4Nl),
+		StorageCodec::Q4_0 => Some(DeviceQuantizer::Q4_0),
+		StorageCodec::Q4_1 => Some(DeviceQuantizer::Q4_1),
+		StorageCodec::Q8_0 => Some(DeviceQuantizer::Q8_0),
+		_ => None,
+	}
+}
+/// The midpoints between consecutive IQ4 levels: a value's code is the number of
+/// midpoints below it, which picks the nearest level and the lower one on a tie.
+const IQ4_MID: [f32; 15] = [-115.5, -93.5, -74.0, -57.0, -42.0, -28.5, -16.0, -4.5, 7.0, 19.0, 31.5, 45.5, 61.0, 79.0, 101.0];
 fn iq4_code(value: f32) -> u8 {
+	IQ4_MID.iter().map(|mid| u8::from(value > *mid)).sum()
+}
+#[allow(dead_code)]
+fn iq4_code_search(value: f32) -> u8 {
 	IQ4.iter().enumerate().min_by(|left, right| (value - f32::from(*left.1)).abs().total_cmp(&(value - f32::from(*right.1)).abs())).unwrap().0 as u8
 }
 #[rustfmt::skip]
-fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
+fn iq4_fit(values: &[f32], tries: i32, codes: &mut [u8]) -> f32 {
 	let mut extreme = 0.0_f32;
 	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
-	if extreme.abs() < 1.0e-15 { return (0.0, vec![0; values.len()]) }
+	if extreme.abs() < 1.0e-15 { codes.fill(0); return 0.0 }
 	let initial = if tries > 0 { -extreme / f32::from(IQ4[0]) } else { extreme / f32::from(IQ4[0]) };
 	let score = |inverse: f32| {
 		values.iter().map(|value| { let level = f32::from(IQ4[usize::from(iq4_code(value * inverse))]);
@@ -11914,7 +12158,8 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 		if denominator > 0.0 && numerator * numerator > best * denominator { scale = numerator / denominator; best = scale * numerator }
 	}
 	let inverse = if tries > 0 && scale != 0.0 { scale.recip() } else { initial.recip() };
-	(scale, values.iter().map(|value| iq4_code(value * inverse)).collect())
+	for (code, value) in codes.iter_mut().zip(values) { *code = iq4_code(value * inverse) }
+	scale
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StorageFormat(pub(crate) u16);
@@ -12102,6 +12347,17 @@ pub(crate) struct StorageSpec {
 enum StoredSegment {
 	Owned(Vec<u8>),
 	Mapped(Arc<gguf::Mapping>, usize, usize),
+	/// Bytes the load kernel writes on the device: they take their place in the
+	/// run but exist on no host page.
+	Absent(usize),
+}
+impl StoredSegment {
+	fn length(&self) -> usize {
+		match self {
+			Self::Owned(bytes) => bytes.len(),
+			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
+		}
+	}
 }
 impl std::ops::Deref for StoredSegment {
 	type Target = [u8];
@@ -12109,6 +12365,7 @@ impl std::ops::Deref for StoredSegment {
 		match self {
 			Self::Owned(bytes) => bytes,
 			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
+			Self::Absent(_) => &[],
 		}
 	}
 }
@@ -12127,18 +12384,37 @@ impl StoredBytes {
 	fn joined(parts: Vec<Self>) -> Self {
 		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
 	}
-	fn len(&self) -> usize {
-		self.0.iter().map(|run| run.len()).sum()
+	/// A run of `length` bytes the load kernel writes on the device.
+	fn absent(length: usize) -> Self {
+		Self(Arc::new(vec![StoredSegment::Absent(length)]))
 	}
-	fn runs(&self) -> impl Iterator<Item = &[u8]> {
-		self.0.iter().map(|run| &**run)
+	/// Whether any run is written on the device rather than held on the host.
+	fn absent_runs(&self) -> bool {
+		self.0.iter().any(|run| matches!(run, StoredSegment::Absent(_)))
+	}
+	fn len(&self) -> usize {
+		self.0.iter().map(StoredSegment::length).sum()
+	}
+	/// Every run held on the host with its byte offset in the weight; a run the
+	/// device writes is skipped.
+	fn runs(&self) -> impl Iterator<Item = (usize, &[u8])> {
+		let mut at = 0;
+		self.0.iter().filter_map(move |run| {
+			let offset = at;
+			at += run.length();
+			match run {
+				StoredSegment::Absent(_) => None,
+				_ => Some((offset, &**run)),
+			}
+		})
 	}
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
 	/// row of a mapped table is read without touching the rest of it.
 	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
 		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
 		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
-		for run in self.runs() {
+		for (_, run) in self.runs() {
 			let start = (at.max(skipped) - skipped).min(run.len());
 			let end = ((at + length).saturating_sub(skipped)).min(run.len());
 			if start < end {
@@ -12148,16 +12424,14 @@ impl StoredBytes {
 		}
 		Ok(out)
 	}
-	/// Appends every run to `out`, which is the only point a mapped weight is copied.
-	fn extend_into(&self, out: &mut Vec<u8>) {
-		for run in self.runs() {
+	/// Every run end to end, which is the only point a mapped weight is copied.
+	fn to_vec(&self) -> Result<Vec<u8>> {
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
+		let mut out = Vec::with_capacity(self.len());
+		for (_, run) in self.runs() {
 			out.extend_from_slice(run);
 		}
-	}
-	fn to_vec(&self) -> Vec<u8> {
-		let mut out = Vec::with_capacity(self.len());
-		self.extend_into(&mut out);
-		out
+		Ok(out)
 	}
 }
 impl From<Vec<u8>> for StoredBytes {
@@ -12278,26 +12552,47 @@ trait Integer {
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>>;
 	fn bits(self) -> u8;
 }
-fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: &str, mut decode: impl FnMut(&[u8], usize) -> f64) -> Result<Vec<f64>> {
-	require(data.len() >= count.div_ceil(block) * stride, error)?;
-	let mut weights = Vec::with_capacity(count);
-	for bytes in data.chunks_exact(stride) {
-		let remaining = block.min(count - weights.len());
-		weights.extend((0..remaining).map(|index| decode(bytes, index)));
-	}
-	Ok(weights)
+/// Decodes every block on the configured CPU workers, each worker taking one
+/// contiguous run of blocks, and joins the runs in index order.
+fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: &str, decode: impl Fn(&[u8], usize) -> f64 + Sync) -> Result<Vec<f64>> {
+	let blocks = count.div_ceil(block);
+	require(data.len() >= blocks * stride, error)?;
+	let workers = cpu_worker_threads()? as usize;
+	let span = blocks.div_ceil(workers.max(1)).max(1);
+	let runs = parallel_map(blocks.div_ceil(span), |run| {
+		let (first, last) = (run * span, ((run + 1) * span).min(blocks));
+		let mut weights = Vec::with_capacity((last - first) * block);
+		for chunk in first..last {
+			let bytes = &data[chunk * stride..(chunk + 1) * stride];
+			let remaining = block.min(count - chunk * block);
+			weights.extend((0..remaining).map(|index| decode(bytes, index)));
+		}
+		weights
+	})?;
+	Ok(runs.concat())
 }
 /// Encodes each `block`-wide slice of the weights on the configured CPU workers and
 /// concatenates the encoded blocks in index order. A trailing partial slice pads with
 /// zeros. Block formats carry no codebook.
 fn encode_blocks(weights: &[f64], block: usize, encode: impl Fn(usize, &[f32], &mut Vec<u8>) + Sync) -> Result<(Vec<u8>, Vec<f64>)> {
-	let blocks = parallel_map(weights.len().div_ceil(block), |chunk| {
-		let values = block_values(weights, chunk, block);
-		let mut data = Vec::new();
-		encode(chunk, &values, &mut data);
+	let blocks = weights.len().div_ceil(block);
+	let workers = cpu_worker_threads()? as usize;
+	let span = blocks.div_ceil(workers.max(1)).max(1);
+	// One contiguous run of blocks per worker, encoded into one buffer with the
+	// block's values staged in a buffer reused across the run.
+	let runs = parallel_map(blocks.div_ceil(span), |run| {
+		let (first, last) = (run * span, ((run + 1) * span).min(blocks));
+		let mut data = Vec::with_capacity((last - first) * block);
+		let mut values = vec![0.0_f32; block];
+		for chunk in first..last {
+			for (index, value) in values.iter_mut().enumerate() {
+				*value = weights.get(chunk * block + index).copied().unwrap_or(0.0) as f32;
+			}
+			encode(chunk, &values, &mut data);
+		}
 		data
 	})?;
-	Ok((blocks.concat(), Vec::new()))
+	Ok((runs.concat(), Vec::new()))
 }
 /// Reads the `chunk`-th `block`-wide slice as single precision, padding past the end with zeros.
 fn block_values(values: &[f64], chunk: usize, block: usize) -> Vec<f32> {
@@ -12581,7 +12876,8 @@ impl Integer for StorageFormat {
 		}
 		if matches!(quantizer, Quantizer::Iq4Nl) {
 			return encode_blocks(weights, 32, |_, values, data| {
-				let (scale, codes) = iq4_fit(values, -1);
+				let mut codes = [0_u8; 32];
+				let scale = iq4_fit(values, -1, &mut codes);
 				put_half(data, scale);
 				for index in 0..16 {
 					data.push(codes[index] | codes[index + 16] << 4)
@@ -12593,9 +12889,8 @@ impl Integer for StorageFormat {
 				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..8 {
-					let (scale, fitted) = iq4_fit(&values[block * 32..block * 32 + 32], 7);
+					let scale = iq4_fit(&values[block * 32..block * 32 + 32], 7, &mut codes[block * 32..block * 32 + 32]);
 					scales[block] = scale;
-					codes[block * 32..block * 32 + 32].copy_from_slice(&fitted);
 					if scale.abs() > extreme {
 						extreme = scale.abs();
 						maximum = scale
@@ -14628,6 +14923,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		lanes: graph.lanes,
 		rank: graph.rank,
 		stored: graph.stored[start..end].to_vec(),
+		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
 		output: last.output,
 		source: (end - start) as i32 - 1,
@@ -15004,6 +15300,9 @@ struct Graph {
 	frozen: Vec<u8>,
 	programs: Vec<f64>,
 	stored: Vec<Option<StoredWeight>>,
+	/// A bound weight the load kernel requantizes on the device: the file's
+	/// bytes, which it decodes into the block's format when the model loads.
+	requantize: Vec<Option<StoredWeight>>,
 	input: Shape,
 	output: Shape,
 	source: i32,
@@ -15036,6 +15335,7 @@ impl Graph {
 			frozen: Vec::new(),
 			programs: Vec::new(),
 			stored: Vec::new(),
+			requantize: Vec::new(),
 			input: shape,
 			output: shape,
 			source: -1,
@@ -15352,13 +15652,62 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	if weight.format == format || format.spec().is_none() {
 		return Ok(());
 	}
-	require(weight.segments.len() == 1, format!("{} holds spans of mixed layouts, which cannot be stored again as {}", graph.nodes[index].identity(index), quantization(format.0)))?;
-	let bytes = weight.bytes.slice(0, weight.bytes.len())?;
-	let values = weight.format.decompress(&bytes, &weight.codebook, weight.count)?;
-	let encoded = format.encode(&values, &vec![1.0; values.len()], config)?;
+	let weight = weight.clone();
+	// A format with a device encoder is written by the load kernel from the file
+	// bytes, so the host neither decodes nor encodes the weight. A table decodes
+	// its rows on the host, so it keeps the host path.
+	if let Some(spec) = format.spec().filter(|spec| device_quantizer(spec.codec).is_some()) {
+		let node = &graph.nodes[index];
+		let decodable = weight.segments.iter().all(|(span, _)| span.spec().is_some_and(|spec| !matches!(spec.codec.quantization().native, NativeDequant::Nf4)));
+		if !node.table() && node.op != Primitive::Lookup && decodable && weight.codebook.is_empty() {
+			let bytes = weight.count.div_ceil(spec.block).checked_mul(spec.stride).ok_or_else(|| RecipeError::new("requantized weight size overflows"))?;
+			trace(&format!("requantize node {index} on the device at load: {} values into {}", weight.count, quantization(format.0)))?;
+			graph.stored[index] = Some(StoredWeight { format, count: weight.count, bytes: StoredBytes::absent(bytes), codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, weight.count)] });
+			graph.requantize[index] = Some(weight);
+			return Ok(());
+		}
+	}
+	// A graph is compiled more than once per run (the context fitter sizes it
+	// first), so a host requantize is kept and handed back to every later compile
+	// of the same file bytes into the same format.
+	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
+		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
+		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
+		StoredSegment::Absent(length) => (0, 0, *length),
+	}).collect::<Vec<_>>());
+	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
+		trace(&format!("requantize node {index} on the host: {} values, kept from the earlier compile", weight.count))?;
+		graph.stored[index] = Some(encoded.clone());
+		return Ok(());
+	}
+	// Each span decodes in its own layout; the whole weight then encodes once.
+	let mut values = Vec::with_capacity(weight.count);
+	let mut at = 0;
+	let started = std::time::Instant::now();
+	for (span, count) in &weight.segments {
+		let spec = span.spec().ok_or_else(|| RecipeError::new(format!("{} holds a span in {}, which cannot be decoded", graph.nodes[index].identity(index), quantization(span.0))))?;
+		let length = if spec.stride == 0 { weight.bytes.len() - at } else { count.div_ceil(spec.block).checked_mul(spec.stride).ok_or_else(|| RecipeError::new("stored span size overflows"))? };
+		let bytes = weight.bytes.slice(at, length)?;
+		values.extend(span.decompress(&bytes, &weight.codebook, *count)?);
+		at += length;
+	}
+	let decoded = started.elapsed().as_secs_f64();
+	let mut encoded = format.encode(&values, &vec![1.0; values.len()], config)?;
+	trace(&format!("requantize node {index} on the host: {} values, decode {decoded:.2} s, encode {:.2} s", weight.count, started.elapsed().as_secs_f64() - decoded))?;
+	// A bound weight keeps only its stored bytes, as one read from a file does; the
+	// decoded values would otherwise hold the whole model in f64 on the host.
+	encoded.arithmetic = Vec::new();
+	drop(values);
+	// The source runs are kept beside the result so their addresses stay taken.
+	cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.insert(key, (weight.bytes.clone(), encoded.clone()));
 	graph.stored[index] = Some(encoded);
 	Ok(())
 }
+/// Host requantize results by source runs and target format, kept for the
+/// later compiles of one run.
+#[allow(clippy::type_complexity)]
+static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
 	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
 	let mut node = Node {
@@ -15415,6 +15764,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	}
 	graph.nodes.push(node);
 	graph.stored.push(stored);
+	graph.requantize.push(None);
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
@@ -16966,11 +17316,10 @@ impl NativeTape {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
-				let mut at = layout.contexts[index];
+				let at = layout.contexts[index];
 				require(checked_add(at, table.bytes.len(), "embedding table context")? <= contexts.bytes, "embedding table exceeds its context arena")?;
-				for run in table.bytes.runs() {
-					contexts.write_bytes(at, run)?;
-					at += run.len();
+				for (offset, run) in table.bytes.runs() {
+					contexts.write_bytes(at + offset, run)?;
 				}
 			}
 			if node.op == Primitive::Lookup {
@@ -18230,10 +18579,8 @@ impl Buffer {
 	/// Writes stored bytes run by run from where they are mapped or held, so a
 	/// weight reaches the device without a host copy of its own size.
 	fn write_runs(&self, offset: usize, stored: &StoredBytes) -> Result<()> {
-		let mut at = offset;
-		for run in stored.runs() {
-			self.write_bytes(at, run)?;
-			at = checked_add(at, run.len(), "GPU run write")?;
+		for (at, run) in stored.runs() {
+			self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
 		}
 		Ok(())
 	}
@@ -19837,11 +20184,17 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					offset += bytes;
 				}
 				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-				let implicit_bytes = dispatch
-					.kernel
-					.kernarg
-					.checked_sub(implicit)
-					.ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?;
+				// A kernel that reads no hidden argument (the load kernel without a
+				// grid barrier) is described by its explicit bytes alone.
+				let implicit_bytes = if dispatch.kernel.kernarg == offset {
+					0
+				} else {
+					dispatch
+						.kernel
+						.kernarg
+						.checked_sub(implicit)
+						.ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?
+				};
 				require(
 					matches!(implicit_bytes, 0 | HSA_IMPLICIT_ARGUMENT_BYTES) && dispatch.kernel.kernarg <= program.kernarg_size,
 					format!(
