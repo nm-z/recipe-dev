@@ -2262,8 +2262,9 @@ impl NativeModelIr {
 			// weight owns no arithmetic span at all, so only a dense node's
 			// parameter range is checked against the graph's parameters.
 			let kept = packed_weight(graph, index, inference).is_some();
+			let bound = graph.stored.get(index).is_some_and(Option::is_some);
 			require(
-				kept || node.offset.checked_add(node.parameters).is_some_and(|end| end <= graph.parameters.len()),
+				kept || bound || node.offset.checked_add(node.parameters).is_some_and(|end| end <= graph.parameters.len()),
 				format!("{} parameter range exceeds {} values", id(), graph.parameters.len()),
 			)?;
 			let width = if node.op == Primitive::Predictor { 2 } else { 3 };
@@ -15710,9 +15711,10 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 			}
 		}
 	};
-	// A packed bound node keeps its bytes and owns no arithmetic span; every
-	// other node reserves its span, which a bound load fills from the file.
-	if stored.is_none() || !node.packed {
+	// A node bound to stored bytes owns no host span: the load kernel writes its
+	// weights on the device from those bytes, packed or not. Every other node
+	// reserves its span here.
+	if stored.is_none() {
 		graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 		graph.frozen.resize(graph.parameters.len(), 0);
 	}
@@ -18558,7 +18560,8 @@ impl Buffer {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
 				buffer.write_runs(offsets[index], &weight.bytes)?;
-			} else if inference && graph.stored.get(index).is_some_and(|stored| arena_weight(node, stored).is_some()) {
+			} else if graph.stored.get(index).is_some_and(|stored| arena_weight(node, stored).is_some()) {
+				// The load kernel writes this node from its stored bytes.
 				continue;
 			} else {
 				buffer.write_bytes(offsets[index], &encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision))?;
