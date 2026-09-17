@@ -2556,54 +2556,54 @@ step:
 %key.13.wide = zext i32 %key.13.index to i64
 %key.14.wide = zext i32 %key.14.index to i64
 %key.15.wide = zext i32 %key.15.index to i64
-%key.0.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.0.wide
-%key.1.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.1.wide
-%key.2.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.2.wide
-%key.3.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.3.wide
-%key.4.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.4.wide
-%key.5.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.5.wide
-%key.6.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.6.wide
-%key.7.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.7.wide
-%key.8.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.8.wide
-%key.9.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.9.wide
-%key.10.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.10.wide
-%key.11.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.11.wide
-%key.12.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.12.wide
-%key.13.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.13.wide
-%key.14.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.14.wide
-%key.15.ptr = getelementptr half, ptr addrspace(1) %kv.context, i64 %key.15.wide
-%key.0.load = load half, ptr addrspace(1) %key.0.ptr, align 2
-%key.1.load = load half, ptr addrspace(1) %key.1.ptr, align 2
-%key.2.load = load half, ptr addrspace(1) %key.2.ptr, align 2
-%key.3.load = load half, ptr addrspace(1) %key.3.ptr, align 2
-%key.4.load = load half, ptr addrspace(1) %key.4.ptr, align 2
-%key.5.load = load half, ptr addrspace(1) %key.5.ptr, align 2
-%key.6.load = load half, ptr addrspace(1) %key.6.ptr, align 2
-%key.7.load = load half, ptr addrspace(1) %key.7.ptr, align 2
-%key.8.load = load half, ptr addrspace(1) %key.8.ptr, align 2
-%key.9.load = load half, ptr addrspace(1) %key.9.ptr, align 2
-%key.10.load = load half, ptr addrspace(1) %key.10.ptr, align 2
-%key.11.load = load half, ptr addrspace(1) %key.11.ptr, align 2
-%key.12.load = load half, ptr addrspace(1) %key.12.ptr, align 2
-%key.13.load = load half, ptr addrspace(1) %key.13.ptr, align 2
-%key.14.load = load half, ptr addrspace(1) %key.14.ptr, align 2
-%key.15.load = load half, ptr addrspace(1) %key.15.ptr, align 2
-%key.0.raw = fpext half %key.0.load to float
-%key.1.raw = fpext half %key.1.load to float
-%key.2.raw = fpext half %key.2.load to float
-%key.3.raw = fpext half %key.3.load to float
-%key.4.raw = fpext half %key.4.load to float
-%key.5.raw = fpext half %key.5.load to float
-%key.6.raw = fpext half %key.6.load to float
-%key.7.raw = fpext half %key.7.load to float
-%key.8.raw = fpext half %key.8.load to float
-%key.9.raw = fpext half %key.9.load to float
-%key.10.raw = fpext half %key.10.load to float
-%key.11.raw = fpext half %key.11.load to float
-%key.12.raw = fpext half %key.12.load to float
-%key.13.raw = fpext half %key.13.load to float
-%key.14.raw = fpext half %key.14.load to float
-%key.15.raw = fpext half %key.15.load to float
+%key.0.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.0.wide
+%key.1.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.1.wide
+%key.2.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.2.wide
+%key.3.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.3.wide
+%key.4.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.4.wide
+%key.5.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.5.wide
+%key.6.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.6.wide
+%key.7.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.7.wide
+%key.8.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.8.wide
+%key.9.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.9.wide
+%key.10.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.10.wide
+%key.11.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.11.wide
+%key.12.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.12.wide
+%key.13.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.13.wide
+%key.14.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.14.wide
+%key.15.ptr = getelementptr RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.15.wide
+%key.0.load = load RECIPE_KV, ptr addrspace(1) %key.0.ptr, align RECIPE_KV_ALIGN
+%key.1.load = load RECIPE_KV, ptr addrspace(1) %key.1.ptr, align RECIPE_KV_ALIGN
+%key.2.load = load RECIPE_KV, ptr addrspace(1) %key.2.ptr, align RECIPE_KV_ALIGN
+%key.3.load = load RECIPE_KV, ptr addrspace(1) %key.3.ptr, align RECIPE_KV_ALIGN
+%key.4.load = load RECIPE_KV, ptr addrspace(1) %key.4.ptr, align RECIPE_KV_ALIGN
+%key.5.load = load RECIPE_KV, ptr addrspace(1) %key.5.ptr, align RECIPE_KV_ALIGN
+%key.6.load = load RECIPE_KV, ptr addrspace(1) %key.6.ptr, align RECIPE_KV_ALIGN
+%key.7.load = load RECIPE_KV, ptr addrspace(1) %key.7.ptr, align RECIPE_KV_ALIGN
+%key.8.load = load RECIPE_KV, ptr addrspace(1) %key.8.ptr, align RECIPE_KV_ALIGN
+%key.9.load = load RECIPE_KV, ptr addrspace(1) %key.9.ptr, align RECIPE_KV_ALIGN
+%key.10.load = load RECIPE_KV, ptr addrspace(1) %key.10.ptr, align RECIPE_KV_ALIGN
+%key.11.load = load RECIPE_KV, ptr addrspace(1) %key.11.ptr, align RECIPE_KV_ALIGN
+%key.12.load = load RECIPE_KV, ptr addrspace(1) %key.12.ptr, align RECIPE_KV_ALIGN
+%key.13.load = load RECIPE_KV, ptr addrspace(1) %key.13.ptr, align RECIPE_KV_ALIGN
+%key.14.load = load RECIPE_KV, ptr addrspace(1) %key.14.ptr, align RECIPE_KV_ALIGN
+%key.15.load = load RECIPE_KV, ptr addrspace(1) %key.15.ptr, align RECIPE_KV_ALIGN
+%key.0.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.0.load)
+%key.1.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.1.load)
+%key.2.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.2.load)
+%key.3.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.3.load)
+%key.4.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.4.load)
+%key.5.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.5.load)
+%key.6.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.6.load)
+%key.7.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.7.load)
+%key.8.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.8.load)
+%key.9.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.9.load)
+%key.10.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.10.load)
+%key.11.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.11.load)
+%key.12.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.12.load)
+%key.13.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.13.load)
+%key.14.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.14.load)
+%key.15.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.15.load)
 %key.0 = select i1 %active.0, float %key.0.raw, float 0x0000000000000000
 %key.1 = select i1 %active.1, float %key.1.raw, float 0x0000000000000000
 %key.2 = select i1 %active.2, float %key.2.raw, float 0x0000000000000000
@@ -2705,12 +2705,14 @@ cache.step:
 %cache.value.source.wide = zext i32 %cache.value.source.index to i64
 %cache.value.source.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %cache.value.source.wide
 %cache.value.value = load half, ptr addrspace(1) %cache.value.source.ptr, align 2
-%cache.key.ptr = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %cache.position.wide
-store half %cache.key.value, ptr addrspace(1) %cache.key.ptr, align 2
+%cache.key.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %cache.position.wide
+%cache.key.kv = call RECIPE_KV @recipe.kv.from.f16(half %cache.key.value)
+store RECIPE_KV %cache.key.kv, ptr addrspace(1) %cache.key.ptr, align RECIPE_KV_ALIGN
 %cache.value.index = add i32 %kv.plane, %cache.position.index
 %cache.value.wide = zext i32 %cache.value.index to i64
-%cache.value.ptr = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %cache.value.wide
-store half %cache.value.value, ptr addrspace(1) %cache.value.ptr, align 2
+%cache.value.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %cache.value.wide
+%cache.value.kv = call RECIPE_KV @recipe.kv.from.f16(half %cache.value.value)
+store RECIPE_KV %cache.value.kv, ptr addrspace(1) %cache.value.ptr, align RECIPE_KV_ALIGN
 %cache.channel.next = add i32 %cache.channel, %threads
 br label %cache.loop
 cache.done:
@@ -2955,18 +2957,18 @@ output.key.step:
 %output.index.1.wide = zext i32 %output.index.1 to i64
 %output.index.2.wide = zext i32 %output.index.2 to i64
 %output.index.3.wide = zext i32 %output.index.3 to i64
-%output.ptr.0 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.0.wide
-%output.ptr.1 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.1.wide
-%output.ptr.2 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.2.wide
-%output.ptr.3 = getelementptr inbounds half, ptr addrspace(1) %kv.context, i64 %output.index.3.wide
-%output.value.0.raw = load half, ptr addrspace(1) %output.ptr.0, align 2
-%output.value.1.raw = load half, ptr addrspace(1) %output.ptr.1, align 2
-%output.value.2.raw = load half, ptr addrspace(1) %output.ptr.2, align 2
-%output.value.3.raw = load half, ptr addrspace(1) %output.ptr.3, align 2
-%output.value.0.float = fpext half %output.value.0.raw to float
-%output.value.1.float = fpext half %output.value.1.raw to float
-%output.value.2.float = fpext half %output.value.2.raw to float
-%output.value.3.float = fpext half %output.value.3.raw to float
+%output.ptr.0 = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.index.0.wide
+%output.ptr.1 = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.index.1.wide
+%output.ptr.2 = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.index.2.wide
+%output.ptr.3 = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %output.index.3.wide
+%output.value.0.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.0, align RECIPE_KV_ALIGN
+%output.value.1.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.1, align RECIPE_KV_ALIGN
+%output.value.2.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.2, align RECIPE_KV_ALIGN
+%output.value.3.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.3, align RECIPE_KV_ALIGN
+%output.value.0.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.0.raw)
+%output.value.1.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.1.raw)
+%output.value.2.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.2.raw)
+%output.value.3.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.3.raw)
 %output.value.0 = select i1 %output.active.0, float %output.value.0.float, float 0x0000000000000000
 %output.value.1 = select i1 %output.active.1, float %output.value.1.float, float 0x0000000000000000
 %output.value.2 = select i1 %output.active.2, float %output.value.2.float, float 0x0000000000000000
@@ -3747,12 +3749,14 @@ br i1 %key.use.cache, label %key.cache.load, label %key.source.load
 key.cache.load:
 %key.cache.row = mul i64 %row.wide, %kv.planes.global
 %key.cache.index = add i64 %key.cache.row, %key.input.local
-%key.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.cache.index
-%key.cache.value = load double, ptr addrspace(1) %key.cache.ptr, align 8
+%key.cache.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.cache.index
+%key.cache.kv = load RECIPE_KV, ptr addrspace(1) %key.cache.ptr, align RECIPE_KV_ALIGN
+%key.cache.value = call double @recipe.kv.decode(RECIPE_KV %key.cache.kv)
 %value.cache.index = add i64 %key.cache.row, %kv.plane.global
 %value.cache.index.final = add i64 %value.cache.index, %value.input.local
-%value.cache.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.cache.index.final
-%value.cache.value = load double, ptr addrspace(1) %value.cache.ptr, align 8
+%value.cache.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %value.cache.index.final
+%value.cache.kv = load RECIPE_KV, ptr addrspace(1) %value.cache.ptr, align RECIPE_KV_ALIGN
+%value.cache.value = call double @recipe.kv.decode(RECIPE_KV %value.cache.kv)
 br label %key.loaded
 key.source.load:
 %key.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %key.input.index
@@ -3765,12 +3769,14 @@ br i1 %carry, label %key.cache.store, label %key.loaded.source
 key.cache.store:
 %key.store.row = mul i64 %row.wide, %kv.planes.global
 %key.store.index = add i64 %key.store.row, %key.input.local
-%key.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %key.store.index
-store double %key.source.value, ptr addrspace(1) %key.store.ptr, align 8
+%key.store.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %key.store.index
+%key.store.kv = call RECIPE_KV @recipe.kv.encode(double %key.source.value)
+store RECIPE_KV %key.store.kv, ptr addrspace(1) %key.store.ptr, align RECIPE_KV_ALIGN
 %value.store.index = add i64 %key.store.row, %kv.plane.global
 %value.store.index.final = add i64 %value.store.index, %value.input.local
-%value.store.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i64 %value.store.index.final
-store double %value.source.value, ptr addrspace(1) %value.store.ptr, align 8
+%value.store.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %value.store.index.final
+%value.store.kv = call RECIPE_KV @recipe.kv.encode(double %value.source.value)
+store RECIPE_KV %value.store.kv, ptr addrspace(1) %value.store.ptr, align RECIPE_KV_ALIGN
 br label %key.loaded.source
 key.loaded.source:
 br label %key.loaded
@@ -4027,8 +4033,9 @@ cache.step:
 %value = load double, ptr addrspace(1) %source.ptr, align 8
 %kv.row = mul i32 %row, %kv.planes
 %kv.index.final = add i32 %kv.row, %within
-%kv.ptr = getelementptr inbounds double, ptr addrspace(1) %kv.context, i32 %kv.index.final
-store double %value, ptr addrspace(1) %kv.ptr, align 8
+%kv.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i32 %kv.index.final
+%kv.encoded = call RECIPE_KV @recipe.kv.encode(double %value)
+store RECIPE_KV %kv.encoded, ptr addrspace(1) %kv.ptr, align RECIPE_KV_ALIGN
 %next = add i32 %p, %threads
 br label %cache.loop
 cache.done:

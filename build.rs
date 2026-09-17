@@ -783,7 +783,48 @@ struct Schedule {
 	matrix_split_span: u32,
 	local_chunks: u32,
 }
-fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String); 10]> {
+/// The key-value cache codec of one template: the cache element type and the
+/// four conversions the attention bodies call. `model` is the template's model
+/// type, `arithmetic` its state, `kv` the cache type.
+fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String {
+	let widen = |name: &str, from: &str| if arithmetic == "double" { format!("%{name} = fpext float %{from} to double\n") } else { format!("%{name} = fadd float %{from}, 0.0\n") };
+	let narrow = |name: &str, from: &str| if arithmetic == "double" { format!("%{name} = fptrunc double %{from} to float\n") } else { format!("%{name} = fadd float %{from}, 0.0\n") };
+	let to_float = |name: &str, from: &str| match kv {
+		"half" => format!("%{name} = fpext half %{from} to float\n"),
+		"i16" => format!("%{name}.wide = zext i16 %{from} to i32\n%{name}.bits = shl i32 %{name}.wide, 16\n%{name} = bitcast i32 %{name}.bits to float\n"),
+		_ => format!("%{name} = fadd float %{from}, 0.0\n"),
+	};
+	let from_float = |name: &str, from: &str| match kv {
+		"half" => format!("%{name}.below = fcmp olt float %{from}, -65504.0\n%{name}.above = fcmp ogt float %{from}, 65504.0\n%{name}.lowered = select i1 %{name}.below, float -65504.0, float %{from}\n%{name}.clamped = select i1 %{name}.above, float 65504.0, float %{name}.lowered\n%{name} = fptrunc float %{name}.clamped to half\n"),
+		"i16" => format!("%{name}.bits = bitcast float %{from} to i32\n%{name}.low = lshr i32 %{name}.bits, 16\n%{name}.odd = and i32 %{name}.low, 1\n%{name}.bias = add i32 %{name}.odd, 32767\n%{name}.rounded = add i32 %{name}.bits, %{name}.bias\n%{name}.high = lshr i32 %{name}.rounded, 16\n%{name} = trunc i32 %{name}.high to i16\n"),
+		_ => format!("%{name} = fadd float %{from}, 0.0\n"),
+	};
+	let mut ir = String::new();
+	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "state"), from_float("result", "narrowed")));
+	ir.push_str(&format!("define internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\n{}{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {model} %result\n}}\n", to_float("wide", "value"), widen("state", "wide")));
+	ir.push_str(&format!("define internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n{}ret float %result\n}}\n", to_float("result", "value")));
+	ir.push_str(&format!("define internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}ret {kv} %result\n}}\n", from_float("result", "wide")));
+	let _ = kv_bytes;
+	ir
+}
+/// Every template source: one per model precision with the cache in the model
+/// type, and one more per cache type a block may name (`-kvf16`, `-kvbf16`,
+/// `-kvf32`) where that type is not the model's own.
+fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, String)>> {
+	let mut sources = Vec::new();
+	for (suffix, contents, model, arithmetic, bytes) in precision_bases(ir, schedule)? {
+		let cache = |kv: &str, kv_bytes: usize| contents.replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, kv_bytes);
+		sources.push((suffix.to_owned(), cache(model, bytes)));
+		for (name, kv, kv_bytes) in [("f16", "half", 2), ("bf16", "i16", 2), ("f32", "float", 4)] {
+			if kv == model && !(name == "f32" && suffix == "-tf32") {
+				continue;
+			}
+			sources.push((format!("{suffix}-kv{name}"), cache(kv, kv_bytes)));
+		}
+	}
+	Ok(sources)
+}
+fn precision_bases(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String, &'static str, &'static str, usize); 10]> {
 	let ir = ir
 		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
 		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
@@ -791,16 +832,16 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static s
 		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
 		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
 	Ok([
-		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
-		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
-		("-f16", half_ir(ir.clone())?),
-		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
-		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
-		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
-		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
-		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
-		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
-		("-f", custom_ir(ir, "_f")?),
+		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?, "double", "double", 8),
+		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?, "float", "float", 4),
+		("-f16", half_ir(ir.clone())?, "half", "float", 2),
+		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?, "i8", "float", 1),
+		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?, "i16", "float", 2),
+		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?, "float", "float", 4),
+		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?, "i8", "float", 1),
+		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?, "i8", "float", 1),
+		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?, "i8", "float", 1),
+		("-f", custom_ir(ir, "_f")?, "double", "double", 8),
 	])
 }
 fn wmma_source(source: &str) -> String {
@@ -842,15 +883,16 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
-		let helpers = if suffix.is_empty() || suffix == "-f" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
-		let state = if suffix.is_empty() || suffix == "-f" { "double" } else { "float" };
+		let base = suffix.split("-kv").next().unwrap_or_default();
+		let helpers = if base.is_empty() || base == "-f" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
+		let state = if base.is_empty() || base == "-f" { "double" } else { "float" };
 		let dot = (state == "float").then_some("declare i32 @llvm.amdgcn.sudot4(i1, i32, i1, i32, i32, i1)\ndeclare i32 @llvm.amdgcn.perm(i32, i32, i32)\n").unwrap_or_default();
 		let helpers = format!("{}\n{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"));
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
-		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
-		if ["-f16", "-bf16", "-int8", "-int4"].contains(&suffix) {
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
+		if ["-f16", "-bf16", "-int8", "-int4"].contains(&suffix.as_str()) {
 			for architecture in ["gfx11", "gfx12"] {
 				let template = format!("{architecture}{suffix}");
 				let method = if template == "gfx12-int4" { "gfx12-int8" } else { &template };
@@ -891,7 +933,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
-		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
@@ -928,7 +970,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 			.replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
 		let path = out.join(format!("recipe-cpu{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
-		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_CPU_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_CPU_COMPILER={clang}");

@@ -2120,7 +2120,7 @@ impl NativeLayout {
 			context_offset = checked_add(context_offset, node_context(graph, node, rows, node.precision, inference)?, "model context arena")?;
 			let kv = if inference && node.op == Primitive::Attention {
 				let offset = align(context_offset, unit)?;
-				context_offset = checked_add(offset, attention_kv_bytes(node, rows, node.precision)?, "attention K/V context")?;
+				context_offset = checked_add(offset, attention_kv_bytes(node, rows, node.kv_precision)?, "attention K/V context")?;
 				Some(offset)
 			} else {
 				None
@@ -2246,9 +2246,12 @@ impl NativeModelIr {
 		let precision = NativePrecision::new(precision)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
 		for node in &graph.nodes {
-			if node.precision != precision.model && !variants.iter().any(|variant| variant.precision.model == node.precision) {
+			let base = node.precision == precision.model && node.kv_precision == node.precision;
+			if !base && !variants.iter().any(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision) {
 				let native = NativePrecision::new(node.precision)?;
-				variants.push(NativeVariant { suffix: variant_suffix(native.source), precision: native });
+				let own = if node.precision == precision.model { String::new() } else { variant_suffix(native.source) };
+				let suffix = if node.kv_precision == node.precision { own } else { format!("{own}_kv{}", kv_key(node.kv_precision)?) };
+				variants.push(NativeVariant { suffix, precision: native, kv: node.kv_precision });
 			}
 		}
 		let mut plans = Vec::with_capacity(graph.nodes.len());
@@ -2301,7 +2304,7 @@ impl NativeModelIr {
 	/// The suffix on every template symbol a node calls: empty for the run's own
 	/// arithmetic, the variant's suffix for any other.
 	fn variant(&self, node: &Node) -> &str {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision).map_or("", |variant| variant.suffix.as_str())
+		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
 	}
 	/// A node's gradient span starts where its weight span starts; the reverse
 	/// bodies index the gradient arena in the node's own element type, so the
@@ -2343,7 +2346,18 @@ fn matrix_capable(precision: NativePrecision) -> bool {
 #[derive(Clone)]
 struct NativeVariant {
 	precision: NativePrecision,
+	/// The key-value cache format the variant's attention bodies store.
+	kv: Compute,
 	suffix: String,
+}
+/// The template key of a cache format a block may name.
+fn kv_key(kv: Compute) -> Result<&'static str> {
+	match kv {
+		Compute::Fp(format) if format == FloatFormat::FP16 => Ok("f16"),
+		Compute::Fp(format) if format == FloatFormat::FP32 => Ok("f32"),
+		Compute::Bf(format) if format == FloatFormat::BF16 => Ok("bf16"),
+		_ => Err(RecipeError::new(format!("a key-value cache takes fp(16), fp(32) or bf(16), not {}", kv.label()))),
+	}
 }
 /// The symbol suffix of a template variant: `-f16` links as `_f16`, the
 /// fp64 template, whose source key is `default`, as `_f64`.
@@ -2402,12 +2416,19 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 			names.push(name.to_owned());
 		}
 	}
+	// A global may share its line with a declaration (`declare void @llvm.trap()
+	// @contraction_tile = ...`), so every `@name =` on a line counts.
 	for line in text.lines() {
-		if let Some(rest) = line.strip_prefix('@')
-			&& let Some(end) = rest.find(|character: char| !(character.is_ascii_alphanumeric() || character == '_' || character == '.'))
-			&& rest[end..].starts_with(" =")
-		{
-			names.push(rest[..end].to_owned());
+		for (at, _) in line.match_indices('@') {
+			if at != 0 && !line[..at].ends_with(' ') {
+				continue;
+			}
+			let rest = &line[at + 1..];
+			if let Some(end) = rest.find(|character: char| !(character.is_ascii_alphanumeric() || character == '_' || character == '.'))
+				&& rest[end..].starts_with(" =")
+			{
+				names.push(rest[..end].to_owned());
+			}
 		}
 	}
 	names.push("recipe.model.decode".to_owned());
@@ -2469,8 +2490,13 @@ fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
 	Ok(path)
 }
 
-fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option<NativeMatrix>) -> Result<String> {
-	let suffix = precision.source;
+fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option<NativeMatrix>, kv: Option<Compute>) -> Result<String> {
+	let cache = match kv.filter(|kv| *kv != precision.model) {
+		Some(kv) => format!("-kv{}", kv_key(kv)?),
+		None => String::new(),
+	};
+	let suffix = format!("{}{cache}", precision.source);
+	let suffix = suffix.as_str();
 	let mapping = match backend {
 		Backend::Cpu => option_env!("RECIPE_CPU_IR").ok_or_else(|| RecipeError::new("CPU native LLVM templates are unavailable"))?,
 		Backend::Amd => option_env!("RECIPE_AMD_IR").ok_or_else(|| RecipeError::new("AMD native LLVM templates are unavailable"))?,
@@ -3800,7 +3826,7 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
@@ -4207,7 +4233,7 @@ impl NativeModelIr {
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @{attention}{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
 					// Index admission is a hard rank gate. Its score has no
 					// differentiable path into the attention output, so the ordinary
@@ -6240,13 +6266,13 @@ impl NativeModelIr {
 				.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
 				.replace("RECIPE_GRADIENT_SCRATCH_BASE", &(self.schedule.scratch_base as usize / element.max(1)).to_string())
 		};
-		let mut ir = substitute(backend_template(backend, self.precision, matrix)?, self.precision.model.bytes());
+		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.model.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
-			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision)))?, variant.precision.model.bytes()), "recipe.model.decode");
+			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.model.bytes()), "recipe.model.decode");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
 		}
@@ -7037,7 +7063,17 @@ fn native_command(mut command: Command, role: &str, key: &str) -> Result<String>
 	if output.status.success() {
 		return Ok(diagnostic);
 	}
-	Err(RecipeError::new(format!("{role} failed: {diagnostic}")))
+	// The module that failed stays beside the cache as failed.ll, so the line
+	// the diagnostic names can be read after the temporary source is gone.
+	let kept = command
+		.get_args()
+		.filter_map(|argument| Path::new(argument).extension().is_some_and(|extension| extension == "ll").then(|| PathBuf::from(argument)))
+		.find_map(|source| {
+			let kept = source.with_file_name("failed.ll");
+			fs::copy(&source, &kept).ok().map(|_| kept)
+		});
+	let kept = kept.map_or_else(String::new, |kept| format!(" (module kept at {})", kept.display()));
+	Err(RecipeError::new(format!("{role} failed: {diagnostic}{kept}")))
 }
 
 /// What the AMD backend reports about a compiled kernel. `occupancy` is the
@@ -9822,7 +9858,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -9831,12 +9867,13 @@ mod bundle {
 			normalization_text(block.qk),
 			u8::from(block.frozen),
 			u8::from(block.packed),
-			precision_token(block.precision)
+			precision_token(block.precision),
+			precision_token(block.kv_precision)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -9847,6 +9884,8 @@ mod bundle {
 			frozen: fields.get(6).map_or(Ok(false), |field| bool_value(field, "block frozen qualifier"))?,
 			packed: fields.get(7).map_or(Ok(false), |field| bool_value(field, "block packed qualifier"))?,
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
+			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
+			kv_pending: false,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -10918,7 +10957,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, kv_precision: None, kv_pending: false } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation};
 	slots! {
@@ -10968,7 +11007,7 @@ macro_rules! precision_methods {
 		}
 	};
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Block {
 	operation: Operation,
 	activation: Activation,
@@ -10979,9 +11018,30 @@ pub struct Block {
 	profile: bool,
 	frozen: bool,
 	packed: bool,
-	/// The arithmetic this block computes in, or the run's default when absent.
+	/// The arithmetic this block computes in, or the model's when absent.
 	precision: Option<Compute>,
+	/// The format an attention block keeps its key-value cache in, named by a
+	/// precision after `.kv(heads)`; the block's own arithmetic when absent.
+	kv_precision: Option<Compute>,
+	/// Whether the last suffix was `.kv(heads)`, so the next precision names
+	/// the cache rather than the block.
+	kv_pending: bool,
 }
+impl PartialEq for Block {
+	fn eq(&self, other: &Self) -> bool {
+		self.operation == other.operation
+			&& self.activation == other.activation
+			&& self.normalization == other.normalization
+			&& self.qk == other.qk
+			&& self.quantization == other.quantization
+			&& self.profile == other.profile
+			&& self.frozen == other.frozen
+			&& self.packed == other.packed
+			&& self.precision == other.precision
+			&& self.kv_precision == other.kv_precision
+	}
+}
+impl Eq for Block {}
 /// The blocks and model-level forward settings captured by one product branch.
 /// Product lowering applies exclusions locally, so one branch cannot alter the
 /// bias configuration of its sibling.
@@ -10999,7 +11059,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, kv_precision: None, kv_pending: false }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
@@ -11013,6 +11073,7 @@ impl Block {
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.kv_pending = false;
 		let normalization = normalization.normalization();
 		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
@@ -11020,6 +11081,7 @@ impl Block {
 		self
 	}
 	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
+		self.kv_pending = false;
 		match &mut self.operation {
 			Operation::Attention(attention) => apply(attention),
 			_ => panic!("{selector} requires a preceding attn block"),
@@ -11034,7 +11096,9 @@ impl Block {
 	/// Equal key and value heads of this `attn` block. Each head serves
 	/// `heads / kv` query heads.
 	pub fn kv(self, heads: usize) -> Self {
-		self.attention("kv", |attention| { attention.keys = heads; attention.values = heads; })
+		let mut block = self.attention("kv", |attention| { attention.keys = heads; attention.values = heads; });
+		block.kv_pending = true;
+		block
 	}
 	/// Rotary position embedding on this `attn` block.
 	pub fn rope(self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
@@ -11084,9 +11148,16 @@ impl Block {
 	pub fn iq(&self, bits: u8) -> Iq<Self> {
 		iq_of(self, bits)
 	}
+	/// A precision right after `.kv(heads)` names the cache; anywhere else it
+	/// names the block.
 	fn arithmetic(&self, format: Compute) -> Self {
 		let mut block = self.clone();
-		block.precision = Some(format);
+		if block.kv_pending {
+			block.kv_precision = Some(format);
+			block.kv_pending = false;
+		} else {
+			block.precision = Some(format);
+		}
 		block
 	}
 	pub fn scale(self, factor: f64) -> Self {
@@ -11258,6 +11329,8 @@ impl Model {
 				frozen: model.pending_frozen,
 				packed: model.pending_packed,
 				precision: model.precision,
+				kv_precision: None,
+				kv_pending: false,
 			});
 			model.pending_frozen = false;
 			model.pending_packed = false;
@@ -11516,7 +11589,7 @@ impl Model {
 	/// that names none.
 	fn arithmetic(&self, format: Compute) -> Self {
 		self.edit(|model| match model.blocks.last_mut() {
-			Some(block) => block.precision = Some(format),
+			Some(block) => *block = block.arithmetic(format),
 			None => model.precision = Some(format),
 		})
 	}
@@ -14888,6 +14961,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_frozen: false,
 		block_packed: false,
 		block_precision: last.precision,
+		block_kv_precision: None,
 		bound: None,
 		bound_values: Vec::new(),
 		bias: graph.bias,
@@ -15238,6 +15312,9 @@ struct Node {
 	packed: bool,
 	/// The arithmetic this node computes in.
 	precision: Compute,
+	/// The format an attention node keeps its key-value cache in; the node's
+	/// own arithmetic for every other node.
+	kv_precision: Compute,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
@@ -15269,6 +15346,8 @@ struct Graph {
 	block_frozen: bool,
 	block_packed: bool,
 	block_precision: Compute,
+	/// The cache format of the attention nodes lowered next, when their block named one.
+	block_kv_precision: Option<Compute>,
 	/// The weights still to bind while a graph compiles over mapped tensors:
 	/// each parameterized node takes the front entry as it is pushed.
 	bound: Option<std::collections::VecDeque<BoundNode>>,
@@ -15302,6 +15381,7 @@ impl Graph {
 			block_frozen: false,
 			block_packed: false,
 			block_precision: Compute::FP64,
+			block_kv_precision: None,
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
@@ -15537,6 +15617,17 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
 		lower_collapse(graph, config)?;
 	}
+	// A part's own qualifiers and precisions hold inside it and its parts, then
+	// the enclosing block's return.
+	let outer = (graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_kv_precision);
+	graph.block_frozen |= block.frozen;
+	graph.block_packed |= block.packed;
+	if let Some(precision) = block.precision {
+		graph.block_precision = precision;
+	}
+	if block.kv_precision.is_some() {
+		graph.block_kv_precision = block.kv_precision;
+	}
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -15597,6 +15688,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
+	(graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_kv_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -15681,6 +15773,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		frozen: graph.block_frozen,
 		packed: graph.block_packed,
 		precision: graph.block_precision,
+		kv_precision: if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.block_precision) } else { graph.block_precision },
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
 	// the next plan entry. Block bytes stay packed and the node reserves no

@@ -15,19 +15,19 @@ fn main() {
 			.res([
 				norm(rms),
 				attn(gemma3.attention.head_count)
-				.kv(gemma3.attention.head_count_kv)
-				.qk(rms)
-				.rope(
-					neox,
-					gemma3.attention.key_length,
-					gemma3.rope.freq_base
-				)
-				.yarn(
-					gemma3.rope.scaling.factor,
-					gemma3.rope.scaling.original_context_length,
-					gemma3.rope.scaling.yarn_beta_fast,
-					gemma3.rope.scaling.yarn_beta_slow
-				),
+					.kv(gemma3.attention.head_count_kv).fp(16)
+					.qk(rms)
+					.rope(
+						neox,
+						gemma3.attention.key_length,
+						gemma3.rope.freq_base
+					)
+					.yarn(
+						gemma3.rope.scaling.factor,
+						gemma3.rope.scaling.original_context_length,
+						gemma3.rope.scaling.yarn_beta_fast,
+						gemma3.rope.scaling.yarn_beta_slow
+					),
 				norm(rms),
 			]).bf(16)
 			.res([

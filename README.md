@@ -85,7 +85,7 @@ blck:
 	attention:
 		attn(heads)
 			.width(d)
-			.kv(heads)
+			.kv(heads)            // key and value heads; a precision right after names the cache: .kv(heads).fp(16)
 			.qk(rms|l2)
 			.rope(neox, dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
