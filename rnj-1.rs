@@ -8,13 +8,13 @@ fn main() {
 	let mut model = recipe.model()
 		.no(bias)
 		.embed(tokenizer.ggml.tokens, gemma3.embedding_length).bf(16)
-		.scale(gemma3.embedding_length.sqrt());
+		.scale(gemma3.embedding_length.sqrt()).bf(16);
 
 	for _ in 0..gemma3.block_count {
 		model = model
 			.res([
 				norm(rms).bf(16),
-				attn(gemma3.attention.head_count)
+				attn(gemma3.attention.head_count).bf(16)
 					.kv(gemma3.attention.head_count_kv).fp(16)
 					.qk(rms)
 					.rope(
@@ -32,7 +32,7 @@ fn main() {
 			]).bf(16)
 			.res([
 				norm(rms).bf(16),
-				layer(gemma3.feed_forward_length).gelu().bf(16)
+				layer(gemma3.feed_forward_length).bf(16).gelu().bf(16)
 					* layer(gemma3.feed_forward_length).bf(16),
 				layer(gemma3.embedding_length).bf(16),
 				norm(rms).bf(16),
@@ -44,7 +44,7 @@ fn main() {
 		.layer(tokenizer.ggml.tokens).bf(16)
 		.scale(1.0 / gemma3.final_logit_softcapping)
 		.tanh()
-		.scale(gemma3.final_logit_softcapping);
+		.scale(gemma3.final_logit_softcapping).bf(16);
 
 	recipe.infer().log([chat]).run(&model, &data);
 }

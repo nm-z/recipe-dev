@@ -706,6 +706,34 @@ fn configured(manifest: &str, key: &str, os: &str) -> BuildResult<Option<String>
 	let (name, inside) = reference.split_once('/').unwrap_or((reference, ""));
 	Ok(env::var_os(name).map(PathBuf::from).map(|root| if inside.is_empty() { root } else { root.join(inside) }.to_string_lossy().into_owned()))
 }
+/// `[precision]` and every `[precision.<name>]` table of the manifest: the
+/// default config's name, and each table as `name:key=value,...` joined by `;`.
+fn precision_profiles(manifest: &str) -> BuildResult<(String, String)> {
+	let (mut section, mut default, mut profiles) = (None::<String>, None::<String>, Vec::<(String, Vec<String>)>::new());
+	for line in manifest.lines() {
+		let line = line.split('#').next().unwrap_or_default().trim();
+		if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+			let name = name.trim().to_owned();
+			if let Some(profile) = name.strip_prefix("precision.") {
+				profiles.push((profile.to_owned(), Vec::new()));
+			}
+			section = Some(name);
+			continue;
+		}
+		let Some((key, value)) = line.split_once('=') else { continue };
+		let (key, value) = (key.trim(), value.trim().trim_matches('"'));
+		match section.as_deref() {
+			Some("precision") if key == "default-config" => default = Some(value.to_owned()),
+			Some(name) if name.starts_with("precision.") => profiles.last_mut().expect("a precision table is open").1.push(format!("{key}={value}")),
+			_ => {}
+		}
+	}
+	let default = default.ok_or_else(|| io::Error::other("[precision] names no default-config"))?;
+	if !profiles.iter().any(|(name, _)| *name == default) {
+		return Err(io::Error::other(format!("default-config {default} names no [precision.{default}] table")).into());
+	}
+	Ok((default, profiles.iter().map(|(name, entries)| format!("{name}:{}", entries.join(","))).collect::<Vec<_>>().join(";")))
+}
 fn native_configuration(manifest: &str, os: &str) -> u64 {
 	let mut hash = 14695981039346656037_u64;
 	let mut update = |value: &str| {
@@ -1073,6 +1101,9 @@ fn main() -> BuildResult<()> {
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
+	let (default_config, profiles) = precision_profiles(&manifest)?;
+	println!("cargo:rustc-env=RECIPE_DEFAULT_CONFIG={default_config}");
+	println!("cargo:rustc-env=RECIPE_PRECISION_PROFILES={profiles}");
 	let placement = setting(&manifest, "multi-device")?;
 	println!(
 		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",

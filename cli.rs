@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [--config <precision table>] [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -58,7 +58,7 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
-fn run(source: &Path, device: Option<&str>) {
+fn run(source: &Path, device: Option<&str>, config: Option<&str>) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -85,6 +85,9 @@ fn run(source: &Path, device: Option<&str>) {
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
+	if let Some(config) = config {
+		command.env("RECIPE_CONFIG", config);
+	}
 	let status = command.status();
 	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
@@ -97,7 +100,7 @@ fn run(source: &Path, device: Option<&str>) {
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
-	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
+	let (mut source, mut operation, mut device, mut config) = (None::<String>, None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	while let Some(argument) = arguments.next() {
 		if argument == "--worker" {
@@ -114,6 +117,14 @@ fn main() {
 				invalid("--device may be specified only once; use a dot-separated device chain")
 			}
 			device = Some(selected);
+			continue;
+		}
+		if argument == "--config" {
+			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			if config.is_some() {
+				invalid("--config may be specified only once")
+			}
+			config = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
@@ -144,7 +155,7 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		None => run(source, device),
+		None => run(source, device, config.as_deref()),
 		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
 		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),

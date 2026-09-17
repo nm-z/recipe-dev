@@ -7727,7 +7727,6 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
-		pub(super) precision: super::Compute,
 		pub(super) quantization: u16,
 	}
 	impl Gguf {
@@ -7749,7 +7748,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, precision: super::Compute::FP64, quantization: 0 })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, quantization: 0 })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -7794,13 +7793,6 @@ mod gguf {
 		/// Every key-value pair of the first shard, in file order.
 		pub fn metadata(&self) -> &[(String, GgufValue)] {
 			&self.metadata
-		}
-		/// Select arithmetic precision without changing the file's weight storage.
-		/// On AMD, a packed Q4_K or Q6_K contraction takes Q8 activation dot
-		/// products, which can change numerical results.
-		pub fn fp(mut self, bits: u8) -> Self {
-			self.precision = super::fp_format(bits);
-			self
 		}
 		pub fn value(&self, key: &str) -> Option<&GgufValue> {
 			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
@@ -9862,7 +9854,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -9872,12 +9864,13 @@ mod bundle {
 			u8::from(block.frozen),
 			u8::from(block.packed),
 			precision_token(block.precision),
-			precision_token(block.kv_precision)
+			precision_token(block.kv_precision),
+			precision_token(block.blck_precision)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -9889,7 +9882,8 @@ mod bundle {
 			packed: fields.get(7).map_or(Ok(false), |field| bool_value(field, "block packed qualifier"))?,
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
-			kv_pending: false,
+			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
+			suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -10961,9 +10955,9 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, kv_precision: None, kv_pending: false } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::End } })+}; }
 pub mod atv {
-	use super::{Activation, Block, Operation};
+	use super::{Activation, Block, Operation, Suffix};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -11022,14 +11016,33 @@ pub struct Block {
 	profile: bool,
 	frozen: bool,
 	packed: bool,
-	/// The arithmetic this block computes in, or the model's when absent.
+	/// The precision of the block's other ops (its atvn, norm, qk, rope, yarn,
+	/// or a residual's add), named by a precision after one of them.
 	precision: Option<Compute>,
+	/// The precision of the op that holds the block's numbers (a layer's sum,
+	/// attention, an embedding's lookup), named by a precision right after it.
+	blck_precision: Option<Compute>,
 	/// The format an attention block keeps its key-value cache in, named by a
-	/// precision after `.kv(heads)`; the block's own arithmetic when absent.
+	/// precision after `.kv(heads)`.
 	kv_precision: Option<Compute>,
-	/// Whether the last suffix was `.kv(heads)`, so the next precision names
-	/// the cache rather than the block.
-	kv_pending: bool,
+	/// What the next precision suffix names.
+	suffix: Suffix,
+}
+/// What a precision suffix names: the blck right before it, the cache, or the
+/// block's other ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suffix {
+	/// Nothing has followed the constructor yet: a precision names the blck
+	/// when the operation holds numbers, else the block's ops.
+	Fresh,
+	Blck,
+	Kv,
+	End,
+}
+impl Suffix {
+	fn for_operation(operation: &Operation) -> Self {
+		if operation.weighted() || matches!(operation, Operation::Embed(..)) { Self::Blck } else { Self::End }
+	}
 }
 impl PartialEq for Block {
 	fn eq(&self, other: &Self) -> bool {
@@ -11042,6 +11055,7 @@ impl PartialEq for Block {
 			&& self.frozen == other.frozen
 			&& self.packed == other.packed
 			&& self.precision == other.precision
+			&& self.blck_precision == other.blck_precision
 			&& self.kv_precision == other.kv_precision
 	}
 }
@@ -11063,21 +11077,23 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, kv_precision: None, kv_pending: false }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
 	pub fn act(mut self, activation: Activation) -> Self {
+		self.suffix = Suffix::End;
 		assert!(self.normalization.is_none(), "activation must precede normalization");
 		self.activation = activation;
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
+		self.suffix = Suffix::End;
 		self.normalization = Some(normalization.normalization());
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.kv_pending = false;
+		self.suffix = Suffix::End;
 		let normalization = normalization.normalization();
 		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
@@ -11085,7 +11101,7 @@ impl Block {
 		self
 	}
 	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
-		self.kv_pending = false;
+		self.suffix = Suffix::End;
 		match &mut self.operation {
 			Operation::Attention(attention) => apply(attention),
 			_ => panic!("{selector} requires a preceding attn block"),
@@ -11101,7 +11117,7 @@ impl Block {
 	/// `heads / kv` query heads.
 	pub fn kv(self, heads: usize) -> Self {
 		let mut block = self.attention("kv", |attention| { attention.keys = heads; attention.values = heads; });
-		block.kv_pending = true;
+		block.suffix = Suffix::Kv;
 		block
 	}
 	/// Rotary position embedding on this `attn` block.
@@ -11152,15 +11168,15 @@ impl Block {
 	pub fn iq(&self, bits: u8) -> Iq<Self> {
 		iq_of(self, bits)
 	}
-	/// A precision right after `.kv(heads)` names the cache; anywhere else it
-	/// names the block.
+	/// A precision names the blck right before it, the cache after `.kv(heads)`,
+	/// or the block's other ops after any of them.
 	fn arithmetic(&self, format: Compute) -> Self {
 		let mut block = self.clone();
-		if block.kv_pending {
-			block.kv_precision = Some(format);
-			block.kv_pending = false;
-		} else {
-			block.precision = Some(format);
+		let suffix = if block.suffix == Suffix::Fresh { Suffix::for_operation(&block.operation) } else { block.suffix };
+		match suffix {
+			Suffix::Fresh | Suffix::Blck => block.blck_precision = Some(format),
+			Suffix::Kv => block.kv_precision = Some(format),
+			Suffix::End => block.precision = Some(format),
 		}
 		block
 	}
@@ -11323,6 +11339,7 @@ impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		assert!(operation.weighted() || !(self.pending_frozen || self.pending_packed), "{} owns no weights to qualify", operation.name());
 		self.edit(|model| {
+			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
 				operation,
 				activation: Activation::Linear,
@@ -11332,9 +11349,10 @@ impl Model {
 				profile: StorageFormat(model.quantization).selection().is_some(),
 				frozen: model.pending_frozen,
 				packed: model.pending_packed,
-				precision: model.precision,
+				precision: None,
+				blck_precision: None,
 				kv_precision: None,
-				kv_pending: false,
+				suffix,
 			});
 			model.pending_frozen = false;
 			model.pending_packed = false;
@@ -11594,7 +11612,7 @@ impl Model {
 	fn arithmetic(&self, format: Compute) -> Self {
 		self.edit(|model| match model.blocks.last_mut() {
 			Some(block) => *block = block.arithmetic(format),
-			None => model.precision = Some(format),
+			None => panic!("a precision names the block before it, and no block comes before this one; name it on a block, or in Cargo.toml's [precision.<config>] for every block that names none"),
 		})
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
@@ -13358,7 +13376,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, pending_packed: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -13520,7 +13538,7 @@ impl Binding {
 /// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
-	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, model.precision, None)?;
+	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, Config::load()?.precision, None)?;
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
@@ -13533,7 +13551,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		*slot = f64::from(*id);
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
-	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, model.precision, None)?;
+	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Config::load()?.precision, None)?;
 	trace(&format!("model preparation {} s", load_started.elapsed().as_secs_f64()))?;
 	decode_steps(
 		&mut tape,
@@ -13572,7 +13590,6 @@ fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], c
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
 	let mut config = Config::load()?;
-	config.precision = model.precision;
 	config.quantization = model.quantization;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
@@ -14348,13 +14365,11 @@ fn arm_trace(metrics: &[Metric]) {
 #[derive(Clone)]
 pub struct Infer {
 	log: Vec<Metric>,
-	/// The arithmetic of a block that names none and whose model names none.
-	precision: Compute,
 	tokens: usize,
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), precision: Compute::FP16, tokens: 32 }
+		Infer { log: Vec::new(), tokens: 32 }
 	}
 }
 impl Infer {
@@ -14372,8 +14387,7 @@ impl Infer {
 		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
 	}
 	fn try_run(&self, model: &Model, data: &Data) -> Result<Generation> {
-		let mut file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		file.precision = self.precision;
+		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		let model = with_last_projection(model);
 		let plan = conventional_plan(&file, &model)?;
 		let device = selected_gpu()?;
@@ -14465,7 +14479,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 	loop {
 		let samples = vec![0.0; length];
 		let graph = bound_graph_on(file, model, plan, &samples, 1, device)?;
-		let bytes = part_bytes(&graph, file.precision)? as u64;
+		let bytes = part_bytes(&graph, Config::load()?.precision)? as u64;
 		trace(&format!("context {length}: {bytes} bytes resident, {free} bytes free"))?;
 		if bytes <= free {
 			return Ok(length);
@@ -14964,8 +14978,10 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_kind: last.block_kind,
 		block_frozen: false,
 		block_packed: false,
-		block_precision: last.precision,
+		block_precision: None,
+		block_blck_precision: None,
 		block_kv_precision: None,
+		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
 		bias: graph.bias,
@@ -15349,9 +15365,14 @@ struct Graph {
 	rank: usize,
 	block_frozen: bool,
 	block_packed: bool,
-	block_precision: Compute,
+	/// The precision the block being lowered named for its other ops, if any.
+	block_precision: Option<Compute>,
+	/// The precision the block being lowered named for its blck, if any.
+	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
 	block_kv_precision: Option<Compute>,
+	/// The run's table: the precision of every kind of op a block names none for.
+	profile: Precisions,
 	/// The weights still to bind while a graph compiles over mapped tensors:
 	/// each parameterized node takes the front entry as it is pushed.
 	bound: Option<std::collections::VecDeque<BoundNode>>,
@@ -15384,8 +15405,10 @@ impl Graph {
 			block_kind: "",
 			block_frozen: false,
 			block_packed: false,
-			block_precision: Compute::FP64,
+			block_precision: None,
+			block_blck_precision: None,
 			block_kv_precision: None,
+			profile: Precisions::default(),
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
@@ -15447,7 +15470,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let sequential = sequential || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
-	graph.block_precision = model.precision.unwrap_or(config.precision);
+	graph.profile = config.profile;
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
@@ -15457,14 +15480,17 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		graph.block_kind = block.operation.name();
 		graph.block_frozen = block.frozen;
 		graph.block_packed = block.packed;
-		// A residual's own precision is its add's; its parts start from the model's.
-		let precision = if matches!(block.operation, Operation::Residual(_)) { model.precision } else { block.precision.or(model.precision) };
-		graph.block_precision = precision.unwrap_or(config.precision);
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	graph.block_frozen = false;
 	graph.block_packed = false;
-	graph.block_precision = model.precision.unwrap_or(config.precision);
+	graph.block_precision = None;
+	graph.block_blck_precision = None;
+	if tracing() {
+		for (index, node) in graph.nodes.iter().enumerate() {
+			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
+		}
+	}
 	if graph.lanes != 0 {
 		lower_collapse(&mut graph, config)?;
 	}
@@ -15623,20 +15649,15 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
 		lower_collapse(graph, config)?;
 	}
-	// A part's own qualifiers and precisions hold inside it and its parts, then
-	// the enclosing block's return.
-	let outer = (graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_kv_precision);
+	// A block's qualifiers hold inside it and its parts; its precisions hold for
+	// its own ops only, and a part that names none takes the run's table, never
+	// the enclosing block's. A residual's precision is its add's alone.
+	let outer = (graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_packed |= block.packed;
-	// A residual's precision is the add's alone: its parts name their own.
-	if let Some(precision) = block.precision
-		&& !matches!(block.operation, Operation::Residual(_))
-	{
-		graph.block_precision = precision;
-	}
-	if block.kv_precision.is_some() {
-		graph.block_kv_precision = block.kv_precision;
-	}
+	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
+	graph.block_blck_precision = block.blck_precision;
+	graph.block_kv_precision = block.kv_precision;
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -15697,7 +15718,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_kv_precision) = outer;
+	(graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -15766,6 +15787,11 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
 	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
+	// The block's own suffix for this kind of op, else the run's table.
+	let kind = precision_kind(op, graph.block_kind);
+	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
+	let precision = named.unwrap_or(graph.profile.of(kind));
+	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
 		op,
 		source,
@@ -15781,8 +15807,8 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
 		packed: graph.block_packed,
-		precision: graph.block_precision,
-		kv_precision: if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.block_precision) } else { graph.block_precision },
+		precision,
+		kv_precision,
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
 	// the next plan entry. Block bytes stay packed and the node reserves no
@@ -16686,10 +16712,11 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 	for part in parts {
 		lower_block(graph, part, total, data, targets, rows, gpu, config)?;
 	}
-	// The add, and any projection the skip path needs, run in the residual's own precision.
-	if let Some(precision) = precision {
-		graph.block_precision = precision;
-	}
+	// The add, and any projection the skip path needs, run in the residual's own
+	// precision, or the table's res entry.
+	graph.block_precision = precision;
+	let outer_kind = graph.block_kind;
+	graph.block_kind = "residual";
 	let branch = graph.source;
 	let branch_shape = graph.output;
 	if branch_shape != shape {
@@ -16711,7 +16738,9 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	let second = if branch_shape == shape { skip } else { branch };
-	push_program(graph, second, &[], program)
+	push_program(graph, second, &[], program)?;
+	graph.block_kind = outer_kind;
+	Ok(())
 }
 /// Lower two model fragments from one source and multiply their outputs
 /// elementwise. The scalar-program reverse pass supplies each branch with the
@@ -17054,6 +17083,110 @@ enum MultiDevice {
 	Forced,
 	Auto,
 }
+/// The kind of op a node is, for the precision its block names none for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrecisionKind {
+	Sum,
+	Embed,
+	Attn,
+	Rope,
+	Atvn,
+	Norm,
+	Res,
+}
+impl PrecisionKind {
+	/// The kinds a block's blck suffix names: the op that holds its numbers.
+	fn blck(self) -> bool {
+		matches!(self, Self::Sum | Self::Embed | Self::Attn)
+	}
+}
+/// The precision of every kind of op, one named `[precision.<name>]` table in
+/// Cargo.toml chosen by `recipe run --config <name>`; a block's own suffix
+/// overrides its op's entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Precisions {
+	sum: Compute,
+	embed: Compute,
+	attn: Compute,
+	rope: Compute,
+	kv: Compute,
+	atvn: Compute,
+	norm: Compute,
+	res: Compute,
+}
+impl Default for Precisions {
+	fn default() -> Self {
+		let fp16 = Compute::FP16;
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16 }
+	}
+}
+impl Precisions {
+	fn of(&self, kind: PrecisionKind) -> Compute {
+		match kind {
+			PrecisionKind::Sum => self.sum,
+			PrecisionKind::Embed => self.embed,
+			PrecisionKind::Attn => self.attn,
+			PrecisionKind::Rope => self.rope,
+			PrecisionKind::Atvn => self.atvn,
+			PrecisionKind::Norm => self.norm,
+			PrecisionKind::Res => self.res,
+		}
+	}
+	/// The table `RECIPE_CONFIG` names, or the manifest's default-config.
+	fn load() -> Result<Self> {
+		let name = std::env::var("RECIPE_CONFIG").unwrap_or_else(|_| env!("RECIPE_DEFAULT_CONFIG").to_owned());
+		let profiles = env!("RECIPE_PRECISION_PROFILES");
+		let names = profiles.split(';').filter_map(|profile| profile.split_once(':').map(|(name, _)| name)).collect::<Vec<_>>().join(", ");
+		let table = profiles
+			.split(';')
+			.find_map(|profile| profile.split_once(':').filter(|(candidate, _)| *candidate == name).map(|(_, body)| body))
+			.ok_or_else(|| RecipeError::new(format!("--config {name} names no [precision.{name}] table in Cargo.toml; the tables are {names}")))?;
+		let mut precisions = Self::default();
+		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
+			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			let compute = precision_named(value).map_err(|error| RecipeError::new(format!("[precision.{name}] {key}: {error}")))?;
+			match key {
+				"sum" => precisions.sum = compute,
+				"embed" => precisions.embed = compute,
+				"attn" => precisions.attn = compute,
+				"rope" => precisions.rope = compute,
+				"kv" => precisions.kv = compute,
+				"atvn" => precisions.atvn = compute,
+				"norm" => precisions.norm = compute,
+				"res" => precisions.res = compute,
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res"))),
+			}
+		}
+		Ok(precisions)
+	}
+}
+/// A precision by the name a table writes: fp8, fp16, fp32, fp64, bf16, tf32, int8, int4, int1.
+fn precision_named(name: &str) -> Result<Compute> {
+	Ok(match name {
+		"fp8" => Compute::FP8,
+		"fp16" => Compute::FP16,
+		"fp32" => Compute::FP32,
+		"fp64" => Compute::FP64,
+		"bf16" => Compute::BF16,
+		"tf32" => Compute::TF32,
+		"int8" => Compute::INT8,
+		"int4" => Compute::INT4,
+		"int1" => Compute::INT1,
+		other => return Err(RecipeError::new(format!("{other} is not a precision; the precisions are fp8, fp16, fp32, fp64, bf16, tf32, int8, int4, int1"))),
+	})
+}
+/// The kind of op a node is, for the table's precision of it.
+fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
+	match op {
+		Primitive::Elementwise if block_kind == "residual" => PrecisionKind::Res,
+		Primitive::Elementwise | Primitive::Expand | Primitive::Read | Primitive::Last | Primitive::Fold | Primitive::TopK => PrecisionKind::Atvn,
+		Primitive::Normalize => PrecisionKind::Norm,
+		Primitive::Attention => PrecisionKind::Attn,
+		Primitive::Rope => PrecisionKind::Rope,
+		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
+		_ => PrecisionKind::Sum,
+	}
+}
 #[derive(Clone, Copy)]
 struct Config {
 	multi_device: MultiDevice,
@@ -17093,7 +17226,10 @@ struct Config {
 	progress_refresh_hz: usize,
 	random_seed: usize,
 	activation: [f64; 8],
+	/// The run's own arithmetic: the table's sum precision, which most nodes take.
 	precision: Compute,
+	/// The precision of every kind of op a block names none for.
+	profile: Precisions,
 	/// The storage format for blocks that name none, 0 for unquantized.
 	quantization: u16,
 }
@@ -17151,7 +17287,8 @@ impl Config {
 				number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?,
 				number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?,
 			],
-			precision: Compute::FP64,
+			precision: Precisions::load()?.sum,
+			profile: Precisions::load()?,
 			quantization: 0,
 		})
 	}
@@ -25853,8 +25990,6 @@ pub struct Train {
 	resume: Option<PathBuf>,
 	save: Option<PathBuf>,
 	seed: Option<usize>,
-	/// The arithmetic of a block that names none and whose model names none.
-	precision: Compute,
 	rat: Option<RatCommand>,
 	rat_target: Option<f64>,
 }
@@ -26240,7 +26375,6 @@ impl Train {
 		prepared.schema = names.iter().map(|name| ("feature".to_owned(), format!("1 {name}"))).chain(outputs.iter().map(|name| ("target".to_owned(), name.clone()))).collect();
 		let gpu = selected_gpu()?;
 		let mut config = Config::load()?;
-		config.precision = self.precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}
@@ -26358,8 +26492,7 @@ impl Train {
 			}
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
-			config.precision = self.precision;
-			if let Some(seed) = self.seed {
+				if let Some(seed) = self.seed {
 				config.random_seed = seed;
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
@@ -26369,8 +26502,7 @@ impl Train {
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
 		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
 		let gpu = gpus[0];
-		let precision = self.precision;
-		config.precision = precision;
+		let precision = config.precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}

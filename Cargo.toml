@@ -114,3 +114,28 @@ huber-threshold = 1.0
 output-tolerance = 0.00000001
 gradient-tolerance = 0.00001
 backend-tolerance = 0.00001
+
+# The precision of every kind of op a block names none for. `recipe run x.rs
+# --config <name>` picks a table; a block's own suffix overrides its op.
+[precision]
+default-config = "recipe"
+
+[precision.recipe]
+sum = "fp16"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp16"
+norm = "fp16"
+res = "fp16"
+
+[precision.llamacpp]
+sum = "int8"
+embed = "fp32"
+attn = "fp16"
+rope = "fp32"
+kv = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp32"
