@@ -1735,6 +1735,10 @@ pub(crate) struct NativeLayout {
 	pub values_bytes: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
+	/// Under a traced run, the byte offset in the context arena of one i64
+	/// device clock per node, written by thread 0 as each node begins; a
+	/// traced forward reads them back and logs the time between nodes.
+	pub clocks: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -2197,7 +2201,11 @@ impl NativeLayout {
 		let spans = graph.nodes.iter().map(|node| (node.offset, node.parameters)).collect::<Vec<_>>();
 		let input_precision = graph.nodes.first().map_or(precision, |node| node.precision);
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
-		Ok(Self { precisions, input_precision, output_precision, weights, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
+		let clocks = tracing().then_some(align(context_offset, 8)?);
+		if let Some(clocks) = clocks {
+			context_offset = checked_add(clocks, checked_mul(graph.nodes.len().max(1), 8, "node clock arena")?, "node clock arena")?;
+		}
+		Ok(Self { precisions, input_precision, output_precision, weights, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element), clocks })
 	}
 }
 
@@ -3495,6 +3503,13 @@ impl NativeModelIr {
 				continue;
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
+			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
+				let pointer = pointer_type(backend);
+				ir.push_str(&format!(
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+					at = clocks + index * 8
+				));
+			}
 			let node = &plan.node;
 			let v = self.variant(node);
 			let matrix = matrix && matrix_capable(self.node_precision(node));
@@ -17949,6 +17964,17 @@ impl NativeTape {
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		if let Some(clocks) = self.program.artifact.layout.clocks {
+			self.program.gpu.synchronize()?;
+			let count = self.program.artifact.layout.precisions.len();
+			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+			let mut line = format!("clocks window {begin}..{end} {unit}");
+			for index in 1..count {
+				line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+			}
+			trace(&line)?;
+		}
 		Ok(())
 	}
 	/// Evaluate rows after `first` with this trained native program. The input

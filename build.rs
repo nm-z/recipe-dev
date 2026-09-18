@@ -170,16 +170,20 @@ const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
 define internal i1 @recipe.int8.dots() #1 { entry: ret i1 true }
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyctr_u64() ret i64 %now }
 define internal float @recipe.wave.partner(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
 define internal i1 @recipe.int8.dots() #1 { entry: ret i1 false }
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyctr_u64() ret i64 %now }
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
 define internal i1 @recipe.int8.dots() #1 { entry: ret i1 false }
+declare i64 @llvm.readcyclecounter()
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }
 define internal RECIPE_STATE @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) ret RECIPE_STATE %zero }
@@ -197,8 +201,10 @@ fn nvidia_wave_helpers(state: &str) -> String {
 	};
 	format!(
 		"declare i32 @llvm.nvvm.shfl.sync.idx.i32(i32, i32, i32, i32)
+declare i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
 define internal i32 @recipe.wavefront.width() #1 {{ entry: ret i32 32 }}
 define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 false }}
+define internal i64 @recipe.clock() #1 {{ entry: %now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer() ret i64 %now }}
 define internal {state} @recipe.wave.partner({state} %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 {partner} }}
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 %bits, i32 %lane, i32 31) %partner = bitcast i32 %partner.bits to float ret float %partner }}
 define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}
