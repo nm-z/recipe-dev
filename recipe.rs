@@ -20307,7 +20307,7 @@ impl Cuda {
 			// kernel allows, as the AMD step does; the forward keeps the schedule
 			// width. Its launch carries the forward's reduction buffer, so its
 			// residency is asked with that buffer and not one scaled to its own block.
-			let step_waves = std::env::var("RECIPE_NV_STEP_WAVES").ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or((self.workgroup.min(512) / self.wave).max(1));
+			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
 			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
 			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
