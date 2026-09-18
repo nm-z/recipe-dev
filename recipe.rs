@@ -19496,7 +19496,7 @@ impl Gpu {
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
 		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
-		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
+		let waves = if cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
 		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
 			/ precision.bytes() as u32
