@@ -18248,18 +18248,27 @@ impl NativeTape {
 				// only the reached positions are unpacked.
 				let bytes = precision.bytes();
 				let needed = checked_mul(channels.saturating_sub(1) * length + positions, bytes, "traced node bytes")?;
-				let region = self.values.download_range::<u8>(*slot, needed)?;
-				let at = |channel: usize, position: usize| {
+				// A wide arena over a long context is read whole only up to 64 MB;
+				// past that the head and the tail come back on their own and the sum
+				// is left out, so a traced deep model still answers inside a cap.
+				let whole = needed <= 64 << 20;
+				let region = if whole { self.values.download_range::<u8>(*slot, needed)? } else { Vec::new() };
+				let one = |channel: usize, position: usize| -> Result<f64> {
 					let start = (channel * length + position) * bytes;
-					region.get(start..start + bytes).map_or(f64::NAN, |chunk| {
+					let chunk = if whole { region.get(start..start + bytes).map(<[u8]>::to_vec) } else { Some(self.values.download_range::<u8>(*slot + start, bytes)?) };
+					Ok(chunk.map_or(f64::NAN, |chunk| {
 						let mut bits = [0_u8; 8];
-						bits[..bytes].copy_from_slice(chunk);
+						bits[..bytes].copy_from_slice(&chunk);
 						precision.unpack(u64::from_le_bytes(bits))
-					})
+					}))
 				};
-				let first = (0..3.min(channels)).map(|channel| at(channel, 0)).collect::<Vec<_>>();
-				let last = (channels.saturating_sub(3)..channels).map(|channel| at(channel, positions - 1)).collect::<Vec<_>>();
-				let sum = (0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| at(channel, position)).sum::<f64>();
+				let first = (0..3.min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
+				let last = (channels.saturating_sub(3)..channels).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
+				let sum = if whole {
+					(0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| one(channel, position)).sum::<Result<f64>>()?.to_string()
+				} else {
+					"-".to_owned()
+				};
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
