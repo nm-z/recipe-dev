@@ -2121,7 +2121,10 @@ impl NativeLayout {
 		let mut released: Vec<(usize, usize)> = Vec::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			let bytes = graph_rows_buffer(node.output, rows, node.precision.bytes())?;
-			let reuse = inference && !retained[index] && !tracing();
+			// A traced run keeps the nodes its dump reads: the first forty and the
+			// last four; every other slot is reused as in an untraced run.
+			let dumped = tracing() && (index < 40 || index + 4 >= graph.nodes.len());
+			let reuse = inference && !retained[index] && !dumped;
 			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
 				Some(position) => released.remove(position).1,
 				None => {
