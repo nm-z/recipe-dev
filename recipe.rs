@@ -2346,8 +2346,15 @@ impl NativeModelIr {
 	}
 	/// The suffix on every template symbol a node calls: empty for the run's own
 	/// arithmetic, the variant's suffix for any other.
+	/// The template a node computes in, by its source key: a declared acc of
+	/// fp32 over a double-state base is that base, as `NativePrecision::new`
+	/// resolves it, so the key and not the raw declaration is compared.
+	fn node_source(&self, node: &Node) -> &'static str {
+		NativePrecision::new(node.precision, node.acc).map_or("", |native| native.source)
+	}
 	fn variant(&self, node: &Node) -> &str {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.precision.acc == node.acc && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
+		let source = self.node_source(node);
+		self.variants.iter().find(|variant| variant.precision.source == source && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
 	}
 	/// A node's gradient span starts where its weight span starts; the reverse
 	/// bodies index the gradient arena in the node's own element type, so the
@@ -2363,7 +2370,8 @@ impl NativeModelIr {
 	}
 	/// The native precision a node computes in.
 	fn node_precision(&self, node: &Node) -> NativePrecision {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.precision.acc == node.acc).map_or(self.precision, |variant| variant.precision)
+		let source = self.node_source(node);
+		self.variants.iter().find(|variant| variant.precision.source == source).map_or(self.precision, |variant| variant.precision)
 	}
 	fn storage(&self) -> StorageImage {
 		let segments: Vec<(usize, StoredBytes)> = self
@@ -6022,14 +6030,61 @@ impl NativeModelIr {
 		format!("define internal i32 @recipe.tile.bytes() #1 {{\nentry:\nret i32 {bytes}\n}}\n")
 	}
 
+	/// The K-quant planes of a packed sum on the block path: one or two planes
+	/// of Q4_K (kind 1) or Q6_K (kind 2), the second plane's rows after the
+	/// first's. Empty for a sum that takes another path.
+	fn block_planes(&self, backend: Backend, plan: &NodePlan) -> Vec<(u8, usize)> {
+		if !self.inference || !self.block_dot_fits(backend, plan) {
+			return Vec::new();
+		}
+		let Some(stored) = plan.stored.as_ref() else { return Vec::new() };
+		let segments = stored.format_segments();
+		if segments.is_empty() || segments.len() > 2 || plan.node.input.channels == 0 {
+			return Vec::new();
+		}
+		let mut planes = Vec::new();
+		for (format, count) in segments {
+			let Some(spec) = format.spec() else { return Vec::new() };
+			let kind = match spec.codec {
+				StorageCodec::Q4K => 1,
+				StorageCodec::Q6K => 2,
+				_ => return Vec::new(),
+			};
+			if count % plan.node.input.channels != 0 {
+				return Vec::new();
+			}
+			planes.push((kind, count));
+		}
+		planes
+	}
+	fn emit_plane_support(&self, backend: Backend) -> String {
+		let (mut kind_arms, mut kind_bodies, mut row_arms, mut row_bodies, mut base_arms, mut base_bodies) = (String::new(), String::new(), String::new(), String::new(), String::new(), String::new());
+		for (index, plan) in self.plans.iter().enumerate() {
+			let planes = self.block_planes(backend, plan);
+			if planes.is_empty() {
+				continue;
+			}
+			let node = index + 1;
+			let kind = |plane: usize| planes.get(plane).map_or(0, |(kind, _)| *kind);
+			let first_rows = planes[0].1 / plan.node.input.channels;
+			let first_bytes = planes[0].1 / 256 * if planes[0].0 == 1 { 144 } else { 210 };
+			kind_arms.push_str(&format!("i32 {node}, label %kind.n{node}\n"));
+			kind_bodies.push_str(&format!("kind.n{node}:\n%kind.n{node}.first = icmp eq i32 %plane, 0\n%kind.n{node}.value = select i1 %kind.n{node}.first, i32 {}, i32 {}\nret i32 %kind.n{node}.value\n", kind(0), kind(1)));
+			row_arms.push_str(&format!("i32 {node}, label %rows.n{node}\n"));
+			row_bodies.push_str(&format!("rows.n{node}:\nret i32 {first_rows}\n"));
+			base_arms.push_str(&format!("i32 {node}, label %base.n{node}\n"));
+			base_bodies.push_str(&format!("base.n{node}:\nret i64 {first_bytes}\n"));
+		}
+		format!(
+			"define internal i32 @recipe.model.plane.kind(i32 %node, i32 %plane) #1 {{\nentry:\nswitch i32 %node, label %kind.none [\n{kind_arms}]\n{kind_bodies}kind.none:\nret i32 0\n}}\ndefine internal i32 @recipe.model.plane.rows(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %rows.none [\n{row_arms}]\n{row_bodies}rows.none:\nret i32 -1\n}}\ndefine internal i64 @recipe.model.plane.base(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %base.none [\n{base_arms}]\n{base_bodies}base.none:\nret i64 0\n}}\n"
+		)
+	}
+
 	fn emit_q4k_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
 		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let q4k = self.block_dot_fits(backend, plan) && plan.stored.as_ref().is_some_and(|stored| {
-					let segments = stored.format_segments();
-					segments.len() == 1 && segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
-				});
+				let q4k = self.block_planes(backend, plan).iter().any(|(kind, _)| *kind == 1);
 				if q4k {
 					arms.push_str(&format!("i32 {}, label %q4k.yes\n", index + 1));
 				}
@@ -6042,10 +6097,7 @@ impl NativeModelIr {
 		let mut arms = String::new();
 		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let q6k = self.block_dot_fits(backend, plan) && plan.stored.as_ref().is_some_and(|stored| {
-					let segments = stored.format_segments();
-					segments.len() == 1 && segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
-				});
+				let q6k = self.block_planes(backend, plan).iter().any(|(kind, _)| *kind == 2);
 				if q6k {
 					arms.push_str(&format!("i32 {}, label %q6k.yes\n", index + 1));
 				}
@@ -6375,6 +6427,7 @@ impl NativeModelIr {
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
 		ir.push_str(&self.emit_tile_bytes());
+		ir.push_str(&self.emit_plane_support(backend));
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
 		ir.push_str(&model_load);

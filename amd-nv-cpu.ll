@@ -909,14 +909,24 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %jobs.adjusted = add i32 %out.channels, %waves
 %jobs.numerator = sub i32 %jobs.adjusted, 1
 %jobs = udiv i32 %jobs.numerator, %waves
-%q4.selector = call i1 @recipe.model.q4k(i32 %decode)
+; A stored weight of one or two planes of 256-value blocks, rows of the
+; second after the first: a row's format and byte base follow its plane.
+%plane.rows = call i32 @recipe.model.plane.rows(i32 %decode)
+%plane.base = call i64 @recipe.model.plane.base(i32 %decode)
+%plane.kind.0 = call i32 @recipe.model.plane.kind(i32 %decode, i32 0)
+%plane.kind.1 = call i32 @recipe.model.plane.kind(i32 %decode, i32 1)
+%plane.0.q4 = icmp eq i32 %plane.kind.0, 1
+%plane.1.q4 = icmp eq i32 %plane.kind.1, 1
+%plane.0.q6 = icmp eq i32 %plane.kind.0, 2
+%plane.1.q6 = icmp eq i32 %plane.kind.1, 2
+%q4.selector = or i1 %plane.0.q4, %plane.1.q4
 %int8.backend = call i1 @recipe.int8.dots()
 %int8.declared = call i1 @recipe.model.int.activations(i32 %decode)
 %int8.dots = and i1 %int8.backend, %int8.declared
 %q4.remainder = urem i32 %terms, 256
 %q4.aligned = icmp eq i32 %q4.remainder, 0
 %q4.available = and i1 %q4.selector, %q4.aligned
-%q6.selector = call i1 @recipe.model.q6k(i32 %decode)
+%q6.selector = or i1 %plane.0.q6, %plane.1.q6
 %q6.available = and i1 %q6.selector, %q4.aligned
 %b32.kind = call i32 @recipe.model.block32(i32 %decode)
 %b32.stride = call i64 @recipe.model.block32.stride(i32 %decode)
@@ -1119,11 +1129,27 @@ job.step:
 %channel.safe = select i1 %channel.active, i32 %channel, i32 0
 %channel.wide = zext i32 %channel.safe to i64
 %channel.offset = mul i64 %channel.wide, %terms.wide
+%row.second = icmp uge i32 %channel.safe, %plane.rows
+%row.kind = select i1 %row.second, i32 %plane.kind.1, i32 %plane.kind.0
+%row.local.raw = sub i32 %channel.safe, %plane.rows
+%row.local = select i1 %row.second, i32 %row.local.raw, i32 %channel.safe
+%row.local.wide = zext i32 %row.local to i64
+%row.q4 = icmp eq i32 %row.kind, 1
+%row.q6 = icmp eq i32 %row.kind, 2
+%row.stride = select i1 %row.q4, i64 144, i64 210
+%row.blocks = udiv i32 %terms, 256
+%row.blocks.wide = zext i32 %row.blocks to i64
+%row.bytes = mul i64 %row.blocks.wide, %row.stride
+%row.offset = mul i64 %row.local.wide, %row.bytes
+%row.plane.base = select i1 %row.second, i64 %plane.base, i64 0
+%row.base = add i64 %row.plane.base, %row.offset
+%row.q4.on = and i1 %q4.available, %row.q4
+%row.q6.on = and i1 %q6.available, %row.q6
 br i1 %exact, label %exact.q4.check, label %q4.check
 q4.check:
-br i1 %q4.available, label %q4.sum.loop, label %q6.check
+br i1 %row.q4.on, label %q4.sum.loop, label %q6.check
 exact.q4.check:
-br i1 %q4.available, label %exact.q4.loop, label %exact.q6.check
+br i1 %row.q4.on, label %exact.q4.loop, label %exact.q6.check
 exact.q4.loop:
 %exact.q4.slice = phi i32 [ %lane, %exact.q4.check ], [ %exact.q4.slice.next, %exact.q4.step ]
 %exact.q4.sum = phi RECIPE_STATE [ %state.zero, %exact.q4.check ], [ %exact.q4.sum.next, %exact.q4.step ]
@@ -1131,15 +1157,12 @@ exact.q4.loop:
 %exact.q4.more = icmp ult i32 %exact.q4.slice, %exact.q4.slices
 br i1 %exact.q4.more, label %exact.q4.step, label %exact.q4.done
 exact.q4.step:
-%exact.q4.row.blocks = udiv i32 %terms, 256
-%exact.q4.row.blocks.wide = zext i32 %exact.q4.row.blocks to i64
-%exact.q4.channel.row = mul i64 %channel.wide, %exact.q4.row.blocks.wide
 %exact.q4.block.local = udiv i32 %exact.q4.slice, 16
 %exact.q4.block = add i32 %exact.q4.block.local, %chunk.k.blocks
 %exact.q4.slice.local = urem i32 %exact.q4.slice, 16
 %exact.q4.block.wide = zext i32 %exact.q4.block to i64
-%exact.q4.block.index = add i64 %exact.q4.channel.row, %exact.q4.block.wide
-%exact.q4.byte.offset = mul i64 %exact.q4.block.index, 144
+%exact.q4.block.bytes = mul i64 %exact.q4.block.wide, 144
+%exact.q4.byte.offset = add i64 %row.base, %exact.q4.block.bytes
 %exact.q4.loaded = call RECIPE_STATE @recipe.q4k.exact(ptr addrspace(1) %weights, i64 %exact.q4.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q4.slice, i32 %chunk.pitch, i32 %exact.q4.slice.local)
 %exact.q4.value = select i1 %channel.active, RECIPE_STATE %exact.q4.loaded, RECIPE_STATE %state.zero
 %exact.q4.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q4.sum, RECIPE_STATE %exact.q4.value)
@@ -1148,7 +1171,7 @@ br label %exact.q4.loop
 exact.q4.done:
 br label %sum.done
 exact.q6.check:
-br i1 %q6.available, label %exact.q6.loop, label %exact.b32.check
+br i1 %row.q6.on, label %exact.q6.loop, label %exact.b32.check
 exact.q6.loop:
 %exact.q6.slice = phi i32 [ %lane, %exact.q6.check ], [ %exact.q6.slice.next, %exact.q6.step ]
 %exact.q6.sum = phi RECIPE_STATE [ %state.zero, %exact.q6.check ], [ %exact.q6.sum.next, %exact.q6.step ]
@@ -1156,15 +1179,12 @@ exact.q6.loop:
 %exact.q6.more = icmp ult i32 %exact.q6.slice, %exact.q6.slices
 br i1 %exact.q6.more, label %exact.q6.step, label %exact.q6.done
 exact.q6.step:
-%exact.q6.row.blocks = udiv i32 %terms, 256
-%exact.q6.row.blocks.wide = zext i32 %exact.q6.row.blocks to i64
-%exact.q6.channel.row = mul i64 %channel.wide, %exact.q6.row.blocks.wide
 %exact.q6.block.local = udiv i32 %exact.q6.slice, 16
 %exact.q6.block = add i32 %exact.q6.block.local, %chunk.k.blocks
 %exact.q6.slice.local = urem i32 %exact.q6.slice, 16
 %exact.q6.block.wide = zext i32 %exact.q6.block to i64
-%exact.q6.block.index = add i64 %exact.q6.channel.row, %exact.q6.block.wide
-%exact.q6.byte.offset = mul i64 %exact.q6.block.index, 210
+%exact.q6.block.bytes = mul i64 %exact.q6.block.wide, 210
+%exact.q6.byte.offset = add i64 %row.base, %exact.q6.block.bytes
 %exact.q6.loaded = call RECIPE_STATE @recipe.q6k.exact(ptr addrspace(1) %weights, i64 %exact.q6.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q6.slice, i32 %chunk.pitch, i32 %exact.q6.slice.local)
 %exact.q6.value = select i1 %channel.active, RECIPE_STATE %exact.q6.loaded, RECIPE_STATE %state.zero
 %exact.q6.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q6.sum, RECIPE_STATE %exact.q6.value)
@@ -1204,14 +1224,11 @@ q4.sum.loop:
 %q4.slice.more = icmp ult i32 %q4.slice, %q4.slices
 br i1 %q4.slice.more, label %q4.sum.step, label %q4.sum.done
 q4.sum.step:
-%q4.row.blocks = udiv i32 %terms, 256
-%q4.row.blocks.wide = zext i32 %q4.row.blocks to i64
-%q4.channel.row = mul i64 %channel.wide, %q4.row.blocks.wide
 %q4.block = udiv i32 %q4.slice, 16
 %q4.slice.local = urem i32 %q4.slice, 16
 %q4.block.wide = zext i32 %q4.block to i64
-%q4.block.index = add i64 %q4.channel.row, %q4.block.wide
-%q4.byte.offset = mul i64 %q4.block.index, 144
+%q4.block.bytes = mul i64 %q4.block.wide, 144
+%q4.byte.offset = add i64 %row.base, %q4.block.bytes
 %q4.q8.offset = mul i64 %q4.block.wide, 288
 %q4.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q4.q8.offset
 %q4.loaded = call RECIPE_STATE @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %q4.byte.offset, ptr addrspace(3) %q4.q8.ptr, i32 %q4.slice.local)
@@ -1224,7 +1241,7 @@ br label %q4.sum.loop
 q4.sum.done:
 br label %sum.done
 q6.check:
-br i1 %q6.available, label %q6.sum.loop, label %b32.check
+br i1 %row.q6.on, label %q6.sum.loop, label %b32.check
 q6.sum.loop:
 %q6.slice = phi i32 [ %lane, %q6.check ], [ %q6.slice.next, %q6.slice.ready ]
 %q6.sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6.sum.next, %q6.slice.ready ]
@@ -1232,14 +1249,11 @@ q6.sum.loop:
 %q6.slice.more = icmp ult i32 %q6.slice, %q6.slices
 br i1 %q6.slice.more, label %q6.sum.step, label %q6.sum.done
 q6.sum.step:
-%q6.row.blocks = udiv i32 %terms, 256
-%q6.row.blocks.wide = zext i32 %q6.row.blocks to i64
-%q6.channel.row = mul i64 %channel.wide, %q6.row.blocks.wide
 %q6.block = udiv i32 %q6.slice, 16
 %q6.slice.local = urem i32 %q6.slice, 16
 %q6.block.wide = zext i32 %q6.block to i64
-%q6.block.index = add i64 %q6.channel.row, %q6.block.wide
-%q6.byte.offset = mul i64 %q6.block.index, 210
+%q6.block.bytes = mul i64 %q6.block.wide, 210
+%q6.byte.offset = add i64 %row.base, %q6.block.bytes
 %q6.q8.offset = mul i64 %q6.block.wide, 288
 %q6.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q6.q8.offset
 %q6.loaded = call RECIPE_STATE @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %q6.byte.offset, ptr addrspace(3) %q6.q8.ptr, i32 %q6.slice.local)
