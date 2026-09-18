@@ -34,6 +34,8 @@ mod program_ir {
 		/// The exact product of the Multiply at `left` plus `right`, in one
 		/// rounding: fma(multiply.left, multiply.right, right).
 		FusedAdd = 16,
+		/// The left operand rounded through fp16 and back.
+		Half = 17,
 	}
 
 	impl ScalarOpcode {
@@ -55,6 +57,7 @@ mod program_ir {
 				14 => Ok(Self::StraightThrough),
 				15 => Ok(Self::Select),
 				16 => Ok(Self::FusedAdd),
+				17 => Ok(Self::Half),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -309,6 +312,12 @@ mod program_ir {
 					let _ = writeln!(output, "{name} = call {ty} @recipe.state.madd{suffix}({ty} {addend}, {ty} {left}, {ty} {right})");
 					name
 				}
+				ScalarOpcode::Half => {
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
+					let _ = writeln!(output, "{name}.half = call half @recipe.state.to.f16{suffix}({ty} {left})");
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.f16{suffix}(half {name}.half)");
+					name
+				}
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater => {
 					let left = scalar_operand(instruction.left, &values, &first, &second)?;
 					let right = scalar_operand(instruction.right, &values, &first, &second)?;
@@ -407,7 +416,8 @@ mod program_ir {
 				| ScalarOpcode::Sin
 				| ScalarOpcode::Cos
 				| ScalarOpcode::Tanh
-				| ScalarOpcode::FusedAdd => format!("%{}.scalar.{index}", context.prefix),
+				| ScalarOpcode::FusedAdd
+				| ScalarOpcode::Half => format!("%{}.scalar.{index}", context.prefix),
 			};
 			values.push(value);
 		}
@@ -437,7 +447,7 @@ mod program_ir {
 		};
 		for (index, instruction) in instructions.iter().enumerate().rev() {
 			let adjoint = adjoints[index].clone();
-			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter) { String::new() } else { operand(instruction.left, &values)? };
+			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::FusedAdd) { String::new() } else { operand(instruction.left, &values)? };
 			let right = if matches!(
 				instruction.opcode,
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough
@@ -565,6 +575,10 @@ mod program_ir {
 					add_operand(&mut output, product.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, product.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, instruction.right, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+				}
+				ScalarOpcode::Half => {
+					// A rounding passes its adjoint straight through.
+					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
 			}
@@ -2229,8 +2243,9 @@ impl NativeLayout {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			let bytes = graph_rows_buffer(node.output, rows, node.precision.bytes())?;
 			// A traced run keeps the nodes its dump reads: the first forty and the
-			// last four; every other slot is reused as in an untraced run.
-			let dumped = tracing() && (index < 40 || index + 4 >= graph.nodes.len());
+			// last four, or the RECIPE_TRACE_NODES=a..b range; every other slot is
+			// reused as in an untraced run.
+			let dumped = tracing() && traced_node(index, graph.nodes.len());
 			let reuse = inference && !retained[index] && !dumped;
 			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
 				Some(position) => released.remove(position).1,
@@ -2286,7 +2301,7 @@ impl NativeLayout {
 					if position > 0 && operands[position - 1] == operand as i32 {
 						continue;
 					}
-					if last[operand] == index && !retained[operand] {
+					if last[operand] == index && !retained[operand] && !(tracing() && traced_node(operand, graph.nodes.len())) {
 						released.push((graph_rows_buffer(graph.nodes[operand].output, rows, graph.nodes[operand].precision.bytes())?, values[operand]));
 					}
 				}
@@ -6878,6 +6893,19 @@ fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32
 		pooled = index_pooled,
 		index_base = native_literal(precision.state, precision.state_type, index_base),
 	))
+}
+/// Whether a traced run dumps (and so keeps the arena of) node `index` of
+/// `total`: the first forty and the last four, or the RECIPE_TRACE_NODES=a..b
+/// range when one is named.
+fn traced_node(index: usize, total: usize) -> bool {
+	let range = std::env::var("RECIPE_TRACE_NODES").ok().and_then(|text| {
+		let (from, to) = text.split_once("..")?;
+		Some((from.trim().parse::<usize>().ok()?, to.trim().parse::<usize>().ok()?))
+	});
+	match range {
+		Some((from, to)) => (from..to).contains(&index),
+		None => index < 40 || index + 4 >= total,
+	}
 }
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
@@ -14742,6 +14770,9 @@ impl Infer {
 		let device = selected_gpu()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
+		// RECIPE_CONTEXT caps the positions a traced probe fits, so its retained
+		// arenas stay small.
+		let ceiling = std::env::var("RECIPE_CONTEXT").ok().and_then(|text| text.parse::<usize>().ok()).map_or(ceiling, |cap| cap.clamp(1, ceiling));
 		let coder = file.tokenizer();
 		let message = std::env::args().nth(1).unwrap_or_else(|| "What is the capital of France?".to_owned());
 		let text = coder.prompt(&[("user", message.as_str())], true)?;
@@ -16426,6 +16457,35 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
+		Activation::Gelu if graph.profile.gelu_table => {
+			// llama.cpp's fp16 gelu table: between -10 and 10 the input rounds to
+			// fp16, the tanh form above runs in fp32 on it, and the result rounds
+			// to fp16; at 10 and above the input passes as it is, at -10 and below
+			// the result is zero.
+			let ten = constant(&mut program, 10.0);
+			let minus_ten = constant(&mut program, -10.0);
+			let rounded = program.unary(ScalarOpcode::Half, x);
+			let cubic = constant(&mut program, config.activation[6]);
+			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, rounded);
+			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, rounded);
+			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
+			let scale = constant(&mut program, config.activation[5]);
+			let scale_x = program.op(ScalarOpcode::Multiply, scale, rounded);
+			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
+			let tanh = program.unary(ScalarOpcode::Tanh, argument);
+			let shifted = program.op(ScalarOpcode::Add, one, tanh);
+			let half = constant(&mut program, 0.5);
+			let half_x = program.op(ScalarOpcode::Multiply, half, rounded);
+			let value = program.op(ScalarOpcode::Multiply, half_x, shifted);
+			let tabled = program.unary(ScalarOpcode::Half, value);
+			let above = program.op(ScalarOpcode::Greater, x, ten);
+			let below = program.op(ScalarOpcode::Greater, minus_ten, x);
+			let outside = program.op(ScalarOpcode::Add, above, below);
+			let inside = program.op(ScalarOpcode::Subtract, one, outside);
+			let passed = program.op(ScalarOpcode::Select, above, x);
+			let kept = program.op(ScalarOpcode::Select, inside, tabled);
+			program.op(ScalarOpcode::Add, passed, kept)
+		}
 		Activation::Gelu => {
 			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
 			// one fused step where its compiler fuses one, so an fp32 gelu prints
@@ -17642,11 +17702,14 @@ pub(crate) struct Precisions {
 	/// `portable`, recipe's own double-evaluated exp, log, sin, cos and tanh,
 	/// the same bits on every backend; or `libm`, the platform's on the CPU.
 	libm: bool,
+	/// Whether gelu takes llama.cpp's fp16 table form: fp16 in and out between
+	/// -10 and 10, the input itself at 10 and above, zero at -10 and below.
+	gelu_table: bool,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false, gelu_table: false }
 	}
 }
 impl Precisions {
@@ -17678,6 +17741,14 @@ impl Precisions {
 		let mut precisions = Self::default();
 		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
 			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			if key == "gelu-table" {
+				precisions.gelu_table = match value.trim().trim_matches('"') {
+					"none" => false,
+					"fp16" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] gelu-table = {other}: a gelu table is none or fp16"))),
+				};
+				continue;
+			}
 			if key == "math" {
 				precisions.libm = match value.trim().trim_matches('"') {
 					"portable" => false,
@@ -17727,7 +17798,7 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order and math the transcendentals' source"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order, math the transcendentals' source and gelu-table the gelu's table"))),
 			}
 		}
 		Ok(precisions)
@@ -18472,8 +18543,9 @@ impl NativeTape {
 			let reached = self.reached.load(Ordering::Relaxed) as usize;
 			// The first two blocks and the model's last nodes: enough to place a
 			// divergence, without reading every arena of a deep model.
+			// RECIPE_TRACE_NODES=a..b names another range of nodes instead.
 			let total = layout.values.len();
-			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| *index < 40 || *index + 4 >= total) {
+			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| traced_node(*index, total)) {
 				let shape = self.nodes[index].output;
 				let (channels, length) = (shape.channels, shape.length);
 				let positions = reached.clamp(1, length.max(1));
@@ -18507,6 +18579,18 @@ impl NativeTape {
 						let values = (start..(start + 3).min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
 						let ending = (start..(start + 3).min(channels)).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
 						at.push_str(&format!(" at {start} {values:?} ending {ending:?}"));
+						// RECIPE_TRACE_ROW=p prints every channel at position p, once per node.
+						if start == 0 {
+							if let Some(position) = std::env::var("RECIPE_TRACE_ROW").ok().and_then(|text| text.parse::<usize>().ok()).filter(|position| *position < positions) {
+								let row = (0..channels).map(|channel| one(channel, position)).collect::<Result<Vec<_>>>()?;
+								at.push_str(&format!(" row {position} {row:?}"));
+							}
+						}
+						// RECIPE_TRACE_POSITIONS=1 also prints the three values at every position.
+						if std::env::var("RECIPE_TRACE_POSITIONS").is_ok() {
+							let rows = (0..positions).map(|position| (start..(start + 3).min(channels)).map(|channel| one(channel, position)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+							at.push_str(&format!(" positions {rows:?}"));
+						}
 					}
 				}
 				let sum = if whole {

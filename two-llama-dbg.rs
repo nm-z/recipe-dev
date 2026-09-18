@@ -10,7 +10,7 @@ fn main() {
 		.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
 		.scale(gemma3.embedding_length.sqrt());
 
-	for _ in 0..1 {
+	for _ in 0..2 {
 		model = model
 			.res([
 				norm(rms).acc(64),

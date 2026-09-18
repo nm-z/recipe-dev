@@ -157,3 +157,5 @@ rope-angle = "chain"
 attn-softmax = "online"
 # llama.cpp's exp, tanh and log are the CPU's libm.
 math = "libm"
+# llama.cpp reads gelu from an fp16 table between -10 and 10.
+gelu-table = "fp16"
