@@ -147,5 +147,7 @@ atvn = "fp32"
 norm = "fp32"
 res = "fp32"
 acc = "fp32"
+# llama.cpp's norms sum fp32 squares in double and finish in fp32.
+norm-acc = "fp64"
 # llama.cpp rounds a sum's inputs to Q8_K: one step per 256.
 step = 256

@@ -189,12 +189,13 @@ define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { en
 /// state, none under a double one.
 fn cpu_int8_helpers(state: &str) -> String {
 	format!(
-		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}",
+		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}{}",
 		state == "float",
 		if state == "float" { generic_dot4_helpers() } else { String::new() },
 		amd_q4_slice_helper(state, state == "float"),
 		amd_q6_slice_helper(state, state == "float"),
-		amd_block32_slice_helper(state, state == "float")
+		amd_block32_slice_helper(state, state == "float"),
+		format!("{}{}", q4_ints_helper(state), q6_part_helper(state))
 	)
 }
 /// A CUDA warp of 32 lanes is the wave; a partner is read through
@@ -215,9 +216,10 @@ define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {int8} }}
 define internal i64 @recipe.clock() #1 {{ entry: %now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer() ret i64 %now }}
 define internal {state} @recipe.wave.partner({state} %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 {partner} }}
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 %bits, i32 %lane, i32 31) %partner = bitcast i32 %partner.bits to float ret float %partner }}
-{dot4}{q4}{q6}{b32}",
+{dot4}{q4}{q6}{b32}{ints}",
 		int8 = state == "float",
 		dot4 = if state == "float" { generic_dot4_helpers() } else { String::new() },
+		ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state)),
 		q4 = amd_q4_slice_helper(state, state == "float"),
 		q6 = amd_q6_slice_helper(state, state == "float"),
 		b32 = amd_block32_slice_helper(state, state == "float"),
@@ -332,6 +334,39 @@ fn amd_q4_slice_helper(state: &str, full: bool) -> String {
 	}
 	ir.push_str(&format!("%dot.value = call {state} @recipe.state.from.s32(i32 {dot_sum})\n%q8.value = call {state} @recipe.state.from.s32(i32 {q8_sum})\n%dot.scaled = call {state} @recipe.state.mul({state} %group.d, {state} %dot.value)\n%minimum.scaled = call {state} @recipe.state.mul({state} %group.dmin, {state} %q8.value)\n%value = call {state} @recipe.state.sub({state} %dot.scaled, {state} %minimum.scaled)\n%result = call {state} @recipe.state.mul({state} %q8.d.state, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
 	ir
+}
+/// The int partials of one Q4_K slice under a 256-value step: the slice's
+/// codes times its Q8 codes, times the group's 6-bit scale, and the group's
+/// 6-bit minimum times the Q8 codes' sum — both exact in i32, so a block's
+/// 16 slices add in any order and the block's float math happens once, in
+/// the order llama.cpp's Q4_K kernels use.
+fn q4_ints_helper(state: &str) -> String {
+	if state != "float" {
+		return "define internal i64 @recipe.q4k.ints(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: ret i64 0 }\n".to_owned();
+	}
+	let full = amd_q4_slice_helper(state, true);
+	let head = full.split("%dot.value = call").next().expect("the slice helper computes its int sums before its float tail");
+	// The two partials come back in one i64 (the dot in the high word, the
+	// minimum sum in the low): the variant linker reads a definition's name
+	// up to its first brace, so an aggregate return type is not for it.
+	let head = head.replacen(&format!("define internal {state} @recipe.q4k.slice("), "define internal i64 @recipe.q4k.ints(", 1);
+	format!("{head}%ints.dot = mul i32 %scale.code, %w3.dot.sum\n%ints.min = mul i32 %minimum, %w3.q8.sum\n%ints.dot.wide = sext i32 %ints.dot to i64\n%ints.dot.high = shl i64 %ints.dot.wide, 32\n%ints.min.wide = zext i32 %ints.min to i64\n%ints = or i64 %ints.dot.high, %ints.min.wide\nret i64 %ints\n}}\n")
+}
+/// The int partials of one four-value word of a Q6_K slice under a 256-value
+/// step: the word's codes times its Q8 codes, times the slice's 8-bit scale
+/// (high word), and the scale times the Q8 codes' sum (low word). llama.cpp's
+/// Q6_K kernel keeps eight int lanes per block, lane l holding the words at
+/// 4l..4l+4 of every 32-value group, less 32 times the scaled Q8 sums of
+/// group l; each lane meets its own float accumulator once per block and the
+/// eight accumulators add in a fixed tree at the end.
+fn q6_part_helper(state: &str) -> String {
+	if state != "float" {
+		return "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry: ret i64 0 }\n".to_owned();
+	}
+	let full = amd_q6_slice_helper(state, true);
+	let head = full.split("%dot.zero = add i32 0, 0").next().expect("the slice helper computes its prelude before its words");
+	let head = head.replacen(&format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:"), "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry:", 1);
+	format!("{head}%word.wide = zext i32 %word to i64\n%word.offset = mul i64 %word.wide, 4\n%p.ql.offset = add i64 %half.ql.base, %word.offset\n%p.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.ql.offset\n%p.ql = load i32, ptr addrspace(1) %p.ql.ptr, align 2\n%p.ql.shifted = lshr i32 %p.ql, %ql.shift\n%p.ql.codes = and i32 %p.ql.shifted, 252645135\n%p.qh.offset = add i64 %half.qh.base, %word.offset\n%p.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.qh.offset\n%p.qh = load i32, ptr addrspace(1) %p.qh.ptr, align 2\n%p.qh.shifted = lshr i32 %p.qh, %qh.shift\n%p.qh.codes = and i32 %p.qh.shifted, 50529027\n%p.qh.bits = shl i32 %p.qh.codes, 4\n%p.codes = or i32 %p.ql.codes, %p.qh.bits\n%p.q8.offset.base = add i64 %q8.half.offset, 4\n%p.q8.offset = add i64 %p.q8.offset.base, %word.offset\n%p.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %p.q8.offset\n%p.q8 = load i32, ptr addrspace(3) %p.q8.ptr, align 4\n%p.dot = call i32 @recipe.dot4.su(i32 %p.codes, i32 %p.q8)\n%p.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %p.q8)\n%p.dot.scaled = mul i32 %scale, %p.dot\n%p.sum.scaled = mul i32 %scale, %p.sum\n%p.dot.wide = sext i32 %p.dot.scaled to i64\n%p.dot.high = shl i64 %p.dot.wide, 32\n%p.sum.wide = zext i32 %p.sum.scaled to i64\n%p.ints = or i64 %p.dot.high, %p.sum.wide\nret i64 %p.ints\n}}\n")
 }
 /// One 16-value Q6_K slice. Q6 scales are already 16 values wide, so the
 /// slice index names the scale directly; the two adjacent slices share one
@@ -1157,7 +1192,8 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		let state = template_state(base);
 		let helpers = if state == "double" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
 		let dot = if state == "float" { AMD_DOT4_HELPERS } else { "" };
-		let helpers = format!("{}\n{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"));
+		let ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state));
+		let helpers = format!("{}\n{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"), ints);
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;

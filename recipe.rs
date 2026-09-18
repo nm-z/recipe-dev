@@ -5537,6 +5537,15 @@ impl NativeModelIr {
 		let zero = native_literal(self.node_precision(node).state, state_ty, 0.0);
 		let one = native_literal(self.node_precision(node).state, state_ty, 1.0);
 		let epsilon = native_literal(self.node_precision(node).state, state_ty, node.argument[1]);
+		// A declared accumulator wider than the block widens the sum alone: the
+		// squares, the mean, the epsilon shift, the root and the reciprocal stay
+		// at the block's precision, the way llama.cpp's rms_norm sums fp32
+		// squares in double and finishes in fp32. The block's own state keeps
+		// every step wide.
+		let precision = self.node_precision(node);
+		let wide_sum_only = precision.acc == Compute::FP64 && precision.model != Compute::FP64 && precision.state == Compute::FP64;
+		let epsilon_model = native_literal(precision.model, ty, node.argument[1]);
+		let one_model = native_literal(precision.model, ty, 1.0);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
 		let width = normalize_width(node);
@@ -5676,6 +5685,12 @@ impl NativeModelIr {
 				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt{v}({state_ty} {variance_total})\n%{prefix}.floored = call i1 @recipe.state.ogt{v}({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n",
 				variance_total = variance_total,
 			)
+		} else if wide_sum_only {
+			format!(
+				"%{prefix}.variance.wide = call {state_ty} @recipe.state.div{v}({state_ty} {variance_total}, {state_ty} {variance_items})\n%{prefix}.variance = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.wide)\n%{prefix}.adjusted = call {ty} @recipe.add{v}({ty} %{prefix}.variance, {ty} {epsilon_model})\n%{prefix}.deviation.model = call {ty} @recipe.sqrt{v}({ty} %{prefix}.adjusted)\n%{prefix}.scale = call {ty} @recipe.div{v}({ty} {one_model}, {ty} %{prefix}.deviation.model)\n",
+				variance_total = variance_total,
+				variance_items = variance_items,
+			)
 		} else {
 			format!(
 				"%{prefix}.variance = call {state_ty} @recipe.state.div{v}({state_ty} {variance_total}, {state_ty} {variance_items})\n%{prefix}.adjusted = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt{v}({state_ty} %{prefix}.adjusted)\n",
@@ -5683,22 +5698,30 @@ impl NativeModelIr {
 				variance_items = variance_items,
 			)
 		};
+		let scale_code = if wide_sum_only && mode != program_ir::NormalizeMode::L2 {
+			scale_code
+		} else {
+			format!("{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n")
+		};
+		let square_code = if wide_sum_only {
+			format!("%{prefix}.variance.square.model = call {ty} @recipe.mul{v}({ty} {difference_model}, {ty} {difference_model})\n%{prefix}.variance.square = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.square.model)\n", difference_model = if zero_mean { format!("%{prefix}.variance.model") } else { format!("%{prefix}.variance.centered.model") })
+		} else {
+			format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n")
+		};
 		ir.push_str(&format!(
-			"%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
 			prefix = prefix,
 			state_ty = state_ty,
-			difference = difference,
+			centered_model = if wide_sum_only && !zero_mean { format!("%{prefix}.variance.centered.model = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.centered)\n") } else { String::new() },
 			item_step = item_step,
 			variance_next = variance_next,
 		));
 		let stored_mean = if zero_mean { model_zero } else { format!("%{prefix}.mean.stored") };
 		let store_code = if mode.per_row() {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
-				state_ty = state_ty,
-				one = one,
 				ty = ty,
 				pointer = pointer,
 				context = pointers.context,
@@ -5712,11 +5735,10 @@ impl NativeModelIr {
 			)
 		} else {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.mean.stored = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.mean)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
 				state_ty = state_ty,
-				one = one,
 				ty = ty,
 				pointer = pointer,
 				context = pointers.context,
@@ -16115,7 +16137,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let kind = precision_kind(op, graph.block_kind);
 	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
 	let precision = named.unwrap_or(graph.profile.of(kind));
-	let acc = graph.block_acc.unwrap_or(graph.profile.acc);
+	let acc = graph.block_acc.unwrap_or(graph.profile.acc_of(kind));
 	let int_step = graph.block_int_step.unwrap_or(graph.profile.step);
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
@@ -17420,6 +17442,19 @@ enum PrecisionKind {
 	Res,
 }
 impl PrecisionKind {
+	/// The kind a table key names.
+	fn named(name: &str) -> Option<Self> {
+		Some(match name {
+			"sum" => Self::Sum,
+			"embed" => Self::Embed,
+			"attn" => Self::Attn,
+			"rope" => Self::Rope,
+			"atvn" => Self::Atvn,
+			"norm" => Self::Norm,
+			"res" => Self::Res,
+			_ => return None,
+		})
+	}
 	/// The kinds a block's blck suffix names: the op that holds its numbers.
 	fn blck(self) -> bool {
 		matches!(self, Self::Sum | Self::Embed | Self::Attn)
@@ -17440,6 +17475,10 @@ pub(crate) struct Precisions {
 	res: Compute,
 	/// The accumulator every block carries unless it names its own: fp32 or fp64.
 	acc: Compute,
+	/// An accumulator for one kind of op, when the table names it under
+	/// `kind-acc`: `norm-acc = "fp64"` gives every norm, the head norms inside
+	/// an attention block too, a wide sum while the sums keep the plain `acc`.
+	kind_acc: [Option<Compute>; 7],
 	/// The inputs that share one step under an int precision unless the block
 	/// names its own: 32 by default.
 	step: u32,
@@ -17447,10 +17486,15 @@ pub(crate) struct Precisions {
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, step: 32 }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32 }
 	}
 }
 impl Precisions {
+	/// The accumulator of one kind of op: the kind's own when named, else the
+	/// table's.
+	fn acc_of(&self, kind: PrecisionKind) -> Compute {
+		self.kind_acc[kind as usize].unwrap_or(self.acc)
+	}
 	fn of(&self, kind: PrecisionKind) -> Compute {
 		match kind {
 			PrecisionKind::Sum => self.sum,
@@ -17480,6 +17524,12 @@ impl Precisions {
 				continue;
 			}
 			let compute = precision_named(value).map_err(|error| RecipeError::new(format!("[precision.{name}] {key}: {error}")))?;
+			if let Some(kind) = key.strip_suffix("-acc") {
+				require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] {key} = {value}: an accumulator is fp32 or fp64"))?;
+				let kind = PrecisionKind::named(kind).ok_or_else(|| RecipeError::new(format!("[precision.{name}] {key}: the kinds are sum, embed, attn, rope, kv, atvn, norm, res")))?;
+				precisions.kind_acc[kind as usize] = Some(compute);
+				continue;
+			}
 			match key {
 				"sum" => precisions.sum = compute,
 				"embed" => precisions.embed = compute,
@@ -17493,7 +17543,7 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator and step the int step"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, and step the int step"))),
 			}
 		}
 		Ok(precisions)
@@ -18264,12 +18314,23 @@ impl NativeTape {
 				};
 				let first = (0..3.min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
 				let last = (channels.saturating_sub(3)..channels).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
+				// RECIPE_TRACE_CHANNELS=4096,5120 also prints three values from each
+				// named channel at the first and the last position: a joined
+				// projection's later heads against a reference that dumps them apart.
+				let mut at = String::new();
+				for start in std::env::var("RECIPE_TRACE_CHANNELS").ok().into_iter().flat_map(|list| list.split(',').filter_map(|text| text.trim().parse::<usize>().ok()).collect::<Vec<_>>()) {
+					if start < channels {
+						let values = (start..(start + 3).min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
+						let ending = (start..(start + 3).min(channels)).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
+						at.push_str(&format!(" at {start} {values:?} ending {ending:?}"));
+					}
+				}
 				let sum = if whole {
 					(0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| one(channel, position)).sum::<Result<f64>>()?.to_string()
 				} else {
 					"-".to_owned()
 				};
-				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?} sum {sum}", self.nodes[index].identity(index)))?;
+				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)

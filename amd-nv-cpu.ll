@@ -1084,9 +1084,13 @@ q8.max.done:
 %q8.max.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.value)
 %q8.nonzero = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.abs, RECIPE_STATE %q8.zero)
 %q8.max.safe = select i1 %q8.nonzero, RECIPE_STATE %q8.max.value, RECIPE_STATE %q8.one
-%q8.max.abs.safe = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.safe)
-%q8.d.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.max.abs.safe, RECIPE_STATE %q8.levels)
-%q8.inverse.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.d.raw)
+; The step as llama.cpp's Q8 quantizers form it: the code scale is -127
+; over the signed extreme (one division), the step its reciprocal, so a
+; code is the input times that scale rounded to even and the products come
+; out the same whichever backend rounds them.
+%q8.levels.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %q8.levels)
+%q8.inverse.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.levels.negative, RECIPE_STATE %q8.max.safe)
+%q8.d.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.inverse.raw)
 %q8.inverse = select i1 %q8.nonzero, RECIPE_STATE %q8.inverse.raw, RECIPE_STATE %q8.zero
 %q8.d = select i1 %q8.nonzero, RECIPE_STATE %q8.d.raw, RECIPE_STATE %q8.zero
 %q8.d.f32 = call float @recipe.state.to.f32(RECIPE_STATE %q8.d)
@@ -1120,8 +1124,8 @@ q8.code.lane.step:
 %q8.code.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q8.code.value, RECIPE_STATE %q8.inverse)
 %q8.code.even = call RECIPE_STATE @recipe.state.roundeven(RECIPE_STATE %q8.code.scaled)
 %q8.code.int.raw = call i32 @recipe.state.to.s32(RECIPE_STATE %q8.code.even)
-%q8.code.low = icmp slt i32 %q8.code.int.raw, -127
-%q8.code.low.clamped = select i1 %q8.code.low, i32 -127, i32 %q8.code.int.raw
+%q8.code.low = icmp slt i32 %q8.code.int.raw, -128
+%q8.code.low.clamped = select i1 %q8.code.low, i32 -128, i32 %q8.code.int.raw
 %q8.code.high = icmp sgt i32 %q8.code.low.clamped, 127
 %q8.code.int = select i1 %q8.code.high, i32 127, i32 %q8.code.low.clamped
 br label %q8.code.store
@@ -1169,9 +1173,187 @@ job.step:
 %row.base = add i64 %row.plane.base, %row.offset
 %row.q4.on = and i1 %q4.available, %row.q4
 %row.q6.on = and i1 %q6.available, %row.q6
+; A Q4_K row under a 256-value step sums each block as llama.cpp's Q4_K
+; kernels do: the block's codes times scales exactly in i32, then one fma
+; per block in block order, the minimums on their own chain, subtracted last.
+%q8.is256 = icmp eq i32 %q8.span, 8
+%row.q4.block = and i1 %row.q4.on, %q8.is256
 br i1 %exact, label %exact.q4.check, label %q4.check
 q4.check:
+br i1 %row.q4.block, label %q4b.loop, label %q4.check.slices
+q4.check.slices:
 br i1 %row.q4.on, label %q4.sum.loop, label %q6.check
+q4b.loop:
+%q4b.block = phi i32 [ 0, %q4.check ], [ %q4b.block.next, %q4b.done ]
+%q4b.acc = phi RECIPE_STATE [ %state.zero, %q4.check ], [ %q4b.acc.next, %q4b.done ]
+%q4b.accmin = phi RECIPE_STATE [ %state.zero, %q4.check ], [ %q4b.accmin.next, %q4b.done ]
+%q4b.blocks = udiv i32 %terms, 256
+%q4b.more = icmp ult i32 %q4b.block, %q4b.blocks
+br i1 %q4b.more, label %q4b.step, label %q4b.exit
+q4b.step:
+%q4b.block.wide = zext i32 %q4b.block to i64
+%q4b.block.bytes = mul i64 %q4b.block.wide, 144
+%q4b.byte = add i64 %row.base, %q4b.block.bytes
+%q4b.q8.offset = mul i64 %q4b.block.wide, 288
+%q4b.q8 = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q4b.q8.offset
+br label %q4b.slice.loop
+q4b.slice.loop:
+; Sixteen slices of sixteen values; llama.cpp folds each quarter of the block
+; (two sub-blocks, 64 values) into one exact int and one fma, so the slices
+; keep four int sums, one per quarter, and the quarters meet the accumulator
+; in order. A quarter's int stays under 2^24, so its float is exact.
+%q4b.s = phi i32 [ %lane, %q4b.step ], [ %q4b.s.next, %q4b.slice.step ]
+%q4b.dot0 = phi i32 [ 0, %q4b.step ], [ %q4b.dot0.next, %q4b.slice.step ]
+%q4b.dot1 = phi i32 [ 0, %q4b.step ], [ %q4b.dot1.next, %q4b.slice.step ]
+%q4b.dot2 = phi i32 [ 0, %q4b.step ], [ %q4b.dot2.next, %q4b.slice.step ]
+%q4b.dot3 = phi i32 [ 0, %q4b.step ], [ %q4b.dot3.next, %q4b.slice.step ]
+%q4b.min0 = phi i32 [ 0, %q4b.step ], [ %q4b.min0.next, %q4b.slice.step ]
+%q4b.min1 = phi i32 [ 0, %q4b.step ], [ %q4b.min1.next, %q4b.slice.step ]
+%q4b.min2 = phi i32 [ 0, %q4b.step ], [ %q4b.min2.next, %q4b.slice.step ]
+%q4b.min3 = phi i32 [ 0, %q4b.step ], [ %q4b.min3.next, %q4b.slice.step ]
+%q4b.s.more = icmp ult i32 %q4b.s, 16
+br i1 %q4b.s.more, label %q4b.slice.step, label %q4b.slice.done
+q4b.slice.step:
+%q4b.ints = call i64 @recipe.q4k.ints(ptr addrspace(1) %weights, i64 %q4b.byte, ptr addrspace(3) %q4b.q8, i32 %q4b.s)
+%q4b.ints.dot.wide = ashr i64 %q4b.ints, 32
+%q4b.ints.dot = trunc i64 %q4b.ints.dot.wide to i32
+%q4b.ints.min = trunc i64 %q4b.ints to i32
+%q4b.quarter = lshr i32 %q4b.s, 2
+%q4b.in0 = icmp eq i32 %q4b.quarter, 0
+%q4b.in1 = icmp eq i32 %q4b.quarter, 1
+%q4b.in2 = icmp eq i32 %q4b.quarter, 2
+%q4b.in3 = icmp eq i32 %q4b.quarter, 3
+%q4b.dot0.add = select i1 %q4b.in0, i32 %q4b.ints.dot, i32 0
+%q4b.dot1.add = select i1 %q4b.in1, i32 %q4b.ints.dot, i32 0
+%q4b.dot2.add = select i1 %q4b.in2, i32 %q4b.ints.dot, i32 0
+%q4b.dot3.add = select i1 %q4b.in3, i32 %q4b.ints.dot, i32 0
+%q4b.min0.add = select i1 %q4b.in0, i32 %q4b.ints.min, i32 0
+%q4b.min1.add = select i1 %q4b.in1, i32 %q4b.ints.min, i32 0
+%q4b.min2.add = select i1 %q4b.in2, i32 %q4b.ints.min, i32 0
+%q4b.min3.add = select i1 %q4b.in3, i32 %q4b.ints.min, i32 0
+%q4b.dot0.next = add i32 %q4b.dot0, %q4b.dot0.add
+%q4b.dot1.next = add i32 %q4b.dot1, %q4b.dot1.add
+%q4b.dot2.next = add i32 %q4b.dot2, %q4b.dot2.add
+%q4b.dot3.next = add i32 %q4b.dot3, %q4b.dot3.add
+%q4b.min0.next = add i32 %q4b.min0, %q4b.min0.add
+%q4b.min1.next = add i32 %q4b.min1, %q4b.min1.add
+%q4b.min2.next = add i32 %q4b.min2, %q4b.min2.add
+%q4b.min3.next = add i32 %q4b.min3, %q4b.min3.add
+%q4b.s.next = add i32 %q4b.s, %width
+br label %q4b.slice.loop
+q4b.slice.done:
+; The lanes that hold slices meet: an int sum per quarter, exact in any
+; order; lanes past the sixteenth hold zero, and every lane ends with all four.
+%q4b.red.width.raw = icmp ult i32 %width, 16
+%q4b.red.width = select i1 %q4b.red.width.raw, i32 %width, i32 16
+%q4b.red.initial = lshr i32 %q4b.red.width, 1
+br label %q4b.red.loop
+q4b.red.loop:
+%q4b.red.offset = phi i32 [ %q4b.red.initial, %q4b.slice.done ], [ %q4b.red.offset.next, %q4b.red.step ]
+%q4b.red.dot0 = phi i32 [ %q4b.dot0, %q4b.slice.done ], [ %q4b.red.dot0.next, %q4b.red.step ]
+%q4b.red.dot1 = phi i32 [ %q4b.dot1, %q4b.slice.done ], [ %q4b.red.dot1.next, %q4b.red.step ]
+%q4b.red.dot2 = phi i32 [ %q4b.dot2, %q4b.slice.done ], [ %q4b.red.dot2.next, %q4b.red.step ]
+%q4b.red.dot3 = phi i32 [ %q4b.dot3, %q4b.slice.done ], [ %q4b.red.dot3.next, %q4b.red.step ]
+%q4b.red.min0 = phi i32 [ %q4b.min0, %q4b.slice.done ], [ %q4b.red.min0.next, %q4b.red.step ]
+%q4b.red.min1 = phi i32 [ %q4b.min1, %q4b.slice.done ], [ %q4b.red.min1.next, %q4b.red.step ]
+%q4b.red.min2 = phi i32 [ %q4b.min2, %q4b.slice.done ], [ %q4b.red.min2.next, %q4b.red.step ]
+%q4b.red.min3 = phi i32 [ %q4b.min3, %q4b.slice.done ], [ %q4b.red.min3.next, %q4b.red.step ]
+%q4b.red.more = icmp ugt i32 %q4b.red.offset, 0
+br i1 %q4b.red.more, label %q4b.red.step, label %q4b.red.done
+q4b.red.step:
+%q4b.red.partner.lane = xor i32 %lane, %q4b.red.offset
+%q4b.red.partner.index = mul i32 %q4b.red.partner.lane, 4
+%q4b.red.dot0.bits = bitcast i32 %q4b.red.dot0 to float
+%q4b.red.dot0.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.dot0.bits, i32 %q4b.red.partner.index)
+%q4b.red.dot0.partner = bitcast float %q4b.red.dot0.partner.bits to i32
+%q4b.red.dot0.next = add i32 %q4b.red.dot0, %q4b.red.dot0.partner
+%q4b.red.min0.bits = bitcast i32 %q4b.red.min0 to float
+%q4b.red.min0.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.min0.bits, i32 %q4b.red.partner.index)
+%q4b.red.min0.partner = bitcast float %q4b.red.min0.partner.bits to i32
+%q4b.red.min0.next = add i32 %q4b.red.min0, %q4b.red.min0.partner
+%q4b.red.dot1.bits = bitcast i32 %q4b.red.dot1 to float
+%q4b.red.dot1.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.dot1.bits, i32 %q4b.red.partner.index)
+%q4b.red.dot1.partner = bitcast float %q4b.red.dot1.partner.bits to i32
+%q4b.red.dot1.next = add i32 %q4b.red.dot1, %q4b.red.dot1.partner
+%q4b.red.min1.bits = bitcast i32 %q4b.red.min1 to float
+%q4b.red.min1.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.min1.bits, i32 %q4b.red.partner.index)
+%q4b.red.min1.partner = bitcast float %q4b.red.min1.partner.bits to i32
+%q4b.red.min1.next = add i32 %q4b.red.min1, %q4b.red.min1.partner
+%q4b.red.dot2.bits = bitcast i32 %q4b.red.dot2 to float
+%q4b.red.dot2.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.dot2.bits, i32 %q4b.red.partner.index)
+%q4b.red.dot2.partner = bitcast float %q4b.red.dot2.partner.bits to i32
+%q4b.red.dot2.next = add i32 %q4b.red.dot2, %q4b.red.dot2.partner
+%q4b.red.min2.bits = bitcast i32 %q4b.red.min2 to float
+%q4b.red.min2.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.min2.bits, i32 %q4b.red.partner.index)
+%q4b.red.min2.partner = bitcast float %q4b.red.min2.partner.bits to i32
+%q4b.red.min2.next = add i32 %q4b.red.min2, %q4b.red.min2.partner
+%q4b.red.dot3.bits = bitcast i32 %q4b.red.dot3 to float
+%q4b.red.dot3.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.dot3.bits, i32 %q4b.red.partner.index)
+%q4b.red.dot3.partner = bitcast float %q4b.red.dot3.partner.bits to i32
+%q4b.red.dot3.next = add i32 %q4b.red.dot3, %q4b.red.dot3.partner
+%q4b.red.min3.bits = bitcast i32 %q4b.red.min3 to float
+%q4b.red.min3.partner.bits = call float @recipe.wave.partner.f32(float %q4b.red.min3.bits, i32 %q4b.red.partner.index)
+%q4b.red.min3.partner = bitcast float %q4b.red.min3.partner.bits to i32
+%q4b.red.min3.next = add i32 %q4b.red.min3, %q4b.red.min3.partner
+%q4b.red.offset.next = lshr i32 %q4b.red.offset, 1
+br label %q4b.red.loop
+q4b.red.done:
+%q4b.d.ptr = getelementptr i8, ptr addrspace(1) %weights, i64 %q4b.byte
+%q4b.d.bits = load half, ptr addrspace(1) %q4b.d.ptr, align 2
+%q4b.d = call RECIPE_STATE @recipe.state.from.f16(half %q4b.d.bits)
+%q4b.dmin.ptr = getelementptr i8, ptr addrspace(1) %q4b.d.ptr, i64 2
+%q4b.dmin.bits = load half, ptr addrspace(1) %q4b.dmin.ptr, align 2
+%q4b.dmin = call RECIPE_STATE @recipe.state.from.f16(half %q4b.dmin.bits)
+%q4b.d8.raw = load float, ptr addrspace(3) %q4b.q8, align 4
+%q4b.d8 = call RECIPE_STATE @recipe.state.from.f32(float %q4b.d8.raw)
+%q4b.scale = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q4b.d, RECIPE_STATE %q4b.d8)
+%q4b.dscale = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q4b.dmin, RECIPE_STATE %q4b.d8)
+%q4b.dot0.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.dot0)
+%q4b.min0.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.min0)
+%q4b.acc.q0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.acc, RECIPE_STATE %q4b.dot0.value, RECIPE_STATE %q4b.scale)
+%q4b.accmin.q0 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.accmin, RECIPE_STATE %q4b.min0.value, RECIPE_STATE %q4b.dscale)
+%q4b.dot1.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.dot1)
+%q4b.min1.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.min1)
+%q4b.acc.q1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.acc.q0, RECIPE_STATE %q4b.dot1.value, RECIPE_STATE %q4b.scale)
+%q4b.accmin.q1 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.accmin.q0, RECIPE_STATE %q4b.min1.value, RECIPE_STATE %q4b.dscale)
+%q4b.dot2.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.dot2)
+%q4b.min2.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.min2)
+%q4b.acc.q2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.acc.q1, RECIPE_STATE %q4b.dot2.value, RECIPE_STATE %q4b.scale)
+%q4b.accmin.q2 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.accmin.q1, RECIPE_STATE %q4b.min2.value, RECIPE_STATE %q4b.dscale)
+%q4b.dot3.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.dot3)
+%q4b.min3.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.red.min3)
+%q4b.acc.q3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.acc.q2, RECIPE_STATE %q4b.dot3.value, RECIPE_STATE %q4b.scale)
+%q4b.accmin.q3 = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.accmin.q2, RECIPE_STATE %q4b.min3.value, RECIPE_STATE %q4b.dscale)
+; llama.cpp feeds a batch's first 4*(N/4) rows through its gemm, four fmas
+; per block as above, and the rows past them (and every single-token step)
+; through its gemv, the whole block's int in one fma; a row follows the
+; kernel its position would meet there.
+%q4b.dot01 = add i32 %q4b.red.dot0, %q4b.red.dot1
+%q4b.dot23 = add i32 %q4b.red.dot2, %q4b.red.dot3
+%q4b.dot.all = add i32 %q4b.dot01, %q4b.dot23
+%q4b.min01 = add i32 %q4b.red.min0, %q4b.red.min1
+%q4b.min23 = add i32 %q4b.red.min2, %q4b.red.min3
+%q4b.min.all = add i32 %q4b.min01, %q4b.min23
+%q4b.dot.all.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.dot.all)
+%q4b.min.all.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q4b.min.all)
+%q4b.acc.whole = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.acc, RECIPE_STATE %q4b.dot.all.value, RECIPE_STATE %q4b.scale)
+%q4b.accmin.whole = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q4b.accmin, RECIPE_STATE %q4b.min.all.value, RECIPE_STATE %q4b.dscale)
+%q4b.batch.local = sub i32 %position.index, %out.begin
+%q4b.batch.rem = and i32 %out.span, 3
+%q4b.gemm.end = sub i32 %out.span, %q4b.batch.rem
+%q4b.whole = icmp uge i32 %q4b.batch.local, %q4b.gemm.end
+%q4b.acc.next = select i1 %q4b.whole, RECIPE_STATE %q4b.acc.whole, RECIPE_STATE %q4b.acc.q3
+%q4b.accmin.next = select i1 %q4b.whole, RECIPE_STATE %q4b.accmin.whole, RECIPE_STATE %q4b.accmin.q3
+br label %q4b.done
+q4b.done:
+%q4b.block.next = add i32 %q4b.block, 1
+br label %q4b.loop
+q4b.exit:
+%q4b.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %q4b.acc, RECIPE_STATE %q4b.accmin)
+%q4b.owner = icmp eq i32 %lane, 0
+%q4b.owned = select i1 %q4b.owner, RECIPE_STATE %q4b.difference, RECIPE_STATE %state.zero
+%q4b.result = select i1 %channel.active, RECIPE_STATE %q4b.owned, RECIPE_STATE %state.zero
+br label %sum.done
 exact.q4.check:
 br i1 %row.q4.on, label %exact.q4.loop, label %exact.q6.check
 exact.q4.loop:
@@ -1242,8 +1424,8 @@ br label %exact.b32.loop
 exact.b32.done:
 br label %sum.done
 q4.sum.loop:
-%q4.slice = phi i32 [ %lane, %q4.check ], [ %q4.slice.next, %q4.slice.ready ]
-%q4.sum = phi RECIPE_STATE [ %state.zero, %q4.check ], [ %q4.sum.next, %q4.slice.ready ]
+%q4.slice = phi i32 [ %lane, %q4.check.slices ], [ %q4.slice.next, %q4.slice.ready ]
+%q4.sum = phi RECIPE_STATE [ %state.zero, %q4.check.slices ], [ %q4.sum.next, %q4.slice.ready ]
 %q4.slices = udiv i32 %terms, 16
 %q4.slice.more = icmp ult i32 %q4.slice, %q4.slices
 br i1 %q4.slice.more, label %q4.sum.step, label %q4.sum.done
@@ -1265,10 +1447,205 @@ br label %q4.sum.loop
 q4.sum.done:
 br label %sum.done
 q6.check:
+; A Q6_K row under a 256-value step sums as llama.cpp's Q6_K kernel does:
+; eight int lanes per block, lane l holding the four-value words at 4l of
+; every 32-value group less 32 times group l's scaled Q8 sums, each lane
+; meeting its own float accumulator once per block, the eight accumulators
+; adding in a fixed tree at the end.
+%row.q6.block = and i1 %row.q6.on, %q8.is256
+br i1 %row.q6.block, label %q6b.loop, label %q6.check.slices
+q6.check.slices:
 br i1 %row.q6.on, label %q6.sum.loop, label %b32.check
+q6b.loop:
+%q6b.block = phi i32 [ 0, %q6.check ], [ %q6b.block.next, %q6b.done ]
+%q6b.f0 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f0.next, %q6b.done ]
+%q6b.f1 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f1.next, %q6b.done ]
+%q6b.f2 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f2.next, %q6b.done ]
+%q6b.f3 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f3.next, %q6b.done ]
+%q6b.f4 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f4.next, %q6b.done ]
+%q6b.f5 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f5.next, %q6b.done ]
+%q6b.f6 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f6.next, %q6b.done ]
+%q6b.f7 = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6b.f7.next, %q6b.done ]
+%q6b.blocks = udiv i32 %terms, 256
+%q6b.more = icmp ult i32 %q6b.block, %q6b.blocks
+br i1 %q6b.more, label %q6b.step, label %q6b.exit
+q6b.step:
+%q6b.block.wide = zext i32 %q6b.block to i64
+%q6b.block.bytes = mul i64 %q6b.block.wide, 210
+%q6b.byte = add i64 %row.base, %q6b.block.bytes
+%q6b.q8.offset = mul i64 %q6b.block.wide, 288
+%q6b.q8 = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q6b.q8.offset
+br label %q6b.role.loop
+q6b.role.loop:
+; Sixteen roles across the lanes: role l under 8 gathers lane l's words,
+; role l over 8 gathers group l's scaled Q8 sums.
+%q6b.p = phi i32 [ %lane, %q6b.step ], [ %q6b.p.next, %q6b.call.done ]
+%q6b.i0 = phi i32 [ 0, %q6b.step ], [ %q6b.i0.next, %q6b.call.done ]
+%q6b.i1 = phi i32 [ 0, %q6b.step ], [ %q6b.i1.next, %q6b.call.done ]
+%q6b.i2 = phi i32 [ 0, %q6b.step ], [ %q6b.i2.next, %q6b.call.done ]
+%q6b.i3 = phi i32 [ 0, %q6b.step ], [ %q6b.i3.next, %q6b.call.done ]
+%q6b.i4 = phi i32 [ 0, %q6b.step ], [ %q6b.i4.next, %q6b.call.done ]
+%q6b.i5 = phi i32 [ 0, %q6b.step ], [ %q6b.i5.next, %q6b.call.done ]
+%q6b.i6 = phi i32 [ 0, %q6b.step ], [ %q6b.i6.next, %q6b.call.done ]
+%q6b.i7 = phi i32 [ 0, %q6b.step ], [ %q6b.i7.next, %q6b.call.done ]
+%q6b.p.more = icmp ult i32 %q6b.p, 16
+br i1 %q6b.p.more, label %q6b.role.step, label %q6b.role.done
+q6b.role.step:
+%q6b.l = and i32 %q6b.p, 7
+%q6b.role = lshr i32 %q6b.p, 3
+%q6b.is.sub = icmp eq i32 %q6b.role, 1
+%q6b.l.high = lshr i32 %q6b.l, 2
+%q6b.l.word = and i32 %q6b.l, 3
+%q6b.l.twice = shl i32 %q6b.l, 1
+br label %q6b.call.loop
+q6b.call.loop:
+%q6b.k = phi i32 [ 0, %q6b.role.step ], [ %q6b.k.next, %q6b.call.step ]
+%q6b.gathered = phi i32 [ 0, %q6b.role.step ], [ %q6b.gathered.next, %q6b.call.step ]
+%q6b.k.more = icmp ult i32 %q6b.k, 8
+br i1 %q6b.k.more, label %q6b.call.step, label %q6b.call.done
+q6b.call.step:
+%q6b.k.twice = shl i32 %q6b.k, 1
+%q6b.slice.words = add i32 %q6b.k.twice, %q6b.l.high
+%q6b.k.high = lshr i32 %q6b.k, 2
+%q6b.k.word = and i32 %q6b.k, 3
+%q6b.slice.sums = add i32 %q6b.l.twice, %q6b.k.high
+%q6b.slice = select i1 %q6b.is.sub, i32 %q6b.slice.sums, i32 %q6b.slice.words
+%q6b.word = select i1 %q6b.is.sub, i32 %q6b.k.word, i32 %q6b.l.word
+%q6b.part = call i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %q6b.byte, ptr addrspace(3) %q6b.q8, i32 %q6b.slice, i32 %q6b.word)
+%q6b.part.dot.wide = ashr i64 %q6b.part, 32
+%q6b.part.dot = trunc i64 %q6b.part.dot.wide to i32
+%q6b.part.sum = trunc i64 %q6b.part to i32
+%q6b.part.sub = mul i32 %q6b.part.sum, -32
+%q6b.term = select i1 %q6b.is.sub, i32 %q6b.part.sub, i32 %q6b.part.dot
+%q6b.gathered.next = add i32 %q6b.gathered, %q6b.term
+%q6b.k.next = add i32 %q6b.k, 1
+br label %q6b.call.loop
+q6b.call.done:
+%q6b.own0 = icmp eq i32 %q6b.l, 0
+%q6b.i0.add = select i1 %q6b.own0, i32 %q6b.gathered, i32 0
+%q6b.i0.next = add i32 %q6b.i0, %q6b.i0.add
+%q6b.own1 = icmp eq i32 %q6b.l, 1
+%q6b.i1.add = select i1 %q6b.own1, i32 %q6b.gathered, i32 0
+%q6b.i1.next = add i32 %q6b.i1, %q6b.i1.add
+%q6b.own2 = icmp eq i32 %q6b.l, 2
+%q6b.i2.add = select i1 %q6b.own2, i32 %q6b.gathered, i32 0
+%q6b.i2.next = add i32 %q6b.i2, %q6b.i2.add
+%q6b.own3 = icmp eq i32 %q6b.l, 3
+%q6b.i3.add = select i1 %q6b.own3, i32 %q6b.gathered, i32 0
+%q6b.i3.next = add i32 %q6b.i3, %q6b.i3.add
+%q6b.own4 = icmp eq i32 %q6b.l, 4
+%q6b.i4.add = select i1 %q6b.own4, i32 %q6b.gathered, i32 0
+%q6b.i4.next = add i32 %q6b.i4, %q6b.i4.add
+%q6b.own5 = icmp eq i32 %q6b.l, 5
+%q6b.i5.add = select i1 %q6b.own5, i32 %q6b.gathered, i32 0
+%q6b.i5.next = add i32 %q6b.i5, %q6b.i5.add
+%q6b.own6 = icmp eq i32 %q6b.l, 6
+%q6b.i6.add = select i1 %q6b.own6, i32 %q6b.gathered, i32 0
+%q6b.i6.next = add i32 %q6b.i6, %q6b.i6.add
+%q6b.own7 = icmp eq i32 %q6b.l, 7
+%q6b.i7.add = select i1 %q6b.own7, i32 %q6b.gathered, i32 0
+%q6b.i7.next = add i32 %q6b.i7, %q6b.i7.add
+%q6b.p.next = add i32 %q6b.p, %width
+br label %q6b.role.loop
+q6b.role.done:
+; The lanes that took roles meet: an int sum per lane, exact in any order;
+; lanes past the sixteenth hold zero, and every lane ends with all eight.
+%q6b.red.width.raw = icmp ult i32 %width, 16
+%q6b.red.width = select i1 %q6b.red.width.raw, i32 %width, i32 16
+%q6b.red.initial = lshr i32 %q6b.red.width, 1
+br label %q6b.red.loop
+q6b.red.loop:
+%q6b.red.offset = phi i32 [ %q6b.red.initial, %q6b.role.done ], [ %q6b.red.offset.next, %q6b.red.step ]
+%q6b.red.i0 = phi i32 [ %q6b.i0, %q6b.role.done ], [ %q6b.red.i0.next, %q6b.red.step ]
+%q6b.red.i1 = phi i32 [ %q6b.i1, %q6b.role.done ], [ %q6b.red.i1.next, %q6b.red.step ]
+%q6b.red.i2 = phi i32 [ %q6b.i2, %q6b.role.done ], [ %q6b.red.i2.next, %q6b.red.step ]
+%q6b.red.i3 = phi i32 [ %q6b.i3, %q6b.role.done ], [ %q6b.red.i3.next, %q6b.red.step ]
+%q6b.red.i4 = phi i32 [ %q6b.i4, %q6b.role.done ], [ %q6b.red.i4.next, %q6b.red.step ]
+%q6b.red.i5 = phi i32 [ %q6b.i5, %q6b.role.done ], [ %q6b.red.i5.next, %q6b.red.step ]
+%q6b.red.i6 = phi i32 [ %q6b.i6, %q6b.role.done ], [ %q6b.red.i6.next, %q6b.red.step ]
+%q6b.red.i7 = phi i32 [ %q6b.i7, %q6b.role.done ], [ %q6b.red.i7.next, %q6b.red.step ]
+%q6b.red.more = icmp ugt i32 %q6b.red.offset, 0
+br i1 %q6b.red.more, label %q6b.red.step, label %q6b.red.done
+q6b.red.step:
+%q6b.red.partner.lane = xor i32 %lane, %q6b.red.offset
+%q6b.red.partner.index = mul i32 %q6b.red.partner.lane, 4
+%q6b.red.i0.bits = bitcast i32 %q6b.red.i0 to float
+%q6b.red.i0.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i0.bits, i32 %q6b.red.partner.index)
+%q6b.red.i0.partner = bitcast float %q6b.red.i0.partner.bits to i32
+%q6b.red.i0.next = add i32 %q6b.red.i0, %q6b.red.i0.partner
+%q6b.red.i1.bits = bitcast i32 %q6b.red.i1 to float
+%q6b.red.i1.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i1.bits, i32 %q6b.red.partner.index)
+%q6b.red.i1.partner = bitcast float %q6b.red.i1.partner.bits to i32
+%q6b.red.i1.next = add i32 %q6b.red.i1, %q6b.red.i1.partner
+%q6b.red.i2.bits = bitcast i32 %q6b.red.i2 to float
+%q6b.red.i2.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i2.bits, i32 %q6b.red.partner.index)
+%q6b.red.i2.partner = bitcast float %q6b.red.i2.partner.bits to i32
+%q6b.red.i2.next = add i32 %q6b.red.i2, %q6b.red.i2.partner
+%q6b.red.i3.bits = bitcast i32 %q6b.red.i3 to float
+%q6b.red.i3.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i3.bits, i32 %q6b.red.partner.index)
+%q6b.red.i3.partner = bitcast float %q6b.red.i3.partner.bits to i32
+%q6b.red.i3.next = add i32 %q6b.red.i3, %q6b.red.i3.partner
+%q6b.red.i4.bits = bitcast i32 %q6b.red.i4 to float
+%q6b.red.i4.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i4.bits, i32 %q6b.red.partner.index)
+%q6b.red.i4.partner = bitcast float %q6b.red.i4.partner.bits to i32
+%q6b.red.i4.next = add i32 %q6b.red.i4, %q6b.red.i4.partner
+%q6b.red.i5.bits = bitcast i32 %q6b.red.i5 to float
+%q6b.red.i5.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i5.bits, i32 %q6b.red.partner.index)
+%q6b.red.i5.partner = bitcast float %q6b.red.i5.partner.bits to i32
+%q6b.red.i5.next = add i32 %q6b.red.i5, %q6b.red.i5.partner
+%q6b.red.i6.bits = bitcast i32 %q6b.red.i6 to float
+%q6b.red.i6.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i6.bits, i32 %q6b.red.partner.index)
+%q6b.red.i6.partner = bitcast float %q6b.red.i6.partner.bits to i32
+%q6b.red.i6.next = add i32 %q6b.red.i6, %q6b.red.i6.partner
+%q6b.red.i7.bits = bitcast i32 %q6b.red.i7 to float
+%q6b.red.i7.partner.bits = call float @recipe.wave.partner.f32(float %q6b.red.i7.bits, i32 %q6b.red.partner.index)
+%q6b.red.i7.partner = bitcast float %q6b.red.i7.partner.bits to i32
+%q6b.red.i7.next = add i32 %q6b.red.i7, %q6b.red.i7.partner
+%q6b.red.offset.next = lshr i32 %q6b.red.offset, 1
+br label %q6b.red.loop
+q6b.red.done:
+%q6b.d.ptr = getelementptr i8, ptr addrspace(1) %weights, i64 %q6b.byte
+%q6b.d.offset = getelementptr i8, ptr addrspace(1) %q6b.d.ptr, i64 208
+%q6b.d.bits = load half, ptr addrspace(1) %q6b.d.offset, align 2
+%q6b.d = call RECIPE_STATE @recipe.state.from.f16(half %q6b.d.bits)
+%q6b.d8.raw = load float, ptr addrspace(3) %q6b.q8, align 4
+%q6b.d8 = call RECIPE_STATE @recipe.state.from.f32(float %q6b.d8.raw)
+%q6b.scale = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q6b.d8, RECIPE_STATE %q6b.d)
+%q6b.i0.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i0)
+%q6b.f0.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f0, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i0.value)
+%q6b.i1.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i1)
+%q6b.f1.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f1, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i1.value)
+%q6b.i2.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i2)
+%q6b.f2.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f2, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i2.value)
+%q6b.i3.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i3)
+%q6b.f3.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f3, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i3.value)
+%q6b.i4.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i4)
+%q6b.f4.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f4, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i4.value)
+%q6b.i5.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i5)
+%q6b.f5.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f5, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i5.value)
+%q6b.i6.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i6)
+%q6b.f6.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f6, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i6.value)
+%q6b.i7.value = call RECIPE_STATE @recipe.state.from.s32(i32 %q6b.red.i7)
+%q6b.f7.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %q6b.f7, RECIPE_STATE %q6b.scale, RECIPE_STATE %q6b.i7.value)
+br label %q6b.done
+q6b.done:
+%q6b.block.next = add i32 %q6b.block, 1
+br label %q6b.loop
+q6b.exit:
+%q6b.t0 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.f0, RECIPE_STATE %q6b.f4)
+%q6b.t1 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.f1, RECIPE_STATE %q6b.f5)
+%q6b.t2 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.f2, RECIPE_STATE %q6b.f6)
+%q6b.t3 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.f3, RECIPE_STATE %q6b.f7)
+%q6b.u0 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.t0, RECIPE_STATE %q6b.t2)
+%q6b.u1 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.t1, RECIPE_STATE %q6b.t3)
+%q6b.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q6b.u0, RECIPE_STATE %q6b.u1)
+%q6b.owner = icmp eq i32 %lane, 0
+%q6b.owned = select i1 %q6b.owner, RECIPE_STATE %q6b.total, RECIPE_STATE %state.zero
+%q6b.result = select i1 %channel.active, RECIPE_STATE %q6b.owned, RECIPE_STATE %state.zero
+br label %sum.done
 q6.sum.loop:
-%q6.slice = phi i32 [ %lane, %q6.check ], [ %q6.slice.next, %q6.slice.ready ]
-%q6.sum = phi RECIPE_STATE [ %state.zero, %q6.check ], [ %q6.sum.next, %q6.slice.ready ]
+%q6.slice = phi i32 [ %lane, %q6.check.slices ], [ %q6.slice.next, %q6.slice.ready ]
+%q6.sum = phi RECIPE_STATE [ %state.zero, %q6.check.slices ], [ %q6.sum.next, %q6.slice.ready ]
 %q6.slices = udiv i32 %terms, 16
 %q6.slice.more = icmp ult i32 %q6.slice, %q6.slices
 br i1 %q6.slice.more, label %q6.sum.step, label %q6.sum.done
@@ -1350,7 +1727,7 @@ weight.ready:
 %k.next = add i32 %k, %width
 br label %sum.loop
 sum.done:
-%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
+%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4b.result, %q4b.exit ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %q6b.result, %q6b.exit ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
 %reduce.offset.initial = udiv i32 %width, 2
 br label %reduce.loop
 reduce.loop:
