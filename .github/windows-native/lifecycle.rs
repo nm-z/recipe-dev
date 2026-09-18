@@ -25,8 +25,8 @@ fn main() {
 	match phase.as_str() {
 		"train" | "resume" => {
 			let data = recipe.data("data/numeric/single_csv.csv").target("target");
-			let model = recipe.model().layer(HIDDEN_WIDTH).relu().layer(OUTPUT_WIDTH).loss(mse);
-			let training = recipe.train().seed(SEED).epochs(EPOCHS).fp(PRECISION_BITS).save(bundle);
+			let model = recipe.model().layer(HIDDEN_WIDTH).fp(PRECISION_BITS).relu().layer(OUTPUT_WIDTH).fp(PRECISION_BITS).loss(mse);
+			let training = recipe.train().seed(SEED).epochs(EPOCHS).save(bundle);
 			let report = if phase == "resume" { training.resume(bundle).run(&model, &data) } else { training.run(&model, &data) };
 			let mut values = Vec::with_capacity(report.predictions().len() + 2);
 			values.push(report.initial_loss());
@@ -43,7 +43,7 @@ fn main() {
 			);
 		}
 		"infer" => {
-			let output = recipe.infer(bundle, &[1.25]);
+			let output = recipe.predict(bundle, &[1.25]);
 			write_evidence(evidence, &output);
 			println!("phase=infer values={} bits={:x?}", output.len(), output.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
 		}
