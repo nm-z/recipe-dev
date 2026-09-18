@@ -1899,6 +1899,9 @@ impl StorageImage {
 pub(crate) struct NativePrecision {
 	model: Compute,
 	state: Compute,
+	/// The accumulator the block declared: fp32 or fp64. A double state over
+	/// a float-state base links the base's `-acc64` sibling.
+	acc: Compute,
 	source: &'static str,
 	model_type: &'static str,
 	state_type: &'static str,
@@ -1923,12 +1926,38 @@ fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
 		impl NativePrecision {
-			fn new(model: Compute) -> Result<Self> {
+			fn base(model: Compute) -> Result<Self> {
 				match model {
-					$($pattern $(if $guard)? => Ok(Self { model, state: $state, source: $source, model_type: $model_type, state_type: $state_type, epoch_layout: $layout }),)+
+					$($pattern $(if $guard)? => Ok(Self { model, state: $state, acc: $state, source: $source, model_type: $model_type, state_type: $state_type, epoch_layout: $layout }),)+
 					_ => Err(RecipeError::new(format!("{} has no native precision composition", model.label()))),
 				}
 			}
+			/// The composition of a model precision under a declared accumulator:
+			/// fp32 leaves a float-state base as it is; fp64 over a float-state base
+			/// takes the base's `-acc64` sibling, whose state is double.
+			fn new(model: Compute, acc: Compute) -> Result<Self> {
+				let base = Self::base(model)?;
+				require(matches!(acc, Compute::FP32 | Compute::FP64), format!("an accumulator is fp32 or fp64, not {}", acc.label()))?;
+				if acc == Compute::FP64 && base.state_type == "float" {
+					let source = acc64_source(base.source)?;
+					return Ok(Self { acc, state: Compute::FP64, state_type: "double", epoch_layout: NATIVE_EPOCH_LAYOUT_FP64, source, ..base });
+				}
+				Ok(Self { acc: if base.state_type == "double" { Compute::FP64 } else { Compute::FP32 }, ..base })
+			}
+		}
+		/// The `-acc64` sibling key of a float-state base, as build.rs names it.
+		fn acc64_source(source: &str) -> Result<&'static str> {
+			Ok(match source {
+				"-f32" => "-f32-acc64",
+				"-f16" => "-f16-acc64",
+				"-f8" => "-f8-acc64",
+				"-bf16" => "-bf16-acc64",
+				"-tf32" => "-tf32-acc64",
+				"-int8" => "-int8-acc64",
+				"-int4" => "-int4-acc64",
+				"-int1" => "-int1-acc64",
+				other => return Err(RecipeError::new(format!("template {other} has no fp64 accumulator sibling"))),
+			})
 		}
 	};
 }
@@ -2250,13 +2279,13 @@ impl NativeModelIr {
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
 		let (weight_offsets, weight_bytes) = native_weight_arena(graph, precision, inference)?;
-		let precision = NativePrecision::new(precision)?;
+		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
 		for node in &graph.nodes {
-			let base = node.precision == precision.model && node.kv_precision == node.precision;
-			if !base && !variants.iter().any(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision) {
-				let native = NativePrecision::new(node.precision)?;
-				let own = if node.precision == precision.model { String::new() } else { variant_suffix(native.source) };
+			let native = NativePrecision::new(node.precision, node.acc)?;
+			let base = native.source == precision.source && node.kv_precision == node.precision;
+			if !base && !variants.iter().any(|variant| variant.precision.source == native.source && variant.kv == node.kv_precision) {
+				let own = if native.source == precision.source { String::new() } else { variant_suffix(native.source) };
 				let suffix = if node.kv_precision == node.precision { own } else { format!("{own}_kv{}", kv_key(node.kv_precision)?) };
 				variants.push(NativeVariant { suffix, precision: native, kv: node.kv_precision });
 			}
@@ -2310,7 +2339,7 @@ impl NativeModelIr {
 	/// The suffix on every template symbol a node calls: empty for the run's own
 	/// arithmetic, the variant's suffix for any other.
 	fn variant(&self, node: &Node) -> &str {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
+		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.precision.acc == node.acc && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
 	}
 	/// A node's gradient span starts where its weight span starts; the reverse
 	/// bodies index the gradient arena in the node's own element type, so the
@@ -2326,7 +2355,7 @@ impl NativeModelIr {
 	}
 	/// The native precision a node computes in.
 	fn node_precision(&self, node: &Node) -> NativePrecision {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision).map_or(self.precision, |variant| variant.precision)
+		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.precision.acc == node.acc).map_or(self.precision, |variant| variant.precision)
 	}
 	fn storage(&self) -> StorageImage {
 		let segments: Vec<(usize, StoredBytes)> = self
@@ -2370,7 +2399,7 @@ fn kv_key(kv: Compute) -> Result<&'static str> {
 /// The symbol suffix of a template variant: `-f16` links as `_f16`, the
 /// fp64 template, whose source key is `default`, as `_f64`.
 fn variant_suffix(source: &str) -> String {
-	if source == "default" { "_f64".to_owned() } else { format!("_{}", source.trim_start_matches('-')) }
+	if source == "default" { "_f64".to_owned() } else { format!("_{}", source.trim_start_matches('-').replace('-', "_")) }
 }
 /// Every `@name` in `text` that is a whole symbol, renamed.
 fn rename_symbol(text: &str, name: &str, renamed: &str) -> String {
@@ -9924,7 +9953,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -9935,12 +9964,13 @@ mod bundle {
 			0,
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
-			precision_token(block.blck_precision)
+			precision_token(block.blck_precision),
+			precision_token(block.acc)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -9952,6 +9982,7 @@ mod bundle {
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
+			acc: fields.get(11).map_or(Ok(None), |field| precision_from_token(field))?,
 			suffix: Suffix::End,
 		})
 	}
@@ -11027,7 +11058,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::End } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::End } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -11096,6 +11127,8 @@ pub struct Block {
 	/// The format an attention block keeps its key-value cache in, named by a
 	/// precision after `.kv(heads)`.
 	kv_precision: Option<Compute>,
+	/// The accumulator the block's sums and reductions carry, when named.
+	acc: Option<Compute>,
 	/// What the next precision suffix names.
 	suffix: Suffix,
 }
@@ -11147,7 +11180,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
@@ -11160,6 +11193,18 @@ impl Block {
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
 		self.suffix = Suffix::End;
 		self.normalization = Some(normalization.normalization());
+		self
+	}
+	/// The accumulator the block's sums and reductions carry: `acc(32)` or
+	/// `acc(64)`. The block's values keep their own precision; only the running
+	/// sums, the softmax and norm statistics widen. A table names the default
+	/// under `acc`.
+	pub fn acc(mut self, bits: u8) -> Self {
+		self.acc = Some(match bits {
+			32 => Compute::FP32,
+			64 => Compute::FP64,
+			_ => panic!("acc bits must be 32 or 64"),
+		});
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -11389,6 +11434,7 @@ impl Model {
 				precision: None,
 				blck_precision: None,
 				kv_precision: None,
+				acc: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -11657,6 +11703,13 @@ impl Model {
 		self.edit(|model| match model.blocks.last_mut() {
 			Some(block) => *block = block.arithmetic(format),
 			None => panic!("a precision names the block before it, and no block comes before this one; name it on a block, or in Cargo.toml's [precision.<config>] for every block that names none"),
+		})
+	}
+	/// The accumulator of the block before it; see [`Block::acc`].
+	pub fn acc(&self, bits: u8) -> Self {
+		self.edit(|model| match model.blocks.last_mut() {
+			Some(block) => *block = block.clone().acc(bits),
+			None => panic!("acc names the block before it, and no block comes before this one"),
 		})
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
@@ -15081,6 +15134,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_precision: None,
 		block_blck_precision: None,
 		block_kv_precision: None,
+		block_acc: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -15438,6 +15492,9 @@ struct Node {
 	int_bits: u8,
 	/// The arithmetic this node computes in.
 	precision: Compute,
+	/// The accumulator its sums and reductions carry: fp32, or fp64 when the
+	/// block or the table declared acc(64).
+	acc: Compute,
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
@@ -15472,6 +15529,7 @@ struct Graph {
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
+	block_acc: Option<Compute>,
 	/// The precision the block being lowered named for its blck, if any.
 	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
@@ -15510,6 +15568,7 @@ impl Graph {
 			block_kind: "",
 			block_frozen: false,
 			block_precision: None,
+			block_acc: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
 			profile: Precisions::default(),
@@ -15587,6 +15646,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	graph.block_frozen = false;
 	graph.block_precision = None;
+	graph.block_acc = None;
 	graph.block_blck_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
@@ -15754,9 +15814,10 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
+	graph.block_acc = block.acc;
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
 	let skip = graph.source;
@@ -15855,7 +15916,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -15928,6 +15989,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let kind = precision_kind(op, graph.block_kind);
 	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
 	let precision = named.unwrap_or(graph.profile.of(kind));
+	let acc = graph.block_acc.unwrap_or(graph.profile.acc);
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
 		op,
@@ -15946,6 +16008,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		packed: false,
 		int_bits: 0,
 		precision,
+		acc,
 		kv_precision,
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
@@ -17247,11 +17310,13 @@ pub(crate) struct Precisions {
 	atvn: Compute,
 	norm: Compute,
 	res: Compute,
+	/// The accumulator every block carries unless it names its own: fp32 or fp64.
+	acc: Compute,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16 }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32 }
 	}
 }
 impl Precisions {
@@ -17288,7 +17353,11 @@ impl Precisions {
 				"atvn" => precisions.atvn = compute,
 				"norm" => precisions.norm = compute,
 				"res" => precisions.res = compute,
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res"))),
+				"acc" => {
+					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
+					precisions.acc = compute
+				}
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res, and acc names the accumulator"))),
 			}
 		}
 		Ok(precisions)
@@ -17741,7 +17810,7 @@ impl NativeTape {
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
-			metrics: Buffer::upload_float(gpu, &[0.0], NativePrecision::new(layout.output_precision)?.state)?,
+			metrics: Buffer::upload_float(gpu, &[0.0], NativePrecision::base(layout.output_precision)?.state)?,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -18088,7 +18157,7 @@ impl NativeTape {
 		Ok(())
 	}
 	fn objective(&self) -> Result<f64> {
-		let objective = self.metrics.download_float(1, NativePrecision::new(self.program.artifact.layout.output_precision)?.state)?[0];
+		let objective = self.metrics.download_float(1, NativePrecision::base(self.program.artifact.layout.output_precision)?.state)?[0];
 		trace(&format!("epoch {} metric complete", self.step))?;
 		Ok(objective)
 	}
@@ -19604,7 +19673,9 @@ impl Gpu {
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
-		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(element.bytes()), "native contraction state ratio")? as u32;
+		// The chunk partials are in the widest state any node declares.
+		let state_bytes = graph.nodes.iter().map(|node| NativePrecision::new(node.precision, node.acc).map(|native| native.state.bytes())).chain([NativePrecision::new(precision, graph.profile.acc).map(|native| native.state.bytes())]).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(4);
+		let ratio = narrow(state_bytes.div_ceil(element.bytes()), "native contraction state ratio")? as u32;
 		let mut extent = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
 		let contractions = shapes
 			.iter()

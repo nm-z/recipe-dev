@@ -688,14 +688,34 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 	block
 }
 
-fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> BuildResult<String> {
+/// A float-state codec lifted to a double state: the model value decodes
+/// through the float decoder and widens, and a double result narrows to float
+/// before the float encoder stores it. The store rounds through float, so a
+/// tie that double would round differently is the one place an acc64 block
+/// differs from a block whose whole arithmetic is double.
+fn widen_codec(codec: &str, value: &str) -> String {
+	let narrow = codec.replace("@recipe.decode(", "@recipe.decode.narrow(").replace("@recipe.encode(", "@recipe.encode.narrow(");
+	format!(
+		"{narrow}\ndefine internal double @recipe.decode({value} %value) #1 {{ entry: %narrow = call float @recipe.decode.narrow({value} %value) %result = fpext float %narrow to double ret double %result }}\ndefine internal {value} @recipe.encode(double %value) #1 {{ entry: %narrow = fptrunc double %value to float %result = call {value} @recipe.encode.narrow(float %narrow) ret {value} %result }}\n"
+	)
+}
+/// The suffix of the state-widened sibling of a float-state template.
+const ACC64: &str = "-acc64";
+fn state_align(state: &str) -> String {
+	if state == "double" { "8".to_owned() } else { "4".to_owned() }
+}
+fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let bits = format.storage.bits();
-	let numeric = numeric_program(llvm, llvm, &native_codec(llvm, format == FloatFormat::TF32));
+	let codec = native_codec(llvm, format == FloatFormat::TF32);
+	let codec = if state == llvm { codec } else { widen_codec(&codec, llvm) };
+	let numeric = numeric_program(llvm, state, &codec);
 	let mut kernel = format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]);
 	kernel = word(kernel, "double", llvm).replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", &format!("align {}", bits / 8));
-	// The arithmetic type is the model type here, so the widening accumulator folds away.
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", &(bits / 8).to_string()).replace("RECIPE_STATE", llvm);
+	// With the state at the model type the widening accumulator folds away;
+	// an acc64 sibling keeps a double state over the same model type.
+	let state_align = if state == llvm { (bits / 8).to_string() } else { state_align(state) };
+	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align).replace("RECIPE_STATE", state);
 	if bits < 64 {
 		let literal = |value: f64| match llvm {
 			"half" => format!("0xH{:04X}", format.pack(value)),
@@ -751,7 +771,7 @@ fn bf16_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i16 %value) #1 { entry: %wide = zext i16 %value to i32 %bits = shl i32 %wide, 16 %result = bitcast i32 %bits to float ret float %result }
 define internal i16 @recipe.encode(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %upper = lshr i32 %bits, 16 %mantissa = and i32 %absolute, 8388607 %nan = icmp ne i32 %mantissa, 0 %quiet = or i32 %upper, 64 %special.bits = select i1 %nan, i32 %quiet, i32 %upper %lower = and i32 %bits, 65535 %above = icmp ugt i32 %lower, 32768 %tie = icmp eq i32 %lower, 32768 %odd.bit = and i32 %upper, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %upper, %increment %encoded = select i1 %special, i32 %special.bits, i32 %rounded %result = trunc i32 %encoded to i16 ret i16 %result }"#
 }
-fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn(f64) -> u64) -> BuildResult<String> {
+fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn(f64) -> u64, state: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let llvm = match bytes {
 		1 => "i8",
@@ -759,11 +779,12 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 		4 => "i32",
 		_ => "i64",
 	};
-	let numeric = numeric_program(llvm, "float", codec);
+	let codec = if state == "double" { widen_codec(codec, llvm) } else { codec.to_owned() };
+	let numeric = numeric_program(llvm, state, &codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", llvm)
 		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
 		.replace("align 8", &format!("align {bytes}"));
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", "4").replace("RECIPE_STATE", "float");
+	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &pack(value).to_string())
 	}
@@ -772,15 +793,16 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 	}
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
-fn half_ir(ir: String) -> BuildResult<String> {
+fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	// Saturate to the half range before rounding, the way the integer codec clamps
 	// to its own extremes. A plain truncation encodes every larger result as an
 	// infinity, so one overflowing activation makes the whole model nonfinite.
 	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %below = fcmp olt float %value, -65504.0 %above = fcmp ogt float %value, 65504.0 %lowered = select i1 %below, float -65504.0, float %value %clamped = select i1 %above, float 65504.0, float %lowered %result = fptrunc float %clamped to half ret half %result }";
-	let numeric = numeric_program("half", "float", codec);
-	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", "@contraction_tile_f16").replace("align 8", "align 2");
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", "4").replace("RECIPE_STATE", "float");
+	let codec = if state == "double" { widen_codec(codec, "half") } else { codec.to_owned() };
+	let numeric = numeric_program("half", state, &codec);
+	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", "align 2");
+	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &format!("0xH{:04X}", FloatFormat::FP16.pack(value)))
 	}
@@ -963,9 +985,9 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String,
 	let mut sources = Vec::new();
 	for (suffix, contents, model, arithmetic, bytes) in precision_bases(ir, schedule)? {
 		let cache = |kv: &str, kv_bytes: usize| contents.replace("RECIPE_KV_ALIGN", &kv_bytes.to_string()).replace("RECIPE_KV", kv) + "\n" + &kv_codec(model, arithmetic, kv, kv_bytes);
-		sources.push((suffix.to_owned(), cache(model, bytes)));
+		sources.push((suffix.clone(), cache(model, bytes)));
 		for (name, kv, kv_bytes) in [("f16", "half", 2), ("bf16", "i16", 2), ("f32", "float", 4)] {
-			if kv == model && !(name == "f32" && suffix == "-tf32") {
+			if kv == model && !(name == "f32" && suffix.starts_with("-tf32")) {
 				continue;
 			}
 			sources.push((format!("{suffix}-kv{name}"), cache(kv, kv_bytes)));
@@ -973,25 +995,39 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String,
 	}
 	Ok(sources)
 }
-fn precision_bases(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String, &'static str, &'static str, usize); 10]> {
+/// Every template base: (source key, contents, model type, state type, model
+/// bytes). The fp64 and custom-float bases compute in double; every other base
+/// computes in float and has an `-acc64` sibling that keeps the same model type
+/// under a double state, the accumulator a block may declare with `acc(64)`.
+fn precision_bases(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, String, &'static str, &'static str, usize)>> {
 	let ir = ir
 		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
 		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
 		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
 		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
 		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
-	Ok([
-		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?, "double", "double", 8),
-		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?, "float", "float", 4),
-		("-f16", half_ir(ir.clone())?, "half", "float", 2),
-		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?, "i8", "float", 1),
-		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?, "i16", "float", 2),
-		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?, "float", "float", 4),
-		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?, "i8", "float", 1),
-		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?, "i8", "float", 1),
-		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?, "i8", "float", 1),
-		("-f", custom_ir(ir, "_f")?, "double", "double", 8),
-	])
+	let mut bases = vec![("".to_owned(), native_ir(ir.clone(), "", "double", FloatFormat::FP64, "double")?, "double", "double", 8)];
+	for state in ["float", "double"] {
+		let acc = if state == "double" { ACC64 } else { "" };
+		// Symbol suffixes spell the key with underscores: a hyphen is not part of
+		// a symbol name to the variant linker.
+		let tile = |key: &str| format!("_{}{}", key.trim_start_matches('-'), acc.replace('-', "_"));
+		bases.push((format!("-f32{acc}"), native_ir(ir.clone(), &tile("-f32"), "float", FloatFormat::FP32, state)?, "float", state, 4));
+		bases.push((format!("-f16{acc}"), half_ir(ir.clone(), &tile("-f16"), state)?, "half", state, 2));
+		bases.push((format!("-f8{acc}"), encoded_ir(ir.clone(), &tile("-f8"), FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value), state)?, "i8", state, 1));
+		bases.push((format!("-bf16{acc}"), encoded_ir(ir.clone(), &tile("-bf16"), FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value), state)?, "i16", state, 2));
+		bases.push((format!("-tf32{acc}"), native_ir(ir.clone(), &tile("-tf32"), "float", FloatFormat::TF32, state)?, "float", state, 4));
+		bases.push((format!("-int8{acc}"), encoded_ir(ir.clone(), &tile("-int8"), IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value), state)?, "i8", state, 1));
+		bases.push((format!("-int4{acc}"), encoded_ir(ir.clone(), &tile("-int4"), IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value), state)?, "i8", state, 1));
+		bases.push((format!("-int1{acc}"), encoded_ir(ir.clone(), &tile("-int1"), IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value), state)?, "i8", state, 1));
+	}
+	bases.push(("-f".to_owned(), custom_ir(ir, "_f")?, "double", "double", 8));
+	Ok(bases)
+}
+/// The state type a template base computes in: double for the fp64 and
+/// custom-float bases and for every `-acc64` sibling, float otherwise.
+fn template_state(base: &str) -> &'static str {
+	if base.is_empty() || base == "-f" || base.ends_with(ACC64) { "double" } else { "float" }
 }
 fn wmma_source(source: &str) -> String {
 	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n")
@@ -1033,8 +1069,8 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
-		let helpers = if base.is_empty() || base == "-f" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
-		let state = if base.is_empty() || base == "-f" { "double" } else { "float" };
+		let state = template_state(base);
+		let helpers = if state == "double" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
 		let dot = (state == "float").then_some("declare i32 @llvm.amdgcn.sudot4(i1, i32, i1, i32, i32, i1)\ndeclare i32 @llvm.amdgcn.perm(i32, i32, i32)\n").unwrap_or_default();
 		let helpers = format!("{}\n{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"));
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
@@ -1080,8 +1116,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
-		let state = if base.is_empty() || base == "-f" { "double" } else { "float" };
-		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &nvidia_wave_helpers(state));
+		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &nvidia_wave_helpers(template_state(base)));
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
