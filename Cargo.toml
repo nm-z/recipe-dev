@@ -151,3 +151,5 @@ acc = "fp32"
 norm-acc = "fp64"
 # llama.cpp rounds a sum's inputs to Q8_K: one step per 256.
 step = 256
+# llama.cpp chains each rope angle by fp32 products and rotates with fmas.
+rope-angle = "chain"

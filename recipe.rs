@@ -3617,12 +3617,12 @@ impl NativeModelIr {
 					let base = native_literal(self.node_precision(node).model, ty, node.argument[1]);
 					let mscale = native_literal(self.node_precision(node).model, ty, node.argument[4]);
 					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
-					let context = native_literal(self.node_precision(node).model, ty, node.argument[6]);
+					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
 					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
 					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @rope_body{v}( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							"call void @rope_body{v}( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
 							channels = node.output.channels,
 							length = node.output.length,
@@ -16540,8 +16540,11 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
 }
-fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64, chain: bool) -> Result<(f64, f64, f64)> {
 	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	if chain {
+		return yarn_parameters_chain(factor, context, dims, base, fast, slow);
+	}
 	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
 	require(base.is_finite() && base > 1.0, "yarn rotary base must exceed one")?;
 	require(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered")?;
@@ -16557,6 +16560,29 @@ fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f6
 	let mscale = 1.0 + 0.1 * factor.ln();
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((mscale, low, high))
+}
+/// The yarn values of a chain-angle rope, in fp32 and in llama.cpp's order:
+/// the correction dims as `n_dims * logf(n_ctx_orig / (n_rot * 2 * pi)) / (2 *
+/// logf(base))` floored and ceiled, and the magnitude scale as the attention
+/// factor `(0.1 ln s + 1) * (1 / (1 + 0.1 ln s))` times `1 + 0.1 ln(1 / freq_scale)`,
+/// every step rounded to fp32 as its own does.
+fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	let (factor, base, fast, slow) = (factor as f32, base as f32, fast as f32, slow as f32);
+	let correction = |rot: f32| -> Result<f32> {
+		let value = dims as f32 * (context as f32 / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+		require(value.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(value)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f32);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if high == low { high + 0.001 } else { high };
+	let freq_scale = 1.0f32 / factor;
+	let scale = 1.0f32 / freq_scale;
+	let attention = (0.1f32 * scale.ln() + 1.0f32) * (1.0f32 / (1.0f32 + 0.1f32 * scale.ln()));
+	let mscale = attention * (1.0f32 + 0.1f32 * (1.0f32 / freq_scale).ln());
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((f64::from(mscale), f64::from(low), f64::from(high)))
 }
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
@@ -16649,11 +16675,14 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			None => (1.0, 1.0, 0.0, 0.0, 1.0),
 			Some((factor, context, fast, slow)) => {
 				let factor = f64::from_bits(factor);
-				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
+		// The seventh argument names the angle: 0 direct, 1 chained.
+		let _ = context;
+		let chain = f64::from(u8::from(graph.profile.chain_angle));
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -16685,11 +16714,13 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				None => (1.0, 1.0, 0.0, 0.0, 1.0),
 				Some((factor, context, fast, slow)) => {
 					let factor = f64::from_bits(factor);
-					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 					(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 				}
 			};
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, mscale, factor, context, low, high], -2)?;
+			let _ = context;
+			let chain = f64::from(u8::from(graph.profile.chain_angle));
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
@@ -17482,11 +17513,17 @@ pub(crate) struct Precisions {
 	/// The inputs that share one step under an int precision unless the block
 	/// names its own: 32 by default.
 	step: u32,
+	/// How a rope reaches its angles: `direct`, each pair's frequency from an
+	/// exponential; or `chain`, llama.cpp's way, the position times the base's
+	/// power one product at a time in the rope's precision, the yarn blend on
+	/// the angle, the magnitude scale on the cosine and sine, and the rotation
+	/// as two fused multiply-adds against the CPU's libm trig.
+	chain_angle: bool,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32 }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false }
 	}
 }
 impl Precisions {
@@ -17518,6 +17555,14 @@ impl Precisions {
 		let mut precisions = Self::default();
 		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
 			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			if key == "rope-angle" {
+				precisions.chain_angle = match value.trim().trim_matches('"') {
+					"direct" => false,
+					"chain" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] rope-angle = {other}: a rope angle is direct or chain"))),
+				};
+				continue;
+			}
 			if key == "step" {
 				let step = value.trim().parse::<u32>().ok().filter(|step| *step != 0 && step % 32 == 0);
 				precisions.step = step.ok_or_else(|| RecipeError::new(format!("[precision.{name}] step = {value}: an int step covers a multiple of 32 inputs")))?;
@@ -17543,7 +17588,7 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, and step the int step"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step and rope-angle the rope's angle"))),
 			}
 		}
 		Ok(precisions)

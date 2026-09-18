@@ -187,15 +187,30 @@ define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %inde
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
 /// state, none under a double one.
+/// The trig and power a chain-angle rope takes: the platform libm's on the
+/// CPU, where llama.cpp's cosf, sinf and powf live, and the portable
+/// evaluations everywhere else.
+fn rope_math_helpers(state: &str, libm: bool) -> String {
+	if !libm {
+		return format!("define internal {state} @recipe.rope.cos({state} %value) #1 {{ entry: %result = call {state} @recipe.state.cos({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.sin({state} %value) #1 {{ entry: %result = call {state} @recipe.state.sin({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.pow({state} %base, {state} %exponent) #1 {{ entry: %log = call {state} @recipe.state.log({state} %base) %scaled = call {state} @recipe.state.mul({state} %log, {state} %exponent) %result = call {state} @recipe.state.exp({state} %scaled) ret {state} %result }}\n");
+	}
+	let intrinsic = match state {
+		"float" => "f32",
+		"double" => "f64",
+		_ => return rope_math_helpers(state, false),
+	};
+	format!("declare {state} @llvm.cos.{intrinsic}({state})\ndeclare {state} @llvm.sin.{intrinsic}({state})\ndeclare {state} @llvm.pow.{intrinsic}({state}, {state})\ndefine internal {state} @recipe.rope.cos({state} %value) #1 {{ entry: %result = call {state} @llvm.cos.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.sin({state} %value) #1 {{ entry: %result = call {state} @llvm.sin.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.pow({state} %base, {state} %exponent) #1 {{ entry: %result = call {state} @llvm.pow.{intrinsic}({state} %base, {state} %exponent) ret {state} %result }}\n")
+}
 fn cpu_int8_helpers(state: &str) -> String {
 	format!(
-		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}{}",
+		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}{}{}",
 		state == "float",
 		if state == "float" { generic_dot4_helpers() } else { String::new() },
 		amd_q4_slice_helper(state, state == "float"),
 		amd_q6_slice_helper(state, state == "float"),
 		amd_block32_slice_helper(state, state == "float"),
-		format!("{}{}", q4_ints_helper(state), q6_part_helper(state))
+		format!("{}{}", q4_ints_helper(state), q6_part_helper(state)),
+		rope_math_helpers(state, true)
 	)
 }
 /// A CUDA warp of 32 lanes is the wave; a partner is read through
@@ -216,7 +231,8 @@ define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {int8} }}
 define internal i64 @recipe.clock() #1 {{ entry: %now = call i64 @llvm.nvvm.read.ptx.sreg.globaltimer() ret i64 %now }}
 define internal {state} @recipe.wave.partner({state} %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 {partner} }}
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 %bits, i32 %lane, i32 31) %partner = bitcast i32 %partner.bits to float ret float %partner }}
-{dot4}{q4}{q6}{b32}{ints}",
+{dot4}{q4}{q6}{b32}{ints}{rope}",
+		rope = rope_math_helpers(state, false),
 		int8 = state == "float",
 		dot4 = if state == "float" { generic_dot4_helpers() } else { String::new() },
 		ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state)),
@@ -1193,7 +1209,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		let helpers = if state == "double" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
 		let dot = if state == "float" { AMD_DOT4_HELPERS } else { "" };
 		let ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state));
-		let helpers = format!("{}\n{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"), ints);
+		let helpers = format!("{}\n{}{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"), ints, rope_math_helpers(state, false));
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
