@@ -20240,9 +20240,12 @@ impl Cuda {
 			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
 			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
 			// The single-position step fills every SM with as many warps as the
-			// kernel allows, as the AMD step does; the forward keeps the schedule width.
+			// kernel allows, as the AMD step does; the forward keeps the schedule
+			// width. Its launch carries the forward's reduction buffer, so its
+			// residency is asked with that buffer and not one scaled to its own block.
 			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
-			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, shared_values, register_values)).transpose()?;
+			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
+			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 			Ok((program, forward, epoch, model_load))
