@@ -201,6 +201,11 @@ fn rope_math_helpers(state: &str, libm: bool) -> String {
 	};
 	format!("declare {state} @llvm.cos.{intrinsic}({state})\ndeclare {state} @llvm.sin.{intrinsic}({state})\ndeclare {state} @llvm.exp.{intrinsic}({state})\ndeclare {state} @llvm.log.{intrinsic}({state})\ndeclare {state} @tanh{tanh_suffix}({state})\ndeclare {state} @llvm.pow.{intrinsic}({state}, {state})\ndefine internal {state} @recipe.libm.exp({state} %value) #1 {{ entry: %result = call {state} @llvm.exp.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.log({state} %value) #1 {{ entry: %result = call {state} @llvm.log.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.tanh({state} %value) #1 {{ entry: %result = call {state} @tanh{tanh_suffix}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.cos({state} %value) #1 {{ entry: %result = call {state} @llvm.cos.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.sin({state} %value) #1 {{ entry: %result = call {state} @llvm.sin.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %result = call {state} @llvm.pow.{intrinsic}({state} %base, {state} %exponent) ret {state} %result }}\n")
 }
+/// The int partial helpers of one template: the Q4_K slice ints and the Q6_K
+/// word parts.
+fn int_partial_helpers(state: &str) -> String {
+	format!("{}{}", q4_ints_helper(state), q6_part_helper(state))
+}
 fn cpu_int8_helpers(state: &str) -> String {
 	format!(
 		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}{}{}",
@@ -209,7 +214,7 @@ fn cpu_int8_helpers(state: &str) -> String {
 		amd_q4_slice_helper(state, state == "float"),
 		amd_q6_slice_helper(state, state == "float"),
 		amd_block32_slice_helper(state, state == "float"),
-		format!("{}{}", q4_ints_helper(state), q6_part_helper(state)),
+		int_partial_helpers(state),
 		rope_math_helpers(state, true)
 	)
 }
@@ -235,7 +240,7 @@ define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 {{ e
 		rope = rope_math_helpers(state, false),
 		int8 = state == "float",
 		dot4 = if state == "float" { generic_dot4_helpers() } else { String::new() },
-		ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state)),
+		ints = int_partial_helpers(state),
 		q4 = amd_q4_slice_helper(state, state == "float"),
 		q6 = amd_q6_slice_helper(state, state == "float"),
 		b32 = amd_block32_slice_helper(state, state == "float"),
@@ -1209,7 +1214,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		let state = template_state(base);
 		let helpers = if state == "double" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
 		let dot = if state == "float" { AMD_DOT4_HELPERS } else { "" };
-		let ints = format!("{}{}", q4_ints_helper(state), q6_part_helper(state));
+		let ints = int_partial_helpers(state);
 		let helpers = format!("{}\n{}{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"), ints, rope_math_helpers(state, false));
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));

@@ -46,5 +46,5 @@ fn main() {
 		.tanh()
 		.scale(gemma3.final_logit_softcapping);
 
-	recipe.infer().log([chat, debug]).run(&model, &data);
+	recipe.infer().tokens(2).log([chat, debug]).run(&model, &data);
 }
