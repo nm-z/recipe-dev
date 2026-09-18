@@ -18131,8 +18131,20 @@ impl NativeTape {
 				let shape = self.nodes[index].output;
 				let (channels, length) = (shape.channels, shape.length);
 				let positions = reached.clamp(1, length.max(1));
-				let region = self.values.download_float_bytes(*slot, channels * length, *precision)?;
-				let at = |channel: usize, position: usize| region.get(channel * length + position).copied().unwrap_or(f64::NAN);
+				// The arena is channel-major over the whole context, so the bytes up
+				// to the last reached position of the last channel come back raw and
+				// only the reached positions are unpacked.
+				let bytes = precision.bytes();
+				let needed = checked_mul(channels.saturating_sub(1) * length + positions, bytes, "traced node bytes")?;
+				let region = self.values.download_range::<u8>(*slot, needed)?;
+				let at = |channel: usize, position: usize| {
+					let start = (channel * length + position) * bytes;
+					region.get(start..start + bytes).map_or(f64::NAN, |chunk| {
+						let mut bits = [0_u8; 8];
+						bits[..bytes].copy_from_slice(chunk);
+						precision.unpack(u64::from_le_bytes(bits))
+					})
+				};
 				let first = (0..3.min(channels)).map(|channel| at(channel, 0)).collect::<Vec<_>>();
 				let last = (channels.saturating_sub(3)..channels).map(|channel| at(channel, positions - 1)).collect::<Vec<_>>();
 				let sum = (0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| at(channel, position)).sum::<f64>();
