@@ -132,6 +132,9 @@ kv = "fp16"
 atvn = "fp16"
 norm = "fp16"
 res = "fp16"
+# The accumulator every block carries unless it names acc(32) or acc(64):
+# the running sums of a dot, the softmax and norm statistics.
+acc = "fp32"
 
 [precision.llamacpp]
 sum = "int8"
@@ -142,3 +145,4 @@ kv = "fp16"
 atvn = "fp32"
 norm = "fp32"
 res = "fp32"
+acc = "fp32"
