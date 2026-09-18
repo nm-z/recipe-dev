@@ -2503,7 +2503,10 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 		Some(kv) => format!("-kv{}", kv_key(kv)?),
 		None => String::new(),
 	};
-	let suffix = format!("{}{cache}", precision.source);
+	// The fp64 base is listed as "default"; its cache variants carry the bare
+	// "-kv..." suffix, so the base name drops out when a cache is named.
+	let base = if precision.source == "default" && !cache.is_empty() { "" } else { precision.source };
+	let suffix = format!("{base}{cache}");
 	let suffix = suffix.as_str();
 	let mapping = match backend {
 		Backend::Cpu => option_env!("RECIPE_CPU_IR").ok_or_else(|| RecipeError::new("CPU native LLVM templates are unavailable"))?,
