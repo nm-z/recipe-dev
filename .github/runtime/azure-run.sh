@@ -608,6 +608,11 @@ while :; do
 	if grep --ignore-case --extended-regexp --quiet 'AllocationFailed|SkuNotAvailable|ZonalAllocationFailed|OverconstrainedAllocationRequest|Capacity Restrictions' "$provision_error_file"; then
 		refused_locations["$LOCATION"]=1
 		echo "$LOCATION is out of $SIZE capacity (attempt $allocation_attempts); purging the partial worker and excluding the region" >&2
+	elif grep --extended-regexp --quiet "(${WORKER}VMNic|${WORKER}-ip|${WORKER}NSG)[^\"]* not found" "$provision_error_file"; then
+		# This run's own public IP, NSG or NIC vanished between its creation and
+		# the VM write: another controller's sweep removed a VM-less resource.
+		# Nothing about the region or quota is wrong, so allocate again.
+		echo "a partial resource of $WORKER was removed under the allocation (attempt $allocation_attempts); allocating again" >&2
 	elif grep --ignore-case --extended-regexp --quiet 'QuotaExceeded|OperationNotAllowed[^{}]*(quota|exceeding approved)' "$provision_error_file"; then
 		quota_refusals["$LOCATION"]=$(( ${quota_refusals[$LOCATION]:-0} + 1 ))
 		if [ "${quota_refusals[$LOCATION]}" -ge 3 ]; then
