@@ -334,7 +334,7 @@ fn amd_q6_slice_helper(state: &str, full: bool) -> String {
 /// serve every backend; a 32-lane wave takes the int8 helpers above instead.
 fn block_dot_helpers() -> String {
 	let mut ir = String::new();
-	ir.push_str(&format!("@recipe_block32_iq4_levels = private unnamed_addr constant [16 x i8] [{}]\n", IQ4_LEVELS.iter().map(|level| format!("i8 {level}")).collect::<Vec<_>>().join(", ")));
+	ir.push_str(&format!("@recipe_block32_iq4_levels = private unnamed_addr constant [16 x i8] [{}]\ndeclare i32 @llvm.fshr.i32(i32, i32, i32)\n", IQ4_LEVELS.iter().map(|level| format!("i8 {level}")).collect::<Vec<_>>().join(", ")));
 	// The activations of one slice: sixteen model values, one per channel, at
 	// the caller's stride, decoded into the state.
 	let activations = |ir: &mut String| {
@@ -358,11 +358,33 @@ fn block_dot_helpers() -> String {
 		if aligned {
 			ir.push_str(&format!("%{name}w.ptr = getelementptr i8, ptr addrspace(1) %block, i64 {base}\n%{name}w = load <4 x i32>, ptr addrspace(1) %{name}w.ptr, align 16\n"));
 		}
+		if !aligned {
+			// A two-aligned slice: the two sixteen-byte lines that cover it, read
+			// aligned, and each word funnel-shifted out of the pair (the weight
+			// arena carries sixteen bytes of slack for the line past its end).
+			ir.push_str(&format!("%{name}w.ptr = getelementptr i8, ptr addrspace(1) %block, i64 {base}\n%{name}w.addr = ptrtoint ptr addrspace(1) %{name}w.ptr to i64\n%{name}w.low = and i64 %{name}w.addr, 15\n%{name}w.line.addr = sub i64 %{name}w.addr, %{name}w.low\n%{name}w.line = inttoptr i64 %{name}w.line.addr to ptr addrspace(1)\n%{name}w.lo = load <4 x i32>, ptr addrspace(1) %{name}w.line, align 16\n%{name}w.next = getelementptr i8, ptr addrspace(1) %{name}w.line, i64 16\n%{name}w.hi = load <4 x i32>, ptr addrspace(1) %{name}w.next, align 16\n%{name}w.q = lshr i64 %{name}w.low, 2\n%{name}w.q32 = trunc i64 %{name}w.q to i32\n%{name}w.r64 = and i64 %{name}w.low, 3\n%{name}w.r32 = trunc i64 %{name}w.r64 to i32\n%{name}w.r = shl i32 %{name}w.r32, 3\n"));
+			for word in 0..8 {
+				let (vector, lane) = if word < 4 { ("lo", word) } else { ("hi", word - 4) };
+				ir.push_str(&format!("%{name}in{word} = extractelement <4 x i32> %{name}w.{vector}, i32 {lane}\n"));
+			}
+			for q in 0..4 {
+				ir.push_str(&format!("%{name}w.is{q} = icmp eq i32 %{name}w.q32, {q}\n"));
+			}
+			for word in 0..4 {
+				// in[word + q] and in[word + q + 1] for the dynamic q in 0..4.
+				for (part, extra) in [("a", 0), ("b", 1)] {
+					let pick = |q: usize| format!("%{name}in{}", word + q + extra);
+					ir.push_str(&format!(
+						"%{name}w{word}.{part}.23 = select i1 %{name}w.is2, i32 {}, i32 {}\n%{name}w{word}.{part}.123 = select i1 %{name}w.is1, i32 {}, i32 %{name}w{word}.{part}.23\n%{name}w{word}.{part} = select i1 %{name}w.is0, i32 {}, i32 %{name}w{word}.{part}.123\n",
+						pick(2), pick(3), pick(1), pick(0)
+					));
+				}
+				ir.push_str(&format!("%{name}w{word} = call i32 @llvm.fshr.i32(i32 %{name}w{word}.b, i32 %{name}w{word}.a, i32 %{name}w.r)\n"));
+			}
+		}
 		for word in 0..4 {
 			if aligned {
 				ir.push_str(&format!("%{name}w{word} = extractelement <4 x i32> %{name}w, i32 {word}\n"));
-			} else {
-				ir.push_str(&format!("%{name}w{word}.offset = add i64 {base}, {}\n%{name}w{word}.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %{name}w{word}.offset\n%{name}w{word} = load i32, ptr addrspace(1) %{name}w{word}.ptr, align 2\n", word * 4));
 			}
 			for byte in 0..4 {
 				let i = word * 4 + byte;

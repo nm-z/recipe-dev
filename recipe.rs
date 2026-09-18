@@ -2022,7 +2022,10 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 		offsets.push(offset);
 		bytes = checked_add(offset, span, "native weight arena")?;
 	}
-	Ok((offsets, bytes))
+	// Sixteen bytes of slack: the block dots read a two-aligned slice as the
+	// two aligned lines that cover it, and the last slice's second line may
+	// lie past the last block.
+	Ok((offsets, checked_add(bytes, 16, "native weight arena slack")?))
 }
 
 /// Whether a node's forward kernel reads its operands at positions outside the
