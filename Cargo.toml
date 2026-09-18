@@ -34,8 +34,10 @@ attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
 # Device memory left free for backend allocations made by the first inference
-# dispatch after a placement has loaded its module and resident buffers.
-placement-launch-reserve-bytes = 16777216
+# dispatch after a placement has loaded its module and resident buffers, and for
+# the compositor of a device that drives a display: at 16 MB the context fitter
+# filled the desktop card to the edge and kwin could no longer pin a framebuffer.
+placement-launch-reserve-bytes = 536870912
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
 cpu-worker-threads = 0
 # Toolchain values are keyed by target operating system. A value beginning with
