@@ -314,7 +314,7 @@ jobs:
           fi
           device="${route##*:}"
           [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
-          grep -q '\.fp32 rows ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
+          grep -q ' rows .* share ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
           echo "device=$device" >> "$GITHUB_OUTPUT"
           echo "executed on $route"
 

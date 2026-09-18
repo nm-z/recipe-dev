@@ -136,7 +136,7 @@ fn composition(cursor: u64, salt: u64) -> String {
 	}
 }
 
-fn model(cursor: u64) -> String {
+fn model(cursor: u64, precision: &str) -> String {
 	let bits = mix(cursor, 1);
 	let mut text = "recipe.model()".to_owned();
 	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
@@ -149,6 +149,7 @@ fn model(cursor: u64) -> String {
 		sequential &= !ESTIMATORS.iter().any(|estimator| block.starts_with(estimator));
 		text.push('.');
 		text.push_str(&block);
+		text.push_str(precision);
 	};
 	for index in 0..1 + bits % 2 {
 		push(&mut text, 200 + 10 * index);
@@ -159,12 +160,12 @@ fn model(cursor: u64) -> String {
 	if (bits >> 12) % 3 == 0 {
 		push(&mut text, 400);
 	}
-	format!("{text}.layer(1).loss({})", pick(cursor, 5, &LOSSES))
+	format!("{text}.layer(1){precision}.loss({})", pick(cursor, 5, &LOSSES))
 }
 
 fn source(cursor: u64, seed: u64) -> String {
-	let model = model(cursor);
 	let precision = pick(cursor, 6, if AVOID_FILED { &PRECISIONS_FILED[..] } else { &PRECISIONS[..] });
+	let model = model(cursor, precision);
 	let data = dataset(cursor);
 	let options = pick(cursor, 8, &DATA_OPTIONS);
 	let target = target(cursor);
@@ -191,10 +192,10 @@ fn main() {{
     let data = recipe.data("{data}").target({target}){options};
     let model = {model};
     phase("training");
-    let report = recipe.train().optimizer(adamw).lr(0.001).seed({seed}).epochs(20).log(all){precision}.save(&bundle).run(&model, &data);
+    let report = recipe.train().optimizer(adamw).lr(0.001).seed({seed}).epochs(20).log(all).save(&bundle).run(&model, &data);
     assert!(report.final_loss().is_finite());
     phase("inference");
-    let output = recipe.infer(&bundle, &vec![0.0; width(&bundle)]);
+    let output = recipe.predict(&bundle, &vec![0.0; width(&bundle)]);
     assert!(!output.is_empty() && output.iter().all(|value| value.is_finite()));
     std::fs::remove_file(bundle).expect("cannot remove saved model");
 }}
