@@ -1583,7 +1583,7 @@ fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, b
 		trace(&format!("schedule tune skipped device={} allocation={} required={launches}", tape.device_label()?, *budget))?;
 		return Ok(());
 	}
-	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
+	let ratio = narrow(tape.precision.state.bytes().div_ceil(usize::from(tape.program.forward.kernel.element)), "native contraction state ratio")? as u32;
 	let allocation = *budget;
 	let identity = native_device_identity(tape.program.gpu, config, allocation);
 	let cache = native_schedule_cache_path(&tape.program.artifact, &identity)?;
@@ -1882,8 +1882,11 @@ pub(crate) struct NativeArtifact {
 /// The model-load storage arena as stored bytes at their arena offsets, so the
 /// arena is written to the device straight from where each weight is mapped
 /// instead of being assembled on the host first.
+/// What the load kernel reads: each node's file bytes, written one node at a
+/// time into one scratch of `bytes`, the largest of them.
 pub(crate) struct StorageImage {
 	pub(crate) bytes: usize,
+	/// The node and its bytes, in load order.
 	pub(crate) segments: Vec<(usize, StoredBytes)>,
 }
 impl StorageImage {
@@ -1909,7 +1912,7 @@ const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
-const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
+const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"8844";
 fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
 	match state_bytes {
 		8 => Ok(NATIVE_EPOCH_LAYOUT_FP64),
@@ -1965,6 +1968,11 @@ fn packed_weight(graph: &Graph, index: usize, inference: bool) -> Option<&Stored
 }
 
 /// Byte offset of every node's weights, and the arena size. A packed node keeps its stored bytes.
+/// The widest element any node of `graph` stages in the local store: its own
+/// precision, its cache precision, or the model default.
+fn widest_precision(graph: &Graph, precision: Compute) -> Compute {
+	graph.nodes.iter().flat_map(|node| [node.precision, node.kv_precision]).chain([precision]).max_by_key(|precision| precision.bytes()).unwrap_or(precision)
+}
 fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Result<(Vec<usize>, usize)> {
 	let mut offsets = Vec::with_capacity(graph.nodes.len());
 	let mut bytes = 0;
@@ -2173,7 +2181,6 @@ struct NodePlan {
 	stored: Option<StoredWeight>,
 	/// The file bytes the load kernel requantizes into `stored`'s format.
 	requantize: Option<StoredWeight>,
-	storage_offset: usize,
 	weight_offset: usize,
 	packed: bool,
 }
@@ -2278,13 +2285,13 @@ impl NativeModelIr {
 				require(weight.count == node.weights(), format!("{} stored weight count {} does not match tensor count {}", id(), weight.count, node.weights()))?;
 			}
 			let requantize = graph.requantize.get(index).cloned().unwrap_or(None);
-			let storage_offset = align(storage_bytes, alignment("float"))?;
-			// The storage arena holds what the load kernel reads: a weight it
+			// The load kernel reads one node's source at a time: a weight it
 			// expands, or the file bytes it requantizes into the block's format.
+			// The total only says whether there is anything to load.
 			if let Some(source) = &requantize {
-				storage_bytes = checked_add(storage_offset, source.bytes.len(), "native storage arena")?;
+				storage_bytes = checked_add(storage_bytes, source.bytes.len(), "native storage arena")?;
 			} else if let Some(weight) = arena_weight(&node, &stored).filter(|_| !kept) {
-				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
+				storage_bytes = checked_add(storage_bytes, weight.bytes.len(), "native storage arena")?;
 			}
 			plans.push(NodePlan {
 				node,
@@ -2294,7 +2301,6 @@ impl NativeModelIr {
 				adjoint: layout.adjoints[index],
 				stored,
 				requantize,
-				storage_offset,
 				weight_offset: weight_offsets[index],
 				packed: kept,
 			});
@@ -2323,18 +2329,20 @@ impl NativeModelIr {
 		self.variants.iter().find(|variant| variant.precision.model == node.precision).map_or(self.precision, |variant| variant.precision)
 	}
 	fn storage(&self) -> StorageImage {
-		let segments = self
+		let segments: Vec<(usize, StoredBytes)> = self
 			.plans
 			.iter()
-			.filter_map(|plan| {
+			.enumerate()
+			.filter_map(|(index, plan)| {
 				let bytes = match &plan.requantize {
 					Some(source) => &source.bytes,
 					None => &arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed)?.bytes,
 				};
-				Some((plan.storage_offset, bytes.clone()))
+				Some((index, bytes.clone()))
 			})
 			.collect();
-		StorageImage { bytes: self.storage_bytes, segments }
+		let bytes = segments.iter().map(|(_, stored)| stored.len()).max().unwrap_or(0);
+		StorageImage { bytes, segments }
 	}
 }
 
@@ -6006,9 +6014,11 @@ impl NativeModelIr {
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
 	}
-	/// Selects one requantized node's file-bytes decoder so the load kernel reads them.
+	/// Selects the decoder of the bytes the load kernel reads for one node: a
+	/// requantized node's file bytes, or the stored weight an unpacked node
+	/// expands, each plane in its own format.
 	fn emit_source_decode(&self, backend: Backend) -> Result<String> {
-		self.emit_decode_switch(backend, "recipe.model.source.decode", |plan| plan.requantize.as_ref())
+		self.emit_decode_switch(backend, "recipe.model.source.decode", |plan| plan.requantize.as_ref().or_else(|| arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed)))
 	}
 	fn emit_decode_switch(&self, backend: Backend, name: &str, select: impl Fn(&NodePlan) -> Option<&StoredWeight>) -> Result<String> {
 		let mut decoders = String::new();
@@ -6056,7 +6066,8 @@ impl NativeModelIr {
 				}
 			}
 		}
-		decoders.push_str(&format!("define internal {ty} @{name}{suffix}({pointer} %matrix, i64 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"));
+		let attributes = if name == "recipe.model.source.decode" { "#3" } else { "#1" };
+		decoders.push_str(&format!("define internal {ty} @{name}{suffix}({pointer} %matrix, i64 %index, i32 %node) {attributes} {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"));
 		}
 		Ok(decoders)
 	}
@@ -6079,7 +6090,7 @@ impl NativeModelIr {
 		let (_, _, name) = self.requantize_function(plan)?;
 		let pointer = pointer_type(backend);
 		let blocks = i32::try_from(source.count.div_ceil(32)).map_err(|_| RecipeError::new("requantized block count exceeds i32"))?;
-		Ok(format!("%rq.n{index}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%rq.n{index}.target = getelementptr i8, {pointer} %weights, i64 {weight}\ncall void @{name}({pointer} %rq.n{index}.storage, {pointer} %rq.n{index}.target, i32 {node}, i64 {count}, i32 {blocks}, i32 %tid, i32 %threads)\n", storage = plan.storage_offset, weight = plan.weight_offset, node = index + 1, count = source.count))
+		Ok(format!("%rq.n{index}.storage = getelementptr i8, {pointer} %storage, i64 0\n%rq.n{index}.target = getelementptr i8, {pointer} %weights, i64 {weight}\ncall void @{name}({pointer} %rq.n{index}.storage, {pointer} %rq.n{index}.target, i32 {node}, i64 {count}, i32 {blocks}, i32 %tid, i32 %threads)\n", weight = plan.weight_offset, node = index + 1, count = source.count))
 	}
 	/// Every requantize function the load kernel calls, one per format, precision
 	/// and packing among the requantized nodes.
@@ -6110,7 +6121,7 @@ impl NativeModelIr {
 		let round = |name: &str, from: &str| format!("%{name}.nn = fcmp oge float %{from}, {zero}\n%{name}.h = select i1 %{name}.nn, float {half}, float {mhalf}\n%{name}.r = fadd float %{from}, %{name}.h\n%{name} = fptosi float %{name}.r to i32\n", zero = lit(0.0), half = lit(0.5), mhalf = lit(-0.5));
 		let clamp_float = |name: &str, from: &str, low: f32, high: f32| format!("%{name}.lo = fcmp olt float %{from}, {low}\n%{name}.l = select i1 %{name}.lo, float {low}, float %{from}\n%{name}.hi = fcmp ogt float %{name}.l, {high}\n%{name} = select i1 %{name}.hi, float {high}, float %{name}.l\n", low = lit(low), high = lit(high));
 		let clamp_int = |name: &str, from: &str, low: i32, high: i32| format!("%{name}.lo = icmp slt i32 %{from}, {low}\n%{name}.l = select i1 %{name}.lo, i32 {low}, i32 %{from}\n%{name}.hi = icmp sgt i32 %{name}.l, {high}\n%{name} = select i1 %{name}.hi, i32 {high}, i32 %{name}.l\n");
-		let mut ir = format!("define internal void @{name}({pointer} %{p}.storage, {pointer} %{p}.target, i32 %{p}.node, i64 %{p}.count, i32 %{p}.blocks, i32 %tid, i32 %threads) #1 {{\nentry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.b = phi i32 [ %tid, %entry ], [ %{p}.next, %{p}.block.done ]\n%{p}.more = icmp ult i32 %{p}.b, %{p}.blocks\nbr i1 %{p}.more, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.b.wide = zext i32 %{p}.b to i64\n%{p}.base = mul i64 %{p}.b.wide, 32\n");
+		let mut ir = format!("define internal void @{name}({pointer} %{p}.storage, {pointer} %{p}.target, i32 %{p}.node, i64 %{p}.count, i32 %{p}.blocks, i32 %tid, i32 %threads) #3 {{\nentry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.b = phi i32 [ %tid, %entry ], [ %{p}.next, %{p}.block.done ]\n%{p}.more = icmp ult i32 %{p}.b, %{p}.blocks\nbr i1 %{p}.more, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.b.wide = zext i32 %{p}.b to i64\n%{p}.base = mul i64 %{p}.b.wide, 32\n");
 		// The block's values through the source decoder; a tail past the weight's
 		// end reads index zero and contributes zero.
 		for i in 0..32 {
@@ -6218,33 +6229,32 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		let (kernel, thread) = native_entry(backend)?;
 		let mut ir = self.emit_requantize_functions(backend)?;
+		// One node per dispatch: the host writes that node's file bytes at the
+		// start of one scratch and names the node, so the device never holds
+		// more than one node's source beside the weights.
 		ir.push_str(&format!(
-			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
+			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads, i32 %node) #0 {{\nentry:\n%tid = {thread}\n",
 			kernel = kernel,
 			pointer = pointer,
 			thread = thread
 		));
-		let mut predecessor = "entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
-			if let Some(source) = &plan.requantize {
-				ir.push_str(&self.emit_requantize_call(backend, index, plan, source)?);
+			let expand = arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed && plan.requantize.is_none());
+			if plan.requantize.is_none() && expand.is_none() {
 				continue;
 			}
-			let Some(stored) = arena_weight(&plan.node, &plan.stored).filter(|_| !plan.packed) else { continue };
-			let (ty, v) = (self.node_precision(&plan.node).model_type, self.variant(&plan.node));
-			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
-			let format = spec.codec.quantization();
-			let native = format.native;
-			let (name, block) = match native {
-				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
-				_ => (format.name.to_owned(), spec.block),
-			};
-			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
-			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
-			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.base = getelementptr i8, {pointer} %weights, i64 {weight}\n%{prefix}.p.wide = zext i32 %{prefix}.p to i64\n%{prefix}.weights = getelementptr {ty}, {pointer} %{prefix}.base, i64 %{prefix}.p.wide\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}{v}({pointer} %{prefix}.storage, i64 0, i64 %{prefix}.p.wide, i64 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.weight_offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
-			ir.push_str(barrier(backend));
-			predecessor = format!("{prefix}.done");
+			ir.push_str(&format!("br label %{prefix}.check\n{prefix}.check:\n%{prefix}.take = icmp eq i32 %node, {index}\nbr i1 %{prefix}.take, label %{prefix}.entry, label %{prefix}.done\n{prefix}.entry:\n"));
+			if let Some(source) = &plan.requantize {
+				ir.push_str(&self.emit_requantize_call(backend, index, plan, source)?);
+				ir.push_str(&format!("br label %{prefix}.done\n{prefix}.done:\n"));
+				continue;
+			}
+			let Some(stored) = expand else { continue };
+			let predecessor = format!("{prefix}.entry");
+			let (ty, v) = (self.node_precision(&plan.node).model_type, self.variant(&plan.node));
+			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
+			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.base = getelementptr i8, {pointer} %weights, i64 {weight}\n%{prefix}.p.wide = zext i32 %{prefix}.p to i64\n%{prefix}.weights = getelementptr {ty}, {pointer} %{prefix}.base, i64 %{prefix}.p.wide\n%{prefix}.value = call {ty} @recipe.model.source.decode{v}({pointer} %{prefix}.storage, i64 %{prefix}.p.wide, i32 {node})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = 0, weight = plan.weight_offset, node = index + 1, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 		}
 		ir.push_str("ret void\n}\n");
 		Ok(ir)
@@ -9862,7 +9872,7 @@ mod bundle {
 			u8::from(block.profile),
 			normalization_text(block.qk),
 			u8::from(block.frozen),
-			u8::from(block.packed),
+			0,
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
 			precision_token(block.blck_precision)
@@ -9879,7 +9889,6 @@ mod bundle {
 			quantization: value_at(Some(&fields[3]), "block quantization")?,
 			profile: bool_value(&fields[4], "block quantization profile")?,
 			frozen: fields.get(6).map_or(Ok(false), |field| bool_value(field, "block frozen qualifier"))?,
-			packed: fields.get(7).map_or(Ok(false), |field| bool_value(field, "block packed qualifier"))?,
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
@@ -9913,7 +9922,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64, exclusions: u8, precision: Option<Compute>) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, quantization, precision, epsilon, exclusions, pending_frozen: false, pending_packed: false }))
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, quantization, precision, epsilon, exclusions, pending_frozen: false }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -10621,6 +10630,9 @@ impl From<attn> for Block {
 	}
 }
 impl attn {
+	fn arithmetic(&self, format: Compute) -> Block {
+		Block::from(*self).arithmetic(format)
+	}
 	pub fn qk(self, normalization: impl NormalizationSelector) -> Block {
 		Block::from(self).qk(normalization)
 	}
@@ -10955,7 +10967,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::End } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::End } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -11015,7 +11027,6 @@ pub struct Block {
 	quantization: u16,
 	profile: bool,
 	frozen: bool,
-	packed: bool,
 	/// The precision of the block's other ops (its atvn, norm, qk, rope, yarn,
 	/// or a residual's add), named by a precision after one of them.
 	precision: Option<Compute>,
@@ -11053,7 +11064,6 @@ impl PartialEq for Block {
 			&& self.quantization == other.quantization
 			&& self.profile == other.profile
 			&& self.frozen == other.frozen
-			&& self.packed == other.packed
 			&& self.precision == other.precision
 			&& self.blck_precision == other.blck_precision
 			&& self.kv_precision == other.kv_precision
@@ -11077,7 +11087,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, packed: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
@@ -11192,16 +11202,14 @@ impl Quantized for Block {
 }
 precision_methods!(Block => Block);
 precision_methods!(Qk<Block> => Block);
+precision_methods!(attn => Block);
 /// A model: the blocks pushed so far and the settings every later block takes.
-/// The handle shares its data, so `model.packed` and `model.frozen` are the
-/// same model with a qualifier pending for the block written next.
+/// The handle shares its data, so `model.frozen` is the same model with a
+/// qualifier pending for the block written next.
 #[derive(Clone)]
 pub struct Model {
 	inner: Arc<ModelData>,
-	/// `model.packed.layer(n)`: the next block keeps its stored weights packed.
-	pub packed: Packed,
-	/// `model.frozen.layer(n)` and `model.frozen.packed.layer(n)`: the next
-	/// block trains no weight.
+	/// `model.frozen.layer(n)`: the next block trains no weight.
 	pub frozen: Frozen,
 }
 #[derive(Clone)]
@@ -11215,9 +11223,8 @@ pub struct ModelData {
 	precision: Option<Compute>,
 	/// The epsilon every normalization the model lowers is built with; saved with the model.
 	epsilon: f64,
-	/// The qualifiers pending for the next block.
+	/// The qualifier pending for the next block.
 	pending_frozen: bool,
-	pending_packed: bool,
 	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
 	exclusions: u8,
 }
@@ -11230,7 +11237,7 @@ impl std::ops::Deref for Model {
 impl Model {
 	fn wrap(data: ModelData) -> Self {
 		let inner = Arc::new(data);
-		Self { packed: Packed { inner: inner.clone(), frozen: false }, frozen: Frozen { packed: Packed { inner: inner.clone(), frozen: true }, inner: inner.clone() }, inner }
+		Self { frozen: Frozen { inner: inner.clone() }, inner }
 	}
 	/// The model with one change applied to a copy of its data.
 	fn edit(&self, edit: impl FnOnce(&mut ModelData)) -> Self {
@@ -11239,27 +11246,14 @@ impl Model {
 		Self::wrap(data)
 	}
 }
-/// `packed` pending on a model: the block written next keeps its stored bytes
-/// in the weight arena and decodes them in its dot products.
-#[derive(Clone)]
-pub struct Packed {
-	inner: Arc<ModelData>,
-	frozen: bool,
-}
 /// `frozen` pending on a model: the block written next trains no weight.
 #[derive(Clone)]
 pub struct Frozen {
 	inner: Arc<ModelData>,
-	pub packed: Packed,
-}
-impl Packed {
-	fn model(&self) -> Model {
-		Model::wrap(ModelData { pending_packed: true, pending_frozen: self.frozen, ..(*self.inner).clone() })
-	}
 }
 impl Frozen {
 	fn model(&self) -> Model {
-		Model::wrap(ModelData { pending_frozen: true, pending_packed: false, ..(*self.inner).clone() })
+		Model::wrap(ModelData { pending_frozen: true, ..(*self.inner).clone() })
 	}
 }
 macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
@@ -11279,18 +11273,10 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Model { self.model().moe(top_k, experts) }
 	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Model { self.model().hyper(lanes, rank, branch) }
 })+ }; }
-qualified_blocks! { Packed, Frozen }
-/// `packed` before a part inside a composition: `packed.layer(n)`,
-/// `packed.attn(heads)`. The part keeps its stored bytes packed.
-pub struct PackedBlock {
-	frozen: bool,
-}
-/// `frozen` before a part inside a composition, and `frozen.packed` for both.
-pub struct FrozenBlock {
-	pub packed: PackedBlock,
-}
-pub static packed: PackedBlock = PackedBlock { frozen: false };
-pub static frozen: FrozenBlock = FrozenBlock { packed: PackedBlock { frozen: true } };
+qualified_blocks! { Frozen }
+/// `frozen` before a part inside a composition: `frozen.layer(n)`.
+pub struct FrozenBlock;
+pub static frozen: FrozenBlock = FrozenBlock;
 macro_rules! qualified_parts { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn layer(&self, width: impl Width) -> Block { self.qualify(layer(width)) }
 	pub fn conv(&self, filters: usize, kernel: usize) -> Block { self.qualify(conv(filters, kernel)) }
@@ -11303,14 +11289,6 @@ macro_rules! qualified_parts { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Block { self.qualify(recur(parts)) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Block { self.qualify(ensemble(members)) }
 })+ }; }
-impl PackedBlock {
-	fn qualify(&self, mut block: Block) -> Block {
-		assert!(block.operation.weighted(), "{} owns no weights to qualify", block.operation.name());
-		block.packed = true;
-		block.frozen = self.frozen;
-		block
-	}
-}
 impl FrozenBlock {
 	fn qualify(&self, mut block: Block) -> Block {
 		assert!(block.operation.weighted(), "{} owns no weights to qualify", block.operation.name());
@@ -11318,7 +11296,7 @@ impl FrozenBlock {
 		block
 	}
 }
-qualified_parts! { PackedBlock, FrozenBlock }
+qualified_parts! { FrozenBlock }
 /// A default a model excludes through `.no(option)`. Every future exclusion adds
 /// a marker here rather than a negative boolean on a block constructor.
 pub trait Exclusion {
@@ -11337,7 +11315,7 @@ macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
-		assert!(operation.weighted() || !(self.pending_frozen || self.pending_packed), "{} owns no weights to qualify", operation.name());
+		assert!(operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", operation.name());
 		self.edit(|model| {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
@@ -11348,19 +11326,17 @@ impl Model {
 				quantization: model.quantization,
 				profile: StorageFormat(model.quantization).selection().is_some(),
 				frozen: model.pending_frozen,
-				packed: model.pending_packed,
 				precision: None,
 				blck_precision: None,
 				kv_precision: None,
 				suffix,
 			});
 			model.pending_frozen = false;
-			model.pending_packed = false;
 		})
 	}
 	/// Clones a model that a block suffix extends, so a pending qualifier cannot outlive its block.
 	fn suffix(&self) -> Self {
-		assert!(!(self.pending_frozen || self.pending_packed), "block qualifier requires a following block");
+		assert!(!self.pending_frozen, "block qualifier requires a following block");
 		self.clone()
 	}
 	/// Excludes a default from this model. The exclusion applies to every weighted
@@ -13217,7 +13193,7 @@ impl std::ops::Mul for Model {
 		let (left, right) = ((*self.inner).clone(), (*right.inner).clone());
 		assert!(!left.blocks.is_empty(), "the left product branch has no blocks");
 		assert!(!right.blocks.is_empty(), "the right product branch has no blocks");
-		assert!(!left.pending_frozen && !left.pending_packed && !right.pending_frozen && !right.pending_packed, "product branch qualifier requires a following block");
+		assert!(!left.pending_frozen && !right.pending_frozen, "product branch qualifier requires a following block");
 		assert!(left.epsilon.to_bits() == right.epsilon.to_bits(), "product branches must use the same normalization epsilon");
 		Block::of(Operation::Product(
 			ProductBranch { blocks: left.blocks, quantization: left.quantization, exclusions: left.exclusions },
@@ -13373,7 +13349,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, pending_packed: false, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -14890,7 +14866,29 @@ fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
-	checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")
+	let resident = checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")?;
+	checked_add(resident, storage_scratch_bytes(part), "part load scratch bytes")
+}
+/// The first eight values of a stored weight's first block, decoded on the host.
+fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
+	let bytes = weight.bytes.slice(0, stride.min(weight.bytes.len()))?;
+	let mut values = span.decompress(&bytes, &weight.codebook, block.min(weight.count))?;
+	values.truncate(8);
+	Ok(values)
+}
+/// The largest source the load kernel reads for one node: the scratch the load
+/// holds beside the weights.
+fn storage_scratch_bytes(graph: &Graph) -> usize {
+	graph
+		.nodes
+		.iter()
+		.enumerate()
+		.filter_map(|(index, node)| match graph.requantize.get(index).and_then(Option::as_ref) {
+			Some(source) => Some(source.bytes.len()),
+			None => graph.stored.get(index).and_then(|stored| arena_weight(node, stored)).filter(|_| !node.packed).map(|weight| weight.bytes.len()),
+		})
+		.max()
+		.unwrap_or(0)
 }
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
@@ -14977,7 +14975,6 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_index: last.block_index,
 		block_kind: last.block_kind,
 		block_frozen: false,
-		block_packed: false,
 		block_precision: None,
 		block_blck_precision: None,
 		block_kv_precision: None,
@@ -15364,7 +15361,6 @@ struct Graph {
 	lanes: usize,
 	rank: usize,
 	block_frozen: bool,
-	block_packed: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
 	/// The precision the block being lowered named for its blck, if any.
@@ -15404,7 +15400,6 @@ impl Graph {
 			block_index: 0,
 			block_kind: "",
 			block_frozen: false,
-			block_packed: false,
 			block_precision: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
@@ -15479,11 +15474,9 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
 		graph.block_frozen = block.frozen;
-		graph.block_packed = block.packed;
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	graph.block_frozen = false;
-	graph.block_packed = false;
 	graph.block_precision = None;
 	graph.block_blck_precision = None;
 	if tracing() {
@@ -15652,9 +15645,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision);
 	graph.block_frozen |= block.frozen;
-	graph.block_packed |= block.packed;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
@@ -15716,9 +15708,35 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			}
 		}
 	}
+	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
+	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
+	// int8 inputs and scaled once per block sum. The sum's own values are its
+	// state, fp32, which is what the int dot produces.
+	for index in first..graph.nodes.len() {
+		let Compute::Int(format) = graph.nodes[index].precision else { continue };
+		let node = &graph.nodes[index];
+		// int on attn names its sums; the attention itself runs in its state.
+		if node.op == Primitive::Attention {
+			graph.nodes[index].precision = Compute::FP32;
+			continue;
+		}
+		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+		let storage = match format.bits {
+			8 => StorageFormat::named("q8_0"),
+			4 => StorageFormat::named("q4_0"),
+			_ => None,
+		}
+		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+		let node = &mut graph.nodes[index];
+		node.argument[8] = f64::from(storage.0);
+		node.packed = true;
+		node.precision = Compute::FP32;
+		node.kv_precision = Compute::FP32;
+		requantize_bound(graph, index, storage, config)?;
+	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_packed, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -15806,7 +15824,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		block_index: graph.block_index,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
-		packed: graph.block_packed,
+		packed: false,
 		precision,
 		kv_precision,
 	};
@@ -15840,8 +15858,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		}
 	};
 	// A node bound to stored bytes owns no host span: the load kernel writes its
-	// weights on the device from those bytes, packed or not. Every other node
-	// reserves its span here.
+	// weights on the device from those bytes. Every other node reserves its span here.
 	if stored.is_none() {
 		graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 		graph.frozen.resize(graph.parameters.len(), 0);
@@ -16749,11 +16766,10 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a product branch must contain an operation")?;
 	let (source, input) = (graph.source, graph.output);
 	let inherited_bias = graph.bias;
-	let (outer_frozen, outer_packed, outer_kind) = (graph.block_frozen, graph.block_packed, graph.block_kind);
+	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.bias = inherited_bias && left.exclusions & bias.mask() == 0;
 	for block in &left.blocks {
 		graph.block_frozen = block.frozen;
-		graph.block_packed = block.packed;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
@@ -16762,12 +16778,11 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
 	for block in &right.blocks {
 		graph.block_frozen = block.frozen;
-		graph.block_packed = block.packed;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
 	graph.bias = inherited_bias;
-	(graph.block_frozen, graph.block_packed, graph.block_kind) = (outer_frozen, outer_packed, outer_kind);
+	(graph.block_frozen, graph.block_kind) = (outer_frozen, outer_kind);
 	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
 	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
@@ -16785,18 +16800,17 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
-	let (outer_frozen, outer_packed, outer_kind) = (graph.block_frozen, graph.block_packed, graph.block_kind);
+	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
 	for block in blocks {
 		graph.block_frozen = block.frozen;
-		graph.block_packed = block.packed;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
 	if graph.lanes != 0 {
 		lower_collapse(graph, config)?;
 	}
-	(graph.block_frozen, graph.block_packed, graph.block_kind, graph.lanes) = (outer_frozen, outer_packed, outer_kind, lanes);
+	(graph.block_frozen, graph.block_kind, graph.lanes) = (outer_frozen, outer_kind, lanes);
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
 	let mut program = ScalarProgram(Vec::new());
@@ -17494,12 +17508,40 @@ impl NativeTape {
 		};
 		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
 		if program.model_load.is_some() {
-			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
-			let storage = Buffer::upload_image(gpu, &program.artifact.storage)?;
+			let image = &program.artifact.storage;
+			require(!image.is_empty(), "native model-load storage is empty")?;
+			// One node at a time through one scratch the size of the largest
+			// source, so the file's bytes never sit whole beside the weights.
+			let storage = Buffer::reserve(gpu, image.bytes)?;
 			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
-			let mut call = ptrs![weights.pointer, storage.pointer, threads];
-			program.launch_model_load(&mut call)?;
-			gpu.synchronize()?;
+			for (node, stored) in &image.segments {
+				if tracing() { trace(&format!("load write node {node} bytes {}", stored.len()))?; }
+				storage.write_runs(0, stored)?;
+				let index = i32::try_from(*node).map_err(|_| RecipeError::new("native model-load node index exceeds i32"))?;
+				if tracing() { trace(&format!("load dispatch node {node} bytes {} threads {threads}", stored.len()))?; }
+				let mut call = ptrs![weights.pointer, storage.pointer, threads, index];
+				program.launch_model_load(&mut call)?;
+				gpu.synchronize()?;
+				if tracing() { trace(&format!("load synced node {node}"))?; }
+				// A traced run compares the first values the load wrote against the
+				// host's own decode of the same bytes.
+				if tracing() && let Some(Some(weight)) = graph.stored.get(*node) && let Some(spec) = weight.format.spec() {
+					let (offsets, _) = native_weight_arena(graph, precision.model, inference)?;
+					// A packed node's first block comes back as bytes and decodes on the host.
+					let written = if graph.nodes[*node].packed {
+						let bytes = weights.download_range::<u8>(offsets[*node], spec.stride.min(weight.bytes.len()))?;
+						let mut values = weight.format.decompress(&bytes, &weight.codebook, spec.block.min(weight.count))?;
+						values.truncate(8);
+						values
+					} else {
+						weights.download_float_bytes(offsets[*node], spec.block.min(weight.count).min(8), graph.nodes[*node].precision)?
+					};
+					// The host reference is the file's own bytes: the requantize source when there is one.
+					let reference = graph.requantize.get(*node).and_then(Option::as_ref).unwrap_or(weight);
+					let host = reference.segments.first().and_then(|(span, _)| span.spec().map(|first| (span, first))).map(|(span, first)| stored_first_values(reference, *span, first.stride, first.block)).transpose()?.unwrap_or_default();
+					trace(&format!("load node {node} {} wrote {written:?} host {host:?}", quantization(weight.format.0)))?;
+				}
+			}
 		} else {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
 		}
@@ -17845,6 +17887,16 @@ impl NativeTape {
 		let output_precision = self.program.artifact.layout.output_precision;
 		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
 		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		// A traced run shows the head of every node's values once, at the first
+		// output, and again if a later output went nonfinite.
+		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+		if tracing() && (!SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) || !values.iter().all(|value| value.is_finite())) {
+			let layout = &self.program.artifact.layout;
+			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate() {
+				let head = self.values.download_float_bytes(*slot, 8, *precision)?;
+				trace(&format!("values node {index} {head:?}"))?;
+			}
+		}
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
@@ -18783,15 +18835,10 @@ impl Buffer {
 		}
 		Ok(())
 	}
-	/// The model-load storage arena, written segment by segment. The gaps between
-	/// segments are alignment padding no kernel reads.
-	fn upload_image(runtime: &'static Gpu, image: &StorageImage) -> Result<Self> {
-		let bytes = image.bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
-		for (offset, stored) in &image.segments {
-			buffer.write_runs(*offset, stored)?;
-		}
-		Ok(buffer)
+	/// A device buffer of `bytes` left as allocated, for a scratch every write fills before a read.
+	fn reserve(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
+		let bytes = bytes.max(1);
+		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes })
 	}
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
@@ -18888,7 +18935,7 @@ struct Dispatch {
 	geometry: Geometry,
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
-type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
+type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
@@ -19346,10 +19393,11 @@ impl Gpu {
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
 		};
+		let element = widest_precision(graph, precision);
 		let shared_values = if cpu {
 			narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32
 		} else {
-			self.shared_limit / precision.bytes() as u32
+			self.shared_limit / element.bytes() as u32
 		};
 		let shapes = native_contraction_shapes(graph, rows)?;
 		let mut limits = Tile { m: 1, n: 1, k: 1 };
@@ -19417,7 +19465,7 @@ impl Gpu {
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
-		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
+		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(element.bytes()), "native contraction state ratio")? as u32;
 		let mut extent = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
 		let contractions = shapes
 			.iter()
@@ -19500,12 +19548,17 @@ impl Gpu {
 		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
 		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
 		let required = fixed
-			.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
+			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
 			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		require(required <= self.shared_limit, "native model exceeds resident device shared memory")?;
+		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
 		Ok(program)
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
+		let pointer = self.allocate_bytes(bytes)?;
+		if tracing() { trace(&format!("allocate {bytes} bytes on {} at {pointer:#x}, {} free after", self.name, self.free_bytes()?))?; }
+		Ok(pointer)
+	}
+	fn allocate_bytes(&self, bytes: usize) -> Result<u64> {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
@@ -20206,7 +20259,7 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 			NativeEntry::ModelLoad => {
 				require(arguments.len() == NATIVE_MODEL_LOAD_LAYOUT.len(), "native CPU model-load argument count is invalid")?;
 				let function = model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
-				function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2));
+				function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2), native_cpu_value(arguments, 3));
 			}
 		}
 		Ok(())
@@ -20246,7 +20299,7 @@ impl NativeProgram {
 		native_artifact_contract(&artifact)?;
 		native_epoch_layout(artifact.precision.state.bytes())?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
-		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
+		let element = u8::try_from(widest_precision(graph, artifact.precision.model).bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
 				let cpu = load_native_cpu(&artifact)?;
