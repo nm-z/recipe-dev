@@ -113,9 +113,9 @@ fn main() {
 	// 1. A linear model recovers an exact linear relationship, checked against
 	//    the closed form rather than against a recorded value.
 	let linear = recipe.data(linear_source.to_str().expect("linear path is not UTF-8")).target("target");
-	let model = recipe.model().layer(1).loss(mse);
+	let model = recipe.model().layer(1).fp(PRECISION_BITS).loss(mse);
 	let bundle = work.join("linear.ogdl");
-	let trained = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).fp(PRECISION_BITS).save(&bundle).run(&model, &linear);
+	let trained = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).save(&bundle).run(&model, &linear);
 	assert_eq!(trained.predictions().len(), LINEAR_ROWS, "linear.csv did not produce one prediction per row");
 	let worst = worst_absolute(&sorted(trained.predictions().iter().copied()), &sorted(linear_targets()));
 	report.record("linear_closed_form", worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={worst:.9} tolerance={CLOSED_FORM_TOLERANCE}"));
@@ -128,15 +128,15 @@ fn main() {
 	// 3. A reduction across three features with mixed signs, again against the
 	//    closed form.
 	let multi = recipe.data(multi_source.to_str().expect("multi path is not UTF-8")).target("target");
-	let multi_model = recipe.model().layer(1).loss(mse);
-	let multi_trained = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).fp(PRECISION_BITS).run(&multi_model, &multi);
+	let multi_model = recipe.model().layer(1).fp(PRECISION_BITS).loss(mse);
+	let multi_trained = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).run(&multi_model, &multi);
 	assert_eq!(multi_trained.predictions().len(), MULTI_ROWS, "multi.csv did not produce one prediction per row");
 	let multi_worst = worst_absolute(&sorted(multi_trained.predictions().iter().copied()), &sorted(multi_targets()));
 	report.record("multi_feature_reduction", multi_worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={multi_worst:.9} rows={MULTI_ROWS} features={}", MULTI_WEIGHTS.len()));
 
 	// 4. The same seed must reproduce the report bits and tile on the same backend.
-	let first = recipe.train().seed(SEED).lr(RATE).epochs(120).fp(PRECISION_BITS).run(&model, &linear);
-	let second = recipe.train().seed(SEED).lr(RATE).epochs(120).fp(PRECISION_BITS).run(&model, &linear);
+	let first = recipe.train().seed(SEED).lr(RATE).epochs(120).run(&model, &linear);
+	let second = recipe.train().seed(SEED).lr(RATE).epochs(120).run(&model, &linear);
 	let first_tile = first.tile();
 	let second_tile = second.tile();
 	let predictions_identical = prediction_bits(first.predictions()) == prediction_bits(second.predictions());
@@ -164,7 +164,7 @@ fn main() {
 	//    inference reads the bundle without rewriting it.
 	let saved = std::fs::read(&bundle).expect("training did not save a bundle");
 	assert!(!saved.is_empty(), "training saved an empty bundle");
-	let resumed = recipe.train().seed(SEED).lr(RATE).epochs(60).fp(PRECISION_BITS).resume(&bundle).save(&bundle).run(&model, &linear);
+	let resumed = recipe.train().seed(SEED).lr(RATE).epochs(60).resume(&bundle).save(&bundle).run(&model, &linear);
 	let resumed_bytes = std::fs::read(&bundle).expect("resume did not save a bundle");
 	let trained_tile = trained.tile();
 	let resumed_tile = resumed.tile();
@@ -195,7 +195,7 @@ fn main() {
 	let mut inference_worst = 0.0_f64;
 	let mut points = Vec::new();
 	for point in [-4.0, -1.5, 0.0, 2.0, 5.25] {
-		let produced = recipe.infer(&bundle, &[point]);
+		let produced = recipe.predict(&bundle, &[point]);
 		assert_eq!(produced.len(), 1, "inference returned {} values for one input", produced.len());
 		let want = LINEAR_SLOPE * point + LINEAR_INTERCEPT;
 		inference_worst = inference_worst.max((produced[0] - want).abs());
