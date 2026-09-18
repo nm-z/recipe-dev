@@ -5940,7 +5940,8 @@ impl NativeModelIr {
 				if precision.state_type != "float" || precision.model.bytes() < 2 {
 					continue;
 				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				// The activation column staged in the local store, in the node's own type.
+				let scratch = plan.node.input.channels.saturating_mul(self.node_precision(&plan.node).model.bytes());
 				let q4k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
 					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
@@ -5962,7 +5963,8 @@ impl NativeModelIr {
 				if precision.state_type != "float" || precision.model.bytes() < 2 {
 					continue;
 				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				// The activation column staged in the local store, in the node's own type.
+				let scratch = plan.node.input.channels.saturating_mul(self.node_precision(&plan.node).model.bytes());
 				let q6k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
 					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
@@ -5987,7 +5989,8 @@ impl NativeModelIr {
 				if precision.state_type != "float" || precision.model.bytes() < 2 {
 					continue;
 				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
+				// The activation column staged in the local store, in the node's own type.
+				let scratch = plan.node.input.channels.saturating_mul(self.node_precision(&plan.node).model.bytes());
 				let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed && plan.node.op == Primitive::Contraction) else { continue };
 				let segments = stored.format_segments();
 				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes() {
@@ -19551,7 +19554,18 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// A block-weighted sum stages its activation column in the store, in its
+		// own type, so the store holds the widest column of any such node.
+		let staged_values = graph
+			.nodes
+			.iter()
+			.enumerate()
+			.filter(|(index, node)| node.op == Primitive::Contraction && node.packed && graph.stored.get(*index).is_some_and(Option::is_some))
+			.map(|(_, node)| node.input.channels.saturating_mul(node.precision.bytes()).div_ceil(element.bytes()))
+			.max()
+			.unwrap_or(0);
+		let staged_values = narrow(staged_values.min(self.shared_limit as usize / element.bytes()), "native staged column")? as u32;
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(staged_values);
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
