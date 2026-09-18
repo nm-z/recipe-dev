@@ -4279,7 +4279,9 @@ br label %q.loop
 q.done:
 %chunks = lshr i32 %width, 6
 %np = shl i32 %chunks, 6
-%negative.infinity = call RECIPE_STATE @recipe.state.from.f32(float 0xFFF0000000000000)
+; Minus infinity as the state computes it: -1 / 0, so no literal names a type.
+%minus.one = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %one)
+%negative.infinity = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %minus.one, RECIPE_STATE %state.zero)
 br label %key.loop
 key.loop:
 %key = phi i32 [ 0, %q.done ], [ %key.next, %key.finish ]
