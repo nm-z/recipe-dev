@@ -2412,42 +2412,41 @@ define internal double @attention_tile_score(i32 %query, i32 %key, i32 %width, i
 %result = call double @recipe.encode(RECIPE_STATE %score)
 ret double %result
 }
-define internal void @attention_step_score_store(ptr addrspace(1) %context, i64 %index, float %value) #1 { entry:
-%ptr = getelementptr float, ptr addrspace(1) %context, i64 %index
-store float %value, ptr addrspace(1) %ptr, align 4
+define internal void @attention_step_score_store(ptr addrspace(1) %context, i64 %index, RECIPE_STATE %value) #1 { entry:
+%ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %context, i64 %index
+store RECIPE_STATE %value, ptr addrspace(1) %ptr, align RECIPE_STATE_ALIGN
 ret void
 }
-define internal float @attention_step_score_load(ptr addrspace(1) %context, i64 %index) #1 { entry:
-%ptr = getelementptr float, ptr addrspace(1) %context, i64 %index
-%value = load float, ptr addrspace(1) %ptr, align 4
-ret float %value
+define internal RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %index) #1 { entry:
+%ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %context, i64 %index
+%value = load RECIPE_STATE, ptr addrspace(1) %ptr, align RECIPE_STATE_ALIGN
+ret RECIPE_STATE %value
 }
-declare float @llvm.exp.f32(float)
 ; Whole-grid inference attention for one query. The ordinary context's two
-; statistics planes temporarily hold one packed state float per score; the
-; dedicated K/V context keeps the settled half-precision history.
-define internal float @attention_step_key_dot(ptr addrspace(3) %query, ptr addrspace(1) %kv.context, i32 %key, i32 %kv.head, i32 %width, i32 %length) #1 {
+; statistics planes temporarily hold one packed state RECIPE_STATE per score; the
+; dedicated K/V context keeps the settled history in the cache type.
+define internal RECIPE_STATE @attention_step_key_dot(ptr addrspace(3) %query, ptr addrspace(1) %kv.context, i32 %key, i32 %kv.head, i32 %width, i32 %length) #1 {
 entry:
 %kv.channel.base = mul i32 %kv.head, %width
 br label %loop
 loop:
 %channel = phi i32 [ 0, %entry ], [ %channel.next, %step ]
-%sum.0 = phi float [ 0x0000000000000000, %entry ], [ %sum.0.next, %step ]
-%sum.1 = phi float [ 0x0000000000000000, %entry ], [ %sum.1.next, %step ]
-%sum.2 = phi float [ 0x0000000000000000, %entry ], [ %sum.2.next, %step ]
-%sum.3 = phi float [ 0x0000000000000000, %entry ], [ %sum.3.next, %step ]
-%sum.4 = phi float [ 0x0000000000000000, %entry ], [ %sum.4.next, %step ]
-%sum.5 = phi float [ 0x0000000000000000, %entry ], [ %sum.5.next, %step ]
-%sum.6 = phi float [ 0x0000000000000000, %entry ], [ %sum.6.next, %step ]
-%sum.7 = phi float [ 0x0000000000000000, %entry ], [ %sum.7.next, %step ]
-%sum.8 = phi float [ 0x0000000000000000, %entry ], [ %sum.8.next, %step ]
-%sum.9 = phi float [ 0x0000000000000000, %entry ], [ %sum.9.next, %step ]
-%sum.10 = phi float [ 0x0000000000000000, %entry ], [ %sum.10.next, %step ]
-%sum.11 = phi float [ 0x0000000000000000, %entry ], [ %sum.11.next, %step ]
-%sum.12 = phi float [ 0x0000000000000000, %entry ], [ %sum.12.next, %step ]
-%sum.13 = phi float [ 0x0000000000000000, %entry ], [ %sum.13.next, %step ]
-%sum.14 = phi float [ 0x0000000000000000, %entry ], [ %sum.14.next, %step ]
-%sum.15 = phi float [ 0x0000000000000000, %entry ], [ %sum.15.next, %step ]
+%sum.0 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.0.next, %step ]
+%sum.1 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.1.next, %step ]
+%sum.2 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.2.next, %step ]
+%sum.3 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.3.next, %step ]
+%sum.4 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.4.next, %step ]
+%sum.5 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.5.next, %step ]
+%sum.6 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.6.next, %step ]
+%sum.7 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.7.next, %step ]
+%sum.8 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.8.next, %step ]
+%sum.9 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.9.next, %step ]
+%sum.10 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.10.next, %step ]
+%sum.11 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.11.next, %step ]
+%sum.12 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.12.next, %step ]
+%sum.13 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.13.next, %step ]
+%sum.14 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.14.next, %step ]
+%sum.15 = phi RECIPE_STATE [ 0x0000000000000000, %entry ], [ %sum.15.next, %step ]
 %more = icmp ult i32 %channel, %width
 br i1 %more, label %step, label %done
 step:
@@ -2499,54 +2498,54 @@ step:
 %safe.13 = select i1 %active.13, i32 %channel.13, i32 0
 %safe.14 = select i1 %active.14, i32 %channel.14, i32 0
 %safe.15 = select i1 %active.15, i32 %channel.15, i32 0
-%q.0.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.0
-%q.1.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.1
-%q.2.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.2
-%q.3.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.3
-%q.4.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.4
-%q.5.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.5
-%q.6.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.6
-%q.7.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.7
-%q.8.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.8
-%q.9.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.9
-%q.10.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.10
-%q.11.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.11
-%q.12.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.12
-%q.13.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.13
-%q.14.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.14
-%q.15.ptr = getelementptr float, ptr addrspace(3) %query, i32 %safe.15
-%q.0.raw = load float, ptr addrspace(3) %q.0.ptr, align 4
-%q.1.raw = load float, ptr addrspace(3) %q.1.ptr, align 4
-%q.2.raw = load float, ptr addrspace(3) %q.2.ptr, align 4
-%q.3.raw = load float, ptr addrspace(3) %q.3.ptr, align 4
-%q.4.raw = load float, ptr addrspace(3) %q.4.ptr, align 4
-%q.5.raw = load float, ptr addrspace(3) %q.5.ptr, align 4
-%q.6.raw = load float, ptr addrspace(3) %q.6.ptr, align 4
-%q.7.raw = load float, ptr addrspace(3) %q.7.ptr, align 4
-%q.8.raw = load float, ptr addrspace(3) %q.8.ptr, align 4
-%q.9.raw = load float, ptr addrspace(3) %q.9.ptr, align 4
-%q.10.raw = load float, ptr addrspace(3) %q.10.ptr, align 4
-%q.11.raw = load float, ptr addrspace(3) %q.11.ptr, align 4
-%q.12.raw = load float, ptr addrspace(3) %q.12.ptr, align 4
-%q.13.raw = load float, ptr addrspace(3) %q.13.ptr, align 4
-%q.14.raw = load float, ptr addrspace(3) %q.14.ptr, align 4
-%q.15.raw = load float, ptr addrspace(3) %q.15.ptr, align 4
-%q.0 = select i1 %active.0, float %q.0.raw, float 0x0000000000000000
-%q.1 = select i1 %active.1, float %q.1.raw, float 0x0000000000000000
-%q.2 = select i1 %active.2, float %q.2.raw, float 0x0000000000000000
-%q.3 = select i1 %active.3, float %q.3.raw, float 0x0000000000000000
-%q.4 = select i1 %active.4, float %q.4.raw, float 0x0000000000000000
-%q.5 = select i1 %active.5, float %q.5.raw, float 0x0000000000000000
-%q.6 = select i1 %active.6, float %q.6.raw, float 0x0000000000000000
-%q.7 = select i1 %active.7, float %q.7.raw, float 0x0000000000000000
-%q.8 = select i1 %active.8, float %q.8.raw, float 0x0000000000000000
-%q.9 = select i1 %active.9, float %q.9.raw, float 0x0000000000000000
-%q.10 = select i1 %active.10, float %q.10.raw, float 0x0000000000000000
-%q.11 = select i1 %active.11, float %q.11.raw, float 0x0000000000000000
-%q.12 = select i1 %active.12, float %q.12.raw, float 0x0000000000000000
-%q.13 = select i1 %active.13, float %q.13.raw, float 0x0000000000000000
-%q.14 = select i1 %active.14, float %q.14.raw, float 0x0000000000000000
-%q.15 = select i1 %active.15, float %q.15.raw, float 0x0000000000000000
+%q.0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.0
+%q.1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.1
+%q.2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.2
+%q.3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.3
+%q.4.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.4
+%q.5.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.5
+%q.6.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.6
+%q.7.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.7
+%q.8.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.8
+%q.9.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.9
+%q.10.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.10
+%q.11.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.11
+%q.12.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.12
+%q.13.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.13
+%q.14.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.14
+%q.15.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %query, i32 %safe.15
+%q.0.raw = load RECIPE_STATE, ptr addrspace(3) %q.0.ptr, align RECIPE_STATE_ALIGN
+%q.1.raw = load RECIPE_STATE, ptr addrspace(3) %q.1.ptr, align RECIPE_STATE_ALIGN
+%q.2.raw = load RECIPE_STATE, ptr addrspace(3) %q.2.ptr, align RECIPE_STATE_ALIGN
+%q.3.raw = load RECIPE_STATE, ptr addrspace(3) %q.3.ptr, align RECIPE_STATE_ALIGN
+%q.4.raw = load RECIPE_STATE, ptr addrspace(3) %q.4.ptr, align RECIPE_STATE_ALIGN
+%q.5.raw = load RECIPE_STATE, ptr addrspace(3) %q.5.ptr, align RECIPE_STATE_ALIGN
+%q.6.raw = load RECIPE_STATE, ptr addrspace(3) %q.6.ptr, align RECIPE_STATE_ALIGN
+%q.7.raw = load RECIPE_STATE, ptr addrspace(3) %q.7.ptr, align RECIPE_STATE_ALIGN
+%q.8.raw = load RECIPE_STATE, ptr addrspace(3) %q.8.ptr, align RECIPE_STATE_ALIGN
+%q.9.raw = load RECIPE_STATE, ptr addrspace(3) %q.9.ptr, align RECIPE_STATE_ALIGN
+%q.10.raw = load RECIPE_STATE, ptr addrspace(3) %q.10.ptr, align RECIPE_STATE_ALIGN
+%q.11.raw = load RECIPE_STATE, ptr addrspace(3) %q.11.ptr, align RECIPE_STATE_ALIGN
+%q.12.raw = load RECIPE_STATE, ptr addrspace(3) %q.12.ptr, align RECIPE_STATE_ALIGN
+%q.13.raw = load RECIPE_STATE, ptr addrspace(3) %q.13.ptr, align RECIPE_STATE_ALIGN
+%q.14.raw = load RECIPE_STATE, ptr addrspace(3) %q.14.ptr, align RECIPE_STATE_ALIGN
+%q.15.raw = load RECIPE_STATE, ptr addrspace(3) %q.15.ptr, align RECIPE_STATE_ALIGN
+%q.0 = select i1 %active.0, RECIPE_STATE %q.0.raw, RECIPE_STATE 0x0000000000000000
+%q.1 = select i1 %active.1, RECIPE_STATE %q.1.raw, RECIPE_STATE 0x0000000000000000
+%q.2 = select i1 %active.2, RECIPE_STATE %q.2.raw, RECIPE_STATE 0x0000000000000000
+%q.3 = select i1 %active.3, RECIPE_STATE %q.3.raw, RECIPE_STATE 0x0000000000000000
+%q.4 = select i1 %active.4, RECIPE_STATE %q.4.raw, RECIPE_STATE 0x0000000000000000
+%q.5 = select i1 %active.5, RECIPE_STATE %q.5.raw, RECIPE_STATE 0x0000000000000000
+%q.6 = select i1 %active.6, RECIPE_STATE %q.6.raw, RECIPE_STATE 0x0000000000000000
+%q.7 = select i1 %active.7, RECIPE_STATE %q.7.raw, RECIPE_STATE 0x0000000000000000
+%q.8 = select i1 %active.8, RECIPE_STATE %q.8.raw, RECIPE_STATE 0x0000000000000000
+%q.9 = select i1 %active.9, RECIPE_STATE %q.9.raw, RECIPE_STATE 0x0000000000000000
+%q.10 = select i1 %active.10, RECIPE_STATE %q.10.raw, RECIPE_STATE 0x0000000000000000
+%q.11 = select i1 %active.11, RECIPE_STATE %q.11.raw, RECIPE_STATE 0x0000000000000000
+%q.12 = select i1 %active.12, RECIPE_STATE %q.12.raw, RECIPE_STATE 0x0000000000000000
+%q.13 = select i1 %active.13, RECIPE_STATE %q.13.raw, RECIPE_STATE 0x0000000000000000
+%q.14 = select i1 %active.14, RECIPE_STATE %q.14.raw, RECIPE_STATE 0x0000000000000000
+%q.15 = select i1 %active.15, RECIPE_STATE %q.15.raw, RECIPE_STATE 0x0000000000000000
 %key.0.channel = add i32 %kv.channel.base, %safe.0
 %key.1.channel = add i32 %kv.channel.base, %safe.1
 %key.2.channel = add i32 %kv.channel.base, %safe.2
@@ -2643,73 +2642,73 @@ step:
 %key.13.load = load RECIPE_KV, ptr addrspace(1) %key.13.ptr, align RECIPE_KV_ALIGN
 %key.14.load = load RECIPE_KV, ptr addrspace(1) %key.14.ptr, align RECIPE_KV_ALIGN
 %key.15.load = load RECIPE_KV, ptr addrspace(1) %key.15.ptr, align RECIPE_KV_ALIGN
-%key.0.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.0.load)
-%key.1.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.1.load)
-%key.2.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.2.load)
-%key.3.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.3.load)
-%key.4.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.4.load)
-%key.5.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.5.load)
-%key.6.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.6.load)
-%key.7.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.7.load)
-%key.8.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.8.load)
-%key.9.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.9.load)
-%key.10.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.10.load)
-%key.11.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.11.load)
-%key.12.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.12.load)
-%key.13.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.13.load)
-%key.14.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.14.load)
-%key.15.raw = call float @recipe.kv.to.f32(RECIPE_KV %key.15.load)
-%key.0 = select i1 %active.0, float %key.0.raw, float 0x0000000000000000
-%key.1 = select i1 %active.1, float %key.1.raw, float 0x0000000000000000
-%key.2 = select i1 %active.2, float %key.2.raw, float 0x0000000000000000
-%key.3 = select i1 %active.3, float %key.3.raw, float 0x0000000000000000
-%key.4 = select i1 %active.4, float %key.4.raw, float 0x0000000000000000
-%key.5 = select i1 %active.5, float %key.5.raw, float 0x0000000000000000
-%key.6 = select i1 %active.6, float %key.6.raw, float 0x0000000000000000
-%key.7 = select i1 %active.7, float %key.7.raw, float 0x0000000000000000
-%key.8 = select i1 %active.8, float %key.8.raw, float 0x0000000000000000
-%key.9 = select i1 %active.9, float %key.9.raw, float 0x0000000000000000
-%key.10 = select i1 %active.10, float %key.10.raw, float 0x0000000000000000
-%key.11 = select i1 %active.11, float %key.11.raw, float 0x0000000000000000
-%key.12 = select i1 %active.12, float %key.12.raw, float 0x0000000000000000
-%key.13 = select i1 %active.13, float %key.13.raw, float 0x0000000000000000
-%key.14 = select i1 %active.14, float %key.14.raw, float 0x0000000000000000
-%key.15 = select i1 %active.15, float %key.15.raw, float 0x0000000000000000
-%sum.0.next = call float @llvm.fma.f32(float %q.0, float %key.0, float %sum.0)
-%sum.1.next = call float @llvm.fma.f32(float %q.1, float %key.1, float %sum.1)
-%sum.2.next = call float @llvm.fma.f32(float %q.2, float %key.2, float %sum.2)
-%sum.3.next = call float @llvm.fma.f32(float %q.3, float %key.3, float %sum.3)
-%sum.4.next = call float @llvm.fma.f32(float %q.4, float %key.4, float %sum.4)
-%sum.5.next = call float @llvm.fma.f32(float %q.5, float %key.5, float %sum.5)
-%sum.6.next = call float @llvm.fma.f32(float %q.6, float %key.6, float %sum.6)
-%sum.7.next = call float @llvm.fma.f32(float %q.7, float %key.7, float %sum.7)
-%sum.8.next = call float @llvm.fma.f32(float %q.8, float %key.8, float %sum.8)
-%sum.9.next = call float @llvm.fma.f32(float %q.9, float %key.9, float %sum.9)
-%sum.10.next = call float @llvm.fma.f32(float %q.10, float %key.10, float %sum.10)
-%sum.11.next = call float @llvm.fma.f32(float %q.11, float %key.11, float %sum.11)
-%sum.12.next = call float @llvm.fma.f32(float %q.12, float %key.12, float %sum.12)
-%sum.13.next = call float @llvm.fma.f32(float %q.13, float %key.13, float %sum.13)
-%sum.14.next = call float @llvm.fma.f32(float %q.14, float %key.14, float %sum.14)
-%sum.15.next = call float @llvm.fma.f32(float %q.15, float %key.15, float %sum.15)
+%key.0.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.0.load)
+%key.1.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.1.load)
+%key.2.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.2.load)
+%key.3.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.3.load)
+%key.4.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.4.load)
+%key.5.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.5.load)
+%key.6.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.6.load)
+%key.7.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.7.load)
+%key.8.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.8.load)
+%key.9.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.9.load)
+%key.10.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.10.load)
+%key.11.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.11.load)
+%key.12.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.12.load)
+%key.13.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.13.load)
+%key.14.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.14.load)
+%key.15.raw = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %key.15.load)
+%key.0 = select i1 %active.0, RECIPE_STATE %key.0.raw, RECIPE_STATE 0x0000000000000000
+%key.1 = select i1 %active.1, RECIPE_STATE %key.1.raw, RECIPE_STATE 0x0000000000000000
+%key.2 = select i1 %active.2, RECIPE_STATE %key.2.raw, RECIPE_STATE 0x0000000000000000
+%key.3 = select i1 %active.3, RECIPE_STATE %key.3.raw, RECIPE_STATE 0x0000000000000000
+%key.4 = select i1 %active.4, RECIPE_STATE %key.4.raw, RECIPE_STATE 0x0000000000000000
+%key.5 = select i1 %active.5, RECIPE_STATE %key.5.raw, RECIPE_STATE 0x0000000000000000
+%key.6 = select i1 %active.6, RECIPE_STATE %key.6.raw, RECIPE_STATE 0x0000000000000000
+%key.7 = select i1 %active.7, RECIPE_STATE %key.7.raw, RECIPE_STATE 0x0000000000000000
+%key.8 = select i1 %active.8, RECIPE_STATE %key.8.raw, RECIPE_STATE 0x0000000000000000
+%key.9 = select i1 %active.9, RECIPE_STATE %key.9.raw, RECIPE_STATE 0x0000000000000000
+%key.10 = select i1 %active.10, RECIPE_STATE %key.10.raw, RECIPE_STATE 0x0000000000000000
+%key.11 = select i1 %active.11, RECIPE_STATE %key.11.raw, RECIPE_STATE 0x0000000000000000
+%key.12 = select i1 %active.12, RECIPE_STATE %key.12.raw, RECIPE_STATE 0x0000000000000000
+%key.13 = select i1 %active.13, RECIPE_STATE %key.13.raw, RECIPE_STATE 0x0000000000000000
+%key.14 = select i1 %active.14, RECIPE_STATE %key.14.raw, RECIPE_STATE 0x0000000000000000
+%key.15 = select i1 %active.15, RECIPE_STATE %key.15.raw, RECIPE_STATE 0x0000000000000000
+%sum.0.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.0, RECIPE_STATE %q.0, RECIPE_STATE %key.0)
+%sum.1.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.1, RECIPE_STATE %q.1, RECIPE_STATE %key.1)
+%sum.2.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.2, RECIPE_STATE %q.2, RECIPE_STATE %key.2)
+%sum.3.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.3, RECIPE_STATE %q.3, RECIPE_STATE %key.3)
+%sum.4.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.4, RECIPE_STATE %q.4, RECIPE_STATE %key.4)
+%sum.5.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.5, RECIPE_STATE %q.5, RECIPE_STATE %key.5)
+%sum.6.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.6, RECIPE_STATE %q.6, RECIPE_STATE %key.6)
+%sum.7.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.7, RECIPE_STATE %q.7, RECIPE_STATE %key.7)
+%sum.8.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.8, RECIPE_STATE %q.8, RECIPE_STATE %key.8)
+%sum.9.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.9, RECIPE_STATE %q.9, RECIPE_STATE %key.9)
+%sum.10.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.10, RECIPE_STATE %q.10, RECIPE_STATE %key.10)
+%sum.11.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.11, RECIPE_STATE %q.11, RECIPE_STATE %key.11)
+%sum.12.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.12, RECIPE_STATE %q.12, RECIPE_STATE %key.12)
+%sum.13.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.13, RECIPE_STATE %q.13, RECIPE_STATE %key.13)
+%sum.14.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.14, RECIPE_STATE %q.14, RECIPE_STATE %key.14)
+%sum.15.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %sum.15, RECIPE_STATE %q.15, RECIPE_STATE %key.15)
 %channel.next = add i32 %channel, 16
 br label %loop
 done:
-%sum.89 = fadd float %sum.8, %sum.9
-%sum.1011 = fadd float %sum.10, %sum.11
-%sum.1213 = fadd float %sum.12, %sum.13
-%sum.1415 = fadd float %sum.14, %sum.15
-%sum.89.1011 = fadd float %sum.89, %sum.1011
-%sum.1213.1415 = fadd float %sum.1213, %sum.1415
-%sum.8to15 = fadd float %sum.89.1011, %sum.1213.1415
-%sum.01 = fadd float %sum.0, %sum.1
-%sum.23 = fadd float %sum.2, %sum.3
-%sum.45 = fadd float %sum.4, %sum.5
-%sum.67 = fadd float %sum.6, %sum.7
-%sum.0123 = fadd float %sum.01, %sum.23
-%sum.4567 = fadd float %sum.45, %sum.67
-%sum.0to7 = fadd float %sum.0123, %sum.4567
-%sum = fadd float %sum.0to7, %sum.8to15
-ret float %sum
+%sum.89 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.8, RECIPE_STATE %sum.9)
+%sum.1011 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.10, RECIPE_STATE %sum.11)
+%sum.1213 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.12, RECIPE_STATE %sum.13)
+%sum.1415 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.14, RECIPE_STATE %sum.15)
+%sum.89.1011 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.89, RECIPE_STATE %sum.1011)
+%sum.1213.1415 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.1213, RECIPE_STATE %sum.1415)
+%sum.8to15 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.89.1011, RECIPE_STATE %sum.1213.1415)
+%sum.01 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.0, RECIPE_STATE %sum.1)
+%sum.23 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.2, RECIPE_STATE %sum.3)
+%sum.45 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.4, RECIPE_STATE %sum.5)
+%sum.67 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.6, RECIPE_STATE %sum.7)
+%sum.0123 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.01, RECIPE_STATE %sum.23)
+%sum.4567 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.45, RECIPE_STATE %sum.67)
+%sum.0to7 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.0123, RECIPE_STATE %sum.4567)
+%sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.0to7, RECIPE_STATE %sum.8to15)
+ret RECIPE_STATE %sum
 }
 define internal void @attention_forward_step_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture writeonly %output,
@@ -2733,15 +2732,15 @@ entry:
 %waves = udiv i32 %block, %wave.width
 %global.wave = udiv i32 %global.id, %wave.width
 %global.waves = udiv i32 %threads, %wave.width
-%width.float = uitofp i32 %width to float
-%scale = call float @llvm.sqrt.f32(float %width.float)
+%width.RECIPE_STATE = call RECIPE_STATE @recipe.state.from.u32(i32 %width)
+%scale = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %width.RECIPE_STATE)
 %wave.half.start = lshr i32 %wave.width, 1
 %maximum.global.index = add i32 %waves, 0
 %denominator.global.index = add i32 %waves, 1
 %tile.base = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
-%tile.float = bitcast ptr addrspace(3) %tile.base to ptr addrspace(3)
-%maximum.global.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %maximum.global.index
-%denominator.global.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %denominator.global.index
+%tile.RECIPE_STATE = bitcast ptr addrspace(3) %tile.base to ptr addrspace(3)
+%maximum.global.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %maximum.global.index
+%denominator.global.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %denominator.global.index
 br label %cache.loop
 cache.loop:
 %cache.channel = phi i32 [ %global.id, %entry ], [ %cache.channel.next, %cache.step ]
@@ -2753,20 +2752,20 @@ cache.step:
 %cache.position.wide = zext i32 %cache.position.index to i64
 %cache.key.source.index = add i32 %from, %cache.position.index
 %cache.key.source.wide = zext i32 %cache.key.source.index to i64
-%cache.key.source.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %cache.key.source.wide
-%cache.key.value = load half, ptr addrspace(1) %cache.key.source.ptr, align 2
+%cache.key.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.key.source.wide
+%cache.key.value = load double, ptr addrspace(1) %cache.key.source.ptr, align 8
 %cache.value.base = add i32 %from, %kv.plane
 %cache.value.source.index = add i32 %cache.value.base, %cache.position.index
 %cache.value.source.wide = zext i32 %cache.value.source.index to i64
-%cache.value.source.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %cache.value.source.wide
-%cache.value.value = load half, ptr addrspace(1) %cache.value.source.ptr, align 2
+%cache.value.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.value.source.wide
+%cache.value.value = load double, ptr addrspace(1) %cache.value.source.ptr, align 8
 %cache.key.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %cache.position.wide
-%cache.key.kv = call RECIPE_KV @recipe.kv.from.f16(half %cache.key.value)
+%cache.key.kv = call RECIPE_KV @recipe.kv.encode(double %cache.key.value)
 store RECIPE_KV %cache.key.kv, ptr addrspace(1) %cache.key.ptr, align RECIPE_KV_ALIGN
 %cache.value.index = add i32 %kv.plane, %cache.position.index
 %cache.value.wide = zext i32 %cache.value.index to i64
 %cache.value.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %cache.value.wide
-%cache.value.kv = call RECIPE_KV @recipe.kv.from.f16(half %cache.value.value)
+%cache.value.kv = call RECIPE_KV @recipe.kv.encode(double %cache.value.value)
 store RECIPE_KV %cache.value.kv, ptr addrspace(1) %cache.value.ptr, align RECIPE_KV_ALIGN
 %cache.channel.next = add i32 %cache.channel, %threads
 br label %cache.loop
@@ -2789,11 +2788,11 @@ score.query.copy.step:
 %score.query.channel.base = mul i32 %score.query.global.channel, %length
 %score.query.index = add i32 %score.query.channel.base, %position
 %score.query.wide = zext i32 %score.query.index to i64
-%score.query.ptr = getelementptr inbounds half, ptr addrspace(1) %input, i64 %score.query.wide
-%score.query.value = load half, ptr addrspace(1) %score.query.ptr, align 2
-%score.query.float = fpext half %score.query.value to float
-%score.query.shared.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %score.query.channel
-store float %score.query.float, ptr addrspace(3) %score.query.shared.ptr, align 4
+%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %score.query.wide
+%score.query.value = load double, ptr addrspace(1) %score.query.ptr, align 8
+%score.query.RECIPE_STATE = call RECIPE_STATE @recipe.state.from.model(double %score.query.value)
+%score.query.shared.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %score.query.channel
+store RECIPE_STATE %score.query.RECIPE_STATE, ptr addrspace(3) %score.query.shared.ptr, align RECIPE_STATE_ALIGN
 %score.query.channel.next = add i32 %score.query.channel, %block
 br label %score.query.copy.loop
 score.query.copy.done:
@@ -2803,12 +2802,12 @@ call void @recipe.local.barrier()
 br i1 %score.key.more, label %score.key.compute, label %score.key.done
 score.key.compute:
 %score.kv.head = udiv i32 %group, %kv.group
-%score.scaled.raw = call float @attention_step_key_dot(ptr addrspace(3) %tile.float, ptr addrspace(1) %kv.context, i32 %score.key, i32 %score.kv.head, i32 %width, i32 %length)
-%score.scaled = fdiv float %score.scaled.raw, %scale
+%score.scaled.raw = call RECIPE_STATE @attention_step_key_dot(ptr addrspace(3) %tile.RECIPE_STATE, ptr addrspace(1) %kv.context, i32 %score.key, i32 %score.kv.head, i32 %width, i32 %length)
+%score.scaled = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %score.scaled.raw, RECIPE_STATE %scale)
 %score.row = mul i32 %group, %length
 %score.slot = add i32 %score.row, %score.key
 %score.slot.wide = zext i32 %score.slot to i64
-call void @attention_step_score_store(ptr addrspace(1) %context, i64 %score.slot.wide, float %score.scaled)
+call void @attention_step_score_store(ptr addrspace(1) %context, i64 %score.slot.wide, RECIPE_STATE %score.scaled)
 br label %score.key.done
 score.key.done:
 call void @recipe.local.barrier()
@@ -2823,37 +2822,37 @@ call void @grid_barrier(i32 %threads)
 br label %maximum.loop
 maximum.loop:
 %maximum.key = phi i32 [ %lid, %score.done ], [ %maximum.key.next, %maximum.step ]
-%maximum.value = phi float [ 0xC7EFFFFFE0000000, %score.done ], [ %maximum.next, %maximum.step ]
+%maximum.value = phi RECIPE_STATE [ 0xC7EFFFFFE0000000, %score.done ], [ %maximum.next, %maximum.step ]
 %maximum.more = icmp ult i32 %maximum.key, %active.limit
 br i1 %maximum.more, label %maximum.step, label %maximum.wave.loop
 maximum.step:
 %maximum.row = mul i32 %group, %length
 %maximum.slot = add i32 %maximum.row, %maximum.key
 %maximum.slot.wide = zext i32 %maximum.slot to i64
-%maximum.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %maximum.slot.wide)
-%maximum.larger = fcmp ogt float %maximum.score, %maximum.value
-%maximum.next = select i1 %maximum.larger, float %maximum.score, float %maximum.value
+%maximum.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %maximum.slot.wide)
+%maximum.larger = call i1 @recipe.state.ogt(RECIPE_STATE %maximum.score, RECIPE_STATE %maximum.value)
+%maximum.next = select i1 %maximum.larger, RECIPE_STATE %maximum.score, RECIPE_STATE %maximum.value
 %maximum.key.next = add i32 %maximum.key, %block
 br label %maximum.loop
 maximum.wave.loop:
 %maximum.offset = phi i32 [ %wave.half.start, %maximum.loop ], [ %maximum.offset.next, %maximum.wave.step ]
-%maximum.wave.value = phi float [ %maximum.value, %maximum.loop ], [ %maximum.wave.value.next, %maximum.wave.step ]
+%maximum.wave.value = phi RECIPE_STATE [ %maximum.value, %maximum.loop ], [ %maximum.wave.value.next, %maximum.wave.step ]
 %maximum.wave.more = icmp ne i32 %maximum.offset, 0
 br i1 %maximum.wave.more, label %maximum.wave.step, label %maximum.wave.done
 maximum.wave.step:
 %maximum.partner.lane = xor i32 %lane, %maximum.offset
 %maximum.partner.index = mul i32 %maximum.partner.lane, 4
-%maximum.partner = call float @recipe.wave.partner.f32(float %maximum.wave.value, i32 %maximum.partner.index)
-%maximum.partner.larger = fcmp ogt float %maximum.partner, %maximum.wave.value
-%maximum.wave.value.next = select i1 %maximum.partner.larger, float %maximum.partner, float %maximum.wave.value
+%maximum.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %maximum.wave.value, i32 %maximum.partner.index)
+%maximum.partner.larger = call i1 @recipe.state.ogt(RECIPE_STATE %maximum.partner, RECIPE_STATE %maximum.wave.value)
+%maximum.wave.value.next = select i1 %maximum.partner.larger, RECIPE_STATE %maximum.partner, RECIPE_STATE %maximum.wave.value
 %maximum.offset.next = lshr i32 %maximum.offset, 1
 br label %maximum.wave.loop
 maximum.wave.done:
 %maximum.owner = icmp eq i32 %lane, 0
 br i1 %maximum.owner, label %maximum.wave.store, label %maximum.wave.skip
 maximum.wave.store:
-%maximum.wave.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %wave
-store float %maximum.wave.value, ptr addrspace(3) %maximum.wave.ptr, align 4
+%maximum.wave.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %wave
+store RECIPE_STATE %maximum.wave.value, ptr addrspace(3) %maximum.wave.ptr, align RECIPE_STATE_ALIGN
 br label %maximum.wave.skip
 maximum.wave.skip:
 call void @recipe.local.barrier()
@@ -2861,56 +2860,56 @@ call void @recipe.local.barrier()
 br i1 %maximum.group.owner, label %maximum.group.loop, label %maximum.group.skip
 maximum.group.loop:
 %maximum.wave.index = phi i32 [ 0, %maximum.wave.skip ], [ %maximum.wave.index.next, %maximum.group.step ]
-%maximum.group.value = phi float [ 0xC7EFFFFFE0000000, %maximum.wave.skip ], [ %maximum.group.next, %maximum.group.step ]
+%maximum.group.value = phi RECIPE_STATE [ 0xC7EFFFFFE0000000, %maximum.wave.skip ], [ %maximum.group.next, %maximum.group.step ]
 %maximum.group.more = icmp ult i32 %maximum.wave.index, %waves
 br i1 %maximum.group.more, label %maximum.group.step, label %maximum.group.done
 maximum.group.step:
-%maximum.group.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %maximum.wave.index
-%maximum.group.wave = load float, ptr addrspace(3) %maximum.group.ptr, align 4
-%maximum.group.larger = fcmp ogt float %maximum.group.wave, %maximum.group.value
-%maximum.group.next = select i1 %maximum.group.larger, float %maximum.group.wave, float %maximum.group.value
+%maximum.group.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %maximum.wave.index
+%maximum.group.wave = load RECIPE_STATE, ptr addrspace(3) %maximum.group.ptr, align RECIPE_STATE_ALIGN
+%maximum.group.larger = call i1 @recipe.state.ogt(RECIPE_STATE %maximum.group.wave, RECIPE_STATE %maximum.group.value)
+%maximum.group.next = select i1 %maximum.group.larger, RECIPE_STATE %maximum.group.wave, RECIPE_STATE %maximum.group.value
 %maximum.wave.index.next = add i32 %maximum.wave.index, 1
 br label %maximum.group.loop
 maximum.group.done:
-store float %maximum.group.value, ptr addrspace(3) %maximum.global.ptr, align 4
+store RECIPE_STATE %maximum.group.value, ptr addrspace(3) %maximum.global.ptr, align RECIPE_STATE_ALIGN
 br label %maximum.group.skip
 maximum.group.skip:
 call void @recipe.local.barrier()
-%maximum.global = load float, ptr addrspace(3) %maximum.global.ptr, align 4
+%maximum.global = load RECIPE_STATE, ptr addrspace(3) %maximum.global.ptr, align RECIPE_STATE_ALIGN
 br label %denominator.loop
 denominator.loop:
 %denominator.key = phi i32 [ %lid, %maximum.group.skip ], [ %denominator.key.next, %denominator.step ]
-%denominator.value = phi float [ 0x0000000000000000, %maximum.group.skip ], [ %denominator.next, %denominator.step ]
+%denominator.value = phi RECIPE_STATE [ 0x0000000000000000, %maximum.group.skip ], [ %denominator.next, %denominator.step ]
 %denominator.more = icmp ult i32 %denominator.key, %active.limit
 br i1 %denominator.more, label %denominator.step, label %denominator.wave.loop
 denominator.step:
 %denominator.row = mul i32 %group, %length
 %denominator.slot = add i32 %denominator.row, %denominator.key
 %denominator.slot.wide = zext i32 %denominator.slot to i64
-%denominator.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %denominator.slot.wide)
-%denominator.centered = fsub float %denominator.score, %maximum.global
-%denominator.exp = call float @llvm.exp.f32(float %denominator.centered)
-%denominator.next = fadd float %denominator.value, %denominator.exp
+%denominator.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %denominator.slot.wide)
+%denominator.centered = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %denominator.score, RECIPE_STATE %maximum.global)
+%denominator.exp = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %denominator.centered)
+%denominator.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.value, RECIPE_STATE %denominator.exp)
 %denominator.key.next = add i32 %denominator.key, %block
 br label %denominator.loop
 denominator.wave.loop:
 %denominator.offset = phi i32 [ %wave.half.start, %denominator.loop ], [ %denominator.offset.next, %denominator.wave.step ]
-%denominator.wave.value = phi float [ %denominator.value, %denominator.loop ], [ %denominator.wave.value.next, %denominator.wave.step ]
+%denominator.wave.value = phi RECIPE_STATE [ %denominator.value, %denominator.loop ], [ %denominator.wave.value.next, %denominator.wave.step ]
 %denominator.wave.more = icmp ne i32 %denominator.offset, 0
 br i1 %denominator.wave.more, label %denominator.wave.step, label %denominator.wave.done
 denominator.wave.step:
 %denominator.partner.lane = xor i32 %lane, %denominator.offset
 %denominator.partner.index = mul i32 %denominator.partner.lane, 4
-%denominator.partner = call float @recipe.wave.partner.f32(float %denominator.wave.value, i32 %denominator.partner.index)
-%denominator.wave.value.next = fadd float %denominator.wave.value, %denominator.partner
+%denominator.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %denominator.wave.value, i32 %denominator.partner.index)
+%denominator.wave.value.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.wave.value, RECIPE_STATE %denominator.partner)
 %denominator.offset.next = lshr i32 %denominator.offset, 1
 br label %denominator.wave.loop
 denominator.wave.done:
 %denominator.owner = icmp eq i32 %lane, 0
 br i1 %denominator.owner, label %denominator.wave.store, label %denominator.wave.skip
 denominator.wave.store:
-%denominator.wave.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %wave
-store float %denominator.wave.value, ptr addrspace(3) %denominator.wave.ptr, align 4
+%denominator.wave.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %wave
+store RECIPE_STATE %denominator.wave.value, ptr addrspace(3) %denominator.wave.ptr, align RECIPE_STATE_ALIGN
 br label %denominator.wave.skip
 denominator.wave.skip:
 call void @recipe.local.barrier()
@@ -2918,21 +2917,21 @@ call void @recipe.local.barrier()
 br i1 %denominator.group.owner, label %denominator.group.loop, label %denominator.group.skip
 denominator.group.loop:
 %denominator.wave.index = phi i32 [ 0, %denominator.wave.skip ], [ %denominator.wave.index.next, %denominator.group.step ]
-%denominator.group.value = phi float [ 0x0000000000000000, %denominator.wave.skip ], [ %denominator.group.next, %denominator.group.step ]
+%denominator.group.value = phi RECIPE_STATE [ 0x0000000000000000, %denominator.wave.skip ], [ %denominator.group.next, %denominator.group.step ]
 %denominator.group.more = icmp ult i32 %denominator.wave.index, %waves
 br i1 %denominator.group.more, label %denominator.group.step, label %denominator.group.done
 denominator.group.step:
-%denominator.group.ptr = getelementptr float, ptr addrspace(3) %tile.float, i32 %denominator.wave.index
-%denominator.group.wave = load float, ptr addrspace(3) %denominator.group.ptr, align 4
-%denominator.group.next = fadd float %denominator.group.value, %denominator.group.wave
+%denominator.group.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %denominator.wave.index
+%denominator.group.wave = load RECIPE_STATE, ptr addrspace(3) %denominator.group.ptr, align RECIPE_STATE_ALIGN
+%denominator.group.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.group.value, RECIPE_STATE %denominator.group.wave)
 %denominator.wave.index.next = add i32 %denominator.wave.index, 1
 br label %denominator.group.loop
 denominator.group.done:
-store float %denominator.group.value, ptr addrspace(3) %denominator.global.ptr, align 4
+store RECIPE_STATE %denominator.group.value, ptr addrspace(3) %denominator.global.ptr, align RECIPE_STATE_ALIGN
 br label %denominator.group.skip
 denominator.group.skip:
 call void @recipe.local.barrier()
-%denominator.global = load float, ptr addrspace(3) %denominator.global.ptr, align 4
+%denominator.global = load RECIPE_STATE, ptr addrspace(3) %denominator.global.ptr, align RECIPE_STATE_ALIGN
 br label %probability.loop
 probability.loop:
 %probability.key = phi i32 [ %lid, %denominator.group.skip ], [ %probability.key.next, %probability.step ]
@@ -2942,11 +2941,11 @@ probability.step:
 %probability.row = mul i32 %group, %length
 %probability.slot = add i32 %probability.row, %probability.key
 %probability.slot.wide = zext i32 %probability.slot to i64
-%probability.score = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %probability.slot.wide)
-%probability.centered = fsub float %probability.score, %maximum.global
-%probability.exp = call float @llvm.exp.f32(float %probability.centered)
-%probability.value = fdiv float %probability.exp, %denominator.global
-call void @attention_step_score_store(ptr addrspace(1) %context, i64 %probability.slot.wide, float %probability.value)
+%probability.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %probability.slot.wide)
+%probability.centered = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %probability.score, RECIPE_STATE %maximum.global)
+%probability.exp = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %probability.centered)
+%probability.value = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %probability.exp, RECIPE_STATE %denominator.global)
+call void @attention_step_score_store(ptr addrspace(1) %context, i64 %probability.slot.wide, RECIPE_STATE %probability.value)
 %probability.key.next = add i32 %probability.key, %block
 br label %probability.loop
 probability.done:
@@ -2958,10 +2957,10 @@ output.channel.loop:
 br i1 %output.channel.more, label %output.key.loop, label %output.stats.owner
 output.key.loop:
 %output.key = phi i32 [ %lane, %output.channel.loop ], [ %output.key.next, %output.key.step ]
-%output.sum.0 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.0.next, %output.key.step ]
-%output.sum.1 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.1.next, %output.key.step ]
-%output.sum.2 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.2.next, %output.key.step ]
-%output.sum.3 = phi float [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.3.next, %output.key.step ]
+%output.sum.0 = phi RECIPE_STATE [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.0.next, %output.key.step ]
+%output.sum.1 = phi RECIPE_STATE [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.1.next, %output.key.step ]
+%output.sum.2 = phi RECIPE_STATE [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.2.next, %output.key.step ]
+%output.sum.3 = phi RECIPE_STATE [ 0x0000000000000000, %output.channel.loop ], [ %output.sum.3.next, %output.key.step ]
 %output.key.more = icmp ult i32 %output.key, %reached
 br i1 %output.key.more, label %output.key.step, label %output.wave.prepare
 output.key.step:
@@ -2992,14 +2991,14 @@ output.key.step:
 %output.slot.1.wide = zext i32 %output.slot.1 to i64
 %output.slot.2.wide = zext i32 %output.slot.2 to i64
 %output.slot.3.wide = zext i32 %output.slot.3 to i64
-%output.probability.0.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.0.wide)
-%output.probability.1.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.1.wide)
-%output.probability.2.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.2.wide)
-%output.probability.3.raw = call float @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.3.wide)
-%output.probability.0 = select i1 %output.active.0, float %output.probability.0.raw, float 0x0000000000000000
-%output.probability.1 = select i1 %output.active.1, float %output.probability.1.raw, float 0x0000000000000000
-%output.probability.2 = select i1 %output.active.2, float %output.probability.2.raw, float 0x0000000000000000
-%output.probability.3 = select i1 %output.active.3, float %output.probability.3.raw, float 0x0000000000000000
+%output.probability.0.raw = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.0.wide)
+%output.probability.1.raw = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.1.wide)
+%output.probability.2.raw = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.2.wide)
+%output.probability.3.raw = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %output.slot.3.wide)
+%output.probability.0 = select i1 %output.active.0, RECIPE_STATE %output.probability.0.raw, RECIPE_STATE 0x0000000000000000
+%output.probability.1 = select i1 %output.active.1, RECIPE_STATE %output.probability.1.raw, RECIPE_STATE 0x0000000000000000
+%output.probability.2 = select i1 %output.active.2, RECIPE_STATE %output.probability.2.raw, RECIPE_STATE 0x0000000000000000
+%output.probability.3 = select i1 %output.active.3, RECIPE_STATE %output.probability.3.raw, RECIPE_STATE 0x0000000000000000
 %output.index.0.local = add i32 %output.kv.channel.offset, %output.safe.0
 %output.index.1.local = add i32 %output.kv.channel.offset, %output.safe.1
 %output.index.2.local = add i32 %output.kv.channel.offset, %output.safe.2
@@ -3020,36 +3019,36 @@ output.key.step:
 %output.value.1.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.1, align RECIPE_KV_ALIGN
 %output.value.2.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.2, align RECIPE_KV_ALIGN
 %output.value.3.raw = load RECIPE_KV, ptr addrspace(1) %output.ptr.3, align RECIPE_KV_ALIGN
-%output.value.0.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.0.raw)
-%output.value.1.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.1.raw)
-%output.value.2.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.2.raw)
-%output.value.3.float = call float @recipe.kv.to.f32(RECIPE_KV %output.value.3.raw)
-%output.value.0 = select i1 %output.active.0, float %output.value.0.float, float 0x0000000000000000
-%output.value.1 = select i1 %output.active.1, float %output.value.1.float, float 0x0000000000000000
-%output.value.2 = select i1 %output.active.2, float %output.value.2.float, float 0x0000000000000000
-%output.value.3 = select i1 %output.active.3, float %output.value.3.float, float 0x0000000000000000
-%output.sum.0.next = call float @llvm.fma.f32(float %output.probability.0, float %output.value.0, float %output.sum.0)
-%output.sum.1.next = call float @llvm.fma.f32(float %output.probability.1, float %output.value.1, float %output.sum.1)
-%output.sum.2.next = call float @llvm.fma.f32(float %output.probability.2, float %output.value.2, float %output.sum.2)
-%output.sum.3.next = call float @llvm.fma.f32(float %output.probability.3, float %output.value.3, float %output.sum.3)
+%output.value.0.RECIPE_STATE = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %output.value.0.raw)
+%output.value.1.RECIPE_STATE = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %output.value.1.raw)
+%output.value.2.RECIPE_STATE = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %output.value.2.raw)
+%output.value.3.RECIPE_STATE = call RECIPE_STATE @recipe.kv.to.state(RECIPE_KV %output.value.3.raw)
+%output.value.0 = select i1 %output.active.0, RECIPE_STATE %output.value.0.RECIPE_STATE, RECIPE_STATE 0x0000000000000000
+%output.value.1 = select i1 %output.active.1, RECIPE_STATE %output.value.1.RECIPE_STATE, RECIPE_STATE 0x0000000000000000
+%output.value.2 = select i1 %output.active.2, RECIPE_STATE %output.value.2.RECIPE_STATE, RECIPE_STATE 0x0000000000000000
+%output.value.3 = select i1 %output.active.3, RECIPE_STATE %output.value.3.RECIPE_STATE, RECIPE_STATE 0x0000000000000000
+%output.sum.0.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.0, RECIPE_STATE %output.probability.0, RECIPE_STATE %output.value.0)
+%output.sum.1.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.1, RECIPE_STATE %output.probability.1, RECIPE_STATE %output.value.1)
+%output.sum.2.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.2, RECIPE_STATE %output.probability.2, RECIPE_STATE %output.value.2)
+%output.sum.3.next = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %output.sum.3, RECIPE_STATE %output.probability.3, RECIPE_STATE %output.value.3)
 %output.key.stride = mul i32 %wave.width, 4
 %output.key.next = add i32 %output.key, %output.key.stride
 br label %output.key.loop
 output.wave.prepare:
-%output.sum.01 = fadd float %output.sum.0, %output.sum.1
-%output.sum.23 = fadd float %output.sum.2, %output.sum.3
-%output.sum = fadd float %output.sum.01, %output.sum.23
+%output.sum.01 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %output.sum.0, RECIPE_STATE %output.sum.1)
+%output.sum.23 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %output.sum.2, RECIPE_STATE %output.sum.3)
+%output.sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %output.sum.01, RECIPE_STATE %output.sum.23)
 br label %output.wave.loop
 output.wave.loop:
 %output.offset = phi i32 [ %wave.half.start, %output.wave.prepare ], [ %output.offset.next, %output.wave.step ]
-%output.wave.sum = phi float [ %output.sum, %output.wave.prepare ], [ %output.wave.sum.next, %output.wave.step ]
+%output.wave.sum = phi RECIPE_STATE [ %output.sum, %output.wave.prepare ], [ %output.wave.sum.next, %output.wave.step ]
 %output.wave.more = icmp ne i32 %output.offset, 0
 br i1 %output.wave.more, label %output.wave.step, label %output.wave.done
 output.wave.step:
 %output.partner.lane = xor i32 %lane, %output.offset
 %output.partner.index = mul i32 %output.partner.lane, 4
-%output.partner = call float @recipe.wave.partner.f32(float %output.wave.sum, i32 %output.partner.index)
-%output.wave.sum.next = fadd float %output.wave.sum, %output.partner
+%output.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %output.wave.sum, i32 %output.partner.index)
+%output.wave.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %output.wave.sum, RECIPE_STATE %output.partner)
 %output.offset.next = lshr i32 %output.offset, 1
 br label %output.wave.loop
 output.wave.done:
@@ -3059,9 +3058,9 @@ output.store:
 %output.position.base = mul i32 %output.channel, %length
 %output.position.index = add i32 %output.position.base, %position
 %output.position.wide = zext i32 %output.position.index to i64
-%output.ptr = getelementptr inbounds half, ptr addrspace(1) %output, i64 %output.position.wide
-%output.half.value = fptrunc float %output.wave.sum to half
-store half %output.half.value, ptr addrspace(1) %output.ptr, align 2
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.position.wide
+%output.half.value = call double @recipe.model.from.state(RECIPE_STATE %output.wave.sum)
+store double %output.half.value, ptr addrspace(1) %output.ptr, align 8
 br label %output.channel.done
 output.channel.done:
 %output.channel.next = add i32 %output.channel, %global.waves

@@ -3809,11 +3809,11 @@ impl NativeModelIr {
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
 					let attention_carry = i32::from(pointers.attention_kv.is_some());
+					// The single-query step body is written in the block's own types, so
+					// every precision takes it.
 					let fast_attention = self.inference
 						&& self.rows == 1
 						&& backend == Backend::Amd
-						&& self.node_precision(node).model_type == "half"
-						&& self.node_precision(node).state_type == "float"
 						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
 						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
 						&& attention == "attention_forward_body"

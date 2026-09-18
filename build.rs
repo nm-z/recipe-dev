@@ -836,13 +836,14 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String 
 	};
 	// The cache in the model's own type: the bytes pass through untouched.
 	if kv == model {
-		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
+		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
 	}
 	let mut ir = String::new();
 	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "state"), from_float("result", "narrowed")));
 	ir.push_str(&format!("define internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\n{}{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {model} %result\n}}\n", to_float("wide", "value"), widen("state", "wide")));
 	ir.push_str(&format!("define internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n{}ret float %result\n}}\n", to_float("result", "value")));
 	ir.push_str(&format!("define internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}ret {kv} %result\n}}\n", from_float("result", "wide")));
+	ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n{}{}ret {arithmetic} %result\n}}\n", to_float("wide", "value"), widen("result", "wide")));
 	let _ = kv_bytes;
 	ir
 }
