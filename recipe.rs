@@ -6318,8 +6318,9 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
-		if loss.is_none() && matches!(backend, Backend::Amd) {
-			ir.push_str("declare void @llvm.assume(i1)\nattributes #4 = { nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }\n");
+		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
+			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
+			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
 			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
 		}
@@ -19062,6 +19063,7 @@ const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 #[cfg(nvidia)]
 struct NativeCudaProgram {
 	module: usize,
+	step: Option<Dispatch>,
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 }
 
@@ -20235,8 +20237,12 @@ impl Cuda {
 			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
-			let program = NativeCudaProgram { module: module as usize, unload: self.unload };
+			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
 			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+			// The single-position step fills every SM with as many warps as the
+			// kernel allows, as the AMD step does; the forward keeps the schedule width.
+			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
+			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, shared_values, register_values)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 			Ok((program, forward, epoch, model_load))
@@ -20435,6 +20441,10 @@ impl NativeProgram {
 	fn launch_forward(&self, arguments: &mut [Ptr], single: bool) -> Result<()> {
 		#[cfg(amd)]
 		if single && let NativeBackend::Amd(program) = &self.backend && let Some(dispatch) = program.step {
+			return self.launch_dispatch(NativeEntry::Forward, arguments, dispatch.geometry.threads()?, dispatch);
+		}
+		#[cfg(nvidia)]
+		if single && let NativeBackend::Nvidia(program) = &self.backend && let Some(dispatch) = program.step {
 			return self.launch_dispatch(NativeEntry::Forward, arguments, dispatch.geometry.threads()?, dispatch);
 		}
 		let _ = single;
