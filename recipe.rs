@@ -2012,7 +2012,9 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 	let _ = precision;
 	for index in 0..graph.nodes.len() {
 		let element = graph.nodes[index].precision.bytes();
-		let offset = align(bytes, element.max(8))?;
+		// Sixteen-byte alignment: a packed node's 144-byte Q4_K blocks are then
+		// read sixteen bytes at a time by the block dots.
+		let offset = align(bytes, element.max(16))?;
 		let span = match packed_weight(graph, index, inference) {
 			Some(weight) => weight.bytes.len(),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
