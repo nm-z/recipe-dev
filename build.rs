@@ -176,7 +176,7 @@ define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { en
 const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
-define internal i1 @recipe.int8.dots() #1 { entry: ret i1 false }
+define internal i1 @recipe.int8.dots() #1 { entry: ret i1 true }
 define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyctr_u64() ret i64 %now }
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
@@ -187,6 +187,12 @@ define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %inde
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
 /// state, none under a double one.
+/// Whether a state carries the int8 dots: the float and double states do
+/// (`int(n).acc(64)` is an int8 dot with a double accumulator); the custom
+/// `f(exp, man)` state, whose model is a double, does not.
+fn int_state(state: &str) -> bool {
+	state == "float" || state == "double"
+}
 /// The trig and power a chain-angle rope takes: the platform libm's on the
 /// CPU, where llama.cpp's cosf, sinf and powf live, and the portable
 /// evaluations everywhere else.
@@ -209,11 +215,11 @@ fn int_partial_helpers(state: &str) -> String {
 fn cpu_int8_helpers(state: &str) -> String {
 	format!(
 		"define internal i1 @recipe.int8.dots() #1 {{ entry: ret i1 {} }}\n{}{}{}{}{}{}",
-		state == "float",
-		if state == "float" { generic_dot4_helpers() } else { String::new() },
-		amd_q4_slice_helper(state, state == "float"),
-		amd_q6_slice_helper(state, state == "float"),
-		amd_block32_slice_helper(state, state == "float"),
+		int_state(state),
+		if int_state(state) { generic_dot4_helpers() } else { String::new() },
+		amd_q4_slice_helper(state, int_state(state)),
+		amd_q6_slice_helper(state, int_state(state)),
+		amd_block32_slice_helper(state, int_state(state)),
 		int_partial_helpers(state),
 		rope_math_helpers(state, true)
 	)
@@ -238,12 +244,12 @@ define internal {state} @recipe.wave.partner({state} %value, i32 %index) #1 {{ e
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 {{ entry: %lane = lshr i32 %index, 2 %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 %bits, i32 %lane, i32 31) %partner = bitcast i32 %partner.bits to float ret float %partner }}
 {dot4}{q4}{q6}{b32}{ints}{rope}",
 		rope = rope_math_helpers(state, false),
-		int8 = state == "float",
-		dot4 = if state == "float" { generic_dot4_helpers() } else { String::new() },
+		int8 = int_state(state),
+		dot4 = if int_state(state) { generic_dot4_helpers() } else { String::new() },
 		ints = int_partial_helpers(state),
-		q4 = amd_q4_slice_helper(state, state == "float"),
-		q6 = amd_q6_slice_helper(state, state == "float"),
-		b32 = amd_block32_slice_helper(state, state == "float"),
+		q4 = amd_q4_slice_helper(state, int_state(state)),
+		q6 = amd_q6_slice_helper(state, int_state(state)),
+		b32 = amd_block32_slice_helper(state, int_state(state)),
 	)
 }
 /// The four-byte dot products and the byte permute the int8 dots use, as
@@ -362,7 +368,7 @@ fn amd_q4_slice_helper(state: &str, full: bool) -> String {
 /// 16 slices add in any order and the block's float math happens once, in
 /// the order llama.cpp's Q4_K kernels use.
 fn q4_ints_helper(state: &str) -> String {
-	if state != "float" {
+	if !int_state(state) {
 		return "define internal i64 @recipe.q4k.ints(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: ret i64 0 }\n".to_owned();
 	}
 	let full = amd_q4_slice_helper(state, true);
@@ -381,7 +387,7 @@ fn q4_ints_helper(state: &str) -> String {
 /// group l; each lane meets its own float accumulator once per block and the
 /// eight accumulators add in a fixed tree at the end.
 fn q6_part_helper(state: &str) -> String {
-	if state != "float" {
+	if !int_state(state) {
 		return "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry: ret i64 0 }\n".to_owned();
 	}
 	let full = amd_q6_slice_helper(state, true);
@@ -1213,9 +1219,9 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		let base = suffix.split("-kv").next().unwrap_or_default();
 		let state = template_state(base);
 		let helpers = if state == "double" { AMD_WAVE_HELPERS_DOUBLE } else { AMD_WAVE_HELPERS };
-		let dot = if state == "float" { AMD_DOT4_HELPERS } else { "" };
+		let dot = if int_state(state) { AMD_DOT4_HELPERS } else { "" };
 		let ints = int_partial_helpers(state);
-		let helpers = format!("{}\n{}{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, state == "float"), amd_q6_slice_helper(state, state == "float"), amd_block32_slice_helper(state, state == "float"), ints, rope_math_helpers(state, false));
+		let helpers = format!("{}\n{}{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, int_state(state)), amd_q6_slice_helper(state, int_state(state)), amd_block32_slice_helper(state, int_state(state)), ints, rope_math_helpers(state, false));
 		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;

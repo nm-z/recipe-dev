@@ -6158,8 +6158,8 @@ impl NativeModelIr {
 		let _ = backend;
 		if plan.node.int_bits != 0 {
 			// The int8 activation codes, 36 bytes per 32 values, live in the tile;
-			// the int8 dots exist only under a float state.
-			precision.state_type == "float" && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
+			// the int8 dots exist under the float and double states.
+			matches!(precision.state_type, "float" | "double") && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
 		} else {
 			// The column is staged in chunks of whole 256-value blocks.
 			256 * precision.model.bytes() <= tile_bytes
@@ -6186,7 +6186,21 @@ impl NativeModelIr {
 				steps.push_str(&format!("step.n{}:\nret i32 {}\n", index + 1, plan.node.int_step));
 			}
 		}
-		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\ndefine internal i32 @recipe.model.int.step(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %step.default [\n{step_arms}]\n{steps}step.default:\nret i32 32\n}}\n")
+		// The tail: the sums after the last attention's output projection of an
+		// inference graph. llama.cpp keeps only the batch's last row from there
+		// on and takes it through its gemv, so a 256-step Q4_K sum in the tail
+		// folds that row's blocks whole whatever the batch length.
+		let last_attention = self.plans.iter().rposition(|plan| plan.node.op == Primitive::Attention);
+		let projection = last_attention.and_then(|attention| self.plans.iter().enumerate().position(|(index, plan)| index > attention && plan.node.op == Primitive::Contraction));
+		let mut tail_arms = String::new();
+		if self.inference {
+			for (index, plan) in self.plans.iter().enumerate() {
+				if plan.node.int_bits != 0 && projection.is_some_and(|projection| index > projection) {
+					tail_arms.push_str(&format!("i32 {}, label %tail.yes\n", index + 1));
+				}
+			}
+		}
+		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\ndefine internal i32 @recipe.model.int.step(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %step.default [\n{step_arms}]\n{steps}step.default:\nret i32 32\n}}\ndefine internal i1 @recipe.model.tail(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %tail.no [\n{tail_arms}]\ntail.yes:\nret i1 true\ntail.no:\nret i1 false\n}}\n")
 	}
 
 	/// The bytes of the shared tile a workgroup owns: the schedule's values in
@@ -14774,7 +14788,8 @@ impl Infer {
 		// arenas stay small.
 		let ceiling = std::env::var("RECIPE_CONTEXT").ok().and_then(|text| text.parse::<usize>().ok()).map_or(ceiling, |cap| cap.clamp(1, ceiling));
 		let coder = file.tokenizer();
-		let message = std::env::args().nth(1).unwrap_or_else(|| "What is the capital of France?".to_owned());
+		// RECIPE_MESSAGE names the user turn; the script's first argument still does.
+		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1)).unwrap_or_else(|| "What is the capital of France?".to_owned());
 		let text = coder.prompt(&[("user", message.as_str())], true)?;
 		let mut prompt = coder.encode(&text);
 		// The template writes the sequence start itself when the file has one,

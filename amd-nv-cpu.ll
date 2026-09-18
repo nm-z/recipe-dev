@@ -1327,7 +1327,8 @@ q4b.red.done:
 ; llama.cpp feeds a batch's first 4*(N/4) rows through its gemm, four fmas
 ; per block as above, and the rows past them (and every single-token step)
 ; through its gemv, the whole block's int in one fma; a row follows the
-; kernel its position would meet there.
+; kernel its position would meet there. After the last attention llama.cpp
+; keeps only the batch's last row, which its gemv folds whole.
 %q4b.dot01 = add i32 %q4b.red.dot0, %q4b.red.dot1
 %q4b.dot23 = add i32 %q4b.red.dot2, %q4b.red.dot3
 %q4b.dot.all = add i32 %q4b.dot01, %q4b.dot23
@@ -1341,7 +1342,12 @@ q4b.red.done:
 %q4b.batch.local = sub i32 %position.index, %out.begin
 %q4b.batch.rem = and i32 %out.span, 3
 %q4b.gemm.end = sub i32 %out.span, %q4b.batch.rem
-%q4b.whole = icmp uge i32 %q4b.batch.local, %q4b.gemm.end
+%q4b.whole.rows = icmp uge i32 %q4b.batch.local, %q4b.gemm.end
+%q4b.tail = call i1 @recipe.model.tail(i32 %decode)
+%q4b.batch.last = sub i32 %out.span, 1
+%q4b.is.last = icmp eq i32 %q4b.batch.local, %q4b.batch.last
+%q4b.tail.last = and i1 %q4b.tail, %q4b.is.last
+%q4b.whole = or i1 %q4b.whole.rows, %q4b.tail.last
 %q4b.acc.next = select i1 %q4b.whole, RECIPE_STATE %q4b.acc.whole, RECIPE_STATE %q4b.acc.q3
 %q4b.accmin.next = select i1 %q4b.whole, RECIPE_STATE %q4b.accmin.whole, RECIPE_STATE %q4b.accmin.q3
 br label %q4b.done
