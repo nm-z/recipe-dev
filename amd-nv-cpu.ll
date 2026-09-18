@@ -2076,14 +2076,13 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 ; base^(-2/dims) taken one product at a time in the state, the yarn blend
 ; falls on the angle, the cosine and sine each carry the magnitude scale, and
 ; the rotation is two fused multiply-adds against the libm trig of the CPU.
+; Under the chain the base argument already holds base^(-2/dims), taken on
+; the host with the CPU's powf so every backend chains the same bits.
 %chain.zero = call double @recipe.from.u32(i32 0)
 %chain.on = call i1 @recipe.ogt(double %angle.chain, double %chain.zero)
 br i1 %chain.on, label %chain, label %finish.direct
 chain:
-%chain.two = call RECIPE_STATE @recipe.state.from.u32(i32 2)
-%chain.exponent.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.two, RECIPE_STATE %dims.value)
-%chain.exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.exponent.raw)
-%chain.scale = call RECIPE_STATE @recipe.libm.pow(RECIPE_STATE %base.wide, RECIPE_STATE %chain.exponent)
+%chain.scale = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %base.wide, RECIPE_STATE %zero)
 br label %chain.loop
 chain.loop:
 %chain.i = phi i64 [ 0, %chain ], [ %chain.i.next, %chain.step ]

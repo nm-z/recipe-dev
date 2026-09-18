@@ -16852,10 +16852,14 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
-		// The seventh argument names the angle: 0 direct, 1 chained.
+		// The seventh argument names the angle: 0 direct, 1 chained. Under the
+		// chain the second argument carries base^(-2/dims) from the host's powf
+		// (llama.cpp's theta_scale) instead of the base, so every backend chains
+		// the same bits.
 		let _ = context;
 		let chain = f64::from(u8::from(graph.profile.chain_angle));
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
+		let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
+		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -16893,7 +16897,8 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			};
 			let _ = context;
 			let chain = f64::from(u8::from(graph.profile.chain_angle));
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
+			let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
