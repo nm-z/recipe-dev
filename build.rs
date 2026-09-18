@@ -282,6 +282,80 @@ fn amd_q6_slice_helper(state: &str, full: bool) -> String {
 	ir.push_str(&format!("%dot.offset = mul i32 {q8_sum}, 32\n%dot.signed = sub i32 {dot_sum}, %dot.offset\n%dot.value = call {state} @recipe.state.from.s32(i32 %dot.signed)\n%scaled = call {state} @recipe.state.mul({state} %scale.state, {state} %dot.value)\n%value = call {state} @recipe.state.mul({state} %q8.d.state, {state} %scaled)\n%result = call {state} @recipe.state.mul({state} %d, {state} %value)\nret {state} %result\n}}\n", state = state, dot_sum = dot_sum, q8_sum = q8_sum));
 	ir
 }
+/// The exact block dots: one 16-value slice of a stored block against the
+/// activations as they are, staged quad-interleaved in the local store in the
+/// model type. Each code multiplies the activation in the state exactly, the
+/// products add in the state, and the block's step scales the sum once, so
+/// nothing about the activation is quantized: the only quantization is the
+/// one the load kernel did. Written in the template's placeholders, they
+/// serve every backend; a 32-lane wave takes the int8 helpers above instead.
+fn block_dot_helpers() -> String {
+	let mut ir = String::new();
+	ir.push_str(&format!("@recipe_block32_iq4_levels = private unnamed_addr constant [16 x i8] [{}]\n", IQ4_LEVELS.iter().map(|level| format!("i8 {level}")).collect::<Vec<_>>().join(", ")));
+	// The activations of one slice: sixteen model values, one per channel, at
+	// the caller's stride, decoded into the state.
+	let activations = |ir: &mut String| {
+		// The column is staged quad-interleaved: channel c sits at
+		// ((c % 16) / 4) * pitch + (c / 16) * 4 + c % 4, so a lane reads each
+		// quad of its slice as one vector and the lanes of a wave, which take
+		// adjacent columns, read adjacent vectors.
+		ir.push_str("%column.quad = mul i32 %column, 4\n");
+		for quad in 0..4 {
+			ir.push_str(&format!("%xq{quad}.row = mul i32 %pitch, {quad}\n%xq{quad}.slot = add i32 %xq{quad}.row, %column.quad\n%xq{quad}.ptr = getelementptr inbounds double, ptr addrspace(3) %tile, i32 %xq{quad}.slot\n%xq{quad} = load <4 x double>, ptr addrspace(3) %xq{quad}.ptr, align 4\n"));
+			for lane in 0..4 {
+				let i = quad * 4 + lane;
+				ir.push_str(&format!("%x{i}.model = extractelement <4 x double> %xq{quad}, i32 {lane}\n%x{i} = call RECIPE_STATE @recipe.decode(double %x{i}.model)\n"));
+			}
+		}
+	};
+	// Sixteen bytes from `base` in the block as four words; byte i is %<name>i.raw.
+	let words = |ir: &mut String, base: &str, name: &str| {
+		for word in 0..4 {
+			ir.push_str(&format!("%{name}w{word}.offset = add i64 {base}, {}\n%{name}w{word}.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %{name}w{word}.offset\n%{name}w{word} = load i32, ptr addrspace(1) %{name}w{word}.ptr, align 2\n", word * 4));
+			for byte in 0..4 {
+				let i = word * 4 + byte;
+				ir.push_str(&format!("%{name}{i}.byte.shift = lshr i32 %{name}w{word}, {}\n%{name}{i}.raw = and i32 %{name}{i}.byte.shift, 255\n", byte * 8));
+			}
+		}
+	};
+	// The running sums: code times activation, and the activation alone.
+	// Four independent chains, one per quad, so the sums do not wait on each
+	// other; they join at the end as %acc16 and %xsum16.
+	let sums = |ir: &mut String, code: &dyn Fn(usize) -> String| {
+		for quad in 0..4 {
+			ir.push_str(&format!("%acc{quad}.0 = call RECIPE_STATE @recipe.state.from.u1(i1 false)\n%xsum{quad}.0 = call RECIPE_STATE @recipe.state.from.u1(i1 false)\n"));
+		}
+		for i in 0..16 {
+			let (quad, step) = (i % 4, i / 4);
+			ir.push_str(&format!("{}%code{i}.state = call RECIPE_STATE @recipe.state.from.s32(i32 %code{i})\n%acc{quad}.{} = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %acc{quad}.{step}, RECIPE_STATE %code{i}.state, RECIPE_STATE %x{i})\n%xsum{quad}.{} = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %xsum{quad}.{step}, RECIPE_STATE %x{i})\n", code(i), step + 1, step + 1));
+		}
+		ir.push_str("%acc01 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %acc0.4, RECIPE_STATE %acc1.4)\n%acc23 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %acc2.4, RECIPE_STATE %acc3.4)\n%acc16 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %acc01, RECIPE_STATE %acc23)\n%xsum01 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %xsum0.4, RECIPE_STATE %xsum1.4)\n%xsum23 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %xsum2.4, RECIPE_STATE %xsum3.4)\n%xsum16 = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %xsum01, RECIPE_STATE %xsum23)\n");
+	};
+	// Q4_K: 256 values in 144 bytes, d and dmin as fp16, eight 6-bit scale and
+	// minimum pairs, then 128 nibble bytes; a slice is half of one 32-group.
+	ir.push_str("define internal RECIPE_STATE @recipe.q4k.exact(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %tile, i32 %column, i32 %pitch, i32 %slice) #1 {\nentry:\n%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call RECIPE_STATE @recipe.state.from.f16(half %d.bits)\n%dmin.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%dmin.bits = load half, ptr addrspace(1) %dmin.ptr, align 2\n%dmin = call RECIPE_STATE @recipe.state.from.f16(half %dmin.bits)\n%group = udiv i32 %slice, 2\n%group.wide = zext i32 %group to i64\n%half = and i32 %slice, 1\n%group.low = icmp ult i32 %group, 4\n%group.plus = add i32 %group, 4\n%group.minus = sub i32 %group, 4\n%scale.index = select i1 %group.low, i32 %group, i32 %group.plus\n%other.index = select i1 %group.low, i32 %group.plus, i32 %group.minus\n%scale.index.wide = zext i32 %scale.index to i64\n%other.index.wide = zext i32 %other.index to i64\n%scale.offset = add i64 4, %scale.index.wide\n%other.offset = add i64 4, %other.index.wide\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%other.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %other.offset\n%other.byte = load i8, ptr addrspace(1) %other.ptr, align 1\n%scale.raw = zext i8 %scale.byte to i32\n%other.raw = zext i8 %other.byte to i32\n%scale.low = and i32 %scale.raw, 63\n%minimum.low = and i32 %other.raw, 63\n%scale.high.low = and i32 %scale.raw, 15\n%minimum.high.low = lshr i32 %scale.raw, 4\n%high.bits = and i32 %other.raw, 192\n%high = lshr i32 %high.bits, 2\n%scale.high = or i32 %scale.high.low, %high\n%minimum.high.offset = add i64 4, %group.wide\n%minimum.high.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %minimum.high.offset\n%minimum.high.byte = load i8, ptr addrspace(1) %minimum.high.ptr, align 1\n%minimum.high.raw = zext i8 %minimum.high.byte to i32\n%minimum.high.bits = and i32 %minimum.high.raw, 192\n%minimum.high.top = lshr i32 %minimum.high.bits, 2\n%minimum.high = or i32 %minimum.high.low, %minimum.high.top\n%minimum = select i1 %group.low, i32 %minimum.low, i32 %minimum.high\n%scale.code = select i1 %group.low, i32 %scale.low, i32 %scale.high\n%scale.value = call RECIPE_STATE @recipe.state.from.u32(i32 %scale.code)\n%minimum.value = call RECIPE_STATE @recipe.state.from.u32(i32 %minimum)\n%group.d = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %d, RECIPE_STATE %scale.value)\n%group.dmin = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %dmin, RECIPE_STATE %minimum.value)\n%pair = udiv i32 %group, 2\n%pair.wide = zext i32 %pair to i64\n%q4.base.part = mul i64 %pair.wide, 32\n%q4.base = add i64 %q4.base.part, 16\n%group.shift = and i32 %group, 1\n%q4.shift = mul i32 %group.shift, 4\n%half.wide = zext i32 %half to i64\n%q4.half.offset = mul i64 %half.wide, 16\n%q4.base.half = add i64 %q4.base, %q4.half.offset\n");
+	activations(&mut ir);
+	words(&mut ir, "%q4.base.half", "q");
+	sums(&mut ir, &|i| format!("%q{i}.shifted = lshr i32 %q{i}.raw, %q4.shift\n%code{i} = and i32 %q{i}.shifted, 15\n"));
+	ir.push_str("%dot.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %group.d, RECIPE_STATE %acc16)\n%minimum.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %group.dmin, RECIPE_STATE %xsum16)\n%result = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %dot.scaled, RECIPE_STATE %minimum.scaled)\nret RECIPE_STATE %result\n}\n");
+	// Q6_K: 256 values in 210 bytes, 128 low-nibble bytes, 64 high-pair bytes,
+	// sixteen int8 scales one per 16 values, then d as fp16.
+	ir.push_str("define internal RECIPE_STATE @recipe.q6k.exact(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %tile, i32 %column, i32 %pitch, i32 %slice) #1 {\nentry:\n%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 208\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call RECIPE_STATE @recipe.state.from.f16(half %d.bits)\n%chunk = udiv i32 %slice, 8\n%group = udiv i32 %slice, 2\n%local = urem i32 %group, 4\n%half = and i32 %slice, 1\n%chunk.wide = zext i32 %chunk to i64\n%half.wide = zext i32 %half to i64\n%low.group = and i32 %local, 1\n%low.group.wide = zext i32 %low.group to i64\n%ql.extra = mul i64 %low.group.wide, 32\n%ql.base.part = mul i64 %chunk.wide, 64\n%ql.base = add i64 %ql.base.part, %ql.extra\n%qh.base.part = mul i64 %chunk.wide, 32\n%qh.base = add i64 %qh.base.part, 128\n%ql.shift.group = udiv i32 %local, 2\n%ql.shift = mul i32 %ql.shift.group, 4\n%qh.shift = mul i32 %local, 2\n%scale.offset = add i32 %slice, 192\n%scale.offset.wide = zext i32 %scale.offset to i64\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset.wide\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%scale = sext i8 %scale.byte to i32\n%scale.state = call RECIPE_STATE @recipe.state.from.s32(i32 %scale)\n%half.offset = mul i64 %half.wide, 16\n%half.ql.base = add i64 %ql.base, %half.offset\n%half.qh.base = add i64 %qh.base, %half.offset\n");
+	activations(&mut ir);
+	words(&mut ir, "%half.ql.base", "ql");
+	words(&mut ir, "%half.qh.base", "qh");
+	sums(&mut ir, &|i| format!("%ql{i}.shifted = lshr i32 %ql{i}.raw, %ql.shift\n%ql{i}.code = and i32 %ql{i}.shifted, 15\n%qh{i}.shifted = lshr i32 %qh{i}.raw, %qh.shift\n%qh{i}.code = and i32 %qh{i}.shifted, 3\n%qh{i}.bits = shl i32 %qh{i}.code, 4\n%q{i}.joined = or i32 %ql{i}.code, %qh{i}.bits\n%code{i} = sub i32 %q{i}.joined, 32\n"));
+	ir.push_str("%scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %scale.state, RECIPE_STATE %acc16)\n%result = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %d, RECIPE_STATE %scaled)\nret RECIPE_STATE %result\n}\n");
+	// The 32-value blocks: IQ4_NL (kind 1), Q4_0 (2), Q4_1 (3), Q8_0 (4): d as
+	// fp16, Q4_1 a minimum after it, then the codes. Slice 0 takes the low
+	// nibbles (or the first sixteen bytes), slice 1 the high ones.
+	ir.push_str("define internal RECIPE_STATE @recipe.block32.exact(i32 %kind, ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %tile, i32 %column, i32 %pitch, i32 %slice) #1 {\nentry:\n%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call RECIPE_STATE @recipe.state.from.f16(half %d.bits)\n%is.iq4 = icmp eq i32 %kind, 1\n%is.q40 = icmp eq i32 %kind, 2\n%is.q41 = icmp eq i32 %kind, 3\n%is.q80 = icmp eq i32 %kind, 4\n%nibble.shift = mul i32 %slice, 4\n%half.wide = zext i32 %slice to i64\n%byte.half = mul i64 %half.wide, 16\n%data.q41 = select i1 %is.q41, i64 4, i64 2\n%data.base = select i1 %is.q80, i64 %byte.half, i64 0\n%data = add i64 %data.q41, %data.base\n%m.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%m.bits = load half, ptr addrspace(1) %m.ptr, align 2\n%m.loaded = call RECIPE_STATE @recipe.state.from.f16(half %m.bits)\n%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)\n%m = select i1 %is.q41, RECIPE_STATE %m.loaded, RECIPE_STATE %zero\n");
+	activations(&mut ir);
+	words(&mut ir, "%data", "b");
+	sums(&mut ir, &|i| format!("%b{i}.shifted = lshr i32 %b{i}.raw, %nibble.shift\n%b{i}.nibble = and i32 %b{i}.shifted, 15\n%b{i}.nibble.wide = zext i32 %b{i}.nibble to i64\n%b{i}.level.ptr = getelementptr inbounds [16 x i8], ptr @recipe_block32_iq4_levels, i64 0, i64 %b{i}.nibble.wide\n%b{i}.level.byte = load i8, ptr %b{i}.level.ptr, align 1\n%b{i}.level = sext i8 %b{i}.level.byte to i32\n%b{i}.byte = trunc i32 %b{i}.raw to i8\n%b{i}.signed = sext i8 %b{i}.byte to i32\n%b{i}.q40 = sub i32 %b{i}.nibble, 8\n%b{i}.four = select i1 %is.q40, i32 %b{i}.q40, i32 %b{i}.nibble\n%b{i}.nibble.or.level = select i1 %is.iq4, i32 %b{i}.level, i32 %b{i}.four\n%code{i} = select i1 %is.q80, i32 %b{i}.signed, i32 %b{i}.nibble.or.level\n"));
+	ir.push_str("%dot.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %d, RECIPE_STATE %acc16)\n%minimum.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %m, RECIPE_STATE %xsum16)\n%result = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %dot.scaled, RECIPE_STATE %minimum.scaled)\nret RECIPE_STATE %result\n}\n");
+	ir
+}
 fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
 	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
@@ -920,7 +994,7 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 }
 fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
-	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
+	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
@@ -958,7 +1032,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
+	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
@@ -988,7 +1062,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS);
+	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}

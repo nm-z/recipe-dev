@@ -38,6 +38,7 @@ define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void
 declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
 ; RECIPE_WAVE_HELPERS
+; RECIPE_BLOCK_HELPERS
 declare void @llvm.trap() @contraction_tile = external addrspace(3) global [0 x double], align 16
 define internal double @contraction_input(
 ptr addrspace(1) %input, i64 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv ) #1 { entry:
@@ -912,19 +913,24 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %q4.width = icmp eq i32 %width, 32
 %q4.remainder = urem i32 %terms, 256
 %q4.aligned = icmp eq i32 %q4.remainder, 0
-%q4.width.ok = and i1 %q4.width, %q4.aligned
-%q4.available = and i1 %q4.selector, %q4.width.ok
+%q4.available = and i1 %q4.selector, %q4.aligned
 %q6.selector = call i1 @recipe.model.q6k(i32 %decode)
-%q6.available = and i1 %q6.selector, %q4.width.ok
+%q6.available = and i1 %q6.selector, %q4.aligned
 %b32.kind = call i32 @recipe.model.block32(i32 %decode)
 %b32.stride = call i64 @recipe.model.block32.stride(i32 %decode)
 %b32.selector = icmp ne i32 %b32.kind, 0
 %b32.remainder = urem i32 %terms, 32
 %b32.aligned = icmp eq i32 %b32.remainder, 0
-%b32.width.ok = and i1 %q4.width, %b32.aligned
-%b32.available = and i1 %b32.selector, %b32.width.ok
+%b32.available = and i1 %b32.selector, %b32.aligned
 %q8.k = or i1 %q4.available, %q6.available
-%q8.available = or i1 %q8.k, %b32.available
+%block.available = or i1 %q8.k, %b32.available
+; A wave of 32 lanes takes the int8 activation path and its dot4 helpers; any
+; other width stages the activation column as it is and dots it exactly.
+%exact = xor i1 %q4.width, true
+%q8.available = and i1 %block.available, %q4.width
+%stage.available = and i1 %block.available, %exact
+%stage.pitch = udiv i32 %terms, 4
+%stage.tile = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
 %q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
 %q8.blocks = udiv i32 %terms, 32
 %q8.span = add i32 1, 0
@@ -942,7 +948,39 @@ position.loop:
 br i1 %position.more, label %position.step, label %exit
 position.step:
 %position = zext i32 %position.index to i64
-br i1 %q8.available, label %q8.entry, label %job.loop
+br i1 %q8.available, label %q8.entry, label %stage.check
+stage.check:
+br i1 %stage.available, label %stage.entry, label %job.loop
+; The activation column of this position, staged once per workgroup in the
+; model type, quad-interleaved so a lane reads each quad of its slice as one
+; vector and adjacent lanes read adjacent vectors.
+stage.entry:
+br label %stage.loop
+stage.loop:
+%stage.c = phi i32 [ %lid, %stage.entry ], [ %stage.c.next, %stage.step ]
+%stage.more = icmp ult i32 %stage.c, %terms
+br i1 %stage.more, label %stage.step, label %stage.done
+stage.step:
+%stage.c.wide = zext i32 %stage.c to i64
+%stage.index = mul i64 %stage.c.wide, %in.length.wide
+%stage.at = add i64 %stage.index, %position
+%stage.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.at
+%stage.value = load double, ptr addrspace(1) %stage.ptr, align 8
+%stage.within = and i32 %stage.c, 15
+%stage.quad = lshr i32 %stage.within, 2
+%stage.lane = and i32 %stage.c, 3
+%stage.column = lshr i32 %stage.c, 4
+%stage.column.quad = mul i32 %stage.column, 4
+%stage.row.base = mul i32 %stage.quad, %stage.pitch
+%stage.at.column = add i32 %stage.row.base, %stage.column.quad
+%stage.at.slot = add i32 %stage.at.column, %stage.lane
+%stage.slot = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %stage.at.slot
+store double %stage.value, ptr addrspace(3) %stage.slot, align 8
+%stage.c.next = add i32 %stage.c, %block
+br label %stage.loop
+stage.done:
+call void @recipe.local.barrier()
+br label %job.loop
 ; The activation column as int8 codes with one float step per 32 values,
 ; |max|/127, the codes rounded to even: an int8 input with its step size.
 q8.entry:
@@ -1048,7 +1086,7 @@ q8.done:
 call void @recipe.local.barrier()
 br label %job.loop
 job.loop:
-%job = phi i32 [ %group, %position.step ], [ %group, %q8.done ], [ %job.next, %job.done ]
+%job = phi i32 [ %group, %stage.check ], [ %group, %stage.done ], [ %group, %q8.done ], [ %job.next, %job.done ]
 %job.more = icmp ult i32 %job, %jobs
 br i1 %job.more, label %job.step, label %position.done
 job.step:
@@ -1058,10 +1096,84 @@ job.step:
 %channel.safe = select i1 %channel.active, i32 %channel, i32 0
 %channel.wide = zext i32 %channel.safe to i64
 %channel.offset = mul i64 %channel.wide, %terms.wide
+br i1 %exact, label %exact.q4.check, label %q4.check
+q4.check:
 br i1 %q4.available, label %q4.sum.loop, label %q6.check
+exact.q4.check:
+br i1 %q4.available, label %exact.q4.loop, label %exact.q6.check
+exact.q4.loop:
+%exact.q4.slice = phi i32 [ %lane, %exact.q4.check ], [ %exact.q4.slice.next, %exact.q4.step ]
+%exact.q4.sum = phi RECIPE_STATE [ %state.zero, %exact.q4.check ], [ %exact.q4.sum.next, %exact.q4.step ]
+%exact.q4.slices = udiv i32 %terms, 16
+%exact.q4.more = icmp ult i32 %exact.q4.slice, %exact.q4.slices
+br i1 %exact.q4.more, label %exact.q4.step, label %exact.q4.done
+exact.q4.step:
+%exact.q4.row.blocks = udiv i32 %terms, 256
+%exact.q4.row.blocks.wide = zext i32 %exact.q4.row.blocks to i64
+%exact.q4.channel.row = mul i64 %channel.wide, %exact.q4.row.blocks.wide
+%exact.q4.block = udiv i32 %exact.q4.slice, 16
+%exact.q4.slice.local = urem i32 %exact.q4.slice, 16
+%exact.q4.block.wide = zext i32 %exact.q4.block to i64
+%exact.q4.block.index = add i64 %exact.q4.channel.row, %exact.q4.block.wide
+%exact.q4.byte.offset = mul i64 %exact.q4.block.index, 144
+%exact.q4.loaded = call RECIPE_STATE @recipe.q4k.exact(ptr addrspace(1) %weights, i64 %exact.q4.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q4.slice, i32 %stage.pitch, i32 %exact.q4.slice.local)
+%exact.q4.value = select i1 %channel.active, RECIPE_STATE %exact.q4.loaded, RECIPE_STATE %state.zero
+%exact.q4.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q4.sum, RECIPE_STATE %exact.q4.value)
+%exact.q4.slice.next = add i32 %exact.q4.slice, %width
+br label %exact.q4.loop
+exact.q4.done:
+br label %sum.done
+exact.q6.check:
+br i1 %q6.available, label %exact.q6.loop, label %exact.b32.check
+exact.q6.loop:
+%exact.q6.slice = phi i32 [ %lane, %exact.q6.check ], [ %exact.q6.slice.next, %exact.q6.step ]
+%exact.q6.sum = phi RECIPE_STATE [ %state.zero, %exact.q6.check ], [ %exact.q6.sum.next, %exact.q6.step ]
+%exact.q6.slices = udiv i32 %terms, 16
+%exact.q6.more = icmp ult i32 %exact.q6.slice, %exact.q6.slices
+br i1 %exact.q6.more, label %exact.q6.step, label %exact.q6.done
+exact.q6.step:
+%exact.q6.row.blocks = udiv i32 %terms, 256
+%exact.q6.row.blocks.wide = zext i32 %exact.q6.row.blocks to i64
+%exact.q6.channel.row = mul i64 %channel.wide, %exact.q6.row.blocks.wide
+%exact.q6.block = udiv i32 %exact.q6.slice, 16
+%exact.q6.slice.local = urem i32 %exact.q6.slice, 16
+%exact.q6.block.wide = zext i32 %exact.q6.block to i64
+%exact.q6.block.index = add i64 %exact.q6.channel.row, %exact.q6.block.wide
+%exact.q6.byte.offset = mul i64 %exact.q6.block.index, 210
+%exact.q6.loaded = call RECIPE_STATE @recipe.q6k.exact(ptr addrspace(1) %weights, i64 %exact.q6.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q6.slice, i32 %stage.pitch, i32 %exact.q6.slice.local)
+%exact.q6.value = select i1 %channel.active, RECIPE_STATE %exact.q6.loaded, RECIPE_STATE %state.zero
+%exact.q6.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q6.sum, RECIPE_STATE %exact.q6.value)
+%exact.q6.slice.next = add i32 %exact.q6.slice, %width
+br label %exact.q6.loop
+exact.q6.done:
+br label %sum.done
+exact.b32.check:
+br i1 %b32.available, label %exact.b32.loop, label %sum.loop
+exact.b32.loop:
+%exact.b32.slice = phi i32 [ %lane, %exact.b32.check ], [ %exact.b32.slice.next, %exact.b32.step ]
+%exact.b32.sum = phi RECIPE_STATE [ %state.zero, %exact.b32.check ], [ %exact.b32.sum.next, %exact.b32.step ]
+%exact.b32.slices = udiv i32 %terms, 16
+%exact.b32.more = icmp ult i32 %exact.b32.slice, %exact.b32.slices
+br i1 %exact.b32.more, label %exact.b32.step, label %exact.b32.done
+exact.b32.step:
+%exact.b32.row.blocks = udiv i32 %terms, 32
+%exact.b32.row.blocks.wide = zext i32 %exact.b32.row.blocks to i64
+%exact.b32.channel.row = mul i64 %channel.wide, %exact.b32.row.blocks.wide
+%exact.b32.block = udiv i32 %exact.b32.slice, 2
+%exact.b32.slice.local = urem i32 %exact.b32.slice, 2
+%exact.b32.block.wide = zext i32 %exact.b32.block to i64
+%exact.b32.block.index = add i64 %exact.b32.channel.row, %exact.b32.block.wide
+%exact.b32.byte.offset = mul i64 %exact.b32.block.index, %b32.stride
+%exact.b32.loaded = call RECIPE_STATE @recipe.block32.exact(i32 %b32.kind, ptr addrspace(1) %weights, i64 %exact.b32.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.b32.slice, i32 %stage.pitch, i32 %exact.b32.slice.local)
+%exact.b32.value = select i1 %channel.active, RECIPE_STATE %exact.b32.loaded, RECIPE_STATE %state.zero
+%exact.b32.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.b32.sum, RECIPE_STATE %exact.b32.value)
+%exact.b32.slice.next = add i32 %exact.b32.slice, %width
+br label %exact.b32.loop
+exact.b32.done:
+br label %sum.done
 q4.sum.loop:
-%q4.slice = phi i32 [ %lane, %job.step ], [ %q4.slice.next, %q4.slice.ready ]
-%q4.sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %q4.sum.next, %q4.slice.ready ]
+%q4.slice = phi i32 [ %lane, %q4.check ], [ %q4.slice.next, %q4.slice.ready ]
+%q4.sum = phi RECIPE_STATE [ %state.zero, %q4.check ], [ %q4.sum.next, %q4.slice.ready ]
 %q4.slices = udiv i32 %terms, 16
 %q4.slice.more = icmp ult i32 %q4.slice, %q4.slices
 br i1 %q4.slice.more, label %q4.sum.step, label %q4.sum.done
@@ -1142,8 +1254,8 @@ br label %b32.sum.loop
 b32.sum.done:
 br label %sum.done
 sum.loop:
-%k = phi i32 [ %lane, %b32.check ], [ %k.next, %weight.ready ]
-%sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %sum.next, %weight.ready ]
+%k = phi i32 [ %lane, %b32.check ], [ %lane, %exact.b32.check ], [ %k.next, %weight.ready ]
+%sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %state.zero, %exact.b32.check ], [ %sum.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
 sum.step:
@@ -1174,7 +1286,7 @@ weight.ready:
 %k.next = add i32 %k, %width
 br label %sum.loop
 sum.done:
-%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %b32.sum, %b32.sum.done ]
+%sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
 %reduce.offset.initial = udiv i32 %width, 2
 br label %reduce.loop
 reduce.loop:
@@ -1267,15 +1379,13 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %blocked.kind = call i32 @recipe.model.block32(i32 %decode)
 %blocked.b32 = icmp ne i32 %blocked.kind, 0
 %blocked.k = or i1 %blocked.q4, %blocked.q6
-%blocked.width = icmp eq i32 %width, 32
 %blocked.rem256 = urem i32 %in.channels, 256
 %blocked.a256 = icmp eq i32 %blocked.rem256, 0
 %blocked.rem32 = urem i32 %in.channels, 32
 %blocked.a32 = icmp eq i32 %blocked.rem32, 0
 %blocked.ok.k = and i1 %blocked.k, %blocked.a256
 %blocked.ok.b32 = and i1 %blocked.b32, %blocked.a32
-%blocked.ok = or i1 %blocked.ok.k, %blocked.ok.b32
-%blocked = and i1 %blocked.ok, %blocked.width
+%blocked = or i1 %blocked.ok.k, %blocked.ok.b32
 %span.ok = or i1 %one, %blocked
 %wave.a = and i1 %span.ok, %kernel.zero
 %wave.b = and i1 %wave.a, %rows.one
@@ -1283,7 +1393,8 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %wave.d = and i1 %wave.c, %accumulate.off
 %wave.e = and i1 %wave.d, %relu.off
 %wave.f = and i1 %wave.e, %transpose.off
-%wave.fast = and i1 %wave.f, %wave.available
+%wave.or.blocked = or i1 %wave.available, %blocked
+%wave.fast = and i1 %wave.f, %wave.or.blocked
 br i1 %wave.fast, label %wave, label %scalar.check
 wave:
 call void @contraction_forward_gemv_wave_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
