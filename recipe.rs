@@ -13573,7 +13573,9 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Config::load()?.precision, None)?;
-	trace(&format!("model preparation {} s", load_started.elapsed().as_secs_f64()))?;
+	let prepared = load_started.elapsed().as_secs_f64();
+	trace(&format!("model preparation {prepared} s"))?;
+	eprintln!("prepared in {prepared} s");
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -14426,8 +14428,9 @@ impl Infer {
 		let stop = stop_ids(&coder)?;
 		trace(&format!("prompt ids {prompt:?}, stop ids {stop:?}, text {text:?}"))?;
 		let budget = self.tokens;
+		let fitting = std::time::Instant::now();
 		let sequence = fitting_context(&file, &model, &plan, device, ceiling)?;
-		eprintln!("{architecture}: {} prompt tokens, {sequence} context positions", prompt.len());
+		eprintln!("{architecture}: {} prompt tokens, {sequence} context positions, fitted in {} s", prompt.len(), fitting.elapsed().as_secs_f64());
 		require(prompt.len() + budget <= sequence, format!("Context full: {} prompt tokens plus {budget} reply tokens exceed {sequence}. Start a new chat or reduce reply length.", prompt.len()))?;
 		let streaming = self.log.iter().any(|metric| metric.0 == chat.0);
 		let (mut ids, mut printed) = (Vec::new(), 0);
