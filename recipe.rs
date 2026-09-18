@@ -6008,7 +6008,10 @@ impl NativeModelIr {
 			return false;
 		}
 		let tile_bytes = self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes();
-		if backend == Backend::Amd && plan.node.int_bits != 0 {
+		let _ = backend;
+		if plan.node.int_bits != 0 {
+			// The int8 activation codes, 36 bytes per 32 values, live in the tile;
+			// the int8 dots exist only under a float state.
 			precision.state_type == "float" && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
 		} else {
 			// The column is staged in chunks of whole 256-value blocks.
@@ -6017,11 +6020,11 @@ impl NativeModelIr {
 	}
 
 	/// The sums whose activations are rounded to int codes before the dot: the
-	/// int(n) blocks, on the backend with int8 dots. Every other packed sum
-	/// stages its activations as they are.
+	/// int(n) blocks, on every backend. Every other packed sum stages its
+	/// activations as they are.
 	fn emit_int_activation_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
 				if plan.node.int_bits != 0 && self.block_dot_fits(backend, plan) {
 					arms.push_str(&format!("i32 {}, label %int.yes\n", index + 1));

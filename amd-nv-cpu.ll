@@ -1029,13 +1029,22 @@ q8.group.step:
 %q8.group.stop = select i1 %q8.group.over, i32 %q8.blocks, i32 %q8.group.stop.raw
 br label %q8.extreme.loop
 q8.extreme.loop:
-%q8.extreme.block = phi i32 [ %q8.group.first, %q8.group.step ], [ %q8.extreme.block.next, %q8.extreme.step ]
-%q8.extreme = phi RECIPE_STATE [ %q8.zero, %q8.group.step ], [ %q8.extreme.next, %q8.extreme.step ]
+%q8.extreme.block = phi i32 [ %q8.group.first, %q8.group.step ], [ %q8.extreme.block.next, %q8.extreme.lane.done ]
+%q8.extreme = phi RECIPE_STATE [ %q8.zero, %q8.group.step ], [ %q8.extreme.acc, %q8.extreme.lane.done ]
 %q8.extreme.more = icmp ult i32 %q8.extreme.block, %q8.group.stop
 br i1 %q8.extreme.more, label %q8.extreme.step, label %q8.extreme.done
+; Each lane walks the block's values at the wave width: one value per lane
+; in a wave of 32, every value on a width of one.
 q8.extreme.step:
 %q8.extreme.term.base = mul i32 %q8.extreme.block, 32
-%q8.extreme.term = add i32 %q8.extreme.term.base, %lane
+br label %q8.extreme.lane.loop
+q8.extreme.lane.loop:
+%q8.extreme.v = phi i32 [ %lane, %q8.extreme.step ], [ %q8.extreme.v.next, %q8.extreme.lane.step ]
+%q8.extreme.acc = phi RECIPE_STATE [ %q8.extreme, %q8.extreme.step ], [ %q8.extreme.next, %q8.extreme.lane.step ]
+%q8.extreme.lane.more = icmp ult i32 %q8.extreme.v, 32
+br i1 %q8.extreme.lane.more, label %q8.extreme.lane.step, label %q8.extreme.lane.done
+q8.extreme.lane.step:
+%q8.extreme.term = add i32 %q8.extreme.term.base, %q8.extreme.v
 %q8.extreme.term.wide = zext i32 %q8.extreme.term to i64
 %q8.extreme.offset = mul i64 %q8.extreme.term.wide, %in.length.wide
 %q8.extreme.index = add i64 %q8.extreme.offset, %position
@@ -1043,9 +1052,12 @@ q8.extreme.step:
 %q8.extreme.model = load double, ptr addrspace(1) %q8.extreme.ptr, align 8
 %q8.extreme.value = call RECIPE_STATE @recipe.decode(double %q8.extreme.model)
 %q8.extreme.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.extreme.value)
-%q8.extreme.have = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.extreme)
+%q8.extreme.have = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.extreme.acc)
 %q8.extreme.larger = call i1 @recipe.state.ogt(RECIPE_STATE %q8.extreme.abs, RECIPE_STATE %q8.extreme.have)
-%q8.extreme.next = select i1 %q8.extreme.larger, RECIPE_STATE %q8.extreme.value, RECIPE_STATE %q8.extreme
+%q8.extreme.next = select i1 %q8.extreme.larger, RECIPE_STATE %q8.extreme.value, RECIPE_STATE %q8.extreme.acc
+%q8.extreme.v.next = add i32 %q8.extreme.v, %width
+br label %q8.extreme.lane.loop
+q8.extreme.lane.done:
 %q8.extreme.block.next = add i32 %q8.extreme.block, 1
 br label %q8.extreme.loop
 q8.extreme.done:
@@ -1077,12 +1089,25 @@ q8.max.done:
 %q8.d.f32 = call float @recipe.state.to.f32(RECIPE_STATE %q8.d)
 br label %q8.code.loop
 q8.code.loop:
-%q8.code.block = phi i32 [ %q8.group.first, %q8.max.done ], [ %q8.code.block.next, %q8.code.store ]
+%q8.code.block = phi i32 [ %q8.group.first, %q8.max.done ], [ %q8.code.block.next, %q8.code.lane.done ]
 %q8.code.more = icmp ult i32 %q8.code.block, %q8.group.stop
 br i1 %q8.code.more, label %q8.code.step, label %q8.group.done
 q8.code.step:
 %q8.code.term.base = mul i32 %q8.code.block, 32
-%q8.code.term = add i32 %q8.code.term.base, %lane
+%q8.code.block.wide = zext i32 %q8.code.block to i64
+%q8.code.block.offset = mul i64 %q8.code.block.wide, 36
+%q8.code.block.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q8.code.block.offset
+%q8.code.owner = icmp eq i32 %lane, 0
+br i1 %q8.code.owner, label %q8.code.meta, label %q8.code.lane.loop
+q8.code.meta:
+store float %q8.d.f32, ptr addrspace(3) %q8.code.block.ptr, align 4
+br label %q8.code.lane.loop
+q8.code.lane.loop:
+%q8.code.v = phi i32 [ %lane, %q8.code.step ], [ %lane, %q8.code.meta ], [ %q8.code.v.next, %q8.code.store ]
+%q8.code.lane.more = icmp ult i32 %q8.code.v, 32
+br i1 %q8.code.lane.more, label %q8.code.lane.step, label %q8.code.lane.done
+q8.code.lane.step:
+%q8.code.term = add i32 %q8.code.term.base, %q8.code.v
 %q8.code.term.wide = zext i32 %q8.code.term to i64
 %q8.code.offset = mul i64 %q8.code.term.wide, %in.length.wide
 %q8.code.index = add i64 %q8.code.offset, %position
@@ -1096,20 +1121,16 @@ q8.code.step:
 %q8.code.low.clamped = select i1 %q8.code.low, i32 -127, i32 %q8.code.int.raw
 %q8.code.high = icmp sgt i32 %q8.code.low.clamped, 127
 %q8.code.int = select i1 %q8.code.high, i32 127, i32 %q8.code.low.clamped
-%q8.code.block.wide = zext i32 %q8.code.block to i64
-%q8.code.block.offset = mul i64 %q8.code.block.wide, 36
-%q8.code.block.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q8.code.block.offset
-%q8.code.owner = icmp eq i32 %lane, 0
-br i1 %q8.code.owner, label %q8.code.meta, label %q8.code.store
-q8.code.meta:
-store float %q8.d.f32, ptr addrspace(3) %q8.code.block.ptr, align 4
 br label %q8.code.store
 q8.code.store:
-%q8.code.lane.wide = zext i32 %lane to i64
+%q8.code.v.wide = zext i32 %q8.code.v to i64
 %q8.code.ptr.base = getelementptr i8, ptr addrspace(3) %q8.code.block.ptr, i64 4
-%q8.code.byte.ptr = getelementptr i8, ptr addrspace(3) %q8.code.ptr.base, i64 %q8.code.lane.wide
+%q8.code.byte.ptr = getelementptr i8, ptr addrspace(3) %q8.code.ptr.base, i64 %q8.code.v.wide
 %q8.code.byte = trunc i32 %q8.code.int to i8
 store i8 %q8.code.byte, ptr addrspace(3) %q8.code.byte.ptr, align 1
+%q8.code.v.next = add i32 %q8.code.v, %width
+br label %q8.code.lane.loop
+q8.code.lane.done:
 %q8.code.block.next = add i32 %q8.code.block, 1
 br label %q8.code.loop
 q8.group.done:
