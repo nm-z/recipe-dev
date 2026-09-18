@@ -738,8 +738,9 @@ jobs:
     timeout-minutes: 90
     concurrency:
       # Keep one Windows GPU worker per push run rather than one global pending
-      # slot. azure-run.sh still admits only one worker at a time through the
-      # Azure lease.
+      # slot. azure-run.sh holds the shared Azure lease only across the quota
+      # read and the allocation; workers of concurrent runs then execute side
+      # by side, bounded by the T4 family quota.
       group: recipe-windows-nvidia-${{ github.run_id }}
       cancel-in-progress: false
     permissions:
