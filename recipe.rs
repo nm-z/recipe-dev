@@ -5943,7 +5943,7 @@ impl NativeModelIr {
 				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
 				let q4k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * precision.model.bytes()
+					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
 						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
 				});
 				if q4k {
@@ -5965,7 +5965,7 @@ impl NativeModelIr {
 				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
 				let q6k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * precision.model.bytes()
+					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
 						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
 				});
 				if q6k {
@@ -5990,7 +5990,7 @@ impl NativeModelIr {
 				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
 				let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed && plan.node.op == Primitive::Contraction) else { continue };
 				let segments = stored.format_segments();
-				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * precision.model.bytes() {
+				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes() {
 					continue;
 				}
 				let Some(spec) = segments[0].0.spec() else { continue };
@@ -11358,7 +11358,11 @@ impl Model {
 		}
 		let model = self.suffix();
 		assert!(!model.blocks.is_empty(), "activation requires a preceding block");
-		model.edit(|model| model.blocks.last_mut().unwrap().activation = activation)
+		model.edit(|model| {
+			let block = model.blocks.last_mut().unwrap();
+			block.activation = activation;
+			block.suffix = Suffix::End;
+		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
 	/// `layer(tokenizer.ggml.tokens)`.
@@ -11533,7 +11537,11 @@ impl Model {
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let model = if self.blocks.is_empty() { self.push(Operation::Norm) } else { self.suffix() };
 		let normalization = normalization.normalization();
-		model.edit(|model| model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block")).normalization = Some(normalization))
+		model.edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
+			block.normalization = Some(normalization);
+			block.suffix = Suffix::End;
+		})
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
 	/// returning to the block input width.
