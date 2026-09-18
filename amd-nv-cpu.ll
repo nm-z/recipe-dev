@@ -903,7 +903,7 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %terms = add i32 %in.channels, 0
 %terms.wide = zext i32 %terms to i64
 %in.length.wide = zext i32 %in.length to i64
-%position = zext i32 %out.begin to i64
+%out.end = add i32 %out.begin, %out.span
 %weight.base.wide = add i64 %weight.base, 0
 %jobs.adjusted = add i32 %out.channels, %waves
 %jobs.numerator = sub i32 %jobs.adjusted, 1
@@ -926,103 +926,131 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %q8.k = or i1 %q4.available, %q6.available
 %q8.available = or i1 %q8.k, %b32.available
 %q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
-br i1 %q8.available, label %q8.entry, label %job.loop
-q8.entry:
 %q8.blocks = udiv i32 %terms, 32
-br label %q8.block.loop
-q8.block.loop:
-%q8.block = phi i32 [ %wave, %q8.entry ], [ %q8.block.next, %q8.q.store ]
-%q8.more = icmp ult i32 %q8.block, %q8.blocks
-br i1 %q8.more, label %q8.block.step, label %q8.done
-q8.block.step:
-%q8.term.base = mul i32 %q8.block, 32
-%q8.term = add i32 %q8.term.base, %lane
-%q8.term.wide = zext i32 %q8.term to i64
-%q8.input.offset = mul i64 %q8.term.wide, %in.length.wide
-%q8.input.index = add i64 %q8.input.offset, %position
-%q8.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q8.input.index
-%q8.input.model = load double, ptr addrspace(1) %q8.input.ptr, align 8
-%q8.input.value = call RECIPE_STATE @recipe.decode(double %q8.input.model)
-%q8.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.input.value)
-%q8.max.offset.initial = udiv i32 %width, 2
+%q8.span = add i32 1, 0
+%q8.groups.adjusted = add i32 %q8.blocks, %q8.span
+%q8.groups.numerator = sub i32 %q8.groups.adjusted, 1
+%q8.groups = udiv i32 %q8.groups.numerator, %q8.span
+%q8.width.half = udiv i32 %width, 2
+%q8.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%q8.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%q8.levels = call RECIPE_STATE @recipe.state.from.u32(i32 127)
+br label %position.loop
+position.loop:
+%position.index = phi i32 [ %out.begin, %entry ], [ %position.next, %position.done ]
+%position.more = icmp ult i32 %position.index, %out.end
+br i1 %position.more, label %position.step, label %exit
+position.step:
+%position = zext i32 %position.index to i64
+br i1 %q8.available, label %q8.entry, label %job.loop
+; The activation column as int8 codes with one float step per 32 values,
+; |max|/127, the codes rounded to even: an int8 input with its step size.
+q8.entry:
+br label %q8.group.loop
+q8.group.loop:
+%q8.group = phi i32 [ %wave, %q8.entry ], [ %q8.group.next, %q8.group.done ]
+%q8.group.more = icmp ult i32 %q8.group, %q8.groups
+br i1 %q8.group.more, label %q8.group.step, label %q8.done
+q8.group.step:
+%q8.group.first = mul i32 %q8.group, %q8.span
+%q8.group.stop.raw = add i32 %q8.group.first, %q8.span
+%q8.group.over = icmp ult i32 %q8.blocks, %q8.group.stop.raw
+%q8.group.stop = select i1 %q8.group.over, i32 %q8.blocks, i32 %q8.group.stop.raw
+br label %q8.extreme.loop
+q8.extreme.loop:
+%q8.extreme.block = phi i32 [ %q8.group.first, %q8.group.step ], [ %q8.extreme.block.next, %q8.extreme.step ]
+%q8.extreme = phi RECIPE_STATE [ %q8.zero, %q8.group.step ], [ %q8.extreme.next, %q8.extreme.step ]
+%q8.extreme.more = icmp ult i32 %q8.extreme.block, %q8.group.stop
+br i1 %q8.extreme.more, label %q8.extreme.step, label %q8.extreme.done
+q8.extreme.step:
+%q8.extreme.term.base = mul i32 %q8.extreme.block, 32
+%q8.extreme.term = add i32 %q8.extreme.term.base, %lane
+%q8.extreme.term.wide = zext i32 %q8.extreme.term to i64
+%q8.extreme.offset = mul i64 %q8.extreme.term.wide, %in.length.wide
+%q8.extreme.index = add i64 %q8.extreme.offset, %position
+%q8.extreme.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q8.extreme.index
+%q8.extreme.model = load double, ptr addrspace(1) %q8.extreme.ptr, align 8
+%q8.extreme.value = call RECIPE_STATE @recipe.decode(double %q8.extreme.model)
+%q8.extreme.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.extreme.value)
+%q8.extreme.have = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.extreme)
+%q8.extreme.larger = call i1 @recipe.state.ogt(RECIPE_STATE %q8.extreme.abs, RECIPE_STATE %q8.extreme.have)
+%q8.extreme.next = select i1 %q8.extreme.larger, RECIPE_STATE %q8.extreme.value, RECIPE_STATE %q8.extreme
+%q8.extreme.block.next = add i32 %q8.extreme.block, 1
+br label %q8.extreme.loop
+q8.extreme.done:
 br label %q8.max.loop
 q8.max.loop:
-%q8.max.offset = phi i32 [ %q8.max.offset.initial, %q8.block.step ], [ %q8.max.offset.next, %q8.max.step ]
-%q8.max.value = phi RECIPE_STATE [ %q8.abs, %q8.block.step ], [ %q8.max.next, %q8.max.step ]
+%q8.max.offset = phi i32 [ %q8.width.half, %q8.extreme.done ], [ %q8.max.offset.next, %q8.max.step ]
+%q8.max.value = phi RECIPE_STATE [ %q8.extreme, %q8.extreme.done ], [ %q8.max.next, %q8.max.step ]
 %q8.max.more = icmp ugt i32 %q8.max.offset, 0
 br i1 %q8.max.more, label %q8.max.step, label %q8.max.done
 q8.max.step:
 %q8.max.partner.lane = xor i32 %lane, %q8.max.offset
 %q8.max.partner.index = mul i32 %q8.max.partner.lane, 4
 %q8.max.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %q8.max.value, i32 %q8.max.partner.index)
-%q8.max.greater = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value)
+%q8.max.partner.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.partner)
+%q8.max.value.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.value)
+%q8.max.greater = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.partner.abs, RECIPE_STATE %q8.max.value.abs)
 %q8.max.next = select i1 %q8.max.greater, RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value
 %q8.max.offset.next = udiv i32 %q8.max.offset, 2
 br label %q8.max.loop
 q8.max.done:
-%q8.denominator = call RECIPE_STATE @recipe.state.from.u32(i32 127)
-%q8.d = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.max.value, RECIPE_STATE %q8.denominator)
-%q8.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
-%q8.nonzero = call i1 @recipe.state.ogt(RECIPE_STATE %q8.d, RECIPE_STATE %q8.zero)
-%q8.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
-%q8.d.safe = select i1 %q8.nonzero, RECIPE_STATE %q8.d, RECIPE_STATE %q8.one
-%q8.q.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.input.value, RECIPE_STATE %q8.d.safe)
-%q8.q.nonnegative = call i1 @recipe.state.oge(RECIPE_STATE %q8.q.raw, RECIPE_STATE %q8.zero)
-%q8.two = call RECIPE_STATE @recipe.state.from.u32(i32 2)
-%q8.half = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.two)
-%q8.negative.half = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %q8.half)
-%q8.round.offset = select i1 %q8.q.nonnegative, RECIPE_STATE %q8.half, RECIPE_STATE %q8.negative.half
-%q8.round.input = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q8.q.raw, RECIPE_STATE %q8.round.offset)
-%q8.q.int.raw = call i32 @recipe.state.to.s32(RECIPE_STATE %q8.round.input)
-%q8.q.low = icmp slt i32 %q8.q.int.raw, -127
-%q8.q.low.clamped = select i1 %q8.q.low, i32 -127, i32 %q8.q.int.raw
-%q8.q.high = icmp sgt i32 %q8.q.low.clamped, 127
-%q8.q.int = select i1 %q8.q.high, i32 127, i32 %q8.q.low.clamped
-%q8.q.state = call RECIPE_STATE @recipe.state.from.s32(i32 %q8.q.int)
-%q8.sum.offset.initial = udiv i32 %width, 2
-br label %q8.sum.loop
-q8.sum.loop:
-%q8.sum.offset = phi i32 [ %q8.sum.offset.initial, %q8.max.done ], [ %q8.sum.offset.next, %q8.sum.step ]
-%q8.sum.value = phi RECIPE_STATE [ %q8.q.state, %q8.max.done ], [ %q8.sum.next, %q8.sum.step ]
-%q8.sum.more = icmp ugt i32 %q8.sum.offset, 0
-br i1 %q8.sum.more, label %q8.sum.step, label %q8.sum.done
-q8.sum.step:
-%q8.sum.partner.lane = xor i32 %lane, %q8.sum.offset
-%q8.sum.partner.index = mul i32 %q8.sum.partner.lane, 4
-%q8.sum.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %q8.sum.value, i32 %q8.sum.partner.index)
-%q8.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %q8.sum.value, RECIPE_STATE %q8.sum.partner)
-%q8.sum.offset.next = udiv i32 %q8.sum.offset, 2
-br label %q8.sum.loop
-q8.sum.done:
-%q8.s = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q8.d, RECIPE_STATE %q8.sum.value)
-%q8.d.f16 = call half @recipe.state.to.f16(RECIPE_STATE %q8.d)
-%q8.s.f16 = call half @recipe.state.to.f16(RECIPE_STATE %q8.s)
-%q8.block.wide = zext i32 %q8.block to i64
-%q8.block.offset = mul i64 %q8.block.wide, 36
-%q8.block.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q8.block.offset
-%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 0
-%q8.s.ptr = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 2
-%q8.owner = icmp eq i32 %lane, 0
-br i1 %q8.owner, label %q8.meta, label %q8.q.store
-q8.meta:
-store half %q8.d.f16, ptr addrspace(3) %q8.d.ptr, align 2
-store half %q8.s.f16, ptr addrspace(3) %q8.s.ptr, align 2
-br label %q8.q.store
-q8.q.store:
-%q8.q.offset = zext i32 %lane to i64
-%q8.q.ptr.base = getelementptr i8, ptr addrspace(3) %q8.block.ptr, i64 4
-%q8.q.ptr = getelementptr i8, ptr addrspace(3) %q8.q.ptr.base, i64 %q8.q.offset
-%q8.q.byte = trunc i32 %q8.q.int to i8
-store i8 %q8.q.byte, ptr addrspace(3) %q8.q.ptr, align 1
-%q8.block.next = add i32 %q8.block, %waves
-br label %q8.block.loop
+%q8.max.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.value)
+%q8.nonzero = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.abs, RECIPE_STATE %q8.zero)
+%q8.max.safe = select i1 %q8.nonzero, RECIPE_STATE %q8.max.value, RECIPE_STATE %q8.one
+%q8.max.abs.safe = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.safe)
+%q8.d.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.max.abs.safe, RECIPE_STATE %q8.levels)
+%q8.inverse.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.d.raw)
+%q8.inverse = select i1 %q8.nonzero, RECIPE_STATE %q8.inverse.raw, RECIPE_STATE %q8.zero
+%q8.d = select i1 %q8.nonzero, RECIPE_STATE %q8.d.raw, RECIPE_STATE %q8.zero
+%q8.d.f32 = call float @recipe.state.to.f32(RECIPE_STATE %q8.d)
+br label %q8.code.loop
+q8.code.loop:
+%q8.code.block = phi i32 [ %q8.group.first, %q8.max.done ], [ %q8.code.block.next, %q8.code.store ]
+%q8.code.more = icmp ult i32 %q8.code.block, %q8.group.stop
+br i1 %q8.code.more, label %q8.code.step, label %q8.group.done
+q8.code.step:
+%q8.code.term.base = mul i32 %q8.code.block, 32
+%q8.code.term = add i32 %q8.code.term.base, %lane
+%q8.code.term.wide = zext i32 %q8.code.term to i64
+%q8.code.offset = mul i64 %q8.code.term.wide, %in.length.wide
+%q8.code.index = add i64 %q8.code.offset, %position
+%q8.code.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q8.code.index
+%q8.code.model = load double, ptr addrspace(1) %q8.code.ptr, align 8
+%q8.code.value = call RECIPE_STATE @recipe.decode(double %q8.code.model)
+%q8.code.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q8.code.value, RECIPE_STATE %q8.inverse)
+%q8.code.even = call RECIPE_STATE @recipe.state.roundeven(RECIPE_STATE %q8.code.scaled)
+%q8.code.int.raw = call i32 @recipe.state.to.s32(RECIPE_STATE %q8.code.even)
+%q8.code.low = icmp slt i32 %q8.code.int.raw, -127
+%q8.code.low.clamped = select i1 %q8.code.low, i32 -127, i32 %q8.code.int.raw
+%q8.code.high = icmp sgt i32 %q8.code.low.clamped, 127
+%q8.code.int = select i1 %q8.code.high, i32 127, i32 %q8.code.low.clamped
+%q8.code.block.wide = zext i32 %q8.code.block to i64
+%q8.code.block.offset = mul i64 %q8.code.block.wide, 36
+%q8.code.block.ptr = getelementptr i8, ptr addrspace(3) %q8.shared, i64 %q8.code.block.offset
+%q8.code.owner = icmp eq i32 %lane, 0
+br i1 %q8.code.owner, label %q8.code.meta, label %q8.code.store
+q8.code.meta:
+store float %q8.d.f32, ptr addrspace(3) %q8.code.block.ptr, align 4
+br label %q8.code.store
+q8.code.store:
+%q8.code.lane.wide = zext i32 %lane to i64
+%q8.code.ptr.base = getelementptr i8, ptr addrspace(3) %q8.code.block.ptr, i64 4
+%q8.code.byte.ptr = getelementptr i8, ptr addrspace(3) %q8.code.ptr.base, i64 %q8.code.lane.wide
+%q8.code.byte = trunc i32 %q8.code.int to i8
+store i8 %q8.code.byte, ptr addrspace(3) %q8.code.byte.ptr, align 1
+%q8.code.block.next = add i32 %q8.code.block, 1
+br label %q8.code.loop
+q8.group.done:
+%q8.group.next = add i32 %q8.group, %waves
+br label %q8.group.loop
 q8.done:
 call void @recipe.local.barrier()
 br label %job.loop
 job.loop:
-%job = phi i32 [ %group, %entry ], [ %group, %q8.done ], [ %job.next, %job.done ]
+%job = phi i32 [ %group, %position.step ], [ %group, %q8.done ], [ %job.next, %job.done ]
 %job.more = icmp ult i32 %job, %jobs
-br i1 %job.more, label %job.step, label %exit
+br i1 %job.more, label %job.step, label %position.done
 job.step:
 %channel.base = mul i32 %job, %waves
 %channel = add i32 %channel.base, %wave
@@ -1203,6 +1231,10 @@ br label %job.done
 job.done:
 %job.next = add i32 %job, %groups
 br label %job.loop
+position.done:
+call void @recipe.local.barrier()
+%position.next = add i32 %position.index, 1
+br label %position.loop
 exit:
 ret void
 }
@@ -1228,7 +1260,30 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %waves.ok = icmp ugt i32 %waves, 0
 %width.ok = icmp ugt i32 %width, 1
 %wave.available = and i1 %waves.ok, %width.ok
-%wave.fast = and i1 %fast.f, %wave.available
+; An int sum is an int dot at every position, not only the single-position
+; decode: block weights whose dot the wave body has send the whole span there.
+%blocked.q4 = call i1 @recipe.model.q4k(i32 %decode)
+%blocked.q6 = call i1 @recipe.model.q6k(i32 %decode)
+%blocked.kind = call i32 @recipe.model.block32(i32 %decode)
+%blocked.b32 = icmp ne i32 %blocked.kind, 0
+%blocked.k = or i1 %blocked.q4, %blocked.q6
+%blocked.width = icmp eq i32 %width, 32
+%blocked.rem256 = urem i32 %in.channels, 256
+%blocked.a256 = icmp eq i32 %blocked.rem256, 0
+%blocked.rem32 = urem i32 %in.channels, 32
+%blocked.a32 = icmp eq i32 %blocked.rem32, 0
+%blocked.ok.k = and i1 %blocked.k, %blocked.a256
+%blocked.ok.b32 = and i1 %blocked.b32, %blocked.a32
+%blocked.ok = or i1 %blocked.ok.k, %blocked.ok.b32
+%blocked = and i1 %blocked.ok, %blocked.width
+%span.ok = or i1 %one, %blocked
+%wave.a = and i1 %span.ok, %kernel.zero
+%wave.b = and i1 %wave.a, %rows.one
+%wave.c = and i1 %wave.b, %reverse.off
+%wave.d = and i1 %wave.c, %accumulate.off
+%wave.e = and i1 %wave.d, %relu.off
+%wave.f = and i1 %wave.e, %transpose.off
+%wave.fast = and i1 %wave.f, %wave.available
 br i1 %wave.fast, label %wave, label %scalar.check
 wave:
 call void @contraction_forward_gemv_wave_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)

@@ -15743,12 +15743,21 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			_ => None,
 		}
 		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+		// int(n) names codes of at most n bits with their step sizes. A stored
+		// plane already in such a format is kept and multiplied as it is; only a
+		// wider plane is requantized to the n-bit block format.
+		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
+			weight.codebook.is_empty() && !weight.segments.is_empty() && weight.segments.iter().all(|(span, _)| span.0 >> 12 != 2 && span.bits() <= format.bits)
+		});
+		let kept = kept.map(|weight| weight.format);
 		let node = &mut graph.nodes[index];
-		node.argument[8] = f64::from(storage.0);
+		node.argument[8] = f64::from(kept.unwrap_or(storage).0);
 		node.packed = true;
 		node.precision = Compute::FP32;
 		node.kv_precision = Compute::FP32;
-		requantize_bound(graph, index, storage, config)?;
+		if kept.is_none() {
+			requantize_bound(graph, index, storage, config)?;
+		}
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;

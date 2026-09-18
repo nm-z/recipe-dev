@@ -133,7 +133,7 @@ res = "fp16"
 [precision.llamacpp]
 sum = "int8"
 embed = "fp32"
-attn = "fp16"
+attn = "fp32"
 rope = "fp32"
 kv = "fp16"
 atvn = "fp32"
