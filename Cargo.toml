@@ -135,6 +135,7 @@ res = "fp16"
 # The accumulator every block carries unless it names acc(32) or acc(64):
 # the running sums of a dot, the softmax and norm statistics.
 acc = "fp32"
+step = 32
 
 [precision.llamacpp]
 sum = "int8"
@@ -146,3 +147,5 @@ atvn = "fp32"
 norm = "fp32"
 res = "fp32"
 acc = "fp32"
+# llama.cpp rounds a sum's inputs to Q8_K: one step per 256.
+step = 256

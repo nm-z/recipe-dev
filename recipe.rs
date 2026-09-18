@@ -6031,7 +6031,15 @@ impl NativeModelIr {
 				}
 			}
 		}
-		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\n")
+		let mut steps = String::new();
+		let mut step_arms = String::new();
+		for (index, plan) in self.plans.iter().enumerate() {
+			if plan.node.int_bits != 0 && plan.node.int_step != 32 {
+				step_arms.push_str(&format!("i32 {}, label %step.n{}\n", index + 1, index + 1));
+				steps.push_str(&format!("step.n{}:\nret i32 {}\n", index + 1, plan.node.int_step));
+			}
+		}
+		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\ndefine internal i32 @recipe.model.int.step(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %step.default [\n{step_arms}]\n{steps}step.default:\nret i32 32\n}}\n")
 	}
 
 	/// The bytes of the shared tile a workgroup owns: the schedule's values in
@@ -10041,7 +10049,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -10053,12 +10061,13 @@ mod bundle {
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
 			precision_token(block.blck_precision),
-			precision_token(block.acc)
+			precision_token(block.acc),
+			block.int_step.map_or("-".to_owned(), |step| step.to_string())
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -10071,6 +10080,7 @@ mod bundle {
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
 			acc: fields.get(11).map_or(Ok(None), |field| precision_from_token(field))?,
+			int_step: fields.get(12).map_or(Ok(None), |field| if field.is_empty() || *field == "-" { Ok(None) } else { self::value::<u32>(field, "block int step").map(Some) })?,
 			suffix: Suffix::End,
 		})
 	}
@@ -11146,7 +11156,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::End } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, int_step: None, suffix: Suffix::End } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -11217,6 +11227,9 @@ pub struct Block {
 	kv_precision: Option<Compute>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	acc: Option<Compute>,
+	/// How many inputs share one step under an int precision, when named:
+	/// 32 as the file's blocks, 256 as llama.cpp's Q8_K activations.
+	int_step: Option<u32>,
 	/// What the next precision suffix names.
 	suffix: Suffix,
 }
@@ -11268,7 +11281,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, int_step: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
@@ -11293,6 +11306,15 @@ impl Block {
 			64 => Compute::FP64,
 			_ => panic!("acc bits must be 32 or 64"),
 		});
+		self
+	}
+	/// How many inputs of an int sum share one step: `layer(n).int(8).step(256)`
+	/// rounds its inputs the way llama.cpp's Q8_K does, one step per 256;
+	/// the default 32 follows the weight blocks. A table names the default
+	/// under `step`.
+	pub fn step(mut self, inputs: u32) -> Self {
+		assert!(inputs != 0 && inputs % 32 == 0, "an int step covers a multiple of 32 inputs, received {inputs}");
+		self.int_step = Some(inputs);
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -11523,6 +11545,7 @@ impl Model {
 				blck_precision: None,
 				kv_precision: None,
 				acc: None,
+				int_step: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -11798,6 +11821,13 @@ impl Model {
 		self.edit(|model| match model.blocks.last_mut() {
 			Some(block) => *block = block.clone().acc(bits),
 			None => panic!("acc names the block before it, and no block comes before this one"),
+		})
+	}
+	/// The int step of the block before it; see [`Block::step`].
+	pub fn step(&self, inputs: u32) -> Self {
+		self.edit(|model| match model.blocks.last_mut() {
+			Some(block) => *block = block.clone().step(inputs),
+			None => panic!("step names the block before it, and no block comes before this one"),
 		})
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
@@ -15223,6 +15253,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_blck_precision: None,
 		block_kv_precision: None,
 		block_acc: None,
+		block_int_step: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -15578,6 +15609,9 @@ struct Node {
 	/// as the block asked. Zero for a sum that names no int, whose activations
 	/// enter the dot as they are.
 	int_bits: u8,
+	/// The inputs that share one step under int(n): 32, or what the block or
+	/// the table named.
+	int_step: u32,
 	/// The arithmetic this node computes in.
 	precision: Compute,
 	/// The accumulator its sums and reductions carry: fp32, or fp64 when the
@@ -15618,6 +15652,7 @@ struct Graph {
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
 	block_acc: Option<Compute>,
+	block_int_step: Option<u32>,
 	/// The precision the block being lowered named for its blck, if any.
 	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
@@ -15657,6 +15692,7 @@ impl Graph {
 			block_frozen: false,
 			block_precision: None,
 			block_acc: None,
+			block_int_step: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
 			profile: Precisions::default(),
@@ -15735,6 +15771,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_frozen = false;
 	graph.block_precision = None;
 	graph.block_acc = None;
+	graph.block_int_step = None;
 	graph.block_blck_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
@@ -15902,10 +15939,11 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc, graph.block_int_step);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_acc = block.acc;
+	graph.block_int_step = block.int_step;
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
 	let skip = graph.source;
@@ -16004,7 +16042,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc, graph.block_int_step) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -16078,6 +16116,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
 	let precision = named.unwrap_or(graph.profile.of(kind));
 	let acc = graph.block_acc.unwrap_or(graph.profile.acc);
+	let int_step = graph.block_int_step.unwrap_or(graph.profile.step);
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
 		op,
@@ -16095,6 +16134,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		frozen: graph.block_frozen,
 		packed: false,
 		int_bits: 0,
+		int_step,
 		precision,
 		acc,
 		kv_precision,
@@ -17400,11 +17440,14 @@ pub(crate) struct Precisions {
 	res: Compute,
 	/// The accumulator every block carries unless it names its own: fp32 or fp64.
 	acc: Compute,
+	/// The inputs that share one step under an int precision unless the block
+	/// names its own: 32 by default.
+	step: u32,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32 }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, step: 32 }
 	}
 }
 impl Precisions {
@@ -17431,6 +17474,11 @@ impl Precisions {
 		let mut precisions = Self::default();
 		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
 			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			if key == "step" {
+				let step = value.trim().parse::<u32>().ok().filter(|step| *step != 0 && step % 32 == 0);
+				precisions.step = step.ok_or_else(|| RecipeError::new(format!("[precision.{name}] step = {value}: an int step covers a multiple of 32 inputs")))?;
+				continue;
+			}
 			let compute = precision_named(value).map_err(|error| RecipeError::new(format!("[precision.{name}] {key}: {error}")))?;
 			match key {
 				"sum" => precisions.sum = compute,
@@ -17445,7 +17493,7 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res, and acc names the accumulator"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator and step the int step"))),
 			}
 		}
 		Ok(precisions)

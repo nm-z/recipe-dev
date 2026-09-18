@@ -952,7 +952,10 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %stage.tile = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
 %q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
 %q8.blocks = udiv i32 %terms, 32
-%q8.span = add i32 1, 0
+; The inputs that share one step, in 32-value records: the block's int(n)
+; step, 32 as the weight blocks or what it declared (256 is llama.cpp's Q8_K).
+%q8.step = call i32 @recipe.model.int.step(i32 %decode)
+%q8.span = udiv i32 %q8.step, 32
 %q8.groups.adjusted = add i32 %q8.blocks, %q8.span
 %q8.groups.numerator = sub i32 %q8.groups.adjusted, 1
 %q8.groups = udiv i32 %q8.groups.numerator, %q8.span
