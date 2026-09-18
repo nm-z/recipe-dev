@@ -910,7 +910,7 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %jobs.numerator = sub i32 %jobs.adjusted, 1
 %jobs = udiv i32 %jobs.numerator, %waves
 %q4.selector = call i1 @recipe.model.q4k(i32 %decode)
-%q4.width = icmp eq i32 %width, 32
+%int8.dots = call i1 @recipe.int8.dots()
 %q4.remainder = urem i32 %terms, 256
 %q4.aligned = icmp eq i32 %q4.remainder, 0
 %q4.available = and i1 %q4.selector, %q4.aligned
@@ -924,10 +924,10 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %b32.available = and i1 %b32.selector, %b32.aligned
 %q8.k = or i1 %q4.available, %q6.available
 %block.available = or i1 %q8.k, %b32.available
-; A wave of 32 lanes takes the int8 activation path and its dot4 helpers; any
-; other width stages the activation column as it is and dots it exactly.
-%exact = xor i1 %q4.width, true
-%q8.available = and i1 %block.available, %q4.width
+; A backend with int8 dots takes the int8 activation path and its dot4
+; helpers; any other stages the activation column as it is and dots it exactly.
+%exact = xor i1 %int8.dots, true
+%q8.available = and i1 %block.available, %int8.dots
 %stage.available = and i1 %block.available, %exact
 %stage.pitch = udiv i32 %terms, 4
 %stage.tile = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
