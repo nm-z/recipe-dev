@@ -20280,7 +20280,10 @@ impl Cuda {
 			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
 			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+			// Every workgroup the SMs hold at once is launched: the grid stays
+			// cooperative, and the work is spread over that many more warps.
+			let groups = geometry.groups.checked_mul(active as u32).ok_or_else(|| RecipeError::new("NVIDIA native grid overflows"))?;
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry: Geometry { groups, block: geometry.block } })
 		}
 	}
 
