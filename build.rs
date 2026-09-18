@@ -137,7 +137,9 @@ define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_g
 // on it and the warp reconverges behind that lane (bar.warp.sync), so no bar.sync
 // follows a divergent spin (bar.sync is per warp before sm_70 and would count the
 // leader's warp as arrived on the lanes that skipped the spin) and only one lane in
-// thirty-two loads the phase while the grid drains.
+// thirty-two loads the phase while the grid drains. The acquire fence is the spinner's
+// alone: before sm_70 a fence is membar.sys, and one per thread cost a millisecond a node;
+// the warp's other lanes issue their loads after the spinner's fence by program order.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
 declare void @llvm.nvvm.bar.warp.sync(i32)
@@ -156,9 +158,10 @@ fence release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
 br i1 %spinner, label %wait, label %waited wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
-br i1 %ready, label %waited, label %wait waited:
+br i1 %ready, label %acquired, label %wait acquired:
+fence acquire br label %waited waited:
 call void @llvm.nvvm.bar.warp.sync(i32 -1)
-fence acquire ret void }"#;
+ret void }"#;
 const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
