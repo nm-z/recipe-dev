@@ -2088,7 +2088,7 @@ impl NativeLayout {
 		let mut released: Vec<(usize, usize)> = Vec::new();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			let bytes = graph_rows_buffer(node.output, rows, node.precision.bytes())?;
-			let reuse = inference && !retained[index];
+			let reuse = inference && !retained[index] && !tracing();
 			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
 				Some(position) => released.remove(position).1,
 				None => {
@@ -14379,7 +14379,7 @@ impl Infer {
 			prompt.remove(0);
 		}
 		let stop = stop_ids(&coder)?;
-		trace(&format!("prompt ids {prompt:?}, stop ids {stop:?}"))?;
+		trace(&format!("prompt ids {prompt:?}, stop ids {stop:?}, text {text:?}"))?;
 		let budget = self.tokens;
 		let sequence = fitting_context(&file, &model, &plan, device, ceiling)?;
 		eprintln!("{architecture}: {} prompt tokens, {sequence} context positions", prompt.len());
@@ -14800,6 +14800,16 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 /// One id at a time over a tape whose input is a sequence of ids. The prefill
 /// runs the prompt, every step adds one id and forwards the positions it reaches
 /// through `logits`, and `samples` holds the whole sequence as the ids settle.
+/// A traced run writes each step's logits the way llama-eval-callback writes
+/// its `result_output`: the first and last three, the sum, and the argmax, so
+/// the two can be read side by side.
+fn trace_logits(step: usize, logits: &[f64]) -> Result<()> {
+	if !tracing() || logits.len() < 3 {
+		return Ok(());
+	}
+	let argmax = logits.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (index, value)| if *value > best.1 { (index, *value) } else { best });
+	trace(&format!("logits step {step} first {:?} last {:?} sum {} argmax {} = {}", &logits[..3], &logits[logits.len() - 3..], logits.iter().sum::<f64>(), argmax.0, argmax.1))
+}
 fn decode_steps(
 	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
@@ -14810,6 +14820,7 @@ fn decode_steps(
 	for step in 0..=budget {
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
 		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
+		trace_logits(step, &sample_logits)?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
 			generation.prefill_seconds = seconds;
@@ -15127,6 +15138,7 @@ impl Placed {
 			let started = std::time::Instant::now();
 			let predictions = self.run_window(&samples, settled, reached)?;
 			let sample_logits = self.last_logits(&predictions, settled, reached)?;
+			trace_logits(step, &sample_logits)?;
 			let seconds = started.elapsed().as_secs_f64();
 			if step == 0 {
 				generation.prefill_seconds = seconds;
@@ -17388,6 +17400,8 @@ struct NativeTape {
 	capacity: usize,
 	positions: u32,
 	vocabulary: f64,
+	/// The end of the last forwarded window: the positions a traced dump reads.
+	reached: std::sync::atomic::AtomicU32,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -17629,6 +17643,7 @@ impl NativeTape {
 			capacity: rows,
 			positions: narrow(positions, "native input positions")? as u32,
 			vocabulary,
+			reached: std::sync::atomic::AtomicU32::new(0),
 		};
 		tape.stage_lookups(0, tape.positions)?;
 		Ok(tape)
@@ -17743,6 +17758,7 @@ impl NativeTape {
 	}
 	fn forward_window_with_samples(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		self.reached.store(end, Ordering::Relaxed);
 		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
@@ -17892,9 +17908,20 @@ impl NativeTape {
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 		if tracing() && (!SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) || !values.iter().all(|value| value.is_finite())) {
 			let layout = &self.program.artifact.layout;
-			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate() {
-				let head = self.values.download_float_bytes(*slot, 8, *precision)?;
-				trace(&format!("values node {index} {head:?}"))?;
+			let reached = self.reached.load(Ordering::Relaxed) as usize;
+			// The first two blocks and the model's last nodes: enough to place a
+			// divergence, without reading every arena of a deep model.
+			let total = layout.values.len();
+			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| *index < 40 || *index + 4 >= total) {
+				let shape = self.nodes[index].output;
+				let (channels, length) = (shape.channels, shape.length);
+				let positions = reached.clamp(1, length.max(1));
+				let region = self.values.download_float_bytes(*slot, channels * length, *precision)?;
+				let at = |channel: usize, position: usize| region.get(channel * length + position).copied().unwrap_or(f64::NAN);
+				let first = (0..3.min(channels)).map(|channel| at(channel, 0)).collect::<Vec<_>>();
+				let last = (channels.saturating_sub(3)..channels).map(|channel| at(channel, positions - 1)).collect::<Vec<_>>();
+				let sum = (0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| at(channel, position)).sum::<f64>();
+				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
@@ -19718,7 +19745,7 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => Ok(self.memory),
+				Driver::Cpu => Ok(host_available_bytes().unwrap_or(self.memory)),
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
@@ -19769,6 +19796,13 @@ fn cpu_worker_threads() -> Result<u32> {
 }
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
+}
+/// The host's available memory in bytes, from /proc/meminfo where there is one.
+fn host_available_bytes() -> Option<u64> {
+	let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+	let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
+	let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+	Some(kib * 1024)
 }
 fn shared_cpu_device() -> Result<&'static Gpu> {
 	static CPU: OnceLock<Result<Gpu>> = OnceLock::new();
