@@ -3768,7 +3768,7 @@ impl NativeModelIr {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
-					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
+					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
@@ -4239,7 +4239,7 @@ impl NativeModelIr {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
 					let geometry = self.indexer_geometry(index)?;
-					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
+					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					ir.push_str(&format!("call void @{attention}{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
@@ -6645,11 +6645,15 @@ fn normalize_groups(node: &Node, rows: usize) -> Result<usize> {
 	}
 }
 
+/// Every arena slot is 8-aligned and every element sits at a multiple of its
+/// own width, so an access is aligned to its type. A half declared at align 1
+/// made NVPTX split it into two byte accesses, and the value came back with
+/// its low byte zero.
 fn alignment(ty: &str) -> usize {
 	match ty {
 		"double" => 8,
 		"float" | "i32" => 4,
-		"i16" => 2,
+		"half" | "bfloat" | "i16" => 2,
 		_ => 1,
 	}
 }
