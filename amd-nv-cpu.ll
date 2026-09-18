@@ -910,7 +910,9 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %jobs.numerator = sub i32 %jobs.adjusted, 1
 %jobs = udiv i32 %jobs.numerator, %waves
 %q4.selector = call i1 @recipe.model.q4k(i32 %decode)
-%int8.dots = call i1 @recipe.int8.dots()
+%int8.backend = call i1 @recipe.int8.dots()
+%int8.declared = call i1 @recipe.model.int.activations(i32 %decode)
+%int8.dots = and i1 %int8.backend, %int8.declared
 %q4.remainder = urem i32 %terms, 256
 %q4.aligned = icmp eq i32 %q4.remainder, 0
 %q4.available = and i1 %q4.selector, %q4.aligned
@@ -924,8 +926,9 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %b32.available = and i1 %b32.selector, %b32.aligned
 %q8.k = or i1 %q4.available, %q6.available
 %block.available = or i1 %q8.k, %b32.available
-; A backend with int8 dots takes the int8 activation path and its dot4
-; helpers; any other stages the activation column as it is and dots it exactly.
+; An int(n) sum on a backend with int8 dots rounds its activations to int8
+; codes for the dot4 helpers, as the block declared; every other sum stages
+; its activation column as it is and dots the stored codes exactly.
 %exact = xor i1 %int8.dots, true
 %q8.available = and i1 %block.available, %int8.dots
 %stage.available = and i1 %block.available, %exact

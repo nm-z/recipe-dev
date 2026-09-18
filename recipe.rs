@@ -5948,11 +5948,26 @@ impl NativeModelIr {
 			return false;
 		}
 		let tile_bytes = self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes();
-		if backend == Backend::Amd {
+		if backend == Backend::Amd && plan.node.int_bits != 0 {
 			precision.state_type == "float" && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
 		} else {
 			plan.node.input.channels.saturating_mul(precision.model.bytes()) <= tile_bytes
 		}
+	}
+
+	/// The sums whose activations are rounded to int codes before the dot: the
+	/// int(n) blocks, on the backend with int8 dots. Every other packed sum
+	/// stages its activations as they are.
+	fn emit_int_activation_support(&self, backend: Backend) -> String {
+		let mut arms = String::new();
+		if self.inference && backend == Backend::Amd {
+			for (index, plan) in self.plans.iter().enumerate() {
+				if plan.node.int_bits != 0 && self.block_dot_fits(backend, plan) {
+					arms.push_str(&format!("i32 {}, label %int.yes\n", index + 1));
+				}
+			}
+		}
+		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\n")
 	}
 
 	fn emit_q4k_support(&self, backend: Backend) -> String {
@@ -6296,6 +6311,7 @@ impl NativeModelIr {
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let source_decode = self.emit_source_decode(backend)?;
 		let q4k_support = self.emit_q4k_support(backend);
+		let int_activation_support = self.emit_int_activation_support(backend);
 		let q6k_support = self.emit_q6k_support(backend);
 		let block32_support = self.emit_block32_support(backend);
 		let model_load = self.emit_model_load(backend)?;
@@ -6305,6 +6321,7 @@ impl NativeModelIr {
 		ir.push_str(&weight_decode);
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
+		ir.push_str(&int_activation_support);
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
 		ir.push_str(&model_load);
@@ -15410,6 +15427,11 @@ struct Node {
 	block_kind: &'static str,
 	frozen: bool,
 	packed: bool,
+	/// The bits an int(n) block declared on this sum: its activations are
+	/// rounded to codes of that many bits with one step per 32 before the dot,
+	/// as the block asked. Zero for a sum that names no int, whose activations
+	/// enter the dot as they are.
+	int_bits: u8,
 	/// The arithmetic this node computes in.
 	precision: Compute,
 	/// The format an attention node keeps its key-value cache in; the node's
@@ -15820,6 +15842,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let node = &mut graph.nodes[index];
 		node.argument[8] = f64::from(kept.unwrap_or(storage).0);
 		node.packed = true;
+		node.int_bits = format.bits;
 		node.precision = Compute::FP32;
 		node.kv_precision = Compute::FP32;
 		if kept.is_none() {
@@ -15917,6 +15940,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
 		packed: false,
+		int_bits: 0,
 		precision,
 		kv_precision,
 	};
