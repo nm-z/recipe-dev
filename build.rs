@@ -133,16 +133,19 @@ define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_g
 // block's writes; the last arriver acquires them, republishes with a release fence, and
 // flips the phase; each waiter acquires after it observes the flip. The fences lower to
 // membar, which every NVIDIA architecture supports, so one barrier serves them all.
-// Every thread reads the phase before the block barrier and then spins on it itself:
-// a block barrier after a divergent leader spin would count the leader's warp as
-// arrived on the lanes that skipped the spin (bar.sync is per warp before sm_70) and
-// release the other warps before the grid had synced.
+// Every thread reads the phase before the block barrier; then one lane per warp spins
+// on it and the warp reconverges behind that lane (bar.warp.sync), so no bar.sync
+// follows a divergent spin (bar.sync is per warp before sm_70 and would count the
+// leader's warp as arrived on the lanes that skipped the spin) and only one lane in
+// thirty-two loads the phase while the grid drains.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
+declare void @llvm.nvvm.bar.warp.sync(i32)
 define internal void @grid_barrier(i32 %threads) #1 { entry:
 %phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
-call void @llvm.amdgcn.s.barrier() %lane = call i32 @llvm.amdgcn.workitem.id.x()
-%leader = icmp eq i32 %lane, 0 br i1 %leader, label %arrive, label %wait arrive:
+call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
+%lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
+%leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
 fence release
 %prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
@@ -150,9 +153,11 @@ fence release
 fence acquire
 store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
 fence release
-store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait wait:
+store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
+br i1 %spinner, label %wait, label %waited wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %waited, label %wait waited:
+call void @llvm.nvvm.bar.warp.sync(i32 -1)
 fence acquire ret void }"#;
 const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
