@@ -20048,8 +20048,20 @@ impl Gpu {
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
+					// HSA_AMD_AGENT_INFO_MEMORY_AVAIL counts what the runtime may still
+					// take, not what a compositor and other processes already hold: on
+					// the desktop card it said 11.8 GB free with 2.4 GB in use. The DRM
+					// counters of the same device (matched by its bus address,
+					// HSA_AMD_AGENT_INFO_BDFID) bound it.
 					let mut free = 0_u64;
 					self.status((driver.info)(driver.agent, 0xA015, (&mut free as *mut u64).cast()), "free memory")?;
+					let (mut bdf, mut domain) = (0_u32, 0_u32);
+					if (driver.info)(driver.agent, 0xA006, (&mut bdf as *mut u32).cast()) == 0
+						&& (driver.info)(driver.agent, 0xA00F, (&mut domain as *mut u32).cast()) == 0
+						&& let Some(drm_free) = amd_drm_free_bytes(domain, bdf)
+					{
+						free = free.min(drm_free);
+					}
 					Ok(free)
 				}
 				Driver::Remote(remote) => {
@@ -20092,6 +20104,30 @@ fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
 /// The host's available memory in bytes, from /proc/meminfo where there is one.
+/// The DRM counters of the AMD device at `domain`:`bdf` (bus << 8 |
+/// device << 3 | function, HSA_AMD_AGENT_INFO_BDFID and _DOMAIN): its VRAM
+/// total less the bytes every process holds, from /sys/class/drm/card*/device,
+/// or None when no card carries that address.
+#[cfg(amd)]
+fn amd_drm_free_bytes(domain: u32, bdf: u32) -> Option<u64> {
+	let address = format!("{domain:04x}:{:02x}:{:02x}.{}", (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 7);
+	for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+		if !name.starts_with("card") || name.contains('-') {
+			continue;
+		}
+		let device = entry.path().join("device");
+		let Ok(target) = fs::read_link(&device) else { continue };
+		if !target.file_name().is_some_and(|file| file.to_string_lossy() == address) {
+			continue;
+		}
+		let read = |file: &str| fs::read_to_string(device.join(file)).ok()?.trim().parse::<u64>().ok();
+		let (total, used) = (read("mem_info_vram_total")?, read("mem_info_vram_used")?);
+		return Some(total.saturating_sub(used));
+	}
+	None
+}
 fn host_available_bytes() -> Option<u64> {
 	let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
 	let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
