@@ -14542,7 +14542,11 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 	let per_position = top.saturating_sub(low) as f64 / (ceiling - half) as f64;
 	let fixed = low as f64 - per_position * half as f64;
 	let estimate = if per_position > 0.0 { ((free as f64 - fixed) / per_position).floor().max(1.0) as usize } else { half };
-	let mut length = (estimate / 64 * 64).clamp(1, ceiling);
+	// The largest power of two under the estimate, as the halving found: the
+	// arenas the estimate counts are not everything a run holds on the device
+	// (the load scratch, the driver's own buffers, a compositor's framebuffers),
+	// and a length that fills the card to its estimate starved the desktop.
+	let mut length = (1_usize << estimate.max(1).ilog2()).clamp(1, ceiling);
 	loop {
 		let bytes = bytes_at(length)?;
 		if bytes <= free {
