@@ -143,50 +143,104 @@ if ! remove_worker "$WORKER"; then
 	cleanup_status=1
 fi
 
+# The sweeps below act on other runs' leftovers and race other controllers
+# doing the same work (a reclaim in azure-run.sh, a neighbouring cleanup step),
+# so a resource that vanishes under them is not this run's failure. They
+# report through watchdog_status; only this run's own worker, blobs and
+# residual check decide the exit code.
+watchdog_status=0
+
+# A worker or blob belongs to a terminal run when GitHub reports the run
+# completed, or when it names an earlier attempt of a run whose latest attempt
+# is newer (a re-run starts only after the previous attempt finished, while
+# the run's status reports the latest attempt).
+declare -A run_state=()
+owner_is_terminal() {
+	local run="$1" attempt="$2" state status latest
+	if ! command -v gh >/dev/null || [ -z "${GH_TOKEN:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; then
+		return 1
+	fi
+	state="${run_state[$run]:-}"
+	if [ -n "$state" ]; then
+		latest="${state#* }"
+		# A newer attempt than the cached one started during this sweep.
+		if [ "$attempt" -gt "$latest" ]; then
+			state=""
+		fi
+	fi
+	if [ -z "$state" ]; then
+		if ! state="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq '.status + " " + (.run_attempt|tostring)' 2>/dev/null)"; then
+			return 1
+		fi
+		run_state[$run]="$state"
+	fi
+	status="${state% *}"
+	latest="${state#* }"
+	[ "$attempt" -lt "$latest" ] || [ "$status" = completed ]
+}
+
 echo "== expiry watchdog =="
 cutoff="$(date -u -d "${MAX_AGE_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
 echo "removing recipe-wgpu-* workers created before $cutoff"
 stale="$(az vm list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-')].name" -o tsv --only-show-errors)" || {
 	echo "could not list workers for the expiry watchdog" >&2
 	stale=""
-	cleanup_status=1
+	watchdog_status=1
 }
 for worker in $stale; do
+	if [ "$worker" = "$WORKER" ]; then
+		continue
+	fi
 	if ! created="$(az resource show --resource-group "$GROUP" --name "$worker" --resource-type Microsoft.Compute/virtualMachines --query "systemData.createdAt" -o tsv --only-show-errors)"; then
-		echo "could not read creation time for $worker" >&2
-		cleanup_status=1
+		echo "could not read creation time for $worker; another controller may have removed it" >&2
+		watchdog_status=1
 		continue
 	fi
 	if [ -n "$created" ] && [[ "$created" < "$cutoff" ]]; then
 		echo "watchdog removing stale worker $worker created $created"
 		if ! remove_worker "$worker"; then
-			cleanup_status=1
+			watchdog_status=1
 		fi
 	fi
 done
 
 echo "== orphan resource watchdog =="
+# Workers of several runs coexist, and az vm create makes the public IP, NSG
+# and NIC before the VM object exists. A resource without a VM is an orphan
+# only once its owning run attempt is terminal; a live run's half-built
+# worker is left alone.
 for kind in nic disk public-ip nsg; do
 	resources="$(list_resources "$kind" "recipe-wgpu-")" || {
 		echo "could not list runtime $kind resources" >&2
-		cleanup_status=1
+		watchdog_status=1
 		continue
 	}
 	while IFS= read -r resource; do
-		if [[ ! "$resource" =~ ^(recipe-wgpu-[0-9]+-[0-9]+) ]]; then
+		if [[ ! "$resource" =~ ^(recipe-wgpu-([0-9]+)-([0-9]+)) ]]; then
 			continue
 		fi
 		worker="${BASH_REMATCH[1]}"
-		if ! current="$(list_vm "$worker")"; then
-			echo "could not determine whether $resource is orphaned" >&2
-			cleanup_status=1
+		owner_run="${BASH_REMATCH[2]}"
+		owner_attempt="${BASH_REMATCH[3]}"
+		if [ "$worker" = "$WORKER" ]; then
 			continue
 		fi
-		if [ -z "$current" ]; then
-			echo "removing orphan $kind $resource"
-			if ! delete_resource "$kind" "$resource"; then
-				cleanup_status=1
-			fi
+		if ! current="$(list_vm "$worker")"; then
+			echo "could not determine whether $resource is orphaned" >&2
+			watchdog_status=1
+			continue
+		fi
+		if [ -n "$current" ]; then
+			continue
+		fi
+		if ! owner_is_terminal "$owner_run" "$owner_attempt"; then
+			echo "leaving $kind $resource to run $owner_run attempt $owner_attempt"
+			continue
+		fi
+		echo "removing orphan $kind $resource"
+		if ! delete_resource "$kind" "$resource"; then
+			echo "could not remove orphan $kind $resource; another controller may have removed it" >&2
+			watchdog_status=1
 		fi
 	done <<< "$resources"
 done
@@ -232,28 +286,29 @@ if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ] 
 		--query "[].name" -o tsv --only-show-errors)" || {
 		echo "could not list prior runtime transfer blobs" >&2
 		blobs=""
-		cleanup_status=1
+		watchdog_status=1
 	}
 	while IFS= read -r blob; do
 		if [[ ! "$blob" =~ ^runtime/windows/([0-9]+)-([0-9]+)/(snapshot\.tar\.gz|runtime-suite\.tar\.gz)$ ]]; then
 			continue
 		fi
 		prior_run="${BASH_REMATCH[1]}"
-		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
-			echo "could not confirm the owner of prior transfer $blob" >&2
-			cleanup_status=1
+		prior_attempt="${BASH_REMATCH[2]}"
+		if [ "$prior_run" = "$RUN" ] && [ "$prior_attempt" = "$ATTEMPT" ]; then
 			continue
 		fi
-		if [ "$prior_status" = "completed" ]; then
-			echo "deleting terminal-run transfer $blob"
-			if ! az storage blob delete \
-				--auth-mode login \
-				--account-name "$AZURE_STORAGE_ACCOUNT" \
-				--container-name "$AZURE_STORAGE_CONTAINER" \
-				--name "$blob" \
-				--only-show-errors -o none; then
-				cleanup_status=1
-			fi
+		if ! owner_is_terminal "$prior_run" "$prior_attempt"; then
+			continue
+		fi
+		echo "deleting terminal-run transfer $blob"
+		if ! az storage blob delete \
+			--auth-mode login \
+			--account-name "$AZURE_STORAGE_ACCOUNT" \
+			--container-name "$AZURE_STORAGE_CONTAINER" \
+			--name "$blob" \
+			--only-show-errors -o none; then
+			echo "could not delete $blob; another controller may have removed it" >&2
+			watchdog_status=1
 		fi
 	done <<< "$blobs"
 else
@@ -274,6 +329,9 @@ else
 	echo "no residual resources remain for $WORKER"
 fi
 
+if [ "$watchdog_status" -ne 0 ]; then
+	echo "the watchdog sweeps over other runs' leftovers did not fully complete; the next cleanup repeats them" >&2
+fi
 if [ "$cleanup_status" -ne 0 ]; then
 	echo "cleanup failed for $WORKER" >&2
 	exit 1

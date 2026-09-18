@@ -72,23 +72,28 @@ if [[ ! "$ADMISSION_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
 fi
 
 release_admission() {
+	local lease_id
 	if [ -n "$admission_renew_pid" ]; then
 		kill "$admission_renew_pid" 2>/dev/null || true
 		wait "$admission_renew_pid" 2>/dev/null || true
 		admission_renew_pid=""
 	fi
 	if [ -n "$admission_lease_id" ]; then
+		# Forget the id before the call: with the renewer gone the lease expires
+		# within ADMISSION_LEASE_SECONDS whether or not this release lands, and a
+		# second release with a stale id would only fail again.
+		lease_id="$admission_lease_id"
+		admission_lease_id=""
 		az storage blob lease release \
 			--auth-mode login \
 			--account-name "$AZURE_STORAGE_ACCOUNT" \
 			--container-name "$AZURE_STORAGE_CONTAINER" \
 			--blob-name "$ADMISSION_BLOB" \
-			--lease-id "$admission_lease_id" \
+			--lease-id "$lease_id" \
 			--only-show-errors -o none || {
 			echo "could not release the Azure GPU admission lease; it will expire automatically" >&2
 			return 1
 		}
-		admission_lease_id=""
 	fi
 }
 trap 'release_admission || true' EXIT
@@ -156,9 +161,12 @@ renew_admission() {
 	done
 }
 
+# Takes the shared lease, waiting until the run-wide admission deadline. The
+# caller may release and re-acquire it while it waits for cores, so the wait
+# budget is measured from the start of admission, not from this call.
 acquire_admission() {
 	local deadline now lease_error_file lease_error detail
-	deadline=$(( $(date +%s) + ADMISSION_WAIT_SECONDS ))
+	deadline=$(( admission_started + ADMISSION_WAIT_SECONDS ))
 	if ! ensure_admission_blob; then
 		cat > evidence/blocker.json <<JSON
 {
@@ -183,10 +191,7 @@ JSON
 			admission_renew_pid=""
 			renew_admission &
 			admission_renew_pid=$!
-			printf '{"worker":"%s","wait_seconds":%s,"lease_seconds":%s}\n' \
-				"$WORKER" "$(( $(date +%s) - admission_started ))" "$ADMISSION_LEASE_SECONDS" \
-				> evidence/azure-admission.json
-			cat evidence/azure-admission.json
+			echo "holding the admission lease after $(( $(date +%s) - admission_started ))s"
 			return 0
 		fi
 		lease_error="$(sed -n '1,8p' "$lease_error_file")"
@@ -222,66 +227,11 @@ JSON
 	done
 }
 
-echo "== acquiring the Windows GPU admission lease =="
-acquire_admission
-
-echo "== selecting available GPU capacity =="
+echo "== resolving GPU shapes offered to this subscription =="
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
-inventory="$(az vm list --show-details \
-	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
-	--only-show-errors -o json)"
-printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
-
-# A forced workflow cancellation can skip the always() cleanup step. Reclaim a
-# prior per-run worker only after GitHub confirms that its owning run completed.
-if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-	while IFS=$'\t' read -r prior_worker prior_group; do
-		if [[ ! "$prior_worker" =~ ^recipe-wgpu-([0-9]+)-([0-9]+)$ ]]; then
-			continue
-		fi
-		prior_run="${BASH_REMATCH[1]}"
-		prior_attempt="${BASH_REMATCH[2]}"
-		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
-			echo "could not confirm the owner of prior worker $prior_worker" >&2
-			continue
-		fi
-		if [ "$prior_status" = "completed" ]; then
-			echo "== reclaiming terminal-run worker $prior_worker =="
-			AZURE_RESOURCE_GROUP="$prior_group" \
-			RUN_ID="$prior_run" \
-			RUN_ATTEMPT="$prior_attempt" \
-				bash "$TRUSTED_RUNTIME/azure-cleanup.sh"
-		fi
-	done < <(jq -r --arg current "$WORKER" '.[] | select(.name != $current) | [.name, .resource_group] | @tsv' <<< "$inventory")
-fi
-
-# Refresh after reclamation, then fail closed if an earlier Recipe worker is
-# still present. The lease normally prevents this state; the inventory guard
-# also prevents overlap if a hard-canceled controller outlives its lease.
-inventory="$(az vm list --show-details \
-	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
-	--only-show-errors -o json)"
-active_workers="$(jq -r --arg current "$WORKER" '
-	.[]
-	| select(.name != $current)
-	| select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith("recipe-wgpu-")))
-	| select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")
-	| .name
-' <<< "$inventory")"
-if [ -n "$active_workers" ]; then
-	cat > evidence/blocker.json <<JSON
-{
-  "blocker": "azure-gpu-worker-active",
-  "detail": "A prior Recipe Windows GPU worker is still present: ${active_workers//$'\n'/, }.",
-  "resolution": "Wait for the owning run's cleanup to delete the worker, then retry. No second worker was provisioned."
-}
-JSON
-	cat evidence/blocker.json
-	exit 1
-fi
-
 # Fetch the subscription-aware SKU catalog once, then check quota only in
-# regions where Azure offers this exact shape to this subscription.
+# regions where Azure offers this exact shape to this subscription. This is
+# the slowest read (about a minute) and needs no lease.
 sku="$(az vm list-skus --resource-type virtualMachines --size "$SIZE" --all --query "[?name=='$SIZE']" -o json --only-show-errors)"
 mapfile -t supported_locations < <(
 	jq -r --arg size "$SIZE" '
@@ -318,6 +268,62 @@ else
 		fi
 	done
 fi
+declare -a quota_locations=()
+for location in "${candidate_locations[@]}"; do
+	if printf '%s\n' "${supported_locations[@]}" | grep -Fqx "$location"; then
+		quota_locations+=("$location")
+	fi
+done
+echo "candidate regions: ${quota_locations[*]}"
+
+# A forced workflow cancellation can skip the always() cleanup step, and a
+# leaked worker holds GPU quota. Reclaim a prior per-run worker only once its
+# owning run is terminal: GitHub reports the run completed, or the worker
+# belongs to an earlier attempt of this very run (a new attempt cannot start
+# before the previous one finished, while the run's status reports the latest
+# attempt). Workers of live runs are expected neighbours now that quota, not
+# a global slot, bounds admission. Reclamation is best effort: another
+# controller may be reclaiming the same worker, and the quota read decides
+# whether this run can proceed.
+reclaim_terminal_workers() {
+	local inventory prior_worker prior_group prior_run prior_attempt prior_status
+	if ! inventory="$(az vm list --show-details \
+		--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
+		--only-show-errors -o json)"; then
+		echo "could not list GPU workers; skipping reclamation" >&2
+		return 0
+	fi
+	printf '%s\n' "$inventory" > evidence/azure-gpu-inventory.json
+	while IFS=$'\t' read -r prior_worker prior_group; do
+		if [[ ! "$prior_worker" =~ ^recipe-wgpu-([0-9]+)-([0-9]+)$ ]]; then
+			continue
+		fi
+		prior_run="${BASH_REMATCH[1]}"
+		prior_attempt="${BASH_REMATCH[2]}"
+		if [ "$prior_run" = "$RUN_ID" ] && [ "$prior_attempt" -lt "$RUN_ATTEMPT" ]; then
+			prior_status=completed
+		elif command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+			if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+				echo "could not confirm the owner of prior worker $prior_worker" >&2
+				continue
+			fi
+		else
+			continue
+		fi
+		if [ "$prior_status" = "completed" ]; then
+			echo "== reclaiming terminal-run worker $prior_worker =="
+			AZURE_RESOURCE_GROUP="$prior_group" \
+			RUN_ID="$prior_run" \
+			RUN_ATTEMPT="$prior_attempt" \
+				bash "$TRUSTED_RUNTIME/azure-cleanup.sh" \
+				|| echo "reclamation of $prior_worker did not fully complete; another controller may have removed it" >&2
+		fi
+	done < <(jq -r --arg current "$WORKER" '.[] | select(.name != $current) | [.name, .resource_group] | @tsv' <<< "$inventory")
+}
+
+echo "== reclaiming workers whose runs already completed =="
+reclaim_terminal_workers
+cat evidence/azure-gpu-inventory.json
 
 read_quota() {
 	local location="$1"
@@ -343,46 +349,69 @@ read_quota() {
 		'{location:$location, family:$family, current:$current, limit:$limit, free:$free, regional_current:$regional_current, regional_limit:$regional_limit, regional_free:$regional_free}'
 }
 
-: > evidence/azure-capacity.jsonl
+# One pass over the candidate regions. Sets LOCATION to the first region with
+# an unused worker's worth of family and regional cores that has not refused
+# this run's allocation, GRANTED_LOCATIONS to every region whose quota could
+# ever hold one, and OPEN_LOCATIONS to the granted regions that have not
+# refused, so the caller can tell "busy" from "never granted" from "every
+# region is out of this shape".
 LOCATION=""
-for location in "${candidate_locations[@]}"; do
-	if ! printf '%s\n' "${supported_locations[@]}" | grep -Fqx "$location"; then
-		continue
+GRANTED_LOCATIONS=""
+OPEN_LOCATIONS=""
+USAGE_UNREAD=0
+declare -A refused_locations=()
+declare -A quota_refusals=()
+select_location() {
+	local location quota free regional_free limit regional_limit unread=0
+	LOCATION=""
+	GRANTED_LOCATIONS=""
+	OPEN_LOCATIONS=""
+	USAGE_UNREAD=0
+	: > evidence/azure-capacity.jsonl
+	for location in "${quota_locations[@]}"; do
+		if ! quota="$(read_quota "$location")"; then
+			echo "skipping $location because its compute usage endpoint is unavailable" >&2
+			unread=$((unread + 1))
+			continue
+		fi
+		printf '%s\n' "$quota" >> evidence/azure-capacity.jsonl
+		limit="$(jq -r '.limit' <<< "$quota")"
+		regional_limit="$(jq -r '.regional_limit' <<< "$quota")"
+		if [ "$limit" -lt "$REQUIRED_CORES" ] || [ "$regional_limit" -lt "$REQUIRED_CORES" ]; then
+			continue
+		fi
+		GRANTED_LOCATIONS="${GRANTED_LOCATIONS:+$GRANTED_LOCATIONS }$location"
+		if [ -n "${refused_locations[$location]:-}" ]; then
+			continue
+		fi
+		OPEN_LOCATIONS="${OPEN_LOCATIONS:+$OPEN_LOCATIONS }$location"
+		free="$(jq -r '.free' <<< "$quota")"
+		regional_free="$(jq -r '.regional_free' <<< "$quota")"
+		if [ "$free" -ge "$REQUIRED_CORES" ] && [ "$regional_free" -ge "$REQUIRED_CORES" ]; then
+			LOCATION="$location"
+			printf '%s\n' "$quota" > evidence/azure-quota.json
+			return 0
+		fi
+	done
+	# Nothing is free. Once every region has been read, later polls only need
+	# the regions that hold a grant.
+	USAGE_UNREAD=$unread
+	if [ -n "$GRANTED_LOCATIONS" ] && [ "$unread" -eq 0 ]; then
+		read -r -a quota_locations <<< "$GRANTED_LOCATIONS"
 	fi
-	if ! quota="$(read_quota "$location")"; then
-		echo "skipping $location because its compute usage endpoint is unavailable" >&2
-		continue
-	fi
-	printf '%s\n' "$quota" | tee -a evidence/azure-capacity.jsonl
-	free="$(jq -r '.free' <<< "$quota")"
-	regional_free="$(jq -r '.regional_free' <<< "$quota")"
-	if [ "$free" -ge "$REQUIRED_CORES" ] && [ "$regional_free" -ge "$REQUIRED_CORES" ]; then
-		LOCATION="$location"
-		printf '%s\n' "$quota" > evidence/azure-quota.json
-		break
-	fi
-done
-
-if [ -z "$LOCATION" ]; then
-	cat > evidence/blocker.json <<JSON
-{
-  "blocker": "azure-gpu-quota-unavailable",
-  "detail": "No subscription-supported region has $REQUIRED_CORES unused $FAMILY cores and regional cores for one $SIZE worker.",
-  "resolution": "Grant the GPU controller Microsoft.Quota/quotas/write and increase the family quota, or free an existing allocation listed in azure-gpu-inventory.json."
+	return 1
 }
-JSON
-	cat evidence/blocker.json
-	echo "recipe/windows-gpu is blocked: no unused GPU quota" >&2
-	exit 1
-fi
-echo "selected $LOCATION for $SIZE"
 
-echo "== resolving the Windows image =="
-az vm image show \
-	--location "$LOCATION" \
-	--urn "$IMAGE" \
-	--query '{urn:urn, id:id, architecture:architecture, hyperVGeneration:hyperVGeneration}' \
-	--only-show-errors -o json | tee evidence/azure-image.json
+# The persistent resource group keeps the region it was first created in; a
+# worker's own --location is what places it, so the group is created only
+# when absent and never moved.
+ensure_group() {
+	local exists
+	exists="$(az group exists --name "$GROUP" -o tsv --only-show-errors)"
+	if [ "$exists" != true ]; then
+		az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
+	fi
+}
 
 list_worker() {
 	az vm list \
@@ -406,6 +435,40 @@ wait_for_worker_absent() {
 	done
 	echo "worker $WORKER is still present after deletion" >&2
 	return 1
+}
+
+# Removes this run's worker and whatever az vm create left beside it (the
+# public IP, NSG and NIC are created before the VM object), so a refused
+# allocation can be retried under the same name.
+purge_worker() {
+	local status=0 kind resource resources current
+	if ! current="$(list_worker)"; then
+		echo "could not determine whether worker $WORKER exists" >&2
+		return 1
+	fi
+	if [ -n "$current" ]; then
+		az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true --only-show-errors || status=1
+	fi
+	wait_for_worker_absent || status=1
+	for kind in nic disk public-ip nsg; do
+		case "$kind" in
+			nic) resources="$(az network nic list --resource-group "$GROUP" --query "[?starts_with(name, '$WORKER')].name" -o tsv --only-show-errors)" ;;
+			disk) resources="$(az disk list --resource-group "$GROUP" --query "[?starts_with(name, '$WORKER')].name" -o tsv --only-show-errors)" ;;
+			public-ip) resources="$(az network public-ip list --resource-group "$GROUP" --query "[?starts_with(name, '$WORKER')].name" -o tsv --only-show-errors)" ;;
+			nsg) resources="$(az network nsg list --resource-group "$GROUP" --query "[?starts_with(name, '$WORKER')].name" -o tsv --only-show-errors)" ;;
+		esac || { status=1; continue; }
+		while IFS= read -r resource; do
+			[ -n "$resource" ] || continue
+			echo "removing $kind $resource left by the refused allocation"
+			case "$kind" in
+				nic) az network nic delete --resource-group "$GROUP" --name "$resource" --only-show-errors ;;
+				disk) az disk delete --resource-group "$GROUP" --name "$resource" --yes --only-show-errors ;;
+				public-ip) az network public-ip delete --resource-group "$GROUP" --name "$resource" --only-show-errors ;;
+				nsg) az network nsg delete --resource-group "$GROUP" --name "$resource" --only-show-errors ;;
+			esac || status=1
+		done <<< "$resources"
+	done
+	return "$status"
 }
 
 cleanup_on_exit() {
@@ -444,32 +507,140 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 
+# The shared lease covers only the quota read and the allocation, so two
+# controllers cannot both see the same free cores; it is released as soon as
+# this run's worker holds its own quota, and also while this run waits for
+# cores, so a waiting controller never blocks another one's allocation or
+# reclamation. Workers of other runs then execute side by side, bounded by
+# the family quota rather than by one global slot.
+write_blocker() {
+	local blocker="$1" detail="$2" resolution="$3"
+	jq -n --arg blocker "$blocker" --arg detail "$detail" --arg resolution "$resolution" \
+		'{blocker:$blocker, detail:$detail, resolution:$resolution}' > evidence/blocker.json
+	cat evidence/blocker.json
+}
+
+admission_deadline=$(( admission_started + ADMISSION_WAIT_SECONDS ))
+provision_error_file="evidence/azure-provision-error.log"
+: > "$provision_error_file"
+lease_wait_seconds=0
+allocation_attempts=0
 echo "== provisioning the isolated worker =="
-az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
-admin_password="Aa1!$(openssl rand -hex 18)"
-az vm create \
-	--resource-group "$GROUP" \
-	--name "$WORKER" \
-	--computer-name "$COMPUTER_NAME" \
-	--location "$LOCATION" \
-	--image "$IMAGE" \
-	--size "$SIZE" \
-	--security-type Standard \
-	--admin-username recipeci \
-	--admin-password "$admin_password" \
-	--public-ip-address "$WORKER-ip" \
-	--public-ip-address-allocation static \
-	--public-ip-sku Standard \
-	--nsg-rule NONE \
-	--os-disk-delete-option Delete \
-	--nic-delete-option Delete \
-	--tags \
-		"recipe-owner=recipe-runtime-ci" \
-		"recipe-worker=$WORKER" \
-		"recipe-run-id=$RUN_ID" \
-		"recipe-run-attempt=$RUN_ATTEMPT" \
-	--only-show-errors -o json > evidence/azure-vm.json
-unset admin_password
+while :; do
+	acquire_started="$(date +%s)"
+	echo "== acquiring the Windows GPU admission lease =="
+	acquire_admission
+	lease_wait_seconds=$(( lease_wait_seconds + $(date +%s) - acquire_started ))
+	if ! select_location; then
+		release_admission || true
+		if [ -z "$GRANTED_LOCATIONS" ] && [ "$USAGE_UNREAD" -eq 0 ]; then
+			write_blocker "azure-gpu-quota-unavailable" \
+				"No subscription-supported region grants $REQUIRED_CORES $FAMILY cores and regional cores for one $SIZE worker." \
+				"Grant the GPU controller Microsoft.Quota/quotas/write and increase the family quota, or free an existing allocation listed in azure-gpu-inventory.json."
+			echo "recipe/windows-gpu is blocked: no GPU quota is granted" >&2
+			exit 1
+		fi
+		if [ -n "$GRANTED_LOCATIONS" ] && [ -z "$OPEN_LOCATIONS" ]; then
+			write_blocker "azure-gpu-allocation-refused" \
+				"Every granted region ($GRANTED_LOCATIONS) refused the $SIZE allocation for capacity after $allocation_attempts attempts; the last refusal is in azure-provision-error.log." \
+				"Retry when a region has $SIZE capacity, or grant the family quota in another region."
+			exit 1
+		fi
+		if [ "$(date +%s)" -ge "$admission_deadline" ]; then
+			write_blocker "azure-gpu-quota-busy" \
+				"Every open region ($OPEN_LOCATIONS) had its $FAMILY cores in use by other Windows GPU workers for ${ADMISSION_WAIT_SECONDS} seconds." \
+				"Raise the $FAMILY quota so more workers fit, or retry after the active workers release their cores."
+			exit 1
+		fi
+		if [ -z "$GRANTED_LOCATIONS" ]; then
+			echo "no region's compute usage could be read ($USAGE_UNREAD unavailable); retrying"
+		else
+			echo "all granted GPU cores in ($OPEN_LOCATIONS) are in use; waiting for a worker to release them"
+		fi
+		sleep 15
+		# A worker whose run ended after the first pass may be holding the cores.
+		reclaim_terminal_workers
+		continue
+	fi
+	echo "selected $LOCATION for $SIZE"
+	echo "== resolving the Windows image in $LOCATION =="
+	az vm image show \
+		--location "$LOCATION" \
+		--urn "$IMAGE" \
+		--query '{urn:urn, id:id, architecture:architecture, hyperVGeneration:hyperVGeneration}' \
+		--only-show-errors -o json | tee evidence/azure-image.json
+	ensure_group
+	allocation_attempts=$((allocation_attempts + 1))
+	admin_password="Aa1!$(openssl rand -hex 18)"
+	if az vm create \
+		--resource-group "$GROUP" \
+		--name "$WORKER" \
+		--computer-name "$COMPUTER_NAME" \
+		--location "$LOCATION" \
+		--image "$IMAGE" \
+		--size "$SIZE" \
+		--security-type Standard \
+		--admin-username recipeci \
+		--admin-password "$admin_password" \
+		--public-ip-address "$WORKER-ip" \
+		--public-ip-address-allocation static \
+		--public-ip-sku Standard \
+		--nsg-rule NONE \
+		--os-disk-delete-option Delete \
+		--nic-delete-option Delete \
+		--tags \
+			"recipe-owner=recipe-runtime-ci" \
+			"recipe-worker=$WORKER" \
+			"recipe-run-id=$RUN_ID" \
+			"recipe-run-attempt=$RUN_ATTEMPT" \
+		--only-show-errors -o json > evidence/azure-vm.json 2>"$provision_error_file"; then
+		unset admin_password
+		break
+	fi
+	unset admin_password
+	cat "$provision_error_file" >&2
+	# A capacity refusal excludes the region for this run; a quota refusal
+	# means another controller's worker landed between the usage read and the
+	# allocation, so the same region is polled again. Compute also reports
+	# permanent refusals (image, security type, disallowed properties) as
+	# OperationNotAllowed, so only its quota wording is retried. Anything
+	# else is a real provisioning failure.
+	if grep --ignore-case --extended-regexp --quiet 'AllocationFailed|SkuNotAvailable|ZonalAllocationFailed|OverconstrainedAllocationRequest|Capacity Restrictions' "$provision_error_file"; then
+		refused_locations["$LOCATION"]=1
+		echo "$LOCATION is out of $SIZE capacity (attempt $allocation_attempts); purging the partial worker and excluding the region" >&2
+	elif grep --ignore-case --extended-regexp --quiet 'QuotaExceeded|OperationNotAllowed[^{}]*(quota|exceeding approved)' "$provision_error_file"; then
+		quota_refusals["$LOCATION"]=$(( ${quota_refusals[$LOCATION]:-0} + 1 ))
+		if [ "${quota_refusals[$LOCATION]}" -ge 3 ]; then
+			# The usage read keeps promising cores the allocation cannot get.
+			refused_locations["$LOCATION"]=1
+			echo "$LOCATION refused the allocation for quota ${quota_refusals[$LOCATION]} times although its usage showed free cores; excluding the region" >&2
+		else
+			echo "$LOCATION ran out of $FAMILY cores during the allocation (attempt $allocation_attempts); purging the partial worker" >&2
+		fi
+	else
+		release_admission || true
+		purge_worker || true
+		write_blocker "azure-gpu-provision-failed" \
+			"az vm create for $SIZE in $LOCATION failed for a reason other than capacity or quota: $(sed -n '1,12p' "$provision_error_file" | tr -s '[:space:]' ' ' | cut -c1-1500)" \
+			"Resolve the provisioning error in azure-provision-error.log before retrying the Windows GPU check."
+		exit 1
+	fi
+	purge_worker || true
+	release_admission || true
+	if [ "$(date +%s)" -ge "$admission_deadline" ]; then
+		write_blocker "azure-gpu-allocation-refused" \
+			"Azure refused the $SIZE allocation $allocation_attempts times for capacity or quota within ${ADMISSION_WAIT_SECONDS} seconds; the last refusal is in azure-provision-error.log." \
+			"Retry when a region has $SIZE capacity, or grant the family quota in another region."
+		exit 1
+	fi
+	# The usage counters trail the allocation that beat this one.
+	sleep 15
+done
+release_admission || true
+printf '{"worker":"%s","location":"%s","lease_wait_seconds":%s,"admission_seconds":%s,"allocation_attempts":%s,"lease_seconds":%s}\n' \
+	"$WORKER" "$LOCATION" "$lease_wait_seconds" "$(( $(date +%s) - admission_started ))" "$allocation_attempts" "$ADMISSION_LEASE_SECONDS" \
+	> evidence/azure-admission.json
+cat evidence/azure-admission.json
 echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with explicit outbound access and no inbound rule"
 
 echo "== transferring the immutable snapshot =="
