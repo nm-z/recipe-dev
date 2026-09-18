@@ -724,7 +724,7 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &
 	// With the state at the model type the widening accumulator folds away;
 	// an acc64 sibling keeps a double state over the same model type.
 	let state_align = if state == llvm { (bits / 8).to_string() } else { state_align(state) };
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align).replace("RECIPE_STATE", state);
+	kernel = kernel.replace("RECIPE_MODEL_BYTES", &(bits / 8).to_string()).replace("RECIPE_STATE_ALIGN", &state_align).replace("RECIPE_STATE", state);
 	if bits < 64 {
 		let literal = |value: f64| match llvm {
 			"half" => format!("0xH{:04X}", format.pack(value)),
@@ -766,6 +766,7 @@ fn custom_ir(ir: String, suffix: &str) -> BuildResult<String> {
 	// the model type and the widening accumulator folds away.
 	Ok(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..])
 		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
+		.replace("RECIPE_MODEL_BYTES", "8")
 		.replace("RECIPE_STATE_ALIGN", "8")
 		.replace("RECIPE_STATE", "double")
 		.replace("@RECIPE_NUMERIC@", &custom_numeric()))
@@ -793,7 +794,7 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", llvm)
 		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
 		.replace("align 8", &format!("align {bytes}"));
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
+	kernel = kernel.replace("RECIPE_MODEL_BYTES", &bytes.to_string()).replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &pack(value).to_string())
 	}
@@ -811,7 +812,7 @@ fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
 	let codec = if state == "double" { widen_codec(codec, "half") } else { codec.to_owned() };
 	let numeric = numeric_program("half", state, &codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", "align 2");
-	kernel = kernel.replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
+	kernel = kernel.replace("RECIPE_MODEL_BYTES", "2").replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &format!("0xH{:04X}", FloatFormat::FP16.pack(value)))
 	}

@@ -5995,7 +5995,8 @@ impl NativeModelIr {
 		if backend == Backend::Amd && plan.node.int_bits != 0 {
 			precision.state_type == "float" && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
 		} else {
-			plan.node.input.channels.saturating_mul(precision.model.bytes()) <= tile_bytes
+			// The column is staged in chunks of whole 256-value blocks.
+			256 * precision.model.bytes() <= tile_bytes
 		}
 	}
 
@@ -6012,6 +6013,13 @@ impl NativeModelIr {
 			}
 		}
 		format!("define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\n")
+	}
+
+	/// The bytes of the shared tile a workgroup owns: the schedule's values in
+	/// the widest element any node declares.
+	fn emit_tile_bytes(&self) -> String {
+		let bytes = self.schedule.shared_values as usize * widest_precision(&self.graph, self.precision.model).bytes();
+		format!("define internal i32 @recipe.tile.bytes() #1 {{\nentry:\nret i32 {bytes}\n}}\n")
 	}
 
 	fn emit_q4k_support(&self, backend: Backend) -> String {
@@ -6366,6 +6374,7 @@ impl NativeModelIr {
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
+		ir.push_str(&self.emit_tile_bytes());
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
 		ir.push_str(&model_load);
