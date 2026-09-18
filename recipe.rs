@@ -1776,7 +1776,7 @@ impl BackendTarget {
 		match self {
 			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
-			Self::Nvidia { .. } => "ptx",
+			Self::Nvidia { .. } => if native_nvidia_assembler().is_some() { "cubin" } else { "ptx" },
 		}
 	}
 
@@ -7187,6 +7187,11 @@ fn native_nvidia_compiler() -> Result<&'static str> {
 fn native_nvidia_codegen() -> Result<&'static str> {
 	option_env!("RECIPE_NV_CODEGEN").ok_or_else(|| RecipeError::new("NVIDIA native code generator is unavailable"))
 }
+/// The toolkit assembler that turns the PTX into the device object at
+/// compile time, so a run never waits on the driver to assemble it.
+fn native_nvidia_assembler() -> Option<&'static str> {
+	option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())
+}
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY")
@@ -7295,6 +7300,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				let generated = native_command(command, "NVIDIA PTX code generator", key);
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
 				generated?;
+			}
+			if let Some(assembler) = native_nvidia_assembler() {
+				let ptx = output.with_extension("ptx");
+				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
+				let mut command = Command::new(assembler);
+				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
+				let assembled = native_command(command, "NVIDIA PTX assembler", key);
+				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
+				assembled?;
+				return Ok(Vec::new());
 			}
 			fs::read(output)
 				.and_then(|mut image| {
