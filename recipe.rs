@@ -14489,24 +14489,41 @@ fn with_last_projection(model: &Model) -> Model {
 	}
 	model
 }
-/// The longest sequence the model fits on `device`, from `ceiling` down by
-/// halves: the weights, the input row, and the value and context arenas of
-/// one row's inference tape, against the device's free memory less its launch
-/// reserve.
+/// The longest sequence the model fits on `device`: the weights, the input
+/// row, and the value and context arenas of one row's inference tape, against
+/// the device's free memory less its launch reserve. Resident bytes grow
+/// linearly with the context, so the ceiling and its half give the slope, the
+/// longest fitting length follows from it, and that length is checked and
+/// stepped down while it is over.
 fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static Gpu, ceiling: usize) -> Result<usize> {
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let free = device.free_bytes()?.saturating_sub(reserve);
-	let mut length = ceiling.max(1);
-	loop {
+	let bytes_at = |length: usize| -> Result<u64> {
 		let samples = vec![0.0; length];
 		let graph = bound_graph_on(file, model, plan, &samples, 1, device)?;
 		let bytes = part_bytes(&graph, Config::load()?.precision)? as u64;
 		trace(&format!("context {length}: {bytes} bytes resident, {free} bytes free"))?;
+		Ok(bytes)
+	};
+	let ceiling = ceiling.max(1);
+	let top = bytes_at(ceiling)?;
+	if top <= free {
+		return Ok(ceiling);
+	}
+	require(ceiling > 1, format!("device {} cannot hold one position: {top} bytes required, {free} bytes free", device.name))?;
+	let half = ceiling / 2;
+	let low = bytes_at(half)?;
+	let per_position = top.saturating_sub(low) as f64 / (ceiling - half) as f64;
+	let fixed = low as f64 - per_position * half as f64;
+	let estimate = if per_position > 0.0 { ((free as f64 - fixed) / per_position).floor().max(1.0) as usize } else { half };
+	let mut length = (estimate / 64 * 64).clamp(1, ceiling);
+	loop {
+		let bytes = bytes_at(length)?;
 		if bytes <= free {
 			return Ok(length);
 		}
 		require(length > 1, format!("device {} cannot hold one position: {bytes} bytes required, {free} bytes free", device.name))?;
-		length /= 2;
+		length = (length - (length / 16).max(1)).max(1);
 	}
 }
 /// The plan that binds a composed model to a GGUF file by the standard tensor
