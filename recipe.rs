@@ -17788,6 +17788,8 @@ impl NativeTape {
 		let single = matches!(mode, ForwardMode::Inference) && end - begin == 1;
 		#[cfg(amd)]
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
+		#[cfg(nvidia)]
+		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
