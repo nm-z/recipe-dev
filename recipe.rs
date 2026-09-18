@@ -3286,6 +3286,9 @@ mod quantized {
 		pub(super) ir: String,
 		pub(super) backend: Backend,
 		pub(super) precision: NativePrecision,
+		/// The variant suffix of the block the decoder serves: its state helpers
+		/// are the ones linked under that suffix, in that state type.
+		pub(super) suffix: String,
 		pub(super) next: usize,
 	}
 
@@ -3353,20 +3356,20 @@ mod quantized {
 			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load half, {pointer} {address}, align 2"));
-			self.instruction(format!("call {state} @recipe.state.from.f16(half {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {loaded})", self.suffix))
 		}
 		fn float(&mut self, offset: Self::Int) -> Self::Value {
 			let pointer = pointer_type(self.backend);
 			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
-			self.instruction(format!("call {state} @recipe.state.from.f32(float {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {loaded})", self.suffix))
 		}
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
 			let state = self.precision.state_type;
 			let bits = self.instruction(format!("trunc i64 {bits} to i16"));
 			let half = self.instruction(format!("bitcast i16 {bits} to half"));
-			self.instruction(format!("call {state} @recipe.state.from.f16(half {half})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {half})", self.suffix))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
 			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
@@ -3393,7 +3396,7 @@ mod quantized {
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
 			let ty = self.precision.state_type;
 			let value = self.instruction(format!("trunc i64 {value} to i32"));
-			self.instruction(format!("call {ty} @recipe.state.from.{}32(i32 {value})", if signed { "s" } else { "u" }))
+			self.instruction(format!("call {ty} @recipe.state.from.{}32{}(i32 {value})", if signed { "s" } else { "u" }, self.suffix))
 		}
 		fn literal(&self, value: f64) -> Self::Value {
 			native_literal(self.precision.state, self.precision.state_type, value)
@@ -3405,7 +3408,7 @@ mod quantized {
 				QuantValueOp::Subtract => "sub",
 				QuantValueOp::Multiply => "mul",
 			};
-			self.instruction(format!("call {ty} @recipe.state.{operation}({ty} {left}, {ty} {right})"))
+			self.instruction(format!("call {ty} @recipe.state.{operation}{}({ty} {left}, {ty} {right})", self.suffix))
 		}
 		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -3414,7 +3417,7 @@ mod quantized {
 		}
 		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
-			let negative = self.instruction(format!("call {ty} @recipe.state.neg({ty} {magnitude})"));
+			let negative = self.instruction(format!("call {ty} @recipe.state.neg{}({ty} {magnitude})", self.suffix));
 			let sign = self.instruction(format!("icmp ne i64 {sign}, 0"));
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
@@ -5858,7 +5861,7 @@ impl NativeModelIr {
 
 	fn emit_native_quantization(&self, backend: Backend, format: &'static Quantization, native: NativeDequant, precision: NativePrecision, suffix: &str) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), precision.model_type);
-		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, next: 0 };
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		require(!matches!(native, NativeDequant::Nf4), "NF4 native dequantization requires its model codebook")?;
 		let result = native.decode(&mut operations);
 		let result = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({} {result})", precision.state_type));
@@ -5880,7 +5883,7 @@ impl NativeModelIr {
 		let name = format!("q4_nf_n{index}");
 		let table_name = format!("{name}_table");
 		let scales_name = format!("{name}_scales");
-		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, next: 0 };
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		let result = dequant_nf4(&mut operations, block, &table_name, table, &scales_name, scales);
 		let result = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({} {result})", precision.state_type));
 		Ok(format!(
@@ -17630,7 +17633,8 @@ impl NativeTape {
 					// The host reference is the file's own bytes: the requantize source when there is one.
 					let reference = graph.requantize.get(*node).and_then(Option::as_ref).unwrap_or(weight);
 					let host = reference.segments.first().and_then(|(span, _)| span.spec().map(|first| (span, first))).map(|(span, first)| stored_first_values(reference, *span, first.stride, first.block)).transpose()?.unwrap_or_default();
-					trace(&format!("load node {node} {} wrote {written:?} host {host:?}", quantization(weight.format.0)))?;
+					let raw = weights.download_range::<u8>(offsets[*node], 16)?;
+					trace(&format!("load node {node} {} wrote {written:?} host {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
 		} else {
