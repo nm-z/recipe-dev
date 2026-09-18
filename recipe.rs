@@ -5932,19 +5932,30 @@ impl NativeModelIr {
 		Ok(emitted)
 	}
 
+	/// Whether the wave body may dot a packed contraction's blocks against a
+	/// column staged in the tile: on the int8 backend the Q8 scratch (36 bytes per
+	/// 32 values, float state only) must fit the tile; elsewhere the column itself,
+	/// in the model type, must.
+	fn block_dot_fits(&self, backend: Backend, plan: &NodePlan) -> bool {
+		let precision = self.node_precision(&plan.node);
+		if precision.model.bytes() < 2 || !plan.packed || plan.node.op != Primitive::Contraction {
+			return false;
+		}
+		let tile_bytes = self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes();
+		if backend == Backend::Amd {
+			precision.state_type == "float" && plan.node.input.channels.div_ceil(32).saturating_mul(36) <= tile_bytes
+		} else {
+			plan.node.input.channels.saturating_mul(precision.model.bytes()) <= tile_bytes
+		}
+	}
+
 	fn emit_q4k_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let q4k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
+				let q4k = self.block_dot_fits(backend, plan) && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
-						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
+					segments.len() == 1 && segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
 				});
 				if q4k {
 					arms.push_str(&format!("i32 {}, label %q4k.yes\n", index + 1));
@@ -5956,17 +5967,11 @@ impl NativeModelIr {
 
 	fn emit_q6k_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let q6k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
+				let q6k = self.block_dot_fits(backend, plan) && plan.stored.as_ref().is_some_and(|stored| {
 					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
-						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
+					segments.len() == 1 && segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
 				});
 				if q6k {
 					arms.push_str(&format!("i32 {}, label %q6k.yes\n", index + 1));
@@ -5981,16 +5986,11 @@ impl NativeModelIr {
 	/// Every other packed format takes the per-value decoder.
 	fn emit_block32_support(&self, backend: Backend) -> String {
 		let (mut kinds, mut strides) = (String::new(), String::new());
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed && plan.node.op == Primitive::Contraction) else { continue };
+				let Some(stored) = plan.stored.as_ref().filter(|_| self.block_dot_fits(backend, plan)) else { continue };
 				let segments = stored.format_segments();
-				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes() {
+				if segments.len() != 1 {
 					continue;
 				}
 				let Some(spec) = segments[0].0.spec() else { continue };
