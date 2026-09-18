@@ -153,3 +153,7 @@ norm-acc = "fp64"
 step = 256
 # llama.cpp chains each rope angle by fp32 products and rotates with fmas.
 rope-angle = "chain"
+# llama.cpp's CPU attention: one query at a time over the keys in order.
+attn-softmax = "online"
+# llama.cpp's exp, tanh and log are the CPU's libm.
+math = "libm"

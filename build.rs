@@ -192,14 +192,14 @@ define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { en
 /// evaluations everywhere else.
 fn rope_math_helpers(state: &str, libm: bool) -> String {
 	if !libm {
-		return format!("define internal {state} @recipe.rope.cos({state} %value) #1 {{ entry: %result = call {state} @recipe.state.cos({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.sin({state} %value) #1 {{ entry: %result = call {state} @recipe.state.sin({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.pow({state} %base, {state} %exponent) #1 {{ entry: %log = call {state} @recipe.state.log({state} %base) %scaled = call {state} @recipe.state.mul({state} %log, {state} %exponent) %result = call {state} @recipe.state.exp({state} %scaled) ret {state} %result }}\n");
+		return format!("define internal {state} @recipe.libm.cos({state} %value) #1 {{ entry: %result = call {state} @recipe.state.cos({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.sin({state} %value) #1 {{ entry: %result = call {state} @recipe.state.sin({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.exp({state} %value) #1 {{ entry: %result = call {state} @recipe.state.exp({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.tanh({state} %value) #1 {{ entry: %result = call {state} @recipe.state.tanh({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.log({state} %value) #1 {{ entry: %result = call {state} @recipe.state.log({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %log = call {state} @recipe.state.log({state} %base) %scaled = call {state} @recipe.state.mul({state} %log, {state} %exponent) %result = call {state} @recipe.state.exp({state} %scaled) ret {state} %result }}\n");
 	}
-	let intrinsic = match state {
-		"float" => "f32",
-		"double" => "f64",
+	let (intrinsic, tanh_suffix) = match state {
+		"float" => ("f32", "f"),
+		"double" => ("f64", ""),
 		_ => return rope_math_helpers(state, false),
 	};
-	format!("declare {state} @llvm.cos.{intrinsic}({state})\ndeclare {state} @llvm.sin.{intrinsic}({state})\ndeclare {state} @llvm.pow.{intrinsic}({state}, {state})\ndefine internal {state} @recipe.rope.cos({state} %value) #1 {{ entry: %result = call {state} @llvm.cos.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.sin({state} %value) #1 {{ entry: %result = call {state} @llvm.sin.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.rope.pow({state} %base, {state} %exponent) #1 {{ entry: %result = call {state} @llvm.pow.{intrinsic}({state} %base, {state} %exponent) ret {state} %result }}\n")
+	format!("declare {state} @llvm.cos.{intrinsic}({state})\ndeclare {state} @llvm.sin.{intrinsic}({state})\ndeclare {state} @llvm.exp.{intrinsic}({state})\ndeclare {state} @llvm.log.{intrinsic}({state})\ndeclare {state} @tanh{tanh_suffix}({state})\ndeclare {state} @llvm.pow.{intrinsic}({state}, {state})\ndefine internal {state} @recipe.libm.exp({state} %value) #1 {{ entry: %result = call {state} @llvm.exp.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.log({state} %value) #1 {{ entry: %result = call {state} @llvm.log.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.tanh({state} %value) #1 {{ entry: %result = call {state} @tanh{tanh_suffix}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.cos({state} %value) #1 {{ entry: %result = call {state} @llvm.cos.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.sin({state} %value) #1 {{ entry: %result = call {state} @llvm.sin.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %result = call {state} @llvm.pow.{intrinsic}({state} %base, {state} %exponent) ret {state} %result }}\n")
 }
 fn cpu_int8_helpers(state: &str) -> String {
 	format!(
@@ -1103,7 +1103,7 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String 
 	};
 	// The cache in the model's own type: the bytes pass through untouched.
 	if kv == model {
-		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
+		return format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\nret {kv} %value\n}}\ndefine internal {model} @recipe.kv.decode({kv} %value) #1 {{\nentry:\nret {model} %value\n}}\ndefine internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}ret float %result\n}}\ndefine internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}%result = call {model} @recipe.encode({arithmetic} %state)\nret {kv} %result\n}}\ndefine internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n%result = call {arithmetic} @recipe.decode({model} %value)\nret {arithmetic} %result\n}}\ndefine internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n%result = call {model} @recipe.encode({arithmetic} %value)\nret {kv} %result\n}}\n", narrow("result", "state"), widen("state", "wide"));
 	}
 	let mut ir = String::new();
 	ir.push_str(&format!("define internal {kv} @recipe.kv.encode({model} %value) #1 {{\nentry:\n%state = call {arithmetic} @recipe.decode({model} %value)\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "state"), from_float("result", "narrowed")));
@@ -1111,6 +1111,7 @@ fn kv_codec(model: &str, arithmetic: &str, kv: &str, kv_bytes: usize) -> String 
 	ir.push_str(&format!("define internal float @recipe.kv.to.f32({kv} %value) #1 {{\nentry:\n{}ret float %result\n}}\n", to_float("result", "value")));
 	ir.push_str(&format!("define internal {kv} @recipe.kv.from.f16(half %value) #1 {{\nentry:\n%wide = fpext half %value to float\n{}ret {kv} %result\n}}\n", from_float("result", "wide")));
 	ir.push_str(&format!("define internal {arithmetic} @recipe.kv.to.state({kv} %value) #1 {{\nentry:\n{}{}ret {arithmetic} %result\n}}\n", to_float("wide", "value"), widen("result", "wide")));
+	ir.push_str(&format!("define internal {kv} @recipe.kv.from.state({arithmetic} %value) #1 {{\nentry:\n{}{}ret {kv} %result\n}}\n", narrow("narrowed", "value"), from_float("result", "narrowed")));
 	let _ = kv_bytes;
 	ir
 }

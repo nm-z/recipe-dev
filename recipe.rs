@@ -31,6 +31,9 @@ mod program_ir {
 		Greater = 13,
 		StraightThrough = 14,
 		Select = 15,
+		/// The exact product of the Multiply at `left` plus `right`, in one
+		/// rounding: fma(multiply.left, multiply.right, right).
+		FusedAdd = 16,
 	}
 
 	impl ScalarOpcode {
@@ -51,6 +54,7 @@ mod program_ir {
 				13 => Ok(Self::Greater),
 				14 => Ok(Self::StraightThrough),
 				15 => Ok(Self::Select),
+				16 => Ok(Self::FusedAdd),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -126,7 +130,14 @@ mod program_ir {
 
 	#[derive(Clone, Copy)]
 	pub struct ScalarContext<'a> {
+		/// The node's model type: what its operands and result are stored as.
 		pub value_type: &'a str,
+		/// The node's state type: what the program computes in. Operands decode
+		/// once on entry and the result encodes once on exit.
+		pub state_type: &'a str,
+		/// Whether the transcendental steps take the platform libm on the CPU
+		/// (`recipe.libm.*`) instead of the portable evaluations.
+		pub libm: bool,
 		/// The template variant suffix of the node's arithmetic.
 		pub suffix: &'a str,
 		pub pointer_type: &'a str,
@@ -175,6 +186,42 @@ mod program_ir {
 		name.to_owned()
 	}
 
+	/// The same two in the state family, for the scalar programs.
+	fn state_binary(code: &mut String, state_type: &str, suffix: &str, name: &str, operation: &str, left: &str, right: &str) -> String {
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.{operation}{suffix}({state_type} {left}, {state_type} {right})");
+		name.to_owned()
+	}
+
+	fn state_predicate(code: &mut String, state_type: &str, suffix: &str, name: &str, operation: &str, left: &str, right: &str) -> String {
+		let _ = writeln!(code, "{name}.condition = call i1 @recipe.state.{operation}{suffix}({state_type} {left}, {state_type} {right})");
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.from.u1{suffix}(i1 {name}.condition)");
+		name.to_owned()
+	}
+
+	/// The names the scalar programs give the decoded operands.
+	fn scalar_entries(prefix: &str) -> (String, String) {
+		(format!("%{prefix}.first.state"), format!("%{prefix}.second.state"))
+	}
+
+	/// Decode the two model-typed operands into the state once, at the top of a
+	/// scalar program; the reverse pass reuses these names.
+	fn scalar_prologue(code: &mut String, context: &ScalarContext<'_>) -> (String, String) {
+		let (first, second) = scalar_entries(context.prefix);
+		let _ = writeln!(code, "{first} = call {state} @recipe.state.from.model{suffix}({ty} {source})", state = context.state_type, suffix = context.suffix, ty = context.value_type, source = context.first);
+		if context.second == context.first {
+			let _ = writeln!(code, "{second} = call {state} @recipe.state.add{suffix}({state} {first}, {state} {zero})", state = context.state_type, suffix = context.suffix, zero = (context.literal)(0.0, context.state_type));
+		} else {
+			let _ = writeln!(code, "{second} = call {state} @recipe.state.from.model{suffix}({ty} {source})", state = context.state_type, suffix = context.suffix, ty = context.value_type, source = context.second);
+		}
+		(first, second)
+	}
+
+	/// A transcendental step's helper family: the platform libm when asked for
+	/// and the step has one, else the portable state evaluation.
+	fn scalar_math(libm: bool, operation: &str) -> &'static str {
+		if libm && matches!(operation, "exp" | "log" | "sin" | "cos" | "tanh") { "recipe.libm" } else { "recipe.state" }
+	}
+
 	fn parse_scalar(code: &[f64]) -> Result<Vec<ScalarInstruction>, EmitError> {
 		if code.len() % 3 != 0 {
 			return Err(EmitError::WrongWidth { kind: "scalar", width: code.len() });
@@ -199,13 +246,15 @@ mod program_ir {
 	/// forward path, matching the real block's inference semantics.
 	pub fn emit_scalar_forward(code: &[f64], context: ScalarContext<'_>) -> Result<ScalarForward, EmitError> {
 		let suffix = context.suffix;
+		let ty = context.state_type;
 		let instructions = parse_scalar(code)?;
 		let mut output = String::new();
+		let (first, second) = scalar_prologue(&mut output, &context);
 		let mut values = Vec::with_capacity(instructions.len());
 		for (index, instruction) in instructions.iter().enumerate() {
 			let name = format!("%{}.scalar.{index}", context.prefix);
 			let value = match instruction.opcode {
-				ScalarOpcode::Constant => (context.literal)(instruction.left, context.value_type),
+				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
 				ScalarOpcode::Parameter => {
 					let parameter = integer(instruction.left, "scalar parameter")?;
 					if parameter < 0 {
@@ -215,16 +264,16 @@ mod program_ir {
 						let pointer = format!("{name}.ptr");
 						let _ = writeln!(
 							output,
-							"{pointer} = getelementptr inbounds {ty}, {ptrty} {weights}, i64 {parameter}",
-							ty = context.value_type,
+							"{pointer} = getelementptr inbounds {model}, {ptrty} {weights}, i64 {parameter}",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							weights = context.weights,
 							parameter = parameter
 						);
 						let _ = writeln!(
 							output,
-							"{name} = load {ty}, {ptrty} {pointer}, align {align}",
-							ty = context.value_type,
+							"{name}.model = load {model}, {ptrty} {pointer}, align {align}",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							pointer = pointer,
 							align = context.alignment
@@ -232,39 +281,48 @@ mod program_ir {
 					} else {
 						let _ = writeln!(
 							output,
-							"{name} = call {ty} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {parameter}, i32 {decode})",
-							ty = context.value_type,
+							"{name}.model = call {model} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {parameter}, i32 {decode})",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							weights = context.weights,
 							parameter = parameter,
 							decode = context.decode
 						);
 					}
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
 					name
 				}
-				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &first, &second)?,
 				ScalarOpcode::Select => {
-					let condition = scalar_operand(instruction.left, &values, context.first, context.second)?;
-					let value = scalar_operand(instruction.right, &values, context.first, context.second)?;
-					let zero = (context.literal)(0.0, context.value_type);
-					let _ = writeln!(output, "{name}.condition = call i1 @recipe.ogt{suffix}({ty} {condition}, {ty} {zero})", ty = context.value_type);
-					let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}", ty = context.value_type);
+					let condition = scalar_operand(instruction.left, &values, &first, &second)?;
+					let value = scalar_operand(instruction.right, &values, &first, &second)?;
+					let zero = (context.literal)(0.0, ty);
+					let _ = writeln!(output, "{name}.condition = call i1 @recipe.state.ogt{suffix}({ty} {condition}, {ty} {zero})");
+					let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}");
+					name
+				}
+				ScalarOpcode::FusedAdd => {
+					let product = fused_product(&instructions, instruction.left)?;
+					let left = scalar_operand(product.left, &values, &first, &second)?;
+					let right = scalar_operand(product.right, &values, &first, &second)?;
+					let addend = scalar_operand(instruction.right, &values, &first, &second)?;
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.madd{suffix}({ty} {addend}, {ty} {left}, {ty} {right})");
 					name
 				}
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater => {
-					let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
-					let right = scalar_operand(instruction.right, &values, context.first, context.second)?;
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
+					let right = scalar_operand(instruction.right, &values, &first, &second)?;
 					match instruction.opcode {
-						ScalarOpcode::Add => binary(&mut output, context.value_type, context.suffix, &name, "add", &left, &right),
-						ScalarOpcode::Subtract => binary(&mut output, context.value_type, context.suffix, &name, "sub", &left, &right),
-						ScalarOpcode::Multiply => binary(&mut output, context.value_type, context.suffix, &name, "mul", &left, &right),
-						ScalarOpcode::Divide => binary(&mut output, context.value_type, context.suffix, &name, "div", &left, &right),
-						ScalarOpcode::Greater => predicate(&mut output, context.value_type, context.suffix, &name, "ogt", &left, &right),
+						ScalarOpcode::Add => state_binary(&mut output, ty, suffix, &name, "add", &left, &right),
+						ScalarOpcode::Subtract => state_binary(&mut output, ty, suffix, &name, "sub", &left, &right),
+						ScalarOpcode::Multiply => state_binary(&mut output, ty, suffix, &name, "mul", &left, &right),
+						ScalarOpcode::Divide => state_binary(&mut output, ty, suffix, &name, "div", &left, &right),
+						ScalarOpcode::Greater => state_predicate(&mut output, ty, suffix, &name, "ogt", &left, &right),
 						_ => unreachable!(),
 					}
 				}
 				ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => {
-					let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
 					let operation = match instruction.opcode {
 						ScalarOpcode::Absolute => "abs",
 						ScalarOpcode::Exp => "exp",
@@ -274,26 +332,39 @@ mod program_ir {
 						ScalarOpcode::Tanh => "tanh",
 						_ => unreachable!(),
 					};
-					let _ = writeln!(output, "{name} = call {ty} @recipe.{operation}{suffix}({ty} {left})", ty = context.value_type);
+					let _ = writeln!(output, "{name} = call {ty} @{family}.{operation}{suffix}({ty} {left})", family = scalar_math(context.libm, operation));
 					name
 				}
 			};
 			values.push(value);
 		}
-		let value = values.last().cloned().ok_or(EmitError::WrongWidth { kind: "scalar", width: 0 })?;
+		let last = values.last().cloned().ok_or(EmitError::WrongWidth { kind: "scalar", width: 0 })?;
+		let value = format!("%{}.scalar.result", context.prefix);
+		let _ = writeln!(output, "{value} = call {model} @recipe.model.from.state{suffix}({ty} {last})", model = context.value_type);
 		Ok(ScalarForward { code: output, value })
 	}
 
-	fn add_adjoint(code: &mut String, value_type: &str, suffix: &str, prefix: &str, old: &mut String, contribution: &str, sequence: &mut usize) {
-		let name = format!("%{prefix}.adjoint.{}", *sequence);
-		*sequence += 1;
-		*old = binary(code, value_type, suffix, &name, "add", old, contribution);
+	/// The Multiply a FusedAdd names: the instruction at `reference`, which must
+	/// be a Multiply that comes before it.
+	fn fused_product(instructions: &[ScalarInstruction], reference: f64) -> Result<&ScalarInstruction, EmitError> {
+		let index = integer(reference, "fused product")?;
+		let product = usize::try_from(index).ok().and_then(|index| instructions.get(index)).ok_or(EmitError::InvalidReference { kind: "fused product", index })?;
+		if product.opcode != ScalarOpcode::Multiply {
+			return Err(EmitError::InvalidReference { kind: "fused product", index });
+		}
+		Ok(product)
 	}
 
-	fn negate(code: &mut String, value_type: &str, suffix: &str, prefix: &str, value: &str, sequence: &mut usize) -> String {
+	fn add_adjoint(code: &mut String, state_type: &str, suffix: &str, prefix: &str, old: &mut String, contribution: &str, sequence: &mut usize) {
+		let name = format!("%{prefix}.adjoint.{}", *sequence);
+		*sequence += 1;
+		*old = state_binary(code, state_type, suffix, &name, "add", old, contribution);
+	}
+
+	fn negate(code: &mut String, state_type: &str, suffix: &str, prefix: &str, value: &str, sequence: &mut usize) -> String {
 		let name = format!("%{prefix}.neg.{}", *sequence);
 		*sequence += 1;
-		let _ = writeln!(code, "{name} = call {value_type} @recipe.neg{suffix}({value_type} {value})");
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.neg{suffix}({state_type} {value})");
 		name
 	}
 
@@ -303,13 +374,18 @@ mod program_ir {
 	/// these expressions at the node's fixed element/parameter offsets.
 	pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &str) -> Result<ScalarReverse, EmitError> {
 		let suffix = context.suffix;
+		let ty = context.state_type;
 		let instructions = parse_scalar(code)?;
 		let mut output = String::new();
+		let (entry_first, entry_second) = scalar_entries(context.prefix);
+		let incoming_state = format!("%{}.incoming.state", context.prefix);
+		let _ = writeln!(output, "{incoming_state} = call {ty} @recipe.state.from.model{suffix}({model} {incoming})", model = ty);
+		let incoming = incoming_state.as_str();
 		let mut values = Vec::with_capacity(instructions.len());
 		let mut parameter_for = vec![None; instructions.len()];
 		for (index, instruction) in instructions.iter().enumerate() {
 			let value = match instruction.opcode {
-				ScalarOpcode::Constant => (context.literal)(instruction.left, context.value_type),
+				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
 				ScalarOpcode::Parameter => {
 					let parameter = integer(instruction.left, "scalar parameter")?;
 					if parameter < 0 {
@@ -318,7 +394,7 @@ mod program_ir {
 					parameter_for[index] = Some(parameter as usize);
 					format!("%{}.scalar.{index}", context.prefix)
 				}
-				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &entry_first, &entry_second)?,
 				ScalarOpcode::Add
 				| ScalarOpcode::Subtract
 				| ScalarOpcode::Multiply
@@ -330,28 +406,30 @@ mod program_ir {
 				| ScalarOpcode::Log
 				| ScalarOpcode::Sin
 				| ScalarOpcode::Cos
-				| ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
+				| ScalarOpcode::Tanh
+				| ScalarOpcode::FusedAdd => format!("%{}.scalar.{index}", context.prefix),
 			};
 			values.push(value);
 		}
-		let mut adjoints = vec![(context.literal)(0.0, context.value_type); instructions.len()];
-		let mut first = (context.literal)(0.0, context.value_type);
-		let mut second = (context.literal)(0.0, context.value_type);
+		let state_zero = (context.literal)(0.0, ty);
+		let mut adjoints = vec![state_zero.clone(); instructions.len()];
+		let mut first = state_zero.clone();
+		let mut second = state_zero.clone();
 		let mut parameters = BTreeMap::new();
 		let mut sequence = 0;
 		if let Some(last) = adjoints.last_mut() {
 			*last = incoming.to_owned();
 		}
-		let operand = |value: f64, values: &[String]| scalar_operand(value, values, context.first, context.second);
+		let operand = |value: f64, values: &[String]| scalar_operand(value, values, &entry_first, &entry_second);
 		let add_operand = |code: &mut String, value: f64, contribution: &str, adjoints: &mut [String], first: &mut String, second: &mut String, sequence: &mut usize| -> Result<(), EmitError> {
 			let index = integer(value, "scalar reference")?;
 			match index {
-				-2 => add_adjoint(code, context.value_type, context.suffix, context.prefix, second, contribution, sequence),
-				-1 => add_adjoint(code, context.value_type, context.suffix, context.prefix, first, contribution, sequence),
+				-2 => add_adjoint(code, ty, context.suffix, context.prefix, second, contribution, sequence),
+				-1 => add_adjoint(code, ty, context.suffix, context.prefix, first, contribution, sequence),
 				0.. => {
 					let slot = usize::try_from(index).map_err(|_| EmitError::InvalidReference { kind: "scalar", index })?;
 					let target = adjoints.get_mut(slot).ok_or(EmitError::InvalidReference { kind: "scalar", index })?;
-					add_adjoint(code, context.value_type, context.suffix, context.prefix, target, contribution, sequence)
+					add_adjoint(code, ty, context.suffix, context.prefix, target, contribution, sequence)
 				}
 				_ => return Err(EmitError::InvalidReference { kind: "scalar", index }),
 			}
@@ -378,27 +456,27 @@ mod program_ir {
 				}
 				ScalarOpcode::Subtract => {
 					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
-					let negative = negate(&mut output, context.value_type, context.suffix, context.prefix, &adjoint, &mut sequence);
+					let negative = negate(&mut output, ty, context.suffix, context.prefix, &adjoint, &mut sequence);
 					add_operand(&mut output, instruction.right, &negative, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Multiply => {
-					let left_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.mul.left.{sequence}", context.prefix), "mul", &adjoint, &right);
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.mul.left.{sequence}", context.prefix), "mul", &adjoint, &right);
 					sequence += 1;
-					let right_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.mul.right.{sequence}", context.prefix), "mul", &adjoint, &left);
+					let right_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.mul.right.{sequence}", context.prefix), "mul", &adjoint, &left);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, instruction.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Divide => {
-					let left_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.left.{sequence}", context.prefix), "div", &adjoint, &right);
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.left.{sequence}", context.prefix), "div", &adjoint, &right);
 					sequence += 1;
-					let square = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.square.{sequence}", context.prefix), "mul", &right, &right);
+					let square = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.square.{sequence}", context.prefix), "mul", &right, &right);
 					sequence += 1;
-					let numerator = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.numerator.{sequence}", context.prefix), "mul", &adjoint, &left);
+					let numerator = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.numerator.{sequence}", context.prefix), "mul", &adjoint, &left);
 					sequence += 1;
-					let raw = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.raw.{sequence}", context.prefix), "div", &numerator, &square);
+					let raw = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.raw.{sequence}", context.prefix), "div", &numerator, &square);
 					sequence += 1;
-					let right_contribution = negate(&mut output, context.value_type, context.suffix, context.prefix, &raw, &mut sequence);
+					let right_contribution = negate(&mut output, ty, context.suffix, context.prefix, &raw, &mut sequence);
 					add_operand(&mut output, instruction.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, instruction.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
@@ -407,74 +485,86 @@ mod program_ir {
 					sequence += 1;
 					let positive = format!("%{}.abs.positive.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{negative} = call i1 @recipe.olt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
-					let _ = writeln!(output, "{positive} = call i1 @recipe.ogt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
-					let negated = negate(&mut output, context.value_type, context.suffix, context.prefix, &adjoint, &mut sequence);
+					let _ = writeln!(output, "{negative} = call i1 @recipe.state.olt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
+					let _ = writeln!(output, "{positive} = call i1 @recipe.state.ogt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
+					let negated = negate(&mut output, ty, context.suffix, context.prefix, &adjoint, &mut sequence);
 					let upper = format!("%{}.abs.upper.{sequence}", context.prefix);
 					sequence += 1;
 					let _ = writeln!(
 						output,
 						"{upper} = select i1 {positive}, {ty} {adjoint}, {ty} {zero}",
-						ty = context.value_type,
 						adjoint = adjoint,
-						zero = (context.literal)(0.0, context.value_type)
+						zero = (context.literal)(0.0, ty)
 					);
 					let contribution = format!("%{}.abs.contribution.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{contribution} = select i1 {negative}, {ty} {negated}, {ty} {upper}", ty = context.value_type, negated = negated, upper = upper);
+					let _ = writeln!(output, "{contribution} = select i1 {negative}, {ty} {negated}, {ty} {upper}", negated = negated, upper = upper);
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Exp => {
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.exp.{sequence}", context.prefix), "mul", &adjoint, &values[index]);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.exp.{sequence}", context.prefix), "mul", &adjoint, &values[index]);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Log => {
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.log.{sequence}", context.prefix), "div", &adjoint, &left);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.log.{sequence}", context.prefix), "div", &adjoint, &left);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Sin => {
 					let cosine = format!("%{}.sin.cosine.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{cosine} = call {ty} @recipe.cos{suffix}({ty} {left})", ty = context.value_type);
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.sin.{sequence}", context.prefix), "mul", &adjoint, &cosine);
+					let _ = writeln!(output, "{cosine} = call {ty} @{family}.cos{suffix}({ty} {left})", family = scalar_math(context.libm, "cos"));
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.sin.{sequence}", context.prefix), "mul", &adjoint, &cosine);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Cos => {
 					let sine = format!("%{}.cos.sine.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{sine} = call {ty} @recipe.sin{suffix}({ty} {left})", ty = context.value_type);
-					let raw = binary(&mut output, context.value_type, context.suffix, &format!("%{}.cos.raw.{sequence}", context.prefix), "mul", &adjoint, &sine);
+					let _ = writeln!(output, "{sine} = call {ty} @{family}.sin{suffix}({ty} {left})", family = scalar_math(context.libm, "sin"));
+					let raw = state_binary(&mut output, ty, context.suffix, &format!("%{}.cos.raw.{sequence}", context.prefix), "mul", &adjoint, &sine);
 					sequence += 1;
-					let contribution = negate(&mut output, context.value_type, context.suffix, context.prefix, &raw, &mut sequence);
+					let contribution = negate(&mut output, ty, context.suffix, context.prefix, &raw, &mut sequence);
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Tanh => {
-					let square = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.square.{sequence}", context.prefix), "mul", &values[index], &values[index]);
+					let square = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.square.{sequence}", context.prefix), "mul", &values[index], &values[index]);
 					sequence += 1;
-					let one = (context.literal)(1.0, context.value_type);
-					let base = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.base.{sequence}", context.prefix), "sub", &one, &square);
+					let one = (context.literal)(1.0, ty);
+					let base = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.base.{sequence}", context.prefix), "sub", &one, &square);
 					sequence += 1;
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Select => {
 					let condition = format!("%{}.select.condition.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{condition} = call i1 @recipe.ogt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
+					let _ = writeln!(output, "{condition} = call i1 @recipe.state.ogt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
 					let contribution = format!("%{}.select.contribution.{sequence}", context.prefix);
 					sequence += 1;
 					let _ = writeln!(
 						output,
 						"{contribution} = select i1 {condition}, {ty} {adjoint}, {ty} {zero}",
-						ty = context.value_type,
 						adjoint = adjoint,
-						zero = (context.literal)(0.0, context.value_type)
+						zero = (context.literal)(0.0, ty)
 					);
 					add_operand(&mut output, instruction.right, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+				}
+				ScalarOpcode::FusedAdd => {
+					// The addend takes the adjoint whole; the fused product's operands
+					// take it as the Multiply's would, without the Multiply's rounding.
+					let product = fused_product(&instructions, instruction.left)?;
+					let product_left = operand(product.left, &values)?;
+					let product_right = operand(product.right, &values)?;
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.fused.left.{sequence}", context.prefix), "mul", &adjoint, &product_right);
+					sequence += 1;
+					let right_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.fused.right.{sequence}", context.prefix), "mul", &adjoint, &product_left);
+					sequence += 1;
+					add_operand(&mut output, product.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+					add_operand(&mut output, product.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+					add_operand(&mut output, instruction.right, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
 			}
@@ -483,10 +573,22 @@ mod program_ir {
 			if let Some(parameter) = parameter {
 				parameters
 					.entry(parameter)
-					.and_modify(|value: &mut String| add_adjoint(&mut output, context.value_type, context.suffix, context.prefix, value, &adjoints[index], &mut sequence))
+					.and_modify(|value: &mut String| add_adjoint(&mut output, ty, context.suffix, context.prefix, value, &adjoints[index], &mut sequence))
 					.or_insert_with(|| adjoints[index].clone());
 			}
 		}
+		// The adjoints leave in the model type, as the callers store them.
+		let mut encode = |name: &str, value: &String| -> String {
+			if *value == state_zero {
+				return (context.literal)(0.0, context.value_type);
+			}
+			let encoded = format!("%{}.{name}.adjoint.model", context.prefix);
+			let _ = writeln!(output, "{encoded} = call {model} @recipe.model.from.state{suffix}({ty} {value})", model = context.value_type);
+			encoded
+		};
+		let first = encode("first", &first);
+		let second = encode("second", &second);
+		let parameters = parameters.into_iter().map(|(index, value)| (index, encode(&format!("parameter{index}"), &value))).collect();
 		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters })
 	}
 
@@ -3832,7 +3934,8 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
-					let attention = if matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let online_order = self.inference && self.graph.profile.online_softmax;
+					let attention = if !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
@@ -3878,6 +3981,7 @@ impl NativeModelIr {
 					// The single-query step body is written in the block's own types, so
 					// every precision takes it.
 					let fast_attention = self.inference
+						&& !online_order
 						&& self.rows == 1
 						&& backend == Backend::Amd
 						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
@@ -3900,7 +4004,7 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { if online_order { ", i1 true" } else { ", i1 false" } } else { "" }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
@@ -3928,6 +4032,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -4351,6 +4457,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -4368,6 +4476,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -4920,7 +5030,7 @@ impl NativeModelIr {
 					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
 					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
 					writeln!(ir, "br label %{name}.p.loop")?;
 					writeln!(ir, "{name}.p.loop:")?;
@@ -5406,7 +5516,7 @@ impl NativeModelIr {
 						writeln!(ir, "{second_value} = load {ty}, {pointer} %recur{index}.reverse{node_index}.second.ptr, align {align}")?;
 					}
 					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
-					let scalar_context = program_ir::ScalarContext { value_type: ty, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
+					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
 					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&forward.code);
 					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming")).map_err(|error| RecipeError::new(error.to_string()))?;
@@ -16317,13 +16427,16 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
 		Activation::Gelu => {
-			let square = program.op(ScalarOpcode::Multiply, x, x);
-			let cube = program.op(ScalarOpcode::Multiply, square, x);
+			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
+			// one fused step where its compiler fuses one, so an fp32 gelu prints
+			// the bits llama.cpp's does.
 			let cubic = constant(&mut program, config.activation[6]);
-			let curved = program.op(ScalarOpcode::Multiply, cubic, cube);
-			let sum = program.op(ScalarOpcode::Add, x, curved);
+			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, x);
+			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, x);
+			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
 			let scale = constant(&mut program, config.activation[5]);
-			let argument = program.op(ScalarOpcode::Multiply, scale, sum);
+			let scale_x = program.op(ScalarOpcode::Multiply, scale, x);
+			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
 			let half = constant(&mut program, 0.5);
@@ -17519,11 +17632,21 @@ pub(crate) struct Precisions {
 	/// the angle, the magnitude scale on the cosine and sine, and the rotation
 	/// as two fused multiply-adds against the CPU's libm trig.
 	chain_angle: bool,
+	/// How attention takes its softmax: `full`, the scores of every key at
+	/// once; or `online`, llama.cpp's CPU order, one thread per query walking
+	/// the keys in position order with a running maximum, the query and the
+	/// value accumulator in the cache type, the exponentials from the CPU's
+	/// libm, and the key dot in four 16-lane fused accumulators folded by halves.
+	online_softmax: bool,
+	/// Where the transcendental steps of the elementwise programs come from:
+	/// `portable`, recipe's own double-evaluated exp, log, sin, cos and tanh,
+	/// the same bits on every backend; or `libm`, the platform's on the CPU.
+	libm: bool,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false }
+		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false }
 	}
 }
 impl Precisions {
@@ -17555,6 +17678,22 @@ impl Precisions {
 		let mut precisions = Self::default();
 		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
 			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			if key == "math" {
+				precisions.libm = match value.trim().trim_matches('"') {
+					"portable" => false,
+					"libm" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] math = {other}: the math is portable or libm"))),
+				};
+				continue;
+			}
+			if key == "attn-softmax" {
+				precisions.online_softmax = match value.trim().trim_matches('"') {
+					"full" => false,
+					"online" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] attn-softmax = {other}: an attention softmax is full or online"))),
+				};
+				continue;
+			}
 			if key == "rope-angle" {
 				precisions.chain_angle = match value.trim().trim_matches('"') {
 					"direct" => false,
@@ -17588,7 +17727,7 @@ impl Precisions {
 					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
 					precisions.acc = compute
 				}
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step and rope-angle the rope's angle"))),
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order and math the transcendentals' source"))),
 			}
 		}
 		Ok(precisions)
@@ -21227,7 +21366,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let driver_version: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDriverGetVersion\0")?;
 		let check = |s, a| driver_status(Backend::Nvidia, s, a);
 		let mut version = 0_i32;
-		check(unsafe { driver_version(&mut version) }, "driver version query")?;
+		check(driver_version(&mut version), "driver version query")?;
 		NVIDIA_DRIVER_VERSION.store(version.max(0) as u32, Ordering::Relaxed);
 		let mut count = 0;
 		check(init(0), "initialization")?;
