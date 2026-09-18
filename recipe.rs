@@ -7187,10 +7187,27 @@ fn native_nvidia_compiler() -> Result<&'static str> {
 fn native_nvidia_codegen() -> Result<&'static str> {
 	option_env!("RECIPE_NV_CODEGEN").ok_or_else(|| RecipeError::new("NVIDIA native code generator is unavailable"))
 }
+/// The CUDA version of the driver that opened the device, as cuDriverGetVersion
+/// reports it (11040 for 11.4); zero until a device is opened in this process.
+static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The toolkit assembler that turns the PTX into the device object at
-/// compile time, so a run never waits on the driver to assemble it.
+/// compile time, so a run never waits on the driver to assemble it. A driver
+/// loads only objects from an assembler no newer than itself, so an assembler
+/// past the driver is left alone and the PTX goes to the driver as before.
 fn native_nvidia_assembler() -> Option<&'static str> {
-	option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())
+	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
+	fn release_of(path: &str) -> Option<u32> {
+		let output = Command::new(path).arg("--version").output().ok()?;
+		let text = String::from_utf8_lossy(&output.stdout);
+		let after = text.split("release ").nth(1)?;
+		let mut parts = after.split(|character: char| !character.is_ascii_digit()).filter(|part| !part.is_empty());
+		let (major, minor) = (parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?);
+		Some(major * 1000 + minor * 10)
+	}
+	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
+	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
+	(driver != 0 && release <= driver).then_some(path)
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
@@ -20768,7 +20785,11 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32 = runtime.function(b"cuModuleGetFunction\0")?;
 		let function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32 = runtime.function(b"cuFuncGetAttribute\0")?;
 		let occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32 = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
+		let driver_version: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDriverGetVersion\0")?;
 		let check = |s, a| driver_status(Backend::Nvidia, s, a);
+		let mut version = 0_i32;
+		check(unsafe { driver_version(&mut version) }, "driver version query")?;
+		NVIDIA_DRIVER_VERSION.store(version.max(0) as u32, Ordering::Relaxed);
 		let mut count = 0;
 		check(init(0), "initialization")?;
 		check(count_devices(&mut count), "device enumeration")?;
