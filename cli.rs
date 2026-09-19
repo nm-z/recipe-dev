@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [--config <precision table>] [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [--config <precision table>] [export]\n       recipe stats <file.gguf>\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -103,6 +103,12 @@ fn main() {
 	let (mut source, mut operation, mut device, mut config) = (None::<String>, None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	while let Some(argument) = arguments.next() {
+		if argument == "stats" && source.is_none() {
+			let path = arguments.next().unwrap_or_else(|| invalid("recipe stats requires a GGUF file"));
+			if arguments.next().is_some() { invalid(USAGE); }
+			recipe::stats(&path).unwrap_or_else(|error| invalid(&error.to_string()));
+			return;
+		}
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
 			recipe::worker_serve(&name).unwrap_or_else(|error| {

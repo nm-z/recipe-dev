@@ -1,3 +1,4 @@
+mod fp8;
 use std::{
 	env,
 	error::Error,
@@ -38,7 +39,8 @@ struct FloatFormat {
 	storage: FloatLayout,
 }
 impl FloatFormat {
-	const FP8: Self = Self::native(1, 5, 2);
+	const FP8: Self = Self::native(1, 4, 3);
+	const FP8_E5M2: Self = Self::native(1, 5, 2);
 	const FP16: Self = Self::native(1, 5, 10);
 	const FP32: Self = Self::native(1, 8, 23);
 	const FP64: Self = Self::native(1, 11, 52);
@@ -52,6 +54,8 @@ impl FloatFormat {
 		self.storage.bits().div_ceil(8) as usize
 	}
 	fn pack(self, value: f64) -> u64 {
+		if self == Self::FP8 { return fp8::Encoding::E4M3.pack(value); }
+		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.pack(value); }
 		let rounded = self.arithmetic.unpack(self.arithmetic.pack_from(value));
 		let bits = match self.storage.bits() {
 			64 => rounded.to_bits(),
@@ -64,6 +68,8 @@ impl FloatFormat {
 		bits
 	}
 	fn unpack(self, bits: u64) -> f64 {
+		if self == Self::FP8 { return fp8::Encoding::E4M3.unpack(bits); }
+		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.unpack(bits); }
 		match self.storage.bits() {
 			64 => f64::from_bits(bits),
 			32 => f64::from(f32::from_bits(bits as u32)),
@@ -109,7 +115,6 @@ struct IntFormat {
 	bits: u8,
 }
 impl IntFormat {
-	const INT1: Self = Self { bits: 1 };
 	const INT4: Self = Self { bits: 4 };
 	const INT8: Self = Self { bits: 8 };
 	const fn bytes(self) -> usize {
@@ -162,6 +167,12 @@ br i1 %ready, label %acquired, label %wait acquired:
 fence acquire br label %waited waited:
 call void @llvm.nvvm.bar.warp.sync(i32 -1)
 ret void }"#;
+// A workgroup barrier on AMD is s_barrier between two workgroup-scope
+// fences: s_barrier alone neither waits for in-flight LDS stores nor keeps
+// the compiler from moving LDS accesses across it, and two waves sharing the
+// int8 activation records read each other's half-written records (2026-09-18).
+// NVIDIA's bar.sync and the CPU's single wave never had the gap.
+const AMD_WORKGROUP_BARRIER: &str = r#"define internal void @recipe.workgroup.barrier() #1 { entry: fence syncscope("workgroup") release call void @llvm.amdgcn.s.barrier() fence syncscope("workgroup") acquire ret void }"#;
 const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
@@ -187,24 +198,367 @@ define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %inde
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
 /// state, none under a double one.
-/// Whether a state carries the int8 dots: the float and double states do
-/// (`int(n).acc(64)` is an int8 dot with a double accumulator); the custom
-/// `f(exp, man)` state, whose model is a double, does not.
+/// The int8 activation record of one 32-input step: the step's scale in the
+/// state, then the 32 codes. 36 bytes under a float state, 40 under double.
+fn q8_record(state: &str) -> usize {
+	32 + q8_scale_bytes(state)
+}
+fn q8_scale_bytes(state: &str) -> usize {
+	if state == "double" { 8 } else { 4 }
+}
+/// Whether a state carries the int8 dots: float and double both do, including
+/// an `int(n).acc(64)` dot with a double accumulator.
 fn int_state(state: &str) -> bool {
 	state == "float" || state == "double"
 }
-/// The trig and power a chain-angle rope takes: the platform libm's on the
-/// CPU, where llama.cpp's cosf, sinf and powf live, and the portable
-/// evaluations everywhere else.
-fn rope_math_helpers(state: &str, libm: bool) -> String {
-	if !libm {
-		return format!("define internal {state} @recipe.libm.cos({state} %value) #1 {{ entry: %result = call {state} @recipe.state.cos({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.sin({state} %value) #1 {{ entry: %result = call {state} @recipe.state.sin({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.exp({state} %value) #1 {{ entry: %result = call {state} @recipe.state.exp({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.tanh({state} %value) #1 {{ entry: %result = call {state} @recipe.state.tanh({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.log({state} %value) #1 {{ entry: %result = call {state} @recipe.state.log({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %log = call {state} @recipe.state.log({state} %base) %scaled = call {state} @recipe.state.mul({state} %log, {state} %exponent) %result = call {state} @recipe.state.exp({state} %scaled) ret {state} %result }}\n");
+/// glibc 2.44's binary32 `expf`, `sinf`, `cosf` and `tanhf` as LLVM IR, so a
+/// `math = "libm"` step prints the bits the x86-64 libm prints on every
+/// backend. `expf`, `sinf` and `cosf` are the ARM optimized-routines
+/// algorithms as GCC contracts them for the FMA variants glibc dispatches to
+/// (`__expf_fma`, `__sinf_fma`, `__cosf_fma`): every product-sum the
+/// disassembly fuses is an `llvm.fma`, every other step a separate IEEE
+/// operation. `tanhf` is the CORE-MATH correctly rounded rational
+/// approximation, which glibc builds without contraction. Verified against the
+/// installed libm over every binary32 input.
+fn glibc_float_math() -> String {
+	// The exp2f table: 2^(i/32) doubles, the low bits of the exponent word later
+	// shifted in from the integer part.
+	const EXP2F_TAB: [u64; 32] = [
+		0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51, 0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
+		0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d, 0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585,
+		0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13, 0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+		0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069, 0x3fef5818dcfba487, 0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+	];
+	// 4/pi in 192 bits, eight bits per entry, for the large-argument reduction.
+	const INV_PIO4: [u32; 24] = [
+		0xa2, 0xa2f9, 0xa2f983, 0xa2f9836e, 0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529, 0x441529fc, 0x1529fc27, 0x29fc2757, 0xfc2757d1, 0x2757d1f5, 0x57d1f534, 0xd1f534dd,
+		0xf534ddc0, 0x34ddc0db, 0xddc0db62, 0xc0db6295, 0xdb629599, 0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041,
+	];
+	let d = |bits: u64| format!("0x{bits:016X}");
+	let f = |bits: u32| format!("0x{:016X}", (f32::from_bits(bits) as f64).to_bits());
+	// expf: InvLn2N = 0x1.71547652b82fep+0 * 32, SHIFT = 0x1.8p52, the poly scaled by 1/N^k.
+	let (inv_ln2_n, shift, c0, c1, c2) = (d(0x40471547652b82fe), d(0x4338000000000000), d(0x3ebc6af84b912394), d(0x3f2ebfce50fac4f3), d(0x3f962e42ff0c52d6));
+	// sincosf: 2/pi scaled by 2^24, pi/2, the cosine and sine polynomials, pi/2^63.
+	let (hpi_inv, hpi, pi63) = (d(0x41645f306dc9c883), d(0x3ff921fb54442d18), d(0x3c1921fb54442d18));
+	let (cos1, cos2, cos3, cos4) = (d(0xbfdffffffd0c621c), d(0x3fa55553e1068f19), d(0xbf56c087e89a359d), d(0x3ef99343027bf8c3));
+	let (sin1, sin2, sin3) = (d(0xbfc555545995a603), d(0x3f81107605230bc4), d(0xbf2994eb3774cf24));
+	let (ncos1, ncos2, ncos3, ncos4) = (d(0x3fdffffffd0c621c), d(0xbfa55553e1068f19), d(0x3f56c087e89a359d), d(0xbef99343027bf8c3));
+	// tanhf: the CORE-MATH numerator and denominator.
+	let cn = [d(0x3ff0000000000000), d(0x3fc30877b8b72d33), d(0x3f7694aa09ae9e5e), d(0x3f14101377abb729), d(0x3e9e0392b1db0018), d(0x3e12533756e546f7), d(0x3d6d62e5abe6ae8a), d(0x3c9b06be534182de)];
+	let cd = [d(0x3ff0000000000000), d(0x3fded99131b0ebea), d(0x3fa0d27ed6c95a69), d(0x3f47cbdaca0e9fcc), d(0x3edb4e60b892578e), d(0x3e5a6f707c5c71ab), d(0x3dc35a8b6e2cd94c), d(0x3d0ca8230677aa01)];
+	let (over, under, third, quarter_ulp) = (f(0x42b17217), f(0xc2cff1b4), f(0xbeaaaaab), f(0x33000000));
+	let tab = EXP2F_TAB.iter().map(|word| format!("i64 {}", *word as i64)).collect::<Vec<_>>().join(", ");
+	let pio4 = INV_PIO4.iter().map(|word| format!("i32 {}", *word as i32)).collect::<Vec<_>>().join(", ");
+	format!(
+		"; GLIBC BEGIN
+@recipe_glibc_exp2f_tab = private unnamed_addr constant [32 x i64] [{tab}]
+@recipe_glibc_inv_pio4 = private unnamed_addr constant [24 x i32] [{pio4}]
+@recipe_glibc_sign = private unnamed_addr constant [4 x double] [double 1.0, double -1.0, double -1.0, double 1.0]
+define internal float @recipe.glibc.expf(float %x) #1 {{
+entry:
+%bits = bitcast float %x to i32
+%top = lshr i32 %bits, 20
+%abstop = and i32 %top, 2047
+%special = icmp uge i32 %abstop, 1067
+br i1 %special, label %special.check, label %main
+special.check:
+%minus.inf = icmp eq i32 %bits, -8388608
+br i1 %minus.inf, label %zero, label %special.nan
+zero:
+ret float 0.0
+special.nan:
+%nonfinite = icmp uge i32 %abstop, 2040
+br i1 %nonfinite, label %nan, label %special.range
+nan:
+%doubled = fadd float %x, %x
+ret float %doubled
+special.range:
+%over = fcmp ogt float %x, {over}
+br i1 %over, label %overflow, label %under.check
+overflow:
+ret float 0x7FF0000000000000
+under.check:
+%under = fcmp olt float %x, {under}
+br i1 %under, label %zero, label %main
+main:
+%xd = fpext float %x to double
+%kd.shifted = call double @llvm.fma.f64(double {inv_ln2_n}, double %xd, double {shift})
+%ki = bitcast double %kd.shifted to i64
+%kd = fsub double %kd.shifted, {shift}
+%neg.kd = fneg double %kd
+%r = call double @llvm.fma.f64(double {inv_ln2_n}, double %xd, double %neg.kd)
+%index = and i64 %ki, 31
+%tab.ptr = getelementptr inbounds [32 x i64], ptr @recipe_glibc_exp2f_tab, i64 0, i64 %index
+%tab = load i64, ptr %tab.ptr, align 8
+%scaled = shl i64 %ki, 47
+%t = add i64 %tab, %scaled
+%s = bitcast i64 %t to double
+%z = call double @llvm.fma.f64(double {c0}, double %r, double {c1})
+%r2 = fmul double %r, %r
+%y0 = call double @llvm.fma.f64(double {c2}, double %r, double 1.0)
+%y1 = call double @llvm.fma.f64(double %z, double %r2, double %y0)
+%y = fmul double %y1, %s
+%result = fptrunc double %y to float
+ret float %result
+}}
+define internal float @recipe.glibc.sincosf(float %y, i1 %want.cos) #1 {{
+entry:
+%bits = bitcast float %y to i32
+%top = lshr i32 %bits, 20
+%abstop = and i32 %top, 2047
+%x = fpext float %y to double
+%small = icmp ult i32 %abstop, 1012
+br i1 %small, label %small.check, label %mid.check
+small.check:
+%tiny = icmp ult i32 %abstop, 920
+br i1 %tiny, label %tiny.exit, label %small.poly
+tiny.exit:
+%tiny.value = select i1 %want.cos, float 1.0, float %y
+ret float %tiny.value
+small.poly:
+%x2.small = fmul double %x, %x
+br i1 %want.cos, label %cos.poly, label %sin.poly
+mid.check:
+%mid = icmp ult i32 %abstop, 1071
+br i1 %mid, label %mid.reduce, label %large.check
+mid.reduce:
+%r.mid = fmul double %x, {hpi_inv}
+%r.int = fptosi double %r.mid to i32
+%r.biased = add i32 %r.int, 8388608
+%n.mid = ashr i32 %r.biased, 24
+%n.mid.d = sitofp i32 %n.mid to double
+%n.mid.neg = fneg double %n.mid.d
+%xr.mid = call double @llvm.fma.f64(double %n.mid.neg, double {hpi}, double %x)
+%table.mid = and i32 %n.mid, 2
+%parity.mid = and i32 %n.mid, 1
+%sign.mid = and i32 %n.mid, 3
+br label %reduced
+large.check:
+%finite = icmp ult i32 %abstop, 2040
+br i1 %finite, label %large.reduce, label %invalid
+invalid:
+%difference = fsub float %y, %y
+%nan = fdiv float %difference, %difference
+ret float %nan
+large.reduce:
+%arr.shift = lshr i32 %bits, 26
+%arr.index = and i32 %arr.shift, 15
+%shift.raw = lshr i32 %bits, 23
+%shift = and i32 %shift.raw, 7
+%mantissa.raw = and i32 %bits, 16777215
+%mantissa = or i32 %mantissa.raw, 8388608
+%xi = shl i32 %mantissa, %shift
+%arr.index.wide = zext i32 %arr.index to i64
+%arr.index.4 = add i64 %arr.index.wide, 4
+%arr.index.8 = add i64 %arr.index.wide, 8
+%a0.ptr = getelementptr inbounds [24 x i32], ptr @recipe_glibc_inv_pio4, i64 0, i64 %arr.index.wide
+%a4.ptr = getelementptr inbounds [24 x i32], ptr @recipe_glibc_inv_pio4, i64 0, i64 %arr.index.4
+%a8.ptr = getelementptr inbounds [24 x i32], ptr @recipe_glibc_inv_pio4, i64 0, i64 %arr.index.8
+%a0 = load i32, ptr %a0.ptr, align 4
+%a4 = load i32, ptr %a4.ptr, align 4
+%a8 = load i32, ptr %a8.ptr, align 4
+%res0.narrow = mul i32 %xi, %a0
+%res0 = zext i32 %res0.narrow to i64
+%xi.wide = zext i32 %xi to i64
+%a4.wide = zext i32 %a4 to i64
+%a8.wide = zext i32 %a8 to i64
+%res1 = mul i64 %xi.wide, %a4.wide
+%res2 = mul i64 %xi.wide, %a8.wide
+%res2.high = lshr i64 %res2, 32
+%res0.high = shl i64 %res0, 32
+%res0.joined = or i64 %res2.high, %res0.high
+%res0.sum = add i64 %res0.joined, %res1
+%biased = add i64 %res0.sum, 2305843009213693952
+%n.large.wide = lshr i64 %biased, 62
+%n.large.shifted = shl i64 %n.large.wide, 62
+%remainder = sub i64 %res0.sum, %n.large.shifted
+%remainder.d = sitofp i64 %remainder to double
+%xr.large = fmul double %remainder.d, {pi63}
+%n.large = trunc i64 %n.large.wide to i32
+%sign.bit = lshr i32 %bits, 31
+%quadrant.large = add i32 %n.large, %sign.bit
+%table.large = and i32 %quadrant.large, 2
+%parity.large = and i32 %n.large, 1
+%sign.large = and i32 %quadrant.large, 3
+br label %reduced
+reduced:
+%xr = phi double [ %xr.mid, %mid.reduce ], [ %xr.large, %large.reduce ]
+%table = phi i32 [ %table.mid, %mid.reduce ], [ %table.large, %large.reduce ]
+%parity = phi i32 [ %parity.mid, %mid.reduce ], [ %parity.large, %large.reduce ]
+%sign.index = phi i32 [ %sign.mid, %mid.reduce ], [ %sign.large, %large.reduce ]
+%x2.reduced = fmul double %xr, %xr
+%odd = icmp ne i32 %parity, 0
+%use.cos = xor i1 %odd, %want.cos
+%second = icmp ne i32 %table, 0
+br i1 %use.cos, label %cos.poly, label %sin.signed
+sin.signed:
+%sign.index.wide = zext i32 %sign.index to i64
+%sign.ptr = getelementptr inbounds [4 x double], ptr @recipe_glibc_sign, i64 0, i64 %sign.index.wide
+%sign = load double, ptr %sign.ptr, align 8
+%xs.signed = fmul double %xr, %sign
+br label %sin.poly
+sin.poly:
+%xs = phi double [ %x, %small.poly ], [ %xs.signed, %sin.signed ]
+%x2.sin = phi double [ %x2.small, %small.poly ], [ %x2.reduced, %sin.signed ]
+%s1v = call double @llvm.fma.f64(double %x2.sin, double {sin3}, double {sin2})
+%x3 = fmul double %x2.sin, %xs
+%x5 = fmul double %x2.sin, %x3
+%s = call double @llvm.fma.f64(double %x3, double {sin1}, double %xs)
+%sin.result = call double @llvm.fma.f64(double %s1v, double %x5, double %s)
+%sin.narrow = fptrunc double %sin.result to float
+ret float %sin.narrow
+cos.poly:
+%x2.cos = phi double [ %x2.small, %small.poly ], [ %x2.reduced, %reduced ]
+%negated = phi i1 [ false, %small.poly ], [ %second, %reduced ]
+%c0 = select i1 %negated, double -1.0, double 1.0
+%c1 = select i1 %negated, double {ncos1}, double {cos1}
+%c2 = select i1 %negated, double {ncos2}, double {cos2}
+%c3 = select i1 %negated, double {ncos3}, double {cos3}
+%c4 = select i1 %negated, double {ncos4}, double {cos4}
+%x4 = fmul double %x2.cos, %x2.cos
+%c2v = call double @llvm.fma.f64(double %x2.cos, double %c4, double %c3)
+%x6 = fmul double %x2.cos, %x4
+%c1v = call double @llvm.fma.f64(double %x2.cos, double %c1, double %c0)
+%c = call double @llvm.fma.f64(double %x4, double %c2, double %c1v)
+%cos.result = call double @llvm.fma.f64(double %c2v, double %x6, double %c)
+%cos.narrow = fptrunc double %cos.result to float
+ret float %cos.narrow
+}}
+define internal float @recipe.glibc.sinf(float %y) #1 {{ entry: %result = call float @recipe.glibc.sincosf(float %y, i1 false) ret float %result }}
+define internal float @recipe.glibc.cosf(float %y) #1 {{ entry: %result = call float @recipe.glibc.sincosf(float %y, i1 true) ret float %result }}
+define internal float @recipe.glibc.tanhf(float %x) #1 {{
+entry:
+%bits = bitcast float %x to i32
+%exponent.raw = lshr i32 %bits, 23
+%magnitude = shl i32 %bits, 1
+%exponent = and i32 %exponent.raw, 255
+%nonfinite = icmp eq i32 %exponent, 255
+br i1 %nonfinite, label %nonfinite.check, label %finite
+nonfinite.check:
+%payload = shl i32 %bits, 9
+%is.nan = icmp ne i32 %payload, 0
+br i1 %is.nan, label %nan, label %infinite
+nan:
+%doubled = fadd float %x, %x
+ret float %doubled
+infinite:
+%negative = icmp slt i32 %bits, 0
+%unit = select i1 %negative, float -1.0, float 1.0
+ret float %unit
+finite:
+%small = icmp ult i32 %exponent, 115
+br i1 %small, label %small.check, label %range
+small.check:
+%tiny = icmp ult i32 %exponent, 102
+br i1 %tiny, label %tiny.check, label %cubic
+tiny.check:
+%zero = icmp eq i32 %magnitude, 0
+br i1 %zero, label %identity, label %linear
+identity:
+ret float %x
+linear:
+%neg.x = fneg float %x
+%abs.x = call float @llvm.fabs.f32(float %x)
+%linear.value = call float @llvm.fma.f32(float %neg.x, float %abs.x, float %x)
+ret float %linear.value
+cubic:
+%x2 = fmul float %x, %x
+%cubic.scale = fmul float {third}, %x2
+%cubic.value = call float @llvm.fma.f32(float %x, float %cubic.scale, float %x)
+ret float %cubic.value
+range:
+%saturated = icmp ugt i32 %magnitude, 2183158118
+br i1 %saturated, label %saturate, label %rational
+saturate:
+%one = call float @llvm.copysign.f32(float 1.0, float %x)
+%step = call float @llvm.copysign.f32(float {quarter_ulp}, float %x)
+%saturated.value = fsub float %one, %step
+ret float %saturated.value
+rational:
+%z = fpext float %x to double
+%z2 = fmul double %z, %z
+%z4 = fmul double %z2, %z2
+%z8 = fmul double %z4, %z4
+%n0.product = fmul double %z2, {cn1}
+%n0 = fadd double {cn0}, %n0.product
+%n2.product = fmul double %z2, {cn3}
+%n2 = fadd double {cn2}, %n2.product
+%n4.product = fmul double %z2, {cn5}
+%n4 = fadd double {cn4}, %n4.product
+%n6.product = fmul double %z2, {cn7}
+%n6 = fadd double {cn6}, %n6.product
+%n0.z4 = fmul double %z4, %n2
+%n0.b = fadd double %n0, %n0.z4
+%n4.z4 = fmul double %z4, %n6
+%n4.b = fadd double %n4, %n4.z4
+%n0.z8 = fmul double %z8, %n4.b
+%n0.c = fadd double %n0.b, %n0.z8
+%d0.product = fmul double %z2, {cd1}
+%d0 = fadd double {cd0}, %d0.product
+%d2.product = fmul double %z2, {cd3}
+%d2 = fadd double {cd2}, %d2.product
+%d4.product = fmul double %z2, {cd5}
+%d4 = fadd double {cd4}, %d4.product
+%d6.product = fmul double %z2, {cd7}
+%d6 = fadd double {cd6}, %d6.product
+%d0.z4 = fmul double %z4, %d2
+%d0.b = fadd double %d0, %d0.z4
+%d4.z4 = fmul double %z4, %d6
+%d4.b = fadd double %d4, %d4.z4
+%d0.z8 = fmul double %z8, %d4.b
+%d0.c = fadd double %d0.b, %d0.z8
+%numerator = fmul double %z, %n0.c
+%ratio = fdiv double %numerator, %d0.c
+%result = fptrunc double %ratio to float
+ret float %result
+}}
+; GLIBC END
+",
+		cn0 = cn[0], cn1 = cn[1], cn2 = cn[2], cn3 = cn[3], cn4 = cn[4], cn5 = cn[5], cn6 = cn[6], cn7 = cn[7],
+		cd0 = cd[0], cd1 = cd[1], cd2 = cd[2], cd3 = cd[3], cd4 = cd[4], cd5 = cd[5], cd6 = cd[6], cd7 = cd[7],
+	)
+}
+/// The intrinsic declarations the glibc block needs, added once each.
+fn with_glibc_declares(mut ir: String) -> String {
+	for declaration in ["declare double @llvm.fma.f64(double, double, double)", "declare float @llvm.fma.f32(float, float, float)", "declare float @llvm.fabs.f32(float)", "declare float @llvm.copysign.f32(float, float)"] {
+		if !ir.contains(declaration) {
+			ir.push('\n');
+			ir.push_str(declaration);
+			ir.push('\n');
+		}
 	}
+	ir
+}
+/// The transcendental steps a `math = "libm"` block takes. Under a float
+/// state exp, cos, sin and tanh are glibc's binary32 routines on every
+/// backend (`glibc_float_math`), so a libm step prints the same bits on the
+/// CPU and on the GPUs; log and pow take the platform libm on the CPU and the
+/// portable evaluations elsewhere. Under a double state the CPU calls the
+/// platform libm and the GPUs evaluate portably.
+fn rope_math_helpers(state: &str, cpu: bool) -> String {
+	let portable = |name: &str| format!("define internal {state} @recipe.libm.{name}({state} %value) #1 {{ entry: %result = call {state} @recipe.state.{name}({state} %value) ret {state} %result }}\n");
+	let portable_pow = format!("define internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %log = call {state} @recipe.state.log({state} %base) %scaled = call {state} @recipe.state.mul({state} %log, {state} %exponent) %result = call {state} @recipe.state.exp({state} %scaled) ret {state} %result }}\n");
 	let (intrinsic, tanh_suffix) = match state {
 		"float" => ("f32", "f"),
 		"double" => ("f64", ""),
-		_ => return rope_math_helpers(state, false),
+		_ => return format!("{}{}{}{}{}{portable_pow}", portable("cos"), portable("sin"), portable("exp"), portable("tanh"), portable("log")),
 	};
+	if state == "float" {
+		let mut ir = glibc_float_math();
+		for (name, port) in [("exp", "expf"), ("cos", "cosf"), ("sin", "sinf"), ("tanh", "tanhf")] {
+			ir.push_str(&format!("define internal float @recipe.libm.{name}(float %value) #1 {{ entry: %result = call float @recipe.glibc.{port}(float %value) ret float %result }}\n"));
+		}
+		if cpu {
+			ir.push_str("declare float @llvm.log.f32(float)\ndeclare float @llvm.pow.f32(float, float)\ndefine internal float @recipe.libm.log(float %value) #1 { entry: %result = call float @llvm.log.f32(float %value) ret float %result }\ndefine internal float @recipe.libm.pow(float %base, float %exponent) #1 { entry: %result = call float @llvm.pow.f32(float %base, float %exponent) ret float %result }\n");
+		} else {
+			ir.push_str(&portable("log"));
+			ir.push_str(&portable_pow);
+		}
+		return ir;
+	}
+	if !cpu {
+		return format!("{}{}{}{}{}{portable_pow}", portable("cos"), portable("sin"), portable("exp"), portable("tanh"), portable("log"));
+	}
 	format!("declare {state} @llvm.cos.{intrinsic}({state})\ndeclare {state} @llvm.sin.{intrinsic}({state})\ndeclare {state} @llvm.exp.{intrinsic}({state})\ndeclare {state} @llvm.log.{intrinsic}({state})\ndeclare {state} @tanh{tanh_suffix}({state})\ndeclare {state} @llvm.pow.{intrinsic}({state}, {state})\ndefine internal {state} @recipe.libm.exp({state} %value) #1 {{ entry: %result = call {state} @llvm.exp.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.log({state} %value) #1 {{ entry: %result = call {state} @llvm.log.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.tanh({state} %value) #1 {{ entry: %result = call {state} @tanh{tanh_suffix}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.cos({state} %value) #1 {{ entry: %result = call {state} @llvm.cos.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.sin({state} %value) #1 {{ entry: %result = call {state} @llvm.sin.{intrinsic}({state} %value) ret {state} %result }}\ndefine internal {state} @recipe.libm.pow({state} %base, {state} %exponent) #1 {{ entry: %result = call {state} @llvm.pow.{intrinsic}({state} %base, {state} %exponent) ret {state} %result }}\n")
 }
 /// The int partial helpers of one template: the Q4_K slice ints and the Q6_K
@@ -294,15 +648,15 @@ const IQ4_LEVELS: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 fn amd_block32_slice_helper(state: &str, full: bool) -> String {
 	let signature = format!("define internal {state} @recipe.block32.slice(i32 %kind, ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n");
 	if !full {
-		return format!("{signature}%zero = call {state} @recipe.state.from.u1(i1 false)\nret {state} %zero\n}}\n");
+		return format!("{signature}call void @llvm.trap()\nunreachable\n}}\n");
 	}
 	let word = |at: usize| u32::from_le_bytes([IQ4_LEVELS[at] as u8, IQ4_LEVELS[at + 1] as u8, IQ4_LEVELS[at + 2] as u8, IQ4_LEVELS[at + 3] as u8]);
 	let (t0, t1, t2, t3) = (word(0), word(4), word(8), word(12));
 	let mut ir = signature;
-	ir.push_str(&format!("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call {state} @recipe.state.from.f16(half %d.bits)\n%half.wide = zext i32 %slice to i64\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.d = load float, ptr addrspace(3) %q8, align 4\n%q8.d.state = call {state} @recipe.state.from.f32(float %q8.d)\n%nibble.shift = mul i32 %slice, 4\n%byte.half = mul i64 %half.wide, 16\n%is.iq4 = icmp eq i32 %kind, 1\n%is.q41 = icmp eq i32 %kind, 3\n%is.q80 = icmp eq i32 %kind, 4\n%data.q41 = select i1 %is.q41, i64 4, i64 2\n%data.base = select i1 %is.q80, i64 %byte.half, i64 0\n%data = add i64 %data.q41, %data.base\n%m.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%m.bits = load half, ptr addrspace(1) %m.ptr, align 2\n%m.loaded = call {state} @recipe.state.from.f16(half %m.bits)\n%zero = call {state} @recipe.state.from.u1(i1 false)\n%m = select i1 %is.q41, {state} %m.loaded, {state} %zero\n%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n"));
+	ir.push_str(&format!("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call {state} @recipe.state.from.f16(half %d.bits)\n%half.wide = zext i32 %slice to i64\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.d.state = load {state}, ptr addrspace(3) %q8, align {q8_align}\n%nibble.shift = mul i32 %slice, 4\n%byte.half = mul i64 %half.wide, 16\n%is.iq4 = icmp eq i32 %kind, 1\n%is.q41 = icmp eq i32 %kind, 3\n%is.q80 = icmp eq i32 %kind, 4\n%data.q41 = select i1 %is.q41, i64 4, i64 2\n%data.base = select i1 %is.q80, i64 %byte.half, i64 0\n%data = add i64 %data.q41, %data.base\n%m.ptr = getelementptr i8, ptr addrspace(1) %block, i64 2\n%m.bits = load half, ptr addrspace(1) %m.ptr, align 2\n%m.loaded = call {state} @recipe.state.from.f16(half %m.bits)\n%zero = call {state} @recipe.state.from.u1(i1 false)\n%m = select i1 %is.q41, {state} %m.loaded, {state} %zero\n%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n", q8_align = q8_scale_bytes(state)));
 	let (mut dot_sum, mut q8_sum) = ("%dot.zero".to_owned(), "%q8.zero".to_owned());
 	for w in 0..4 {
-		ir.push_str(&format!("%w{w}.offset = add i64 %data, {at}\n%w{w}.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{w}.offset\n%w{w}.word = load i32, ptr addrspace(1) %w{w}.ptr, align 2\n%w{w}.shifted = lshr i32 %w{w}.word, %nibble.shift\n%w{w}.codes = and i32 %w{w}.shifted, 252645135\n%w{w}.sel = and i32 %w{w}.codes, 117901063\n%w{w}.lo = call i32 @recipe.perm(i32 {t1}, i32 {t0}, i32 %w{w}.sel)\n%w{w}.hi = call i32 @recipe.perm(i32 {t3}, i32 {t2}, i32 %w{w}.sel)\n%w{w}.top = lshr i32 %w{w}.codes, 3\n%w{w}.top.bits = and i32 %w{w}.top, 16843009\n%w{w}.mask = mul i32 %w{w}.top.bits, 255\n%w{w}.mask.not = xor i32 %w{w}.mask, -1\n%w{w}.hi.masked = and i32 %w{w}.hi, %w{w}.mask\n%w{w}.lo.masked = and i32 %w{w}.lo, %w{w}.mask.not\n%w{w}.levels = or i32 %w{w}.hi.masked, %w{w}.lo.masked\n%w{w}.q8.offset = add i64 %q8.half.offset, {q8at}\n%w{w}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8, i64 %w{w}.q8.offset\n%w{w}.q8 = load i32, ptr addrspace(3) %w{w}.q8.ptr, align 4\n%w{w}.dot.iq4 = call i32 @recipe.dot4.ss(i32 %w{w}.levels, i32 %w{w}.q8)\n%w{w}.dot.q80 = call i32 @recipe.dot4.ss(i32 %w{w}.word, i32 %w{w}.q8)\n%w{w}.dot.q4 = call i32 @recipe.dot4.su(i32 %w{w}.codes, i32 %w{w}.q8)\n%w{w}.dot.signed = select i1 %is.q80, i32 %w{w}.dot.q80, i32 %w{w}.dot.q4\n%w{w}.dot = select i1 %is.iq4, i32 %w{w}.dot.iq4, i32 %w{w}.dot.signed\n%w{w}.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %w{w}.q8)\n%w{w}.dot.acc = add i32 {dot_sum}, %w{w}.dot\n%w{w}.q8.acc = add i32 {q8_sum}, %w{w}.sum\n", at = w * 4, q8at = 4 + w * 4));
+		ir.push_str(&format!("%w{w}.offset = add i64 %data, {at}\n%w{w}.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{w}.offset\n%w{w}.word = load i32, ptr addrspace(1) %w{w}.ptr, align 2\n%w{w}.shifted = lshr i32 %w{w}.word, %nibble.shift\n%w{w}.codes = and i32 %w{w}.shifted, 252645135\n%w{w}.sel = and i32 %w{w}.codes, 117901063\n%w{w}.lo = call i32 @recipe.perm(i32 {t1}, i32 {t0}, i32 %w{w}.sel)\n%w{w}.hi = call i32 @recipe.perm(i32 {t3}, i32 {t2}, i32 %w{w}.sel)\n%w{w}.top = lshr i32 %w{w}.codes, 3\n%w{w}.top.bits = and i32 %w{w}.top, 16843009\n%w{w}.mask = mul i32 %w{w}.top.bits, 255\n%w{w}.mask.not = xor i32 %w{w}.mask, -1\n%w{w}.hi.masked = and i32 %w{w}.hi, %w{w}.mask\n%w{w}.lo.masked = and i32 %w{w}.lo, %w{w}.mask.not\n%w{w}.levels = or i32 %w{w}.hi.masked, %w{w}.lo.masked\n%w{w}.q8.offset = add i64 %q8.half.offset, {q8at}\n%w{w}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8, i64 %w{w}.q8.offset\n%w{w}.q8 = load i32, ptr addrspace(3) %w{w}.q8.ptr, align 4\n%w{w}.dot.iq4 = call i32 @recipe.dot4.ss(i32 %w{w}.levels, i32 %w{w}.q8)\n%w{w}.dot.q80 = call i32 @recipe.dot4.ss(i32 %w{w}.word, i32 %w{w}.q8)\n%w{w}.dot.q4 = call i32 @recipe.dot4.su(i32 %w{w}.codes, i32 %w{w}.q8)\n%w{w}.dot.signed = select i1 %is.q80, i32 %w{w}.dot.q80, i32 %w{w}.dot.q4\n%w{w}.dot = select i1 %is.iq4, i32 %w{w}.dot.iq4, i32 %w{w}.dot.signed\n%w{w}.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %w{w}.q8)\n%w{w}.dot.acc = add i32 {dot_sum}, %w{w}.dot\n%w{w}.q8.acc = add i32 {q8_sum}, %w{w}.sum\n", at = w * 4, q8at = q8_scale_bytes(state) + w * 4));
 		dot_sum = format!("%w{w}.dot.acc");
 		q8_sum = format!("%w{w}.q8.acc");
 	}
@@ -315,7 +669,7 @@ fn amd_block32_slice_helper(state: &str, full: bool) -> String {
 /// of a wave, so this helper keeps only four dot4 words live at once.
 fn amd_q4_slice_helper(state: &str, full: bool) -> String {
 	if !full {
-		return format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+		return format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: call void @llvm.trap() unreachable }}\n");
 	}
 	let mut ir = String::new();
 	ir.push_str(&format!("define internal {state} @recipe.q4k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
@@ -339,14 +693,13 @@ fn amd_q4_slice_helper(state: &str, full: bool) -> String {
 	ir.push_str(state);
 	ir.push_str(" %dmin, ");
 	ir.push_str(state);
-	ir.push_str(" %minimum.value)\n%pair = udiv i32 %group, 2\n%pair.wide = zext i32 %pair to i64\n%q4.base.part = mul i64 %pair.wide, 32\n%q4.base = add i64 %q4.base.part, 16\n%group.shift = and i32 %group, 1\n%q4.shift = mul i32 %group.shift, 4\n%half.wide = zext i32 %half to i64\n%q4.half.offset = mul i64 %half.wide, 16\n%q4.base.half = add i64 %q4.base, %q4.half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load float, ptr addrspace(3) %q8.d.ptr, align 4\n%q8.d.state = call ");
-	ir.push_str(state);
-	ir.push_str(" @recipe.state.from.f32(float %q8.d)\n");
+	ir.push_str(" %minimum.value)\n%pair = udiv i32 %group, 2\n%pair.wide = zext i32 %pair to i64\n%q4.base.part = mul i64 %pair.wide, 32\n%q4.base = add i64 %q4.base.part, 16\n%group.shift = and i32 %group, 1\n%q4.shift = mul i32 %group.shift, 4\n%half.wide = zext i32 %half to i64\n%q4.half.offset = mul i64 %half.wide, 16\n%q4.base.half = add i64 %q4.base, %q4.half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n%q8.group = zext i32 %group to i64\n");
+	ir.push_str(&format!("%q8.offset = mul i64 %q8.group, {q8_record}\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.state = load {state}, ptr addrspace(3) %q8.block, align {q8_align}\n", q8_record = q8_record(state), q8_align = q8_scale_bytes(state)));
 	let mut dot_sum = "%dot.zero".to_owned();
 	let mut q8_sum = "%q8.zero".to_owned();
 	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
 	for word in 0..4 {
-		let q8_offset = 4 + word * 4;
+		let q8_offset = q8_scale_bytes(state) + word * 4;
 		let word_offset = word * 4;
 		ir.push_str(&format!(
 			"%w{word}.q4.offset = add i64 %q4.base.half, {word_offset}\n%w{word}.q4.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.q4.offset\n%w{word}.q4.word = load i32, ptr addrspace(1) %w{word}.q4.ptr, align 2\n%w{word}.q4.shifted = lshr i32 %w{word}.q4.word, %q4.shift\n%w{word}.q4.codes = and i32 %w{word}.q4.shifted, 252645135\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8.word = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot = call i32 @recipe.dot4.su(i32 %w{word}.q4.codes, i32 %w{word}.q8.word)\n%w{word}.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %w{word}.q8.word)\n",
@@ -369,7 +722,7 @@ fn amd_q4_slice_helper(state: &str, full: bool) -> String {
 /// the order llama.cpp's Q4_K kernels use.
 fn q4_ints_helper(state: &str) -> String {
 	if !int_state(state) {
-		return "define internal i64 @recipe.q4k.ints(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: ret i64 0 }\n".to_owned();
+		return "define internal i64 @recipe.q4k.ints(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 { entry: call void @llvm.trap() unreachable }\n".to_owned();
 	}
 	let full = amd_q4_slice_helper(state, true);
 	let head = full.split("%dot.value = call").next().expect("the slice helper computes its int sums before its float tail");
@@ -388,27 +741,27 @@ fn q4_ints_helper(state: &str) -> String {
 /// eight accumulators add in a fixed tree at the end.
 fn q6_part_helper(state: &str) -> String {
 	if !int_state(state) {
-		return "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry: ret i64 0 }\n".to_owned();
+		return "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry: call void @llvm.trap() unreachable }\n".to_owned();
 	}
 	let full = amd_q6_slice_helper(state, true);
 	let head = full.split("%dot.zero = add i32 0, 0").next().expect("the slice helper computes its prelude before its words");
 	let head = head.replacen(&format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:"), "define internal i64 @recipe.q6k.part(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice, i32 %word) #1 { entry:", 1);
-	format!("{head}%word.wide = zext i32 %word to i64\n%word.offset = mul i64 %word.wide, 4\n%p.ql.offset = add i64 %half.ql.base, %word.offset\n%p.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.ql.offset\n%p.ql = load i32, ptr addrspace(1) %p.ql.ptr, align 2\n%p.ql.shifted = lshr i32 %p.ql, %ql.shift\n%p.ql.codes = and i32 %p.ql.shifted, 252645135\n%p.qh.offset = add i64 %half.qh.base, %word.offset\n%p.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.qh.offset\n%p.qh = load i32, ptr addrspace(1) %p.qh.ptr, align 2\n%p.qh.shifted = lshr i32 %p.qh, %qh.shift\n%p.qh.codes = and i32 %p.qh.shifted, 50529027\n%p.qh.bits = shl i32 %p.qh.codes, 4\n%p.codes = or i32 %p.ql.codes, %p.qh.bits\n%p.q8.offset.base = add i64 %q8.half.offset, 4\n%p.q8.offset = add i64 %p.q8.offset.base, %word.offset\n%p.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %p.q8.offset\n%p.q8 = load i32, ptr addrspace(3) %p.q8.ptr, align 4\n%p.dot = call i32 @recipe.dot4.su(i32 %p.codes, i32 %p.q8)\n%p.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %p.q8)\n%p.dot.scaled = mul i32 %scale, %p.dot\n%p.sum.scaled = mul i32 %scale, %p.sum\n%p.dot.wide = sext i32 %p.dot.scaled to i64\n%p.dot.high = shl i64 %p.dot.wide, 32\n%p.sum.wide = zext i32 %p.sum.scaled to i64\n%p.ints = or i64 %p.dot.high, %p.sum.wide\nret i64 %p.ints\n}}\n")
+	format!("{head}%word.wide = zext i32 %word to i64\n%word.offset = mul i64 %word.wide, 4\n%p.ql.offset = add i64 %half.ql.base, %word.offset\n%p.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.ql.offset\n%p.ql = load i32, ptr addrspace(1) %p.ql.ptr, align 2\n%p.ql.shifted = lshr i32 %p.ql, %ql.shift\n%p.ql.codes = and i32 %p.ql.shifted, 252645135\n%p.qh.offset = add i64 %half.qh.base, %word.offset\n%p.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %p.qh.offset\n%p.qh = load i32, ptr addrspace(1) %p.qh.ptr, align 2\n%p.qh.shifted = lshr i32 %p.qh, %qh.shift\n%p.qh.codes = and i32 %p.qh.shifted, 50529027\n%p.qh.bits = shl i32 %p.qh.codes, 4\n%p.codes = or i32 %p.ql.codes, %p.qh.bits\n%p.q8.offset.base = add i64 %q8.half.offset, {q8_scale}\n%p.q8.offset = add i64 %p.q8.offset.base, %word.offset\n%p.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %p.q8.offset\n%p.q8 = load i32, ptr addrspace(3) %p.q8.ptr, align 4\n%p.dot = call i32 @recipe.dot4.su(i32 %p.codes, i32 %p.q8)\n%p.sum = call i32 @recipe.dot4.su(i32 16843009, i32 %p.q8)\n%p.dot.scaled = mul i32 %scale, %p.dot\n%p.sum.scaled = mul i32 %scale, %p.sum\n%p.dot.wide = sext i32 %p.dot.scaled to i64\n%p.dot.high = shl i64 %p.dot.wide, 32\n%p.sum.wide = zext i32 %p.sum.scaled to i64\n%p.ints = or i64 %p.dot.high, %p.sum.wide\nret i64 %p.ints\n}}\n", q8_scale = q8_scale_bytes(state))
 }
 /// One 16-value Q6_K slice. Q6 scales are already 16 values wide, so the
 /// slice index names the scale directly; the two adjacent slices share one
 /// Q8_1 activation block.
 fn amd_q6_slice_helper(state: &str, full: bool) -> String {
 	if !full {
-		return format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: %zero = call {state} @recipe.state.from.u1(i1 false) ret {state} %zero }}\n");
+		return format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry: call void @llvm.trap() unreachable }}\n");
 	}
 	let mut ir = String::new();
 	ir.push_str(&format!("define internal {state} @recipe.q6k.slice(ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %q8, i32 %slice) #1 {{ entry:\n"));
 	ir.push_str("%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.ptr = getelementptr i8, ptr addrspace(1) %block, i64 208\n%d.bits = load half, ptr addrspace(1) %d.ptr, align 2\n%d = call ");
 	ir.push_str(state);
-	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%chunk = udiv i32 %slice, 8\n%group = udiv i32 %slice, 2\n%local = urem i32 %group, 4\n%half = and i32 %slice, 1\n%chunk.wide = zext i32 %chunk to i64\n%local.wide = zext i32 %local to i64\n%half.wide = zext i32 %half to i64\n%low.group = and i32 %local, 1\n%low.group.wide = zext i32 %low.group to i64\n%ql.extra = mul i64 %low.group.wide, 32\n%ql.base.part = mul i64 %chunk.wide, 64\n%ql.base = add i64 %ql.base.part, %ql.extra\n%qh.base.part = mul i64 %chunk.wide, 32\n%qh.base = add i64 %qh.base.part, 128\n%ql.shift.group = udiv i32 %local, 2\n%ql.shift = mul i32 %ql.shift.group, 4\n%qh.shift = mul i32 %local, 2\n%q8.group = zext i32 %group to i64\n%q8.offset = mul i64 %q8.group, 36\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 0\n%q8.d = load float, ptr addrspace(3) %q8.d.ptr, align 4\n%q8.d.state = call ");
-	ir.push_str(state);
-	ir.push_str(" @recipe.state.from.f32(float %q8.d)\n%scale.offset = add i32 %slice, 192\n%scale.offset.wide = zext i32 %scale.offset to i64\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset.wide\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%scale = sext i8 %scale.byte to i32\n%scale.state = call ");
+	ir.push_str(" @recipe.state.from.f16(half %d.bits)\n%chunk = udiv i32 %slice, 8\n%group = udiv i32 %slice, 2\n%local = urem i32 %group, 4\n%half = and i32 %slice, 1\n%chunk.wide = zext i32 %chunk to i64\n%local.wide = zext i32 %local to i64\n%half.wide = zext i32 %half to i64\n%low.group = and i32 %local, 1\n%low.group.wide = zext i32 %low.group to i64\n%ql.extra = mul i64 %low.group.wide, 32\n%ql.base.part = mul i64 %chunk.wide, 64\n%ql.base = add i64 %ql.base.part, %ql.extra\n%qh.base.part = mul i64 %chunk.wide, 32\n%qh.base = add i64 %qh.base.part, 128\n%ql.shift.group = udiv i32 %local, 2\n%ql.shift = mul i32 %ql.shift.group, 4\n%qh.shift = mul i32 %local, 2\n%q8.group = zext i32 %group to i64\n");
+	ir.push_str(&format!("%q8.offset = mul i64 %q8.group, {q8_record}\n%q8.block = getelementptr i8, ptr addrspace(3) %q8, i64 %q8.offset\n%q8.d.state = load {state}, ptr addrspace(3) %q8.block, align {q8_align}\n", q8_record = q8_record(state), q8_align = q8_scale_bytes(state)));
+	ir.push_str("%scale.offset = add i32 %slice, 192\n%scale.offset.wide = zext i32 %scale.offset to i64\n%scale.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %scale.offset.wide\n%scale.byte = load i8, ptr addrspace(1) %scale.ptr, align 1\n%scale = sext i8 %scale.byte to i32\n%scale.state = call ");
 	ir.push_str(state);
 	ir.push_str(" @recipe.state.from.s32(i32 %scale)\n%half.offset = mul i64 %half.wide, 16\n%half.ql.base = add i64 %ql.base, %half.offset\n%half.qh.base = add i64 %qh.base, %half.offset\n%q8.half.offset = mul i64 %half.wide, 16\n");
 	let mut dot_sum = "%dot.zero".to_owned();
@@ -416,7 +769,7 @@ fn amd_q6_slice_helper(state: &str, full: bool) -> String {
 	ir.push_str("%dot.zero = add i32 0, 0\n%q8.zero = add i32 0, 0\n");
 	for word in 0..4 {
 		let q_offset = word * 4;
-		let q8_offset = 4 + word * 4;
+		let q8_offset = q8_scale_bytes(state) + word * 4;
 		ir.push_str(&format!(
 			"%w{word}.ql.offset = add i64 %half.ql.base, {q_offset}\n%w{word}.ql.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.ql.offset\n%w{word}.ql = load i32, ptr addrspace(1) %w{word}.ql.ptr, align 2\n%w{word}.ql.shifted = lshr i32 %w{word}.ql, %ql.shift\n%w{word}.ql.codes = and i32 %w{word}.ql.shifted, 252645135\n%w{word}.qh.offset = add i64 %half.qh.base, {q_offset}\n%w{word}.qh.ptr = getelementptr i8, ptr addrspace(1) %block, i64 %w{word}.qh.offset\n%w{word}.qh = load i32, ptr addrspace(1) %w{word}.qh.ptr, align 2\n%w{word}.qh.shifted = lshr i32 %w{word}.qh, %qh.shift\n%w{word}.qh.codes = and i32 %w{word}.qh.shifted, 50529027\n%w{word}.qh.bits = shl i32 %w{word}.qh.codes, 4\n%w{word}.codes = or i32 %w{word}.ql.codes, %w{word}.qh.bits\n%w{word}.q8.offset = add i64 %q8.half.offset, {q8_offset}\n%w{word}.q8.ptr = getelementptr i8, ptr addrspace(3) %q8.block, i64 %w{word}.q8.offset\n%w{word}.q8 = load i32, ptr addrspace(3) %w{word}.q8.ptr, align 4\n%w{word}.dot.raw = call i32 @recipe.dot4.su(i32 %w{word}.codes, i32 %w{word}.q8)\n%w{word}.sum.raw = call i32 @recipe.dot4.su(i32 16843009, i32 %w{word}.q8)\n",
 			q_offset = q_offset,
@@ -440,6 +793,8 @@ fn amd_q6_slice_helper(state: &str, full: bool) -> String {
 /// serve every backend; a 32-lane wave takes the int8 helpers above instead.
 fn block_dot_helpers() -> String {
 	let mut ir = String::new();
+	ir.push_str("define internal RECIPE_STATE @recipe.block32.fp32(i32 %kind, ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %tile, i32 %column, i32 %pitch) #1 {\ncheck:\n%valid = icmp eq i32 %kind, 4\nbr i1 %valid, label %entry, label %invalid\ninvalid:\ncall void @llvm.trap()\nunreachable\nentry:\n%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call RECIPE_STATE @recipe.state.from.f16(half %d.bits)\n%weight.codes = getelementptr i8, ptr addrspace(1) %block, i64 2\n%base = mul i32 %column, 32\n%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)\nbr label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %next, %step ]\n%sum = phi RECIPE_STATE [ %zero, %entry ], [ %added, %step ]\n%more = icmp ult i32 %i, 32\nbr i1 %more, label %step, label %done\nstep:\n%c = add i32 %base, %i\n%within = and i32 %c, 15\n%quad = lshr i32 %within, 2\n%lane = and i32 %c, 3\n%group = lshr i32 %c, 4\n%row = mul i32 %quad, %pitch\n%group.offset = mul i32 %group, 4\n%row.group = add i32 %row, %group.offset\n%slot = add i32 %row.group, %lane\n%ap = getelementptr double, ptr addrspace(3) %tile, i32 %slot\n%a = load double, ptr addrspace(3) %ap, align 8\n%value = call RECIPE_STATE @recipe.decode(double %a)\n%wp = getelementptr i8, ptr addrspace(1) %weight.codes, i32 %i\n%w = load i8, ptr addrspace(1) %wp, align 1\n%wi = sext i8 %w to i32\n%weight = call RECIPE_STATE @recipe.state.from.s32(i32 %wi)\n%product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight, RECIPE_STATE %value)\n%added = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)\n%next = add i32 %i, 1\nbr label %loop\ndone:\n%result = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %d, RECIPE_STATE %sum)\nret RECIPE_STATE %result\n}\n");
+	ir.push_str("define internal RECIPE_STATE @recipe.block32.i16(i32 %kind, ptr addrspace(1) %weights, i64 %offset, ptr addrspace(3) %activation, i32 %slice) #1 {\ncheck:\n%valid = icmp eq i32 %kind, 4\nbr i1 %valid, label %entry, label %invalid\ninvalid:\ncall void @llvm.trap()\nunreachable\nentry:\n%block = getelementptr i8, ptr addrspace(1) %weights, i64 %offset\n%d.bits = load half, ptr addrspace(1) %block, align 2\n%d = call RECIPE_STATE @recipe.state.from.f16(half %d.bits)\n%s = load RECIPE_STATE, ptr addrspace(3) %activation, align RECIPE_STATE_ALIGN\n%codes = getelementptr i8, ptr addrspace(3) %activation, i64 RECIPE_STATE_ALIGN\n%weight.codes = getelementptr i8, ptr addrspace(1) %block, i64 2\nbr label %loop\nloop:\n%i = phi i32 [ 0, %entry ], [ %next, %step ]\n%sum = phi i32 [ 0, %entry ], [ %added, %step ]\n%more = icmp ult i32 %i, 32\nbr i1 %more, label %step, label %done\nstep:\n%wp = getelementptr i8, ptr addrspace(1) %weight.codes, i32 %i\n%w = load i8, ptr addrspace(1) %wp, align 1\n%ap = getelementptr i16, ptr addrspace(3) %codes, i32 %i\n%a = load i16, ptr addrspace(3) %ap, align 2\n%wi = sext i8 %w to i32\n%ai = sext i16 %a to i32\n%product = mul i32 %wi, %ai\n%added = add i32 %sum, %product\n%next = add i32 %i, 1\nbr label %loop\ndone:\n%integer = call RECIPE_STATE @recipe.state.from.s32(i32 %sum)\n%scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %d, RECIPE_STATE %integer)\n%result = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %scaled, RECIPE_STATE %s)\nret RECIPE_STATE %result\n}\n");
 	ir.push_str(&format!("@recipe_block32_iq4_levels = private unnamed_addr constant [16 x i8] [{}]\ndeclare i32 @llvm.fshr.i32(i32, i32, i32)\n", IQ4_LEVELS.iter().map(|level| format!("i8 {level}")).collect::<Vec<_>>().join(", ")));
 	// The activations of one slice: sixteen model values, one per channel, at
 	// the caller's stride, decoded into the state.
@@ -839,8 +1194,129 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 /// before the float encoder stores it. The store rounds through float, so a
 /// tie that double would round differently is the one place an acc64 block
 /// differs from a block whose whole arithmetic is double.
-fn widen_codec(codec: &str, value: &str) -> String {
+/// A double rounded once to a narrow float of `exp` exponent bits and `man`
+/// mantissa bits, as the LLVM type `llvm` (an integer of the format's width,
+/// or half / float for the native ones): round to nearest even from the
+/// double's own bits, a subnormal result kept, NaN quiet, and past the largest
+/// finite value the largest finite value when `saturate`, else infinity.
+fn double_encoder(name: &str, llvm: &str, exp: u32, man: u32, saturate: bool) -> String {
+	let bias = (1i64 << (exp - 1)) - 1;
+	let finite_e4m3 = llvm == "i8" && exp == 4 && man == 3;
+	let top = (1i64 << exp) - i64::from(!finite_e4m3);
+	let width = exp + man + 1;
+	let integer = format!("i{width}");
+	let quiet = if finite_e4m3 { 127 } else { (top << man) | (1i64 << (man - 1)) };
+	let infinity = if finite_e4m3 { 127 } else { top << man };
+	let largest = if finite_e4m3 { 126 } else { (top - 1) << man | ((1i64 << man) - 1) };
+	let overflow = if saturate || finite_e4m3 { largest } else { infinity };
+	let sign_shift = 63 - (width as i64 - 1);
+	let to_llvm = if llvm == integer { "%result = add {integer} %packed, 0".replace("{integer}", &integer) } else { format!("%result = bitcast {integer} %packed to {llvm}") };
+	format!(
+		"define internal {llvm} @{name}(double %value) #1 {{
+entry:
+%bits = bitcast double %value to i64
+%sign.wide = lshr i64 %bits, {sign_shift}
+%sign = and i64 %sign.wide, {sign_bit}
+%absolute = and i64 %bits, 9223372036854775807
+%exponent.field = lshr i64 %absolute, 52
+%mantissa = and i64 %absolute, 4503599627370495
+%nan = icmp ugt i64 %absolute, 9218868437227405312
+br i1 %nan, label %quiet, label %finite.check
+quiet:
+%quiet.bits = or i64 %sign, {quiet}
+br label %pack
+finite.check:
+%unbiased = sub i64 %exponent.field, 1023
+%target = add i64 %unbiased, {bias}
+%too.large = icmp sge i64 %target, {top}
+br i1 %too.large, label %over, label %range
+over:
+%over.bits = or i64 %sign, {overflow}
+br label %pack
+range:
+%normal = icmp sge i64 %target, 1
+br i1 %normal, label %round.normal, label %round.small
+round.normal:
+%keep = lshr i64 %mantissa, {drop}
+%rest = and i64 %mantissa, {rest_mask}
+%rest.above = icmp ugt i64 %rest, {half}
+%rest.tie = icmp eq i64 %rest, {half}
+%keep.odd = trunc i64 %keep to i1
+%tie.up = and i1 %rest.tie, %keep.odd
+%up = or i1 %rest.above, %tie.up
+%up.wide = zext i1 %up to i64
+%rounded = add i64 %keep, %up.wide
+%exponent.bits = shl i64 %target, {man}
+%normal.bits.raw = add i64 %exponent.bits, %rounded
+%normal.over = icmp sge i64 %normal.bits.raw, {infinity}
+%normal.bits.kept = select i1 %normal.over, i64 {overflow}, i64 %normal.bits.raw
+%normal.bits = or i64 %sign, %normal.bits.kept
+br label %pack
+round.small:
+%full = or i64 %mantissa, 4503599627370496
+%below = sub i64 1, %target
+%shift.raw = add i64 %below, {drop}
+%shift.far = icmp ugt i64 %shift.raw, 62
+%shift = select i1 %shift.far, i64 62, i64 %shift.raw
+%small.keep = lshr i64 %full, %shift
+%shift.less = sub i64 %shift, 1
+%small.half = shl i64 1, %shift.less
+%small.mask = sub i64 %small.half, 1
+%small.rest.mask = or i64 %small.mask, %small.half
+%small.rest = and i64 %full, %small.rest.mask
+%small.above = icmp ugt i64 %small.rest, %small.half
+%small.tie = icmp eq i64 %small.rest, %small.half
+%small.odd = trunc i64 %small.keep to i1
+%small.tie.up = and i1 %small.tie, %small.odd
+%small.up = or i1 %small.above, %small.tie.up
+%small.up.wide = zext i1 %small.up to i64
+%small.rounded = add i64 %small.keep, %small.up.wide
+%small.bits = or i64 %sign, %small.rounded
+br label %pack
+pack:
+%packed.wide = phi i64 [ %quiet.bits, %quiet ], [ %over.bits, %over ], [ %normal.bits, %round.normal ], [ %small.bits, %round.small ]
+%packed = trunc i64 %packed.wide to {integer}
+{to_llvm}
+ret {llvm} %result
+}}
+",
+		sign_bit = 1i64 << (width - 1),
+		drop = 52 - man,
+		rest_mask = (1i64 << (52 - man)) - 1,
+		half = 1i64 << (52 - man - 1),
+	)
+}
+/// An integer codec's double side: round to nearest even, clamp, NaN to zero.
+fn int_double_encoder(name: &str, format: IntFormat) -> String {
+	let minimum = -(1i64 << (format.bits - 1));
+	let maximum = (1i64 << (format.bits - 1)) - 1;
+	let mask = (1u64 << format.bits) - 1;
+	format!("define internal i8 @{name}(double %value) #1 {{ entry: %nan = fcmp uno double %value, %value %rounded = call double @llvm.roundeven.f64(double %value) %below = fcmp olt double %rounded, {minimum}.0 %above = fcmp ogt double %rounded, {maximum}.0 %lowered = select i1 %below, double {minimum}.0, double %rounded %clamped = select i1 %above, double {maximum}.0, double %lowered %finite = select i1 %nan, double 0.0, double %clamped %wide = fptosi double %finite to i32 %masked = and i32 %wide, {mask} %result = trunc i32 %masked to i8 ret i8 %result }}
+")
+}
+/// The double side of a model codec: what a double state rounds to on the
+/// way into the model type. A float model truncates once; every narrower
+/// model rounds once from the double's own bits.
+fn double_side(llvm: &str, value: &str) -> String {
+	match value {
+		"float" => "define internal float @recipe.encode(double %value) #1 { entry: %result = fptrunc double %value to float ret float %result }
+".to_owned(),
+		"half" => double_encoder("recipe.encode", "half", 5, 10, true),
+		"i16" => double_encoder("recipe.encode", "i16", 8, 7, false),
+		"i8" if llvm == "fp8" => double_encoder("recipe.encode", "i8", 4, 3, true),
+		"i8" if llvm == "fp8e5m2" => fp8_encoder("recipe.encode", FloatFormat::FP8_E5M2),
+		"i8" if llvm == "int8" => int_double_encoder("recipe.encode", IntFormat::INT8),
+		"i8" if llvm == "int4" => int_double_encoder("recipe.encode", IntFormat::INT4),
+		_ => panic!("no double side for the {llvm} codec of {value}"),
+	}
+}
+fn widen_codec_as(codec: &str, value: &str, kind: &str) -> String {
 	let narrow = codec.replace("@recipe.decode(", "@recipe.decode.narrow(").replace("@recipe.encode(", "@recipe.encode.narrow(");
+	if kind != "tf32" {
+		return format!("{narrow}
+define internal double @recipe.decode({value} %value) #1 {{ entry: %narrow = call float @recipe.decode.narrow({value} %value) %result = fpext float %narrow to double ret double %result }}
+{}", double_side(kind, value));
+	}
 	format!(
 		"{narrow}\ndefine internal double @recipe.decode({value} %value) #1 {{ entry: %narrow = call float @recipe.decode.narrow({value} %value) %result = fpext float %narrow to double ret double %result }}\ndefine internal {value} @recipe.encode(double %value) #1 {{ entry: %narrow = fptrunc double %value to float %result = call {value} @recipe.encode.narrow(float %narrow) ret {value} %result }}\n"
 	)
@@ -854,7 +1330,7 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &
 	let (start, end) = numeric_region(&ir)?;
 	let bits = format.storage.bits();
 	let codec = native_codec(llvm, format == FloatFormat::TF32);
-	let codec = if state == llvm { codec } else { widen_codec(&codec, llvm) };
+	let codec = if state == llvm { codec } else { widen_codec_as(&codec, llvm, if format == FloatFormat::TF32 { "tf32" } else { "float" }) };
 	let numeric = numeric_program(llvm, state, &codec);
 	let mut kernel = format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]);
 	kernel = word(kernel, "double", llvm).replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", &format!("align {}", bits / 8));
@@ -875,50 +1351,64 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &
 	}
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
-/// Rounding saturates a finite value above the format's range to its largest
-/// finite magnitude. Only a genuine infinity encodes as one, so an activation
-/// that leaves the range cannot make the whole model nonfinite.
-fn custom_numeric() -> String {
-	let mut block = String::from(
-		r#"; NUMERIC BEGIN
-@recipe_f_exp = internal addrspace(3) global i32 undef, align 4
-@recipe_f_man = internal addrspace(3) global i32 undef, align 4
-declare double @llvm.sqrt.f64(double)
-declare double @llvm.fabs.f64(double)
-declare double @llvm.floor.f64(double)
-declare i64 @llvm.ctlz.i64(i64, i1)
-declare double @llvm.roundeven.f64(double)
-define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: store atomic i32 %exp, ptr addrspace(3) @recipe_f_exp monotonic, align 4 store atomic i32 %man, ptr addrspace(3) @recipe_f_man monotonic, align 4 ret void }
-define internal double @recipe.f.power(i64 %exponent) #3 { entry: %high = icmp sgt i64 %exponent, 1023 br i1 %high, label %infinity, label %low.check infinity: ret double 0x7FF0000000000000 low.check: %low = icmp slt i64 %exponent, -1074 br i1 %low, label %zero, label %finite zero: ret double 0.0 finite: %normal = icmp sge i64 %exponent, -1022 br i1 %normal, label %power.normal, label %power.subnormal power.normal: %biased = add i64 %exponent, 1023 %normal.bits = shl i64 %biased, 52 %normal.result = bitcast i64 %normal.bits to double ret double %normal.result power.subnormal: %shift = add i64 %exponent, 1074 %subnormal.bits = shl i64 1, %shift %subnormal.result = bitcast i64 %subnormal.bits to double ret double %subnormal.result }
-define internal double @recipe.round(double %value) #3 { entry: %source = bitcast double %value to i64 %sign.source = lshr i64 %source, 63 %absolute.bits = and i64 %source, 9223372036854775807 %absolute = bitcast i64 %absolute.bits to double %exp.word = load atomic i32, ptr addrspace(3) @recipe_f_exp monotonic, align 4 %man.word = load atomic i32, ptr addrspace(3) @recipe_f_man monotonic, align 4 %exp = zext i32 %exp.word to i64 %man = zext i32 %man.word to i64 %total = add i64 %exp, %man %sign = shl i64 %sign.source, %total %exp.shift = sub i64 %exp, 1 %bias.one = shl i64 1, %exp.shift %bias = sub i64 %bias.one, 1 %exponent.one = shl i64 1, %exp %exponent.limit = sub i64 %exponent.one, 1 %mantissa.limit = shl i64 1, %man %nan = fcmp uno double %value, %value br i1 %nan, label %encode.nan, label %infinite.check encode.nan: %quiet.shift = sub i64 %man, 1 %quiet = shl i64 1, %quiet.shift %special.exponent = shl i64 %exponent.limit, %man %nan.base = or i64 %sign, %special.exponent %nan.bits = or i64 %nan.base, %quiet %nan.result = call double @recipe.f.decode(i64 %nan.bits) ret double %nan.result infinite.check: %infinite = fcmp oeq double %absolute, 0x7FF0000000000000 br i1 %infinite, label %encode.infinity, label %zero.check encode.infinity: %infinity.exponent = shl i64 %exponent.limit, %man %infinity.bits = or i64 %sign, %infinity.exponent %infinity.result = call double @recipe.f.decode(i64 %infinity.bits) ret double %infinity.result zero.check: %zero = fcmp oeq double %absolute, 0.0 br i1 %zero, label %encode.zero, label %finite encode.zero: %zero.bits = shl i64 %sign.source, 63 %zero.result = bitcast i64 %zero.bits to double ret double %zero.result finite: %minimum = sub i64 1, %bias %source.exponent.shifted = lshr i64 %absolute.bits, 52 %source.exponent = and i64 %source.exponent.shifted, 2047 %source.mantissa = and i64 %absolute.bits, 4503599627370495 %source.normal = icmp ne i64 %source.exponent, 0 br i1 %source.normal, label %source.normal.exponent, label %source.subnormal.exponent source.normal.exponent: %normal.unbiased = sub i64 %source.exponent, 1023 br label %source.exponent.ready source.subnormal.exponent: %leading.zeros = call i64 @llvm.ctlz.i64(i64 %source.mantissa, i1 false) %highest = sub i64 63, %leading.zeros %subnormal.unbiased = sub i64 %highest, 1074 br label %source.exponent.ready source.exponent.ready: %unbiased = phi i64 [ %normal.unbiased, %source.normal.exponent ], [ %subnormal.unbiased, %source.subnormal.exponent ] %subnormal = icmp slt i64 %unbiased, %minimum br i1 %subnormal, label %encode.subnormal, label %encode.normal encode.subnormal: %minimum.power = call double @recipe.f.power(i64 %minimum) %subnormal.ratio = fdiv double %absolute, %minimum.power %subnormal.scaled = uitofp i64 %mantissa.limit to double %subnormal.value = fmul double %subnormal.ratio, %subnormal.scaled %subnormal.rounded = call double @llvm.roundeven.f64(double %subnormal.value) %subnormal.mantissa = fptoui double %subnormal.rounded to i64 %subnormal.carry = icmp eq i64 %subnormal.mantissa, %mantissa.limit %subnormal.encoded = select i1 %subnormal.carry, i64 %mantissa.limit, i64 %subnormal.mantissa %subnormal.bits = or i64 %sign, %subnormal.encoded %subnormal.result = call double @recipe.f.decode(i64 %subnormal.bits) ret double %subnormal.result encode.normal: %power = call double @recipe.f.power(i64 %unbiased) %ratio = fdiv double %absolute, %power %fraction = fsub double %ratio, 1.0 %mantissa.scale = uitofp i64 %mantissa.limit to double %mantissa.value = fmul double %fraction, %mantissa.scale %mantissa.rounded = call double @llvm.roundeven.f64(double %mantissa.value) %mantissa.initial = fptoui double %mantissa.rounded to i64 %carry = icmp eq i64 %mantissa.initial, %mantissa.limit %carry.value = zext i1 %carry to i64 %final.unbiased = add i64 %unbiased, %carry.value %mantissa = select i1 %carry, i64 0, i64 %mantissa.initial %stored = add i64 %final.unbiased, %bias %overflow = icmp sge i64 %stored, %exponent.limit br i1 %overflow, label %encode.saturate, label %pack encode.saturate: %saturate.exponent = sub i64 %exponent.limit, 1 %saturate.shifted = shl i64 %saturate.exponent, %man %saturate.mantissa = sub i64 %mantissa.limit, 1 %saturate.base = or i64 %sign, %saturate.shifted %saturate.bits = or i64 %saturate.base, %saturate.mantissa %saturate.result = call double @recipe.f.decode(i64 %saturate.bits) ret double %saturate.result pack: %stored.bits = shl i64 %stored, %man %normal.base = or i64 %sign, %stored.bits %normal.bits = or i64 %normal.base, %mantissa %normal.result = call double @recipe.f.decode(i64 %normal.bits) ret double %normal.result }
-define internal double @recipe.f.decode(i64 %bits) #3 { entry: %exp.word = load atomic i32, ptr addrspace(3) @recipe_f_exp monotonic, align 4 %man.word = load atomic i32, ptr addrspace(3) @recipe_f_man monotonic, align 4 %exp = zext i32 %exp.word to i64 %man = zext i32 %man.word to i64 %total = add i64 %exp, %man %negative.bit = lshr i64 %bits, %total %negative = icmp ne i64 %negative.bit, 0 %exp.one = shl i64 1, %exp %exp.limit = sub i64 %exp.one, 1 %man.limit = shl i64 1, %man %shifted = lshr i64 %bits, %man %exponent = and i64 %shifted, %exp.limit %man.mask = sub i64 %man.limit, 1 %mantissa = and i64 %bits, %man.mask %special = icmp eq i64 %exponent, %exp.limit br i1 %special, label %decode.special, label %finite decode.special: %infinity = icmp eq i64 %mantissa, 0 %special.value = select i1 %infinity, double 0x7FF0000000000000, double 0x7FF8000000000000 br label %signed finite: %zero.exp = icmp eq i64 %exponent, 0 br i1 %zero.exp, label %decode.subnormal, label %decode.normal decode.subnormal: %zero.man = icmp eq i64 %mantissa, 0 br i1 %zero.man, label %decode.zero, label %subnormal decode.zero: br label %signed subnormal: %bias.shift = sub i64 %exp, 1 %bias.one = shl i64 1, %bias.shift %bias = sub i64 %bias.one, 1 %subnormal.exponent = sub i64 1, %bias %subnormal.power = call double @recipe.f.power(i64 %subnormal.exponent) %subnormal.man = uitofp i64 %mantissa to double %subnormal.limit = uitofp i64 %man.limit to double %subnormal.fraction = fdiv double %subnormal.man, %subnormal.limit %subnormal.value = fmul double %subnormal.power, %subnormal.fraction br label %signed decode.normal: %normal.bias.shift = sub i64 %exp, 1 %normal.bias.one = shl i64 1, %normal.bias.shift %normal.bias = sub i64 %normal.bias.one, 1 %normal.exponent = sub i64 %exponent, %normal.bias %normal.power = call double @recipe.f.power(i64 %normal.exponent) %normal.man = uitofp i64 %mantissa to double %normal.limit = uitofp i64 %man.limit to double %normal.fraction = fdiv double %normal.man, %normal.limit %normal.significand = fadd double 1.0, %normal.fraction %normal.value = fmul double %normal.power, %normal.significand br label %signed signed: %magnitude = phi double [ %special.value, %decode.special ], [ 0.0, %decode.zero ], [ %subnormal.value, %subnormal ], [ %normal.value, %decode.normal ] %negated = fneg double %magnitude %result = select i1 %negative, double %negated, double %magnitude ret double %result }
-"#,
-	);
-	block.push_str("define internal double @recipe.decode(double %value) #1 { entry: %result = call double @recipe.round(double %value) ret double %result }\ndefine internal double @recipe.encode(double %value) #1 { entry: %result = call double @recipe.round(double %value) ret double %result }\n");
-	numeric_program("double", "double", &block)
+fn fp8_encoder(name: &str, format: FloatFormat) -> String {
+	let mut ir = double_encoder(name, "i8", format.arithmetic.exp.into(), format.arithmetic.man.into(), true);
+	if format == FloatFormat::FP8_E5M2 {
+		// Preserve infinities, but saturate finite overflow consistently with the host.
+		ir = ir.replace("%over.bits = or i64 %sign, 123", "%input.infinity = icmp eq i64 %absolute, 9218868437227405312\n%over.magnitude = select i1 %input.infinity, i64 124, i64 123\n%over.bits = or i64 %sign, %over.magnitude");
+	}
+	ir
 }
-fn custom_ir(ir: String, suffix: &str) -> BuildResult<String> {
-	let (start, end) = numeric_region(&ir)?;
-	// The custom float carries its values in double, so the arithmetic type is
-	// the model type and the widening accumulator folds away.
-	Ok(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..])
-		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
-		.replace("RECIPE_MODEL_BYTES", "8")
-		.replace("RECIPE_STATE_ALIGN", "8")
-		.replace("RECIPE_STATE", "double")
-		.replace("@RECIPE_NUMERIC@", &custom_numeric()))
-}
-fn fp8_codec() -> &'static str {
-	// The codec stays out of line. It is the one narrow-float body that branches,
-	// so inlining it at every arithmetic site multiplies the kernel.
-	r#"define internal float @recipe.decode(i8 %value) #3 { entry: %wide = zext i8 %value to i32 %sign = and i32 %wide, 128 %exponent.shifted = lshr i32 %wide, 2 %exponent = and i32 %exponent.shifted, 31 %mantissa = and i32 %wide, 3 %zero.exponent = icmp eq i32 %exponent, 0 br i1 %zero.exponent, label %subnormal, label %nonzero subnormal: %mantissa.float = uitofp i32 %mantissa to float %negative = icmp ne i32 %sign, 0 %subnormal.value = select i1 %negative, float 0xBEF0000000000000, float 0x3EF0000000000000 %scaled = fmul float %mantissa.float, %subnormal.value ret float %scaled nonzero: %special = icmp eq i32 %exponent, 31 %biased.exponent = add i32 %exponent, 112 %float.exponent = select i1 %special, i32 255, i32 %biased.exponent %float.sign = shl i32 %sign, 24 %float.exponent.bits = shl i32 %float.exponent, 23 %float.mantissa = shl i32 %mantissa, 21 %signed = or i32 %float.sign, %float.exponent.bits %bits = or i32 %signed, %float.mantissa %result = bitcast i32 %bits to float ret float %result }
-define internal i8 @recipe.encode(float %value) #3 { entry: %bits = bitcast float %value to i32 %sign.shifted = lshr i32 %bits, 24 %sign = and i32 %sign.shifted, 128 %absolute = and i32 %bits, 2147483647 %exponent.shifted = lshr i32 %absolute, 23 %exponent = and i32 %exponent.shifted, 255 %mantissa = and i32 %absolute, 8388607 %special = icmp eq i32 %exponent, 255 br i1 %special, label %encode.special, label %finite encode.special: %nan = icmp ne i32 %mantissa, 0 %special.mantissa = select i1 %nan, i32 2, i32 0 %special.base = or i32 %sign, 124 %special.bits = or i32 %special.base, %special.mantissa %special.result = trunc i32 %special.bits to i8 ret i8 %special.result finite: %zero = icmp eq i32 %exponent, 0 br i1 %zero, label %encode.zero, label %range encode.zero: %zero.result = trunc i32 %sign to i8 ret i8 %zero.result range: %unbiased = sub i32 %exponent, 127 %overflow = icmp sgt i32 %unbiased, 15 br i1 %overflow, label %encode.infinity, label %normal.check encode.infinity: %infinity.bits = or i32 %sign, 124 %infinity.result = trunc i32 %infinity.bits to i8 ret i8 %infinity.result normal.check: %normal = icmp sge i32 %unbiased, -14 br i1 %normal, label %encode.normal, label %subnormal.check encode.normal: %stored = add i32 %unbiased, 15 %top = lshr i32 %mantissa, 21 %remainder = and i32 %mantissa, 2097151 %above = icmp ugt i32 %remainder, 1048576 %tie = icmp eq i32 %remainder, 1048576 %odd.bit = and i32 %top, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %top, %increment %carry = lshr i32 %rounded, 2 %final.exponent = add i32 %stored, %carry %rounded.overflow = icmp uge i32 %final.exponent, 31 br i1 %rounded.overflow, label %encode.infinity, label %normal.pack normal.pack: %final.mantissa = and i32 %rounded, 3 %exponent.bits = shl i32 %final.exponent, 2 %normal.base = or i32 %sign, %exponent.bits %normal.bits = or i32 %normal.base, %final.mantissa %normal.result = trunc i32 %normal.bits to i8 ret i8 %normal.result subnormal.check: %too.small = icmp slt i32 %unbiased, -17 br i1 %too.small, label %encode.zero, label %encode.subnormal encode.subnormal: %significand = or i32 %mantissa, 8388608 %shift = sub i32 7, %unbiased %subnormal.top = lshr i32 %significand, %shift %one = shl i32 1, %shift %mask = sub i32 %one, 1 %subnormal.remainder = and i32 %significand, %mask %half.shift = sub i32 %shift, 1 %half = shl i32 1, %half.shift %subnormal.above = icmp ugt i32 %subnormal.remainder, %half %subnormal.tie = icmp eq i32 %subnormal.remainder, %half %subnormal.odd.bit = and i32 %subnormal.top, 1 %subnormal.odd = icmp ne i32 %subnormal.odd.bit, 0 %subnormal.tie.odd = and i1 %subnormal.tie, %subnormal.odd %subnormal.round = or i1 %subnormal.above, %subnormal.tie.odd %subnormal.increment = zext i1 %subnormal.round to i32 %subnormal.mantissa = add i32 %subnormal.top, %subnormal.increment %subnormal.bits = or i32 %sign, %subnormal.mantissa %subnormal.result = trunc i32 %subnormal.bits to i8 ret i8 %subnormal.result }"#
+fn fp8_codec(format: FloatFormat) -> String {
+	let (man, exp) = (format.arithmetic.man, format.arithmetic.exp);
+	let bias = (1u32 << (exp - 1)) - 1;
+	let special = if format == FloatFormat::FP8 {
+		"%special = icmp eq i32 %magnitude, 127\n%special.bits = or i32 %float.sign, 2143289344".to_owned()
+	} else {
+		"%special = icmp uge i32 %magnitude, 124\n%special.base = or i32 %float.sign, 2139095040\n%special.bits = or i32 %special.base, %float.mantissa".to_owned()
+	};
+	let subnormal = f64::from(2.0_f32.powi(1 - bias as i32 - man as i32)).to_bits();
+	format!("define internal float @recipe.decode(i8 %value) #3 {{
+entry:
+%wide = zext i8 %value to i32
+%magnitude = and i32 %wide, 127
+%sign = and i32 %wide, 128
+%float.sign = shl i32 %sign, 24
+%exponent = lshr i32 %magnitude, {man}
+%mantissa = and i32 %wide, {mask}
+%float.mantissa = shl i32 %mantissa, {shift}
+%zero.exponent = icmp eq i32 %exponent, 0
+br i1 %zero.exponent, label %subnormal, label %normal
+subnormal:
+%mantissa.float = uitofp i32 %mantissa to float
+%scaled = fmul float %mantissa.float, 0x{subnormal:016X}
+%sub.bits = bitcast float %scaled to i32
+%sub.signed = or i32 %sub.bits, %float.sign
+%sub.value = bitcast i32 %sub.signed to float
+ret float %sub.value
+normal:
+%biased = add i32 %exponent, {offset}
+%exponent.bits = shl i32 %biased, 23
+%normal.base = or i32 %float.sign, %exponent.bits
+%normal.bits = or i32 %normal.base, %float.mantissa
+{special}
+%bits = select i1 %special, i32 %special.bits, i32 %normal.bits
+%result = bitcast i32 %bits to float
+ret float %result
+}}
+{}
+define internal i8 @recipe.encode(float %value) #3 {{ entry:
+%wide = fpext float %value to double
+%result = call i8 @recipe.fp8.encode(double %wide)
+ret i8 %result
+}}
+", fp8_encoder("recipe.fp8.encode", format), mask = (1u32 << man) - 1, shift = 23 - man, offset = 127 - bias)
 }
 fn bf16_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i16 %value) #1 { entry: %wide = zext i16 %value to i32 %bits = shl i32 %wide, 16 %result = bitcast i32 %bits to float ret float %result }
 define internal i16 @recipe.encode(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %upper = lshr i32 %bits, 16 %mantissa = and i32 %absolute, 8388607 %nan = icmp ne i32 %mantissa, 0 %quiet = or i32 %upper, 64 %special.bits = select i1 %nan, i32 %quiet, i32 %upper %lower = and i32 %bits, 65535 %above = icmp ugt i32 %lower, 32768 %tie = icmp eq i32 %lower, 32768 %odd.bit = and i32 %upper, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %upper, %increment %encoded = select i1 %special, i32 %special.bits, i32 %rounded %result = trunc i32 %encoded to i16 ret i16 %result }"#
 }
-fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn(f64) -> u64, state: &str) -> BuildResult<String> {
+fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn(f64) -> u64, state: &str, kind: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let llvm = match bytes {
 		1 => "i8",
@@ -926,7 +1416,7 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 		4 => "i32",
 		_ => "i64",
 	};
-	let codec = if state == "double" { widen_codec(codec, llvm) } else { codec.to_owned() };
+	let codec = if state == "double" { widen_codec_as(codec, llvm, kind) } else { codec.to_owned() };
 	let numeric = numeric_program(llvm, state, &codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", llvm)
 		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
@@ -946,7 +1436,7 @@ fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
 	// to its own extremes. A plain truncation encodes every larger result as an
 	// infinity, so one overflowing activation makes the whole model nonfinite.
 	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %below = fcmp olt float %value, -65504.0 %above = fcmp ogt float %value, 65504.0 %lowered = select i1 %below, float -65504.0, float %value %clamped = select i1 %above, float 65504.0, float %lowered %result = fptrunc float %clamped to half ret half %result }";
-	let codec = if state == "double" { widen_codec(codec, "half") } else { codec.to_owned() };
+	let codec = if state == "double" { widen_codec_as(codec, "half", "half") } else { codec.to_owned() };
 	let numeric = numeric_program("half", state, &codec);
 	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", "align 2");
 	kernel = kernel.replace("RECIPE_MODEL_BYTES", "2").replace("RECIPE_STATE_ALIGN", &state_align(state)).replace("RECIPE_STATE", state);
@@ -1162,20 +1652,20 @@ fn precision_bases(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, S
 		let tile = |key: &str| format!("_{}{}", key.trim_start_matches('-'), acc.replace('-', "_"));
 		bases.push((format!("-f32{acc}"), native_ir(ir.clone(), &tile("-f32"), "float", FloatFormat::FP32, state)?, "float", state, 4));
 		bases.push((format!("-f16{acc}"), half_ir(ir.clone(), &tile("-f16"), state)?, "half", state, 2));
-		bases.push((format!("-f8{acc}"), encoded_ir(ir.clone(), &tile("-f8"), FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value), state)?, "i8", state, 1));
-		bases.push((format!("-bf16{acc}"), encoded_ir(ir.clone(), &tile("-bf16"), FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value), state)?, "i16", state, 2));
+		for (key, kind, format) in [("-f8", "fp8", FloatFormat::FP8), ("-f8e5m2", "fp8e5m2", FloatFormat::FP8_E5M2)] {
+			bases.push((format!("{key}{acc}"), encoded_ir(ir.clone(), &tile(key), format.bytes(), &fp8_codec(format), |value| format.pack(value), state, kind)?, "i8", state, 1));
+		}
+		bases.push((format!("-bf16{acc}"), encoded_ir(ir.clone(), &tile("-bf16"), FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value), state, "bf16")?, "i16", state, 2));
 		bases.push((format!("-tf32{acc}"), native_ir(ir.clone(), &tile("-tf32"), "float", FloatFormat::TF32, state)?, "float", state, 4));
-		bases.push((format!("-int8{acc}"), encoded_ir(ir.clone(), &tile("-int8"), IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value), state)?, "i8", state, 1));
-		bases.push((format!("-int4{acc}"), encoded_ir(ir.clone(), &tile("-int4"), IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value), state)?, "i8", state, 1));
-		bases.push((format!("-int1{acc}"), encoded_ir(ir.clone(), &tile("-int1"), IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value), state)?, "i8", state, 1));
+		bases.push((format!("-int8{acc}"), encoded_ir(ir.clone(), &tile("-int8"), IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value), state, "int8")?, "i8", state, 1));
+		bases.push((format!("-int4{acc}"), encoded_ir(ir.clone(), &tile("-int4"), IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value), state, "int4")?, "i8", state, 1));
 	}
-	bases.push(("-f".to_owned(), custom_ir(ir, "_f")?, "double", "double", 8));
 	Ok(bases)
 }
 /// The state type a template base computes in: double for the fp64 and
 /// custom-float bases and for every `-acc64` sibling, float otherwise.
 fn template_state(base: &str) -> &'static str {
-	if base.is_empty() || base == "-f" || base.ends_with(ACC64) { "double" } else { "float" }
+	if base.is_empty() || base.ends_with(ACC64) { "double" } else { "float" }
 }
 fn wmma_source(source: &str) -> String {
 	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n")
@@ -1211,9 +1701,44 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
+/// The backward passes take the vector product with one operand staged in the
+/// arithmetic type: `_bs` reads B (the delta) as RECIPE_STATE after a model A and
+/// `_as` reads A (the delta) as RECIPE_STATE before a model B. Both are the vector
+/// kernel's own text with the fragment loads and the widening swapped, so the
+/// chunking, the owner and the fold order are the forward kernel's exactly.
+fn backward_accumulate_variants(ir: &str) -> BuildResult<String> {
+	let start = ir.find("define internal void @contraction_vector_accumulate(").ok_or("contraction_vector_accumulate is missing")?;
+	let tail = "\nexit:\nret void\n}\n";
+	let end = start + ir[start..].find(tail).ok_or("contraction_vector_accumulate has no end")? + tail.len();
+	let kernel = &ir[start..end];
+	let swap = |text: String, from: &str, to: &str| -> BuildResult<String> {
+		if !text.contains(from) {
+			return Err(format!("backward accumulate: {from} is missing").into());
+		}
+		Ok(text.replace(from, to))
+	};
+	let b_state = kernel
+		.replace("@contraction_vector_accumulate(", "@contraction_vector_accumulate_bs(")
+		.replace("@contraction_a_fragment(", "@contraction_a_fragment_vector(")
+		.replace("@contraction_b_fragment(", "@contraction_b_fragment_state(")
+		.replace("<RECIPE_REGISTER_N x double>", "<RECIPE_REGISTER_N x RECIPE_STATE>");
+	let b_state = swap(b_state, "%local.b = extractelement <RECIPE_REGISTER_N x RECIPE_STATE> %local.b.fragment, i32 %local.b.index\n%local.b.wide = call RECIPE_STATE @recipe.decode(double %local.b)\n", "%local.b.wide = extractelement <RECIPE_REGISTER_N x RECIPE_STATE> %local.b.fragment, i32 %local.b.index\n")?;
+	let b_state = swap(b_state, "%b = extractelement <RECIPE_REGISTER_N x RECIPE_STATE> %b.fragment, i32 %register.n\n%b.wide = call RECIPE_STATE @recipe.decode(double %b)\n", "%b.wide = extractelement <RECIPE_REGISTER_N x RECIPE_STATE> %b.fragment, i32 %register.n\n")?;
+	let a_state = kernel
+		.replace("@contraction_vector_accumulate(", "@contraction_vector_accumulate_as(")
+		.replace("@contraction_a_fragment(", "@contraction_a_fragment_state(")
+		.replace("@contraction_b_fragment(", "@contraction_b_fragment_after_state(")
+		.replace("<RECIPE_REGISTER_M x double>", "<RECIPE_REGISTER_M x RECIPE_STATE>");
+	let a_state = swap(a_state, "%local.a.wide = call <RECIPE_REGISTER_M x RECIPE_STATE> @contraction_widen_m(<RECIPE_REGISTER_M x RECIPE_STATE> %local.a.fragment)\n", "%local.a.wide = select i1 true, <RECIPE_REGISTER_M x RECIPE_STATE> %local.a.fragment, <RECIPE_REGISTER_M x RECIPE_STATE> %local.a.fragment\n")?;
+	let a_state = swap(a_state, "%a.wide = call <RECIPE_REGISTER_M x RECIPE_STATE> @contraction_widen_m(<RECIPE_REGISTER_M x RECIPE_STATE> %a.fragment)\n", "%a.wide = select i1 true, <RECIPE_REGISTER_M x RECIPE_STATE> %a.fragment, <RECIPE_REGISTER_M x RECIPE_STATE> %a.fragment\n")?;
+	Ok(format!("{}{b_state}{a_state}{}", &ir[..end], &ir[end..]))
+}
 fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let source = fs::read_to_string("amd-nv-cpu.ll")?;
-	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let source = backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?;
+	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER)
+		.replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers())
+		.replace("call void @llvm.amdgcn.s.barrier()", "call void @recipe.workgroup.barrier()")
+		.replace("; RECIPE_WAVE_HELPERS", &format!("{AMD_WORKGROUP_BARRIER}\n; RECIPE_WAVE_HELPERS"));
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
@@ -1222,7 +1747,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		let dot = if int_state(state) { AMD_DOT4_HELPERS } else { "" };
 		let ints = int_partial_helpers(state);
 		let helpers = format!("{}\n{}{}{}{}{}{}", helpers, dot, amd_q4_slice_helper(state, int_state(state)), amd_q6_slice_helper(state, int_state(state)), amd_block32_slice_helper(state, int_state(state)), ints, rope_math_helpers(state, false));
-		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &helpers);
+		let contents = with_glibc_declares(contents.replace("; RECIPE_WAVE_HELPERS", &helpers));
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
@@ -1252,7 +1777,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
@@ -1265,7 +1790,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
-		let contents = contents.replace("; RECIPE_WAVE_HELPERS", &nvidia_wave_helpers(template_state(base)));
+		let contents = with_glibc_declares(contents.replace("; RECIPE_WAVE_HELPERS", &nvidia_wave_helpers(template_state(base))));
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
@@ -1282,7 +1807,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let mut ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -1297,7 +1822,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let base = suffix.split("-kv").next().unwrap_or_default();
-		let contents = (contents + "\n" + &cpu_int8_helpers(template_state(base)))
+		let contents = (with_glibc_declares(contents + "\n" + &cpu_int8_helpers(template_state(base))))
 			.replace(" addrspace(1)", "")
 			.replace(" addrspace(3)", "")
 			.replace(", addrspace(5)", "")
@@ -1443,6 +1968,7 @@ fn main() -> BuildResult<()> {
 		compile_nvidia(&manifest, &out, &os, schedule)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
+	println!("cargo:rerun-if-changed=fp8.rs");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
 	Ok(())
 }

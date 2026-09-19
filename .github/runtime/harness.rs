@@ -65,15 +65,11 @@ const ACTIVATIONS: [&str; 10] = ["", ".relu()", ".gelu()", ".silu()", ".tanh()",
 const AVOID_FILED: bool = true;
 const NORMS: [&str; 7] = ["", "", "", ".norm(batch)", ".norm(layer)", ".norm(rms)", ".norm(l2)"];
 const NORMS_FILED: [&str; 6] = ["", "", "", ".norm(batch)", ".norm(rms)", ".norm(l2)"];
-const QUANTS: [&str; 7] = ["", "", "", ".qi(8).q0", ".qi(4).q1", ".qi(5).q0", ".qi(4).nf"];
-// The model builder spells the same quantization suffixes as tuple fields.
-const MODEL_QUANTS: [&str; 10] = ["", "", "", ".qi(8).0", ".qi(4).1", ".qi(5).0", ".qi(4).nf", ".qi(2).k", ".qi(3).k.s", ".iq(2).xxs"];
 const LOSSES: [&str; 6] = ["mse", "rmse", "huber", "mae", "bce", "focal"];
-// Every README precision: fp(8|16|32|64), int(1|4|8), bf(16), tf(32) and two computed formats
-// f(exp, mantissa), the e5m2 and e4m3 layouts of an 8-bit float. fp(32) keeps three entries so
-// a third of the trials stay at the reference precision.
-const PRECISIONS: [&str; 13] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(1)", ".f(5, 2)", ".f(4, 3)"];
-const PRECISIONS_FILED: [&str; 12] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(1)", ".f(5, 2)", ".f(4, 3)"];
+// Every model precision: fp(8|16|32|64), int(4|8|16|32), bf(16), and tf(32).
+// fp(32) keeps three entries so a third of trials stay at the reference precision.
+const PRECISIONS: [&str; 12] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
+const PRECISIONS_FILED: [&str; 11] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
 const ATTENTION_OPTIONS: [&str; 6] = ["", ".kv(1)", ".qk(rms)", ".qk(l2)", ".gate()", ".rope(neox, {width}, 10000.0)"];
 // Estimators take no activation, normalization or quantization.
 const ESTIMATORS: [&str; 7] = ["svm()", "bayes()", "cbst(8)", "xgbst(8)", "lgbm(8)", "kmeans(4)", "knn(3)"];
@@ -95,7 +91,7 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 // One README block in grammar order: operation, activation, normalization, quantization.
 // `member` restricts the operation to length-preserving ones and `width` pins its width for branch members.
 // `sequential` says whether a sequence still reaches this block, see `model`.
-fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<usize>, sequential: bool) -> String {
+fn block(cursor: u64, salt: u64, member: bool, width: Option<usize>, sequential: bool) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
@@ -117,11 +113,11 @@ fn block(cursor: u64, salt: u64, quants: &[&str], member: bool, width: Option<us
 		_ => format!("pool({})", 2 + (bits >> 8) % 3),
 	};
 	let norms: &[&str] = if AVOID_FILED { &NORMS_FILED } else { &NORMS };
-	format!("{operation}{}{}{}", pick(cursor, salt + 1, &ACTIVATIONS), pick(cursor, salt + 2, norms), pick(cursor, salt + 3, quants))
+	format!("{operation}{}{}", pick(cursor, salt + 1, &ACTIVATIONS), pick(cursor, salt + 2, norms))
 }
 
 fn branch(cursor: u64, salt: u64, count: usize, width: Option<usize>) -> String {
-	(0..count).map(|index| block(cursor, salt + 10 * index as u64, &QUANTS, AVOID_FILED, width, false)).collect::<Vec<_>>().join(", ")
+	(0..count).map(|index| block(cursor, salt + 10 * index as u64, AVOID_FILED, width, false)).collect::<Vec<_>>().join(", ")
 }
 
 fn composition(cursor: u64, salt: u64) -> String {
@@ -145,7 +141,7 @@ fn model(cursor: u64, precision: &str) -> String {
 	// either only asks Recipe for a kernel longer than the sequence (#214).
 	let mut sequential = dataset(cursor) == "data/numeric/sample_subfolders";
 	let mut push = |text: &mut String, salt: u64| {
-		let block = block(cursor, salt, &MODEL_QUANTS, false, None, sequential);
+		let block = block(cursor, salt, false, None, sequential);
 		sequential &= !ESTIMATORS.iter().any(|estimator| block.starts_with(estimator));
 		text.push('.');
 		text.push_str(&block);

@@ -40,35 +40,34 @@ let model = recipe.model()
 ```
 ```rust
 	.loss(mae|mse|...)|.loss(&evaluator)
-```
 ```r
-frozen.blck.atvn.norm.quant.prec = block
-  │      │    │    │    │     └─ precision it computes in
-  │      │    │    │    └─────── quantization it is stored in
-  │      │    │    └──────────── normalization
-  │      │    └───────────────── activation
-  │      └────────────────────── ""
-  └───────────────────────────── frozen qualifier
+frozen.blck.atvn.norm.prec = block
+  │      │    │    │    └─ precision it computes in
+  │      │    │    └────── normalization
+  │      │    └─────────── activation
+  │      └──────────────── ""
+  └─────────────────────── frozen qualifier
 ```
 
-Every block may name its own `quant` and `prec`: train writes the `quant`, infer reads what the file holds unless the block names another, and both compute in the `prec`. A precision names the op right before it: right after `layer(n)`, `attn(h)` or `embed(v, d)` it is that op's, the sum and how its numbers are stored; after `.kv(k)` it is the cache's; after `.gelu()`, `.norm(rms)`, `.qk(rms)`, `.rope(...)` or `.yarn(...)` it is the block's other ops'. `layer(n).int(8).gelu().fp(32)` is an int8 sum and an fp32 gelu. An int precision on a sum is its storage: int8 weights sit in VRAM as Q8_0 blocks and int4 as Q4_0 (a file plane already at that many bits or fewer, Q4_K or Q6_K under int8, is kept as it is), one step size per 32, multiplied as ints against int8 inputs rounded with their own step per 32, and scaled once per block — the same dot on AMD, NVIDIA and the CPU; every other precision loads its weights into itself once. Nothing decodes a weight in a kernel. `acc(32)` or `acc(64)` after a block names the accumulator its sums and statistics carry (`acc` in the table names the default, `norm-acc` or another `<kind>-acc` one kind's): `layer(n).fp(32).acc(64)` sums fp32 weights in fp64 and stores fp32, and a norm under `acc(64)` sums its fp32 squares in fp64 and finishes in fp32. `step(256)` after an int sum rounds its inputs one step per 256 the way llama.cpp's Q8_K does (`step` in the table names the default, 32), and a Q4_K or Q6_K plane under that step sums in llama.cpp's own order, block by block. `rope-angle = "chain"` in a table reaches each rope angle as llama.cpp does, the position times the base's power one fp32 product at a time, and rotates with fused multiply-adds against the CPU's libm trig; the default `direct` takes each frequency from one exponential. `attn-softmax = "online"` walks each query's keys in position order with a running maximum, the query and the value accumulator in the cache type, as llama.cpp's CPU attention does; the default `full` scores every key at once. `math = "libm"` takes the elementwise programs' exp, log, sin, cos and tanh from the CPU's libm (the portable evaluations stay on the GPUs); the default `portable` gives the same bits on every backend. An elementwise program computes in its block's state and rounds once to the block's precision on the way out, so `gelu().fp(16)` is an fp16 input, fp32 arithmetic and an fp16 result. `gelu-table = "fp16"` is llama.cpp's gelu exactly: that fp16 round trip between -10 and 10, the input itself at 10 and above, zero at -10 and below, on an fp32 gelu. A precision on `res([...])` is the add's alone; each part inside names its own. An op that names none takes the run's table: `[precision.<name>]` in Cargo.toml, chosen by `recipe run x.rs --config <name>`, with `default-config` under `[precision]`. Train and infer take no precision, and neither does `recipe.model()` before a block.
+Every block may name its compute precision. A precision names the operation right
+before it: after `layer(n)`, `attn(h)`, or `embed(v, d)` it names that operation;
+after `.kv(k)` it names the cache; after `.gelu()`, `.norm(rms)`, `.qk(rms)`,
+`.rope(...)`, or `.yarn(...)` it names that operation. File quantization is a
+load format and is not selected by the model API. An integer precision uses the
+canonical packed layout selected by the precision table. `acc(32)` or `acc(64)`
+names the accumulator. The table's `step` is the only activation block size. An
+operation that names no precision takes the selected `[precision.<name>]` table.
 
 ```rust
 let model = recipe.model()
-	.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
-	.layer(gemma3.feed_forward_length).gelu().qi(4).k.m.int(4)
-	.layer(gemma3.embedding_length).qi(8).0.fp(16)
-	.layer(tokenizer.ggml.tokens).qi(6).k.int(8);
+	.embed(tokenizer.ggml.tokens, gemma3.embedding_length).fp(16)
+	.layer(gemma3.feed_forward_length).int(4).gelu().fp(16)
+	.layer(gemma3.embedding_length).int(8)
+	.layer(tokenizer.ggml.tokens).int(8);
 
 recipe.train().run(&model, &data);
 recipe.infer().run(&model, &data);
 ```
-
-**blocks:**
-
-```rust
-blck:
-	layer(neurons)
 	conv(filters, kernel)
 	rnn(hidden)
 	gru(hidden)
@@ -116,27 +115,15 @@ norm:
 	.norm(layer)
 	.norm(rms)
 	.norm(l2)
-quant:
-	quantized integer:
-		.qi(4|5|8).(0|1)
-		.qi(2|6|8).k
-		.qi(3).k.[s|m|l]
-		.qi(4|5).k.[s|m]
-		.qi(4).nf
-	importance quantized:
-		.iq(1).(s|m)
-		.iq(2|3).(xxs|xs|s|m)
-		.iq(4).(xs|nl)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
 	.no(bias)
 prec:
 	.fp(8|16|32|64)
-	.int(1|4|8)
+	.int(4|8|16|32)
 	.bf(16)
 	.tf(32)
-	.f(exp, mantissa)
 ```
 
 **compositions**
@@ -184,3 +171,56 @@ recipe.infer().log([chat]).run(&model, &data);
 ```rust
 .tokens(count)
 ```
+
+## GGUF statistics
+
+```bash
+recipe stats model.gguf
+```
+
+The command streams one row at a time and prints each tensor's mean absolute
+weight, RMS, participation ratio, outlier rows, and normalized histogram. It uses
+the same GGUF decoders as model loading and does not expand a whole tensor in
+memory.
+
+## Precision and reference checks
+
+`.int(16)` stores and checkpoints weights as int8 blocks and quantizes activations
+to int16. `.int(32)` keeps the same int8 weight layout and uses unchanged fp32
+activations. Both apply each block's scale after its dot product.
+
+Each `[precision.<name>]` table declares these settings:
+
+```toml
+fp8 = "e4m3"       # Encoding for .fp(8); e5m2 is also supported.
+train = "fp32"     # Float arithmetic for integer checkpoint blocks.
+tolerance = 0.05   # Maximum absolute logit difference for this integer profile.
+exact-cpu = false  # The llamacpp profile sets this to true.
+```
+
+Integer checkpoint training supports `train = "fp16"`, `"bf16"`, `"fp32"`, and
+`"fp64"`. Forward weights and activations use that format. Parameter gradients,
+activation derivatives, and backward reduction buffers use the block's fp32 or
+fp64 accumulator; optimizer state uses the run's accumulator. Checkpoints retain
+the declared integer weight layout.
+
+Backward contractions and attention use vector kernels to preserve wide
+derivatives; forward matrix kernels remain eligible. Custom `recur([...])` bodies
+whose model and accumulator formats differ still fail explicitly. Built-in RNN,
+GRU, LSTM, and delta-rule backward kernels support wide derivatives.
+
+Finite FP8 overflow saturates; E4M3 has a maximum magnitude of 448, and E5M2
+preserves infinities.
+
+Set `RECIPE_REFERENCE_WRITE` to a file path to record a decode's full logits.
+Set `RECIPE_REFERENCE` to that path on a later run to compare them. Use one variable
+at a time. Recording replaces the named file. Both modes feed the reference
+winner into the next step, so random sampling cannot change the comparison prompt.
+Use the same initial prompt and token budget for both runs.
+
+The comparison reports maximum absolute error and token flips. A flip passes only
+if all logits meet the profile's tolerance and the reference scores the two winners
+within that tolerance. Other mismatches fail the run. `exact-cpu = true` requires
+identical logit bits when every selected device is a CPU; GPU runs use `tolerance`.
+Use `0.001` for fp32 profiles, `0.01` for fp16/bf16 profiles, and `0.05` for integer
+profiles.

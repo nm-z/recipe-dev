@@ -34,8 +34,9 @@ const server = http.createServer(async (req, res) => {
     send({ status: 'Loading model and preparing conversation…' });
     const child = spawn('flock', ['-x', '/home/nate/codex/rnj-estimate/gpu.lock', `${state}/rnj-chat`], {
       cwd: root, detached: true,
-      env: { ...process.env, RECIPE_DEVICE: 'amd0', RECIPE_PACKED_DOT: '1', RECIPE_HOST_SPILL: '1', RECIPE_TIMINGS: '1', RNJ_CONTEXT: '32768',
-        RNJ_TOKENS: String(tokens), RNJ_PROMPT_FILE: `${state}/prompt.txt`, RNJ_RAW_PROMPT: '1' },
+      env: { ...process.env, RECIPE_DEVICE: 'amd0', RECIPE_PACKED_DOT: '1', RECIPE_HOST_SPILL: '1', RECIPE_TIMINGS: '1', RNJ_CONTEXT: '32768', RECIPE_CONTEXT: '1024',
+        RNJ_TOKENS: String(tokens), RNJ_PROMPT_FILE: `${state}/prompt.txt`, RNJ_RAW_PROMPT: '1',
+             RECIPE_MESSAGE: messages[messages.length - 1].content },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     const decoder = new StringDecoder('utf8');
@@ -43,7 +44,7 @@ const server = http.createServer(async (req, res) => {
     child.stdout.on('data', chunk => send({ text: decoder.write(chunk) }));
     child.stderr.on('data', chunk => {
       log += chunk.toString();
-      const match = log.match(/RNJ-1: (\d+) prompt tokens/);
+      const match = log.match(/(\d+) prompt tokens/);
       if (match) send({ promptTokens: Number(match[1]) });
     });
     res.on('close', () => { if (child.exitCode === null) { try { process.kill(-child.pid, 'SIGTERM'); } catch {} } });
