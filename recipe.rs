@@ -2087,7 +2087,10 @@ impl NativeLayout {
 			// RECIPE_TRACE_REUSE=1 keeps the reuse under a trace, to read the values
 			// a reused slot held when a run without the trace went wrong.
 			let dumped = tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
-			let reuse = inference && !retained[index] && !dumped;
+			// Reuse remains an explicit experiment until every branched architecture
+			// has a retained-output proof. Gemma 4 becomes nonfinite in a long range
+			// under the current proof while the conservative layout stays finite.
+			let reuse = inference && !retained[index] && !dumped && std::env::var("RECIPE_VALUE_REUSE").as_deref() == Ok("1");
 			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
 				Some(position) => released.remove(position).1,
 				None => {
@@ -10120,9 +10123,10 @@ mod bundle {
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
 				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
 				let factors = if attention.factors { ",f=1" } else { "" };
+				let unscaled = if attention.unscaled { ",s=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}",
+					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -10237,7 +10241,7 @@ mod bundle {
 					),
 				};
 				let mut values = keys;
-				let (mut window, mut factors) = (0, false);
+				let (mut window, mut factors, mut unscaled) = (0, false, false);
 				for marker in first_marker.into_iter().chain(fields) {
 					if let Some(value) = marker.strip_prefix("v=") {
 						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
@@ -10245,6 +10249,8 @@ mod bundle {
 						window = value.parse().map_err(|error| RecipeError::new(format!("invalid attention window: {error}")))?;
 					} else if marker == "f=1" {
 						factors = true;
+					} else if marker == "s=1" {
+						unscaled = true;
 					} else {
 						return Err(RecipeError::new("attention record has extra fields"));
 					}
@@ -10260,6 +10266,7 @@ mod bundle {
 					gate,
 					window,
 					factors,
+					unscaled,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -11301,10 +11308,12 @@ struct AttentionBlock {
 	window: usize,
 	/// Whether the Rope node binds one proportional-frequency factor per pair.
 	factors: bool,
+	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
+	unscaled: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false }
 	}
 
 
@@ -14314,6 +14323,9 @@ impl<'a> Builder<'a> {
 			model = model.epsilon(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
+		if matches!(architecture, "gemma3" | "gemma4") {
+			model = model.scale((dimensions.width as f64).sqrt());
+		}
 		// The gather addresses rows of the file's own layout, so the block's
 		// storage format is the tensor's format rather than a selection.
 		require(!model.blocks.is_empty(), "the embedding block is absent")?;
@@ -15347,6 +15359,7 @@ pub struct Sampler {
 	penalty: f64,
 	window: usize,
 	state: u64,
+	suppressed: Vec<u32>,
 }
 impl Sampler {
 	pub fn temperature(mut self, value: f64) -> Self {
@@ -15385,6 +15398,8 @@ impl Sampler {
 			let logit = &mut candidates[*id as usize].1;
 			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
 		}
+		candidates.retain(|(id, _)| !self.suppressed.contains(id));
+		assert!(!candidates.is_empty(), "sampler suppressed every logit");
 		if self.temperature <= 0.0 {
 			return candidates.iter().max_by(|left, right| left.1.total_cmp(&right.1).then(right.0.cmp(&left.0))).unwrap().0;
 		}
@@ -15428,7 +15443,7 @@ pub struct Generation {
 }
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
-		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15 }
+		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15, suppressed: Vec::new() }
 	}
 	/// Autoregressive decode over a saved model on the primary device: the
 	/// model placed as one range, decoded by [`Placed::decode`] over one tape.
@@ -15573,7 +15588,7 @@ fn decode_steps(
 /// its named-input transforms, while a bound graph reads its input directly.
 enum PlacedSource {
 	Saved(Vec<bundle::SemanticGraph>),
-	Bound(Shape),
+	Bound(Shape, Vec<u32>),
 }
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
@@ -15822,8 +15837,13 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	let samples = vec![0.0; positions];
 	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
 	let input = graph.input;
+	let suppressed = match model.file.value("tokenizer.ggml.suppress_tokens") {
+		Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| RecipeError::new("tokenizer suppress_tokens contains an invalid id"))).collect::<Result<Vec<_>>>()?,
+		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
+		None => Vec::new(),
+	};
 	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), split, tapes: vec![ranges], resident, moved })
 }
 impl Placed {
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
@@ -15863,6 +15883,9 @@ impl Placed {
 		let first = self.tapes.first().and_then(|tapes| tapes.first()).ok_or_else(|| RecipeError::new("placement has no tape"))?;
 		let exact = first.profile.exact_cpu && self.tapes.iter().flatten().all(|tape| tape.program.gpu.backend == Backend::Cpu);
 		let mut reference = reference::Reference::open(f64::from_bits(first.profile.tolerance), exact).map_err(RecipeError::new)?;
+		if let PlacedSource::Bound(_, suppressed) = &self.source {
+			sampler.suppressed.clone_from(suppressed);
+		}
 		let sequence = match &self.source {
 			PlacedSource::Saved(graphs) => match graphs.as_slice() {
 				[only] => {
@@ -15871,7 +15894,7 @@ impl Placed {
 				}
 				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
 			},
-			PlacedSource::Bound(input) => {
+			PlacedSource::Bound(input, _) => {
 				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
 				input.elements()
 			}
@@ -15889,7 +15912,14 @@ impl Placed {
 			let reached = narrow(generation.ids.len(), "decode position")? as u32;
 			let started = std::time::Instant::now();
 			let predictions = self.run_window(&samples, settled, reached)?;
-			let sample_logits = self.last_logits(&predictions, settled, reached)?;
+			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
+			if let PlacedSource::Bound(_, suppressed) = &self.source {
+				for id in suppressed {
+					if let Some(logit) = sample_logits.get_mut(*id as usize) {
+						*logit = -f64::MAX;
+					}
+				}
+			}
 			let reference_id = reference.step(step, &sample_logits).map_err(RecipeError::new)?;
 			trace_logits(step, &sample_logits)?;
 			let seconds = started.elapsed().as_secs_f64();
@@ -15930,7 +15960,7 @@ impl Placed {
 					self.forward_window(ranges, prepared, begin, end)
 				})
 			}
-			PlacedSource::Bound(input) => {
+			PlacedSource::Bound(input, _) => {
 				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
 				self.forward_window(ranges, samples, begin, end)
@@ -17178,10 +17208,11 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
+	require(!unscaled || index.is_none(), "unscaled attention and sparse indexing cannot share one block")?;
 	require(heads != 0, "attention head partition is invalid")?;
 	if width == 0 && keys == heads && values == heads && graph.output.channels % heads != 0 {
 		let requested = heads;
@@ -17296,7 +17327,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		side = graph.source;
 		reset(graph, main, main_shape);
 	}
-	let epsilon = graph.epsilon;
+	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
 	graph.block_precision = ordinary_precision;
 	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
 	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
@@ -18514,6 +18545,12 @@ mod precision_contract_checks {
 		assert!(!cuts_connection(&graph, 1));
 		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
 		assert!(cuts_connection(&graph, 2));
+	}
+	#[test]
+	fn sampler_never_selects_suppressed_tokens() {
+		let mut sampler = recipe.sampler().temperature(0.0);
+		sampler.suppressed = vec![1];
+		assert_eq!(sampler.sample(&[0.0, 10.0, 5.0], &[]), 2);
 	}
 	#[test]
 	fn precision_suffix_scope_is_local_and_explicit() {

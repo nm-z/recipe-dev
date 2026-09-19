@@ -4742,7 +4742,7 @@ ret void
 ; accumulated in the cache type (one fma, rounded, per key), the sum as
 ; fma(S, ms, vs), and the output the accumulator times one over the sum.
 define internal void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context,
-i64 %row.stride, i64 %row.cache, i64 %output.row, i32 %head, i32 %position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %width, i32 %length, i1 %gate, i64 %gate.row) #1 {
+i64 %row.stride, i64 %row.cache, i64 %output.row, i32 %head, i32 %position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %width, i32 %length, i1 %unscaled, i1 %gate, i64 %gate.row) #1 {
 entry:
 %q16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
 %v16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
@@ -4760,7 +4760,8 @@ entry:
 %position.wide = zext i32 %position to i64
 %width.state = call RECIPE_STATE @recipe.state.from.u32(i32 %width)
 %root = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %width.state)
-%q.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %root)
+%q.scale.default = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %root)
+%q.scale = select i1 %unscaled, RECIPE_STATE %one, RECIPE_STATE %q.scale.default
 %head.channel = mul i32 %head, %width
 %kv.channel = mul i32 %kv.head, %width
 %value.channel = mul i32 %value.head, %width
@@ -5006,7 +5007,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %length = udiv i32 %from, %channels
 %head.width = udiv i32 %channels, %heads
 %head.width.double = call double @recipe.from.u32(i32 %head.width)
-%scale = call double @recipe.sqrt(double %head.width.double)
+%scale.default = call double @recipe.sqrt(double %head.width.double)
+%attention.zero = call double @recipe.from.u32(i32 0)
+%attention.one = call double @recipe.from.u32(i32 1)
+%unscaled = call i1 @recipe.ogt(double %attention.zero, double %epsilon)
+%scale = select i1 %unscaled, double %attention.one, double %scale.default
 %kv.group = udiv i32 %heads, %kv.heads
 %value.group = udiv i32 %heads, %value.heads
 %kv.channels = mul i32 %kv.heads, %head.width
@@ -5123,7 +5128,7 @@ online.query.step:
 %oq.row.cache = mul i64 %oq.row.wide, %kv.planes.global
 %oq.output.row = mul i64 %oq.row.wide, %from.global
 %oq.gate.row = add i64 %oq.row.stride, %gate.base.global
-call void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context, i64 %oq.row.stride, i64 %oq.row.cache, i64 %oq.output.row, i32 %oq.head, i32 %oq.position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %head.width, i32 %length, i1 %gate, i64 %oq.gate.row)
+call void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context, i64 %oq.row.stride, i64 %oq.row.cache, i64 %oq.output.row, i32 %oq.head, i32 %oq.position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %head.width, i32 %length, i1 %unscaled, i1 %gate, i64 %oq.gate.row)
 %oq.next = add i32 %oq, %threads
 br label %online.query.loop
 job.loop:
@@ -5565,7 +5570,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %length = udiv i32 %from, %channels
 %head.width = udiv i32 %channels, %heads
 %width.double = call double @recipe.from.u32(i32 %head.width)
-%scale = call double @recipe.sqrt(double %width.double)
+%scale.default = call double @recipe.sqrt(double %width.double)
+%attention.zero = call double @recipe.from.u32(i32 0)
+%attention.one = call double @recipe.from.u32(i32 1)
+%unscaled = call i1 @recipe.ogt(double %attention.zero, double %epsilon)
+%scale = select i1 %unscaled, double %attention.one, double %scale.default
 br i1 %carry, label %attention.cache.entry, label %attention.cache.done
 attention.cache.entry:
 call void @attention_cache_body( ptr addrspace(1) %input, ptr addrspace(1) %kv.context, i32 %rows, i32 %from, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %length, i32 %threads )
@@ -5927,7 +5936,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %length = udiv i32 %from, %channels
 %head.width = udiv i32 %channels, %heads
 %width.double = call double @recipe.from.u32(i32 %head.width)
-%scale = call double @recipe.sqrt(double %width.double)
+%scale.default = call double @recipe.sqrt(double %width.double)
+%attention.zero = call double @recipe.from.u32(i32 0)
+%attention.one = call double @recipe.from.u32(i32 1)
+%unscaled = call i1 @recipe.ogt(double %attention.zero, double %epsilon)
+%scale = select i1 %unscaled, double %attention.one, double %scale.default
 %head.jobs = mul i32 %rows, %heads
 %statistics.rows = mul i32 %head.jobs, %length
 %head.values = mul i32 %length, %head.width
@@ -6198,7 +6211,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %length = udiv i32 %from, %channels
 %head.width = udiv i32 %channels, %heads
 %head.width.double = call double @recipe.from.u32(i32 %head.width)
-%scale = call double @recipe.sqrt(double %head.width.double)
+%scale.default = call double @recipe.sqrt(double %head.width.double)
+%attention.zero = call double @recipe.from.u32(i32 0)
+%attention.one = call double @recipe.from.u32(i32 1)
+%unscaled = call i1 @recipe.ogt(double %attention.zero, double %epsilon)
+%scale = select i1 %unscaled, double %attention.one, double %scale.default
 %scale.wide = call RECIPE_STATE @recipe.decode(double %scale)
 %kv.group = udiv i32 %heads, %kv.heads
 %value.group = udiv i32 %heads, %value.heads
