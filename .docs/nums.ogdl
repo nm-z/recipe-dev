@@ -1,5 +1,59 @@
-layer
-	neurons
-		parameters
-			weights
-			biases
+FP16:
+	64 bits
+		[−2048, 2048]
+	4 numbers
+		4xFP16
+	3 ops
+		2 mult
+		1 add
+	x₁ · w₁    + x₂ · w₂
+	1.5·0.0137 + 0.8·(−0.0042) = 0.01719
+FP32:
+	128 bits
+		[−16777216, 16777216]
+	4 numbers
+		4xFP32
+	3 ops
+		2 mult
+		1 add
+	x₁ · w₁    + x₂ · w₂
+	1.5·0.0137 + 0.8·(−0.0042) = 0.01719
+Q4_K:
+	104 bits
+	6 numbers
+		2xINT4
+		2xFP16
+		2xFP32
+	7 ops
+		4 mult
+		3 add
+	x₁ ·(q₁·d       − m)      + x₂  ·(q₂·d       − m)
+	1.5·(15·0.001193 − 0.0042) + 0.8·(0·0.001193 − 0.0042) = 0.01719
+INT4:
+	64 bits
+		[−8, 7]  or  [0, 15]
+	7 numbers
+		4xINT4
+		2xFP16
+		1xFP16
+	8 ops
+		5 mult
+		3 add
+	step size (d)
+		d = (max(block) - min(block)) / 15
+		q = -min(block)
+	(d       (q₁k₁ + q₂k₂)  − m     (k₁ + k₂)) · s
+	(0.001193(15·7 + 0·4 )  − 0.0042(7 + 4))   · 0.2143 = 0.01694
+INT8:
+	72 bits
+		[−128, 127]
+	7 numbers
+		2xINT4
+		2xFP16
+		2xINT8
+		1xFP16
+	8 ops
+		5 mult
+		3 add
+	(d       (q₁k₁  + q₂k₂)  − m     (k₁  + k₂)) · s
+	(0.001193(15·127 + 0·68) − 0.0042(127 + 68)) · 0.01181 = 0.01718
