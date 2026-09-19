@@ -68,6 +68,18 @@ let model = recipe.model()
 recipe.train().run(&model, &data);
 recipe.infer().run(&model, &data);
 ```
+
+Attention suffixes are independent. This keeps Q/K normalization narrow while
+rotary constants and chained angles stay fp32:
+
+```rb
+attn(heads).int(8)
+	.kv(kv_heads).fp(16)
+	.qk(rms).fp(16)
+	.rope(neox, head_width, rope_base)
+	.yarn(factor, original_context, fast, slow).fp(32)
+```
+
 	conv(filters, kernel)
 	rnn(hidden)
 	gru(hidden)
