@@ -184,6 +184,15 @@ recipe.infer().log([chat]).run(&model, &data);
 .tokens(count)
 ```
 
+## Resident RNJ chat
+
+Run `rnj-chat/start.sh` to serve the local page on `127.0.0.1:8766`. The Rust
+worker loads and places the model once, then accepts every conversation over one
+pipe. Each request sends the complete conversation and its selected reply budget.
+Each reply keeps a statistics line with the device, resolved instruction routes,
+prefill time, decode time, and tok/s. Set `RECIPE_DEVICE` and `RECIPE_CONTEXT`
+before starting the server to override its `amd0` and 1,024-position defaults.
+
 ## GGUF statistics
 
 ```bash
