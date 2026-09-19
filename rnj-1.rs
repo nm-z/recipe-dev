@@ -1,6 +1,9 @@
 use recipe::*;
 
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
+// llama.cpp's Gemma3 loader uses this architecture default and ignores the
+// file's stray yarn_beta_fast = 64 metadata.
+const YARN_FAST: f64 = 32.0;
 #[rustfmt::skip]
 fn main() {
 	let data = recipe.data(GGUF);
@@ -25,9 +28,9 @@ fn main() {
 					.yarn(
 						gemma3.rope.scaling.factor,
 						gemma3.rope.scaling.original_context_length,
-						gemma3.rope.scaling.yarn_beta_fast,
+						YARN_FAST,
 						gemma3.rope.scaling.yarn_beta_slow
-					),
+					).fp(32),
 				norm(rms).fp(16),
 			]).fp(16)
 			.res([

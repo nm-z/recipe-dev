@@ -3797,8 +3797,10 @@ impl NativeModelIr {
 					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @{body}{v}( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
+							weights = pointers.weights,
+							has_factors = node.parameters != 0,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -6948,13 +6950,14 @@ impl NativeModelIr {
 /// state so narrow or integer model encodings cannot clip it.
 fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { node.argument[1] as usize } else { node.argument[8] as usize } }
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
+	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
 		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
-		block = integer_argument(node.argument[3], "indexer block")?,
+		block = block,
 		gate = node.argument[2] != 0.0,
 		model_ty = precision.model_type,
 		state_ty = precision.state_type,
@@ -8778,6 +8781,17 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+			if self.family == Family::Gemma4 {
+				let mut prompt = String::new();
+				for (role, content) in messages {
+					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
+					prompt.push_str(&format!("<|turn>{role}\n{}<turn|>\n", content.trim()));
+				}
+				if generation {
+					prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+				}
+				return Ok(prompt);
+			}
 			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
 			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
 			let conversation = messages
@@ -10104,9 +10118,11 @@ mod bundle {
 				let index = attention.index.unwrap_or(Indexer::NONE);
 				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
+				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
+				let factors = if attention.factors { ",f=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}",
+					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -10207,9 +10223,9 @@ mod bundle {
 				// value-head marker may appear immediately after width when YaRN is
 				// absent, so it cannot be mistaken for a yarn factor.
 				let first_optional = fields.next();
-				let (yarn, value_marker) = match first_optional {
+				let (yarn, first_marker) = match first_optional {
 					None => (None, None),
-					Some(value) if value.starts_with("v=") => (None, Some(value)),
+					Some(value) if value.contains('=') => (None, Some(value)),
 					Some(factor) => (
 						Some((
 							value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
@@ -10220,11 +10236,19 @@ mod bundle {
 						fields.next(),
 					),
 				};
-				let values = match value_marker {
-					None => keys,
-					Some(value) => value.strip_prefix("v=").ok_or_else(|| RecipeError::new("attention record has extra fields"))?.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?,
-				};
-				require(fields.next().is_none(), "attention record has extra fields")?;
+				let mut values = keys;
+				let (mut window, mut factors) = (0, false);
+				for marker in first_marker.into_iter().chain(fields) {
+					if let Some(value) = marker.strip_prefix("v=") {
+						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
+					} else if let Some(value) = marker.strip_prefix("w=") {
+						window = value.parse().map_err(|error| RecipeError::new(format!("invalid attention window: {error}")))?;
+					} else if marker == "f=1" {
+						factors = true;
+					} else {
+						return Err(RecipeError::new("attention record has extra fields"));
+					}
+				}
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
@@ -10234,6 +10258,8 @@ mod bundle {
 					yarn,
 					index: (index.block != 0).then_some(index),
 					gate,
+					window,
+					factors,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -10328,7 +10354,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|-|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -10340,12 +10366,16 @@ mod bundle {
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
 			precision_token(block.blck_precision),
-			precision_token(block.acc)
+			precision_token(block.acc),
+			precision_token(block.qk_precision),
+			precision_token(block.rope_precision),
+			precision_token(block.activation_precision),
+			precision_token(block.norm_precision)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17), "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -10358,6 +10388,10 @@ mod bundle {
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
 			acc: fields.get(11).map_or(Ok(None), |field| precision_from_token(field))?,
+			qk_precision: fields.get(13).map_or(Ok(None), |field| precision_from_token(field))?,
+			rope_precision: fields.get(14).map_or(Ok(None), |field| precision_from_token(field))?,
+			activation_precision: fields.get(15).map_or(Ok(None), |field| precision_from_token(field))?,
+			norm_precision: fields.get(16).map_or(Ok(None), |field| precision_from_token(field))?,
 			suffix: Suffix::End,
 		})
 	}
@@ -10838,7 +10872,7 @@ mod bundle {
 		feed(&format!("precision:{precision:?};"));
 		feed(&format!("loss:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
-			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
+		feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.storage, node.output.elements()));
 		}
 		format!("recipe-native-{hash:016x}")
 	}
@@ -10930,6 +10964,24 @@ mod bundle {
 			}
 		}
 		Ok(result)
+	}
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		#[test]
+		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
+			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
+			let text = block_text(&original);
+			assert_eq!(split_escaped(&text, '|').len(), 17);
+			assert_eq!(block(&text).unwrap(), original);
+			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
+			let legacy = block(legacy).unwrap();
+			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
+			assert_eq!(legacy.qk_precision, None);
+			assert_eq!(legacy.rope_precision, None);
+			assert_eq!(legacy.activation_precision, None);
+			assert_eq!(legacy.norm_precision, None);
+		}
 	}
 }
 #[cfg(unix)]
@@ -11097,7 +11149,7 @@ pub const fn conv(filters: usize, kernel: usize) -> Block {
 }
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
-	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+	Block { normalization: Some(normalization.normalization()), suffix: Suffix::Norm, ..Block::of(Operation::Identity) }
 }
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
@@ -11244,10 +11296,15 @@ struct AttentionBlock {
 	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
+	/// A sliding layer attends fully only up to this many positions. Longer
+	/// contexts are rejected until the attention kernel carries the mask.
+	window: usize,
+	/// Whether the Rope node binds one proportional-frequency factor per pair.
+	factors: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false }
 	}
 
 
@@ -11451,7 +11508,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::End } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, acc: None, suffix: Suffix::Activation } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -11508,8 +11565,8 @@ pub struct Block {
 	quantization: u16,
 	profile: bool,
 	frozen: bool,
-	/// The precision of the block's other ops (its atvn, norm, qk, rope, yarn,
-	/// or a residual's add), named by a precision after one of them.
+	/// The precision of an activation, output normalization, composition, or
+	/// residual add named by a suffix immediately after that operation.
 	precision: Option<Compute>,
 	/// The precision of the op that holds the block's numbers (a layer's sum,
 	/// attention, an embedding's lookup), named by a precision right after it.
@@ -11517,13 +11574,19 @@ pub struct Block {
 	/// The format an attention block keeps its key-value cache in, named by a
 	/// precision after `.kv(heads)`.
 	kv_precision: Option<Compute>,
+	/// The arithmetic of the query and key normalization named after `.qk(...)`.
+	qk_precision: Option<Compute>,
+	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
+	rope_precision: Option<Compute>,
+	activation_precision: Option<Compute>,
+	norm_precision: Option<Compute>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	acc: Option<Compute>,
 	/// What the next precision suffix names.
 	suffix: Suffix,
 }
-/// What a precision suffix names: the blck right before it, the cache, or the
-/// block's other ops.
+/// What a precision suffix names inside one block. Each operation has its own
+/// slot so a later suffix cannot rewrite an earlier operation's arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Suffix {
 	/// Nothing has followed the constructor yet: a precision names the blck
@@ -11531,6 +11594,10 @@ enum Suffix {
 	Fresh,
 	Blck,
 	Kv,
+	Qk,
+	Rope,
+	Activation,
+	Norm,
 	End,
 }
 impl Suffix {
@@ -11559,6 +11626,10 @@ impl PartialEq for Block {
 			&& self.precision == other.precision
 			&& self.blck_precision == other.blck_precision
 			&& self.kv_precision == other.kv_precision
+			&& self.qk_precision == other.qk_precision
+			&& self.rope_precision == other.rope_precision
+			&& self.activation_precision == other.activation_precision
+			&& self.norm_precision == other.norm_precision
 	}
 }
 impl Eq for Block {}
@@ -11578,18 +11649,18 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, acc: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, acc: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
 	pub fn act(mut self, activation: Activation) -> Self {
-		self.suffix = Suffix::End;
+		self.suffix = Suffix::Activation;
 		assert!(self.normalization.is_none(), "activation must precede normalization");
 		self.activation = activation;
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::End;
+		self.suffix = Suffix::Norm;
 		self.normalization = Some(normalization.normalization());
 		self
 	}
@@ -11606,15 +11677,14 @@ impl Block {
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::End;
 		let normalization = normalization.normalization();
 		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
 		self.qk = Some(normalization);
+		self.suffix = Suffix::Qk;
 		self
 	}
 	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
-		self.suffix = Suffix::End;
 		match &mut self.operation {
 			Operation::Attention(attention) => apply(attention),
 			_ => panic!("{selector} requires a preceding attn block"),
@@ -11638,39 +11708,51 @@ impl Block {
 		let layout = layout.layout();
 		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
 		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
-		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+		let mut block = self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())));
+		block.suffix = Suffix::Rope;
+		block
 	}
 	/// YaRN frequency scaling for this `rope`.
 	pub fn yarn(self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
-		self.attention("yarn", |attention| {
+		let mut block = self.attention("yarn", |attention| {
 			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
 			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
 			assert!(context != 0, "yarn context must be positive");
 			assert!(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered");
 			attention.yarn = Some((factor.to_bits(), context, fast.to_bits(), slow.to_bits()));
-		})
+		});
+		block.suffix = Suffix::Rope;
+		block
 	}
 	/// Sparse key selection on this `attn` block.
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
+		let mut value = self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }));
+		value.suffix = Suffix::End;
+		value
 	}
 	/// Sigmoid gate on the output of this `attn` block.
 	pub fn gate(self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
+		let mut block = self.attention("gate", |attention| attention.gate = true);
+		block.suffix = Suffix::End;
+		block
 	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
 		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
 		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
 	}
-	/// A precision names the blck right before it, the cache after `.kv(heads)`,
-	/// or the block's other ops after any of them.
+	/// A precision names only the operation immediately before it: the primary
+	/// block op, key-value cache, Q/K normalization, rotary embedding, or output op.
 	fn arithmetic(&self, format: Compute) -> Self {
 		let mut block = self.clone();
 		let suffix = if block.suffix == Suffix::Fresh { Suffix::for_operation(&block.operation) } else { block.suffix };
 		match suffix {
 			Suffix::Fresh | Suffix::Blck => block.blck_precision = Some(format),
 			Suffix::Kv => block.kv_precision = Some(format),
+			Suffix::Qk => block.qk_precision = Some(format),
+			Suffix::Rope => block.rope_precision = Some(format),
+			Suffix::Activation => block.activation_precision = Some(format),
+			Suffix::Norm => block.norm_precision = Some(format),
 			Suffix::End => block.precision = Some(format),
 		}
 		block
@@ -11805,6 +11887,10 @@ impl Model {
 				precision: None,
 				blck_precision: None,
 				kv_precision: None,
+				qk_precision: None,
+				rope_precision: None,
+				activation_precision: None,
+				norm_precision: None,
 				acc: None,
 				suffix,
 			});
@@ -11834,7 +11920,7 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap();
 			block.activation = activation;
-			block.suffix = Suffix::End;
+			block.suffix = Suffix::Activation;
 		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
@@ -12013,7 +12099,7 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
 			block.normalization = Some(normalization);
-			block.suffix = Suffix::End;
+			block.suffix = Suffix::Norm;
 		})
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
@@ -14084,6 +14170,7 @@ struct Architecture {
 const ARCHITECTURES: &[Architecture] = &[
 	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
 	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
@@ -14114,6 +14201,12 @@ impl Bound {
 	/// and its feed-forward, both on the residual stream.
 	pub fn blocks(&self) -> usize {
 		self.blocks
+	}
+	/// Top-level Recipe blocks the placement splitter assigns across devices.
+	/// This can exceed the architecture layer count because each transformer
+	/// layer has separate attention and feed-forward residual blocks.
+	pub fn placement_blocks(&self) -> usize {
+		self.model.blocks.len()
 	}
 	/// The stored tensors the plan reads, each counted once: as a mapped view, or
 	/// as the values the host rewrote from it.
@@ -14172,6 +14265,8 @@ struct Dimensions {
 	head: Vec<usize>,
 	rope_dims: Vec<usize>,
 	rope_base: Vec<f64>,
+	swa: Vec<bool>,
+	window: usize,
 	shortconv: Option<usize>,
 	/// Every `interval`th block attends and the rest are delta blocks; absent,
 	/// every block attends.
@@ -14242,13 +14337,21 @@ impl<'a> Builder<'a> {
 			} else {
 				builder.delta(branch, layer, &dimensions)?
 			};
+			let branch = builder.post(layer, "attn", branch, &dimensions)?;
 			model = builder.close(model, branch, &dimensions);
 			let branch = builder.open(layer, "ffn", &dimensions)?;
 			let branch = match &dimensions.experts {
 				Some(experts) => builder.experts(branch, layer, experts, &dimensions)?,
 				None => builder.feed_forward(branch, layer, &dimensions)?,
 			};
+			let branch = builder.post(layer, "ffn", branch, &dimensions)?;
 			model = builder.close(model, branch, &dimensions);
+			if let Some(scale) = builder.optional(&format!("blk.{layer}.layer_output_scale.weight")) {
+				require(scale.elements() == 1, format!("{} holds {} values; block {layer} output scale is one value", scale.name, scale.elements()))?;
+				let value = file.values(&scale)?[0];
+				require(value.is_finite(), format!("{} is nonfinite", scale.name))?;
+				model = model.scale(value);
+			}
 		}
 		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
 		if let Some(scale) = output_norm {
@@ -14266,7 +14369,12 @@ impl<'a> Builder<'a> {
 			Some(output) => output,
 			None => embedding,
 		};
-		builder.mapped(vec![output]);
+	builder.mapped(vec![output]);
+		if builder.present("final_logit_softcapping") {
+			let cap = file.float_at(&builder.key("final_logit_softcapping"))?;
+			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
+			model = model.scale(1.0 / cap).tanh().scale(cap);
+		}
 		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.consumed.len();
@@ -14300,18 +14408,38 @@ impl<'a> Builder<'a> {
 			}
 		}
 	}
+	fn layer_booleans(&self, suffix: &str, default: bool, layers: usize) -> Result<Vec<bool>> {
+		match self.file.value(&self.key(suffix)) {
+			None => Ok(vec![default; layers]),
+			Some(GgufValue::Array(values)) => {
+				require(values.len() == layers, format!("{}.{} holds {} values for {layers} layers", self.architecture, suffix, values.len()))?;
+				values.iter().map(|value| match value { GgufValue::Bool(value) => Ok(*value), _ => Err(RecipeError::new(format!("{}.{} contains a non-boolean layer value", self.architecture, suffix))) }).collect()
+			}
+			Some(GgufValue::Bool(value)) => Ok(vec![*value; layers]),
+			Some(_) => Err(RecipeError::new(format!("{}.{} is not a boolean or boolean array", self.architecture, suffix))),
+		}
+	}
 	fn dimensions(&self) -> Result<Dimensions> {
 		let layers = self.integer("block_count")?;
 		let width = self.integer("embedding_length")?;
 		let heads = self.integer("attention.head_count")?;
 		let kv = self.layer_integers("attention.head_count_kv", heads, layers)?;
 		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{heads} heads do not partition a stream of {width}"))?;
-		let head_value = self.integer_or("attention.key_length", width / heads.max(1))?;
-		let value = self.integer_or("attention.value_length", head_value)?;
-		require(value == head_value, format!("attention keys are {head_value} wide and values {value}; the attention block takes one head width"))?;
-		let head = vec![head_value; layers];
-		let rope_dims = vec![self.integer_or("rope.dimension_count", head_value)?; layers];
-		let rope_base = vec![if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 }; layers];
+		let swa = self.layer_booleans("attention.sliding_window_pattern", false, layers)?;
+		let full_head = self.integer_or("attention.key_length", width / heads.max(1))?;
+		let full_value = self.integer_or("attention.value_length", full_head)?;
+		require(full_value == full_head, format!("attention keys are {full_head} wide and values {full_value}; the attention block takes one head width"))?;
+		let swa_head = self.integer_or("attention.key_length_swa", full_head)?;
+		let swa_value = self.integer_or("attention.value_length_swa", swa_head)?;
+		require(swa_value == swa_head, format!("sliding attention keys are {swa_head} wide and values {swa_value}; the attention block takes one head width"))?;
+		let head = swa.iter().map(|swa| if *swa { swa_head } else { full_head }).collect::<Vec<_>>();
+		let full_rope_dims = self.integer_or("rope.dimension_count", full_head)?;
+		let swa_rope_dims = self.integer_or("rope.dimension_count_swa", full_rope_dims)?;
+		let rope_dims = swa.iter().map(|swa| if *swa { swa_rope_dims } else { full_rope_dims }).collect::<Vec<_>>();
+		let full_rope_base = if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 };
+		let swa_rope_base = if self.present("rope.freq_base_swa") { self.file.float_at(&self.key("rope.freq_base_swa"))? } else { full_rope_base };
+		let rope_base = swa.iter().map(|swa| if *swa { swa_rope_base } else { full_rope_base }).collect::<Vec<_>>();
+		let window = self.integer_or("attention.sliding_window", 0)?;
 		let shortconv = self.file.value(&self.key("shortconv.l_cache")).map(|_| self.integer("shortconv.l_cache")).transpose()?;
 		let interval = if self.present("full_attention_interval") { Some(self.integer("full_attention_interval")?) } else { None };
 		let delta = match interval {
@@ -14351,7 +14479,7 @@ impl<'a> Builder<'a> {
 			None
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
-		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
@@ -14420,6 +14548,7 @@ impl<'a> Builder<'a> {
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
 		let (width, heads) = (dimensions.width, dimensions.heads);
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
+		let sliding = dimensions.swa[layer];
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
 		let query = self.tensor(&name("attn_q.weight"), &role)?;
@@ -14430,7 +14559,13 @@ impl<'a> Builder<'a> {
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
 		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = self.projection(&name("attn_v.weight"), &role, width, kv * head)?;
+		let value = match self.optional(&name("attn_v.weight")) {
+			Some(value) => {
+				require(value.shape.len() == 2 && value.shape[0] as usize == width && value.shape[1] as usize == kv * head, format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
+				value
+			}
+			None => key.clone(),
+		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
@@ -14453,11 +14588,22 @@ impl<'a> Builder<'a> {
 			block = block.qk(rms);
 		}
 		block = block.rope(self.rope, rope_dims, rope_base);
+		let factors = !sliding && self.file.tensor("rope_freqs.weight").is_some();
+		block = block.edit(|model| {
+			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
+			attention.window = if sliding { dimensions.window } else { 0 };
+			attention.factors = factors;
+		});
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
+		}
+		if factors {
+			let factors = self.tensor("rope_freqs.weight", &role)?;
+			require(factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			self.mapped(vec![factors]);
 		}
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
@@ -14674,11 +14820,24 @@ impl<'a> Builder<'a> {
 			}
 		}
 	}
+	/// Applies an architecture's post-attention or post-FFN normalization inside
+	/// the branch, before the residual add. Architectures without that tensor keep
+	/// the branch unchanged.
+	fn post(&mut self, layer: usize, part: &str, branch: Model, dimensions: &Dimensions) -> Result<Model> {
+		let suffix = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
+		let name = format!("blk.{layer}.{suffix}");
+		let Some(scale) = self.optional(&name) else { return Ok(branch) };
+		require(scale.elements() == dimensions.width, format!("{} holds {} values; block {layer} {part} post-normalization scales {} channels", scale.name, scale.elements(), dimensions.width))?;
+		self.mapped(vec![scale]);
+		Ok(branch.norm(rms))
+	}
 	/// Closes a branch: the mixer's lanes and rank under hyper-connections, and
 	/// one ungated lane, the plain residual, otherwise.
 	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
-		let (lanes, rank) = dimensions.hyper.unwrap_or((1, 0));
-		model.hyper(lanes, rank, &branch)
+		match dimensions.hyper {
+			Some((lanes, rank)) => model.hyper(lanes, rank, &branch),
+			None => model.push(Operation::Residual(branch.blocks.clone())),
+		}
 	}
 }
 /// The GGUF a model file opens through `recipe.data`, whose metadata the
@@ -15471,8 +15630,8 @@ fn storage_scratch_bytes(graph: &Graph) -> usize {
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
-	graph.nodes[start..].iter().flat_map(|node| [(node.source, 1), (node.second, 0)]).any(|(index, first)| match usize::try_from(index) {
-		Ok(from) => from + first < start,
+	graph.nodes[start..].iter().flat_map(|node| [node.source, node.second]).any(|index| match usize::try_from(index) {
+		Ok(from) => from + 1 < start,
 		Err(_) => index == -1 && start != 0,
 	})
 }
@@ -15493,17 +15652,35 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 		}
 	}
 	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
+	let mut candidate: Option<(usize, usize, usize)> = None;
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
+		if taken != 0 && !cuts_connection(graph, start) {
+			let prior = part_bytes(&graph_part(graph, first, start)?, precision)? as u64;
+			if prior <= free {
+				candidate = Some((taken, start, block));
+			}
+		}
 		let mut resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
-		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
-			split.push(taken);
-			(taken, first, free) = (0, start, available(&devices[split.len()])?);
+		if resident > free && split.len() + 1 < devices.len()
+			&& let Some((before, boundary, boundary_block)) = candidate.take()
+		{
+			split.push(before);
+			(taken, first, free) = (block - boundary_block, boundary, available(&devices[split.len()])?);
 			resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		}
 		if resident > free {
 			let device = split.len();
-			return Err(RecipeError::new(format!("device {device} cannot hold placement blocks {}..{}: {resident} bytes required, {free} bytes available", first, end)));
+			let legal = starts.iter().skip(1).filter(|start| !cuts_connection(graph, **start)).count();
+			let probe = starts.get(1).copied().unwrap_or(0);
+			let crossing = graph.nodes[probe..].iter().enumerate().find_map(|(offset, node)| {
+				[("source", node.source), ("second", node.second)].into_iter().find_map(|(role, reference)| match usize::try_from(reference) {
+					Ok(from) if from + 1 < probe => Some(format!("node {} block {} {role}={reference}", probe + offset, node.block_index)),
+					Err(_) if reference == -1 && probe != 0 => Some(format!("node {} block {} {role}=-1", probe + offset, node.block_index)),
+					_ => None,
+				})
+			});
+			return Err(RecipeError::new(format!("device {device} cannot hold placement blocks {}..{}: {resident} bytes required, {free} bytes available; {legal} legal layer boundaries; first boundary crossing {crossing:?}", first, end)));
 		}
 		taken += 1;
 	}
@@ -15556,6 +15733,10 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_precision: None,
 		block_blck_precision: None,
 		block_kv_precision: None,
+		block_qk_precision: None,
+		block_rope_precision: None,
+		block_activation_precision: None,
+		block_norm_precision: None,
 		block_acc: None,
 		profile: graph.profile,
 		bound: None,
@@ -15908,6 +16089,9 @@ struct Node {
 	argument: [f64; 9],
 	program_offset: usize,
 	program_count: usize,
+	/// The private file/checkpoint layout of this node's weights. This is not an
+	/// operation argument and never aliases an op-specific structural value.
+	storage: u16,
 	block_index: usize,
 	block_kind: &'static str,
 	frozen: bool,
@@ -15962,6 +16146,10 @@ struct Graph {
 	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
 	block_kv_precision: Option<Compute>,
+	block_qk_precision: Option<Compute>,
+	block_rope_precision: Option<Compute>,
+	block_activation_precision: Option<Compute>,
+	block_norm_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
 	/// The weights still to bind while a graph compiles over mapped tensors:
@@ -15999,6 +16187,10 @@ impl Graph {
 			block_acc: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
+			block_qk_precision: None,
+			block_rope_precision: None,
+			block_activation_precision: None,
+			block_norm_precision: None,
 			profile: Precisions::default(),
 			bound: None,
 			bound_values: Vec::new(),
@@ -16038,13 +16230,13 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 		// one that carries no quantization stays as drawn.
 		let drawn = graph.stored[index].take().filter(|_| node.table()).map(|stored| stored.arithmetic);
 		let weights = drawn.as_deref().unwrap_or(&graph.parameters[node.offset..node.offset + node.parameters]);
-		if weights.is_empty() || node.argument[8] == 0.0 {
+		if weights.is_empty() || node.storage == 0 {
 			if let Some(arithmetic) = drawn {
 				graph.stored[index] = Some(bundle::raw_weight(&arithmetic));
 			}
 			continue;
 		}
-		let format = StorageFormat(node.argument[8] as u16);
+		let format = StorageFormat(node.storage);
 		require(format.spec().is_some(), format.unavailable().to_string())?;
 		// A node that never received gradient, like an unrouted expert, has an all-zero
 		// variance slice: it carries no importance signal, so weight it uniformly.
@@ -16069,8 +16261,8 @@ fn sequential_operation(operation: &Operation) -> bool {
 }
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
-	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
-		return Err(format.unavailable());
+	if let Some((index, format)) = model.blocks.iter().enumerate().map(|(index, block)| (index, StorageFormat(block.quantization))).find(|(_, format)| format.0 != 0 && !format.valid()) {
+		return Err(RecipeError::new(format!("block {index} {}: {}", model.blocks[index].operation.name(), format.unavailable())));
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
@@ -16093,6 +16285,11 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_precision = None;
 	graph.block_acc = None;
 	graph.block_blck_precision = None;
+	graph.block_kv_precision = None;
+	graph.block_qk_precision = None;
+	graph.block_rope_precision = None;
+	graph.block_activation_precision = None;
+	graph.block_norm_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
@@ -16120,7 +16317,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
 	{
-		node.argument[8] = f64::from(format.tensor(0, false, true))
+		node.storage = format.tensor(0, false, true)
 	}
 	if initialize {
 		initialize_graph(&mut graph, config);
@@ -16229,7 +16426,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let program_base = graph.programs.len();
 	for node in &mut part.nodes {
 		node.source = if node.source < 0 { source } else { node.source + node_base };
-		if node.second >= 0 {
+		if node.second == -1 {
+			node.second = source;
+		} else if node.second >= 0 {
 			node.second += node_base
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
@@ -16255,12 +16454,16 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision, graph.block_acc);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_acc = block.acc;
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
+	graph.block_qk_precision = block.qk_precision;
+	graph.block_rope_precision = block.rope_precision;
+	graph.block_activation_precision = block.activation_precision;
+	graph.block_norm_precision = block.norm_precision;
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -16293,11 +16496,17 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		}
 	}
 	if block.activation != Activation::Linear {
+		let precision = graph.block_precision;
+		graph.block_precision = graph.block_activation_precision.or(precision);
 		lower_activation(graph, block.activation, config)?;
+		graph.block_precision = precision;
 	}
 	if let Some(normalization) = block.normalization {
+		let precision = graph.block_precision;
+		graph.block_precision = graph.block_norm_precision.or(precision);
 		let channels = graph.output.channels;
 		lower_normalize(graph, normalization, channels, channels)?;
+		graph.block_precision = precision;
 	}
 	// Only a legacy block record can name storage. New models take storage from
 	// each bound tensor or from the compute format selected for this operation.
@@ -16310,7 +16519,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				let format = if profile { StorageFormat(quantization).tensor(role, more, false) } else { quantization };
-				node.argument[8] = f64::from(format);
+				node.storage = format;
 				parameter += 1;
 				requantize_bound(graph, index, StorageFormat(format), config)?;
 			}
@@ -16353,7 +16562,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		});
 		let kept = kept.map(|weight| weight.format);
 		let node = &mut graph.nodes[index];
-		node.argument[8] = f64::from(kept.unwrap_or(storage).0);
+		node.storage = kept.unwrap_or(storage).0;
 		node.packed = true;
 		node.int_bits = format.bits;
 		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
@@ -16364,7 +16573,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_acc) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision, graph.block_acc) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -16456,6 +16665,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		argument,
 		program_offset: 0,
 		program_count: 0,
+		storage: 0,
 		block_index: graph.block_index,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
@@ -16480,7 +16690,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 				// The block's `packed` qualifier decides whether the bytes stay
 				// packed in the weight arena or the load expands them into it.
 				BoundWeight::Stored(weight) => {
-					if node.table() { node.argument[8] = f64::from(weight.format.0); }
+					if node.table() { node.storage = weight.format.0; }
 					Some(weight)
 				}
 				// A table has no parameter span: its rows decode from the bound
@@ -16968,7 +17178,10 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors } = attention;
+	let ordinary_precision = graph.block_precision;
+	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
+	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
 	require(heads != 0, "attention head partition is invalid")?;
 	if width == 0 && keys == heads && values == heads && graph.output.channels % heads != 0 {
 		let requested = heads;
@@ -17000,11 +17213,14 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let gated = if gate { inner } else { 0 };
 	lower_project(graph, checked_add(pairs, gated, "attention projection width")?)?;
 	if let Some(normalization) = qk {
+		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
 		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, keys, "attention query and key heads")?, "attention query and key span")?)?;
+		graph.block_precision = ordinary_precision;
 	}
 	if let Some((layout, dims, base)) = rope {
+		graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
 		match layout {
@@ -17026,7 +17242,13 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let _ = context;
 		let chain = f64::from(u8::from(graph.profile.chain_angle));
 		let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
+		let parameters = if factors { dims / 2 } else { 0 };
+		push_node(graph, Primitive::Rope, graph.output, parameters, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
+		if factors {
+			let precision = graph.nodes.last().unwrap().precision;
+			require(matches!(precision, Compute::FP32 | Compute::FP64), format!("proportional rope factors require fp32 or fp64, not {}", precision.label()))?;
+		}
+		graph.block_precision = ordinary_precision;
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -17050,8 +17272,11 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let query_channels = checked_mul(index.heads, index.width, "indexer query width")?;
 		let span = if scored { query_channels } else { graph.output.channels };
 		let parameters = if normalization == BlockNormalization::Rms { if scored { checked_add(query_channels, index.width, "indexer query and key scales")? } else { span } } else { 0 };
+		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		lower_normalize_parameters(graph, normalization, index.width, span, parameters)?;
+		graph.block_precision = ordinary_precision;
 		if dims != 0 {
+			graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 			let (_, _, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
 			let (mscale, factor, context, low, high) = match yarn {
@@ -17066,12 +17291,15 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			let chain = f64::from(u8::from(graph.profile.chain_angle));
 			let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
 			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
+			graph.block_precision = ordinary_precision;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
 	}
 	let epsilon = graph.epsilon;
-	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
+	graph.block_precision = ordinary_precision;
+	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
+	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
 	lower_project(graph, input.channels)
 }
@@ -17100,7 +17328,7 @@ fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalizati
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
 fn attention_blocks(node: &Node) -> usize {
-	let block = node.argument[3] as usize;
+	let block = if node.argument[3] > 0.0 { node.argument[3] as usize } else { 0 };
 	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
@@ -17379,7 +17607,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		if body.output.channels != width { lower_project(&mut body, width)?; }
 		for node in &mut body.nodes {
 			node.block_kind = "recur_body";
-			require(node.argument[8] == 0.0, "recurrent body quantization is not emitted yet")?;
+			require(node.storage == 0, "recurrent body quantization is not emitted yet")?;
 		}
 		let body_count = body.nodes.len();
 		require(body_count != 0, "a recurrent body has no lowered operation")?;
@@ -18241,14 +18469,76 @@ mod precision_contract_checks {
 		assert!(!widened.contains("entry: ret i32 0"));
 	}
 	#[test]
+	fn proportional_rope_factors_match_the_analytic_rotation() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let mut graph = Graph::new(Shape { channels: 4, length: 2 }, 1e-5);
+		graph.profile = Config::load().unwrap().profile;
+		graph.block_precision = Some(Compute::FP32);
+		push_node(&mut graph, Primitive::Rope, Shape { channels: 4, length: 2 }, 2, [4.0, 10000.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0, 1.0], -2).unwrap();
+		graph.parameters.copy_from_slice(&[1.0, 2.0]);
+		let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
+		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
+		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
+		assert_eq!(tape.nodes[0].parameters, 2);
+		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false).unwrap();
+		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
+		tape.forward(ForwardMode::Inference).unwrap();
+		let output = tape.predictions().unwrap();
+		let expected = [
+			1.0,
+			2.0 * 1.0_f64.cos() - 6.0 * 1.0_f64.sin(),
+			3.0,
+			4.0 * 0.005_f64.cos() - 8.0 * 0.005_f64.sin(),
+			5.0,
+			6.0 * 1.0_f64.cos() + 2.0 * 1.0_f64.sin(),
+			7.0,
+			8.0 * 0.005_f64.cos() + 4.0 * 0.005_f64.sin(),
+		];
+		for (actual, expected) in output.iter().zip(expected) {
+			assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+		}
+		let mut graph = Graph::new(Shape { channels: 4, length: 5 }, 1e-5);
+		let mut attention = AttentionBlock::new(1);
+		attention.width = 4;
+		attention.window = 4;
+		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
+		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
+	}
+	#[test]
+	fn placement_accepts_both_operands_from_the_immediate_boundary() {
+		let shape = Shape { channels: 1, length: 1 };
+		let mut graph = Graph::new(shape, 1e-5);
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], -2).unwrap();
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
+		assert!(!cuts_connection(&graph, 1));
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
+		assert!(cuts_connection(&graph, 2));
+	}
+	#[test]
 	fn precision_suffix_scope_is_local_and_explicit() {
-		let projection = layer(32).int(4).gelu().fp(16);
+		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
 		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.precision, Some(Compute::FP16));
-		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(32);
+		assert_eq!(projection.activation_precision, Some(Compute::FP16));
+		assert_eq!(projection.norm_precision, Some(Compute::FP32));
+		assert_eq!(projection.precision, None);
+		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
 		assert_eq!(attention.blck_precision, Some(Compute::INT8));
 		assert_eq!(attention.kv_precision, Some(Compute::BF16));
-		assert_eq!(attention.precision, Some(Compute::FP32));
+		assert_eq!(attention.qk_precision, Some(Compute::FP16));
+		assert_eq!(attention.rope_precision, Some(Compute::FP32));
+		assert_eq!(attention.precision, None);
+		let mut graph = Graph::new(Shape { channels: 8, length: 2 }, 1e-5);
+		graph.profile = Config::load().unwrap().profile;
+		graph.block_blck_precision = Some(Compute::FP32);
+		graph.block_qk_precision = attention.qk_precision;
+		graph.block_rope_precision = attention.rope_precision;
+		let mut operation = AttentionBlock::new(2);
+		operation.width = 4;
+		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
+		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
+		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
+		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
 		let model = recipe.model().res([projection.clone()]).fp(64);
 		let residual = model.blocks.last().unwrap();
 		assert_eq!(residual.precision, Some(Compute::FP64));
@@ -19944,7 +20234,7 @@ fn attention_kv_bytes(node: &Node, rows: usize, precision: Compute) -> Result<us
 // An embedding row is addressed inside the packed table, so the row must span
 // whole blocks and the layout must keep one row's blocks together.
 fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
-	let format = StorageFormat(node.argument[8] as u16);
+	let format = StorageFormat(node.storage);
 	let layout = format.spec().ok_or_else(|| RecipeError::new("embedding table must be stored in a quantization"))?.codec.quantization();
 	require(!matches!(layout.native, NativeDequant::Nf4), format!("embedding table cannot use {}: its codebook addresses the whole tensor", layout.name))?;
 	require(node.output.channels % layout.block == 0, format!("embedding width {} must be a multiple of the {} block of {}", node.output.channels, layout.name, layout.block))?;

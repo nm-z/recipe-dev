@@ -6,18 +6,20 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const state = '/home/nate/codex/rnj-chat';
 await mkdir(state, { recursive: true });
+await mkdir('/home/nate/codex/rnj-estimate', { recursive: true });
 let busy = false;
 let pending;
 let startupLog = '';
 const routes = new Set();
 const residentEnv = {
   ...process.env,
-  RECIPE_DEVICE: 'amd0',
+  RECIPE_DEVICE: process.env.RECIPE_DEVICE || 'amd0',
   RECIPE_TIMINGS: '1',
-  RECIPE_CONTEXT: '1024',
+  RECIPE_CONTEXT: process.env.RECIPE_CONTEXT || '1024',
 };
 const child = spawn('flock', ['-x', '/home/nate/codex/rnj-estimate/gpu.lock', `${state}/rnj-chat`], {
   cwd: root,
+  detached: true,
   env: residentEnv,
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -103,4 +105,13 @@ const server = http.createServer(async (req, res) => {
     res.end(error.message);
   } finally { busy = false; }
 });
+const stopResident = () => { try { process.kill(-child.pid, 'SIGTERM'); } catch {} };
+server.on('error', error => { stopResident(); console.error(error); process.exit(1); });
 server.listen(8766, '127.0.0.1', () => console.log('RNJ-1 chat: http://127.0.0.1:8766'));
+for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    stopResident();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  });
+}

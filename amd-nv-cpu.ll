@@ -2387,8 +2387,8 @@ ret void }
 ; each head the channel pairs (i, i + dims/2) below %dims rotate by
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
-define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
- i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
+ i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %p
@@ -2406,9 +2406,20 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %other.model = load double, ptr addrspace(1) %partner.ptr, align 8
 %other = call RECIPE_STATE @recipe.decode(double %other.model)
 %two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %index.i32 = trunc i64 %index to i32 %two.index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %two.index.i32) %index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %index.i32)
+br i1 %has.factors, label %factor.load, label %factor.one
+factor.load:
+%factor.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %index
+%factor.model = load double, ptr addrspace(1) %factor.ptr, align 8
+%factor.loaded = call RECIPE_STATE @recipe.decode(double %factor.model)
+br label %factor.ready
+factor.one:
+br label %factor.ready
+factor.ready:
+%frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
 %dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
 %log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
 %exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
+%frequency.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %frequency.factor)
 %yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
 %ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
 %ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
@@ -2417,12 +2428,12 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
 %ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
 %ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
-%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %factor.wide)
+%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.extrap, RECIPE_STATE %factor.wide)
 %ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.raw)
+%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.extrap)
 %interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
 %blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
-%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.raw
+%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
 %position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
 %cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
 %sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
@@ -2452,13 +2463,14 @@ chain.step:
 %chain.i.next = add i64 %chain.i, 1
 br label %chain.loop
 chain.done:
+%chain.theta.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.theta, RECIPE_STATE %frequency.factor)
 %chain.freq.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %factor.wide)
-%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta)
+%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta.extrap)
 %chain.mix = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
 %chain.mix.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %chain.mix)
-%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta, RECIPE_STATE %chain.mix)
+%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta.extrap, RECIPE_STATE %chain.mix)
 %chain.angle.yarn = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.extrap.part, RECIPE_STATE %chain.interp, RECIPE_STATE %chain.mix.inverse)
-%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta
+%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta.extrap
 %chain.cos.raw = call RECIPE_STATE @recipe.libm.cos(RECIPE_STATE %chain.angle)
 %chain.sin.raw = call RECIPE_STATE @recipe.libm.sin(RECIPE_STATE %chain.angle)
 %chain.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.cos.raw, RECIPE_STATE %mscale.wide)
@@ -2474,7 +2486,7 @@ chain.done:
 %rotated.chain = select i1 %upper, RECIPE_STATE %chain.upper, RECIPE_STATE %chain.lower
 br label %finish.direct
 finish.direct:
-%rotated.value = phi RECIPE_STATE [ %rotated.direct, %rotate ], [ %rotated.chain, %chain.done ]
+%rotated.value = phi RECIPE_STATE [ %rotated.direct, %factor.ready ], [ %rotated.chain, %chain.done ]
 %rotated.model = call double @recipe.encode(RECIPE_STATE %rotated.value) br label %finish finish:
 %result = phi double [ %unrotated.model, %entry ], [ %rotated.model, %finish.direct ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
@@ -2483,8 +2495,8 @@ br i1 %reverse, label %accumulate, label %assign accumulate: %prior.model = load
 assign: store double %result, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; The adjoint twin: the same angles and coefficients, read from a state-typed delta
 ; and added into a state-typed previous, so nothing on the adjoint side is rounded.
-define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
- i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
+ i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input, i64 %p
@@ -2499,9 +2511,20 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %partner.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input, i64 %partner
 %other = load RECIPE_STATE, ptr addrspace(1) %partner.ptr, align RECIPE_STATE_ALIGN
 %two.index = mul i64 %index, 2 %two.index.i32 = trunc i64 %two.index to i32 %index.i32 = trunc i64 %index to i32 %two.index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %two.index.i32) %index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %index.i32)
+br i1 %has.factors, label %factor.load, label %factor.one
+factor.load:
+%factor.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %index
+%factor.model = load double, ptr addrspace(1) %factor.ptr, align 8
+%factor.loaded = call RECIPE_STATE @recipe.decode(double %factor.model)
+br label %factor.ready
+factor.one:
+br label %factor.ready
+factor.ready:
+%frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
 %dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
 %log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
 %exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
+%frequency.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %frequency.factor)
 %yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
 %ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
 %ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
@@ -2510,12 +2533,12 @@ br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local
 %ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
 %ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
 %ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
-%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %factor.wide)
+%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.extrap, RECIPE_STATE %factor.wide)
 %ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.raw)
+%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.extrap)
 %interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
 %blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
-%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.raw
+%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
 %position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
 %cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
 %sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
@@ -2545,13 +2568,14 @@ chain.step:
 %chain.i.next = add i64 %chain.i, 1
 br label %chain.loop
 chain.done:
+%chain.theta.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.theta, RECIPE_STATE %frequency.factor)
 %chain.freq.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %factor.wide)
-%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta)
+%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta.extrap)
 %chain.mix = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
 %chain.mix.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %chain.mix)
-%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta, RECIPE_STATE %chain.mix)
+%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta.extrap, RECIPE_STATE %chain.mix)
 %chain.angle.yarn = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.extrap.part, RECIPE_STATE %chain.interp, RECIPE_STATE %chain.mix.inverse)
-%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta
+%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta.extrap
 %chain.cos.raw = call RECIPE_STATE @recipe.libm.cos(RECIPE_STATE %chain.angle)
 %chain.sin.raw = call RECIPE_STATE @recipe.libm.sin(RECIPE_STATE %chain.angle)
 %chain.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.cos.raw, RECIPE_STATE %mscale.wide)
@@ -2567,7 +2591,7 @@ chain.done:
 %rotated.chain = select i1 %upper, RECIPE_STATE %chain.upper, RECIPE_STATE %chain.lower
 br label %finish.direct
 finish.direct:
-%rotated.value = phi RECIPE_STATE [ %rotated.direct, %rotate ], [ %rotated.chain, %chain.done ]
+%rotated.value = phi RECIPE_STATE [ %rotated.direct, %factor.ready ], [ %rotated.chain, %chain.done ]
 br label %finish finish:
 %result = phi RECIPE_STATE [ %value, %entry ], [ %rotated.value, %finish.direct ]
 %output.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %output, i64 %p
