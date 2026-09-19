@@ -449,7 +449,9 @@ additional numbered items.
    its fp32 constants were silently forced through the Q/K normalization's fp16
    suffix. Q/K and RoPE now own separate suffixes, and explicit fp32 RoPE restores
    coherent output. Resolve the remaining llama.cpp token mismatch and remove
-   superseded one-off scripts.
+   superseded one-off scripts. The retained cleanup inventory identifies six
+   tracked probes, the user-edited `six-llama-dbg.rs`, and the untracked
+   `one-attn32-s256.rs` as the only probe still calling removed `.step(256)`.
 5. **Partial:** The `llamacpp` profile completes on both the M60 and `amd0`
    without deadlock, including prefill and decode. Both full-model outputs are
    wrong, so fix and retain passing logit evidence before calling this complete.
