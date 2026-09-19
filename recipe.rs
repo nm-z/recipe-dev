@@ -15883,8 +15883,9 @@ impl Placed {
 		let first = self.tapes.first().and_then(|tapes| tapes.first()).ok_or_else(|| RecipeError::new("placement has no tape"))?;
 		let exact = first.profile.exact_cpu && self.tapes.iter().flatten().all(|tape| tape.program.gpu.backend == Backend::Cpu);
 		let mut reference = reference::Reference::open(f64::from_bits(first.profile.tolerance), exact).map_err(RecipeError::new)?;
-		if let PlacedSource::Bound(_, suppressed) = &self.source {
-			sampler.suppressed.clone_from(suppressed);
+		match &self.source {
+			PlacedSource::Bound(_, suppressed) => sampler.suppressed.clone_from(suppressed),
+			PlacedSource::Saved(_) => sampler.suppressed.clear(),
 		}
 		let sequence = match &self.source {
 			PlacedSource::Saved(graphs) => match graphs.as_slice() {
