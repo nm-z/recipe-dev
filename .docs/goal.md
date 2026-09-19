@@ -344,11 +344,11 @@ activations) or `"e5m2"` (gradients); the suffix never picks silently.
 
 The builder must know every architecture people actually download as GGUF, so that
 `recipe.data("x.gguf")` plus the script is the whole job. Today: llama, gemma3,
-qwen2/qwen3/qwen3moe, qwen3.5/qwen3next, qwen4. Missing and needed: gemma4 (the
-per-layer output scale and varying attention geometry), lfm2 (short conv), phi,
-mistral, deepseek2, glm4, granite. Each is a builder function and a metadata
-namespace; none needs a new kernel. Gemma 4's raw-UTF-8, SentencePiece-style BPE
-tokenizer must preserve whitespace escaping and newline-run tokens.
+qwen2/qwen3/qwen3moe, qwen3.5/qwen3next, qwen4, and lfm2. Missing and needed:
+gemma4 (the per-layer output scale and varying attention geometry), phi, mistral,
+deepseek2, glm4, and granite. Each is a builder function and a metadata namespace;
+none needs a new kernel. Gemma 4's raw-UTF-8, SentencePiece-style BPE tokenizer
+must preserve whitespace escaping and newline-run tokens.
 
 ## The chat
 
@@ -385,16 +385,16 @@ overall completion is claimed.
 | Section | Implemented or verified | Remaining acceptance criteria |
 | --- | --- | --- |
 | Numeric contract | `sum = "int8"` is the local default. Int4 uses 32 codes with scale and minimum (`Q4_1` storage), while int8/int16/int32 weights use Q8_0. Single noncanonical planes convert at load; Q4_K planes can remain in their int4 inner layout. FP8 encoding is explicit in the table. | Mixed Q4_K/Q6_K nodes temporarily retain both legacy planes because the load kernel emits only one target layout per node. Several source codecs still take a host conversion path. Add per-plane target encoding, convert Q6_K to Q8_0, and remove superseded legacy dot helpers. |
-| Model definition | The public suffixes are `.fp`, `.int(4|8|16|32)`, `.bf`, and `.tf`. `.int(1)`, `.f()`, `.qi()`, `.iq()`, `.quantize()`, `.profile()`, and `.step()` are removed from `Block` and `Model`; build templates and new bundle precision tokens no longer contain int1 or arbitrary floats. A nested-scope check verifies layer, activation, attention, cache, and residual suffix ownership. The table supplies every node's step. | Legacy storage codecs remain loader-only; legacy bundle block records with the former step field still load. |
+| Model definition | The public suffixes are `.fp`, `.int(4|8|16|32)`, `.bf`, and `.tf`. `.int(1)`, `.f()`, `.qi()`, `.iq()`, `.quantize()`, `.profile()`, and `.step()` are removed from `Block` and `Model`; build templates and new bundle precision tokens no longer contain int1 or arbitrary floats. A nested-scope check verifies layer, depthwise convolution, activation, attention, cache, and residual suffix ownership. The table supplies every node's step. Model and product branches no longer carry run-level storage selection, and new bundles write a `model2` header with no quantization field. | Legacy storage codecs and the former model, product, block, and step fields remain read adapters only. |
 | Organization and tracing | Precision, layout, node identities, traces, and reference comparisons exist. Their consistency across the full execution path has not been audited. | Consolidate duplicated decisions in the existing code. Derive storage and kernel interfaces from shared definitions, preserve operation identity through branches and fusion, and verify buffer ownership, lifetime, and ordering. Extend diagnostics from those shared boundaries. |
-| Instruction contract | One target/format capability table now drives pre-build hard errors, matrix eligibility, and startup instruction lines. Invalid storage kinds and impossible legacy packed-dot variants trap instead of returning zero. CPU, generic NVIDIA, generic AMD, gfx11, and gfx12 rows describe the routes the current code actually emits. | Split generic rows into the required CPU feature, NVIDIA SM, and older AMD target rows as their named instructions land. Int4 still uses int8 activations; NVIDIA remains on scalar packed dots rather than dp4a. Matrix selection is still module-wide rather than per operation. |
-| Backends as rows | Existing AMD, NVIDIA, and CPU execution paths run bounded fixtures. | Implement and measure the named instruction rows for gfx906, gfx900, sm_61, sm_75, VNNI, and NEON. Runtime success alone does not prove the intended instruction was selected. |
-| Speed | Historical session reports: rnj-1 decode at 25-33 tok/s on the 7700 XT. A current uncached M60 build produced 5.05 MB LLVM IR and took 162.5 s through compile/JIT; the cached run prepared in 4.69 s and decoded at 3.79 tok/s. Direct Clang-to-PTX also exceeded 240 s. | Emit repeated layers as loops, split variants into parallel modules, and remeasure the current tree with recorded model, format, context, and device. Measure prefill, establish ceilings from actual resident bytes and verified bandwidth, and meet the decode and compile targets. |
-| Correctness | Reference recording and comparison are wired into both decode paths. Bounded CPU/M60 fixtures pass tolerance checks; the CPU fixture also passes exact comparison under the `llamacpp` policy. The NVIDIA attention argument-width defect is fixed and verified. | Reported GPU deadlocks in the `llamacpp` profile and invalid `rnj-1.rs` output remain unresolved here. Reproduce them on the current tree, retain failing cases, and verify full-model logits against llama.cpp. An exact comparison policy is not proof of llama.cpp parity. |
+| Instruction contract | One target/format capability table drives pre-build hard errors, matrix eligibility, and startup instruction lines. Invalid storage kinds and impossible legacy packed-dot variants trap instead of returning zero. CPU, generic AMD, gfx11, gfx12, pre-Pascal NVIDIA, and Pascal-or-newer NVIDIA rows describe the routes the code emits. K80/M60 keep Q8_0 weights and int8 activations packed and multiply the codes in fp32 registers; a two-step M60/K80 comparison had zero logit delta. `sm_61+` int8 helpers call NVVM `idp4a`; LLVM 22 emits `dp4a.s32.s32` and `dp4a.u32.s32`. | Split the remaining generic CPU and older AMD rows by features. Implement the NVIDIA int4 matrix route and per-operation matrix selection; int4 still uses int8 activations on the current AMD vector route. |
+| Backends as rows | Existing AMD, NVIDIA, and CPU execution paths run bounded fixtures. The pre-Pascal NVIDIA row is bit-identical across an M60 and K80 bounded logit check. The `sm_61+` int8 row has a retained compiler receipt proving the named PTX instructions. | Run and measure the new row on a P40, then implement and measure gfx906, gfx900, sm_75 matrix, VNNI, and NEON rows. Compiler output proves instruction selection, not runtime correctness or speed. |
+| Speed | Historical session reports: rnj-1 decode at 25-33 tok/s on the 7700 XT. A current uncached M60 build produced 5.05 MB LLVM IR and took 162.5 s through compile/JIT; the cached run prepared in 4.69 s and decoded at 3.79 tok/s. A later uncached `llamacpp`-profile variant prepared in 238.9 s, then prefetched in 16.54 s and decoded at 2.13 tok/s. Direct Clang-to-PTX also exceeded 240 s. | Emit repeated layers as loops, split variants into parallel modules, and remeasure the current tree with recorded model, format, context, and device. Measure prefill, establish ceilings from actual resident bytes and verified bandwidth, and meet the decode and compile targets. |
+| Correctness | Reference recording and comparison are wired into both decode paths. Bounded CPU/M60 fixtures pass tolerance checks; the CPU fixture also passes exact comparison under the `llamacpp` policy. The NVIDIA attention argument-width defect is fixed and verified. A full 8-token `llamacpp`-profile run now completes on the M60 without a kernel deadlock, though its output is corrupt. | Reproduce or close the reported AMD deadlock, retain failing cases, and verify full-model logits against llama.cpp. RNJ output remains wrong: changing YaRN fast from the GGUF's 64 to llama.cpp's Gemma3 default of 32 changes the result materially, while step 32 versus 256 does not repair the first-token mismatch. An exact comparison policy is not proof of llama.cpp parity. |
 | Training | Eleven library checks pass on CPU. Targeted M60 checks cover wide gradients, reductions, normalization, attention, built-in recurrence, and mixed accumulators. Fresh fp16 `.int(16)` and bf16 `.int(32)` runs train, save Q8_0 checkpoints, and reload successfully on M60. | Backward contraction and attention use vector kernels; matrix training remains open. Custom `recur([...])` bodies reject differing model and accumulator formats. Verify representative full-model training and convergence, plus capability-table resolution for backward kernels. |
 | Several cards | Layer placement exists. Two-M60 data-parallel training verifies gradient aggregation and weight synchronization on a bounded fixture. | That check does not establish model-parallel training or a 27B model split across six cards. Verify those paths and measured hop costs. The reported pageable host-transfer path still needs a current audit and the planned pinned DMA/P2P work. |
-| Architectures | Builder entries already exist for llama, gemma3, qwen2/3 families, qwen3.5/next, and qwen4. Gemma 4 raw-UTF-8 BPE now matches the local Gemma 4 llama.cpp tokenizer exactly on representative whitespace, newline, accent, and Japanese cases. | Add the Gemma 4 graph and its per-layer attention metadata, then the other missing families listed above. Verify each family with a representative file; a builder entry or tokenizer alone does not establish model correctness. |
-| Chat | The server constructs a full conversation prompt, accepts a requested reply budget, and passes both to the executable. It still starts a subprocess per request. | Verify the executable consumes the complete prompt and budget. Keep one resident model across messages and verify the requested per-reply statistics. The older last-message-only and fixed-budget reports need an end-to-end recheck. |
+| Architectures | Builder entries exist for llama, gemma3, qwen2/3 families, qwen3.5/next, qwen4, and lfm2. The LFM2.5 builder handles per-layer attention or short-convolution selection and produced the same greedy answer as llama.cpp on a complete 1.2B Q8_0 model on an M60; its tokenizer IDs also match. Gemma 4 raw-UTF-8 BPE matches the local Gemma 4 llama.cpp tokenizer exactly on representative whitespace, newline, accent, and Japanese cases. | Add the Gemma 4 graph and its per-layer attention metadata, then the other missing families listed above. Verify LFM2 logits within profile tolerance and verify every other family with a representative file; a builder entry, matching answer, or tokenizer alone does not establish full model correctness. |
+| Chat | The server constructs a full conversation prompt and accepts a requested reply budget. Its Rust worker places the script-defined GGUF model once, reads requests over one pipe, reuses the same `Placed` tapes, and reports the device, resolved startup routes, prefill time, decode time, and tok/s under each reply. One M60 process answered two requests after one `READY`, with no reload. | Verify the browser UI end to end, including conversation persistence, cancellation behavior, and the displayed per-reply statistics. |
 | Measurement tools | `recipe stats <file.gguf>` streams rows through the loader's decoders and prints per-tensor mean absolute weight, RMS, participation, three-sigma RMS outlier rows, and a normalized histogram. A mixed Q8_0/F32 fixture verifies both block and float decoding without whole-tensor expansion. | Cross-check representative Q2/Q3/Q4/Q5/Q6/IQ/NF4 files against the earlier scripts, then add stable machine-readable output if downstream tools need it. |
 
 Evidence and scope:
@@ -402,6 +402,10 @@ Evidence and scope:
 - [Initial precision and reference verification](/home/nate/codex/precision-contract-8IP92O/RESULTS.md).
 - [Wide-gradient CPU and M60 verification](/home/nate/codex/wide-gradients-8Uc4T7/RESULTS.md),
   including the two-M60 check and fresh checkpoint paths.
+- [LFM2.5 tokenizer, builder, and M60 verification](/home/nate/codex/lfm2-verification-20260919/RESULTS.md).
+- [RNJ resident chat two-request M60 verification](/home/nate/codex/rnj-chat-resident-20260919/RESULTS.md).
+- [NVIDIA sm_61 dp4a compiler verification](/home/nate/codex/nvidia-dp4a-20260919/RESULTS.md).
+- [M60 and K80 packed-int8 fp32 widening verification](/home/nate/codex/nvidia-widen-20260919/RESULTS.md).
 - Storage retention is implemented in `lower_block` in [recipe.rs](../recipe.rs).
   Chat request handling is in [server.mjs](../rnj-chat/server.mjs); the executable
   selected by [start.sh](../rnj-chat/start.sh) must also be checked.
@@ -417,9 +421,9 @@ Bounded arithmetic checks do not close either issue.
 
 ## The first milestone from where the tree is tonight
 
-Completion: **1/8 fully complete under the criteria below**. Items 2, 3, and 6
-have partial implementations. The int8 default is present locally but remains
-uncommitted; tolerances and resolution printing are not additional numbered items.
+Completion: **2/8 fully complete under the criteria below**. Items 2, 5, 6, and
+8 have partial implementations. Tolerances and resolution printing are not
+additional numbered items.
 
 1. **Done:** `.step()` is absent from the public block/model API and new bundle
    records. Lowering obtains every node's step from the selected precision table.
@@ -433,14 +437,17 @@ uncommitted; tolerances and resolution printing are not additional numbered item
    On K80/M60, declare and print the packed-code route using fp32 register
    arithmetic. Resolve float training arithmetic separately from integer
    checkpoint storage.
-3. **Partial:** Commit `sum = "int8"` as the default. Keep packed weight codes in
-   device memory; a float multiply declaration must not expand them into a
-   persistent float weight buffer.
+3. **Done:** `sum = "int8"` is the committed default. Integer inference keeps
+   packed weight codes in device memory. The K80/M60 widening route reads the
+   Q8_0 and int8 activation codes into fp32 registers instead of expanding a
+   persistent float weight buffer; its bounded cross-device logits are identical.
 4. **Open, reported failure:** Determine whether YaRN, softcap, step-256, or another
    cause breaks `rnj-1.rs`. Fix the reproduced cause, verify the intended script,
    and remove superseded one-off scripts.
-5. **Open, reported failure:** Run the `llamacpp` profile on both target GPUs
-   without deadlock, with retained correctness evidence.
+5. **Partial:** The `llamacpp` profile completed an uncached full-model M60 run,
+   including prefill and eight decode steps, without deadlock. Its output was
+   corrupt. Reproduce or close the AMD report, then retain correctness evidence
+   for both devices.
 6. **Partial:** Integer compute converts single noncanonical quantized planes into
    Q4_1 or Q8_0 at load, and a device-load fixture matches host canonical encoding.
    Add per-plane targets so mixed Q4_K/Q6_K nodes keep Q4_K as int4 and convert
@@ -450,5 +457,6 @@ uncommitted; tolerances and resolution printing are not additional numbered item
    paths.
 7. **Open:** Implement the int4 activation quantizer and `sudot8` path; measure
    prefill.
-8. **Open:** Add and verify gfx906 and sm_61 rows. Measure the V340L and P40 against
-   their applicable table entries.
+8. **Partial:** The `sm_61+` row emits named signed and mixed-sign `dp4a`
+   instructions in a compiler check. Run it on a P40. Add and verify gfx906,
+   then measure the V340L and P40 against their applicable table entries.

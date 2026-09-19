@@ -1,12 +1,67 @@
 import http from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { StringDecoder } from 'node:string_decoder';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const state = '/home/nate/codex/rnj-chat';
 await mkdir(state, { recursive: true });
 let busy = false;
+let pending;
+let startupLog = '';
+const routes = new Set();
+const residentEnv = {
+  ...process.env,
+  RECIPE_DEVICE: 'amd0',
+  RECIPE_TIMINGS: '1',
+  RECIPE_CONTEXT: '1024',
+};
+const child = spawn('flock', ['-x', '/home/nate/codex/rnj-estimate/gpu.lock', `${state}/rnj-chat`], {
+  cwd: root,
+  env: residentEnv,
+  stdio: ['pipe', 'pipe', 'pipe'],
+});
+let readyResolve;
+let readyReject;
+const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+createInterface({ input: child.stdout }).on('line', line => {
+  if (line.startsWith('READY\t')) return readyResolve(Number(line.slice(6)));
+  if (!line.startsWith('RESULT\t') || !pending) return;
+  const [, promptTokens, prefill, decode, rate, encoded] = line.split('\t');
+  const current = pending;
+  pending = undefined;
+  current.resolve({
+    text: Buffer.from(encoded, 'hex').toString('utf8'),
+    promptTokens: Number(promptTokens),
+    prefill: Number(prefill),
+    decode: Number(decode),
+    rate: Number(rate),
+  });
+});
+child.stderr.on('data', chunk => {
+  startupLog = (startupLog + chunk.toString()).slice(-200_000);
+  for (const line of startupLog.split('\n')) {
+    if (line.includes(' -> ')) routes.add(line.trim());
+  }
+});
+const residentFailed = error => {
+  readyReject(error);
+  if (pending) {
+    pending.reject(error);
+    pending = undefined;
+  }
+};
+child.on('error', residentFailed);
+child.on('close', code => residentFailed(Error(startupLog.trim() || `Resident model exited with code ${code}.`)));
+const decode = (path, tokens) => new Promise((resolve, reject) => {
+  pending = { resolve, reject };
+  child.stdin.write(`${path}\t${tokens}\n`, error => {
+    if (error && pending) {
+      pending = undefined;
+      reject(error);
+    }
+  });
+});
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -31,31 +86,21 @@ const server = http.createServer(async (req, res) => {
     await writeFile(`${state}/prompt.txt`, prompt);
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' });
     const send = value => { if (!res.destroyed) res.write(JSON.stringify(value) + '\n'); };
-    send({ status: 'Loading model and preparing conversation…' });
-    const child = spawn('flock', ['-x', '/home/nate/codex/rnj-estimate/gpu.lock', `${state}/rnj-chat`], {
-      cwd: root, detached: true,
-      env: { ...process.env, RECIPE_DEVICE: 'amd0', RECIPE_PACKED_DOT: '1', RECIPE_HOST_SPILL: '1', RECIPE_TIMINGS: '1', RNJ_CONTEXT: '32768', RECIPE_CONTEXT: '1024',
-        RNJ_TOKENS: String(tokens), RNJ_PROMPT_FILE: `${state}/prompt.txt`, RNJ_RAW_PROMPT: '1',
-             RECIPE_MESSAGE: messages[messages.length - 1].content },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    const decoder = new StringDecoder('utf8');
-    let log = '';
-    child.stdout.on('data', chunk => send({ text: decoder.write(chunk) }));
-    child.stderr.on('data', chunk => {
-      log += chunk.toString();
-      const match = log.match(/(\d+) prompt tokens/);
-      if (match) send({ promptTokens: Number(match[1]) });
-    });
-    res.on('close', () => { if (child.exitCode === null) { try { process.kill(-child.pid, 'SIGTERM'); } catch {} } });
-    child.on('error', error => { busy = false; send({ error: error.message }); res.end(); });
-    child.on('close', async code => {
-      busy = false;
-      send({ text: decoder.end() });
-      await writeFile(`${state}/last-run.log`, log);
-      send(code === 0 ? { done: true, stats: log.trim() } : { error: log.trim() || `Generation exited with code ${code}.` });
-      res.end();
-    });
-  } catch (error) { busy = false; res.writeHead(400); res.end(error.message); }
+    send({ status: 'Preparing the resident model and conversation…' });
+    const context = await ready;
+    send({ context });
+    const result = await decode(`${state}/prompt.txt`, tokens);
+    send({ promptTokens: result.promptTokens });
+    send({ text: result.text });
+    const instructions = [...routes].join('; ');
+    const stats = `${residentEnv.RECIPE_DEVICE}; context ${context}; ${instructions}; prefill ${result.prefill.toFixed(3)} s; decode ${result.decode.toFixed(3)} s; ${result.rate.toFixed(2)} tok/s`;
+    await writeFile(`${state}/last-run.log`, `${startupLog}\n${stats}\n`);
+    send({ done: true, stats });
+    res.end();
+  } catch (error) {
+    if (!res.headersSent) res.writeHead(400);
+    else if (!res.destroyed) res.write(JSON.stringify({ error: error.message }) + '\n');
+    res.end(error.message);
+  } finally { busy = false; }
 });
 server.listen(8766, '127.0.0.1', () => console.log('RNJ-1 chat: http://127.0.0.1:8766'));

@@ -2272,12 +2272,17 @@ impl ContractFormat {
 	}
 }
 #[derive(Clone, Copy)]
-enum TargetMatch { Cpu, Amd(&'static str), Nvidia }
+enum TargetMatch { Cpu, Amd(&'static str), NvidiaAtLeast(u32), Nvidia }
+fn nvidia_sm(architecture: &str) -> Option<u32> {
+	architecture.strip_prefix("sm_").or_else(|| architecture.strip_prefix("sm")).and_then(|value| value.parse().ok())
+}
 impl TargetMatch {
 	fn matches(self, target: &BackendTarget) -> bool {
 		match (self, target) {
-			(Self::Cpu, BackendTarget::Cpu { .. }) | (Self::Nvidia, BackendTarget::Nvidia { .. }) => true,
+			(Self::Cpu, BackendTarget::Cpu { .. }) => true,
 			(Self::Amd(prefix), BackendTarget::Amd { architecture }) => architecture.starts_with(prefix),
+			(Self::NvidiaAtLeast(minimum), BackendTarget::Nvidia { architecture }) => nvidia_sm(architecture).is_some_and(|sm| sm >= minimum),
+			(Self::Nvidia, BackendTarget::Nvidia { .. }) => true,
 			_ => false,
 		}
 	}
@@ -2304,9 +2309,21 @@ const CPU_CAPABILITIES: &[FormatCapability] = &[
 	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
 	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
 ];
-const NVIDIA_CAPABILITIES: &[FormatCapability] = &[
-	FormatCapability { format: ContractFormat::Int4, vector: Some("scalar packed dot"), matrix: None },
-	FormatCapability { format: ContractFormat::Int8, vector: Some("scalar packed dot"), matrix: None },
+const NVIDIA_WIDEN_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("fp32 dot of packed i8 codes"), matrix: None },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const NVIDIA_DP4A_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("dp4a"), matrix: None },
 	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
 	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
 	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
@@ -2356,7 +2373,8 @@ const CAPABILITY_ROWS: &[CapabilityRow] = &[
 	CapabilityRow { target: TargetMatch::Amd("gfx12"), formats: AMD_GFX12_CAPABILITIES },
 	CapabilityRow { target: TargetMatch::Amd("gfx11"), formats: AMD_GFX11_CAPABILITIES },
 	CapabilityRow { target: TargetMatch::Amd("gfx"), formats: AMD_GENERIC_CAPABILITIES },
-	CapabilityRow { target: TargetMatch::Nvidia, formats: NVIDIA_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::NvidiaAtLeast(61), formats: NVIDIA_DP4A_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::Nvidia, formats: NVIDIA_WIDEN_CAPABILITIES },
 	CapabilityRow { target: TargetMatch::Cpu, formats: CPU_CAPABILITIES },
 ];
 fn capability_row(target: &BackendTarget) -> Result<&'static CapabilityRow> {
@@ -2723,6 +2741,60 @@ fn definition_span(ir: &str, name: &str) -> Option<(usize, usize)> {
 fn strip_definition(mut ir: String, name: &str) -> String {
 	if let Some((start, end)) = definition_span(&ir, name) {
 		ir.replace_range(start..end, "")
+	}
+	ir
+}
+
+/// Replaces the portable four-byte products in every linked arithmetic variant
+/// with Pascal's named signed and mixed-sign dot instructions. The weight bytes
+/// remain packed and the intrinsic contributes directly to the i32 block sum.
+fn nvidia_dp4a_helpers(mut ir: String, variants: &[NativeVariant]) -> String {
+	let suffixes = std::iter::once("").chain(variants.iter().map(|variant| variant.suffix.as_str())).collect::<Vec<_>>();
+	for suffix in &suffixes {
+		ir = strip_definition(ir, &format!("recipe.dot4.su{suffix}"));
+		ir = strip_definition(ir, &format!("recipe.dot4.ss{suffix}"));
+	}
+	ir.push_str("declare i32 @llvm.nvvm.idp4a.u.s(i32, i32, i32)\ndeclare i32 @llvm.nvvm.idp4a.s.s(i32, i32, i32)\n");
+	for suffix in suffixes {
+		ir.push_str(&format!(
+			"define internal i32 @recipe.dot4.su{suffix}(i32 %a, i32 %b) #1 {{ entry: %r = call i32 @llvm.nvvm.idp4a.u.s(i32 %a, i32 %b, i32 0) ret i32 %r }}\n\
+define internal i32 @recipe.dot4.ss{suffix}(i32 %a, i32 %b) #1 {{ entry: %r = call i32 @llvm.nvvm.idp4a.s.s(i32 %a, i32 %b, i32 0) ret i32 %r }}\n"
+		));
+	}
+	ir
+}
+
+/// Pre-Pascal NVIDIA has no integer dot instruction. Keep the same packed i8
+/// codes and scales, but widen each four-byte product into fp32 registers. The
+/// largest four-product partial is exactly representable, so the returned i32
+/// block sum has the same integer value as the named int8 operation.
+fn nvidia_float_dot4_helpers(mut ir: String, variants: &[NativeVariant]) -> String {
+	let suffixes = std::iter::once("").chain(variants.iter().map(|variant| variant.suffix.as_str())).collect::<Vec<_>>();
+	for suffix in &suffixes {
+		ir = strip_definition(ir, &format!("recipe.dot4.su{suffix}"));
+		ir = strip_definition(ir, &format!("recipe.dot4.ss{suffix}"));
+	}
+	for suffix in suffixes {
+		for (name, signed) in [("su", false), ("ss", true)] {
+			ir.push_str(&format!("define internal i32 @recipe.dot4.{name}{suffix}(i32 %a, i32 %b) #1 {{ entry:\n"));
+			let mut sum = String::new();
+			for byte in 0..4 {
+				let shift = 24 - byte * 8;
+				if signed {
+					ir.push_str(&format!("%a{byte}.s = shl i32 %a, {shift}\n%a{byte} = ashr i32 %a{byte}.s, 24\n"));
+				} else {
+					ir.push_str(&format!("%a{byte}.s = lshr i32 %a, {}\n%a{byte} = and i32 %a{byte}.s, 255\n", byte * 8));
+				}
+				ir.push_str(&format!("%b{byte}.s = shl i32 %b, {shift}\n%b{byte} = ashr i32 %b{byte}.s, 24\n%a{byte}.f = sitofp i32 %a{byte} to float\n%b{byte}.f = sitofp i32 %b{byte} to float\n%p{byte} = fmul float %a{byte}.f, %b{byte}.f\n"));
+				if byte == 0 {
+					sum = "%p0".to_owned();
+				} else {
+					ir.push_str(&format!("%s{byte} = fadd float {sum}, %p{byte}\n"));
+					sum = format!("%s{byte}");
+				}
+			}
+			ir.push_str(&format!("%result = fptosi float {sum} to i32\nret i32 %result\n}}\n"));
+		}
 	}
 	ir
 }
@@ -6544,7 +6616,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, nvidia_dp4a: bool, nvidia_widen: bool) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let substitute = |template: String, element: usize| {
 			template
@@ -6569,6 +6641,11 @@ impl NativeModelIr {
 			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
+		}
+		if nvidia_dp4a {
+			ir = nvidia_dp4a_helpers(ir, &self.variants);
+		} else if nvidia_widen {
+			ir = nvidia_float_dot4_helpers(ir, &self.variants);
 		}
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
@@ -7655,7 +7732,9 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
-	let ir = model.emit(target.backend(), matrix, loss)?;
+	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
+	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
+	let ir = model.emit(target.backend(), matrix, loss, dp4a, widen)?;
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -8084,7 +8163,6 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
-		pub(super) quantization: u16,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
@@ -8105,7 +8183,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, quantization: 0 })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -8388,7 +8466,7 @@ mod tokenizer {
 		fn named(pre: &str) -> Result<Self> {
 			Ok(match pre {
 				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
-				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
+				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" | "lfm2" => Self::Llama3,
 				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
 				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
 			})
@@ -8699,7 +8777,7 @@ mod tokenizer {
 		pub fn chat(&self, messages: &[(&str, &str)], generation: bool) -> String {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
-		pub(crate) fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
 			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
 			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
 			let conversation = messages
@@ -9911,27 +9989,38 @@ mod bundle {
 	}
 	fn product_branch_text(value: &ProductBranch) -> String {
 		let blocks = value.blocks.iter().map(residual_text).collect::<Vec<_>>().join(";");
-		format!("{}:{}:{blocks}", value.quantization, value.exclusions)
+		format!("{}:{blocks}", value.exclusions)
 	}
 	fn product_branch(value: &str) -> Result<ProductBranch> {
-		// Product records written before branch settings were carried contain only
-		// escaped block lists. New records prefix quantization and exclusions, so
-		// split only the first two colons and leave nested product text untouched.
+		// Product records that carried a run-level quantization prefix are adapted
+		// at load into block-local legacy storage. New records carry only exclusions.
 		let mut fields = value.splitn(3, ':');
 		let first = fields.next().unwrap_or("");
 		if let (Some(exclusions), Some(blocks)) = (fields.next(), fields.next())
 			&& let Ok(quantization) = first.parse::<u16>()
 			&& let Ok(exclusions) = exclusions.parse::<u8>()
 		{
+			let mut blocks = split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?;
+			if quantization != 0 {
+				for block in &mut blocks {
+					if block.quantization == 0 {
+						block.quantization = quantization;
+						block.profile = StorageFormat(quantization).selection().is_some();
+					}
+				}
+			}
+			return Ok(ProductBranch { blocks, exclusions });
+		}
+		if let Some((exclusions, blocks)) = value.split_once(':')
+			&& let Ok(exclusions) = exclusions.parse::<u8>()
+		{
 			return Ok(ProductBranch {
 				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-				quantization,
 				exclusions,
 			});
 		}
 		Ok(ProductBranch {
 			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-			quantization: 0,
 			exclusions: 0,
 		})
 	}
@@ -10296,10 +10385,18 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64, exclusions: u8, precision: Option<Compute>) -> Result<Model> {
+	fn model(mut blocks: Vec<Block>, loss: u8, legacy_quantization: u16, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, quantization, precision, epsilon, exclusions, pending_frozen: false }))
+		if legacy_quantization != 0 {
+			for block in &mut blocks {
+				if block.quantization == 0 {
+					block.quantization = legacy_quantization;
+					block.profile = StorageFormat(legacy_quantization).selection().is_some();
+				}
+			}
+		}
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, exclusions, pending_frozen: false }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -10382,7 +10479,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.epsilon.to_bits() == b.epsilon.to_bits() && a.exclusions == b.exclusions && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.epsilon.to_bits() == b.epsilon.to_bits() && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -10410,10 +10507,9 @@ mod bundle {
 	#[derive(Default)]
 	struct ModelParts {
 		loss: Option<u8>,
-		quantization: Option<u16>,
+		legacy_quantization: Option<u16>,
 		epsilon: Option<f64>,
 		exclusions: u8,
-		precision: Option<Compute>,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -10443,11 +10539,10 @@ mod bundle {
 			let model = model(
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
-				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				parts.legacy_quantization.unwrap_or(0),
 				// A bundle saved before models carried an epsilon was lowered with the Cargo default.
 				parts.epsilon.map_or_else(default_epsilon, Ok)?,
 				parts.exclusions,
-				parts.precision,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -10537,6 +10632,17 @@ mod bundle {
 			}
 			let builder = current.as_mut().ok_or_else(|| RecipeError::new("semantic model value precedes graph"))?;
 			match kind {
+				"model2" => {
+					let fields = value.split_whitespace().collect::<Vec<_>>();
+					require(fields.len() == 3, "semantic model2 header has the wrong width")?;
+					require(builder.model.is_none(), "semantic graph has more than one model")?;
+					builder.model = Some(ModelParts {
+						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
+						epsilon: Some(number("semantic model epsilon", fields[1])?),
+						exclusions: value_at(fields.get(2).copied(), "semantic model exclusions")?,
+						..ModelParts::default()
+					});
+				}
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
 					require((2..=5).contains(&fields.len()), "semantic model header has the wrong width")?;
@@ -10547,13 +10653,14 @@ mod bundle {
 						Some(field) => (None, value_at(Some(*field), "semantic model exclusions")?),
 					};
 					let exclusions = fields.get(3).map_or(Ok(exclusions), |field| value_at(Some(*field), "semantic model exclusions"))?;
-					let precision = fields.get(4).map_or(Ok(None), |field| precision_from_token(field))?;
+					if let Some(field) = fields.get(4) {
+						precision_from_token(field)?;
+					}
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
-						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						legacy_quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
 						epsilon,
 						exclusions,
-						precision,
 						..ModelParts::default()
 					});
 				}
@@ -10637,7 +10744,7 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {} {} {} {}", semantic.model.loss.0, semantic.model.quantization, semantic.model.epsilon, semantic.model.exclusions, precision_token(semantic.model.precision)));
+			field(&mut document, "model2", &format!("{} {} {}", semantic.model.loss.0, semantic.model.epsilon, semantic.model.exclusions));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -10729,7 +10836,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.quantization, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
+		feed(&format!("loss:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -11428,12 +11535,15 @@ enum Suffix {
 }
 impl Suffix {
 	fn for_operation(operation: &Operation) -> Self {
-		if matches!(operation, Operation::Residual(_) | Operation::Product(..) | Operation::Ensemble(_) | Operation::MoeBlocks(..) | Operation::Recur(_) | Operation::Hyper(..)) {
-			Self::End
-		} else if operation.weighted() || matches!(operation, Operation::Embed(..)) {
-			Self::Blck
-		} else {
-			Self::End
+		match operation {
+			// These operations lower their declared arithmetic through a sum,
+			// table lookup, or attention node. Their trailing suffix therefore
+			// names the block's primary numeric operation, not a later activation.
+			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::Moe(..) => Self::Blck,
+			// Every other operation lowers its primary node through the ordinary
+			// operation precision. Weight ownership alone does not choose a slot:
+			// a depthwise convolution owns taps but is not a matrix sum.
+			_ => Self::End,
 		}
 	}
 }
@@ -11458,7 +11568,6 @@ impl Eq for Block {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductBranch {
 	blocks: Vec<Block>,
-	quantization: u16,
 	exclusions: u8,
 }
 /// The blocks and model-level forward settings captured by one product branch.
@@ -11588,9 +11697,6 @@ pub struct ModelData {
 	loss: LossFunction,
 	/// The evaluator a command-RAT proposer is scored through, from `.loss(&evaluator)`.
 	downstream: Option<Box<Model>>,
-	quantization: u16,
-	/// The arithmetic the blocks that named none compute in, when the model set one before its first block.
-	precision: Option<Compute>,
 	/// The epsilon every normalization the model lowers is built with; saved with the model.
 	epsilon: f64,
 	/// The qualifier pending for the next block.
@@ -11693,8 +11799,8 @@ impl Model {
 				activation: Activation::Linear,
 				normalization: None,
 				qk: None,
-				quantization: model.quantization,
-				profile: StorageFormat(model.quantization).selection().is_some(),
+				quantization: 0,
+				profile: false,
 				frozen: model.pending_frozen,
 				precision: None,
 				blck_precision: None,
@@ -13501,8 +13607,8 @@ impl std::ops::Mul for Model {
 		assert!(!left.pending_frozen && !right.pending_frozen, "product branch qualifier requires a following block");
 		assert!(left.epsilon.to_bits() == right.epsilon.to_bits(), "product branches must use the same normalization epsilon");
 		Block::of(Operation::Product(
-			ProductBranch { blocks: left.blocks, quantization: left.quantization, exclusions: left.exclusions },
-			ProductBranch { blocks: right.blocks, quantization: right.quantization, exclusions: right.exclusions },
+			ProductBranch { blocks: left.blocks, exclusions: left.exclusions },
+			ProductBranch { blocks: right.blocks, exclusions: right.exclusions },
 		))
 	}
 }
@@ -13518,8 +13624,8 @@ impl std::ops::Mul for Block {
 	type Output = Self;
 	fn mul(self, right: Self) -> Self {
 		Block::of(Operation::Product(
-			ProductBranch { blocks: vec![self], quantization: 0, exclusions: 0 },
-			ProductBranch { blocks: vec![right], quantization: 0, exclusions: 0 },
+			ProductBranch { blocks: vec![self], exclusions: 0 },
+			ProductBranch { blocks: vec![right], exclusions: 0 },
 		))
 	}
 }
@@ -13654,7 +13760,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -13798,6 +13904,15 @@ impl Gguf {
 	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
 		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
 	}
+	/// Places a script-defined GGUF model once and keeps its weights and state
+	/// resident across every later decode. Standard tensor names bind the model
+	/// through the same checked plan used by `recipe.infer()`.
+	pub fn place(&self, blocks: &Model, positions: usize, split: &[usize]) -> Placed {
+		let model = with_last_projection(blocks);
+		let plan = conventional_plan(self, &model).unwrap_or_else(|error| panic!("{error}"));
+		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
 		Binding::default()
@@ -13917,8 +14032,7 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	let mut config = Config::load()?;
-	config.quantization = model.quantization;
+	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
@@ -13970,6 +14084,7 @@ struct Architecture {
 const ARCHITECTURES: &[Architecture] = &[
 	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
 	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
 	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
@@ -14053,10 +14168,11 @@ struct Builder<'a> {
 struct Dimensions {
 	width: usize,
 	heads: usize,
-	kv: usize,
-	head: usize,
-	rope_dims: usize,
-	rope_base: f64,
+	kv: Vec<usize>,
+	head: Vec<usize>,
+	rope_dims: Vec<usize>,
+	rope_base: Vec<f64>,
+	shortconv: Option<usize>,
 	/// Every `interval`th block attends and the rest are delta blocks; absent,
 	/// every block attends.
 	interval: Option<usize>,
@@ -14117,9 +14233,15 @@ impl<'a> Builder<'a> {
 				model = model.ple(ple);
 				builder.ple(layer, ple, &dimensions)?;
 			}
-			let attends = dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
+			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
 			let branch = builder.open(layer, "attn", &dimensions)?;
-			let branch = if attends { builder.attention(branch, layer, &dimensions)? } else { builder.delta(branch, layer, &dimensions)? };
+			let branch = if attends {
+				builder.attention(branch, layer, &dimensions)?
+			} else if dimensions.shortconv.is_some() {
+				builder.shortconv(branch, layer, &dimensions)?
+			} else {
+				builder.delta(branch, layer, &dimensions)?
+			};
 			model = builder.close(model, branch, &dimensions);
 			let branch = builder.open(layer, "ffn", &dimensions)?;
 			let branch = match &dimensions.experts {
@@ -14128,7 +14250,8 @@ impl<'a> Builder<'a> {
 			};
 			model = builder.close(model, branch, &dimensions);
 		}
-		if let Some(scale) = builder.optional("output_norm.weight") {
+		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
+		if let Some(scale) = output_norm {
 			model = model.norm(rms);
 			builder.mapped(vec![scale]);
 		} else if dimensions.hyper.is_some_and(|(_, rank)| rank != 0) {
@@ -14164,16 +14287,32 @@ impl<'a> Builder<'a> {
 	fn present(&self, suffix: &str) -> bool {
 		self.file.value(&self.key(suffix)).is_some()
 	}
+	fn layer_integers(&self, suffix: &str, default: usize, layers: usize) -> Result<Vec<usize>> {
+		match self.file.value(&self.key(suffix)) {
+			None => Ok(vec![default; layers]),
+			Some(GgufValue::Array(values)) => {
+				require(values.len() == layers, format!("{}.{} holds {} values for {layers} layers", self.architecture, suffix, values.len()))?;
+				values.iter().map(|value| value.integer().and_then(|value| usize::try_from(value).ok()).ok_or_else(|| RecipeError::new(format!("{}.{} contains an invalid layer value", self.architecture, suffix)))).collect()
+			}
+			Some(value) => {
+				let value = value.integer().and_then(|value| usize::try_from(value).ok()).ok_or_else(|| RecipeError::new(format!("{}.{} is not a nonnegative integer", self.architecture, suffix)))?;
+				Ok(vec![value; layers])
+			}
+		}
+	}
 	fn dimensions(&self) -> Result<Dimensions> {
+		let layers = self.integer("block_count")?;
 		let width = self.integer("embedding_length")?;
 		let heads = self.integer("attention.head_count")?;
-		let kv = self.integer_or("attention.head_count_kv", heads)?;
-		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{} heads do not partition a stream of {width}", heads))?;
-		let head = self.integer_or("attention.key_length", width / heads.max(1))?;
-		let value = self.integer_or("attention.value_length", head)?;
-		require(value == head, format!("attention keys are {head} wide and values {value}; the attention block takes one head width"))?;
-		let rope_dims = self.integer_or("rope.dimension_count", head)?;
-		let rope_base = if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 };
+		let kv = self.layer_integers("attention.head_count_kv", heads, layers)?;
+		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{heads} heads do not partition a stream of {width}"))?;
+		let head_value = self.integer_or("attention.key_length", width / heads.max(1))?;
+		let value = self.integer_or("attention.value_length", head_value)?;
+		require(value == head_value, format!("attention keys are {head_value} wide and values {value}; the attention block takes one head width"))?;
+		let head = vec![head_value; layers];
+		let rope_dims = vec![self.integer_or("rope.dimension_count", head_value)?; layers];
+		let rope_base = vec![if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 }; layers];
+		let shortconv = self.file.value(&self.key("shortconv.l_cache")).map(|_| self.integer("shortconv.l_cache")).transpose()?;
 		let interval = if self.present("full_attention_interval") { Some(self.integer("full_attention_interval")?) } else { None };
 		let delta = match interval {
 			Some(_) => Some(DeltaDims {
@@ -14212,7 +14351,7 @@ impl<'a> Builder<'a> {
 			None
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
-		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
@@ -14279,7 +14418,8 @@ impl<'a> Builder<'a> {
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
-		let Dimensions { width, heads, kv, head, rope_dims, rope_base, .. } = *dimensions;
+		let (width, heads) = (dimensions.width, dimensions.heads);
+		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
 		let query = self.tensor(&name("attn_q.weight"), &role)?;
@@ -14346,6 +14486,38 @@ impl<'a> Builder<'a> {
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
 		Ok(block)
+	}
+	/// LFM2 short convolution: project B, C and X in one stored tensor, run
+	/// `C * depthwise_conv(B * X)`, then project back to the residual width.
+	fn shortconv(&mut self, branch: Model, layer_index: usize, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let kernel = dimensions.shortconv.ok_or_else(|| RecipeError::new("the architecture names no short-convolution cache"))?;
+		require(kernel > 1, "short-convolution cache must cover the current position and at least one prior position")?;
+		let name = |suffix: &str| format!("blk.{layer_index}.{suffix}");
+		let role = format!("block {layer_index} short convolution");
+		let input = self.tensor(&name("shortconv.in_proj.weight"), &role)?;
+		require(input.shape == [width as u64, (3 * width) as u64], format!("{} has shape {:?}; {role} projects three {width}-wide planes", input.name, input.shape))?;
+		let b = input.rows(0, width)?;
+		let c = input.rows(width, width)?;
+		let x = input.rows(2 * width, width)?;
+		let taps = self.tensor(&name("shortconv.conv.weight"), &role)?;
+		require(taps.shape == [kernel as u64, width as u64], format!("{} has shape {:?}; {role} holds {kernel} taps for {width} channels", taps.name, taps.shape))?;
+		let output = self.projection(&name("shortconv.out_proj.weight"), &role, width, width)?;
+		// Lowering walks the nested product's left branch first: B, X, taps,
+		// then the right C branch, followed by the output projection.
+		self.mapped(vec![b]);
+		self.mapped(vec![x]);
+		self.mapped(vec![taps]);
+		self.mapped(vec![c]);
+		self.mapped(vec![output]);
+		let bx = layer(width) * layer(width);
+		let dconv = Block::of(Operation::Dconv(kernel, 1));
+		let short = Block::of(Operation::Product(
+			ProductBranch { blocks: vec![bx, dconv], exclusions: 0 },
+			ProductBranch { blocks: vec![layer(width)], exclusions: 0 },
+		));
+		let branch = branch.edit(|model| model.blocks.push(short));
+		Ok(branch.layer(width))
 	}
 	/// One gated delta rule block and the plan of its gate projection, its
 	/// query-key-value projection, its convolution taps, its decay, its output
@@ -14789,6 +14961,14 @@ fn stop_ids(coder: &Tokenizer) -> Result<Vec<u32>> {
 		}
 	}
 	Ok(stop)
+}
+impl Tokenizer {
+	/// End-of-turn ids rendered by this tokenizer's own chat template, including
+	/// its declared EOS id. A resident chat process can use the same stop set as
+	/// `recipe.infer()` without restating model-specific tokens.
+	pub fn stop_ids(&self) -> Vec<u32> {
+		stop_ids(self).unwrap_or_else(|error| panic!("{error}"))
+	}
 }
 /// The model with its output projection evaluated at the newest position
 /// alone: a `last` before the projection onto the vocabulary, unless the
@@ -15928,11 +16108,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
 		lower_conv(&mut graph, data.target_width, length)?;
-		let quantization = if model.quantization != 0 { model.quantization } else { config.quantization };
-		if quantization != 0 {
-			graph.nodes.last_mut().unwrap().argument[8] = f64::from(quantization)
-		}
-		output_profile = StorageFormat(quantization).selection().map(|_| StorageFormat(quantization));
+		output_profile = None;
 	}
 	if let Some(left) = graph.bound.take().filter(|plan| !plan.is_empty()) {
 		return Err(RecipeError::new(format!("the plan names {} more weights than the model has parameterized nodes, starting with {}", left.len(), left[0].names)));
@@ -16123,12 +16299,9 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let channels = graph.output.channels;
 		lower_normalize(graph, normalization, channels, channels)?;
 	}
-	// A block's own storage format wins; a block that names none takes the run's.
-	let (quantization, profile) = if block.quantization != 0 {
-		(block.quantization, block.profile)
-	} else {
-		(config.quantization, StorageFormat(config.quantization).selection().is_some())
-	};
+	// Only a legacy block record can name storage. New models take storage from
+	// each bound tensor or from the compute format selected for this operation.
+	let (quantization, profile) = (block.quantization, block.profile);
 	if quantization != 0 {
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
@@ -18051,6 +18224,21 @@ mod precision_contract_checks {
 		assert!(matches!(f16.matrix, Some((NativeMatrix::Gfx11, "wmma f16"))));
 		let gfx12 = BackendTarget::Amd { architecture: "gfx1201".to_owned() };
 		assert!(matches!(resolve_capability(&gfx12, ContractFormat::Bf16).unwrap().matrix, Some((NativeMatrix::Gfx12, "wmma bf16"))));
+		let sm52 = BackendTarget::Nvidia { architecture: "sm_52".to_owned() };
+		assert_eq!(resolve_capability(&sm52, ContractFormat::Int8).unwrap().vector, Some("fp32 dot of packed i8 codes"));
+		assert!(resolve_capability(&sm52, ContractFormat::Int4).is_err());
+		let sm61 = BackendTarget::Nvidia { architecture: "sm_61".to_owned() };
+		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
+	}
+	#[test]
+	fn nvidia_dp4a_replaces_portable_helpers() {
+		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
+		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
+		assert!(replaced.contains("call i32 @llvm.nvvm.idp4a.u.s") && replaced.contains("call i32 @llvm.nvvm.idp4a.s.s"));
+		assert!(!replaced.contains("entry: ret i32 0"));
+		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
+		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
+		assert!(!widened.contains("entry: ret i32 0"));
 	}
 	#[test]
 	fn precision_suffix_scope_is_local_and_explicit() {
@@ -18066,6 +18254,10 @@ mod precision_contract_checks {
 		assert_eq!(residual.precision, Some(Compute::FP64));
 		let Operation::Residual(parts) = &residual.operation else { panic!("residual block was not preserved") };
 		assert_eq!(parts[0], projection);
+		let depthwise = recipe.model().dconv(3).fp(32);
+		let depthwise = depthwise.blocks.last().unwrap();
+		assert_eq!(depthwise.precision, Some(Compute::FP32));
+		assert_eq!(depthwise.blck_precision, None);
 		assert!(std::panic::catch_unwind(|| layer(1).int(1)).is_err());
 	}
 	#[test]
@@ -18258,12 +18450,12 @@ fn precision_named(name: &str) -> Result<Compute> {
 fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 	match op {
 		Primitive::Elementwise if block_kind == "residual" => PrecisionKind::Res,
-		Primitive::Elementwise | Primitive::Expand | Primitive::Read | Primitive::Last | Primitive::Fold | Primitive::TopK => PrecisionKind::Atvn,
 		Primitive::Normalize => PrecisionKind::Norm,
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		_ => PrecisionKind::Sum,
+		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		_ => PrecisionKind::Atvn,
 	}
 }
 #[derive(Clone, Copy)]
@@ -18309,8 +18501,6 @@ struct Config {
 	precision: Compute,
 	/// The precision of every kind of op a block names none for.
 	profile: Precisions,
-	/// The storage format for blocks that name none, 0 for unquantized.
-	quantization: u16,
 }
 impl Config {
 	fn load() -> Result<Self> {
@@ -18369,7 +18559,6 @@ impl Config {
 			],
 			precision: if matches!(profile.sum, Compute::Int(_)) { profile.acc } else { profile.resolve(profile.sum) },
 			profile,
-			quantization: 0,
 		})
 	}
 }
