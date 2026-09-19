@@ -400,6 +400,7 @@ stricter: only 2 of the 8 first-milestone items are fully complete.
 
 Evidence and scope:
 
+- [Half-progress consolidated receipt](/home/nate/codex/goal-half-20260919/RESULTS.md).
 - [Initial precision and reference verification](/home/nate/codex/precision-contract-8IP92O/RESULTS.md).
 - [Wide-gradient CPU and M60 verification](/home/nate/codex/wide-gradients-8Uc4T7/RESULTS.md),
   including the two-M60 check and fresh checkpoint paths.
