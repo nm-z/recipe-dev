@@ -15570,7 +15570,7 @@ impl Infer {
 				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
 				let Some(line) = chat_line()? else { break };
 				if line.trim() == "/exit" { break; }
-				if line.trim() == "/clear" { conversation.clear(); continue; }
+				if line.trim() == "/clear" { conversation.clear(); placed.clear(); continue; }
 				if line.trim().is_empty() { continue; }
 				request_started = Instant::now();
 				progress = start_progress(request_started);
@@ -15624,9 +15624,9 @@ impl Infer {
 			let reply = coder.decode(&ids);
 			request_history.push(Arc::new(InferenceRequest {
 				time: DurationReport(seconds),
-				input: prompt.len(), out: ids.len(), cached: 0, reply_limit: budget,
+				input: prompt.len(), out: ids.len(), cached: generation.cached, reply_limit: budget,
 				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
-				pp_seconds: generation.prefill_seconds, tg_seconds: generation.step_seconds.iter().sum(),
+				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds,
 			}));
 			if !interactive { break; }
 			conversation.push(("assistant".to_owned(), reply));
@@ -15968,13 +15968,22 @@ impl Sampler {
 	}
 }
 /// What `decode` produced: the prompt followed by the generated ids, the logits
-/// of the last forward, the seconds of the prefill, and the seconds of each
-/// later step.
+/// of the last forward, and elapsed seconds for prefill and generation.
 pub struct Generation {
 	pub ids: Vec<u32>,
 	pub logits: Vec<f64>,
+	/// Prompt positions whose previously computed state this request reused.
+	pub cached: usize,
 	pub prefill_seconds: f64,
-	pub step_seconds: Vec<f64>,
+	pub generation_seconds: f64,
+}
+/// Only evaluated tokens belong here. The final sampled token has no KV state
+/// until the next forward evaluates it. Logits stay in machine RAM.
+#[derive(Default)]
+struct DecodeState {
+	ids: Vec<u32>,
+	predictions: Vec<f64>,
+	logits: Vec<f64>,
 }
 pub struct InferenceReport {
 	pub llvm: LlvmReport,
@@ -16031,27 +16040,34 @@ pub struct InferenceProgress {
 	pub cached: usize,
 	pub prefill_seconds: f64,
 	pub prefill_tokens: usize,
-	pub decode_steps: usize,
-	pub decode_seconds: f64,
-	pub last_decode_seconds: f64,
+	pub generation_seconds: f64,
 	pub context: usize,
 	pub devices: String,
 	pub memory: Vec<DeviceMemory>,
 	started: Option<Instant>,
+	phase_started: Option<Instant>,
 	finished: bool,
 	reply: String,
 	version: usize,
 }
 impl InferenceProgress {
 	pub fn pp(&self) -> f64 { if self.prefill_seconds > 0.0 { self.prefill_tokens as f64 / self.prefill_seconds } else { 0.0 } }
-	pub fn tg(&self) -> f64 { if self.decode_seconds > 0.0 { self.decode_steps as f64 / self.decode_seconds } else { 0.0 } }
-	fn line(&self, metrics: &[ChatMetric], final_line: bool) -> String {
+	pub fn tg(&self) -> f64 { if self.generation_seconds > 0.0 { self.out_tokens as f64 / self.generation_seconds } else { 0.0 } }
+	fn observe(&mut self, now: Instant) {
+		if self.finished { return; }
+		if let Some(started) = self.started { self.seconds = now.duration_since(started).as_secs_f64(); }
+		if let Some(started) = self.phase_started {
+			let seconds = now.duration_since(started).as_secs_f64();
+			match self.phase { "prefill" => self.prefill_seconds = seconds, "tg" => self.generation_seconds = seconds, _ => {} }
+		}
+	}
+	fn line(&self, metrics: &[ChatMetric]) -> String {
 		let mut values = Vec::new();
 		for metric in metrics {
 			match metric.0 {
 				1 if self.prefill_seconds > 0.0 => values.push(format!("pp {:.2} tok/s", self.pp())),
 				1 => values.push("pp ...".to_owned()),
-				2 if self.decode_steps != 0 && self.last_decode_seconds > 0.0 => values.push(format!("tg {:.2} tok/s", if final_line { self.tg() } else { 1.0 / self.last_decode_seconds })),
+				2 if self.generation_seconds > 0.0 => values.push(format!("tg {:.2} tok/s", self.tg())),
 				2 => values.push("tg ...".to_owned()),
 				3 if self.in_tokens != 0 => values.push(format!("input {}", self.in_tokens)),
 				3 => values.push("input ...".to_owned()),
@@ -16187,7 +16203,7 @@ impl InferenceLive {
 	fn new(state: InferenceProgress, metrics: Vec<ChatMetric>) -> Self {
 		let mut renderer = std::io::stderr().is_terminal().then(ChatTerminal::new).flatten();
 		if let Some(renderer) = &mut renderer {
-			if let Err(error) = renderer.render((state.phase != "load").then_some(state.reply.as_str()), &state.line(&metrics, false), false) { eprintln!("cannot print chat progress: {error}"); }
+			if let Err(error) = renderer.render((state.phase != "load").then_some(state.reply.as_str()), &state.line(&metrics), false) { eprintln!("cannot print chat progress: {error}"); }
 		}
 		let state = Arc::new(Mutex::new(state));
 		let (stop, receiver) = std::sync::mpsc::channel();
@@ -16200,13 +16216,14 @@ impl InferenceLive {
 				let complete = !matches!(receiver.recv_timeout(refresh), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
 				let mut view = {
 					let state = shared.lock().unwrap();
-					let ticking = metrics.contains(&infer::time) && !state.finished;
+					let ticking = !state.finished && (metrics.contains(&infer::time)
+						|| state.phase == "prefill" && metrics.contains(&infer::pp) || state.phase == "tg" && metrics.contains(&infer::tg));
 					if !complete && !ticking && version == Some(state.version) { continue; }
 					state.clone()
 				};
-				if !view.finished && let Some(started) = view.started { view.seconds = started.elapsed().as_secs_f64(); }
+				view.observe(Instant::now());
 				if terminal || complete {
-					let line = view.line(&metrics, complete);
+					let line = view.line(&metrics);
 					if let Some(renderer) = &mut renderer {
 						let reply = (!matches!(view.phase, "load" | "ready")).then_some(view.reply.as_str());
 						if let Err(error) = renderer.render(reply, &line, complete) { eprintln!("cannot print chat progress: {error}"); break; }
@@ -16223,7 +16240,7 @@ impl InferenceLive {
 	fn finish(&self) -> f64 {
 		let mut state = self.state.lock().unwrap();
 		if !state.finished {
-			if let Some(started) = state.started { state.seconds = started.elapsed().as_secs_f64(); }
+			state.observe(Instant::now());
 			state.finished = true;
 			state.version += 1;
 		}
@@ -16235,16 +16252,21 @@ impl InferenceLive {
 		state.phase = "prefill";
 		state.version += 1;
 	}
-	fn prefilled(&self, tokens: usize, seconds: f64) {
+	fn prefilled(&self, tokens: usize) {
 		let mut state = self.state.lock().unwrap();
-		state.prefill_tokens = tokens;
-		state.prefill_seconds = seconds;
+		state.prefill_tokens = tokens.saturating_sub(state.cached);
 		state.version += 1;
 	}
-	fn measured(&self, step: usize, seconds: f64) {
+	fn cached(&self, tokens: usize) {
 		let mut state = self.state.lock().unwrap();
-		if step == 0 { state.prefill_tokens = state.in_tokens.saturating_sub(state.cached); state.prefill_seconds = seconds; state.phase = "tg"; }
-		else { state.decode_steps += 1; state.decode_seconds += seconds; state.last_decode_seconds = seconds; }
+		state.cached = tokens;
+		state.version += 1;
+	}
+	fn phase(&self, phase: &'static str, now: Instant) {
+		let mut state = self.state.lock().unwrap();
+		state.observe(now);
+		state.phase = phase;
+		state.phase_started = Some(now);
 		state.version += 1;
 	}
 	fn generated(&self, visible: bool) {
@@ -16379,49 +16401,71 @@ fn decode_steps(
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
 	let exact = tape.profile.exact_cpu && tape.program.gpu.backend == Backend::Cpu;
-	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, emit, |samples, begin, end| {
-		let (predictions, logits) = logits(tape, samples, begin, end)?;
-		Ok((predictions, logits, f64::from_bits(tape.last_device_seconds.load(Ordering::Acquire))))
-	})
+	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, &mut DecodeState::default(), emit, |samples, begin, end| logits(tape, samples, begin, end))
 }
 /// Both a single tape and a placed model measure and report through this loop.
 fn decode_sequence(
-	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>,
-	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>, f64)>,
+	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>, state: &mut DecodeState,
+	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
 	let mut reference = reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)?;
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-	let mut settled = 0;
-	for step in 0..=budget {
+	let mut cached = prompt.iter().zip(&state.ids).take_while(|(left, right)| left == right).count();
+	// A shorter prompt needs its own terminal logits. Earlier KV positions are
+	// still valid, but the last position must produce that output again.
+	if cached == prompt.len() && cached != state.ids.len() { cached = cached.saturating_sub(1); }
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0 };
+	let prefill_started = Instant::now();
+	let mut generation_started = None;
+	let mut ended = None;
+	if let Some(progress) = progress { progress.cached(cached); progress.phase("prefill", prefill_started); }
+	let mut settled = narrow(cached, "cached positions")? as u32;
+	for step in 0..budget.max(1) {
 		if INTERRUPTED.load(Ordering::Acquire) { break; }
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let started = Instant::now();
-		let (predictions, sample_logits, device_seconds) = logits(samples, settled, reached)?;
-		let seconds = if device_seconds > 0.0 { device_seconds } else { started.elapsed().as_secs_f64() };
-		if let Some(progress) = progress { progress.measured(step, seconds); }
+		let (predictions, sample_logits) = if settled == reached {
+			(state.predictions.clone(), state.logits.clone())
+		} else {
+			let output = logits(samples, settled, reached)?;
+			state.ids.truncate(settled as usize);
+			state.ids.extend_from_slice(&generation.ids[settled as usize..reached as usize]);
+			state.predictions.clone_from(&output.0);
+			state.logits.clone_from(&output.1);
+			output
+		};
+		if step == 0 {
+			let boundary = Instant::now();
+			generation.prefill_seconds = boundary.duration_since(prefill_started).as_secs_f64();
+			if budget > 0 { generation_started = Some(boundary); }
+			if let Some(progress) = progress {
+				progress.prefilled(prompt.len());
+				progress.phase(if budget > 0 { "tg" } else { "done" }, boundary);
+			}
+		}
 		let reference_id = reference.step(step, &sample_logits).map_err(RecipeError::new)?;
 		trace_logits(step, &sample_logits)?;
-		if step == 0 {
-			generation.prefill_seconds = seconds;
-		} else {
-			generation.step_seconds.push(seconds);
-		}
 		settled = reached;
 		generation.logits = predictions;
-		if step == budget {
+		if budget == 0 {
 			break;
 		}
 		let id = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&sample_logits, &generation.ids));
-		if let Some(progress) = progress { progress.generated(!stop.contains(&id)); }
+		let stopped = stop.contains(&id);
+		if stopped {
+			let now = Instant::now();
+			ended = Some(now);
+			if let Some(progress) = progress { progress.phase("done", now); }
+		} else if let Some(progress) = progress { progress.generated(true); }
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
-		if stop.contains(&id) {
+		if stopped {
 			break;
 		}
 	}
+	let ended = ended.unwrap_or_else(Instant::now);
+	if let Some(started) = generation_started { generation.generation_seconds = ended.duration_since(started).as_secs_f64(); }
+	if let Some(progress) = progress { progress.phase("done", ended); }
 	require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
-	if let Some(progress) = progress { progress.state.lock().unwrap().phase = "done"; }
 	Ok(generation)
 }
 /// The interface in front of placed tapes: a saved semantic pipeline applies
@@ -16436,6 +16480,7 @@ enum PlacedSource {
 /// extends them one position at a time.
 pub struct Placed {
 	source: PlacedSource,
+	decode: Mutex<DecodeState>,
 	devices: Vec<&'static Gpu>,
 	split: Vec<usize>,
 	/// One tape per range of every graph, on the range's device.
@@ -16717,7 +16762,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -16732,7 +16777,7 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 		None => Vec::new(),
 	};
 	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
 	fn llvm_report(&self) -> LlvmReport {
@@ -16802,8 +16847,14 @@ impl Placed {
 		}).collect()
 	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap();
+		*state = DecodeState::default();
 		let end = self.tapes.first().and_then(|ranges| ranges.first()).map_or(0, |tape| tape.positions);
 		self.run_window(input, 0, end).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Clear the cached sequence while keeping weights and compiled kernels resident.
+	pub fn clear(&self) {
+		*self.decode.lock().unwrap() = DecodeState::default();
 	}
 	/// Autoregressive decode over the placed model, whose input is a sequence
 	/// of ids and whose output is one logit per id. The tapes hold the state of
@@ -16838,6 +16889,7 @@ impl Placed {
 		self.decode_observed(prompt, sampler, stop, budget, None, emit)
 	}
 	fn decode_observed(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		let mut state = self.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))?;
 		let first = self.tapes.first().and_then(|tapes| tapes.first()).ok_or_else(|| RecipeError::new("placement has no tape"))?;
 		let exact = first.profile.exact_cpu && self.tapes.iter().flatten().all(|tape| tape.program.gpu.backend == Backend::Cpu);
 		match &self.source {
@@ -16864,8 +16916,14 @@ impl Placed {
 		for (slot, id) in samples.iter_mut().zip(prompt) {
 			*slot = f64::from(*id);
 		}
-		decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, emit, |samples, settled, reached| {
-			let predictions = self.run_window_observed(samples, settled, reached, if settled == 0 { progress } else { None })?;
+		// A delta rule keeps a live state rather than a state at every position.
+		// Indexed attention also updates representatives shared by a whole block.
+		// These states can extend their prefix, but cannot rewind into a changed one.
+		if !prompt.starts_with(&state.ids) && self.tapes.iter().flatten().any(|tape| tape.nodes.iter().any(|node| node.op == Primitive::Delta || node.op == Primitive::Attention && attention_blocks(node) > 0)) {
+			*state = DecodeState::default();
+		}
+		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
+			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
@@ -16874,11 +16932,10 @@ impl Placed {
 					}
 				}
 			}
-			Ok((predictions, sample_logits, self.last_device_seconds()))
-		})
-	}
-	fn last_device_seconds(&self) -> f64 {
-		self.tapes.iter().flatten().map(|tape| f64::from_bits(tape.last_device_seconds.load(Ordering::Acquire))).sum()
+			Ok((predictions, sample_logits))
+		});
+		if result.is_err() { *state = DecodeState::default(); }
+		result
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
@@ -16922,12 +16979,10 @@ impl Placed {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
 		}
 		let (mut begin, mut end) = (begin, end);
-		let mut seconds = 0.0;
 		for (index, tape) in tapes.iter().enumerate() {
-			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, elapsed| {
-				seconds += elapsed;
+			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
-				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize, seconds); }
+				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize); }
 			})?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
