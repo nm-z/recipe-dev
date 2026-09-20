@@ -1,7 +1,11 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention uses learned Q/K/V and output projections.
 #![allow(non_upper_case_globals)]
-mod fp8;
+// Compile the same numeric definitions as the template generator, without separate source files.
+#[allow(dead_code)]
+#[path = "build.rs"]
+mod native_build;
+use native_build::{encoding, fp8};
 mod reference;
 mod program_ir {
 	//! Compile-time lowering for the scalar, predictor, route, and normalization
@@ -1671,6 +1675,8 @@ pub(crate) struct NativeLayout {
 	pub values_bytes: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
+	/// Two i64 device timestamps for the current forward: entry and completion.
+	pub timing: usize,
 	/// Under a traced run, the byte offset in the context arena of one i64
 	/// device clock per node, written by thread 0 as each node begins; a
 	/// traced forward reads them back and logs the time between nodes.
@@ -1821,6 +1827,36 @@ pub(crate) struct NativeArtifact {
 	pub(crate) path: PathBuf,
 	pub(crate) storage: StorageImage,
 	pub(crate) training: bool,
+	llvm: LlvmNames,
+	compile_seconds: f64,
+}
+
+#[derive(Clone, Default)]
+struct LlvmNames {
+	instructions: Vec<String>,
+	intrinsics: Vec<String>,
+}
+
+fn llvm_names(ir: &str) -> LlvmNames {
+	const OPCODES: &[&str] = &[
+		"add", "addrspacecast", "alloca", "and", "ashr", "atomicrmw", "bitcast", "br", "call", "cmpxchg", "extractelement", "extractvalue", "fadd", "fcmp", "fdiv", "fence", "fmul", "fneg", "fpext", "fptosi", "fptoui", "fptrunc", "freeze", "fsub", "getelementptr", "icmp", "insertelement", "insertvalue", "inttoptr", "invoke", "load", "lshr", "mul", "or", "phi", "ptrtoint", "ret", "select", "sext", "shl", "shufflevector", "sitofp", "store", "sub", "switch", "trunc", "udiv", "uitofp", "urem", "va_arg", "xor", "zext",
+	];
+	let mut instructions = std::collections::BTreeSet::new();
+	for line in ir.lines() {
+		let code = line.split(';').next().unwrap_or_default();
+		for token in code.split(|character: char| character.is_ascii_whitespace() || matches!(character, '=' | ',' | '(' | ')' | '[' | ']' | '{' | '}')) {
+			if OPCODES.contains(&token) { instructions.insert(token.to_owned()); }
+		}
+	}
+	let mut intrinsics = std::collections::BTreeSet::new();
+	let mut rest = ir;
+	while let Some(start) = rest.find("@llvm.") {
+		rest = &rest[start + 1..];
+		let end = rest.find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_'))).unwrap_or(rest.len());
+		intrinsics.insert(rest[..end].to_owned());
+		rest = &rest[end..];
+	}
+	LlvmNames { instructions: instructions.into_iter().collect(), intrinsics: intrinsics.into_iter().collect() }
 }
 
 /// The model-load storage arena as stored bytes at their arena offsets, so the
@@ -2179,11 +2215,13 @@ impl NativeLayout {
 		let input_adjoint_precision = gradient_precisions.first().copied().unwrap_or(Compute::FP32);
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
+		let timing = align(context_offset, 8)?;
+		context_offset = checked_add(timing, 16, "forward timing arena")?;
 		let clocks = tracing().then_some(align(context_offset, 8)?);
 		if let Some(clocks) = clocks {
 			context_offset = checked_add(clocks, checked_mul(graph.nodes.len().max(1), 8, "node clock arena")?, "node clock arena")?;
 		}
-		Ok(Self { precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element), clocks })
+		Ok(Self { precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element), timing, clocks })
 	}
 }
 
@@ -2567,27 +2605,22 @@ fn kv_key(kv: Compute) -> Result<&'static str> {
 fn variant_suffix(source: &str) -> String {
 	if source == "default" { "_f64".to_owned() } else { format!("_{}", source.trim_start_matches('-').replace('-', "_")) }
 }
-/// Every `@name` in `text` that is a whole symbol, renamed.
-fn rename_symbol(text: &str, name: &str, renamed: &str) -> String {
-	let needle = format!("@{name}");
-	let mut out = String::with_capacity(text.len() + 64);
-	let mut at = 0;
-	for (start, _) in text.match_indices(&needle) {
-		if start < at {
-			continue;
-		}
-		let end = start + needle.len();
-		let whole = text[end..].chars().next().is_none_or(|next| !(next.is_ascii_alphanumeric() || next == '_' || next == '.'));
-		if !whole {
-			continue;
-		}
-		out.push_str(&text[at..start]);
-		out.push('@');
-		out.push_str(renamed);
-		at = end;
+fn rename_symbols(text: &str, names: &HashMap<&str, String>) -> String {
+	let mut output = String::with_capacity(text.len() + names.len() * 16);
+	let mut at = 0usize;
+	while let Some(found) = text[at..].find('@') {
+		let start = at + found;
+		let name_start = start + 1;
+		let name_end = text[name_start..]
+			.find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.')))
+			.map_or(text.len(), |offset| name_start + offset);
+		output.push_str(&text[at..start]);
+		output.push('@');
+		if let Some(renamed) = names.get(&text[name_start..name_end]) { output.push_str(renamed); } else { output.push_str(&text[name_start..name_end]); }
+		at = name_end;
 	}
-	out.push_str(&text[at..]);
-	out
+	output.push_str(&text[at..]);
+	output
 }
 /// The end of the parameter list that opens at `open` in `text`.
 fn parameter_list_end(text: &str, open: usize) -> Option<usize> {
@@ -2647,9 +2680,8 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 		renamed = strip_definition(renamed, name);
 		renamed = renamed.lines().filter(|line| !line.starts_with(&format!("@{name} ="))).collect::<Vec<_>>().join("\n");
 	}
-	for name in names.iter().filter(|name| !shared(name)) {
-		renamed = rename_symbol(&renamed, name, &format!("{name}{suffix}"));
-	}
+	let replacements = names.iter().filter(|name| !shared(name)).map(|name| (name.as_str(), format!("{name}{suffix}"))).collect::<HashMap<_, _>>();
+	renamed = rename_symbols(&renamed, &replacements);
 	let mut out = String::with_capacity(renamed.len());
 	for line in renamed.lines() {
 		if line.starts_with("attributes #") || line.starts_with('!') || line.starts_with("target ") || line.starts_with("source_filename") {
@@ -2690,6 +2722,9 @@ fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
 		.split(';')
 		.find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key).map(|(_, path)| PathBuf::from(path)))
 		.ok_or_else(|| RecipeError::new(format!("native LLVM template {key:?} is absent")))?;
+	if let Some(root) = std::env::var_os("RECIPE_TEMPLATE_ROOT") {
+		return Ok(PathBuf::from(root).join(path.file_name().ok_or_else(|| RecipeError::new("native template has no filename"))?));
+	}
 	Ok(path)
 }
 
@@ -2803,27 +2838,56 @@ fn nvidia_float_dot4_helpers(mut ir: String, variants: &[NativeVariant]) -> Stri
 }
 
 fn prune_internal_definitions(mut ir: String) -> String {
-	loop {
-		let names = ir
-			.match_indices("define internal ")
-			.filter_map(|(start, _)| {
-				let signature = &ir[start..ir[start..].find('{').map(|offset| start + offset)?];
-				Some(signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned())
-			})
-			.collect::<Vec<_>>();
-		// A reference reads "@name(", so one pass over the module's '@' positions counts every name at once instead of searching the whole module again once per name, and no name outruns the window so a later '(' names nothing. The definitions arrive in ascending order, so removing their spans in reverse leaves the earlier spans valid.
-		let (bytes, window, mut counts) = (ir.as_bytes(), names.iter().map(|name| name.len() + 1).max().unwrap_or(0), HashMap::new());
-		ir.match_indices('@')
-			.filter_map(|(at, _)| bytes[at + 1..(at + 1 + window).min(bytes.len())].iter().position(|&byte| byte == b'(').map(|stop| &bytes[at + 1..at + 1 + stop]))
-			.for_each(|name| *counts.entry(name).or_insert(0usize) += 1);
-		let spans: Vec<_> = names.iter().filter(|name| counts[name.as_bytes()] == 1).filter_map(|name| definition_span(&ir, name)).collect();
-		if spans.is_empty() {
-			return ir;
+	let definitions = ir
+		.match_indices("define internal ")
+		.filter_map(|(start, _)| {
+			let open = start + ir[start..].find('{')?;
+			let signature = &ir[start..open];
+			let name = signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned();
+			let mut depth = 0usize;
+			let end = ir[open..].bytes().enumerate().find_map(|(offset, byte)| match byte {
+				b'{' => { depth += 1; None }
+				b'}' => { depth = depth.saturating_sub(1); (depth == 0).then_some(open + offset + 1) }
+				_ => None,
+			})?;
+			Some((name, start, end))
+		})
+		.collect::<Vec<_>>();
+	if definitions.is_empty() { return ir; }
+	let names = definitions.iter().enumerate().map(|(index, (name, _, _))| (name.as_str(), index)).collect::<HashMap<_, _>>();
+	let references = |text: &str| {
+		let mut found = Vec::new();
+		let mut at = 0usize;
+		while let Some(offset) = text[at..].find('@') {
+			let start = at + offset + 1;
+			let end = text[start..].find('(').map_or(text.len(), |length| start + length);
+			if end != text.len() && !text[start..end].bytes().any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'@' | b'=' | b','))
+				&& let Some(index) = names.get(&text[start..end])
+			{
+				found.push(*index);
+			}
+			at = start;
 		}
-		for (start, end) in spans.into_iter().rev() {
-			ir.replace_range(start..end, "")
-		}
+		found
+	};
+	let edges = definitions.iter().map(|(_, start, end)| references(&ir[*start..*end])).collect::<Vec<_>>();
+	let mut roots = Vec::new();
+	let mut outside = 0usize;
+	for (_, start, end) in &definitions {
+		roots.extend(references(&ir[outside..*start]));
+		outside = *end;
 	}
+	roots.extend(references(&ir[outside..]));
+	let mut reachable = vec![false; definitions.len()];
+	while let Some(index) = roots.pop() {
+		if reachable[index] { continue; }
+		reachable[index] = true;
+		roots.extend(edges[index].iter().copied());
+	}
+	for (index, (_, start, end)) in definitions.iter().enumerate().rev() {
+		if !reachable[index] { ir.replace_range(*start..*end, ""); }
+	}
+	ir
 }
 
 fn barrier(backend: Backend) -> &'static str {
@@ -6675,16 +6739,22 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		let state_ty = self.precision.state_type;
 		let (kernel, thread) = native_entry(backend)?;
+		let timing_start = |prefix: &str, slot: usize| format!("%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.write, label %{prefix}.done\n{prefix}.write:\n%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\nstore i64 %{prefix}.clock, {pointer} %{prefix}.base, align 8\nbr label %{prefix}.done\n{prefix}.done:\n");
+		let timing_end = |prefix: &str, slot: usize| format!("%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\n%{prefix}.prior = atomicrmw umax {pointer} %{prefix}.base, i64 %{prefix}.clock monotonic\n");
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
 		body.push_str(&inference_forward);
+		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
 			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
 			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&timing_start("timing.training.start", self.layout.timing));
 			body.push_str(&training_forward);
+			body.push_str(&timing_end("timing.training.end", self.layout.timing + 8));
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
@@ -6708,24 +6778,28 @@ impl NativeModelIr {
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
-			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&timing_start("timing.epoch.start", self.layout.timing));
+			body.push_str("%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %gradient.skip\ngradient.skip:\nbr i1 %epoch.optimizer, label %optimizer.entry, label %metrics.forward.entry\ngradient.entry:\n");
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
 			body.push_str(&format!(
-				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\n",
+				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.entry:\n",
 				positions = graph_positions(&self.graph)
 			));
-			body.push('\n');
 			let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
 			let (output, ov) = (self.node_precision(&last.node), self.variant(&last.node));
 			body.push_str(&self.emit_loss_and_seed(backend, loss, output.model_type, output.state, output.state_type, pointer, alignment(output.model_type), alignment(output.state_type), ov)?);
+			body.push_str("br i1 %epoch.gradient, label %reverse.entry, label %gradient.done\nreverse.entry:\n");
 			body.push_str(barrier(backend));
 			body.push_str(&reverse);
-			body.push_str("br i1 %epoch.optimizer, label %optimizer.entry, label %epoch.done\n");
+			body.push_str("br label %gradient.done\ngradient.done:\nbr i1 %epoch.optimizer, label %optimizer.entry, label %epoch.done\n");
 			body.push_str(&self.emit_adamw(pointer)?);
-			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
+			body.push_str("br label %epoch.done\nepoch.done:\n");
+			body.push_str(&timing_end("timing.epoch.end", self.layout.timing + 8));
+			body.push_str("ret void\n}\n");
 		}
 		ir.push_str(&body);
 		let mut ir = prune_internal_definitions(ir);
@@ -6744,12 +6818,13 @@ impl NativeModelIr {
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
+		let one = native_literal(state_precision, state_ty, 1.0);
 		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.count = mul i32 %rows, {output}\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
 		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32{v}(i32 %loss.count)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%prediction.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %prediction.sum.next, %loss.item ]\n%r2.target.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.sum.next, %loss.item ]\n%r2.target.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.square.next, %loss.item ]\n%r2.residual.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.residual.square.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -6764,14 +6839,15 @@ impl NativeModelIr {
 			"%loss.contribution".to_owned()
 		};
 		ir.push_str(&format!(
-			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
+			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%prediction.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %prediction.sum, {state_ty} {prediction})\n%r2.target.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.sum, {state_ty} {target})\n%r2.target.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} {target}, {state_ty} {target})\n%r2.target.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.square, {state_ty} %r2.target.item.square)\n%r2.residual = call {state_ty} @recipe.state.sub{v}({state_ty} {prediction}, {state_ty} {target})\n%r2.residual.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.residual, {state_ty} %r2.residual)\n%r2.residual.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.residual.square, {state_ty} %r2.residual.item.square)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
 		));
 		if loss.0 == 1 {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.mean)\n"));
 		} else {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {zero})\n"));
 		}
-		ir.push_str(&format!("store {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str(&format!("%r2.target.mean.part = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.target.sum, {state_ty} %r2.target.sum)\n%r2.target.mean.square = call {state_ty} @recipe.state.div{v}({state_ty} %r2.target.mean.part, {state_ty} %loss.items)\n%r2.total = call {state_ty} @recipe.state.sub{v}({state_ty} %r2.target.square, {state_ty} %r2.target.mean.square)\n%r2.ratio = call {state_ty} @recipe.state.div{v}({state_ty} %r2.residual.square, {state_ty} %r2.total)\n%r2.value.raw = call {state_ty} @recipe.state.sub{v}({state_ty} {one}, {state_ty} %r2.ratio)\n%r2.total.zero = call i1 @recipe.state.oeq{v}({state_ty} %r2.total, {state_ty} {zero})\n%r2.value = select i1 %r2.total.zero, {state_ty} {zero}, {state_ty} %r2.value.raw\n%metric.target.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 1\n%metric.target.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 2\n%metric.residual.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 3\n%metric.r2.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 4\n%metric.prediction.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 5\nstore {state_ty} %prediction.sum, {pointer} %metric.prediction.sum.ptr, align {state_align}\nstore {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nstore {state_ty} %r2.target.sum, {pointer} %metric.target.sum.ptr, align {state_align}\nstore {state_ty} %r2.target.square, {pointer} %metric.target.square.ptr, align {state_align}\nstore {state_ty} %r2.residual.square, {pointer} %metric.residual.square.ptr, align {state_align}\nstore {state_ty} %r2.value, {pointer} %metric.r2.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str("br i1 %epoch.gradient, label %seed.prepare, label %metrics.done\nseed.prepare:\n");
 		let loss_value = if loss.0 == 1 {
 			ir.push_str(barrier(backend));
 			ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n"));
@@ -6779,9 +6855,9 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, %loss.count\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.target.model)\n",));
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %seed.prepare ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, %loss.count\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.target.model)\n",));
 		let gradient = emit_loss_gradient(&mut ir, v, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%loss.count")?;
-		ir.push_str(&format!("%seed.ptr = getelementptr {state_ty}, {pointer} %adjoint, i32 %seed.p\nstore {state_ty} {gradient}, {pointer} %seed.ptr, align {state_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
+		ir.push_str(&format!("%seed.ptr = getelementptr {state_ty}, {pointer} %adjoint, i32 %seed.p\nstore {state_ty} {gradient}, {pointer} %seed.ptr, align {state_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\nbr label %metrics.done\nmetrics.done:\n"));
 		Ok(ir)
 	}
 
@@ -7735,12 +7811,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 }
 
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+	let compile_started = Instant::now();
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
 	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
 	let ir = model.emit(target.backend(), matrix, loss, dp4a, widen)?;
+	let llvm = llvm_names(&ir);
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -7780,7 +7858,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some(), llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7866,16 +7944,17 @@ struct FloatFormat {
 	storage: FloatLayout,
 }
 impl FloatFormat {
-	const FP8: Self = Self::native(1, 4, 3);
-	const FP8_E5M2: Self = Self::native(1, 5, 2);
-	const FP16: Self = Self::native(1, 5, 10);
-	const FP32: Self = Self::native(1, 8, 23);
-	const FP64: Self = Self::native(1, 11, 52);
-	const BF16: Self = Self::native(1, 8, 7);
-	const TF32: Self = Self { arithmetic: FloatLayout::new(1, 8, 10), storage: FloatLayout::new(1, 8, 23) };
-	const fn native(sign: u8, exp: u8, man: u8) -> Self {
-		let layout = FloatLayout::new(sign, exp, man);
-		Self { arithmetic: layout, storage: layout }
+	const FP8: Self = Self::configured("fp8-e4m3", "fp8-e4m3");
+	const FP8_E5M2: Self = Self::configured("fp8-e5m2", "fp8-e5m2");
+	const FP16: Self = Self::configured("fp16", "fp16");
+	const FP32: Self = Self::configured("fp32", "fp32");
+	const FP64: Self = Self::configured("fp64", "fp64");
+	const BF16: Self = Self::configured("bf16", "bf16");
+	const TF32: Self = Self::configured("tf32", "tf32-storage");
+	const fn configured(arithmetic: &str, storage: &str) -> Self {
+		let [s, e, m] = encoding::fields(arithmetic);
+		let [ss, se, sm] = encoding::fields(storage);
+		Self { arithmetic: FloatLayout::new(s, e, m), storage: FloatLayout::new(ss, se, sm) }
 	}
 	const fn bytes(self) -> usize {
 		self.storage.bits().div_ceil(8) as usize
@@ -11019,17 +11098,50 @@ static RUN: AtomicU64 = AtomicU64::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_CHECKPOINTED: AtomicBool = AtomicBool::new(false);
 static DEBUG_LOG: OnceLock<std::io::Result<Mutex<fs::File>>> = OnceLock::new();
+#[derive(Clone, Copy, Default)]
+struct TransferTotals { to_device_bytes: usize, to_device_seconds: f64, to_ram_bytes: usize, to_ram_seconds: f64 }
+type TransferCollection = Arc<Mutex<HashMap<String, TransferTotals>>>;
+std::thread_local! {
+	static TRANSFER_TOTALS: std::cell::RefCell<Option<TransferCollection>> = const { std::cell::RefCell::new(None) };
+}
+/// Each run owns its measurements. Nested runs restore their caller's collection;
+/// concurrent shards explicitly inherit the collection of their parent run.
+struct TransferScope(Option<TransferCollection>);
+impl TransferScope {
+	fn new() -> Self { Self::enter(Some(Arc::new(Mutex::new(HashMap::new())))) }
+	fn current() -> Option<TransferCollection> { TRANSFER_TOTALS.with(|slot| slot.borrow().clone()) }
+	fn enter(collection: Option<TransferCollection>) -> Self { Self(TRANSFER_TOTALS.with(|slot| slot.replace(collection))) }
+}
+impl Drop for TransferScope {
+	fn drop(&mut self) { TRANSFER_TOTALS.with(|slot| slot.replace(self.0.take())); }
+}
+fn record_transfer(device: &str, to_device: bool, bytes: usize, seconds: f64) {
+	if bytes == 0 || !seconds.is_finite() || seconds <= 0.0 { return; }
+	let Some(collection) = TransferScope::current() else { return };
+	if let Ok(mut totals) = collection.lock() {
+		let total = totals.entry(device.to_owned()).or_default();
+		if to_device { total.to_device_bytes += bytes; total.to_device_seconds += seconds; } else { total.to_ram_bytes += bytes; total.to_ram_seconds += seconds; }
+	}
+}
+fn transfer_report(gpus: impl IntoIterator<Item = &'static Gpu>) -> Result<ReportLines> {
+	let Some(collection) = TransferScope::current() else { return Ok(ReportLines::default()) };
+	let totals = collection.lock().map_err(|_| RecipeError::new("transfer observations are unavailable"))?;
+	let mut lines = Vec::new();
+	for gpu in gpus {
+		let Some(total) = totals.get(&gpu.name) else { continue };
+		let device = device_label(gpu)?;
+		let machine = device.split(':').next().unwrap_or("machine");
+		if total.to_ram_seconds > 0.0 { lines.push(format!("{device}  link: {device} -> {machine}:ram {:.1} MB/s", total.to_ram_bytes as f64 / total.to_ram_seconds / 1e6)); }
+		if total.to_device_seconds > 0.0 { lines.push(format!("{device}  link: {machine}:ram -> {device} {:.1} MB/s", total.to_device_bytes as f64 / total.to_device_seconds / 1e6)); }
+	}
+	Ok(ReportLines::new(lines))
+}
 const DEBUG_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recipe.log");
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
 fn record_interrupt() {
-	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
-		let message = b"\ninterrupt received, finishing checkpoint\n";
-		unsafe {
-			write(2, message.as_ptr().cast(), message.len());
-		}
-	}
+	INTERRUPTED.store(true, Ordering::Release);
 }
 #[cfg(unix)]
 extern "C" fn interrupt(_: i32) {
@@ -11049,6 +11161,29 @@ fn register_interrupt() -> usize {
 		return signal(SIGINT, interrupt);
 		#[cfg(windows)]
 		return SetConsoleCtrlHandler(Some(interrupt), 1) as usize;
+	}
+}
+#[cfg(unix)]
+#[repr(C)]
+struct PollFd { fd: i32, events: i16, revents: i16 }
+fn chat_line() -> Result<Option<String>> {
+	#[cfg(unix)]
+	loop {
+		if INTERRUPTED.load(Ordering::Acquire) { if std::io::stderr().is_terminal() { eprintln!(); } return Ok(None); }
+		let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
+		let ready = unsafe { poll(&mut descriptor, 1, 100) };
+		if ready < 0 {
+			if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+			return Err(RecipeError::new(format!("cannot wait for chat input: {}", std::io::Error::last_os_error())));
+		}
+		if ready == 0 { continue; }
+		let mut line = String::new();
+		return std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")));
+	}
+	#[cfg(windows)]
+	{
+		let mut line = String::new();
+		std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")))
 	}
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
@@ -12189,6 +12324,19 @@ impl Model {
 			.collect::<Vec<_>>()
 			.join("/")
 	}
+	/// Inspect the planned inference arenas before compiling or allocating GPU
+	/// kernels. This uses the same graph and arena layout as a real run.
+	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
+		require(positions > 0, "memory inspection requires context positions")?;
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
+		let model = with_last_projection(self);
+		let plan = conventional_plan(file, &model)?;
+		let gpu = selected_gpu()?;
+		let graph = bound_graph_on(file, &model, &plan, &vec![0.0; positions], 1, gpu)?;
+		let mut memory = part_memory(&graph, Config::load()?.precision)?;
+		memory.device = gpu.name.clone();
+		Ok(memory)
+	}
 }
 fn quantization(code: u16) -> String {
 	let (family, bits, variant) = (code >> 12, code as u8, usize::from(code >> 8 & 15));
@@ -13037,7 +13185,7 @@ impl StoredBytes {
 	/// row of a mapped table is read without touching the rest of it.
 	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
 		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
-		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
 		for (_, run) in self.runs() {
 			let start = (at.max(skipped) - skipped).min(run.len());
@@ -13051,7 +13199,7 @@ impl StoredBytes {
 	}
 	/// Every run end to end, which is the only point a mapped weight is copied.
 	fn to_vec(&self) -> Result<Vec<u8>> {
-		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let mut out = Vec::with_capacity(self.len());
 		for (_, run) in self.runs() {
 			out.extend_from_slice(run);
@@ -13746,6 +13894,137 @@ impl<'a> From<&'a Model> for ModelLoss<'a> {
 }
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
+
+#[derive(Clone, Default)]
+pub struct ReportLines(Vec<String>);
+impl ReportLines {
+	fn new(lines: impl IntoIterator<Item = String>) -> Self {
+		let lines = lines.into_iter().collect::<Vec<_>>();
+		assert!(lines.iter().all(|line| !line.contains('\n') && !line.contains('\r')), "a report item must fit on one line");
+		Self(lines)
+	}
+}
+impl fmt::Display for ReportLines {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0.join("\n")) }
+}
+impl std::ops::Deref for ReportLines {
+	type Target = [String];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[derive(Clone, Default)]
+pub struct NameList(Vec<String>);
+impl NameList {
+	fn new(values: impl IntoIterator<Item = String>) -> Self { Self(values.into_iter().collect()) }
+	fn extend(&mut self, values: impl IntoIterator<Item = String>) { self.0.extend(values); self.0.sort(); self.0.dedup(); }
+}
+impl fmt::Display for NameList {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0.join(", ")) }
+}
+impl std::ops::Deref for NameList {
+	type Target = [String];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[derive(Clone, Default)]
+pub struct LlvmReport { pub instructions: NameList, pub intrinsics: NameList }
+
+#[derive(Clone, Copy, Default)]
+pub struct DurationReport(f64);
+impl DurationReport {
+	pub const fn seconds(self) -> f64 { self.0 }
+}
+impl fmt::Display for DurationReport {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if self.0 < 1.0 { write!(formatter, "{:.3} ms", self.0 * 1e3) } else { write!(formatter, "{:.3} s", self.0) }
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct ScalarHistory(Vec<Vec<f64>>);
+impl ScalarHistory {
+	fn push(&mut self, epoch: usize, value: f64) {
+		while self.0.len() < epoch { self.0.push(Vec::new()); }
+		self.0[epoch - 1].push(value);
+	}
+}
+impl std::ops::Deref for ScalarHistory {
+	type Target = [Vec<f64>];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl fmt::Display for ScalarHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("{")?;
+		for (epoch, values) in self.0.iter().enumerate() {
+			if epoch != 0 { formatter.write_str(",")?; }
+			write!(formatter, "\"{}\":[", epoch + 1)?;
+			for (index, value) in values.iter().enumerate() {
+				if index != 0 { formatter.write_str(",")?; }
+				if value.is_finite() { write!(formatter, "{value}")?; } else { formatter.write_str("null")?; }
+			}
+			formatter.write_str("]")?;
+		}
+		formatter.write_str("}")
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct PredictionHistory(Vec<Vec<Vec<f64>>>);
+impl PredictionHistory {
+	fn push(&mut self, epoch: usize, values: Vec<f64>) {
+		while self.0.len() < epoch { self.0.push(Vec::new()); }
+		self.0[epoch - 1].push(values);
+	}
+}
+impl std::ops::Deref for PredictionHistory {
+	type Target = [Vec<Vec<f64>>];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl fmt::Display for PredictionHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("{")?;
+		for (epoch, observations) in self.0.iter().enumerate() {
+			if epoch != 0 { formatter.write_str(",")?; }
+			write!(formatter, "\"{}\":[", epoch + 1)?;
+			for (observation, values) in observations.iter().enumerate() {
+				if observation != 0 { formatter.write_str(",")?; }
+				formatter.write_str("[")?;
+				for (index, value) in values.iter().take(3).enumerate() {
+					if index != 0 { formatter.write_str(",")?; }
+					write!(formatter, "{value}")?;
+				}
+				formatter.write_str("]")?;
+			}
+			formatter.write_str("]")?;
+		}
+		formatter.write_str("}")
+	}
+}
+
+#[derive(Clone, Copy)]
+pub struct RatModelPoint { pub r2: f64, pub reward: f64 }
+impl Default for RatModelPoint {
+	fn default() -> Self { Self { r2: f64::NAN, reward: f64::NAN } }
+}
+#[derive(Clone, Copy, Default)]
+pub struct RatPoint { pub eval: RatModelPoint, pub pred: RatModelPoint }
+impl fmt::Display for RatPoint {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "eval.r2 {} eval.reward {} pred.r2 {} pred.reward {}", self.eval.r2, self.eval.reward, self.pred.r2, self.pred.reward)
+	}
+}
+#[derive(Clone, Default)]
+pub struct RatModelHistory { pub r2: ScalarHistory, pub reward: ScalarHistory }
+#[derive(Clone, Default)]
+pub struct RatHistory { pub eval: RatModelHistory, pub pred: RatModelHistory }
+impl fmt::Display for RatHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{{\"eval\":{{\"r2\":{},\"reward\":{}}},\"pred\":{{\"r2\":{},\"reward\":{}}}}}", self.eval.r2, self.eval.reward, self.pred.r2, self.pred.reward)
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct TrainingPoint { pub loss: f64, pub predictions: Vec<f64>, pub r2: f64, pub rat: RatPoint }
 pub struct ZScore;
 pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
@@ -13778,23 +14057,52 @@ pub const Score: Metric = Metric(11);
 pub const Window: Metric = Metric(12);
 /// The decisions the epoch scored, on a command-RAT run.
 pub const Choices: Metric = Metric(13);
-/// All progress fields except the native tile schedule.
-pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, Score, Choices, Window];
-/// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window];
+/// The ordinary training fields: run, time, epoch, r2, loss, and model blocks.
+pub const all: Metric = Metric(16);
+/// The development fields: tile, score, choices, and window.
+pub const dev: Metric = Metric(17);
+/// Lowercase field selectors for `.log(...)`; groups and the uncommon `blck`
+/// and `tile` selectors remain available from the crate root.
+pub mod log {
+	use super::Metric;
+	pub const run: Metric = super::Run;
+	pub const time: Metric = super::Time;
+	pub const epoch: Metric = super::Epoch;
+	pub const r2: Metric = super::R2;
+	pub const loss: Metric = super::Loss;
+	pub const score: Metric = super::Score;
+	pub const choices: Metric = super::Choices;
+	pub const window: Metric = super::Window;
+}
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
 }
 impl IntoMetrics for Metric {
 	fn into_metrics(self) -> Vec<Metric> {
-		vec![self]
+		normalize_metrics(std::iter::once(self))
 	}
 }
 impl<const N: usize> IntoMetrics for [Metric; N] {
 	fn into_metrics(self) -> Vec<Metric> {
-		self.into()
+		normalize_metrics(self)
 	}
+}
+fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
+	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
+	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
+	const ORDER: [Metric; 12] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug];
+	let mut selected = Vec::new();
+	for metric in metrics {
+		match metric {
+			metric if metric.0 == all.0 => selected.extend(ALL),
+			metric if metric.0 == dev.0 => selected.extend(DEV),
+			metric => selected.push(metric),
+		}
+	}
+	let metrics = ORDER.into_iter().filter(|metric| selected.iter().any(|selected| selected.0 == metric.0)).collect::<Vec<_>>();
+	assert!(!metrics.is_empty(), "log requires at least one option");
+	metrics
 }
 pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
@@ -14091,7 +14399,6 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Config::load()?.precision, None)?;
 	let prepared = load_started.elapsed().as_secs_f64();
 	trace(&format!("model preparation {prepared} s"))?;
-	eprintln!("prepared in {prepared} s");
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -15036,84 +15343,161 @@ fn arm_trace(metrics: &[Metric]) {
 #[derive(Clone)]
 pub struct Infer {
 	log: Vec<Metric>,
-	tokens: usize,
+	tokens: Option<usize>,
+	chat: Option<Vec<ChatMetric>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ChatMetric(u8);
+pub mod infer {
+	use super::ChatMetric;
+	pub const text: ChatMetric = ChatMetric(0);
+	pub const pp: ChatMetric = ChatMetric(1);
+	pub const tg: ChatMetric = ChatMetric(2);
+	pub const r#in: ChatMetric = ChatMetric(3);
+	pub const out: ChatMetric = ChatMetric(4);
+	pub const cached: ChatMetric = ChatMetric(5);
+}
+pub trait IntoChatMetrics { fn into_chat_metrics(self) -> Vec<ChatMetric>; }
+impl IntoChatMetrics for ChatMetric {
+	fn into_chat_metrics(self) -> Vec<ChatMetric> { vec![self] }
+}
+impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
+	fn into_chat_metrics(self) -> Vec<ChatMetric> {
+		assert!(N != 0, "chat requires at least one option");
+		let mut metrics = self.to_vec();
+		metrics.sort_by_key(|metric| metric.0);
+		metrics.dedup_by_key(|metric| metric.0);
+		metrics
+	}
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: 32 }
+		Infer { log: Vec::new(), tokens: None, chat: None }
 	}
 }
 impl Infer {
+	/// Keep the model resident and read successive messages from stdin. A supplied
+	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
+	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log = metrics.into_metrics();
 		arm_trace(&self.log);
 		self
 	}
-	/// The reply length in ids, 32 unless chosen.
+	/// An optional reply cap. Otherwise use the model's stop tokens and remaining context.
 	pub const fn tokens(mut self, count: usize) -> Self {
-		self.tokens = count;
+		self.tokens = Some(count);
 		self
 	}
-	pub fn run(&self, model: &Model, data: &Data) -> Generation {
+	pub fn run(&self, model: &Model, data: &Data) -> InferenceReport {
+		let _transfers = TransferScope::new();
 		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
 	}
-	fn try_run(&self, model: &Model, data: &Data) -> Result<Generation> {
+	fn try_run(&self, model: &Model, data: &Data) -> Result<InferenceReport> {
+		SIGNAL.get_or_init(register_interrupt);
+		INTERRUPTED.store(false, Ordering::Release);
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		let model = with_last_projection(model);
 		let plan = conventional_plan(&file, &model)?;
-		let device = selected_gpu()?;
+		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
-		// RECIPE_CONTEXT caps the positions a traced probe fits, so its retained
-		// arenas stay small.
-		let ceiling = std::env::var("RECIPE_CONTEXT").ok().and_then(|text| text.parse::<usize>().ok()).map_or(ceiling, |cap| cap.clamp(1, ceiling));
+		let requested = std::env::var("RECIPE_CONTEXT").ok().map(|value| value.parse::<usize>().map_err(|_| RecipeError::new("RECIPE_CONTEXT must be a positive integer"))).transpose()?;
+		if let Some(context) = requested { require(context > 0 && context <= ceiling, format!("requested context {context} is outside this model's 1..={ceiling} positions"))?; }
 		let coder = file.tokenizer();
 		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
-		let text = match supplied {
-			Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt,
-			Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
-			None => {
-				let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1)).unwrap_or_else(|| "What is the capital of France?".to_owned());
-				coder.prompt(&[("user", message.as_str())], true)?
-			}
-		};
-		let mut prompt = coder.encode(&text);
-		// The template writes the sequence start itself when the file has one,
-		// and the encoder adds it again, so one of the pair goes.
-		if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos {
-			prompt.remove(0);
-		}
+		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
+		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
 		let stop = stop_ids(&coder)?;
-		trace(&format!("prompt ids {prompt:?}, stop ids {stop:?}, text {text:?}"))?;
-		let budget = std::env::var("RNJ_TOKENS").ok().map(|value| value.parse::<usize>().map_err(|_| RecipeError::new(format!("RNJ_TOKENS is not a nonnegative integer: {value:?}")))).transpose()?.unwrap_or(self.tokens);
-		let fitting = std::time::Instant::now();
-		let sequence = fitting_context(&file, &model, &plan, device, ceiling)?;
-		eprintln!("{architecture}: {} prompt tokens, {sequence} context positions, fitted in {} s", prompt.len(), fitting.elapsed().as_secs_f64());
-		require(prompt.len() + budget <= sequence, format!("Context full: {} prompt tokens plus {budget} reply tokens exceed {sequence}. Start a new chat or reduce reply length.", prompt.len()))?;
-		let streaming = self.log.iter().any(|metric| metric.0 == chat.0);
-		let (mut ids, mut printed) = (Vec::new(), 0);
-		let generation = decode_gguf(&file, &model, &plan, sequence, &prompt, &mut recipe.sampler().temperature(0.0), &stop, budget, |id| {
-			if !streaming || stop.contains(&id) {
-				return;
+		let sequence = match requested {
+			Some(context) => context,
+			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
+			None => ceiling,
+		};
+		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		let placed = place_bound(&bound, sequence, &[], devices)?;
+		let memory = placed.memory();
+		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
+		let mut conversation: Vec<(String, String)> = Vec::new();
+		let mut request_history = Vec::new();
+		loop {
+			let text = if interactive {
+				if INTERRUPTED.load(Ordering::Acquire) { break; }
+				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
+				let Some(line) = chat_line()? else { break };
+				if line.trim() == "/exit" { break; }
+				if line.trim() == "/clear" { conversation.clear(); continue; }
+				if line.trim().is_empty() { continue; }
+				conversation.push(("user".to_owned(), line.trim_end().to_owned()));
+				coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+			} else {
+				match &supplied {
+					Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
+					Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
+					None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
+				}
+			};
+			let mut prompt = coder.encode(&text);
+			if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
+			if prompt.len() >= sequence && interactive {
+				conversation.pop();
+				eprintln!("context full: {} prompt tokens leave no reply positions in {sequence}; use /clear", prompt.len());
+				continue;
 			}
-			ids.push(id);
-			let text = coder.decode(&ids);
-			let text = text.trim_end_matches('\u{FFFD}');
-			if text.len() >= printed {
-				print!("{}", &text[printed..]);
-				std::io::stdout().flush().ok();
-				printed = text.len();
-			}
-		})?;
-		if streaming {
-			println!();
-			let seconds = generation.step_seconds.iter().sum::<f64>();
-			eprintln!("prefill {} s; {} decode steps in {} s", generation.prefill_seconds, generation.step_seconds.len(), seconds);
-			if seconds > 0.0 {
-				eprintln!("{} tok/s", generation.step_seconds.len() as f64 / seconds);
-			}
+			require(prompt.len() < sequence, format!("{} prompt tokens leave no reply positions in {sequence} context positions", prompt.len()))?;
+			let available = sequence - prompt.len();
+			let budget = self.tokens.map_or(available, |limit| limit.min(available));
+			let chat_metrics = self.chat.clone().unwrap_or_default();
+			let status_metrics = chat_metrics.iter().copied().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
+			let progress = (!status_metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prefill", seconds: 0.0, in_tokens: prompt.len(), out_tokens: 0, cached: 0, prefill_seconds: 0.0, decode_steps: 0, decode_seconds: 0.0, last_decode_seconds: 0.0, context: sequence, devices: device_names.clone(), memory: memory.clone(), reply: String::new(), version: 0 }, status_metrics));
+			let show_reply = self.chat.is_some() || self.log.iter().any(|metric| metric.0 == chat.0);
+			let streaming = show_reply;
+			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
+			let (mut ids, mut printed) = (Vec::new(), 0);
+			if streaming && !framed { print!("~ "); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot print reply prefix: {error}")))?; }
+			let generation = placed.decode_observed(&prompt, &mut recipe.sampler().temperature(0.0), &stop, budget, progress.as_ref(), |id| {
+				if stop.contains(&id) { return Ok(()); }
+				ids.push(id);
+				if streaming {
+					let text = coder.decode(&ids);
+					let text = text.trim_end_matches('\u{FFFD}');
+					if framed {
+						if let Some(progress) = &progress { progress.reply(text.to_owned()); }
+					} else if text.len() >= printed {
+						print!("{}", &text[printed..]);
+						std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot print reply: {error}")))?;
+						printed = text.len();
+					}
+				}
+				Ok(())
+			})?;
+			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
+			drop(progress);
+			let reply = coder.decode(&ids);
+			request_history.push(Arc::new(InferenceRequest {
+				r#in: prompt.len(), out: ids.len(), cached: 0, reply_limit: budget,
+				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
+				pp_seconds: generation.prefill_seconds, tg_seconds: generation.step_seconds.iter().sum(),
+			}));
+			if !interactive { break; }
+			conversation.push(("assistant".to_owned(), reply));
 		}
-		Ok(generation)
+		Ok(InferenceReport {
+			llvm: placed.llvm_report(),
+			path: data.report_path()?,
+			formats: placed.format_report()?,
+			memory: placed.memory_report()?,
+			links: placed.link_report()?,
+			aot: placed.aot_report()?,
+			tiles: placed.tile_report()?,
+			grids: placed.grid_report()?,
+			load: DurationReport(placed.load_seconds()),
+			compile: DurationReport(placed.compile_seconds()),
+			context: sequence,
+			requests: request_history.len(),
+			last: request_history.last().cloned().unwrap_or_default(),
+			history: request_history,
+		})
 	}
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
@@ -15441,6 +15825,151 @@ pub struct Generation {
 	pub prefill_seconds: f64,
 	pub step_seconds: Vec<f64>,
 }
+pub struct InferenceReport {
+	pub llvm: LlvmReport,
+	pub path: String,
+	pub formats: ReportLines,
+	pub memory: ReportLines,
+	pub links: ReportLines,
+	pub aot: ReportLines,
+	pub tiles: ReportLines,
+	pub grids: ReportLines,
+	pub load: DurationReport,
+	pub compile: DurationReport,
+	pub context: usize,
+	pub requests: usize,
+	/// Completed requests in execution order, retained across `/clear`.
+	pub history: Vec<Arc<InferenceRequest>>,
+	last: Arc<InferenceRequest>,
+}
+impl std::ops::Deref for InferenceReport {
+	type Target = InferenceRequest;
+	fn deref(&self) -> &Self::Target { &self.last }
+}
+/// Observations from one request. The flat report fields refer to its last request.
+#[derive(Default)]
+pub struct InferenceRequest {
+	pub reply_limit: usize,
+	pub r#in: usize,
+	pub out: usize,
+	pub cached: usize,
+	pub input_ids: Vec<u32>,
+	pub output_ids: Vec<u32>,
+	pub logits: Vec<f64>,
+	pub prediction: String,
+	pp_seconds: f64,
+	tg_seconds: f64,
+}
+impl InferenceRequest {
+	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.r#in.saturating_sub(self.cached) as f64 / self.pp_seconds } }
+	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
+}
+/// Measured inference state passed to the model script's live formatter.
+#[derive(Clone)]
+pub struct InferenceProgress {
+	pub phase: &'static str,
+	pub seconds: f64,
+	pub in_tokens: usize,
+	pub out_tokens: usize,
+	pub cached: usize,
+	pub prefill_seconds: f64,
+	pub decode_steps: usize,
+	pub decode_seconds: f64,
+	pub last_decode_seconds: f64,
+	pub context: usize,
+	pub devices: String,
+	pub memory: Vec<DeviceMemory>,
+	reply: String,
+	version: usize,
+}
+impl InferenceProgress {
+	pub fn pp(&self) -> f64 { if self.prefill_seconds > 0.0 { self.in_tokens.saturating_sub(self.cached) as f64 / self.prefill_seconds } else { 0.0 } }
+	pub fn tg(&self) -> f64 { if self.decode_seconds > 0.0 { self.decode_steps as f64 / self.decode_seconds } else { 0.0 } }
+	fn line(&self, metrics: &[ChatMetric], final_line: bool) -> String {
+		let mut values = Vec::new();
+		for metric in metrics {
+			match metric.0 {
+				1 if self.prefill_seconds > 0.0 => values.push(format!("pp {:.2} tok/s", self.pp())),
+				2 if self.decode_steps != 0 => values.push(format!("tg {:.2} tok/s", if final_line { self.tg() } else { 1.0 / self.last_decode_seconds })),
+				3 => values.push(format!("in {}", self.in_tokens)),
+				4 => values.push(format!("out {}", self.out_tokens)),
+				5 => values.push(format!("cached {}", self.cached)),
+				_ => {}
+			}
+		}
+		values.join("  ")
+	}
+}
+struct InferenceLive {
+	state: Arc<Mutex<InferenceProgress>>,
+	stop: std::sync::mpsc::Sender<()>,
+	thread: Option<std::thread::JoinHandle<()>>,
+	terminal: bool,
+}
+impl InferenceLive {
+	fn new(mut state: InferenceProgress, metrics: Vec<ChatMetric>) -> Self {
+		state.phase = "prefill";
+		let state = Arc::new(Mutex::new(state));
+		let (stop, receiver) = std::sync::mpsc::channel();
+		let shared = Arc::clone(&state);
+		let terminal = std::io::stderr().is_terminal();
+		let refresh = Duration::from_secs_f64(1.0 / Config::load().map_or(5, |config| config.progress_refresh_hz).max(1) as f64);
+		let thread = std::thread::spawn(move || {
+			let started = Instant::now();
+			let mut version = 0;
+			let mut rendered_rows = 0usize;
+			loop {
+				let complete = !matches!(receiver.recv_timeout(refresh), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+				let mut view = shared.lock().unwrap().clone();
+				view.seconds = started.elapsed().as_secs_f64();
+				if complete && view.phase != "done" { view.phase = "stopped"; }
+				if (terminal || complete) && (complete || view.version != version) {
+					let line = view.line(&metrics, complete);
+					if terminal {
+						let columns = std::env::var("COLUMNS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(80).max(1);
+						if rendered_rows != 0 {
+							eprint!("\r");
+							for _ in 1..rendered_rows { eprint!("\x1b[1A"); }
+						}
+						let reply_rows = (view.reply.chars().count() + 2).div_ceil(columns).max(1);
+						eprint!("\r\x1b[J{line}\n~ {}", view.reply);
+						if complete { eprintln!(); } else { let _ = std::io::stderr().flush(); }
+						rendered_rows = 1 + reply_rows;
+					} else if complete && !line.is_empty() {
+						let _ = Train::write_progress(&line, false, true);
+					}
+					version = view.version;
+				}
+				if complete { break; }
+			}
+		});
+		Self { state, stop, thread: Some(thread), terminal }
+	}
+	fn measured(&self, step: usize, seconds: f64) {
+		let mut state = self.state.lock().unwrap();
+		if step == 0 { state.prefill_seconds = seconds; state.phase = "tg"; }
+		else { state.decode_steps += 1; state.decode_seconds += seconds; state.last_decode_seconds = seconds; }
+		state.version += 1;
+	}
+	fn generated(&self, visible: bool) {
+		if !visible { return; }
+		let mut state = self.state.lock().unwrap();
+		state.out_tokens += 1;
+		state.version += 1;
+	}
+	fn reply(&self, text: String) {
+		let mut state = self.state.lock().unwrap();
+		state.reply = text;
+		state.version += 1;
+	}
+	fn renders_reply(&self) -> bool { self.terminal }
+}
+impl Drop for InferenceLive {
+	fn drop(&mut self) {
+		let _ = self.stop.send(());
+		if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+	}
+}
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
 		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15, suppressed: Vec::new() }
@@ -15549,31 +16078,44 @@ fn trace_logits(step: usize, logits: &[f64]) -> Result<()> {
 	trace(&format!("logits step {step} first {:?} last {:?} sum {} argmax {} = {}", &logits[..3], &logits[logits.len() - 3..], logits.iter().sum::<f64>(), argmax.0, argmax.1))
 }
 fn decode_steps(
-	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
+	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32) -> Result<()>,
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
-	let mut reference = reference::Reference::open(f64::from_bits(tape.profile.tolerance), tape.profile.exact_cpu && tape.program.gpu.backend == Backend::Cpu).map_err(RecipeError::new)?;
+	let exact = tape.profile.exact_cpu && tape.program.gpu.backend == Backend::Cpu;
+	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, emit, |samples, begin, end| {
+		let (predictions, logits) = logits(tape, samples, begin, end)?;
+		Ok((predictions, logits, f64::from_bits(tape.last_device_seconds.load(Ordering::Acquire))))
+	})
+}
+/// Both a single tape and a placed model measure and report through this loop.
+fn decode_sequence(
+	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>,
+	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>, f64)>,
+) -> Result<Generation> {
+	let mut reference = reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)?;
 	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
 	let mut settled = 0;
-	let mut started = std::time::Instant::now();
 	for step in 0..=budget {
+		if INTERRUPTED.load(Ordering::Acquire) { break; }
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
+		let started = Instant::now();
+		let (predictions, sample_logits, device_seconds) = logits(samples, settled, reached)?;
+		let seconds = if device_seconds > 0.0 { device_seconds } else { started.elapsed().as_secs_f64() };
+		if let Some(progress) = progress { progress.measured(step, seconds); }
 		let reference_id = reference.step(step, &sample_logits).map_err(RecipeError::new)?;
 		trace_logits(step, &sample_logits)?;
-		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
 			generation.prefill_seconds = seconds;
 		} else {
 			generation.step_seconds.push(seconds);
 		}
-		started = std::time::Instant::now();
 		settled = reached;
 		generation.logits = predictions;
 		if step == budget {
 			break;
 		}
 		let id = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&sample_logits, &generation.ids));
+		if let Some(progress) = progress { progress.generated(!stop.contains(&id)); }
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
@@ -15582,6 +16124,7 @@ fn decode_steps(
 		}
 	}
 	require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
+	if let Some(progress) = progress { progress.state.lock().unwrap().phase = "done"; }
 	Ok(generation)
 }
 /// The interface in front of placed tapes: a saved semantic pipeline applies
@@ -15596,10 +16139,12 @@ enum PlacedSource {
 /// extends them one position at a time.
 pub struct Placed {
 	source: PlacedSource,
+	devices: Vec<&'static Gpu>,
 	split: Vec<usize>,
 	/// One tape per range of every graph, on the range's device.
 	tapes: Vec<Vec<NativeTape>>,
 	resident: Vec<usize>,
+	movement: Vec<usize>,
 	moved: usize,
 }
 /// The saved statistics a batch normalization carries into inference, as the
@@ -15611,15 +16156,42 @@ fn saved_statistics(nodes: &[Node], rows: usize) -> Result<Vec<(usize, usize)>> 
 		.map(|(index, state)| (index, state.values))
 		.collect())
 }
-/// The bytes a device holds to run one row of a graph part: its input, weight
-/// arena, and value and context arenas for the part's own inference layout.
-fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+/// The bytes a device holds to run one row of a graph part, kept by arena so a
+/// placement failure identifies the allocation that exceeds the device.
+#[derive(Clone, Debug)]
+pub struct DeviceMemory {
+	pub device: String,
+	pub input: usize,
+	pub weights: usize,
+	pub values: usize,
+	pub contexts: usize,
+	pub scratch: usize,
+}
+impl fmt::Display for DeviceMemory {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+		write!(f, "{} memory: weights {:.3} GiB, values {:.3} GiB, contexts/KV {:.3} GiB, input {:.3} GiB, load scratch {:.3} GiB",
+			self.device, gib(self.weights), gib(self.values), gib(self.contexts), gib(self.input), gib(self.scratch))
+	}
+}
+impl DeviceMemory {
+	pub fn total(&self) -> Result<usize> {
+		checked_add(
+			checked_add(self.input, self.weights, "part resident bytes")?,
+			checked_add(checked_add(self.values, self.contexts, "part arena bytes")?, self.scratch, "part load bytes")?,
+			"part bytes",
+		)
+	}
+}
+fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
 	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
-	let resident = checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")?;
-	checked_add(resident, storage_scratch_bytes(part), "part load scratch bytes")
+	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part) })
+}
+fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+	part_memory(part, precision)?.total()
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
@@ -15686,6 +16258,8 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 		}
 		if resident > free {
 			let device = split.len();
+			let mut memory = part_memory(&graph_part(graph, first, end)?, precision)?;
+			memory.device = devices[device].name.clone();
 			let legal = starts.iter().skip(1).filter(|start| !cuts_connection(graph, **start)).count();
 			let probe = starts.get(1).copied().unwrap_or(0);
 			let crossing = graph.nodes[probe..].iter().enumerate().find_map(|(offset, node)| {
@@ -15695,7 +16269,10 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 					_ => None,
 				})
 			});
-			return Err(RecipeError::new(format!("device {device} cannot hold placement blocks {}..{}: {resident} bytes required, {free} bytes available; {legal} legal layer boundaries; first boundary crossing {crossing:?}", first, end)));
+			return Err(RecipeError::new(format!(
+				"{} cannot hold graph nodes {first}..{end}: {:.3} GiB required, {:.3} GiB available; {memory}; {legal} legal block boundaries; first boundary crossing {crossing:?}",
+				memory.device, resident as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64
+			)));
 		}
 		taken += 1;
 	}
@@ -15781,7 +16358,7 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
 /// Build one persistent tape for every contiguous device range of `graph`.
-fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, usize)> {
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
 	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
 	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
@@ -15797,38 +16374,42 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 		let available = device.free_bytes()?.saturating_sub(reserve);
 		require(required <= available, format!("device {index} cannot hold placement blocks for explicit split: {required} bytes required, {available} bytes available"))?;
 	}
-	let (mut ranges, mut resident, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], 0, 0);
+	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
 		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics)?;
 		resident[index] = tape.resident_bytes();
 		if index + 1 < split.len() {
-			moved += part.output.channels * precision.bytes();
+			movement[index] = part.output.channels * precision.bytes();
+			moved += movement[index];
 		}
 		ranges.push(tape);
 	}
 	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
-	Ok((split, ranges, resident, moved))
+	Ok((split, ranges, resident, movement, moved))
 }
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
 fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
 	let path = resolve_path(path)?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
-	let (mut chosen, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
+	let (mut chosen, mut tapes, mut resident, mut movement, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let (next, ranges, bytes, movement) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
 		if chosen.is_empty() {
 			chosen = next;
 		}
 		for (total, bytes) in resident.iter_mut().zip(bytes) {
 			*total += bytes;
 		}
-		moved += movement;
+		for (total, bytes) in movement.iter_mut().zip(graph_movement) {
+			*total += bytes;
+		}
+		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), split: chosen, tapes, resident, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -15842,10 +16423,77 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
 		None => Vec::new(),
 	};
-	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), split, tapes: vec![ranges], resident, moved })
+	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	fn llvm_report(&self) -> LlvmReport {
+		let mut report = LlvmReport::default();
+		for tape in self.tapes.iter().flatten() {
+			report.instructions.extend(tape.program.artifact.llvm.instructions.clone());
+			report.intrinsics.extend(tape.program.artifact.llvm.intrinsics.clone());
+		}
+		report
+	}
+	fn format_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::format_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn memory_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			let mut bytes = [0_usize; 8];
+			for tape in self.tapes.iter().filter_map(|ranges| ranges.get(index)) {
+				bytes[0] += tape.samples.bytes;
+				bytes[1] += tape.weights.bytes;
+				bytes[2] += tape.values.bytes;
+				bytes[3] += tape.contexts.bytes;
+				bytes[4] += tape.adjoints.bytes;
+				bytes[5] += tape.gradient.bytes;
+				bytes[6] += tape.moments.bytes + tape.variances.bytes;
+				bytes[7] += tape.program.artifact.storage.bytes;
+			}
+			lines.push(format!(
+				"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
+				device_label(gpu)?, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+			));
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn link_report(&self) -> Result<ReportLines> { transfer_report(self.tapes.iter().flatten().map(|tape| tape.program.gpu)) }
+	fn aot_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			let tapes = self.tapes.iter().filter_map(|ranges| ranges.get(index)).collect::<Vec<_>>();
+			let blocks = tapes
+				.iter()
+				.filter_map(|tape| Some((tape.nodes.first()?.block_index, tape.nodes.last()?.block_index)))
+				.map(|(first, last)| if first == last { first.to_string() } else { format!("{first}..{last}") })
+				.collect::<Vec<_>>();
+			let blocks = if blocks.is_empty() { "none".to_owned() } else { blocks.join(",") };
+			let matrix = tapes.iter().any(|tape| tape.program.schedule.matrix);
+			let vector = tapes.iter().any(|tape| !tape.program.schedule.matrix);
+			let pp = if matrix && vector { "mixed" } else if matrix { "matrix" } else if vector { "vector" } else { "none" };
+			let tg = if tapes.is_empty() { "none" } else { "vector" };
+			let moved = self.movement[index];
+			lines.push(format!("{}  aot: blocks {blocks} pp {pp} tg {tg} transfer {moved} bytes/token", device_label(gpu)?));
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn tile_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::tile_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn grid_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
+	fn load_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.load_seconds).sum() }
+	/// Actual resident arena sizes, available directly to model scripts.
+	pub fn memory(&self) -> Vec<DeviceMemory> {
+		self.tapes.iter().flatten().map(|tape| DeviceMemory {
+			device: tape.program.gpu.name.clone(), input: tape.samples.bytes, weights: tape.weights.bytes,
+			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0,
+		}).collect()
+	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
 		let end = self.tapes.first().and_then(|ranges| ranges.first()).map_or(0, |tape| tape.positions);
 		self.run_window(input, 0, end).unwrap_or_else(|error| panic!("{error}"))
@@ -15879,10 +16527,12 @@ impl Placed {
 	pub fn moved_bytes(&self) -> usize {
 		self.moved
 	}
-	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		self.decode_observed(prompt, sampler, stop, budget, None, emit)
+	}
+	fn decode_observed(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 		let first = self.tapes.first().and_then(|tapes| tapes.first()).ok_or_else(|| RecipeError::new("placement has no tape"))?;
 		let exact = first.profile.exact_cpu && self.tapes.iter().flatten().all(|tape| tape.program.gpu.backend == Backend::Cpu);
-		let mut reference = reference::Reference::open(f64::from_bits(first.profile.tolerance), exact).map_err(RecipeError::new)?;
 		match &self.source {
 			PlacedSource::Bound(_, suppressed) => sampler.suppressed.clone_from(suppressed),
 			PlacedSource::Saved(_) => sampler.suppressed.clear(),
@@ -15907,11 +16557,7 @@ impl Placed {
 		for (slot, id) in samples.iter_mut().zip(prompt) {
 			*slot = f64::from(*id);
 		}
-		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-		let mut settled = 0;
-		for step in 0..=budget {
-			let reached = narrow(generation.ids.len(), "decode position")? as u32;
-			let started = std::time::Instant::now();
+		decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, emit, |samples, settled, reached| {
 			let predictions = self.run_window(&samples, settled, reached)?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
@@ -15921,29 +16567,11 @@ impl Placed {
 					}
 				}
 			}
-			let reference_id = reference.step(step, &sample_logits).map_err(RecipeError::new)?;
-			trace_logits(step, &sample_logits)?;
-			let seconds = started.elapsed().as_secs_f64();
-			if step == 0 {
-				generation.prefill_seconds = seconds;
-			} else {
-				generation.step_seconds.push(seconds);
-			}
-			settled = reached;
-			generation.logits = predictions;
-			if step == budget {
-				break;
-			}
-			let id = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&sample_logits, &generation.ids));
-			emit(id)?;
-			samples[generation.ids.len()] = f64::from(id);
-			generation.ids.push(id);
-			if stop.contains(&id) {
-				break;
-			}
-		}
-		require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
-		Ok(generation)
+			Ok((predictions, sample_logits, self.last_device_seconds()))
+		})
+	}
+	fn last_device_seconds(&self) -> f64 {
+		self.tapes.iter().flatten().map(|tape| f64::from_bits(tape.last_device_seconds.load(Ordering::Acquire))).sum()
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
@@ -16079,8 +16707,8 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
-	fn identity(&self, index: usize) -> String {
-		let prim = match self.op {
+	fn primitive_name(&self) -> &'static str {
+		match self.op {
 			Primitive::Contraction => "Contraction",
 			Primitive::Pool => "Pool",
 			Primitive::Attention => "Attention",
@@ -16101,10 +16729,12 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
-		};
+		}
+	}
+	fn identity(&self, index: usize) -> String {
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
-			self.block_index, self.block_kind, index, prim, self.input.channels, self.input.length, self.output.channels, self.output.length, self.offset, self.parameters, self.source
+			self.block_index, self.block_kind, index, self.primitive_name(), self.input.channels, self.input.length, self.output.channels, self.output.length, self.offset, self.parameters, self.source
 		)
 	}
 }
@@ -16640,7 +17270,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
-		trace(&format!("requantize node {index} on the host: {} values, kept from the earlier compile", weight.count))?;
+		trace(&format!("requantize node {index} in machine RAM: {} values, kept from the earlier compile", weight.count))?;
 		graph.stored[index] = Some(encoded.clone());
 		return Ok(());
 	}
@@ -16657,7 +17287,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	}
 	let decoded = started.elapsed().as_secs_f64();
 	let mut encoded = format.encode(&values, &vec![1.0; values.len()], config)?;
-	trace(&format!("requantize node {index} on the host: {} values, decode {decoded:.2} s, encode {:.2} s", weight.count, started.elapsed().as_secs_f64() - decoded))?;
+	trace(&format!("requantize node {index} in machine RAM: {} values, decode {decoded:.2} s, encode {:.2} s", weight.count, started.elapsed().as_secs_f64() - decoded))?;
 	// A bound weight keeps only its stored bytes, as one read from a file does; the
 	// decoded values would otherwise hold the whole model in f64 on the host.
 	encoded.arithmetic = Vec::new();
@@ -17221,10 +17851,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		heads = valid[0];
 		keys = heads;
 		values = heads;
-		eprintln!(
-			"invalid: attn({requested})  valid: {}  choosing attn({heads})",
-			valid.iter().map(|heads| format!("attn({heads})")).collect::<Vec<_>>().join("|")
-		);
+		trace(&format!("attention requested {requested} heads; valid {} selected {heads}", valid.iter().map(|heads| heads.to_string()).collect::<Vec<_>>().join(",")))?;
 	}
 	require(
 		keys != 0 && keys <= heads && heads % keys == 0,
@@ -18660,7 +19287,7 @@ mod precision_contract_checks {
 		let inverse = -127.0 / extreme;
 		let step = 1.0 / inverse;
 		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
-		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, host canonical encoding produced {expected}");
+		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
 	}
 	#[test]
 	fn narrow_training_preserves_small_and_large_gradients() {
@@ -18969,9 +19596,13 @@ struct NativeTape {
 	input: Shape,
 	output: Shape,
 	nodes: Vec<Node>,
+	storage: Vec<String>,
 	capacity: usize,
 	positions: u32,
 	vocabulary: f64,
+	compile_seconds: f64,
+	load_seconds: f64,
+	last_device_seconds: AtomicU64,
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
 }
@@ -18989,6 +19620,39 @@ enum EpochOperation {
 	Full,
 	Gradient,
 	Optimizer,
+	Metrics,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EpochMetrics {
+	loss: f64,
+	target_sum: f64,
+	target_square: f64,
+	residual_square: f64,
+	prediction_sum: f64,
+	r2: f64,
+	count: usize,
+	device_seconds: f64,
+}
+impl EpochMetrics {
+	const VALUES: usize = 6;
+	fn read(values: &[f64], count: usize, device_seconds: f64) -> Self {
+		Self { loss: values[0], target_sum: values[1], target_square: values[2], residual_square: values[3], r2: values[4], prediction_sum: values[5], count, device_seconds }
+	}
+	fn predicted_mean(self) -> f64 { self.prediction_sum / self.count as f64 }
+	fn combine(parts: impl IntoIterator<Item = (Self, f64)>, root_loss: bool) -> Self {
+		let parts = parts.into_iter().collect::<Vec<_>>();
+		let target_sum = parts.iter().map(|(part, _)| part.target_sum).sum();
+		let target_square = parts.iter().map(|(part, _)| part.target_square).sum();
+		let residual_square = parts.iter().map(|(part, _)| part.residual_square).sum();
+		let prediction_sum = parts.iter().map(|(part, _)| part.prediction_sum).sum();
+		let count: usize = parts.iter().map(|(part, _)| part.count).sum();
+		let loss = if root_loss { parts.iter().map(|(part, share)| share * part.loss * part.loss).sum::<f64>().sqrt() } else { parts.iter().map(|(part, share)| share * part.loss).sum() };
+		let total = target_square - target_sum * target_sum / count.max(1) as f64;
+		let r2 = if total == 0.0 { 0.0 } else { 1.0 - residual_square / total };
+		let device_seconds = parts.iter().map(|(part, _)| part.device_seconds).fold(0.0, f64::max);
+		Self { loss, target_sum, target_square, residual_square, prediction_sum, r2, count, device_seconds }
+	}
 }
 
 impl EpochOperation {
@@ -19045,10 +19709,74 @@ fn native_context_regions(graph: &Graph, layout: &NativeLayout, weights: &Buffer
 	Ok(regions)
 }
 impl NativeTape {
+	fn llvm_report(&self) -> LlvmReport {
+		LlvmReport {
+			instructions: NameList::new(self.program.artifact.llvm.instructions.clone()),
+			intrinsics: NameList::new(self.program.artifact.llvm.intrinsics.clone()),
+		}
+	}
+	fn format_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		let mut lines = Vec::new();
+		let mut seen = std::collections::BTreeSet::new();
+		for (index, node) in self.nodes.iter().enumerate() {
+			let storage = &self.storage[index];
+			let operand = if node.int_bits == 32 { "fp32".to_owned() } else if node.int_bits != 0 { format!("int{}", node.int_bits) } else { node.precision.label() };
+			let item = format!("{} {} storage {storage} operand {operand} accumulator {} result {}", node.block_kind, node.primitive_name(), node.acc.label(), node.precision.label());
+			if seen.insert(item.clone()) { lines.push(format!("{device}  format: {item}")); }
+		}
+		Ok(lines)
+	}
+	fn memory_line(&self) -> Result<String> {
+		Ok(format!(
+			"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
+			self.device_label()?,
+			self.samples.bytes,
+			self.weights.bytes,
+			self.values.bytes,
+			self.contexts.bytes,
+			self.adjoints.bytes,
+			self.gradient.bytes,
+			self.moments.bytes + self.variances.bytes,
+			self.program.artifact.storage.bytes
+		))
+	}
+	fn tile_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		Ok(self
+			.program
+			.schedule
+			.contractions
+			.iter()
+			.enumerate()
+			.filter_map(|(index, tiles)| tiles.map(|tiles| if self.program.epoch.is_some() {
+				format!("{device}  tile: {} fwd {}x{}x{} wgd {}x{}x{} igd {}x{}x{}", self.nodes[index].identity(index), tiles.forward.m, tiles.forward.n, tiles.forward.k, tiles.gradient.m, tiles.gradient.n, tiles.gradient.k, tiles.previous.m, tiles.previous.n, tiles.previous.k)
+			} else {
+				format!("{device}  tile: {} pp {}x{}x{}", self.nodes[index].identity(index), tiles.forward.m, tiles.forward.n, tiles.forward.k)
+			}))
+			.collect())
+	}
+	fn grid_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		let mut lines = Vec::new();
+		let forward = self.program.forward.geometry;
+		if let Some(epoch) = self.program.epoch {
+			lines.push(format!("{device}  grid: forward {}x1x1 workgroup {}x1x1", forward.groups, forward.block));
+			lines.push(format!("{device}  grid: epoch {}x1x1 workgroup {}x1x1", epoch.geometry.groups, epoch.geometry.block));
+		} else {
+			lines.push(format!("{device}  grid: pp {}x1x1 workgroup {}x1x1", forward.groups, forward.block));
+			if let Some(tg) = self.program.step_geometry() {
+				lines.push(format!("{device}  grid: tg {}x1x1 workgroup {}x1x1", tg.groups, tg.block));
+			}
+		}
+		if let Some(load) = self.program.model_load { lines.push(format!("{device}  grid: load {}x1x1 workgroup {}x1x1", load.geometry.groups, load.geometry.block)); }
+		Ok(lines)
+	}
 	/// `tokens` are the model's ids, one per position of every row, which the
 	/// lookups of this graph gather rows for; a whole graph reads its own
 	/// samples, and a part of a split graph reads the ids its stream came from.
 	fn new(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+		let prepare_started = Instant::now();
 		let training_graph;
 		let graph = if loss.is_some() {
 			training_graph = graph.training_graph()?;
@@ -19077,7 +19805,7 @@ impl NativeTape {
 				format!("; {} training, {} gradients, {} optimizer, {storage} checkpoint", node.precision.label(), native.state.label(), NativePrecision::new(precision, graph.profile.acc)?.state.label())
 			} else { String::new() };
 			let line = format!("{} {} -> {route}{detail}", node.block_kind, format.name());
-			if resolutions.insert(line.clone()) { eprintln!("{line}"); }
+			if resolutions.insert(line.clone()) { trace(&format!("route {line}"))?; }
 		}
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
 		// Only the epoch entrypoint reads the optimizer state, the gradient and
@@ -19149,7 +19877,7 @@ impl NativeTape {
 					let reference = graph.requantize.get(*node).and_then(Option::as_ref).unwrap_or(weight);
 					let host = reference.segments.first().and_then(|(span, _)| span.spec().map(|first| (span, first))).map(|(span, first)| stored_first_values(reference, *span, first.stride, first.block)).transpose()?.unwrap_or_default();
 					let raw = weights.download_range::<u8>(offsets[*node], 16)?;
-					trace(&format!("load node {node} {} wrote {written:?} host {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
+					trace(&format!("load node {node} {} wrote {written:?} machine {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
 		} else {
@@ -19214,6 +19942,18 @@ impl NativeTape {
 			weights.bytes
 		))?;
 		write_contraction_schedule(&contexts, &layout, &program.schedule.contractions)?;
+		let compile_seconds = program.artifact.compile_seconds;
+		let load_seconds = (prepare_started.elapsed().as_secs_f64() - compile_seconds).max(0.0);
+		let storage = graph.nodes.iter().enumerate().map(|(index, node)| {
+			if node.weights() == 0 { return "none".to_owned(); }
+			let Some(weight) = graph.stored.get(index).and_then(Option::as_ref).filter(|_| node.packed || node.table()) else { return node.precision.label(); };
+			let mut formats = Vec::new();
+			for (format, _) in weight.format_segments() {
+				let format = if format.0 == 0 { node.precision.label() } else { quantization(format.0) };
+				if !formats.contains(&format) { formats.push(format); }
+			}
+			formats.join("+")
+		}).collect();
 		let tape = Self {
 			profile: graph.profile,
 			program,
@@ -19233,7 +19973,7 @@ impl NativeTape {
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
-			metrics: Buffer::upload_float(gpu, &[0.0], layout.output_adjoint_precision)?,
+			metrics: Buffer::zeroed(gpu, EpochMetrics::VALUES * layout.output_adjoint_precision.bytes())?,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -19241,9 +19981,13 @@ impl NativeTape {
 			input: graph.input,
 			output: graph.output,
 			nodes: graph.nodes.clone(),
+			storage,
 			capacity: rows,
 			positions: narrow(positions, "native input positions")? as u32,
 			vocabulary,
+			compile_seconds,
+			load_seconds,
+			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
 			reached: std::sync::atomic::AtomicU32::new(0),
 		};
 		tape.stage_lookups(0, tape.positions)?;
@@ -19371,9 +20115,13 @@ impl NativeTape {
 		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
+		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.program.gpu.synchronize()?;
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		if let Some(clocks) = self.program.artifact.layout.clocks {
-			self.program.gpu.synchronize()?;
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
 			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
@@ -19388,31 +20136,41 @@ impl NativeTape {
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
 	/// holdout does not compile a second artifact or read stale rows.
-	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], targets: &[f64], first: usize, loss: LossFunction, config: Config) -> Result<(Vec<f64>, EpochMetrics)> {
 		let input = graph.input.elements();
+		let output = graph.output.elements();
 		require(input != 0 && samples.len() % input == 0, format!("evaluation samples must be a multiple of {input} values"))?;
 		let rows = samples.len() / input;
+		require(targets.len() == rows * output, format!("evaluation targets must hold {rows} rows of {output} values"))?;
 		require(first <= rows, format!("evaluation start row {first} exceeds {rows} rows"))?;
 		let saved_rows = self.rows;
 		let result = (|| {
 			self.upload_weights(&graph.parameters)?;
 			let evaluation_count = checked_mul(self.capacity, input, "native evaluation sample allocation")?;
+			let target_count = checked_mul(self.capacity, output, "native evaluation target allocation")?;
 			let evaluation_samples = Buffer::upload_float(self.program.gpu, &vec![0.0; evaluation_count], self.program.artifact.layout.input_precision)?;
+			let evaluation_targets = Buffer::upload_float(self.program.gpu, &vec![0.0; target_count], self.program.artifact.layout.output_precision)?;
 			let mut predictions = Vec::new();
+			let mut measured = Vec::new();
 			let mut row = first;
 			while row < rows {
 				let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
 				self.rows = narrow(end - row, "native evaluation rows")? as u32;
 				evaluation_samples.write_float_bytes(0, &samples[row * input..end * input], self.program.artifact.layout.input_precision)?;
+				evaluation_targets.write_float_bytes(0, &targets[row * output..end * output], self.program.artifact.layout.output_precision)?;
 				self.values.clear()?;
 				for &(start, stop) in &self.context_resets {
 					self.contexts.clear_range(start, stop - start)?;
 				}
-				self.forward_window_with_samples(evaluation_samples.pointer, 0, self.positions, ForwardMode::Inference)?;
+				measured.push(self.metric_launch_with(evaluation_samples.pointer, evaluation_targets.pointer, config)?);
 				predictions.extend(self.predictions()?);
 				row = end;
 			}
-			Ok(predictions)
+			let count = measured.iter().map(|part| part.count).sum::<usize>().max(1);
+			let seconds = measured.iter().map(|part| part.device_seconds).sum();
+			let mut metrics = EpochMetrics::combine(measured.into_iter().map(|part| { let share = part.count as f64 / count as f64; (part, share) }), loss.0 == 1);
+			metrics.device_seconds = seconds;
+			Ok((predictions, metrics))
 		})();
 		self.rows = saved_rows;
 		result
@@ -19599,7 +20357,10 @@ impl NativeTape {
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
-		require(self.step != 0, "optimizer epoch is absent")?;
+		self.epoch_launch_with(rate, config, operation, self.samples.pointer, self.targets.pointer)
+	}
+	fn epoch_launch_with(&mut self, rate: f64, config: Config, operation: EpochOperation, samples: u64, targets: u64) -> Result<()> {
+		require(self.step != 0 || matches!(operation, EpochOperation::Metrics), "optimizer epoch is absent")?;
 		let threads = self.program.dispatch(NativeEntry::Epoch)?.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
@@ -19613,8 +20374,8 @@ impl NativeTape {
 		let run_gradient = u32::from(operation.gradient());
 		let run_optimizer = u32::from(operation.optimizer());
 		let mut call = ptrs![
-			self.samples.pointer,
-			self.targets.pointer,
+			samples,
+			targets,
 			self.weights.pointer,
 			self.frozen.pointer,
 			self.moments.pointer,
@@ -19638,14 +20399,30 @@ impl NativeTape {
 			run_optimizer
 		];
 		trace(&format!("epoch {} {operation:?} launch", self.step))?;
+		let machine_started = Instant::now();
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
+		self.program.gpu.synchronize()?;
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
 	}
-	fn objective(&self) -> Result<f64> {
-		let objective = self.metrics.download_float(1, self.program.artifact.layout.output_adjoint_precision)?[0];
+	fn epoch_metrics(&self) -> Result<EpochMetrics> {
+		let values = self.metrics.download_float(EpochMetrics::VALUES, self.program.artifact.layout.output_adjoint_precision)?;
 		trace(&format!("epoch {} metric complete", self.step))?;
-		Ok(objective)
+		Ok(EpochMetrics::read(&values, self.rows as usize * self.output.elements(), f64::from_bits(self.last_device_seconds.load(Ordering::Acquire))))
+	}
+	fn metric_launch(&mut self, config: Config) -> Result<EpochMetrics> {
+		self.epoch_launch(0.0, config, EpochOperation::Metrics)?;
+		self.epoch_metrics()
+	}
+	fn metric_launch_with(&mut self, samples: u64, targets: u64, config: Config) -> Result<EpochMetrics> {
+		self.epoch_launch_with(0.0, config, EpochOperation::Metrics, samples, targets)?;
+		self.epoch_metrics()
+	}
+	fn objective(&self) -> Result<f64> {
+		Ok(self.epoch_metrics()?.loss)
 	}
 	fn full_epoch(&mut self, rate: f64, config: Config) -> Result<f64> {
 		self.epoch_launch(rate, config, EpochOperation::Full)?;
@@ -19783,13 +20560,8 @@ struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
 }
-impl TransferCost {
-	fn seconds(self, bytes: usize) -> f64 {
-		self.latency.as_secs_f64() + bytes as f64 / self.bandwidth
-	}
-}
 /// The measured behavior of one device: the two transfer directions between it and the coordinating
-/// host, the gradient work it retires each second, and the fixed cost of one dispatch on it.
+/// machine, the gradient work it retires each second, and the fixed cost of one dispatch on it.
 #[derive(Clone, Copy)]
 struct Link {
 	to_host: TransferCost,
@@ -19837,11 +20609,6 @@ struct Transfer {
 	to: usize,
 	bytes: usize,
 	cost: TransferCost,
-}
-impl Transfer {
-	fn seconds(self) -> f64 {
-		self.cost.seconds(self.bytes)
-	}
 }
 /// The route one training run takes: the row share of every shard, the movement its fused epoch performs, and the
 /// complete epoch predicted for it from computation, transfers, synchronization, and persistent-state movement.
@@ -20000,19 +20767,23 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, loss:
 		let state = NativePrecision::new(node.precision, node.acc)?.state;
 		Ok::<_, RecipeError>((checked_add(gradients, checked_mul(node.parameters, state.bytes(), "gradient transfer")?, "gradient transfers")?, checked_add(weights, checked_mul(node.parameters, node.precision.bytes(), "weight transfer")?, "weight transfers")?))
 	})?;
-	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
-	for (gpu, link) in gpus.iter().zip(links) {
-		eprintln!(
-			"measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}",
-			device_label(gpu)?,
-			link.work,
-			link.overhead,
-			link.to_host.bandwidth / 1e6,
-			link.to_host.latency,
-			link.from_host.bandwidth / 1e6,
-			link.from_host.latency
-		);
+	if gpus.len() == 1 {
+		let zero = TransferCost { latency: Duration::ZERO, bandwidth: f64::INFINITY };
+		return Ok((
+			vec![0],
+			vec![rows],
+			Placement {
+				shares: vec![1.0],
+				gradient_to_host: vec![Transfer { from: 1, to: 0, bytes: bytes.0, cost: zero }],
+				gradient_to_primary: Transfer { from: 0, to: 1, bytes: bytes.0, cost: zero },
+				weights_to_host: Transfer { from: 1, to: 0, bytes: bytes.1, cost: zero },
+				weights_from_host: Vec::new(),
+				loss,
+				predicted: [0.0; 4],
+			},
+		));
 	}
+	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
 	let candidates: Vec<Vec<usize>> = match config.multi_device {
 		MultiDevice::Local => vec![vec![0]],
 		MultiDevice::Forced => vec![(0..gpus.len()).collect()],
@@ -20023,13 +20794,6 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, loss:
 		// The fastest device leads the route and applies the one update.
 		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
 		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
-		let [computation, transfers, synchronization, movement] = placement.predicted;
-		eprintln!(
-			"route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}",
-			route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","),
-			counts.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
-			placement.seconds()
-		);
 		best = if best.as_ref().is_none_or(|previous| placement.seconds() < previous.2.seconds()) { Some((route, counts, placement)) } else { best };
 	}
 	best.ok_or_else(|| RecipeError::new("no candidate route fits this workload"))
@@ -20039,10 +20803,55 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, loss:
 /// devices the rows shard contiguously, every device computes a gradient, the
 /// primary device applies the one emitted optimizer, and its weights broadcast.
 struct DeviceTape {
+	devices: Vec<&'static Gpu>,
+	route: Vec<usize>,
 	shards: Vec<NativeTape>,
 	placement: Placement,
 }
 impl DeviceTape {
+	fn llvm_report(&self) -> LlvmReport {
+		let mut report = LlvmReport::default();
+		for shard in &self.shards {
+			report.instructions.extend(shard.program.artifact.llvm.instructions.clone());
+			report.intrinsics.extend(shard.program.artifact.llvm.intrinsics.clone());
+		}
+		report
+	}
+	fn format_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::format_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn memory_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			if let Some(position) = self.route.iter().position(|selected| *selected == index) {
+				lines.push(self.shards[position].memory_line()?);
+			} else {
+				lines.push(format!("{}  memory: input 0 bytes weights 0 bytes values 0 bytes contexts 0 bytes adjoints 0 bytes gradients 0 bytes optimizer 0 bytes load-scratch 0 bytes", device_label(gpu)?));
+			}
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn link_report(&self) -> Result<ReportLines> { transfer_report(self.shards.iter().map(|shard| shard.program.gpu)) }
+	fn aot_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			if let Some(position) = self.route.iter().position(|selected| *selected == index) {
+				let shard = &self.shards[position];
+				lines.push(format!("{}  aot: rows {} share {:.6} predicted epoch {:.3} µs", device_label(gpu)?, shard.rows, self.placement.shares[position], self.placement.seconds() * 1e6));
+			} else {
+				lines.push(format!("{}  aot: rows 0 share 0.000000", device_label(gpu)?));
+			}
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn tile_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::tile_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn grid_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn compile_seconds(&self) -> f64 { self.shards.iter().map(|shard| shard.compile_seconds).sum() }
+	fn load_seconds(&self) -> f64 { self.shards.iter().map(|shard| shard.load_seconds).sum() }
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction, config: Config) -> Result<Self> {
 		// Validate and resolve training before route calibration builds any kernels.
 		let training_graph = graph.training_graph()?;
@@ -20057,7 +20866,6 @@ impl DeviceTape {
 			"batch normalization computes whole-batch statistics, so this model trains on one device",
 		)?;
 		let (route, counts, placement) = select_route(gpus, graph, rows, loss, config)?;
-		eprintln!("selected route {} predicted epoch {:.9}s", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), placement.seconds());
 		let (mut shards, mut start) = (Vec::new(), 0);
 		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
@@ -20072,10 +20880,22 @@ impl DeviceTape {
 			)?);
 			start = end;
 		}
-		Ok(Self { shards, placement })
+		Ok(Self { devices: gpus.to_vec(), route, shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
 		self.shards.iter().try_for_each(|tape| tape.forward(ForwardMode::Inference))
+	}
+	fn metrics(&mut self, config: Config) -> Result<EpochMetrics> {
+		let transfers = TransferScope::current();
+		let parts = std::thread::scope(|scope| {
+			let measured = self.shards.iter_mut().map(|shard| {
+				let transfers = transfers.clone();
+				scope.spawn(move || { let _transfers = TransferScope::enter(transfers); shard.metric_launch(config) })
+			}).collect::<Vec<_>>();
+			measured.into_iter().map(|part| part.join().map_err(|_| RecipeError::new("device metrics panicked"))?).collect::<Result<Vec<_>>>()
+		})?;
+		let root_loss = self.placement.loss.0 == 1;
+		Ok(EpochMetrics::combine(parts.into_iter().zip(self.placement.shares.iter().copied()), root_loss))
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let mut predictions = Vec::new();
@@ -20084,8 +20904,8 @@ impl DeviceTape {
 		}
 		Ok(predictions)
 	}
-	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
-		self.shards.first_mut().ok_or_else(|| RecipeError::new("training placement has no device"))?.evaluate(graph, samples, first)
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], targets: &[f64], first: usize, loss: LossFunction, config: Config) -> Result<(Vec<f64>, EpochMetrics)> {
+		self.shards.first_mut().ok_or_else(|| RecipeError::new("training placement has no device"))?.evaluate(graph, samples, targets, first, loss, config)
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		if self.shards.len() > 1 {
@@ -20145,54 +20965,55 @@ impl DeviceTape {
 	/// The one fused epoch every policy runs: each shard computes its gradient
 	/// concurrently, the leading device applies the one emitted optimizer to the
 	/// aggregate, and the updated persistent weights return to every shard.
-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(EpochMetrics, bool)> {
 		if self.shards.len() == 1 {
 			let loss = self.shards[0].full_epoch(rate, config)?;
 			let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-			return Ok((loss, checkpoint_requested));
+			return Ok((self.shards[0].epoch_metrics()?, checkpoint_requested));
 		}
 		let placement = &self.placement;
 		let shards = &mut self.shards;
+		let transfers = TransferScope::current();
 		let measured = std::thread::scope(|scope| {
 			let dispatched = shards.iter_mut().zip(&placement.gradient_to_host).map(|(shard, transfer)| {
 				let transfer = *transfer;
-				scope.spawn(move || -> Result<(f64, Vec<f64>)> {
-					require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
-					let objective = shard.gradient_launch(rate, config)?;
-					Ok((objective, shard.download_gradient()?))
+				let transfers = transfers.clone();
+				scope.spawn(move || -> Result<(EpochMetrics, Vec<f64>)> {
+					let _transfers = TransferScope::enter(transfers);
+					require(transfer.to == 0, "gradient transfer must end on the master")?;
+					shard.gradient_launch(rate, config)?;
+					Ok((shard.epoch_metrics()?, shard.download_gradient()?))
 				})
 			});
 			dispatched.collect::<Vec<_>>().into_iter().map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?).collect::<Result<Vec<_>>>()
 		})?;
 		let root_metric = placement.loss.0 == 1;
-		let loss = if root_metric {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective * objective).sum::<f64>().sqrt()
-		} else {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective).sum()
-		};
+		let mut metrics = EpochMetrics::combine(measured.iter().zip(&placement.shares).map(|((metrics, _), share)| (*metrics, *share)), root_metric);
+		let loss = metrics.loss;
 		let parameters = self.shards[0].parameters;
 		let mut gradient = vec![0.0; parameters];
-		for ((objective, shard_gradient), share) in measured.iter().zip(&placement.shares) {
+		for ((metrics, shard_gradient), share) in measured.iter().zip(&placement.shares) {
 			// The RMSE seed divides by the shard-local loss, so restoring the
 			// whole-batch gradient rescales each shard by its loss ratio.
-			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { objective / loss } } else { 1.0 };
+			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { metrics.loss / loss } } else { 1.0 };
 			for (total, partial) in gradient.iter_mut().zip(shard_gradient) {
 				*total += scale * partial;
 			}
 		}
 		require(
 			placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1 && placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0,
-			"the aggregate gradient and the updated weights must cross the coordinating host",
+			"the aggregate gradient and the updated weights must cross the master",
 		)?;
 		self.shards[0].upload_gradient(&gradient)?;
 		self.shards[0].optimizer_launch(rate, config)?;
+		metrics.device_seconds += f64::from_bits(self.shards[0].last_device_seconds.load(Ordering::Acquire));
 		let weights = self.shards[0].weights()?;
 		for (shard, transfer) in self.shards.iter().skip(1).zip(&placement.weights_from_host) {
-			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
+			require(transfer.from == 0, "weight transfer must originate on the master")?;
 			shard.upload_weights(&weights)?;
 		}
 		let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-		Ok((loss, checkpoint_requested))
+		Ok((metrics, checkpoint_requested))
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.shards[0].weights()
@@ -20200,38 +21021,80 @@ impl DeviceTape {
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		self.shards[0].capture(graph)
 	}
-	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
-	fn print_devices(&self, graph: &Graph) -> Result<()> {
-		for (index, node) in graph.nodes.iter().enumerate() {
-			if node.op == Primitive::Gather {
-				let (layout, row) = embedding_row(node)?;
-				let table = checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, row, "embedding table bytes")?;
-				eprintln!("movement gather {} {row} bytes per token of a {table} byte table", layout.name);
-			}
-			if node.op == Primitive::Lookup
-				&& let Some(table) = graph.stored.get(index).and_then(Option::as_ref)
-			{
-				let (heads, rows) = (node.argument[0] as usize, (node.argument[2] as usize).max(1));
-				eprintln!("movement lookup {heads} rows of {} bytes per token from a {} byte host table", table.bytes.len() / rows, table.bytes.len());
-			}
-		}
-		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
-			eprintln!("{}.{} rows {} share {share:.6}", shard.device_label()?, shard.precision.model.label(), shard.rows);
-		}
-		for (index, movement) in self.placement.movements().enumerate() {
-			let kind = ["gradient", "aggregate", "weights"][(index >= self.shards.len()) as usize + (index > self.shards.len()) as usize];
-			eprintln!(
-				"movement {kind} {}>{} {} bytes {:.0?} {:.1} MB/s {:.6} ms",
-				movement.from,
-				movement.to,
-				movement.bytes,
-				movement.cost.latency,
-				movement.cost.bandwidth / 1e6,
-				movement.seconds() * 1e3
-			);
-		}
-		Ok(())
-	}
+}
+
+fn training_observability(
+	data: &Data,
+	rows: usize,
+	tape: &DeviceTape,
+	itl: TrainingPoint,
+	loss: ScalarHistory,
+	predictions: PredictionHistory,
+	r2: ScalarHistory,
+	rat: RatHistory,
+	fnl: TrainingPoint,
+	epochs: usize,
+	epoch_seconds: f64,
+) -> Result<TrainingObservability> {
+	Ok(TrainingObservability {
+		llvm: tape.llvm_report(),
+		path: data.report_path()?,
+		rows,
+		formats: tape.format_report()?,
+		memory: tape.memory_report()?,
+		links: tape.link_report()?,
+		aot: tape.aot_report()?,
+		tiles: tape.tile_report()?,
+		grids: tape.grid_report()?,
+		load: DurationReport(tape.load_seconds()),
+		compile: DurationReport(tape.compile_seconds()),
+		itl,
+		loss,
+		predictions,
+		r2,
+		rat,
+		fnl,
+		eps: if epoch_seconds == 0.0 { 0.0 } else { epochs as f64 / epoch_seconds },
+	})
+}
+
+fn single_training_observability(
+	path: String,
+	rows: usize,
+	tape: &NativeTape,
+	_link: Option<Link>,
+	predicted_epoch: Option<f64>,
+	itl: TrainingPoint,
+	loss: ScalarHistory,
+	predictions: PredictionHistory,
+	r2: ScalarHistory,
+	rat: RatHistory,
+	fnl: TrainingPoint,
+	epochs: usize,
+	epoch_seconds: f64,
+) -> Result<TrainingObservability> {
+	let device = tape.device_label()?;
+	let links = transfer_report([tape.program.gpu])?;
+	Ok(TrainingObservability {
+		llvm: tape.llvm_report(),
+		path,
+		rows,
+		formats: ReportLines::new(tape.format_lines()?),
+		memory: ReportLines::new([tape.memory_line()?]),
+		links,
+		aot: ReportLines::new([predicted_epoch.map_or_else(|| format!("{device}  aot: rows {rows}"), |seconds| format!("{device}  aot: rows {rows} predicted epoch {:.3} µs", seconds * 1e6))]),
+		tiles: ReportLines::new(tape.tile_lines()?),
+		grids: ReportLines::new(tape.grid_lines()?),
+		load: DurationReport(tape.load_seconds),
+		compile: DurationReport(tape.compile_seconds),
+		itl,
+		loss,
+		predictions,
+		r2,
+		rat,
+		fnl,
+		eps: if epoch_seconds == 0.0 { 0.0 } else { epochs as f64 / epoch_seconds },
+	})
 }
 #[derive(Clone, Copy)]
 enum CheckpointStatus {
@@ -21346,7 +22209,7 @@ impl Gpu {
 					if status == 4104 && std::env::var("RECIPE_HOST_SPILL").as_deref() == Ok("1") {
 						self.status((driver.allocate)(driver.kernarg_pool, bytes, 0, &mut pointer), "system memory allocation")?;
 						self.status((driver.allow)(1, &driver.agent, ptr::null(), pointer), "GPU system memory access")?;
-						eprintln!("Using {} MiB of system memory for GPU allocation", bytes.div_ceil(1024 * 1024));
+						trace(&format!("GPU allocation uses {} MiB of machine memory", bytes.div_ceil(1024 * 1024)))?;
 					} else {
 						self.status(status, "allocation")?;
 					}
@@ -21394,7 +22257,8 @@ impl Gpu {
 	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
 		self.activate()?;
 		let dst = if dst == 0 { self.allocate(bytes)? } else { dst };
-		unsafe {
+		let started = Instant::now();
+		let result = unsafe {
 			match &self.driver {
 				Driver::Cpu => {
 					ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes);
@@ -21414,7 +22278,9 @@ impl Gpu {
 					channel.read_status("upload").map(|_| dst)
 				}
 			}
-		}
+		};
+		if result.is_ok() { record_transfer(&self.name, true, bytes, started.elapsed().as_secs_f64()); }
+		result
 	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn clear(&self, pointer: u64, bytes: usize) -> Result<()> {
@@ -21452,7 +22318,8 @@ impl Gpu {
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		self.activate()?;
-		unsafe {
+		let started = Instant::now();
+		let result = unsafe {
 			match &self.driver {
 				Driver::Cpu => {
 					ptr::copy_nonoverlapping(src as *const u8, dst.cast::<u8>(), bytes);
@@ -21472,7 +22339,9 @@ impl Gpu {
 					channel.read_into(std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes))
 				}
 			}
-		}
+		};
+		if result.is_ok() { record_transfer(&self.name, false, bytes, started.elapsed().as_secs_f64()); }
+		result
 	}
 	/// The memory the device has free now. The host is not bounded by device
 	/// memory, so the CPU reports its whole capacity.
@@ -21589,7 +22458,7 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 	for part in selection.split('.') {
 		require(!part.is_empty(), "device selection contains an empty component")?;
 		let name = if let Some((prefix, name)) = part.split_once(':') {
-			require(!prefix.is_empty(), "device host is empty")?;
+			require(!prefix.is_empty(), "device node is empty")?;
 			hostname.push(prefix);
 			host = hostname.join(".");
 			hostname.clear();
@@ -21602,11 +22471,11 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 			hostname.push(part);
 			continue;
 		}
-		require(hostname.is_empty(), format!("host {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
+		require(hostname.is_empty(), format!("node {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
 		require(gpu || name == "cpu", format!("invalid device selector {name:?}; expected amd<number>, nv<number>, or cpu"))?;
 		names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
 	}
-	require(hostname.is_empty(), format!("host {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
+	require(hostname.is_empty(), format!("node {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
 	Ok(names)
 }
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
@@ -21661,24 +22530,24 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 fn local_host() -> Result<String> {
 	// gethostname(3) rather than the hostname(1) executable, which a minimal
 	// image need not carry: a container without it failed device selection
-	// with "cannot read hostname: No such file or directory".
+	// with "cannot read machine name: No such file or directory".
 	unsafe extern "C" {
 		fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
 	}
 	let mut bytes = [0_u8; 256];
 	// The call truncates rather than failing on a long name, and POSIX leaves
 	// truncated output possibly unterminated, so the last byte stays reserved.
-	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query hostname")?;
+	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query machine name")?;
 	let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
-	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))?;
+	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("machine name is not UTF-8: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 #[cfg(windows)]
 fn local_host() -> Result<String> {
 	let mut words = [0_u16; 256];
 	let mut length = words.len() as u32;
-	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
-	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
+	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query machine name")?;
+	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("machine name is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
@@ -21734,6 +22603,60 @@ fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
 	require(output.status.success(), format!("cannot {action}: {}", String::from_utf8_lossy(&output.stderr)))?;
 	Ok(output.stdout)
 }
+fn shell_argument(value: &str) -> String {
+	format!("'{}'", value.replace('\'', "'\\''"))
+}
+fn copy_remote(host: &str, source: &Path, destination: &str) -> Result<()> {
+	let status = Command::new("scp").args(["-q", "-o", "BatchMode=yes"]).arg(source).arg(format!("{host}:{destination}"))
+		.status().map_err(|error| RecipeError::new(format!("cannot copy {} to {host}: {error}", source.display())))?;
+	require(status.success(), format!("cannot copy {} to {host}: {status}", source.display()))
+}
+/// Run a locally compiled model on its selected machine. Files opened by the model
+/// belong to that machine, and stdin, stdout, stderr, and exit status remain attached
+/// to the calling terminal. Chains across machines retain the device worker protocol.
+pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&str>) -> Result<Option<std::process::ExitStatus>> {
+	let names = device_names(selection)?;
+	let Some((host, _)) = names.first().and_then(|name| name.split_once(':')) else { return Ok(None) };
+	require(host.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("unsafe execution node {host:?}"))?;
+	if host == local_host()? || names.iter().any(|name| name.split_once(':').is_none_or(|(candidate, _)| candidate != host)) {
+		return Ok(None);
+	}
+	let devices = names.iter().map(|name| name.split_once(':').unwrap().1).collect::<Vec<_>>().join(".");
+	let directory = remote_directory(host)?;
+	let remote_script = format!("{}/model", directory.path);
+	let remote_recipe = format!("{}/recipe", directory.path);
+	copy_remote(host, script, &remote_script)?;
+	copy_remote(host, &std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate recipe: {error}")))?, &remote_recipe)?;
+	let mut templates = std::collections::BTreeSet::new();
+	for (prefix, mapping) in [("cpu", option_env!("RECIPE_CPU_IR")), ("amd", option_env!("RECIPE_AMD_IR")), ("nv", option_env!("RECIPE_NV_IR"))] {
+		if names.iter().any(|name| name.split_once(':').unwrap().1.starts_with(prefix)) {
+			let mapping = mapping.ok_or_else(|| RecipeError::new(format!("this build has no {prefix} templates for {selection}")))?;
+			templates.extend(mapping.split(';').filter_map(|entry| entry.split_once('=').map(|(_, path)| path)));
+		}
+	}
+	if !templates.is_empty() {
+		let status = Command::new("rsync").args(["-az", "-e", "ssh -o BatchMode=yes", "--"]).args(templates).arg(format!("{host}:{}/", directory.path))
+			.status().map_err(|error| RecipeError::new(format!("cannot send runtime templates to {host}: {error}")))?;
+		require(status.success(), format!("cannot send runtime templates to {host}: {status}"))?;
+	}
+	let mut environment = std::env::vars().filter(|(name, _)| (name.starts_with("RECIPE_") || name.starts_with("RNJ_") || name == "TERM") && !matches!(name.as_str(), "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_CONFIG")).collect::<Vec<_>>();
+	environment.push(("RECIPE_DEVICE".to_owned(), devices));
+	environment.push(("RECIPE_BINARY".to_owned(), remote_recipe));
+	environment.push(("RECIPE_TEMPLATE_ROOT".to_owned(), directory.path.clone()));
+	if let Some(config) = configuration.map(str::to_owned).or_else(|| std::env::var("RECIPE_CONFIG").ok()) {
+		environment.push(("RECIPE_CONFIG".to_owned(), config));
+	}
+	let environment = environment.iter().map(|(key, value)| shell_argument(&format!("{key}={value}"))).collect::<Vec<_>>().join(" ");
+	let cwd = std::env::current_dir().map_err(|error| RecipeError::new(format!("cannot read model working directory: {error}")))?;
+	let command = format!("chmod 700 {remote_script} && cd {cwd} && exec env {environment} {remote_script}", cwd = shell_argument(&cwd.to_string_lossy()));
+	let mut ssh = Command::new("ssh");
+	ssh.args(["-q", "-o", "BatchMode=yes"]);
+	if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() { ssh.arg("-tt"); }
+	let status = ssh.args([host, &command]).status().map_err(|error| RecipeError::new(format!("cannot run model on {host}: {error}")))?;
+	// The remote process can exit by signal before its progress guard unwinds.
+	if std::io::stderr().is_terminal() { eprint!("\x1b[?7h"); }
+	Ok(Some(status))
+}
 fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	let mut command = Command::new("ssh");
 	command.args(["-o", "BatchMode=yes", host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
@@ -21758,14 +22681,14 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 /// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
 	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
-	for (kind, value) in [("host", host), ("device", device_name)] {
+	for (kind, value) in [("node", host), ("device", device_name)] {
 		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
 	}
 	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
 	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
 		return Ok(gpu);
 	}
-	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
+	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach node {host:?}")))?;
 	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
 	let directory = remote_directory(host)?;
 	let remote_path = format!("{}/recipe", directory.path);
@@ -22113,6 +23036,15 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 }
 
 impl NativeProgram {
+	fn step_geometry(&self) -> Option<Geometry> {
+		match &self.backend {
+			#[cfg(amd)]
+			NativeBackend::Amd(program) => program.step.map(|dispatch| dispatch.geometry),
+			#[cfg(nvidia)]
+			NativeBackend::Nvidia(program) => program.step.map(|dispatch| dispatch.geometry),
+			_ => None,
+		}
+	}
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, shapes: Vec<Option<NativeContractionShapes>>, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		native_epoch_layout(artifact.precision.state.bytes())?;
@@ -22803,8 +23735,8 @@ unsafe extern "system" {
 unsafe extern "C" {
 	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
-	#[cfg_attr(windows, link_name = "_write")]
-	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
+	#[cfg(unix)]
+	fn poll(descriptors: *mut PollFd, count: usize, timeout: i32) -> i32;
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
@@ -24368,6 +25300,11 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	}
 }
 impl Data {
+	fn report_path(&self) -> Result<String> {
+		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
+		Ok(format!("{}:{}", local_host()?, path.display()))
+	}
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
 		self.target = target.into_data_sources();
 		self
@@ -25603,7 +26540,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
 		let percentage = count as f64 * 100.0 / row_count as f64;
 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
-		eprintln!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]);
+		trace(&format!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]))?;
 	}
 	let schema = columns
 		.iter()
@@ -27501,7 +28438,11 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 fn embed(graph: &mut Graph, source: i32, shape: Shape, channels: impl IntoIterator<Item = Option<usize>>) -> Result<i32> {
 	let channels = channels.into_iter().collect::<Vec<_>>();
 	reset(graph, source, shape);
+	let precision = (graph.block_precision, graph.block_blck_precision);
+	graph.block_precision = Some(Compute::FP32);
+	graph.block_blck_precision = Some(Compute::FP32);
 	lower_project(graph, channels.len())?;
+	(graph.block_precision, graph.block_blck_precision) = precision;
 	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("channel embedding node is absent"))?;
 	let (offset, inputs, count) = (node.offset, node.input.channels, node.parameters);
 	for (output, input) in channels.into_iter().enumerate() {
@@ -27638,6 +28579,14 @@ impl RatFit {
 		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
 		self.tape.forward(ForwardMode::Inference)?;
 		self.tape.predictions()
+	}
+	/// Replace a scoring forward with forward plus reductions in the same dispatch.
+	fn measure(&mut self, samples: &[f64], targets: &[f64], config: Config) -> Result<EpochMetrics> {
+		require(!targets.is_empty() && samples.len() == targets.len() * self.width, "RAT metric target shape differs from its inputs")?;
+		self.reserve(targets.len())?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.program.artifact.layout.input_precision)?;
+		self.tape.targets.write_float_bytes(0, targets, self.tape.program.artifact.layout.output_precision)?;
+		self.tape.metric_launch(config)
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.tape.weights()
@@ -27800,9 +28749,7 @@ impl LearnedReplay {
 		// An empty selection is a valid outcome: the fit performs no optimizer
 		// step for it, and no fallback or rank heuristic stands in.
 		target.fit(samples, targets, &selected, steps, rate, config)?;
-		let predictions = target.predict(samples)?;
-		require(predictions.len() == targets.len(), "learned RAT target prediction count differs from observations")?;
-		let quality = coefficient(targets, &predictions);
+		let quality = target.measure(samples, targets, config)?.r2;
 		require(quality.is_finite(), "learned RAT primary surrogate R2 is not finite")?;
 		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
 		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
@@ -27997,6 +28944,7 @@ impl Train {
 		self
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
+		let _transfers = TransferScope::new();
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
@@ -28082,7 +29030,7 @@ impl Train {
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
 		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(samples), samples, &objectives, gpu, config.precision, Some(composition.loss))?;
-		tape.forward(ForwardMode::Inference)?;
+		let initial_composed = tape.metric_launch(config)?;
 		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
 		let node_values = |tape: &NativeTape| -> Result<Vec<f64>> {
 			let values = tape.predictions_at(composition.proposal as i32, proposal_width)?;
@@ -28100,7 +29048,6 @@ impl Train {
 			let initial_observation = observation(samples, &initial_predictions)?;
 			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
 		};
-		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		// The `Loss` field reports the evaluator model's loss. The external
 		// command score is reported separately through `Score`; it is not a
 		// substitute for the evaluator's loss.
@@ -28109,8 +29056,11 @@ impl Train {
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
-		let mut last_evaluator_r2 = None;
-		let mut last_evaluator_loss = f64::NAN;
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
+		let mut rat_history = RatHistory::default();
+		let mut initial_rat = RatPoint::default();
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -28142,26 +29092,37 @@ impl Train {
 				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
 				indices.len()
 			};
-			let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-			let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
-			let evaluator_loss = model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7]);
-			last_evaluator_r2 = Some(evaluator_r2);
-			last_evaluator_loss = evaluator_loss;
+			let before_fit = (iteration == 0 && fitting.tape.step != 0).then(|| fitting.tape.epoch_metrics()).transpose()?;
+			let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
+			let evaluator_r2 = evaluated.r2;
+			let evaluator_loss = evaluated.loss;
 			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
-			tape.forward(ForwardMode::Inference)?;
+			let composed = tape.metric_launch(config)?;
 			let predictions = node_values(&tape)?;
 			let (measured_score, reward) = if full_set {
-				(replay.raw.iter().sum::<f64>() / replay.raw.len() as f64, mean(&evaluation_targets))
+				let reward = evaluated.target_sum / evaluated.count as f64;
+				(reward, reward)
 			} else {
 				let observed = observation(sample, &predictions)?;
 				let raw_score = command.evaluate(&input_names, &observed)?[0];
 				(raw_score, replay.observe(&observed, raw_score)?)
 			};
 			if iteration == 0 {
-				initial_loss = evaluator_loss;
+				let before_fit = before_fit.unwrap_or(evaluated);
+				initial_loss = before_fit.loss;
+				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: if full_set { evaluated.target_sum / evaluated.count as f64 } else { initial_reward } }, pred: RatModelPoint { r2: f64::NAN, reward: initial_composed.predicted_mean() } };
 			}
 			measured_reward = reward;
-			measured_predictions = predictions;
+			measured_predictions = predictions.clone();
+			let epoch = iteration + 1;
+			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: measured_score }, pred: RatModelPoint { r2: f64::NAN, reward: composed.predicted_mean() } };
+			loss_history.push(epoch, evaluator_loss);
+			prediction_history.push(epoch, predictions);
+			r2_history.push(epoch, evaluator_r2);
+			rat_history.eval.r2.push(epoch, rat.eval.r2);
+			rat_history.eval.reward.push(epoch, rat.eval.reward);
+			rat_history.pred.r2.push(epoch, rat.pred.r2);
+			rat_history.pred.reward.push(epoch, rat.pred.reward);
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
 			self.print_rat(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, &tape.schedule(), measured_score, fitted_rows, proposal_rows)?;
@@ -28179,26 +29140,13 @@ impl Train {
 			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
 				replay.observe(row, value)?;
 			}
-			let (_, final_targets) = replay.snapshot();
-			measured_reward = mean(&final_targets);
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
-		let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-		let evaluator_r2 = last_evaluator_r2.or_else(|| (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions)));
-		let predicted_reward = if evaluation_targets.is_empty() {
-			None
-		} else if full_set {
-			Some(mean(&evaluator_predictions))
-		} else {
-			Some(mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?))
-		};
-		let final_loss = if last_evaluator_loss.is_finite() {
-			last_evaluator_loss
-		} else if evaluator_r2.is_some() {
-			model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7])
-		} else {
-			f64::NAN
-		};
+		let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
+		if full_set { measured_reward = evaluated.target_sum / evaluated.count as f64; }
+		let evaluator_r2 = Some(evaluated.r2);
+		let predicted_reward = Some(tape.epoch_metrics()?.predicted_mean());
+		let final_loss = evaluated.loss;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
 		tape.capture(&mut composition.graph)?;
@@ -28222,12 +29170,21 @@ impl Train {
 			stored.artifact = bundle::artifact_key(&composition.storage_model, &prepared.schema, config.precision, &composition.proposer, native_target_label(&gpu.native_target));
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
+		let final_evaluator_r2 = evaluator_r2.unwrap_or(f64::NAN);
+		let final_predicted_reward = predicted_reward.unwrap_or(f64::NAN);
+		let final_measured_reward = measured_reward;
+		let final_rat = RatPoint { eval: RatModelPoint { r2: final_evaluator_r2, reward: final_measured_reward }, pred: RatModelPoint { r2: f64::NAN, reward: final_predicted_reward } };
+		if self.epochs == 0 { initial_loss = final_loss; initial_rat = final_rat; }
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_rat.eval.r2, rat: initial_rat };
+		let fnl = TrainingPoint { loss: final_loss, predictions: measured_predictions.clone(), r2: final_evaluator_r2, rat: final_rat };
+		let observability = single_training_observability(data.report_path()?, proposal_rows, &tape, None, None, itl, loss_history, prediction_history, r2_history, rat_history, fnl, self.epochs, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions: measured_predictions,
-			r2: f64::NAN,
+			final_predictions: measured_predictions,
+			final_r2: f64::NAN,
 			evaluator_r2,
 			validation_r2: None,
 			predicted_reward,
@@ -28273,7 +29230,15 @@ impl Train {
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
 		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
 		let initial_predictions = episode.action.clone();
+		let initial_reward = episode.score;
+		let initial_predicted_reward = tape.predictions()?[0];
+		let mut predicted_reward = initial_predicted_reward;
 		let (mut initial_loss, mut final_loss, mut evaluator_r2, mut epoch_seconds) = (f64::NAN, f64::NAN, f64::NAN, 0.0);
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
+		let mut rat_history = RatHistory::default();
+		let mut initial_rat = RatPoint::default();
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
 		for iteration in 0..self.epochs {
 			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during stateful RAT training")?;
@@ -28297,11 +29262,14 @@ impl Train {
 				fitting.fit(&samples, &targets, &(0..targets.len()).collect::<Vec<_>>(), 1, config.surrogate_rate, config)?;
 				targets.len()
 			};
-			let predictions = fitting.predict(&samples)?;
-			final_loss = model_loss(&predictions, &targets, composition.loss, config.activation[7]);
-			evaluator_r2 = coefficient(&targets, &predictions);
+			let before_fit = (iteration == 0 && fitting.tape.step != 0).then(|| fitting.tape.epoch_metrics()).transpose()?;
+			let evaluated = fitting.measure(&samples, &targets, config)?;
+			final_loss = evaluated.loss;
+			evaluator_r2 = evaluated.r2;
 			if iteration == 0 {
-				initial_loss = final_loss;
+				let before_fit = before_fit.unwrap_or(evaluated);
+				initial_loss = before_fit.loss;
+				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: initial_reward }, pred: RatModelPoint { r2: f64::NAN, reward: initial_predicted_reward } };
 			}
 			// One proposer update uses a retained decision state. All labels are
 			// the evaluator's terminal score, never a fabricated intermediate score.
@@ -28313,14 +29281,22 @@ impl Train {
 				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
 			};
 			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			predicted_reward = episode.observations.last().map(|observation| fitting.measure(observation, &[episode.score], config).map(EpochMetrics::predicted_mean)).transpose()?.unwrap_or(f64::NAN);
+			let epoch = iteration + 1;
+			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: episode.score }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
+			loss_history.push(epoch, final_loss);
+			prediction_history.push(epoch, episode.action.clone());
+			r2_history.push(epoch, evaluator_r2);
+			rat_history.eval.r2.push(epoch, rat.eval.r2);
+			rat_history.eval.reward.push(epoch, rat.eval.reward);
+			rat_history.pred.r2.push(epoch, rat.pred.r2);
+			rat_history.pred.reward.push(epoch, rat.pred.reward);
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
 			self.print_rat(model, composition.loss.name(), run, iteration + 1, self.epochs, final_loss, evaluator_r2, seconds, &tape.schedule(), episode.score, fitted_rows, episode.observations.len())?;
 		}
 		session.finish()?;
 		let reward = episode.score;
-		let final_observation = episode.observations.last().ok_or_else(|| RecipeError::new("stateful RAT episode has no decisions"))?;
-		let predicted_reward = fitting.predict(final_observation)?[0];
 		tape.capture(&mut composition.graph)?;
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
 		if let Some(path) = &self.save {
@@ -28343,12 +29319,18 @@ impl Train {
 			stored.bn_stats.truncate(proposer_bn);
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
+		let path = format!("{}:{}", local_host()?, command.path.display());
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_rat.eval.r2, rat: initial_rat };
+		let final_rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
+		let fnl = TrainingPoint { loss: final_loss, predictions: episode.action.clone(), r2: evaluator_r2, rat: final_rat };
+		let observability = single_training_observability(path, 1, &tape, None, None, itl, loss_history, prediction_history, r2_history, rat_history, fnl, self.epochs, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions: episode.action,
-			r2: f64::NAN,
+			final_predictions: episode.action,
+			final_r2: f64::NAN,
 			evaluator_r2: Some(evaluator_r2),
 			validation_r2: None,
 			predicted_reward: Some(predicted_reward),
@@ -28378,7 +29360,7 @@ impl Train {
 			}
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
-				if let Some(seed) = self.seed {
+			if let Some(seed) = self.seed {
 				config.random_seed = seed;
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
@@ -28424,7 +29406,6 @@ impl Train {
 			&tape,
 			None,
 		)?;
-		tape.print_devices(&stored.graph)?;
 		if let Err(error) = tape.tune(self.learning_rate, self.epochs, config) {
 			// An interrupt during pre-epoch tuning restores the measured state and
 			// follows the same one-checkpoint exit path as an interrupted real epoch.
@@ -28433,12 +29414,15 @@ impl Train {
 		}
 		// The initial report must come from the selected runtime schedule, not
 		// from the heuristic forward that initialized the tape before tuning.
-		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
-		stored.bn_stats = tape.extract_bn_stats()?;
+		let (initial_metrics, _) = self.finish_dispatch(tape.metrics(config), &mut stored, &prepared.schema, &tape, None)?;
 		let initial_predictions = tape.predictions()?;
-		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
+		stored.bn_stats = tape.extract_bn_stats()?;
+		let initial_loss = initial_metrics.loss;
+		let initial_r2 = initial_metrics.r2;
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
 		let tolerance = self.stop.unwrap_or(0.0);
-		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		for _ in 0..self.epochs {
@@ -28450,29 +29434,32 @@ impl Train {
 			let epoch = tape.step() as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
-			let ((loss, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+			let ((metrics, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
-				let ((loss, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
-				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
+				let ((metrics, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+				let predictions = tape.predictions()?;
 				if checkpoint_requested {
 					stored.bn_stats = tape.extract_bn_stats()?
 				}
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, checkpoint_requested.then_some(()))?;
 				let checkpoint = checkpoint.or(persisted);
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
-				Ok((loss, checkpoint.or(persisted), predictions))
+				Ok((metrics, checkpoint.or(persisted), predictions))
 			})?;
-			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, checkpoint, live, &schedule)?;
+			epoch_seconds += if metrics.device_seconds > 0.0 { metrics.device_seconds } else { seconds };
+			loss_history.push(epoch, metrics.loss);
+			prediction_history.push(epoch, predictions.clone());
+			r2_history.push(epoch, metrics.r2);
+			self.print(model, run, epoch, self.epochs, metrics.loss, metrics.r2, seconds, checkpoint, live, &schedule)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
 		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
-		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
+		let (mut final_metrics, _) = self.finish_dispatch(tape.metrics(config), &mut stored, &prepared.schema, &tape, None)?;
 		let raw_predictions = tape.predictions()?;
-		let mut final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
+		let mut final_loss = final_metrics.loss;
 		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
 		let mut evaluated = Vec::new();
 		if evaluation && data.autoregressive {
@@ -28504,28 +29491,32 @@ impl Train {
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let validation_targets = &target_values[training_values..];
-			let raw = tape.evaluate(&graph, &prepared.samples, training_rows)?;
-			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
+			let (raw, validation_metrics) = tape.evaluate(&graph, &prepared.samples, &target_values, training_rows, model.loss, config)?;
+			final_loss = validation_metrics.loss;
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
+			final_metrics.r2 = validation_metrics.r2;
 		}
 		let r2 = if training_rows == prepared.rows {
-			coefficient(&prepared.targets, &predictions)
+			final_metrics.r2
 		} else if evaluation && data.autoregressive {
 			coefficient(&prepared.targets[training_rows..], &predictions[training_rows..])
 		} else {
-			coefficient(&prepared.targets[training_values..], &evaluated)
+			final_metrics.r2
 		};
 		if !evaluated.is_empty() {
 			predictions = evaluated
 		}
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_r2, rat: RatPoint::default() };
+		let fnl = TrainingPoint { loss: final_loss, predictions: predictions.clone(), r2, rat: RatPoint::default() };
+		let observability = training_observability(data, training_rows, &tape, itl, loss_history, prediction_history, r2_history, RatHistory::default(), fnl, tape.step() as usize, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions,
-			r2,
+			final_predictions: predictions,
+			final_r2: r2,
 			evaluator_r2: None,
 			validation_r2: None,
 			predicted_reward: None,
@@ -28550,13 +29541,13 @@ impl Train {
 		result.map(|value| (value, checkpoint))
 	}
 	fn print(
-		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
+		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
 		schedule: &str,
 	) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
 		}
-		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then(|| coefficient(targets, predictions));
+		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then_some(r2);
 		Self::write_progress(
 			&Self::metric_line(
 				model.loss.name(),
@@ -28571,8 +29562,8 @@ impl Train {
 		)
 	}
 	fn print_evaluation(&self, model: &Model, report: &TrainingReport) {
-		let defaults = [Loss, R2];
-		let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics };
+		if self.log_metrics.is_empty() { return; }
+		let metrics = &self.log_metrics;
 		Self::write_progress(
 			&Self::metric_line(
 				model.loss.name(),
@@ -28580,7 +29571,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.final_r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
 			),
 			false,
 			true,
@@ -28725,12 +29716,38 @@ struct Metrics {
 	window: Option<usize>,
 	choices: Option<usize>,
 }
+#[derive(Default)]
+pub struct TrainingObservability {
+	pub llvm: LlvmReport,
+	pub path: String,
+	pub rows: usize,
+	pub formats: ReportLines,
+	pub memory: ReportLines,
+	pub links: ReportLines,
+	pub aot: ReportLines,
+	pub tiles: ReportLines,
+	pub grids: ReportLines,
+	pub load: DurationReport,
+	pub compile: DurationReport,
+	pub itl: TrainingPoint,
+	pub loss: ScalarHistory,
+	pub predictions: PredictionHistory,
+	pub r2: ScalarHistory,
+	pub rat: RatHistory,
+	pub fnl: TrainingPoint,
+	eps: f64,
+}
+impl TrainingObservability {
+	pub fn eps(&self) -> f64 { self.eps }
+}
+
 pub struct TrainingReport {
+	observability: TrainingObservability,
 	initial_loss: f64,
 	final_loss: f64,
 	initial_predictions: Vec<f64>,
-	predictions: Vec<f64>,
-	r2: f64,
+	final_predictions: Vec<f64>,
+	final_r2: f64,
 	/// On a command-RAT run: the evaluator's R-squared over the observations it
 	/// fitted, over measured proposals withheld from fitting when there are any,
 	/// its predicted raw score for the last proposal, and the command's measured
@@ -28746,6 +29763,10 @@ pub struct TrainingReport {
 	seconds: f64,
 	epoch_seconds: f64,
 }
+impl std::ops::Deref for TrainingReport {
+	type Target = TrainingObservability;
+	fn deref(&self) -> &Self::Target { &self.observability }
+}
 impl TrainingReport {
 	pub const fn initial_loss(&self) -> f64 {
 		self.initial_loss
@@ -28757,10 +29778,10 @@ impl TrainingReport {
 		&self.initial_predictions
 	}
 	pub fn predictions(&self) -> &[f64] {
-		&self.predictions
+		&self.final_predictions
 	}
 	pub const fn r2(&self) -> f64 {
-		self.r2
+		self.final_r2
 	}
 	/// The evaluator's R-squared over the observations it fitted, on a command-RAT run.
 	pub const fn evaluator_r2(&self) -> Option<f64> {

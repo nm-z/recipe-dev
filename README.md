@@ -42,11 +42,11 @@ let model = recipe.model()
 	.loss(mae|mse|...)|.loss(&evaluator)
 ```r
 frozen.blck.atvn.norm.prec = block
-  │      │    │    │    └─ precision it computes in
-  │      │    │    └────── normalization
-  │      │    └─────────── activation
-  │      └──────────────── ""
-  └─────────────────────── frozen qualifier
+	│      │    │    │    └─ precision it computes in
+	│      │    │    └────── normalization
+	│      │    └─────────── activation
+	│      └──────────────── ""
+	└─────────────────────── frozen qualifier
 ```
 
 Every block may name its compute precision. A precision names the operation right
@@ -170,28 +170,68 @@ recipe.train()
 .rat(history|rolling|online|learned|full, "./evaluate")
 .target(value)
 observe:
-	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|chat|debug|all|dev)
+	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window])
+	.log(all) // run, time, epoch, r2, loss, blck
+	.log(dev) // tile, score, choices, window
 ```
 
 ## **Infer**
 
 ```rust
 let prediction = recipe.predict("model.ogdl", &input);
-recipe.infer().log([chat]).run(&model, &data);
+recipe.infer().chat(recipe::infer::text).run(&model, &data);
 ```
 
 ```rust
 .tokens(count)
 ```
 
-## Resident RNJ chat
+Without an explicit Rust reply cap, inference stops at the model's end markers
+from GGUF metadata and its chat template, or when the available context is full.
 
-Run `rnj-chat/start.sh` to serve the local page on `127.0.0.1:8766`. The Rust
-worker loads and places the model once, then accepts every conversation over one
-pipe. Each request sends the complete conversation and its selected reply budget.
-Each reply keeps a statistics line with the device, resolved instruction routes,
-prefill time, decode time, and tok/s. Set `RECIPE_DEVICE` and `RECIPE_CONTEXT`
-before starting the server to override its `amd0` and 1,024-position defaults.
+## Terminal chat and remote execution
+
+```bash
+recipe run rnj-1.rs --device archy:nv6.nv7 --context 128
+```
+
+The local source compiles locally. When every selected device is on one remote
+machine, Recipe sends the executable and its runtime templates over SSH and runs
+the model there. File paths resolve on that machine, including model data, prompt
+files, and saved outputs. Relative paths use the same working-directory path as
+the launcher; that directory must exist remotely. For development, sync the
+checkout there with rsync first. Chains across machines keep the existing device-worker
+protocol and open files on the launching machine. This runner requires compatible
+executables and the configured compiler toolchain on the machine doing the computation.
+
+`.chat(...)` keeps one placement resident across messages. Each request uses the
+whole conversation. `/clear` clears the conversation without reloading weights;
+`/exit` or EOF exits. `--message "text"` instead performs one measured request.
+`--context` is an explicit capacity: Recipe reports an allocation error if it
+cannot fit, rather than silently reducing it. The outstanding full-sequence
+intermediate-buffer allocation issue still prevents the RNJ 32K configuration from fitting on the K80.
+
+Recipe streams reply text as tokens arrive. Select live prompt processing, token
+generation, input, output, and reused-prefix observations in the chat call:
+
+```rust
+use recipe::infer::{cached, out, pp, r#in, tg};
+let report = recipe.infer().chat([pp, tg, r#in, out, cached]).run(&model, &data);
+println!("prediction {:?}", report.prediction);
+```
+
+The final status uses average rates. `in` counts cached and uncached input;
+`cached` counts prefix tokens actually reused. Inspect planned memory allocations before compiling
+kernels with `model.memory(&data, 32768)`, or actual resident allocations with
+`placed.memory()`. Both return named fields for input, weights, values, contexts,
+and load scratch, using the same layout as execution:
+
+```rust
+println!("{}", model.memory(&data, 32768).unwrap());
+```
+
+The older `rnj-chat/` HTTP frontend remains available, but `rnj-1.rs` now runs
+the resident terminal chat directly.
 
 ## GGUF statistics
 

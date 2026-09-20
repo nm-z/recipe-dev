@@ -118,6 +118,20 @@ output-tolerance = 0.00000001
 gradient-tolerance = 0.00001
 backend-tolerance = 0.00001
 
+[encoding]
+# Fields: sign bits, exponent bits, fraction bits.
+fp8-e4m3 = [1, 4, 3]
+fp8-e5m2 = [1, 5, 2]
+fp16 = [1, 5, 10]
+fp32 = [1, 8, 23]
+fp64 = [1, 11, 52]
+bf16 = [1, 8, 7]
+tf32 = [1, 8, 10]
+tf32-storage = [1, 8, 23]
+# Positive FP8 codes: largest finite, canonical NaN, infinity (saturates for E4M3).
+fp8-e4m3-special = [126, 127, 126]
+fp8-e5m2-special = [123, 126, 124]
+
 # The precision of every kind of op a block names none for. `recipe run x.rs
 # --config <name>` picks a table; a block's own suffix overrides its op.
 [precision]

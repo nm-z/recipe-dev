@@ -1,4 +1,5 @@
 use recipe::*;
+use recipe::infer::{cached, out, pp, r#in, tg};
 
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
 // llama.cpp's Gemma3 loader uses this architecture default and ignores the
@@ -49,5 +50,5 @@ fn main() {
 		.tanh().fp(16)
 		.scale(gemma3.final_logit_softcapping).fp(16);
 
-	recipe.infer().log([chat]).run(&model, &data);
+	recipe.infer().chat([pp, tg, r#in, out, cached]).run(&model, &data);
 }

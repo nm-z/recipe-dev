@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## File boundaries
+
+Never create new files that Recipe depends on. Implement required logic in the existing `recipe.rs`, `amd-nv-cpu.ll`, `build.rs`, and `cli.rs`; keep configuration in `Cargo.toml`. Scratch files belong under `/home/nate/claude/` or `/home/nate/codex/`, never in this repository, and Recipe must not depend on them. If existing work violates this rule, move the required logic into the existing source files and remove the extra dependency.
+
 ```go
 amd-nv-cpu.ll (6265)
 ├── 1 target triple amdgcn-amd-amdhsa

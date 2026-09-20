@@ -1,4 +1,133 @@
-mod fp8;
+pub(crate) mod encoding {
+	//! Float encodings shared by the Rust runtime and LLVM template generator.
+	//! Cargo.toml owns the bit layouts and FP8 special codes.
+
+	const MANIFEST: &[u8] = include_bytes!("Cargo.toml");
+
+	const fn equal(bytes: &[u8], start: usize, end: usize, wanted: &[u8]) -> bool {
+		if end - start != wanted.len() { return false; }
+		let mut i = 0;
+		while i < wanted.len() {
+			if bytes[start + i] != wanted[i] { return false; }
+			i += 1;
+		}
+		true
+	}
+
+	/// Read one three-integer encoding row at compile time in both crates.
+	pub(crate) const fn fields(name: &str) -> [u8; 3] {
+		let mut start = 0;
+		let mut section = false;
+		let mut found = false;
+		let mut result = [0; 3];
+		while start < MANIFEST.len() {
+			let mut end = start;
+			while end < MANIFEST.len() && MANIFEST[end] != b'\n' { end += 1; }
+			let next = end + 1;
+			while start < end && MANIFEST[start].is_ascii_whitespace() { start += 1; }
+			let mut comment = start;
+			while comment < end && MANIFEST[comment] != b'#' { comment += 1; }
+			end = comment;
+			while end > start && MANIFEST[end - 1].is_ascii_whitespace() { end -= 1; }
+			if start < end && MANIFEST[start] == b'[' {
+				section = equal(MANIFEST, start, end, b"[encoding]");
+			} else if section {
+				let mut key_end = start;
+				while key_end < end && MANIFEST[key_end] != b'=' { key_end += 1; }
+				let mut trimmed = key_end;
+				while trimmed > start && MANIFEST[trimmed - 1].is_ascii_whitespace() { trimmed -= 1; }
+				if equal(MANIFEST, start, trimmed, name.as_bytes()) {
+					assert!(!found, "duplicate Cargo.toml encoding");
+					found = true;
+					let mut at = key_end + 1;
+					while at < end && MANIFEST[at].is_ascii_whitespace() { at += 1; }
+					assert!(at < end && MANIFEST[at] == b'[', "encoding must be an integer array");
+					at += 1;
+					let mut field = 0;
+					while field < 3 {
+						while at < end && MANIFEST[at].is_ascii_whitespace() { at += 1; }
+						assert!(at < end && MANIFEST[at].is_ascii_digit(), "encoding requires three integers");
+						let mut value = 0u16;
+						while at < end && MANIFEST[at].is_ascii_digit() {
+							value = value * 10 + (MANIFEST[at] - b'0') as u16;
+							assert!(value <= 255, "encoding field exceeds a byte");
+							at += 1;
+						}
+						result[field] = value as u8;
+						while at < end && MANIFEST[at].is_ascii_whitespace() { at += 1; }
+						assert!(at < end && MANIFEST[at] == if field == 2 { b']' } else { b',' }, "encoding requires three integers");
+						at += 1;
+						field += 1;
+					}
+					while at < end && MANIFEST[at].is_ascii_whitespace() { at += 1; }
+					assert!(at == end, "unexpected text after encoding");
+				}
+			}
+			start = next;
+		}
+		assert!(found, "missing Cargo.toml encoding");
+		result
+	}
+}
+pub(crate) mod fp8 {
+	//! FP8 storage codecs shared by the runtime and template generator.
+
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Encoding {
+		E4M3,
+		E5M2,
+	}
+
+	impl Encoding {
+		fn layout(self) -> (u32, i32, u64, u64, u64) {
+			const E4M3: ([u8; 3], [u8; 3]) = (crate::encoding::fields("fp8-e4m3"), crate::encoding::fields("fp8-e4m3-special"));
+			const E5M2: ([u8; 3], [u8; 3]) = (crate::encoding::fields("fp8-e5m2"), crate::encoding::fields("fp8-e5m2-special"));
+			let ([sign, exponent, fraction], [largest, nan, infinity]) = match self {
+				Self::E4M3 => E4M3,
+				Self::E5M2 => E5M2,
+			};
+			assert!(sign == 1 && exponent + fraction == 7, "FP8 encoding must occupy eight bits");
+			(u32::from(fraction), (1 << (exponent - 1)) - 1, u64::from(largest), u64::from(nan), u64::from(infinity))
+		}
+		pub(crate) fn pack(self, value: f64) -> u64 {
+			let sign = (value.to_bits() >> 63) << 7;
+			let (man, bias, largest, nan, infinity) = self.layout();
+			if value.is_nan() { return sign | nan; }
+			if value.is_infinite() {
+				return sign | infinity;
+			}
+			let magnitude = value.abs();
+			if magnitude == 0.0 { return sign; }
+			if magnitude >= self.unpack(largest) { return sign | largest; }
+			let exponent = ((magnitude.to_bits() >> 52) & 2047) as i32 - 1023;
+			let target = exponent + bias;
+			let bits = if target <= 0 {
+				(magnitude * 2.0_f64.powi(bias + man as i32 - 1)).round_ties_even() as u64
+			} else {
+				let significand = (magnitude * 2.0_f64.powi(man as i32 - exponent)).round_ties_even() as u64;
+				(((target - 1) as u64) << man) + significand
+			};
+			sign | bits.min(largest)
+		}
+
+		pub(crate) fn unpack(self, bits: u64) -> f64 {
+			let (man, bias, largest, _, infinity) = self.layout();
+			let mask = (1 << (7 - man)) - 1;
+			let magnitude = bits & 127;
+			if magnitude > largest && magnitude != infinity { return f64::NAN; }
+			let exponent = ((bits >> man) & mask) as i32;
+			let fraction = bits & ((1 << man) - 1);
+			let value = if infinity > largest && magnitude == infinity {
+				f64::INFINITY
+			} else if exponent == 0 {
+				fraction as f64 * 2.0_f64.powi(1 - bias - man as i32)
+			} else {
+				((1 << man) + fraction) as f64 * 2.0_f64.powi(exponent - bias - man as i32)
+			};
+			if bits & 128 != 0 { -value } else { value }
+		}
+	}
+}
 use std::{
 	env,
 	error::Error,
@@ -39,16 +168,17 @@ struct FloatFormat {
 	storage: FloatLayout,
 }
 impl FloatFormat {
-	const FP8: Self = Self::native(1, 4, 3);
-	const FP8_E5M2: Self = Self::native(1, 5, 2);
-	const FP16: Self = Self::native(1, 5, 10);
-	const FP32: Self = Self::native(1, 8, 23);
-	const FP64: Self = Self::native(1, 11, 52);
-	const BF16: Self = Self::native(1, 8, 7);
-	const TF32: Self = Self { arithmetic: FloatLayout::new(1, 8, 10), storage: FloatLayout::new(1, 8, 23) };
-	const fn native(sign: u8, exp: u8, man: u8) -> Self {
-		let layout = FloatLayout::new(sign, exp, man);
-		Self { arithmetic: layout, storage: layout }
+	const FP8: Self = Self::configured("fp8-e4m3", "fp8-e4m3");
+	const FP8_E5M2: Self = Self::configured("fp8-e5m2", "fp8-e5m2");
+	const FP16: Self = Self::configured("fp16", "fp16");
+	const FP32: Self = Self::configured("fp32", "fp32");
+	const FP64: Self = Self::configured("fp64", "fp64");
+	const BF16: Self = Self::configured("bf16", "bf16");
+	const TF32: Self = Self::configured("tf32", "tf32-storage");
+	const fn configured(arithmetic: &str, storage: &str) -> Self {
+		let [s, e, m] = encoding::fields(arithmetic);
+		let [ss, se, sm] = encoding::fields(storage);
+		Self { arithmetic: FloatLayout::new(s, e, m), storage: FloatLayout::new(ss, se, sm) }
 	}
 	const fn bytes(self) -> usize {
 		self.storage.bits().div_ceil(8) as usize
@@ -1968,7 +2098,7 @@ fn main() -> BuildResult<()> {
 		compile_nvidia(&manifest, &out, &os, schedule)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
-	println!("cargo:rerun-if-changed=fp8.rs");
+	println!("cargo:rerun-if-changed=build.rs");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
 	Ok(())
 }
