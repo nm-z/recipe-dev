@@ -15829,6 +15829,13 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// embedding when the file has none. The walk follows the order the lowering
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
+	// Architecture-built models carry tensor arrangements beyond the flat
+	// residual convention, including hyper-connections and per-layer embeddings.
+	if model.blocks.iter().any(|block| matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..))) {
+		let bound = Builder::build(file)?;
+		require(model.blocks == with_last_projection(&bound.model).blocks, "this model requires the GGUF architecture's model definition for tensor binding")?;
+		return Ok(bound.plan);
+	}
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
@@ -16638,7 +16645,22 @@ fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> 
 	let total = memory.total()?;
 	let buffers = total.checked_sub(model).ok_or_else(|| RecipeError::new("model data exceeds total planned memory"))?;
 	let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
-	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
+	// Lookup tables stay in machine RAM; only gathered rows occupy the device
+	// context counted above. Shared table runs contribute their storage once.
+	let mut tables = BTreeSet::new();
+	let mut ngram_bytes = 0;
+	for (index, _) in graph.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Lookup) {
+		let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?;
+		for (_, bytes) in table.bytes.runs() {
+			if tables.insert((bytes.as_ptr() as usize, bytes.len())) {
+				ngram_bytes = checked_add(ngram_bytes, bytes.len(), "n-gram table bytes")?;
+			}
+		}
+	}
+	let ngram = if tables.is_empty() { String::new() } else {
+		format!("  n-gram table {:.3} GiB ({ngram_bytes} bytes) in RAM, outside allocation total; gathered rows included in buffer size", gib(ngram_bytes))
+	};
+	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{ngram}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
