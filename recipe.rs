@@ -11320,24 +11320,83 @@ fn register_interrupt() -> usize {
 #[cfg(unix)]
 #[repr(C)]
 struct PollFd { fd: i32, events: i16, revents: i16 }
-fn chat_line() -> Result<Option<String>> {
-	#[cfg(unix)]
-	loop {
-		if INTERRUPTED.load(Ordering::Acquire) { if std::io::stderr().is_terminal() { eprintln!(); } return Ok(None); }
-		let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
-		let ready = unsafe { poll(&mut descriptor, 1, 100) };
-		if ready < 0 {
-			if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
-			return Err(RecipeError::new(format!("cannot wait for chat input: {}", std::io::Error::last_os_error())));
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ChatTermios { input: u32, output: u32, control: u32, local: u32, line: u8, characters: [u8; 32], input_speed: u32, output_speed: u32 }
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+	fn tcgetattr(fd: i32, settings: *mut ChatTermios) -> i32;
+	fn tcsetattr(fd: i32, action: i32, settings: *const ChatTermios) -> i32;
+}
+struct ChatInput {
+	terminal: bool,
+	#[cfg(target_os = "linux")]
+	saved: Option<ChatTermios>,
+}
+impl ChatInput {
+	fn new(interactive: bool) -> Result<Self> {
+		let terminal = interactive && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+		let mut input = Self { terminal, #[cfg(target_os = "linux")] saved: None };
+		if terminal {
+			#[cfg(target_os = "linux")]
+			{
+				let mut settings = ChatTermios::default();
+				require(unsafe { tcgetattr(0, &mut settings) } == 0, "cannot read terminal input settings")?;
+				input.saved = Some(settings);
+				// Keep canonical editing, but let echoed paste markers remain escape
+				// sequences instead of displaying their caret notation as input text.
+				settings.local &= !0o1000;
+				require(unsafe { tcsetattr(0, 0, &settings) } == 0, "cannot configure terminal input")?;
+			}
+			write!(std::io::stderr(), "\x1b[?2004h").and_then(|()| std::io::stderr().flush()).map_err(|error| RecipeError::new(format!("cannot enable terminal paste: {error}")))?;
 		}
-		if ready == 0 { continue; }
-		let mut line = String::new();
-		return std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")));
+		Ok(input)
 	}
-	#[cfg(windows)]
-	{
-		let mut line = String::new();
-		std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")))
+	fn read(&self) -> Result<Option<String>> {
+		let (mut message, mut pasting) = (String::new(), false);
+		loop {
+			if INTERRUPTED.load(Ordering::Acquire) { return Ok(None); }
+			#[cfg(unix)]
+			{
+				let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
+				let ready = unsafe { poll(&mut descriptor, 1, 100) };
+				if ready < 0 {
+					if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+					return Err(RecipeError::new(format!("cannot wait for chat input: {}", std::io::Error::last_os_error())));
+				}
+				if ready == 0 { continue; }
+			}
+			let mut line = String::new();
+			match std::io::stdin().read_line(&mut line) {
+				Ok(0) => return Ok(None),
+				Ok(_) => {},
+				Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+				Err(error) => return Err(RecipeError::new(format!("cannot read chat message: {error}"))),
+			}
+			let mut remaining = line.as_str();
+			if self.terminal {
+				while let Some((index, paste)) = remaining.find("\x1b[200~").map(|index| (index, true)).into_iter()
+					.chain(remaining.find("\x1b[201~").map(|index| (index, false))).min_by_key(|(index, _)| *index) {
+					message.push_str(&remaining[..index]);
+					pasting = paste;
+					remaining = &remaining[index + 6..];
+				}
+			}
+			message.push_str(remaining);
+			if !pasting { return Ok(Some(message)); }
+		}
+	}
+}
+impl Drop for ChatInput {
+	fn drop(&mut self) {
+		if !self.terminal { return; }
+		#[cfg(target_os = "linux")]
+		if let Some(saved) = &self.saved { unsafe { tcsetattr(0, 0, saved); } }
+		let mut output = std::io::stderr().lock();
+		let _ = write!(output, "\x1b[?2004l");
+		if INTERRUPTED.load(Ordering::Acquire) { let _ = writeln!(output, "^C"); }
+		let _ = output.flush();
 	}
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
@@ -15555,6 +15614,7 @@ impl Infer {
 		let placed = place_bound(&bound, sequence, &[], devices)?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
+		let input = ChatInput::new(interactive)?;
 		let memory = placed.memory();
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
@@ -15568,7 +15628,7 @@ impl Infer {
 			let text = if interactive {
 				if INTERRUPTED.load(Ordering::Acquire) { break; }
 				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
-				let Some(line) = chat_line()? else { break };
+				let Some(line) = input.read()? else { break };
 				if line.trim() == "/exit" { break; }
 				if line.trim() == "/clear" { conversation.clear(); placed.clear(); continue; }
 				if line.trim().is_empty() { continue; }

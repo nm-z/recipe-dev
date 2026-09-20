@@ -23,6 +23,8 @@ Invoke Recipe directly as `recipe ...`. Do not prefix Recipe commands with `dsh`
 
 Never create new files that Recipe depends on. Implement required logic in the existing `recipe.rs`, `amd-nv-cpu.ll`, `build.rs`, and `cli.rs`; keep configuration in `Cargo.toml`. Scratch files belong under `/home/nate/claude/` or `/home/nate/codex/`, never in this repository, and Recipe must not depend on them. If existing work violates this rule, move the required logic into the existing source files and remove the extra dependency.
 
+Recipe must remain dependency-free: no external Rust crates. Terminal handling, CLI code, IR generation, and math do not require additional files or dependencies. Use the existing files, including `cli.rs` for CLI responsibilities; do not treat file count as a bottleneck without evidence.
+
 ## Scope, efficiency, and completion
 
 Use Nate's relative token-cost model: `(10 * input + 1 * cache_read + 12 * cache_write + 50 * output) * multiplier`. Count the token categories separately without double-counting. These are planning weights supplied by Nate.
@@ -54,6 +56,12 @@ Use Rust 2024, 200-column formatting, and Rust naming conventions. Use Rust, LLV
 
 Define precision, layout, and kernel interfaces once. Distinguish storage, operands, results, and accumulators. Preserve wide results; widen smaller operands in registers instead of copying large tensors to match types.
 
+Invoke the compiled work exactly once per unit: one prefill, one token-generation step, or one training epoch. This is a hard execution rule, not merely a restriction on observability. Count invocations of the compiled unit of work, not its internal routines. Prefill and generation do not have to share an invocation. Do not add an invocation after the requested work is finished.
+
+Minimal execution computes each needed value once, retains it until its final use, then reuses its storage. Never discard a value that later work must recompute. AOT may evaluate recomputing intermediate operations only after establishing a correct no-recomputation baseline and finding that the model does not fit. That evaluation is separate AOT work, not permission to introduce recomputation into minimal execution.
+
+Remove obsolete APIs completely, including their fields, compatibility branches, no-op stubs, and messages about removed APIs. Saved-model compatibility does not justify retaining obsolete machinery. Validate saved data against the current format without special cases that preserve removed APIs.
+
 ## Observability and public reports
 
 Use **machine** in prose, including execution across machines, and **node** in printed machine identifiers. Every participating machine is a node in distributed execution; use **master** and **worker** only for their actual distributed roles. Identify RAM, compute, files, and servers by the machine or node they belong to. Do not use **host** in user-facing, developer-facing, or debug output, or in TOML configuration. Internal code identifiers may use **host**; do not rename internals merely to enforce an output terminology rule.
@@ -84,6 +92,8 @@ println!("tok/s {}", report.tg());
 
 Printing and measurement access are separate. Common diagnostics must be built-in, conditional public capabilities. Installed users must not need source edits or ad hoc print statements. Errors remain visible.
 
+`report.*` must expose the observations the user wants to report. Store collected report history in machine RAM, not VRAM. Compute GPU metrics on the device, transfer completed results, and reuse their temporary output storage after transfer. Do not retain report history in device buffers or count RAM-held history toward VRAM requirements.
+
 Measurements originate in the executing kernel. For GPU work, use device instructions and device-side reductions, including mixed CPU/GPU runs. Return compact results; do not dump tensors into machine RAM to recompute metrics. Observability must not replay token, epoch, load, or unload work or add measurement-only dispatches. Routine timings must not require rocprof.
 
 ## Verification guidelines
@@ -103,8 +113,6 @@ after `.kv(k)` it names the cache; after `.gelu()`, `.norm(rms)`, `.qk(rms)`,
 load format and is not selected by the model API. An integer precision uses the
 canonical packed layout selected by the precision table. Only the table configures
 accumulators, using `acc = "fp32"` or `acc = "fp64"` and per-operation accumulator keys.
-Legacy saved blocks with accumulator overrides are rejected; re-save from a model
-definition without those overrides and select the accumulator in the precision table.
 The table's `step` is the only activation block size. An
 operation that names no precision takes the selected `[precision.<name>]` table.
 Without an explicit Rust reply cap, inference stops at the model's end markers
@@ -148,10 +156,11 @@ with three decimal places. It stops when the model is ready and leaves that load
 in scrollback. Each submitted message starts a new timer, which stops when generation
 ends and leaves its final line visible. Waiting for user input is not timed.
 `report.load` records preparation time, including compilation; `report.time` records the
-last request's elapsed time. `pp` updates after each completed prefill chunk
-as completed tokens divided by accumulated execution time. GPU timings come from the
-existing device measurements; no extra dispatches are needed. A single-chunk prompt
-has no intermediate prefill measurement. The final status uses average rates.
+last request's elapsed time. `pp` and `tg` divide cumulative completed tokens by elapsed
+time in their respective phases at each refresh. One timestamp ends prefill and starts
+generation; EOS stops generation. Include the whole phase, not only kernel execution,
+and use the same counts and intervals in live output and reports. The final rates use
+the frozen phase intervals. The request's `time` timer is separate from these phase timers.
 `input` counts cached and uncached input;
 `cached` counts prefix tokens actually reused. Inspect planned memory allocations before compiling
 kernels with `model.memory(&data, 32768)`, or actual resident allocations with

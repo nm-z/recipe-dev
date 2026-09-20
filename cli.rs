@@ -102,6 +102,14 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	if let Some(config) = config {
 		command.env("RECIPE_CONFIG", config);
 	}
+	#[cfg(unix)]
+	{
+		// Wait for the script to restore the terminal after Ctrl+C. The child
+		// receives the same signal directly from the foreground process group.
+		extern "C" fn wait_for_script(_: i32) {}
+		unsafe extern "C" { fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }
+		unsafe { signal(2, wait_for_script); }
+	}
 	let status = command.status();
 	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
