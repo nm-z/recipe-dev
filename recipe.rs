@@ -6126,7 +6126,6 @@ impl NativeModelIr {
 				"{variance_reduce_code}{prefix}.store:\n{scale_code}{mean_stored_code}%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
-				state_ty = state_ty,
 				ty = ty,
 				pointer = pointer,
 				context = pointers.context,
