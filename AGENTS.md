@@ -19,7 +19,7 @@ Recipe targets inexpensive GPUs and CPUs. Follow `.docs/nums.ogdl`.
 
 Edit locally; rsync for remote development. Recipe owns execution and file resolution.
 
-Invoke Recipe directly as `recipe ...`. Do not prefix Recipe commands with `dsh` in commands, scripts, documentation, or verification. DSH is unrelated to Recipe execution.
+Invoke Recipe directly as `recipe ...`. Do not prefix Recipe commands with `dsh` in commands, scripts, documentation, or verification. DSH is unrelated to Recipe execution. Do not inspect, troubleshoot, or modify DSH unless the user explicitly asks you to work on it. Optional agent coordination does not authorize an investigation of unrelated tooling.
 
 Never create new files that Recipe depends on. Implement required logic in the existing `recipe.rs`, `amd-nv-cpu.ll`, `build.rs`, and `cli.rs`; keep configuration in `Cargo.toml`. Scratch files belong under `/home/nate/claude/` or `/home/nate/codex/`, never in this repository, and Recipe must not depend on them. If existing work violates this rule, move the required logic into the existing source files and remove the extra dependency.
 
@@ -38,6 +38,8 @@ Never use Terra. Its multipliers are recorded for completeness, not authorizatio
 - Optimize expected total cost to a correct result, including generation, context transfer, retries, supervision, and future rework. Token count alone is insufficient: cached context is inexpensive; generating or transcribing it again is expensive.
 - Generate, transform, and compare bulk data with tools. Keep tensors, prediction vectors, binary artifacts, and large logs in files. Inspect an unfamiliar file's format before reading its contents, and bound excerpts by bytes as well as lines. Return only the relevant sample, discrepancy, or summary needed for a decision. Do not hand-transcribe bulk values or copy noisy output into the conversation. Preserve complete evidence on disk.
 - Establish the complete requested scope and acceptance criteria. Inspect the relevant data flow before editing, fix shared causes, and batch related changes before expensive validation. Reuse valid results; repeat checks only when a change, failure, or unresolved question requires them.
+- Use instructions and evidence already present in the conversation. Do not restart discovery after a clarification or interruption. Reopen files only to resolve a specific gap or check a relevant change, and request bounded excerpts.
+- Treat token estimates as estimates, not promises. For a budgeted goal, check usage between work phases and before large reads or edits. Include tool output in the budget, reserve room for verification and handoff, and reduce optional investigation before the remaining budget becomes insufficient. Do not repeat a failed estimate without accounting for the work that remains.
 - When iteration repeatedly encounters the same obstacle, consider improving shared observability, automation, or tooling. Make that bounded investment when its expected savings across the current work and foreseeable reuse justify its cost. Reducing immediate edits is not the objective; reducing total cost while completing the task is.
 - When delegation is authorized, choose a capable model using the weighted cost of the whole assignment, including its context, handoff, and review. Give bounded work and request concise evidence. Avoid duplicate investigations and verbose transcripts.
 - Complete required work, then hand off. Report unrelated findings without silently expanding the task. Claim completion only when the agreed acceptance criteria are supported by evidence; distinguish implementation, successful execution, and verified correctness. Report remaining gaps explicitly.
@@ -100,9 +102,15 @@ Measurements originate in the executing kernel. For GPU work, use device instruc
 
 Reuse canonical model definitions and existing public entrypoints for verification. Add only the missing check; do not duplicate a complete model or example to attach assertions or prints, including through generated copies. Use the existing observability interfaces to inspect the run.
 
+Use the smallest check that resolves a material uncertainty. Accept user observations as evidence of what they demonstrate, and test only the remaining gaps. Reuse an existing verification script when it covers the request. Keep routine checks concise; explain failures or limitations that affect the result.
+
 Inline Rust tests and separate test-only execution paths are banned. Verify through the installed CLI and public API. Scratch programs are allowed under `/home/nate/codex/`, but must use that same user path and observability. Respect selected devices; prove new GPU arithmetic on CPU and Archy before `amd0`. Distinguish execution, correctness, and performance.
 
 ## Commits and pull requests
+
+Work in the existing checkout on `minimal` and push to `origin/minimal`, unless the user names another destination. A checked-out branch or configured upstream does not override this destination. Do not create branches, worktrees, or additional checkouts unless the user requests them. Preserve uncommitted files when switching branches.
+
+Interpret commit scope from the user's full request and corrections. When the user asks to publish the current local folder or all local changes, include all current tracked changes and non-ignored new files; do not keep excluding edits because they predate your task. For a narrower request, preserve unrelated changes. Carry explicit authorization through the requested commit and push without asking again. Preserve commit history; do not squash unless requested.
 
 Use imperative subjects and the actual Codex session ID for agent-authored commits. Preserve unrelated changes. PRs describe behavior, link issues, and include user-path receipts naming device, model, precision, and context. Review before pushing or merging.
 
