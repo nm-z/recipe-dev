@@ -337,7 +337,7 @@ fn q8_scale_bytes(state: &str) -> usize {
 	if state == "double" { 8 } else { 4 }
 }
 /// Whether a state carries the int8 dots: float and double both do, including
-/// an `int(n).acc(64)` dot with a double accumulator.
+/// an integer dot with `acc = "fp64"` in the precision table.
 fn int_state(state: &str) -> bool {
 	state == "float" || state == "double"
 }
@@ -1766,7 +1766,7 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<Vec<(String,
 /// Every template base: (source key, contents, model type, state type, model
 /// bytes). The fp64 and custom-float bases compute in double; every other base
 /// computes in float and has an `-acc64` sibling that keeps the same model type
-/// under a double state, the accumulator a block may declare with `acc(64)`.
+/// under a double state, selected by `acc = "fp64"` in the precision table.
 fn precision_bases(ir: String, schedule: Schedule) -> BuildResult<Vec<(String, String, &'static str, &'static str, usize)>> {
 	let ir = ir
 		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())

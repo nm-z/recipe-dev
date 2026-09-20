@@ -1663,8 +1663,11 @@ use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
+	pub window_positions: usize,
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
+	pub contexts_in_values: Vec<bool>,
+	pub context_resets: Vec<(usize, usize)>,
 	/// The persistent K/V history region for an inference attention node, or
 	/// `None` for training and non-attention nodes.
 	pub attention_kv: Vec<Option<usize>>,
@@ -1673,6 +1676,8 @@ pub(crate) struct NativeLayout {
 	/// the context arena. Nodes without a schedule use `usize::MAX`.
 	pub schedule: Vec<usize>,
 	pub values_bytes: usize,
+	pub dead_bytes: usize,
+	pub dead_buffers: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
 	/// Two i64 device timestamps for the current forward: entry and completion.
@@ -2048,6 +2053,14 @@ fn window_signatures(graph: &Graph) -> Vec<String> {
 	signatures
 }
 
+fn retained_operand(graph: &Graph, index: usize, position: usize, signatures: &[String]) -> bool {
+	let node = &graph.nodes[index];
+	let operand = [node.source, node.second][position];
+	let Ok(operand) = usize::try_from(operand) else { return false };
+	if position == 0 { node.op != Primitive::Attention && reads_beyond_window(node) }
+	else { reads_beyond_window(node) || signatures[operand] != signatures[index] }
+}
+
 /// The outputs a later forward window reads, so their slots must outlive the
 /// window that writes them: the graph output, an operand a kernel reads beyond
 /// its own window, a scan's own carried output, and a second operand whose
@@ -2060,20 +2073,16 @@ fn retained_outputs(graph: &Graph) -> Vec<bool> {
 		*last = true;
 	}
 	for (index, node) in graph.nodes.iter().enumerate() {
-		let beyond = reads_beyond_window(node);
 		if node.op == Primitive::Scan {
 			retained[index] = true;
 		}
 		// Inference attention writes its settled keys and values to the dedicated
 		// context region. Its combined QKV source therefore only needs to live for
 		// the current window; training keeps the old full source for the reverse pass.
-		if node.op != Primitive::Attention
-			&& let Ok(source) = usize::try_from(node.source)
-		{
-			retained[source] |= beyond;
-		}
-		if let Ok(second) = usize::try_from(node.second) {
-			retained[second] |= beyond || signatures[second] != signatures[index];
+		for (position, operand) in [node.source, node.second].into_iter().enumerate() {
+			if let Ok(operand) = usize::try_from(operand) {
+				retained[operand] |= retained_operand(graph, index, position, &signatures);
+			}
 		}
 	}
 	retained
@@ -2093,50 +2102,187 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 	last
 }
 
+/// A causal token graph keeps history in K/V, not in intermediate tensors.
+/// Other temporal operators retain their existing full-sequence layout until
+/// they declare an independent history buffer and a position-local interface.
+fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
+	const POSITIONS: usize = 128;
+	let length = graph.input.length;
+	let bounded = inference && rows == 1 && graph.input.channels == 1 && graph.output.length == 1
+		&& graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather)
+		&& graph.nodes.iter().enumerate().all(|(index, node)| {
+			(node.input.length == length || node.input.length == 1) && (node.output.length == length || node.output.length == 1)
+				&& (index == 0 || node.source >= 0) && node.second != -1
+				&& match node.op {
+					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last => true,
+					Primitive::Contraction => node.argument[0] <= 1.0,
+					Primitive::Normalize => normalize_mode(node.argument[0]).is_ok_and(|mode| mode.per_row()),
+					Primitive::Attention => attention_blocks(node) == 0,
+					_ => false,
+				}
+		});
+	if bounded { length.min(POSITIONS) } else { length }
+}
+
+fn window_shape(shape: Shape, sequence: usize, positions: usize) -> Shape {
+	Shape { length: if shape.length == sequence { positions } else { shape.length }, ..shape }
+}
+
+#[derive(Clone, Copy)]
+enum BufferLifetime {
+	Unused,
+	Until(usize),
+	Retained,
+	ReadOnly,
+}
+
+struct BufferSpan {
+	begin: usize,
+	end: usize,
+	first: usize,
+	last: Option<usize>,
+	read_only: bool,
+}
+
+#[derive(Default)]
+struct BufferPlan {
+	bytes: usize,
+	spans: Vec<BufferSpan>,
+}
+
+impl BufferPlan {
+	/// Choose storage from the same lifetimes the report reads. Every transient
+	/// allocation can use expired ranges, regardless of tensor kind or size.
+	fn allocate(&mut self, regions: &[(usize, BufferLifetime)], alignment: usize, first: usize, reuse: bool) -> Result<usize> {
+		let bytes = regions.iter().try_fold(0, |total, (bytes, _)| checked_add(total, *bytes, "buffer reservation"))?;
+		let retained = regions.iter().any(|(bytes, lifetime)| *bytes != 0 && matches!(lifetime, BufferLifetime::Retained | BufferLifetime::ReadOnly));
+		let last = regions.iter().filter_map(|(bytes, lifetime)| match lifetime { BufferLifetime::Until(last) if *bytes != 0 => Some(*last), _ => None }).max();
+		let offset = if reuse && !retained && let Some(last) = last {
+			let mut occupied = self.spans.iter().filter(|span| span.first <= last && span.last.is_none_or(|last| last >= first))
+				.map(|span| (span.begin, span.end)).collect::<Vec<_>>();
+			occupied.sort_unstable();
+			let mut offset = 0;
+			for (begin, end) in occupied {
+				if end <= offset { continue; }
+				if checked_add(offset, bytes, "buffer reservation")? <= begin { break; }
+				offset = align(end, alignment)?;
+			}
+			offset
+		} else { align(self.bytes, alignment)? };
+		let mut end = offset;
+		for &(bytes, lifetime) in regions {
+			let begin = end;
+			end = checked_add(begin, bytes, "planned buffer bytes")?;
+			if bytes == 0 || matches!(lifetime, BufferLifetime::Unused) { continue; }
+			let last = match lifetime { BufferLifetime::Until(last) => Some(last), _ => None };
+			require(last.is_none_or(|last| last >= first), "buffer expires before its first write")?;
+			// A retained region can contain history from an earlier forward window.
+			// No operation in this window may borrow it before its writer runs.
+			self.spans.push(BufferSpan { begin, end, first: if last.is_none() { 0 } else { first }, last, read_only: matches!(lifetime, BufferLifetime::ReadOnly) });
+		}
+		self.bytes = self.bytes.max(end);
+		Ok(offset)
+	}
+
+	fn reset_ranges(&self) -> Vec<(usize, usize)> {
+		let mut spans = self.spans.iter().filter(|span| !span.read_only).map(|span| (span.begin, span.end)).collect::<Vec<_>>();
+		spans.sort_unstable();
+		let mut ranges = Vec::<(usize, usize)>::new();
+		for (begin, end) in spans {
+			if let Some((_, previous_end)) = ranges.last_mut().filter(|(_, previous_end)| begin <= *previous_end) {
+				*previous_end = (*previous_end).max(end);
+			} else {
+				ranges.push((begin, end));
+			}
+		}
+		ranges
+	}
+
+	/// Count storage that is never actually reused in this forward plan, whose
+	/// contents finish being read before a later buffer write. Merely putting a
+	/// slot on the reuse list does not exclude it; an actual overlapping write
+	/// does. Split at every boundary so partial reuse excludes only reused bytes.
+	fn unreused_dead_storage(plans: &[&Self]) -> Result<(usize, usize)> {
+		let (mut spans, mut base) = (Vec::new(), 0);
+		for plan in plans {
+			for span in &plan.spans {
+				spans.push(BufferSpan { begin: checked_add(base, span.begin, "buffer range")?, end: checked_add(base, span.end, "buffer range")?, first: span.first, last: span.last, read_only: span.read_only });
+			}
+			base = checked_add(base, plan.bytes, "planned buffer total")?;
+		}
+		let mut boundaries = spans.iter().flat_map(|span| [span.begin, span.end]).collect::<Vec<_>>();
+		boundaries.sort_unstable();
+		boundaries.dedup();
+		let mut owners = vec![None; boundaries.len().saturating_sub(1)];
+		let mut reused = vec![false; owners.len()];
+		let mut writes = spans.iter().enumerate().map(|(id, span)| (span.first, id)).collect::<Vec<_>>();
+		writes.sort_unstable();
+		let last_write = writes.last().map_or(0, |(step, _)| *step);
+		for (step, id) in writes {
+			let span = &spans[id];
+			let range = boundaries.binary_search(&span.begin).unwrap()..boundaries.binary_search(&span.end).unwrap();
+			for cell in range {
+				if let Some(owner) = owners[cell] {
+					let previous: &BufferSpan = &spans[owner];
+					require(previous.last.is_some_and(|last| last < step), "buffer reuse overlaps a live value")?;
+					reused[cell] = true;
+				}
+				owners[cell] = Some(id);
+			}
+		}
+		let mut dead_owners = vec![false; spans.len()];
+		let bytes = owners.into_iter().enumerate().try_fold(0, |dead, (cell, owner)| {
+			if !reused[cell] && let Some(id) = owner && spans[id].last.is_some_and(|last| last < last_write) {
+				dead_owners[id] = true;
+				checked_add(dead, boundaries[cell + 1] - boundaries[cell], "unreused dead buffer bytes")
+			} else { Ok(dead) }
+		})?;
+		Ok((bytes, dead_owners.into_iter().filter(|dead| *dead).count()))
+	}
+}
+
 impl NativeLayout {
+
 	/// Training gives every node its own value, context and adjoint slot for the
 	/// whole run, because the reverse pass reads each output after every later
 	/// node has run. An inference tape holds no adjoints, drops the context
-	/// regions only the reverse pass fills, and shares value slots: a retained
-	/// output keeps a slot of its own, and a transient one takes a released slot
-	/// of the same size when one exists. A slot is released after the last node
-	/// that reads it, and a barrier follows every node, so no reader overlaps the
-	/// writer that follows.
+	/// regions only the reverse pass fills. Values, conversions, and workspace
+	/// use the same lifetime-based allocator. Retained regions stay private;
+	/// transient regions share storage after their last reader's barrier.
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
 		let mut values = Vec::with_capacity(graph.nodes.len());
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
+		let mut contexts_in_values = Vec::with_capacity(graph.nodes.len());
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
-		let (mut value_offset, mut context_offset, mut adjoint_offset) = (0, 0, 0);
+		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
-		let mut released: Vec<(usize, usize)> = Vec::new();
+		let signatures = window_signatures(graph);
+		let lifetimes = (0..graph.nodes.len()).map(|index| {
+			let observed = tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
+			if inference && !retained[index] && !observed {
+				Ok(BufferLifetime::Until(checked_add(checked_mul(last[index], 2, "buffer lifetime")?, 1, "buffer lifetime")?))
+			} else { Ok(BufferLifetime::Retained) }
+		}).collect::<Result<Vec<_>>>()?;
 		for (index, node) in graph.nodes.iter().enumerate() {
-			let bytes = graph_rows_buffer(node.output, rows, node.precision.bytes())?;
+			let output = window_shape(node.output, graph.input.length, window_positions);
+			let bytes = graph_rows_buffer(output, rows, node.precision.bytes())?;
 			let state = NativePrecision::new(node.precision, node.acc)?.state;
+			let cast_step = checked_mul(index, 2, "buffer step")?;
+			let step = checked_add(cast_step, 1, "buffer step")?;
 			// A traced run keeps the nodes its dump reads: the first forty and the
 			// last four, or the RECIPE_TRACE_NODES=a..b range; every other slot is
 			// reused as in an untraced run.
 			// RECIPE_TRACE_REUSE=1 keeps the reuse under a trace, to read the values
 			// a reused slot held when a run without the trace went wrong.
-			let dumped = tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
-			// Reuse remains an explicit experiment until every branched architecture
-			// has a retained-output proof. Gemma 4 becomes nonfinite in a long range
-			// under the current proof while the conservative layout stays finite.
-			let reuse = inference && !retained[index] && !dumped && std::env::var("RECIPE_VALUE_REUSE").as_deref() == Ok("1");
-			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
-				Some(position) => released.remove(position).1,
-				None => {
-					let slot = align(value_offset, unit)?;
-					value_offset = checked_add(slot, bytes, "model value arena")?;
-					slot
-				}
-			};
+			let slot = value_plan.allocate(&[(bytes, lifetimes[index])], unit, step, inference)?;
 			if tracing() {
-				trace(&format!("layout node {index} slot {slot} bytes {bytes} reuse {reuse} last {} retained {} source {} second {}", last.get(index).copied().unwrap_or(0), retained.get(index).copied().unwrap_or(false), node.source, node.second))?;
+				trace(&format!("layout node {index} slot {slot} bytes {bytes} last {} retained {} source {} second {}", last.get(index).copied().unwrap_or(0), retained.get(index).copied().unwrap_or(false), node.source, node.second))?;
 			}
 			values.push(slot);
 			// An operand computed in another arithmetic is converted into this
@@ -2151,27 +2297,32 @@ impl NativeLayout {
 					require(node.precision == graph.nodes[0].precision, format!("{} computes in {} but reads the model input in {}", node.identity(index), node.precision.label(), graph.nodes[0].precision.label()))?;
 					(&graph.nodes[0], graph.input)
 				} else { continue };
-				if source.precision != node.precision {
-					let converted = graph_rows_buffer(shape, rows, node.precision.bytes())?;
-					let slot = align(value_offset, unit)?;
-					value_offset = checked_add(slot, converted, "model cast arena")?;
+				if source.precision != node.precision && !(inference && matches!(node.op, Primitive::Elementwise | Primitive::Last)) {
+					let converted = graph_rows_buffer(window_shape(shape, graph.input.length, window_positions), rows, node.precision.bytes())?;
+					let lifetime = if inference && !retained_operand(graph, index, position, &signatures) { BufferLifetime::Until(step) } else { BufferLifetime::Retained };
+					let slot = value_plan.allocate(&[(converted, lifetime)], unit, cast_step, inference)?;
 					node_casts[position] = Some(slot);
 				}
 				if !inference && NativePrecision::new(source.precision, source.acc)?.state != state {
 					let converted = graph_rows_buffer(shape, rows, state.bytes())?;
-					let slot = align(adjoint_offset, unit)?;
-					adjoint_offset = checked_add(slot, converted, "model cast adjoint arena")?;
+					let slot = adjoint_plan.allocate(&[(converted, BufferLifetime::Retained)], unit, 0, false)?;
 					node_cast_adjoints[position] = Some(slot);
 				}
 			}
 			casts.push(node_casts);
 			cast_adjoints.push(node_cast_adjoints);
-			context_offset = align(context_offset, unit)?;
-			contexts.push(context_offset);
-			context_offset = checked_add(context_offset, node_context(graph, node, rows, node.precision, inference)?, "model context arena")?;
+			let mut context_node = node.clone();
+			if node.op != Primitive::Attention {
+				context_node.input = window_shape(node.input, graph.input.length, window_positions);
+				context_node.output = output;
+			}
+			let regions = node_context(graph, &context_node, rows, node.precision, inference, step)?;
+			let temporary = inference && regions.iter().all(|(_, lifetime)| matches!(lifetime, BufferLifetime::Until(_) | BufferLifetime::Unused));
+			let plan = if temporary { &mut value_plan } else { &mut context_plan };
+			contexts.push(plan.allocate(&regions, unit, step, inference)?);
+			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
-				let offset = align(context_offset, unit)?;
-				context_offset = checked_add(offset, attention_kv_bytes(node, rows, node.kv_precision)?, "attention K/V context")?;
+				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
 				Some(offset)
 			} else {
 				None
@@ -2179,29 +2330,14 @@ impl NativeLayout {
 			attention_kv.push(kv);
 			if inference {
 				adjoints.push(0);
-				let mut operands = [node.source, node.second, index as i32];
-				operands.sort_unstable();
-				for (position, operand) in operands.into_iter().enumerate() {
-					let Ok(operand) = usize::try_from(operand) else { continue };
-					if position > 0 && operands[position - 1] == operand as i32 {
-						continue;
-					}
-					if last[operand] == index && !retained[operand] && !(tracing() && traced_node(operand, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err()) {
-						released.push((graph_rows_buffer(graph.nodes[operand].output, rows, graph.nodes[operand].precision.bytes())?, values[operand]));
-					}
-				}
 			} else {
-				adjoint_offset = align(adjoint_offset, unit)?;
-				adjoints.push(adjoint_offset);
-				adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, state.bytes())?, "model adjoint arena")?;
+				adjoints.push(adjoint_plan.allocate(&[(graph_rows_buffer(node.output, rows, state.bytes())?, BufferLifetime::Retained)], unit, 0, false)?);
 			}
 		}
 		let mut schedule = Vec::with_capacity(graph.nodes.len());
 		for node in &graph.nodes {
 			if matches!(node.op, Primitive::Contraction | Primitive::Scan) {
-				context_offset = align(context_offset, 8)?;
-				schedule.push(context_offset);
-				context_offset = checked_add(context_offset, NATIVE_SCHEDULE_WORDS * size_of::<i32>(), "model schedule arena")?;
+				schedule.push(context_plan.allocate(&[(NATIVE_SCHEDULE_WORDS * size_of::<i32>(), BufferLifetime::ReadOnly)], 8, 0, false)?);
 			} else {
 				schedule.push(usize::MAX);
 			}
@@ -2215,13 +2351,12 @@ impl NativeLayout {
 		let input_adjoint_precision = gradient_precisions.first().copied().unwrap_or(Compute::FP32);
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
-		let timing = align(context_offset, 8)?;
-		context_offset = checked_add(timing, 16, "forward timing arena")?;
-		let clocks = tracing().then_some(align(context_offset, 8)?);
-		if let Some(clocks) = clocks {
-			context_offset = checked_add(clocks, checked_mul(graph.nodes.len().max(1), 8, "node clock arena")?, "node clock arena")?;
-		}
-		Ok(Self { precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element), timing, clocks })
+		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
+		let clocks = if tracing() {
+			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
+		} else { None };
+		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks })
 	}
 }
 
@@ -2461,7 +2596,7 @@ impl NativeModelIr {
 		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if !inference && NativePrecision::new(node.precision, node.acc)?.state != node.precision {
-				require(node.block_kind != "recur_body" && recurrent_body_elements(graph, node, rows)?.is_none(), format!("{} has no accumulator-width backward kernel for a custom recurrent body in {} yet", node.identity(index), node.precision.label()))?;
+				require(node.block_kind != "recur_body" && recurrent_body_regions(graph, node, rows, false, 0)?.is_none(), format!("{} has no accumulator-width backward kernel for a custom recurrent body in {} yet", node.identity(index), node.precision.label()))?;
 			}
 			if inference && matches!(node.int_bits, 16 | 32) {
 				let storage = packed_weight(graph, index, true).ok_or_else(|| RecipeError::new(format!("{} int{} requires packed int8 weights", node.identity(index), node.int_bits)))?;
@@ -2489,7 +2624,7 @@ impl NativeModelIr {
 		}
 		let mut plans = Vec::with_capacity(graph.nodes.len());
 		let mut storage_bytes = 0usize;
-		for (index, node) in graph.nodes.iter().cloned().enumerate() {
+		for (index, mut node) in graph.nodes.iter().cloned().enumerate() {
 			let id = || node.identity(index);
 			// A lookup reads its ids on the host, so it names no device source.
 			require((node.source >= -1 || (node.source == -2 && node.op == Primitive::Lookup)) && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
@@ -2519,6 +2654,8 @@ impl NativeModelIr {
 			} else if let Some(weight) = arena_weight(&node, &stored).filter(|_| !kept) {
 				storage_bytes = checked_add(storage_bytes, weight.bytes.len(), "native storage arena")?;
 			}
+			node.input = window_shape(node.input, graph.input.length, layout.window_positions);
+			node.output = window_shape(node.output, graph.input.length, layout.window_positions);
 			plans.push(NodePlan {
 				gradient_offset: layout.gradients[index],
 				node,
@@ -3864,7 +4001,8 @@ impl NativeModelIr {
 					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse} )\n",
+							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							position_origin = if reverse { "" } else if self.layout.window_positions < self.graph.input.length { ", i32 %begin" } else { ", i32 0" },
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							has_factors = node.parameters != 0,
@@ -3982,17 +4120,14 @@ impl NativeModelIr {
 					let source_elements = node.input.elements();
 					emit_runtime_window_loop(&mut ir, index, "last", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.position = sub i32 {source_end}, 1\n%{prefix}.position.wide = zext i32 %{prefix}.position to i64\n%{prefix}.source.local = add i64 %{prefix}.channel.base, %{prefix}.position.wide\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.source.index\n%{prefix}.source.value = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.source.value, {pointer} %{prefix}.output.ptr, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.position = sub i32 {source_end}, 1\n%{prefix}.position.wide = zext i32 %{prefix}.position to i64\n%{prefix}.source.local = add i64 %{prefix}.channel.base, %{prefix}.position.wide\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n",
 							channels = node.output.channels,
 							source_elements = source_elements,
 							source_length = node.input.length,
 							source_end = source_end,
-							ty = ty,
-							pointer = pointer,
-							source = pointers.source,
-							value = pointers.value,
-							align = alignment(ty),
 						));
+						self.emit_operand_load(backend, index, 0, &pointers.source, &format!("%{prefix}.source.index"), &format!("%{prefix}.source.value"), ir);
+						ir.push_str(&format!("%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.source.value, {pointer} %{prefix}.output.ptr, align {align}\n", value = pointers.value, align = alignment(ty)));
 					})?;
 					ir.push_str(barrier(backend));
 				}
@@ -4075,9 +4210,14 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Attention) => {
+					let buffer_length = node.output.length;
+					let compact = self.layout.window_positions < self.graph.input.length;
+					let buffer_origin = if compact { "%begin" } else { "0" };
+					let begin = if compact { "%begin" } else { begin.as_str() };
+					let node = &self.graph.nodes[index];
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let online_order = self.inference && self.graph.profile.online_softmax;
-					let attention = if !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let attention = if !compact && !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
@@ -4146,11 +4286,11 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { if online_order { ", i1 true" } else { ", i1 false" } } else { "" }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
 						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
@@ -4189,22 +4329,10 @@ impl NativeModelIr {
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
-						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
-						ir.push_str(&format!(
-							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
-							source = pointers.source,
-							wide = wide,
-							align = alignment(ty)
-						));
+						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
-							let second_pointer = format!("%{prefix}.second.ptr");
-							ir.push_str(&format!(
-								"{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i64 {wide}\n",
-								second_source = pointers.second,
-								wide = wide
-							));
-							ir.push_str(&format!("{second} = load {ty}, {pointer} {second_pointer}, align {align}\n", align = alignment(ty)));
+							self.emit_operand_load(backend, index, 1, &pointers.second, wide, &second, ir);
 						}
 						ir.push_str(&forward.code);
 						ir.push_str(&format!(
@@ -6012,7 +6140,11 @@ impl NativeModelIr {
 	/// and never rewrites a position whose inputs are already present.
 	fn emit_node_window(&self, index: usize, node: &Node, ir: &mut String) -> Result<NodeWindow> {
 		let prefix = format!("n{index}");
-		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) } else { ("%begin".to_owned(), "%end".to_owned()) };
+		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) }
+		else if self.layout.window_positions < self.graph.input.length {
+			ir.push_str(&format!("%{prefix}.input.span = sub i32 %end, %begin\n"));
+			("0".to_owned(), format!("%{prefix}.input.span"))
+		} else { ("%begin".to_owned(), "%end".to_owned()) };
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
 		match node.op {
@@ -6063,6 +6195,25 @@ impl NativeModelIr {
 		};
 		ir.push_str(&format!("%{prefix}.model = call {} @recipe.model.from.state{tv}({} {state})\n", target.model_type, target.state_type));
 		format!("%{prefix}.model")
+	}
+	/// Read the operand's stored type and convert in registers when this consumer
+	/// does not need a materialized conversion. Training keeps its saved copies.
+	fn emit_operand_load(&self, backend: Backend, index: usize, position: usize, base: &str, offset: &str, result: &str, ir: &mut String) {
+		let node = &self.plans[index].node;
+		let operand = [node.source, node.second][position];
+		let source = if self.layout.casts[index][position].is_some() { node }
+		else if let Ok(operand) = usize::try_from(operand) { &self.plans[operand].node }
+		else { &self.plans[0].node };
+		let pointer = pointer_type(backend);
+		let from_ty = self.node_precision(source).model_type;
+		let prefix = result.trim_start_matches('%');
+		let convert = source.precision != node.precision;
+		let raw = if convert { format!("%{prefix}.raw") } else { result.to_owned() };
+		ir.push_str(&format!("%{prefix}.ptr = getelementptr inbounds {from_ty}, {pointer} {base}, i64 {offset}\n{raw} = load {from_ty}, {pointer} %{prefix}.ptr, align {align}\n", align = alignment(from_ty)));
+		if convert {
+			let converted = self.emit_convert(ir, &format!("{prefix}.convert"), source, node, &raw);
+			ir.push_str(&format!("{result} = freeze {} {converted}\n", self.node_precision(node).model_type));
+		}
 	}
 	/// Before a node runs, each operand held in another arithmetic is converted
 	/// into the node's own over the positions the node writes, and the node reads
@@ -6127,7 +6278,11 @@ impl NativeModelIr {
 	}
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
-		let source = if plan.node.source >= 0 { format!("%{prefix}.source") } else { "%samples".to_owned() };
+		let source = if plan.node.source >= 0 { format!("%{prefix}.source") }
+		else if self.layout.window_positions < self.graph.input.length {
+			ir.push_str(&format!("%{prefix}.input.begin = zext i32 %begin to i64\n%{prefix}.input = getelementptr i32, {} %samples, i64 %{prefix}.input.begin\n", pointer_type(backend)));
+			format!("%{prefix}.input")
+		} else { "%samples".to_owned() };
 		if plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &format!("{prefix}.source")));
@@ -6152,7 +6307,7 @@ impl NativeModelIr {
 		let delta = format!("%{prefix}.delta");
 		let weights = format!("%{prefix}.weights");
 		ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("{prefix}.value")));
-		ir.push_str(&ptr_gep(backend, "contexts", plan.context, &format!("{prefix}.context")));
+		ir.push_str(&ptr_gep(backend, if self.layout.contexts_in_values[index] { "values" } else { "contexts" }, plan.context, &format!("{prefix}.context")));
 		if reverse && matches!(plan.node.op, Primitive::Scan | Primitive::Delta) {
 			let offset = checked_add(plan.context, backward_context_offset(&plan.node, self.rows)?, "backward context offset")?;
 			ir.push_str(&ptr_gep(backend, "contexts", offset, &format!("{prefix}.backward.context")));
@@ -10440,7 +10595,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|-|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}||-|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -10452,7 +10607,6 @@ mod bundle {
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
 			precision_token(block.blck_precision),
-			precision_token(block.acc),
 			precision_token(block.qk_precision),
 			precision_token(block.rope_precision),
 			precision_token(block.activation_precision),
@@ -10462,6 +10616,7 @@ mod bundle {
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
 		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17), "semantic model block has the wrong width")?;
+		require(fields.get(11).is_none_or(|field| field.is_empty()), "saved block accumulator overrides are no longer supported; configure acc in the precision table")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -10473,7 +10628,6 @@ mod bundle {
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
-			acc: fields.get(11).map_or(Ok(None), |field| precision_from_token(field))?,
 			qk_precision: fields.get(13).map_or(Ok(None), |field| precision_from_token(field))?,
 			rope_precision: fields.get(14).map_or(Ok(None), |field| precision_from_token(field))?,
 			activation_precision: fields.get(15).map_or(Ok(None), |field| precision_from_token(field))?,
@@ -11652,7 +11806,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, acc: None, suffix: Suffix::Activation } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Activation } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -11725,7 +11879,6 @@ pub struct Block {
 	activation_precision: Option<Compute>,
 	norm_precision: Option<Compute>,
 	/// The accumulator the block's sums and reductions carry, when named.
-	acc: Option<Compute>,
 	/// What the next precision suffix names.
 	suffix: Suffix,
 }
@@ -11793,7 +11946,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, acc: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
@@ -11806,18 +11959,6 @@ impl Block {
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
 		self.suffix = Suffix::Norm;
 		self.normalization = Some(normalization.normalization());
-		self
-	}
-	/// The accumulator the block's sums and reductions carry: `acc(32)` or
-	/// `acc(64)`. The block's values keep their own precision; only the running
-	/// sums, the softmax and norm statistics widen. A table names the default
-	/// under `acc`.
-	pub fn acc(mut self, bits: u8) -> Self {
-		self.acc = Some(match bits {
-			32 => Compute::FP32,
-			64 => Compute::FP64,
-			_ => panic!("acc bits must be 32 or 64"),
-		});
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -12035,7 +12176,6 @@ impl Model {
 				rope_precision: None,
 				activation_precision: None,
 				norm_precision: None,
-				acc: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -12287,13 +12427,6 @@ impl Model {
 		self.edit(|model| match model.blocks.last_mut() {
 			Some(block) => *block = block.arithmetic(format),
 			None => panic!("a precision names the block before it, and no block comes before this one; name it on a block, or in Cargo.toml's [precision.<config>] for every block that names none"),
-		})
-	}
-	/// The accumulator of the block before it; see [`Block::acc`].
-	pub fn acc(&self, bits: u8) -> Self {
-		self.edit(|model| match model.blocks.last_mut() {
-			Some(block) => *block = block.clone().acc(bits),
-			None => panic!("acc names the block before it, and no block comes before this one"),
 		})
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
@@ -15353,9 +15486,10 @@ pub mod infer {
 	pub const text: ChatMetric = ChatMetric(0);
 	pub const pp: ChatMetric = ChatMetric(1);
 	pub const tg: ChatMetric = ChatMetric(2);
-	pub const r#in: ChatMetric = ChatMetric(3);
+	pub const input: ChatMetric = ChatMetric(3);
 	pub const out: ChatMetric = ChatMetric(4);
 	pub const cached: ChatMetric = ChatMetric(5);
+	pub const time: ChatMetric = ChatMetric(6);
 }
 pub trait IntoChatMetrics { fn into_chat_metrics(self) -> Vec<ChatMetric>; }
 impl IntoChatMetrics for ChatMetric {
@@ -15396,6 +15530,9 @@ impl Infer {
 	fn try_run(&self, model: &Model, data: &Data) -> Result<InferenceReport> {
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPTED.store(false, Ordering::Release);
+		let load_started = Instant::now();
+		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
+		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		let model = with_last_projection(model);
 		let plan = conventional_plan(&file, &model)?;
@@ -15416,11 +15553,18 @@ impl Infer {
 		};
 		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
 		let placed = place_bound(&bound, sequence, &[], devices)?;
+		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
+		drop(loading);
 		let memory = placed.memory();
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history = Vec::new();
 		loop {
+			let start_progress = |started| {
+				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
+			};
+			let progress;
+			let request_started;
 			let text = if interactive {
 				if INTERRUPTED.load(Ordering::Acquire) { break; }
 				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
@@ -15428,9 +15572,13 @@ impl Infer {
 				if line.trim() == "/exit" { break; }
 				if line.trim() == "/clear" { conversation.clear(); continue; }
 				if line.trim().is_empty() { continue; }
+				request_started = Instant::now();
+				progress = start_progress(request_started);
 				conversation.push(("user".to_owned(), line.trim_end().to_owned()));
 				coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
 			} else {
+				request_started = Instant::now();
+				progress = start_progress(request_started);
 				match &supplied {
 					Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
 					Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
@@ -15439,17 +15587,16 @@ impl Infer {
 			};
 			let mut prompt = coder.encode(&text);
 			if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
+			if let Some(progress) = &progress { progress.prompt(prompt.len()); }
 			if prompt.len() >= sequence && interactive {
 				conversation.pop();
+				drop(progress);
 				eprintln!("context full: {} prompt tokens leave no reply positions in {sequence}; use /clear", prompt.len());
 				continue;
 			}
 			require(prompt.len() < sequence, format!("{} prompt tokens leave no reply positions in {sequence} context positions", prompt.len()))?;
 			let available = sequence - prompt.len();
 			let budget = self.tokens.map_or(available, |limit| limit.min(available));
-			let chat_metrics = self.chat.clone().unwrap_or_default();
-			let status_metrics = chat_metrics.iter().copied().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
-			let progress = (!status_metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prefill", seconds: 0.0, in_tokens: prompt.len(), out_tokens: 0, cached: 0, prefill_seconds: 0.0, decode_steps: 0, decode_seconds: 0.0, last_decode_seconds: 0.0, context: sequence, devices: device_names.clone(), memory: memory.clone(), reply: String::new(), version: 0 }, status_metrics));
 			let show_reply = self.chat.is_some() || self.log.iter().any(|metric| metric.0 == chat.0);
 			let streaming = show_reply;
 			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
@@ -15471,11 +15618,13 @@ impl Infer {
 				}
 				Ok(())
 			})?;
+			let seconds = progress.as_ref().map_or_else(|| request_started.elapsed().as_secs_f64(), InferenceLive::finish);
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
 			let reply = coder.decode(&ids);
 			request_history.push(Arc::new(InferenceRequest {
-				r#in: prompt.len(), out: ids.len(), cached: 0, reply_limit: budget,
+				time: DurationReport(seconds),
+				input: prompt.len(), out: ids.len(), cached: 0, reply_limit: budget,
 				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
 				pp_seconds: generation.prefill_seconds, tg_seconds: generation.step_seconds.iter().sum(),
 			}));
@@ -15487,11 +15636,13 @@ impl Infer {
 			path: data.report_path()?,
 			formats: placed.format_report()?,
 			memory: placed.memory_report()?,
+			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
+			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
 			links: placed.link_report()?,
 			aot: placed.aot_report()?,
 			tiles: placed.tile_report()?,
 			grids: placed.grid_report()?,
-			load: DurationReport(placed.load_seconds()),
+			load: DurationReport(load_seconds),
 			compile: DurationReport(placed.compile_seconds()),
 			context: sequence,
 			requests: request_history.len(),
@@ -15830,6 +15981,10 @@ pub struct InferenceReport {
 	pub path: String,
 	pub formats: ReportLines,
 	pub memory: ReportLines,
+	/// Planned buffers containing dead storage as defined by `DeviceMemory::dead`.
+	pub dead_buffers: usize,
+	/// Dead storage bytes already included in the reported memory allocations.
+	pub dead_bytes: usize,
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
@@ -15849,8 +16004,10 @@ impl std::ops::Deref for InferenceReport {
 /// Observations from one request. The flat report fields refer to its last request.
 #[derive(Default)]
 pub struct InferenceRequest {
+	/// Elapsed request time, from submission through the end of generation.
+	pub time: DurationReport,
 	pub reply_limit: usize,
-	pub r#in: usize,
+	pub input: usize,
 	pub out: usize,
 	pub cached: usize,
 	pub input_ids: Vec<u32>,
@@ -15861,11 +16018,11 @@ pub struct InferenceRequest {
 	tg_seconds: f64,
 }
 impl InferenceRequest {
-	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.r#in.saturating_sub(self.cached) as f64 / self.pp_seconds } }
+	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.input.saturating_sub(self.cached) as f64 / self.pp_seconds } }
 	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
 }
 /// Measured inference state passed to the model script's live formatter.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct InferenceProgress {
 	pub phase: &'static str,
 	pub seconds: f64,
@@ -15873,27 +16030,36 @@ pub struct InferenceProgress {
 	pub out_tokens: usize,
 	pub cached: usize,
 	pub prefill_seconds: f64,
+	pub prefill_tokens: usize,
 	pub decode_steps: usize,
 	pub decode_seconds: f64,
 	pub last_decode_seconds: f64,
 	pub context: usize,
 	pub devices: String,
 	pub memory: Vec<DeviceMemory>,
+	started: Option<Instant>,
+	finished: bool,
 	reply: String,
 	version: usize,
 }
 impl InferenceProgress {
-	pub fn pp(&self) -> f64 { if self.prefill_seconds > 0.0 { self.in_tokens.saturating_sub(self.cached) as f64 / self.prefill_seconds } else { 0.0 } }
+	pub fn pp(&self) -> f64 { if self.prefill_seconds > 0.0 { self.prefill_tokens as f64 / self.prefill_seconds } else { 0.0 } }
 	pub fn tg(&self) -> f64 { if self.decode_seconds > 0.0 { self.decode_steps as f64 / self.decode_seconds } else { 0.0 } }
 	fn line(&self, metrics: &[ChatMetric], final_line: bool) -> String {
 		let mut values = Vec::new();
 		for metric in metrics {
 			match metric.0 {
 				1 if self.prefill_seconds > 0.0 => values.push(format!("pp {:.2} tok/s", self.pp())),
-				2 if self.decode_steps != 0 => values.push(format!("tg {:.2} tok/s", if final_line { self.tg() } else { 1.0 / self.last_decode_seconds })),
-				3 => values.push(format!("in {}", self.in_tokens)),
-				4 => values.push(format!("out {}", self.out_tokens)),
-				5 => values.push(format!("cached {}", self.cached)),
+				1 => values.push("pp ...".to_owned()),
+				2 if self.decode_steps != 0 && self.last_decode_seconds > 0.0 => values.push(format!("tg {:.2} tok/s", if final_line { self.tg() } else { 1.0 / self.last_decode_seconds })),
+				2 => values.push("tg ...".to_owned()),
+				3 if self.in_tokens != 0 => values.push(format!("input {}", self.in_tokens)),
+				3 => values.push("input ...".to_owned()),
+				4 if !matches!(self.phase, "load" | "ready") => values.push(format!("out {}", self.out_tokens)),
+				4 => values.push("out ...".to_owned()),
+				5 if self.in_tokens != 0 => values.push(format!("cached {}", self.cached)),
+				5 => values.push("cached ...".to_owned()),
+				6 => values.push(format!("time {:.3}s", self.seconds)),
 				_ => {}
 			}
 		}
@@ -15906,48 +16072,178 @@ struct InferenceLive {
 	thread: Option<std::thread::JoinHandle<()>>,
 	terminal: bool,
 }
+/// Only the unfinished reply row and the metrics row can be redrawn. Earlier
+/// reply rows are committed to the terminal and its native scrollback.
+struct ChatTerminal {
+	committed: usize,
+	printed: usize,
+	tail: String,
+	status: String,
+	drawn: bool,
+	has_reply: bool,
+	columns: usize,
+	#[cfg(unix)]
+	locale: usize,
+}
+impl ChatTerminal {
+	fn size() -> Option<(usize, usize)> {
+		#[cfg(unix)]
+		{
+			unsafe extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			const SIZE: usize = 0x5413;
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			const SIZE: usize = 0x40087468;
+			let mut size = [0_u16; 4];
+			if unsafe { ioctl(2, SIZE, size.as_mut_ptr()) } == 0 && size[0] >= 2 && size[1] >= 2 {
+				return Some((usize::from(size[0]), usize::from(size[1])));
+			}
+		}
+		None
+	}
+	fn new() -> Option<Self> {
+		Self::size()?;
+		#[cfg(unix)]
+		let locale = {
+			unsafe extern "C" { fn newlocale(mask: i32, name: *const std::ffi::c_char, base: *mut std::ffi::c_void) -> *mut std::ffi::c_void; }
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			const CTYPE: i32 = 1;
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			const CTYPE: i32 = 4;
+			let locale = unsafe { newlocale(CTYPE, c"C.UTF-8".as_ptr(), std::ptr::null_mut()) };
+			let locale = if locale.is_null() { unsafe { newlocale(CTYPE, c"en_US.UTF-8".as_ptr(), std::ptr::null_mut()) } } else { locale };
+			if locale.is_null() { return None; }
+			locale as usize
+		};
+		Some(Self { committed: 0, printed: 0, tail: String::new(), status: String::new(), drawn: false, has_reply: false, columns: 0, #[cfg(unix)] locale })
+	}
+	/// The final physical row starts at a UTF-8 boundary. Query the machine's
+	/// Unicode cell widths rather than treating bytes or characters as columns.
+	fn last_row(&self, text: &str, columns: usize) -> (usize, usize) {
+		#[cfg(unix)]
+		unsafe extern "C" {
+			fn uselocale(locale: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+			fn wcwidth(character: i32) -> i32;
+		}
+		#[cfg(unix)]
+		let previous = unsafe { uselocale(self.locale as *mut std::ffi::c_void) };
+		let (mut start, mut column, mut rows) = (0, 0, 1);
+		for (index, character) in text.char_indices() {
+			if character == '\n' { start = index + 1; column = 0; rows += 1; continue; }
+			if character == '\t' { column = ((column / 8 + 1) * 8).min(columns - 1); continue; }
+			#[cfg(unix)]
+			let width = unsafe { wcwidth(character as i32) }.max(0) as usize;
+			#[cfg(not(unix))]
+			let width = usize::from(!character.is_control());
+			if column + width > columns { start = index; column = 0; rows += 1; }
+			column += width;
+		}
+		#[cfg(unix)]
+		unsafe { uselocale(previous); }
+		(start, rows)
+	}
+	fn render(&mut self, reply: Option<&str>, line: &str, complete: bool) -> std::io::Result<()> {
+		let mut output = std::io::stderr().lock();
+		let text = reply.map(|reply| format!("~ {reply}")).unwrap_or_default();
+		let Some((height, columns)) = Self::size() else { return Ok(()); };
+		if !self.drawn { write!(output, "\x1b[?7h")?; }
+		if self.drawn {
+			let rows = if self.has_reply { self.last_row(&self.tail, self.columns).1 } else { 0 } + self.last_row(&self.status, self.columns).1;
+			if columns == self.columns && rows <= height {
+				write!(output, "\r")?;
+				if rows > 1 { write!(output, "\x1b[{}A", rows - 1)?; }
+				for row in 0..rows { write!(output, "\x1b[2K")?; if row + 1 < rows { write!(output, "\x1b[1B")?; } }
+				if rows > 1 { write!(output, "\x1b[{}A", rows - 1)?; }
+			} else {
+				// Resize reflow differs across terminals. Preserve the old frame
+				// rather than moving into text whose screen position is unknown.
+				writeln!(output)?;
+				self.committed = self.printed;
+			}
+		}
+		let suffix = &text[self.committed..];
+		if reply.is_some() { writeln!(output, "{suffix}")?; }
+		let tail = self.last_row(suffix, columns).0;
+		self.tail = suffix[tail..].to_owned();
+		self.committed += tail;
+		self.printed = text.len();
+		self.status = line.to_owned();
+		write!(output, "{}", self.status)?;
+		if complete { writeln!(output)?; }
+		self.drawn = true;
+		self.has_reply = reply.is_some();
+		self.columns = columns;
+		output.flush()
+	}
+}
+#[cfg(unix)]
+impl Drop for ChatTerminal {
+	fn drop(&mut self) {
+		unsafe extern "C" { fn freelocale(locale: *mut std::ffi::c_void); }
+		unsafe { freelocale(self.locale as *mut std::ffi::c_void); }
+	}
+}
 impl InferenceLive {
-	fn new(mut state: InferenceProgress, metrics: Vec<ChatMetric>) -> Self {
-		state.phase = "prefill";
+	fn new(state: InferenceProgress, metrics: Vec<ChatMetric>) -> Self {
+		let mut renderer = std::io::stderr().is_terminal().then(ChatTerminal::new).flatten();
+		if let Some(renderer) = &mut renderer {
+			if let Err(error) = renderer.render((state.phase != "load").then_some(state.reply.as_str()), &state.line(&metrics, false), false) { eprintln!("cannot print chat progress: {error}"); }
+		}
 		let state = Arc::new(Mutex::new(state));
 		let (stop, receiver) = std::sync::mpsc::channel();
 		let shared = Arc::clone(&state);
-		let terminal = std::io::stderr().is_terminal();
+		let terminal = renderer.is_some();
 		let refresh = Duration::from_secs_f64(1.0 / Config::load().map_or(5, |config| config.progress_refresh_hz).max(1) as f64);
 		let thread = std::thread::spawn(move || {
-			let started = Instant::now();
-			let mut version = 0;
-			let mut rendered_rows = 0usize;
+			let mut version = Some(0);
 			loop {
 				let complete = !matches!(receiver.recv_timeout(refresh), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-				let mut view = shared.lock().unwrap().clone();
-				view.seconds = started.elapsed().as_secs_f64();
-				if complete && view.phase != "done" { view.phase = "stopped"; }
-				if (terminal || complete) && (complete || view.version != version) {
+				let mut view = {
+					let state = shared.lock().unwrap();
+					let ticking = metrics.contains(&infer::time) && !state.finished;
+					if !complete && !ticking && version == Some(state.version) { continue; }
+					state.clone()
+				};
+				if !view.finished && let Some(started) = view.started { view.seconds = started.elapsed().as_secs_f64(); }
+				if terminal || complete {
 					let line = view.line(&metrics, complete);
-					if terminal {
-						let columns = std::env::var("COLUMNS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(80).max(1);
-						if rendered_rows != 0 {
-							eprint!("\r");
-							for _ in 1..rendered_rows { eprint!("\x1b[1A"); }
-						}
-						let reply_rows = (view.reply.chars().count() + 2).div_ceil(columns).max(1);
-						eprint!("\r\x1b[J{line}\n~ {}", view.reply);
-						if complete { eprintln!(); } else { let _ = std::io::stderr().flush(); }
-						rendered_rows = 1 + reply_rows;
+					if let Some(renderer) = &mut renderer {
+						let reply = (!matches!(view.phase, "load" | "ready")).then_some(view.reply.as_str());
+						if let Err(error) = renderer.render(reply, &line, complete) { eprintln!("cannot print chat progress: {error}"); break; }
 					} else if complete && !line.is_empty() {
 						let _ = Train::write_progress(&line, false, true);
 					}
-					version = view.version;
+					version = Some(view.version);
 				}
 				if complete { break; }
 			}
 		});
 		Self { state, stop, thread: Some(thread), terminal }
 	}
+	fn finish(&self) -> f64 {
+		let mut state = self.state.lock().unwrap();
+		if !state.finished {
+			if let Some(started) = state.started { state.seconds = started.elapsed().as_secs_f64(); }
+			state.finished = true;
+			state.version += 1;
+		}
+		state.seconds
+	}
+	fn prompt(&self, tokens: usize) {
+		let mut state = self.state.lock().unwrap();
+		state.in_tokens = tokens;
+		state.phase = "prefill";
+		state.version += 1;
+	}
+	fn prefilled(&self, tokens: usize, seconds: f64) {
+		let mut state = self.state.lock().unwrap();
+		state.prefill_tokens = tokens;
+		state.prefill_seconds = seconds;
+		state.version += 1;
+	}
 	fn measured(&self, step: usize, seconds: f64) {
 		let mut state = self.state.lock().unwrap();
-		if step == 0 { state.prefill_seconds = seconds; state.phase = "tg"; }
+		if step == 0 { state.prefill_tokens = state.in_tokens.saturating_sub(state.cached); state.prefill_seconds = seconds; state.phase = "tg"; }
 		else { state.decode_steps += 1; state.decode_seconds += seconds; state.last_decode_seconds = seconds; }
 		state.version += 1;
 	}
@@ -15966,6 +16262,7 @@ impl InferenceLive {
 }
 impl Drop for InferenceLive {
 	fn drop(&mut self) {
+		self.finish();
 		let _ = self.stop.send(());
 		if let Some(thread) = self.thread.take() { let _ = thread.join(); }
 	}
@@ -16166,6 +16463,13 @@ pub struct DeviceMemory {
 	pub values: usize,
 	pub contexts: usize,
 	pub scratch: usize,
+	/// Intermediate and workspace bytes never reused in the inference forward
+	/// plan, held past their last read while later buffers are written. Included
+	/// in `values` and `contexts`, not an additional allocation.
+	pub dead: usize,
+	/// Number of distinct planned buffers contributing to `dead`, including
+	/// partially reused buffers with an unreused portion. Each buffer counts once.
+	pub dead_buffers: usize,
 }
 impl fmt::Display for DeviceMemory {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -16188,10 +16492,21 @@ fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
-	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part) })
+	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
 }
 fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 	part_memory(part, precision)?.total()
+}
+/// Full-graph model data and working buffers, independent of the failed placement boundary.
+fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> Result<RecipeError> {
+	let memory = part_memory(graph, precision)?;
+	let model = graph.nodes.iter().filter(|node| node.op == Primitive::Gather).try_fold(memory.weights, |bytes, node| {
+		node_context(graph, node, 1, node.precision, true, 0)?.into_iter().try_fold(bytes, |total, (bytes, _)| checked_add(total, bytes, "model embedding bytes"))
+	})?;
+	let total = memory.total()?;
+	let buffers = total.checked_sub(model).ok_or_else(|| RecipeError::new("model data exceeds total planned memory"))?;
+	let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
@@ -16239,6 +16554,13 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 		}
 	}
 	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
+	// A complete causal graph can have a smaller working window than a prefix
+	// whose output must retain every position. Check the actual single-device
+	// graph instead of assuming each prefix's allocation is monotonic.
+	if devices.len() == 1 {
+		require(!starts.is_empty(), "model has no block")?;
+		return if part_bytes(graph, precision)? as u64 <= free { Ok(vec![starts.len()]) } else { Err(placement_memory_error(graph, precision, free)?) };
+	}
 	let mut candidate: Option<(usize, usize, usize)> = None;
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
@@ -16257,22 +16579,7 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 			resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		}
 		if resident > free {
-			let device = split.len();
-			let mut memory = part_memory(&graph_part(graph, first, end)?, precision)?;
-			memory.device = devices[device].name.clone();
-			let legal = starts.iter().skip(1).filter(|start| !cuts_connection(graph, **start)).count();
-			let probe = starts.get(1).copied().unwrap_or(0);
-			let crossing = graph.nodes[probe..].iter().enumerate().find_map(|(offset, node)| {
-				[("source", node.source), ("second", node.second)].into_iter().find_map(|(role, reference)| match usize::try_from(reference) {
-					Ok(from) if from + 1 < probe => Some(format!("node {} block {} {role}={reference}", probe + offset, node.block_index)),
-					Err(_) if reference == -1 && probe != 0 => Some(format!("node {} block {} {role}=-1", probe + offset, node.block_index)),
-					_ => None,
-				})
-			});
-			return Err(RecipeError::new(format!(
-				"{} cannot hold graph nodes {first}..{end}: {:.3} GiB required, {:.3} GiB available; {memory}; {legal} legal block boundaries; first boundary crossing {crossing:?}",
-				memory.device, resident as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64
-			)));
+			return Err(placement_memory_error(graph, precision, free)?);
 		}
 		taken += 1;
 	}
@@ -16329,7 +16636,6 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_rope_precision: None,
 		block_activation_precision: None,
 		block_norm_precision: None,
-		block_acc: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -16369,10 +16675,12 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 	// multi-graph saved model.
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let parts = split_graph(graph, &split)?;
-	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
+	for (part, device) in parts.iter().zip(devices) {
 		let required = part_bytes(part, precision)? as u64;
 		let available = device.free_bytes()?.saturating_sub(reserve);
-		require(required <= available, format!("device {index} cannot hold placement blocks for explicit split: {required} bytes required, {available} bytes available"))?;
+		if required > available {
+			return Err(placement_memory_error(graph, precision, available)?);
+		}
 	}
 	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
@@ -16486,12 +16794,11 @@ impl Placed {
 		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
 	}
 	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
-	fn load_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.load_seconds).sum() }
 	/// Actual resident arena sizes, available directly to model scripts.
 	pub fn memory(&self) -> Vec<DeviceMemory> {
 		self.tapes.iter().flatten().map(|tape| DeviceMemory {
 			device: tape.program.gpu.name.clone(), input: tape.samples.bytes, weights: tape.weights.bytes,
-			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0,
+			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
 		}).collect()
 	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
@@ -16558,7 +16865,7 @@ impl Placed {
 			*slot = f64::from(*id);
 		}
 		decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, emit, |samples, settled, reached| {
-			let predictions = self.run_window(&samples, settled, reached)?;
+			let predictions = self.run_window_observed(samples, settled, reached, if settled == 0 { progress } else { None })?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
@@ -16580,19 +16887,22 @@ impl Placed {
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
 	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		self.run_window_observed(samples, begin, end, None)
+	}
+	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		match &self.source {
 			PlacedSource::Saved(graphs) => {
 				let mut graph = 0;
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window(ranges, prepared, begin, end)
+					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None })
 				})
 			}
 			PlacedSource::Bound(input, _) => {
 				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
-				self.forward_window(ranges, samples, begin, end)
+				self.forward_window(ranges, samples, begin, end, progress)
 			}
 		}
 	}
@@ -16601,7 +16911,7 @@ impl Placed {
 	/// `samples` enter the first range, each range writes the positions the
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
-	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
@@ -16612,8 +16922,13 @@ impl Placed {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
 		}
 		let (mut begin, mut end) = (begin, end);
+		let mut seconds = 0.0;
 		for (index, tape) in tapes.iter().enumerate() {
-			tape.forward_window(begin, end, ForwardMode::Inference)?;
+			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, elapsed| {
+				seconds += elapsed;
+				// A token has completed prefill only after the final placed range.
+				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize, seconds); }
+			})?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
 			for (start, count) in window_runs(tape.output, begin, end) {
@@ -16766,7 +17081,7 @@ struct Node {
 	/// The arithmetic this node computes in.
 	precision: Compute,
 	/// The accumulator its sums and reductions carry: fp32, or fp64 when the
-	/// block or the table declared acc(64).
+	/// precision table selects an fp64 accumulator.
 	acc: Compute,
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
@@ -16802,7 +17117,6 @@ struct Graph {
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
-	block_acc: Option<Compute>,
 	/// The precision the block being lowered named for its blck, if any.
 	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
@@ -16845,7 +17159,6 @@ impl Graph {
 			block_kind: "",
 			block_frozen: false,
 			block_precision: None,
-			block_acc: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
 			block_qk_precision: None,
@@ -16944,7 +17257,6 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	graph.block_frozen = false;
 	graph.block_precision = None;
-	graph.block_acc = None;
 	graph.block_blck_precision = None;
 	graph.block_kv_precision = None;
 	graph.block_qk_precision = None;
@@ -17115,10 +17427,9 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision, graph.block_acc);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
-	graph.block_acc = block.acc;
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
 	graph.block_qk_precision = block.qk_precision;
@@ -17189,7 +17500,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
 	// int8 inputs and scaled once per block sum. The sum's own values are what
-	// the int dot produces: its accumulator, fp32 or the fp64 an acc(64) names.
+	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
 	for index in first..graph.nodes.len() {
 		let Compute::Int(format) = graph.nodes[index].precision else { continue };
 		let node = &graph.nodes[index];
@@ -17234,7 +17545,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision, graph.block_acc) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -17307,12 +17618,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let kind = precision_kind(op, graph.block_kind);
 	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
 	let precision = graph.profile.resolve(named.unwrap_or(graph.profile.of(kind)));
-	let acc = graph.block_acc.unwrap_or(graph.profile.acc_of(kind));
-	// An fp64 block has no fp32
-	// accumulator: the table's fp32 is a floor it already exceeds, but a block
-	// that names acc(32) on it asks for something the block cannot do.
-	let double_state = precision == Compute::FP64;
-	require(!(double_state && graph.block_acc == Some(Compute::FP32)), format!("block {} computes in {}, whose state is double; acc(32) names a narrower accumulator than its state, so name acc(64) or nothing", graph.block_index, precision.label()))?;
+	let acc = graph.profile.acc_of(kind);
 	let int_step = graph.profile.step;
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
@@ -19323,15 +19629,16 @@ mod precision_contract_checks {
 		for tail in [false, true] {
 			let mut config = Config::load().unwrap();
 			config.profile.train = Some(Compute::FP16);
+			config.profile.acc = Compute::FP64;
 			let sample = 2.0_f64.powi(-14);
 			let target = sample;
 			let prepared = Prepared::matrix(vec![sample; 32], vec![target], 1, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).acc(64).loss(mse);
+			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
 			let scale = if tail { 2.0_f64.powi(-14) } else { 1.0 };
 			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
 			if tail {
 				graph.block_precision = Some(Compute::FP32);
-				graph.block_acc = Some(Compute::FP32);
+				graph.profile.acc = Compute::FP32;
 				lower_scale(&mut graph, scale).unwrap();
 			}
 			graph.parameters.fill(sample);
@@ -19605,6 +19912,7 @@ struct NativeTape {
 	last_device_seconds: AtomicU64,
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
+	window_begin: std::sync::atomic::AtomicU32,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -19913,22 +20221,7 @@ impl NativeTape {
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
 			}
 		}
-		// A new sequence clears every mutable context span. Packed embedding
-		// tables and saved evaluation statistics remain unchanged.
-		let mut context_resets = Vec::<(usize, usize)>::new();
-		for (index, node) in graph.nodes.iter().enumerate() {
-			let persistent = node.op == Primitive::Gather || (node.op == Primitive::Normalize && normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Evaluation);
-			if persistent {
-				continue;
-			}
-			let start = layout.contexts[index];
-			let end = layout.contexts.get(index + 1).copied().unwrap_or_else(|| layout.schedule.iter().copied().filter(|offset| *offset != usize::MAX).min().unwrap_or(layout.contexts_bytes));
-			if let Some((_, prior_end)) = context_resets.last_mut().filter(|(_, prior_end)| *prior_end == start) {
-				*prior_end = end;
-			} else {
-				context_resets.push((start, end));
-			}
-		}
+		let context_resets = layout.context_resets.clone();
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
 			contexts.write_bytes(offset, &region)?;
@@ -19989,6 +20282,7 @@ impl NativeTape {
 			load_seconds,
 			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
 			reached: std::sync::atomic::AtomicU32::new(0),
+			window_begin: std::sync::atomic::AtomicU32::new(0),
 		};
 		tape.stage_lookups(0, tape.positions)?;
 		Ok(tape)
@@ -20102,8 +20396,24 @@ impl NativeTape {
 		self.forward_window_with_samples(self.samples.pointer, begin, end, mode)
 	}
 	fn forward_window_with_samples(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
+		self.forward_window_observed(samples, begin, end, mode, &mut |_, _| {})
+	}
+	fn forward_window_observed(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64)) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		let capacity = self.program.artifact.layout.window_positions as u32;
+		if end - begin > capacity {
+			let (mut cursor, mut seconds) = (begin, 0.0);
+			while cursor < end {
+				let stop = cursor.saturating_add(capacity).min(end);
+				self.forward_window_observed(samples, cursor, stop, mode, observed)?;
+				seconds += f64::from_bits(self.last_device_seconds.load(Ordering::Acquire));
+				cursor = stop;
+			}
+			self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+			return Ok(());
+		}
 		self.reached.store(end, Ordering::Relaxed);
+		self.window_begin.store(begin, Ordering::Relaxed);
 		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
@@ -20121,6 +20431,7 @@ impl NativeTape {
 		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+		observed(end, seconds);
 		if let Some(clocks) = self.program.artifact.layout.clocks {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
@@ -20289,9 +20600,9 @@ impl NativeTape {
 			// a slot holds after the forward, not what the node wrote.
 			let extra = std::env::var("RECIPE_TRACE_DUMP").ok().and_then(|text| { let (from, to) = text.split_once("..")?; Some((from.trim().parse::<usize>().ok()?, to.trim().parse::<usize>().ok()?)) });
 			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| traced_node(*index, total) || extra.is_some_and(|(from, to)| (from..to).contains(index))) {
-				let shape = self.nodes[index].output;
+				let shape = window_shape(self.nodes[index].output, self.input.length, layout.window_positions);
 				let (channels, length) = (shape.channels, shape.length);
-				let positions = reached.clamp(1, length.max(1));
+				let positions = if layout.window_positions < self.input.length { reached.saturating_sub(self.window_begin.load(Ordering::Relaxed) as usize) } else { reached }.clamp(1, length.max(1));
 				// The arena is channel-major over the whole context, so the bytes up
 				// to the last reached position of the last channel come back raw and
 				// only the reached positions are unpacked.
@@ -21253,12 +21564,9 @@ fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize,
 	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
 	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
 }
-/// Returns the context arena size, in model elements, for a generic recurrent
-/// body. The first part is the ordinary scan state arena; the remainder is a
-/// cell scratch row, a value/adjoint tape for every position, a temporary body
-/// gradient vector, and the cell-output adjoint tape consumed by the legacy
-/// recurrent reverse kernel.
-fn recurrent_body_elements(graph: &Graph, node: &Node, rows: usize) -> Result<Option<usize>> {
+/// Context regions in model elements, including which forward data survives
+/// the next window and which storage only the backward pass uses.
+fn recurrent_body_regions(graph: &Graph, node: &Node, rows: usize, inference: bool, step: usize) -> Result<Option<Vec<(usize, BufferLifetime)>>> {
 	if node.op != Primitive::Scan || node.argument[5] != 1.0 {
 		return Ok(None);
 	}
@@ -21288,7 +21596,19 @@ fn recurrent_body_elements(graph: &Graph, node: &Node, rows: usize) -> Result<Op
 	let temporary_gradient = checked_add(adjoints, adjoints_total, "recurrent body temporary gradient")?;
 	let cell_delta = checked_add(temporary_gradient, body_gradient, "recurrent body cell adjoint")?;
 	let total = checked_add(cell_delta, checked_mul(rows, node.output.elements(), "recurrent body cell adjoint")?, "recurrent body context")?;
-	Ok(Some(total.max(1)))
+	if !inference { return Ok(Some(vec![(total.max(1), BufferLifetime::Retained)])); }
+	let local = BufferLifetime::Until(step);
+	let gates = checked_mul(node.argument[0] as usize, state_count, "recurrent gate context")?;
+	let forward = checked_add(gates, state_count, "recurrent forward context")?;
+	Ok(Some(vec![
+		(gates, local),
+		(state_count, if node.argument[0] == 4.0 { BufferLifetime::Retained } else { BufferLifetime::Unused }),
+		(scan_base - forward, BufferLifetime::Unused),
+		(cell, local),
+		(values - cell_values, BufferLifetime::Retained),
+		(values_total, local),
+		(total - adjoints, BufferLifetime::Unused),
+	]))
 }
 fn backward_context_offset(node: &Node, rows: usize) -> Result<usize> {
 	let elements = match node.op {
@@ -21321,24 +21641,32 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 	};
 	checked_mul(elements, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "backward context bytes")
 }
-fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool) -> Result<usize> {
+/// Context sizing and lifetimes are one declaration consumed by allocation.
+/// Regions remain contiguous and in the order the kernel reads them.
+fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool, step: usize) -> Result<Vec<(usize, BufferLifetime)>> {
+	use BufferLifetime::{ReadOnly, Retained, Unused};
+	let local = if inference { BufferLifetime::Until(step) } else { Retained };
+	let unused = if inference { Unused } else { Retained };
 	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
-		return Ok(bytes);
+		return Ok(vec![(bytes, ReadOnly)]);
 	}
-	if let Some(elements) = recurrent_body_elements(graph, node, rows)? {
-		return checked_mul(elements, precision.bytes(), "recurrent body context bytes");
+	if let Some(regions) = recurrent_body_regions(graph, node, rows, inference, step)? {
+		return regions.into_iter().map(|(elements, lifetime)| Ok((checked_mul(elements, precision.bytes(), "recurrent body context bytes")?, lifetime))).collect();
 	}
 	let state = carried(node, rows)?.values;
-	let elements = match node.op {
+	let regions = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
-		Primitive::Elementwise if inference => 1,
+		Primitive::Elementwise if inference => vec![(precision.bytes(), Unused)],
 		Primitive::Elementwise => {
 			let partials = checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?;
-			return checked_mul(partials.max(1), NativePrecision::new(node.precision, node.acc)?.state.bytes(), "scalar gradient partial bytes");
+			vec![(checked_mul(partials.max(1), NativePrecision::new(node.precision, node.acc)?.state.bytes(), "scalar gradient partial bytes")?, Retained)]
 		}
-		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		Primitive::Predictor => {
+			let elements = checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?;
+			vec![(checked_mul(elements.max(1), precision.bytes(), "predictor workspace bytes")?, local)]
+		}
 		// Softmax statistics, then the indexer block representatives, then one
 		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
@@ -21347,54 +21675,71 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
 			let derivatives = if inference { 0 } else { checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")? };
-			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
+			vec![
+				(checked_mul(statistics, precision.bytes(), "attention statistics bytes")?, local),
+				(checked_mul(representatives, precision.bytes(), "indexer representatives bytes")?, Retained),
+				(checked_mul(scores, precision.bytes(), "indexer scores bytes")?, local),
+				(checked_mul(derivatives, precision.bytes(), "indexer derivatives bytes")?, Retained),
+			]
 		}
 		// The gate states, then the weight gradient rows only the reverse pass
 		// accumulates, then the reduction scratch.
 		Primitive::Scan => {
-			if !inference { return checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "scan context"); }
+			if !inference { return Ok(vec![(checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "scan context")?, Retained)]); }
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
-			let state_spans = gates.checked_add(1).ok_or_else(|| RecipeError::new("scan state spans overflow"))?;
-			checked_mul(state_spans.checked_add(node.argument[1] as usize).ok_or_else(|| RecipeError::new("scan state spans overflow"))?, state_count, "scan states")?
+			let state_bytes = checked_mul(state_count, precision.bytes(), "scan state bytes")?;
+			vec![
+				(checked_mul(gates, state_bytes, "scan gate bytes")?, local),
+				(state_bytes, if gates == 4 { Retained } else { Unused }),
+				(checked_mul(node.argument[1] as usize, state_bytes, "scan reserved bytes")?, Unused),
+			]
 		}
 		// One thread owns one row and head: the chunk entry states, the live state,
 		// the chunk the reverse pass replays, the state adjoint, the readout error
 		// and key weight vectors, and one decay partial. The forward pass carries
 		// the live state alone, so an inference pair holds no entry or replay span.
 		Primitive::Delta => {
-			if !inference { return checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "delta context"); }
+			if !inference { return Ok(vec![(checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "delta context")?, Retained)]); }
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta state")?;
-			let pair = checked_add(state, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
-			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
+			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
+			vec![
+				(checked_mul(pair_bytes, state, "delta carried state bytes")?, Retained),
+				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+			]
 		}
-		Primitive::Pool if inference => return Ok(0),
-		Primitive::Pool => return checked_mul(state, size_of::<u64>(), "pool context bytes"),
+		Primitive::Pool if inference => Vec::new(),
+		Primitive::Pool => vec![(checked_mul(state, size_of::<u64>(), "pool context bytes")?, Retained)],
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
-		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
-		Primitive::Lookup => state,
+		Primitive::Gather => vec![(checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes")?, ReadOnly)],
+		Primitive::Lookup => vec![(checked_mul(state.max(1), precision.bytes(), "lookup context bytes")?, Retained)],
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order. Only the weight gradients walk
 		// the lists, so an inference tape holds none.
-		Primitive::ExpertIn | Primitive::ExpertOut if inference => 1,
+		Primitive::ExpertIn | Primitive::ExpertOut if inference => vec![(precision.bytes(), Unused)],
 		Primitive::ExpertIn | Primitive::ExpertOut => {
 			let entries = checked_mul(checked_mul(rows, node.output.length, "routed positions")?, node.argument[1] as usize, "routed slots")?;
-			return checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes");
+			vec![(checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes")?, Retained)]
 		}
 		// Four statistics per group; for an evaluation mode that span is the saved
 		// mean and variance the node declares, so it is counted once.
 		Primitive::Normalize => {
 			if inference {
-				return checked_mul(checked_mul(2, normalize_groups(node, rows)?, "normalization statistics")?, precision.bytes(), "normalization context");
+				let lifetime = match normalize_mode(node.argument[0])? {
+					program_ir::NormalizeMode::Evaluation => ReadOnly,
+					program_ir::NormalizeMode::Batch => Retained,
+					_ => local,
+				};
+				return Ok(vec![(checked_mul(checked_mul(2, normalize_groups(node, rows)?, "normalization statistics")?, precision.bytes(), "normalization context")?, lifetime)]);
 			}
 			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
 			let partial_bytes = checked_mul(partials, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "normalization weight partial bytes")?;
-			return checked_add(normalize_gradient_scratch(node, rows)?, partial_bytes, "normalization context");
+			vec![(checked_add(normalize_gradient_scratch(node, rows)?, partial_bytes, "normalization context")?, Retained)]
 		}
-		_ => 1,
+		_ => vec![(precision.bytes(), unused)],
 	};
-	checked_mul(elements.max(1), precision.bytes(), "context bytes")
+	Ok(regions)
 }
 fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))

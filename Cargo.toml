@@ -138,10 +138,6 @@ fp8-e5m2-special = [123, 126, 124]
 default-config = "recipe"
 
 [precision.recipe]
-fp8 = "e4m3"
-train = "fp32"
-tolerance = 0.05
-exact-cpu = false
 sum = "int8"
 embed = "fp16"
 attn = "fp16"
@@ -151,11 +147,15 @@ atvn = "fp16"
 norm = "fp16"
 res = "fp16"
 acc = "fp32"
-step = 32
+train = "fp32"
+fp8 = "e4m3"
 rope-angle = "direct"
 attn-softmax = "full"
 math = "portable"
 gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
 
 [precision.llamacpp]
 fp8 = "e4m3"

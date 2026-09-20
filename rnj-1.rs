@@ -1,5 +1,5 @@
 use recipe::*;
-use recipe::infer::{cached, out, pp, r#in, tg};
+use recipe::infer::{cached, input, out, pp, tg, time};
 
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
 // llama.cpp's Gemma3 loader uses this architecture default and ignores the
@@ -18,7 +18,7 @@ fn main() {
 		model = model
 			.res([
 				norm(rms).fp(16),
-				attn(gemma3.attention.head_count).int(8).acc(32)
+				attn(gemma3.attention.head_count).int(8)
 					.kv(gemma3.attention.head_count_kv).fp(16)
 					.qk(rms).fp(16)
 					.rope(
@@ -36,19 +36,19 @@ fn main() {
 			]).fp(16)
 			.res([
 				norm(rms).fp(16),
-				layer(gemma3.feed_forward_length).int(8).acc(32).gelu().fp(16)
-					* layer(gemma3.feed_forward_length).int(8).acc(32),
-				layer(gemma3.embedding_length).int(8).acc(32),
+				layer(gemma3.feed_forward_length).int(8).gelu().fp(16)
+					* layer(gemma3.feed_forward_length).int(8),
+				layer(gemma3.embedding_length).int(8),
 				norm(rms).fp(16),
 			]).fp(16);
 	}
 
 	model = model
 		.norm(rms).fp(16)
-		.layer(tokenizer.ggml.tokens).int(8).acc(32)
+		.layer(tokenizer.ggml.tokens).int(8)
 		.scale(1.0 / gemma3.final_logit_softcapping).fp(16)
 		.tanh().fp(16)
 		.scale(gemma3.final_logit_softcapping).fp(16);
 
-	recipe.infer().chat([pp, tg, r#in, out, cached]).run(&model, &data);
+	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
 }

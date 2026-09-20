@@ -2388,7 +2388,7 @@ ret void }
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
 define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
- i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
+	i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse, i32 %position.origin ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %p
@@ -2434,7 +2434,7 @@ factor.ready:
 %interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
 %blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
 %frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
-%position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
+%position.local = trunc i64 %position to i32 %position.i32 = add i32 %position.local, %position.origin %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
 %cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
 %sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
 %sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
@@ -3834,10 +3834,22 @@ done:
 %sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.0to7, RECIPE_STATE %sum.8to15)
 ret RECIPE_STATE %sum
 }
+define internal i64 @recipe.window.index(i64 %index, i32 %length, i32 %pitch, i32 %origin) #1 {
+entry:
+	%length.wide = zext i32 %length to i64
+	%pitch.wide = zext i32 %pitch to i64
+	%origin.wide = zext i32 %origin to i64
+	%channel = udiv i64 %index, %length.wide
+	%position = urem i64 %index, %length.wide
+	%channel.scaled = mul i64 %channel, %pitch.wide
+	%position.shifted = sub i64 %position, %origin.wide
+	%result = add i64 %channel.scaled, %position.shifted
+	ret i64 %result
+}
 define internal void @attention_forward_step_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture writeonly %output,
 ptr addrspace(1) %context, ptr addrspace(1) %kv.context,
-i32 %from, i32 %heads, i32 %channels, i32 %position, i32 %kv.heads, i32 %threads) #3 {
+i32 %from, i32 %heads, i32 %channels, i32 %position, i32 %kv.heads, i32 %threads, i32 %buffer.length, i32 %buffer.origin) #3 {
 entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
@@ -3882,12 +3894,14 @@ cache.step:
 %cache.position.wide = zext i32 %cache.position.index to i64
 %cache.key.source.index = add i32 %from, %cache.position.index
 %cache.key.source.wide = zext i32 %cache.key.source.index to i64
-%cache.key.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.key.source.wide
+%cache.key.source.phys = call i64 @recipe.window.index(i64 %cache.key.source.wide, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%cache.key.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.key.source.phys
 %cache.key.value = load double, ptr addrspace(1) %cache.key.source.ptr, align 8
 %cache.value.base = add i32 %from, %kv.plane
 %cache.value.source.index = add i32 %cache.value.base, %cache.position.index
 %cache.value.source.wide = zext i32 %cache.value.source.index to i64
-%cache.value.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.value.source.wide
+%cache.value.source.phys = call i64 @recipe.window.index(i64 %cache.value.source.wide, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%cache.value.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %cache.value.source.phys
 %cache.value.value = load double, ptr addrspace(1) %cache.value.source.ptr, align 8
 %cache.key.ptr = getelementptr inbounds RECIPE_KV, ptr addrspace(1) %kv.context, i64 %cache.position.wide
 %cache.key.kv = call RECIPE_KV @recipe.kv.encode(double %cache.key.value)
@@ -3918,7 +3932,8 @@ score.query.copy.step:
 %score.query.channel.base = mul i32 %score.query.global.channel, %length
 %score.query.index = add i32 %score.query.channel.base, %position
 %score.query.wide = zext i32 %score.query.index to i64
-%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %score.query.wide
+%score.query.phys = call i64 @recipe.window.index(i64 %score.query.wide, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %score.query.phys
 %score.query.value = load double, ptr addrspace(1) %score.query.ptr, align 8
 %score.query.RECIPE_STATE = call RECIPE_STATE @recipe.state.from.model(double %score.query.value)
 %score.query.shared.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %tile.RECIPE_STATE, i32 %score.query.channel
@@ -4188,7 +4203,8 @@ output.store:
 %output.position.base = mul i32 %output.channel, %length
 %output.position.index = add i32 %output.position.base, %position
 %output.position.wide = zext i32 %output.position.index to i64
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.position.wide
+%output.position.phys = call i64 @recipe.window.index(i64 %output.position.wide, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.position.phys
 %output.half.value = call double @recipe.model.from.state(RECIPE_STATE %output.wave.sum)
 store double %output.half.value, ptr addrspace(1) %output.ptr, align 8
 br label %output.channel.done
@@ -4742,7 +4758,7 @@ ret void
 ; accumulated in the cache type (one fma, rounded, per key), the sum as
 ; fma(S, ms, vs), and the output the accumulator times one over the sum.
 define internal void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context,
-i64 %row.stride, i64 %row.cache, i64 %output.row, i32 %head, i32 %position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %width, i32 %length, i1 %unscaled, i1 %gate, i64 %gate.row) #1 {
+i64 %row.stride, i64 %row.cache, i64 %output.row, i32 %head, i32 %position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %width, i32 %length, i1 %unscaled, i1 %gate, i64 %gate.row, i32 %buffer.length, i32 %buffer.origin) #1 {
 entry:
 %q16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
 %v16 = alloca [256 x RECIPE_KV], align RECIPE_KV_ALIGN, addrspace(5)
@@ -4786,7 +4802,8 @@ q.step:
 %q.channel.offset = mul i64 %q.d.wide, %length.wide
 %q.index.base = add i64 %q.row, %q.channel.offset
 %q.index = add i64 %q.index.base, %position.wide
-%q.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q.index
+%q.index.phys = call i64 @recipe.window.index(i64 %q.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%q.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %q.index.phys
 %q.model = load double, ptr addrspace(1) %q.ptr, align 8
 %q.value = call RECIPE_STATE @recipe.state.from.model(double %q.model)
 %q.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %q.value, RECIPE_STATE %q.scale)
@@ -4980,14 +4997,16 @@ out.step:
 br i1 %gate, label %out.gate, label %out.store
 out.gate:
 %gate.index = add i64 %gate.row, %out.local
-%gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %gate.index
+%gate.index.phys = call i64 @recipe.window.index(i64 %gate.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %gate.index.phys
 %gate.value = load double, ptr addrspace(1) %gate.ptr, align 8
 %gate.factor = call double @recipe.sigmoid(double %gate.value)
 %out.gated = call double @recipe.mul(double %out.model, double %gate.factor)
 br label %out.store
 out.store:
 %out.result = phi double [ %out.model, %out.step ], [ %out.gated, %out.gate ]
-%out.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %out.index
+%out.index.phys = call i64 @recipe.window.index(i64 %out.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%out.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %out.index.phys
 store double %out.result, ptr addrspace(1) %out.ptr, align 8
 %od.next = add i32 %od, 1
 br label %out.loop
@@ -4999,7 +5018,7 @@ ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly 
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
-i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online ) #3 { entry:
+i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin ) #3 { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -5098,7 +5117,8 @@ online.cache.step:
 %oc.source.plane.wide = zext i32 %oc.source.plane to i64
 %oc.source.base = add i64 %oc.source.row, %oc.source.plane.wide
 %oc.source.index = add i64 %oc.source.base, %oc.local.index
-%oc.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %oc.source.index
+%oc.source.index.phys = call i64 @recipe.window.index(i64 %oc.source.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%oc.source.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %oc.source.index.phys
 %oc.value = load double, ptr addrspace(1) %oc.source.ptr, align 8
 %oc.cache.plane.wide = zext i32 %oc.cache.plane to i64
 %oc.cache.base = add i64 %oc.cache.row, %oc.cache.plane.wide
@@ -5128,7 +5148,7 @@ online.query.step:
 %oq.row.cache = mul i64 %oq.row.wide, %kv.planes.global
 %oq.output.row = mul i64 %oq.row.wide, %from.global
 %oq.gate.row = add i64 %oq.row.stride, %gate.base.global
-call void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context, i64 %oq.row.stride, i64 %oq.row.cache, i64 %oq.output.row, i32 %oq.head, i32 %oq.position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %head.width, i32 %length, i1 %unscaled, i1 %gate, i64 %oq.gate.row)
+call void @attention_online_query(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %kv.context, i64 %oq.row.stride, i64 %oq.row.cache, i64 %oq.output.row, i32 %oq.head, i32 %oq.position, i32 %heads, i32 %kv.heads, i32 %value.heads, i32 %head.width, i32 %length, i1 %unscaled, i1 %gate, i64 %oq.gate.row, i32 %buffer.length, i32 %buffer.origin)
 %oq.next = add i32 %oq, %threads
 br label %online.query.loop
 job.loop:
@@ -5171,7 +5191,8 @@ query.stage.step:
 %query.channel.wide = zext i32 %query.channel to i64 %query.channel.base = mul i64 %query.channel.wide, %length.global
 %query.local.wide = zext i32 %query.local to i64 %query.position.wide = zext i32 %query.position to i64 %query.input.local = add i64 %query.channel.base, %query.position.wide
 %query.input.index = add i64 %row.base.wide, %query.input.local
-%query.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %query.input.index
+%query.input.index.phys = call i64 @recipe.window.index(i64 %query.input.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%query.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %query.input.index.phys
 %query.value = load double, ptr addrspace(1) %query.input.ptr, align 8
 %query.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %query.p
 store double %query.value, ptr addrspace(3) %query.shared.ptr, align 8
@@ -5270,11 +5291,13 @@ key.cache.load:
 %value.cache.value = call double @recipe.kv.decode(RECIPE_KV %value.cache.kv)
 br label %key.loaded
 key.source.load:
-%key.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %key.input.index
+%key.input.index.phys = call i64 @recipe.window.index(i64 %key.input.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%key.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %key.input.index.phys
 %key.source.value = load double, ptr addrspace(1) %key.input.ptr, align 8
 %value.row = add i64 %row.base.wide, %value.plane.base.global
 %value.input.index = add i64 %value.row, %value.input.local
-%value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.input.index
+%value.input.index.phys = call i64 @recipe.window.index(i64 %value.input.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.input.index.phys
 %value.source.value = load double, ptr addrspace(1) %value.input.ptr, align 8
 br i1 %carry, label %key.cache.store, label %key.loaded.source
 key.cache.store:
@@ -5497,12 +5520,14 @@ output.value.store:
 %output.query.wide = zext i32 %output.query to i64 %output.local = add i64 %output.channel.base, %output.query.wide
 %output.row.base = mul i64 %row.wide, %from.global
 %output.index = add i64 %output.row.base, %output.local
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.index
+%output.index.phys = call i64 @recipe.window.index(i64 %output.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.index.phys
 br i1 %gate, label %output.gate, label %output.plain
 output.gate:
 %output.gate.row = add i64 %row.base.wide, %gate.base.global
 %output.gate.index = add i64 %output.gate.row, %output.local
-%output.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %output.gate.index
+%output.gate.index.phys = call i64 @recipe.window.index(i64 %output.gate.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%output.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %output.gate.index.phys
 %output.gate.value = load double, ptr addrspace(1) %output.gate.ptr, align 8
 %output.gate.factor = call double @recipe.sigmoid(double %output.gate.value)
 %output.gated = call double @recipe.mul(double %attention, double %output.gate.factor)
