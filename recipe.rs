@@ -1,6 +1,12 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention uses learned Q/K/V and output projections.
 #![allow(non_upper_case_globals)]
+// Compile the same numeric definitions as the template generator, without separate source files.
+#[allow(dead_code)]
+#[path = "build.rs"]
+mod native_build;
+use native_build::{encoding, fp8};
+mod reference;
 mod program_ir {
 	//! Compile-time lowering for the scalar, predictor, route, and normalization
 	//! pieces of a concrete model.
@@ -31,6 +37,11 @@ mod program_ir {
 		Greater = 13,
 		StraightThrough = 14,
 		Select = 15,
+		/// The exact product of the Multiply at `left` plus `right`, in one
+		/// rounding: fma(multiply.left, multiply.right, right).
+		FusedAdd = 16,
+		/// The left operand rounded through fp16 and back.
+		Half = 17,
 	}
 
 	impl ScalarOpcode {
@@ -51,6 +62,8 @@ mod program_ir {
 				13 => Ok(Self::Greater),
 				14 => Ok(Self::StraightThrough),
 				15 => Ok(Self::Select),
+				16 => Ok(Self::FusedAdd),
+				17 => Ok(Self::Half),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -126,7 +139,14 @@ mod program_ir {
 
 	#[derive(Clone, Copy)]
 	pub struct ScalarContext<'a> {
+		/// The node's model type: what its operands and result are stored as.
 		pub value_type: &'a str,
+		/// The node's state type: what the program computes in. Operands decode
+		/// once on entry and the result encodes once on exit.
+		pub state_type: &'a str,
+		/// Whether the transcendental steps take the platform libm on the CPU
+		/// (`recipe.libm.*`) instead of the portable evaluations.
+		pub libm: bool,
 		/// The template variant suffix of the node's arithmetic.
 		pub suffix: &'a str,
 		pub pointer_type: &'a str,
@@ -175,6 +195,42 @@ mod program_ir {
 		name.to_owned()
 	}
 
+	/// The same two in the state family, for the scalar programs.
+	fn state_binary(code: &mut String, state_type: &str, suffix: &str, name: &str, operation: &str, left: &str, right: &str) -> String {
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.{operation}{suffix}({state_type} {left}, {state_type} {right})");
+		name.to_owned()
+	}
+
+	fn state_predicate(code: &mut String, state_type: &str, suffix: &str, name: &str, operation: &str, left: &str, right: &str) -> String {
+		let _ = writeln!(code, "{name}.condition = call i1 @recipe.state.{operation}{suffix}({state_type} {left}, {state_type} {right})");
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.from.u1{suffix}(i1 {name}.condition)");
+		name.to_owned()
+	}
+
+	/// The names the scalar programs give the decoded operands.
+	fn scalar_entries(prefix: &str) -> (String, String) {
+		(format!("%{prefix}.first.state"), format!("%{prefix}.second.state"))
+	}
+
+	/// Decode the two model-typed operands into the state once, at the top of a
+	/// scalar program; the reverse pass reuses these names.
+	fn scalar_prologue(code: &mut String, context: &ScalarContext<'_>) -> (String, String) {
+		let (first, second) = scalar_entries(context.prefix);
+		let _ = writeln!(code, "{first} = call {state} @recipe.state.from.model{suffix}({ty} {source})", state = context.state_type, suffix = context.suffix, ty = context.value_type, source = context.first);
+		if context.second == context.first {
+			let _ = writeln!(code, "{second} = call {state} @recipe.state.add{suffix}({state} {first}, {state} {zero})", state = context.state_type, suffix = context.suffix, zero = (context.literal)(0.0, context.state_type));
+		} else {
+			let _ = writeln!(code, "{second} = call {state} @recipe.state.from.model{suffix}({ty} {source})", state = context.state_type, suffix = context.suffix, ty = context.value_type, source = context.second);
+		}
+		(first, second)
+	}
+
+	/// A transcendental step's helper family: the platform libm when asked for
+	/// and the step has one, else the portable state evaluation.
+	fn scalar_math(libm: bool, operation: &str) -> &'static str {
+		if libm && matches!(operation, "exp" | "log" | "sin" | "cos" | "tanh") { "recipe.libm" } else { "recipe.state" }
+	}
+
 	fn parse_scalar(code: &[f64]) -> Result<Vec<ScalarInstruction>, EmitError> {
 		if code.len() % 3 != 0 {
 			return Err(EmitError::WrongWidth { kind: "scalar", width: code.len() });
@@ -199,13 +255,15 @@ mod program_ir {
 	/// forward path, matching the real block's inference semantics.
 	pub fn emit_scalar_forward(code: &[f64], context: ScalarContext<'_>) -> Result<ScalarForward, EmitError> {
 		let suffix = context.suffix;
+		let ty = context.state_type;
 		let instructions = parse_scalar(code)?;
 		let mut output = String::new();
+		let (first, second) = scalar_prologue(&mut output, &context);
 		let mut values = Vec::with_capacity(instructions.len());
 		for (index, instruction) in instructions.iter().enumerate() {
 			let name = format!("%{}.scalar.{index}", context.prefix);
 			let value = match instruction.opcode {
-				ScalarOpcode::Constant => (context.literal)(instruction.left, context.value_type),
+				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
 				ScalarOpcode::Parameter => {
 					let parameter = integer(instruction.left, "scalar parameter")?;
 					if parameter < 0 {
@@ -215,16 +273,16 @@ mod program_ir {
 						let pointer = format!("{name}.ptr");
 						let _ = writeln!(
 							output,
-							"{pointer} = getelementptr inbounds {ty}, {ptrty} {weights}, i64 {parameter}",
-							ty = context.value_type,
+							"{pointer} = getelementptr inbounds {model}, {ptrty} {weights}, i64 {parameter}",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							weights = context.weights,
 							parameter = parameter
 						);
 						let _ = writeln!(
 							output,
-							"{name} = load {ty}, {ptrty} {pointer}, align {align}",
-							ty = context.value_type,
+							"{name}.model = load {model}, {ptrty} {pointer}, align {align}",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							pointer = pointer,
 							align = context.alignment
@@ -232,39 +290,54 @@ mod program_ir {
 					} else {
 						let _ = writeln!(
 							output,
-							"{name} = call {ty} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {parameter}, i32 {decode})",
-							ty = context.value_type,
+							"{name}.model = call {model} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {parameter}, i32 {decode})",
+							model = context.value_type,
 							ptrty = context.pointer_type,
 							weights = context.weights,
 							parameter = parameter,
 							decode = context.decode
 						);
 					}
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
 					name
 				}
-				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &first, &second)?,
 				ScalarOpcode::Select => {
-					let condition = scalar_operand(instruction.left, &values, context.first, context.second)?;
-					let value = scalar_operand(instruction.right, &values, context.first, context.second)?;
-					let zero = (context.literal)(0.0, context.value_type);
-					let _ = writeln!(output, "{name}.condition = call i1 @recipe.ogt{suffix}({ty} {condition}, {ty} {zero})", ty = context.value_type);
-					let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}", ty = context.value_type);
+					let condition = scalar_operand(instruction.left, &values, &first, &second)?;
+					let value = scalar_operand(instruction.right, &values, &first, &second)?;
+					let zero = (context.literal)(0.0, ty);
+					let _ = writeln!(output, "{name}.condition = call i1 @recipe.state.ogt{suffix}({ty} {condition}, {ty} {zero})");
+					let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}");
+					name
+				}
+				ScalarOpcode::FusedAdd => {
+					let product = fused_product(&instructions, instruction.left)?;
+					let left = scalar_operand(product.left, &values, &first, &second)?;
+					let right = scalar_operand(product.right, &values, &first, &second)?;
+					let addend = scalar_operand(instruction.right, &values, &first, &second)?;
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.madd{suffix}({ty} {addend}, {ty} {left}, {ty} {right})");
+					name
+				}
+				ScalarOpcode::Half => {
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
+					let _ = writeln!(output, "{name}.half = call half @recipe.state.to.f16{suffix}({ty} {left})");
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.f16{suffix}(half {name}.half)");
 					name
 				}
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater => {
-					let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
-					let right = scalar_operand(instruction.right, &values, context.first, context.second)?;
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
+					let right = scalar_operand(instruction.right, &values, &first, &second)?;
 					match instruction.opcode {
-						ScalarOpcode::Add => binary(&mut output, context.value_type, context.suffix, &name, "add", &left, &right),
-						ScalarOpcode::Subtract => binary(&mut output, context.value_type, context.suffix, &name, "sub", &left, &right),
-						ScalarOpcode::Multiply => binary(&mut output, context.value_type, context.suffix, &name, "mul", &left, &right),
-						ScalarOpcode::Divide => binary(&mut output, context.value_type, context.suffix, &name, "div", &left, &right),
-						ScalarOpcode::Greater => predicate(&mut output, context.value_type, context.suffix, &name, "ogt", &left, &right),
+						ScalarOpcode::Add => state_binary(&mut output, ty, suffix, &name, "add", &left, &right),
+						ScalarOpcode::Subtract => state_binary(&mut output, ty, suffix, &name, "sub", &left, &right),
+						ScalarOpcode::Multiply => state_binary(&mut output, ty, suffix, &name, "mul", &left, &right),
+						ScalarOpcode::Divide => state_binary(&mut output, ty, suffix, &name, "div", &left, &right),
+						ScalarOpcode::Greater => state_predicate(&mut output, ty, suffix, &name, "ogt", &left, &right),
 						_ => unreachable!(),
 					}
 				}
 				ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => {
-					let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
+					let left = scalar_operand(instruction.left, &values, &first, &second)?;
 					let operation = match instruction.opcode {
 						ScalarOpcode::Absolute => "abs",
 						ScalarOpcode::Exp => "exp",
@@ -274,26 +347,39 @@ mod program_ir {
 						ScalarOpcode::Tanh => "tanh",
 						_ => unreachable!(),
 					};
-					let _ = writeln!(output, "{name} = call {ty} @recipe.{operation}{suffix}({ty} {left})", ty = context.value_type);
+					let _ = writeln!(output, "{name} = call {ty} @{family}.{operation}{suffix}({ty} {left})", family = scalar_math(context.libm, operation));
 					name
 				}
 			};
 			values.push(value);
 		}
-		let value = values.last().cloned().ok_or(EmitError::WrongWidth { kind: "scalar", width: 0 })?;
+		let last = values.last().cloned().ok_or(EmitError::WrongWidth { kind: "scalar", width: 0 })?;
+		let value = format!("%{}.scalar.result", context.prefix);
+		let _ = writeln!(output, "{value} = call {model} @recipe.model.from.state{suffix}({ty} {last})", model = context.value_type);
 		Ok(ScalarForward { code: output, value })
 	}
 
-	fn add_adjoint(code: &mut String, value_type: &str, suffix: &str, prefix: &str, old: &mut String, contribution: &str, sequence: &mut usize) {
-		let name = format!("%{prefix}.adjoint.{}", *sequence);
-		*sequence += 1;
-		*old = binary(code, value_type, suffix, &name, "add", old, contribution);
+	/// The Multiply a FusedAdd names: the instruction at `reference`, which must
+	/// be a Multiply that comes before it.
+	fn fused_product(instructions: &[ScalarInstruction], reference: f64) -> Result<&ScalarInstruction, EmitError> {
+		let index = integer(reference, "fused product")?;
+		let product = usize::try_from(index).ok().and_then(|index| instructions.get(index)).ok_or(EmitError::InvalidReference { kind: "fused product", index })?;
+		if product.opcode != ScalarOpcode::Multiply {
+			return Err(EmitError::InvalidReference { kind: "fused product", index });
+		}
+		Ok(product)
 	}
 
-	fn negate(code: &mut String, value_type: &str, suffix: &str, prefix: &str, value: &str, sequence: &mut usize) -> String {
+	fn add_adjoint(code: &mut String, state_type: &str, suffix: &str, prefix: &str, old: &mut String, contribution: &str, sequence: &mut usize) {
+		let name = format!("%{prefix}.adjoint.{}", *sequence);
+		*sequence += 1;
+		*old = state_binary(code, state_type, suffix, &name, "add", old, contribution);
+	}
+
+	fn negate(code: &mut String, state_type: &str, suffix: &str, prefix: &str, value: &str, sequence: &mut usize) -> String {
 		let name = format!("%{prefix}.neg.{}", *sequence);
 		*sequence += 1;
-		let _ = writeln!(code, "{name} = call {value_type} @recipe.neg{suffix}({value_type} {value})");
+		let _ = writeln!(code, "{name} = call {state_type} @recipe.state.neg{suffix}({state_type} {value})");
 		name
 	}
 
@@ -301,15 +387,25 @@ mod program_ir {
 	/// result contains expressions for the two input adjoints and parameter
 	/// adjoints. The caller owns the flat adjoint and gradient arenas and stores
 	/// these expressions at the node's fixed element/parameter offsets.
-	pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &str) -> Result<ScalarReverse, EmitError> {
+	pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &str, wide_adjoint: bool) -> Result<ScalarReverse, EmitError> {
 		let suffix = context.suffix;
+		let ty = context.state_type;
 		let instructions = parse_scalar(code)?;
 		let mut output = String::new();
+		let (entry_first, entry_second) = scalar_entries(context.prefix);
+		let incoming_state = if wide_adjoint {
+			incoming.to_owned()
+		} else {
+			let converted = format!("%{}.incoming.state", context.prefix);
+			let _ = writeln!(output, "{converted} = call {ty} @recipe.state.from.model{suffix}({model} {incoming})", model = context.value_type);
+			converted
+		};
+		let incoming = incoming_state.as_str();
 		let mut values = Vec::with_capacity(instructions.len());
 		let mut parameter_for = vec![None; instructions.len()];
 		for (index, instruction) in instructions.iter().enumerate() {
 			let value = match instruction.opcode {
-				ScalarOpcode::Constant => (context.literal)(instruction.left, context.value_type),
+				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
 				ScalarOpcode::Parameter => {
 					let parameter = integer(instruction.left, "scalar parameter")?;
 					if parameter < 0 {
@@ -318,7 +414,7 @@ mod program_ir {
 					parameter_for[index] = Some(parameter as usize);
 					format!("%{}.scalar.{index}", context.prefix)
 				}
-				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &entry_first, &entry_second)?,
 				ScalarOpcode::Add
 				| ScalarOpcode::Subtract
 				| ScalarOpcode::Multiply
@@ -330,28 +426,31 @@ mod program_ir {
 				| ScalarOpcode::Log
 				| ScalarOpcode::Sin
 				| ScalarOpcode::Cos
-				| ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
+				| ScalarOpcode::Tanh
+				| ScalarOpcode::FusedAdd
+				| ScalarOpcode::Half => format!("%{}.scalar.{index}", context.prefix),
 			};
 			values.push(value);
 		}
-		let mut adjoints = vec![(context.literal)(0.0, context.value_type); instructions.len()];
-		let mut first = (context.literal)(0.0, context.value_type);
-		let mut second = (context.literal)(0.0, context.value_type);
+		let state_zero = (context.literal)(0.0, ty);
+		let mut adjoints = vec![state_zero.clone(); instructions.len()];
+		let mut first = state_zero.clone();
+		let mut second = state_zero.clone();
 		let mut parameters = BTreeMap::new();
 		let mut sequence = 0;
 		if let Some(last) = adjoints.last_mut() {
 			*last = incoming.to_owned();
 		}
-		let operand = |value: f64, values: &[String]| scalar_operand(value, values, context.first, context.second);
+		let operand = |value: f64, values: &[String]| scalar_operand(value, values, &entry_first, &entry_second);
 		let add_operand = |code: &mut String, value: f64, contribution: &str, adjoints: &mut [String], first: &mut String, second: &mut String, sequence: &mut usize| -> Result<(), EmitError> {
 			let index = integer(value, "scalar reference")?;
 			match index {
-				-2 => add_adjoint(code, context.value_type, context.suffix, context.prefix, second, contribution, sequence),
-				-1 => add_adjoint(code, context.value_type, context.suffix, context.prefix, first, contribution, sequence),
+				-2 => add_adjoint(code, ty, context.suffix, context.prefix, second, contribution, sequence),
+				-1 => add_adjoint(code, ty, context.suffix, context.prefix, first, contribution, sequence),
 				0.. => {
 					let slot = usize::try_from(index).map_err(|_| EmitError::InvalidReference { kind: "scalar", index })?;
 					let target = adjoints.get_mut(slot).ok_or(EmitError::InvalidReference { kind: "scalar", index })?;
-					add_adjoint(code, context.value_type, context.suffix, context.prefix, target, contribution, sequence)
+					add_adjoint(code, ty, context.suffix, context.prefix, target, contribution, sequence)
 				}
 				_ => return Err(EmitError::InvalidReference { kind: "scalar", index }),
 			}
@@ -359,7 +458,7 @@ mod program_ir {
 		};
 		for (index, instruction) in instructions.iter().enumerate().rev() {
 			let adjoint = adjoints[index].clone();
-			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter) { String::new() } else { operand(instruction.left, &values)? };
+			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::FusedAdd) { String::new() } else { operand(instruction.left, &values)? };
 			let right = if matches!(
 				instruction.opcode,
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough
@@ -378,27 +477,27 @@ mod program_ir {
 				}
 				ScalarOpcode::Subtract => {
 					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
-					let negative = negate(&mut output, context.value_type, context.suffix, context.prefix, &adjoint, &mut sequence);
+					let negative = negate(&mut output, ty, context.suffix, context.prefix, &adjoint, &mut sequence);
 					add_operand(&mut output, instruction.right, &negative, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Multiply => {
-					let left_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.mul.left.{sequence}", context.prefix), "mul", &adjoint, &right);
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.mul.left.{sequence}", context.prefix), "mul", &adjoint, &right);
 					sequence += 1;
-					let right_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.mul.right.{sequence}", context.prefix), "mul", &adjoint, &left);
+					let right_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.mul.right.{sequence}", context.prefix), "mul", &adjoint, &left);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, instruction.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Divide => {
-					let left_contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.left.{sequence}", context.prefix), "div", &adjoint, &right);
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.left.{sequence}", context.prefix), "div", &adjoint, &right);
 					sequence += 1;
-					let square = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.square.{sequence}", context.prefix), "mul", &right, &right);
+					let square = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.square.{sequence}", context.prefix), "mul", &right, &right);
 					sequence += 1;
-					let numerator = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.numerator.{sequence}", context.prefix), "mul", &adjoint, &left);
+					let numerator = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.numerator.{sequence}", context.prefix), "mul", &adjoint, &left);
 					sequence += 1;
-					let raw = binary(&mut output, context.value_type, context.suffix, &format!("%{}.div.raw.{sequence}", context.prefix), "div", &numerator, &square);
+					let raw = state_binary(&mut output, ty, context.suffix, &format!("%{}.div.raw.{sequence}", context.prefix), "div", &numerator, &square);
 					sequence += 1;
-					let right_contribution = negate(&mut output, context.value_type, context.suffix, context.prefix, &raw, &mut sequence);
+					let right_contribution = negate(&mut output, ty, context.suffix, context.prefix, &raw, &mut sequence);
 					add_operand(&mut output, instruction.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 					add_operand(&mut output, instruction.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
@@ -407,74 +506,90 @@ mod program_ir {
 					sequence += 1;
 					let positive = format!("%{}.abs.positive.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{negative} = call i1 @recipe.olt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
-					let _ = writeln!(output, "{positive} = call i1 @recipe.ogt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
-					let negated = negate(&mut output, context.value_type, context.suffix, context.prefix, &adjoint, &mut sequence);
+					let _ = writeln!(output, "{negative} = call i1 @recipe.state.olt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
+					let _ = writeln!(output, "{positive} = call i1 @recipe.state.ogt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
+					let negated = negate(&mut output, ty, context.suffix, context.prefix, &adjoint, &mut sequence);
 					let upper = format!("%{}.abs.upper.{sequence}", context.prefix);
 					sequence += 1;
 					let _ = writeln!(
 						output,
 						"{upper} = select i1 {positive}, {ty} {adjoint}, {ty} {zero}",
-						ty = context.value_type,
 						adjoint = adjoint,
-						zero = (context.literal)(0.0, context.value_type)
+						zero = (context.literal)(0.0, ty)
 					);
 					let contribution = format!("%{}.abs.contribution.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{contribution} = select i1 {negative}, {ty} {negated}, {ty} {upper}", ty = context.value_type, negated = negated, upper = upper);
+					let _ = writeln!(output, "{contribution} = select i1 {negative}, {ty} {negated}, {ty} {upper}", negated = negated, upper = upper);
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Exp => {
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.exp.{sequence}", context.prefix), "mul", &adjoint, &values[index]);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.exp.{sequence}", context.prefix), "mul", &adjoint, &values[index]);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Log => {
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.log.{sequence}", context.prefix), "div", &adjoint, &left);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.log.{sequence}", context.prefix), "div", &adjoint, &left);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Sin => {
 					let cosine = format!("%{}.sin.cosine.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{cosine} = call {ty} @recipe.cos{suffix}({ty} {left})", ty = context.value_type);
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.sin.{sequence}", context.prefix), "mul", &adjoint, &cosine);
+					let _ = writeln!(output, "{cosine} = call {ty} @{family}.cos{suffix}({ty} {left})", family = scalar_math(context.libm, "cos"));
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.sin.{sequence}", context.prefix), "mul", &adjoint, &cosine);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Cos => {
 					let sine = format!("%{}.cos.sine.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{sine} = call {ty} @recipe.sin{suffix}({ty} {left})", ty = context.value_type);
-					let raw = binary(&mut output, context.value_type, context.suffix, &format!("%{}.cos.raw.{sequence}", context.prefix), "mul", &adjoint, &sine);
+					let _ = writeln!(output, "{sine} = call {ty} @{family}.sin{suffix}({ty} {left})", family = scalar_math(context.libm, "sin"));
+					let raw = state_binary(&mut output, ty, context.suffix, &format!("%{}.cos.raw.{sequence}", context.prefix), "mul", &adjoint, &sine);
 					sequence += 1;
-					let contribution = negate(&mut output, context.value_type, context.suffix, context.prefix, &raw, &mut sequence);
+					let contribution = negate(&mut output, ty, context.suffix, context.prefix, &raw, &mut sequence);
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Tanh => {
-					let square = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.square.{sequence}", context.prefix), "mul", &values[index], &values[index]);
+					let square = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.square.{sequence}", context.prefix), "mul", &values[index], &values[index]);
 					sequence += 1;
-					let one = (context.literal)(1.0, context.value_type);
-					let base = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.base.{sequence}", context.prefix), "sub", &one, &square);
+					let one = (context.literal)(1.0, ty);
+					let base = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.base.{sequence}", context.prefix), "sub", &one, &square);
 					sequence += 1;
-					let contribution = binary(&mut output, context.value_type, context.suffix, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Select => {
 					let condition = format!("%{}.select.condition.{sequence}", context.prefix);
 					sequence += 1;
-					let _ = writeln!(output, "{condition} = call i1 @recipe.ogt{suffix}({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
+					let _ = writeln!(output, "{condition} = call i1 @recipe.state.ogt{suffix}({ty} {left}, {ty} {zero})", zero = (context.literal)(0.0, ty));
 					let contribution = format!("%{}.select.contribution.{sequence}", context.prefix);
 					sequence += 1;
 					let _ = writeln!(
 						output,
 						"{contribution} = select i1 {condition}, {ty} {adjoint}, {ty} {zero}",
-						ty = context.value_type,
 						adjoint = adjoint,
-						zero = (context.literal)(0.0, context.value_type)
+						zero = (context.literal)(0.0, ty)
 					);
 					add_operand(&mut output, instruction.right, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+				}
+				ScalarOpcode::FusedAdd => {
+					// The addend takes the adjoint whole; the fused product's operands
+					// take it as the Multiply's would, without the Multiply's rounding.
+					let product = fused_product(&instructions, instruction.left)?;
+					let product_left = operand(product.left, &values)?;
+					let product_right = operand(product.right, &values)?;
+					let left_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.fused.left.{sequence}", context.prefix), "mul", &adjoint, &product_right);
+					sequence += 1;
+					let right_contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.fused.right.{sequence}", context.prefix), "mul", &adjoint, &product_left);
+					sequence += 1;
+					add_operand(&mut output, product.left, &left_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+					add_operand(&mut output, product.right, &right_contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+					add_operand(&mut output, instruction.right, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+				}
+				ScalarOpcode::Half => {
+					// A rounding passes its adjoint straight through.
+					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
 				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
 			}
@@ -483,10 +598,24 @@ mod program_ir {
 			if let Some(parameter) = parameter {
 				parameters
 					.entry(parameter)
-					.and_modify(|value: &mut String| add_adjoint(&mut output, context.value_type, context.suffix, context.prefix, value, &adjoints[index], &mut sequence))
+					.and_modify(|value: &mut String| add_adjoint(&mut output, ty, context.suffix, context.prefix, value, &adjoints[index], &mut sequence))
 					.or_insert_with(|| adjoints[index].clone());
 			}
 		}
+		// Ordinary reverse kernels keep state-width adjoints. Legacy custom
+		// recurrent bodies retain their model-width ABI until they are ported.
+		let mut encode = |name: &str, value: &String| -> String {
+			if wide_adjoint { return value.clone(); }
+			if *value == state_zero {
+				return (context.literal)(0.0, context.value_type);
+			}
+			let encoded = format!("%{}.{name}.adjoint.model", context.prefix);
+			let _ = writeln!(output, "{encoded} = call {model} @recipe.model.from.state{suffix}({ty} {value})", model = context.value_type);
+			encoded
+		};
+		let first = encode("first", &first);
+		let second = encode("second", &second);
+		let parameters = parameters.into_iter().map(|(index, value)| (index, encode(&format!("parameter{index}"), &value))).collect();
 		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters })
 	}
 
@@ -1045,283 +1174,94 @@ mod program_ir {
 	/// format, like the loss reduction, and store them as per-item means in the
 	/// model format. Batch groups span every row, so the raw counts and sums can
 	/// exceed the finite range of narrow model formats; the means cannot.
+	fn normalize_adjoint_pointers(code: &mut String, context: NormalizeReverseContext<'_>, prefix: &str, groups: &str, group: &str) -> (String, String) {
+		let (ty, pointer, base) = (context.state_type, context.pointer_type, context.context);
+		let bytes = if ty == "double" { 8 } else { 4 };
+		let sum = format!("%{prefix}.sum.ptr");
+		let projection = format!("%{prefix}.projected.ptr");
+		let _ = writeln!(code, "%{prefix}.stats.bytes = mul i64 {groups}, {model_pair}\n%{prefix}.stats.padded = add i64 %{prefix}.stats.bytes, {padding}\n%{prefix}.sum.base = udiv i64 %{prefix}.stats.padded, {bytes}\n%{prefix}.projected.base = add i64 %{prefix}.sum.base, {groups}\n%{prefix}.sum.index = add i64 %{prefix}.sum.base, {group}\n%{prefix}.projected.index = add i64 %{prefix}.projected.base, {group}\n{sum} = getelementptr {ty}, {pointer} {base}, i64 %{prefix}.sum.index\n{projection} = getelementptr {ty}, {pointer} {base}, i64 %{prefix}.projected.index", model_pair = 2 * context.alignment, padding = bytes - 1);
+		(sum, projection)
+	}
+	fn normalize_backward_values(code: &mut String, context: NormalizeReverseContext<'_>, prefix: &str, element: &str, channel: &str, delta: &str, output: &str) -> (String, String) {
+		let (mt, st, ptr, suffix) = (context.value_type, context.state_type, context.pointer_type, context.suffix);
+		let normalized = if context.weight.is_some() {
+			let source = format!("%{prefix}.source");
+			let _ = writeln!(code, "%{prefix}.source.ptr = getelementptr {mt}, {ptr} {input}, i64 {element}\n{source} = load {mt}, {ptr} %{prefix}.source.ptr, align {align}", input = context.source, align = context.alignment);
+			let replay_prefix = format!("{prefix}.replay");
+			let normalized = emit_normalize(NormalizeContext {
+				value_type: mt, suffix, pointer_type: ptr, alignment: context.alignment,
+				source_value: &source, context: context.context, rows: context.rows, channels: context.channels,
+				length: context.length, width: context.width, span: context.span, weight: None, mode: context.mode, prefix: &replay_prefix,
+			}, element);
+			code.push_str(&normalized.code);
+			normalized.value
+		} else { output.to_owned() };
+		let value = format!("%{prefix}.normalized.state");
+		let _ = writeln!(code, "{value} = call {st} @recipe.state.from.model{suffix}({mt} {normalized})");
+		let weighted = if let Some(weight) = context.weight {
+			let name = format!("%{prefix}.weighted");
+			let _ = writeln!(code, "%{prefix}.weight.ptr = getelementptr {mt}, {ptr} {weight}, i64 {channel}\n%{prefix}.weight = load {mt}, {ptr} %{prefix}.weight.ptr, align {align}\n%{prefix}.weight.state = call {st} @recipe.state.from.model{suffix}({mt} %{prefix}.weight)\n{name} = call {st} @recipe.state.mul{suffix}({st} {delta}, {st} %{prefix}.weight.state)", align = context.alignment);
+			name
+		} else { delta.to_owned() };
+		(weighted, value)
+	}
 	pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta: &str, output_value: &str) -> String {
-		let suffix = context.suffix;
+		if context.mode == NormalizeMode::Evaluation { return String::new(); }
 		let mut code = String::new();
-		let elements = context.channels * context.length;
 		let prefix = context.prefix;
-		let group = format!("%{prefix}.group");
-		let groups = format!("%{prefix}.groups");
-		let items = format!("%{prefix}.items");
-		let heads = context.span / context.width;
-		let rows = format!("%{prefix}.rows.wide");
-		let threads = format!("%{prefix}.threads.wide");
-		let tid = format!("%{prefix}.tid.wide");
-		let _ = writeln!(code, "{rows} = zext i32 {} to i64", context.rows);
-		let _ = writeln!(code, "{threads} = zext i32 %threads to i64");
-		let _ = writeln!(code, "{tid} = zext i32 %tid to i64");
-		match context.mode {
-			NormalizeMode::Batch => {
-				let _ = writeln!(code, "{groups} = add i64 0, {}", context.channels);
-				let _ = writeln!(code, "{items} = mul i64 {rows}, {}", context.length);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
-				let _ = writeln!(code, "{groups} = mul i64 {rows}, {}", context.length * heads);
-				let _ = writeln!(code, "{items} = add i64 0, {}", context.width);
-			}
-			NormalizeMode::Evaluation => return code,
-		}
-		let _ = writeln!(code, "br label %{prefix}.entry");
-		let _ = writeln!(code, "{prefix}.entry:");
-		let _ = writeln!(code, "br label %{prefix}.group.loop");
-		let _ = writeln!(code, "{prefix}.group.loop:");
-		let _ = writeln!(code, "{group} = phi i64 [ {tid}, %{prefix}.entry ], [ %{prefix}.group.next, %{prefix}.store ]");
-		let _ = writeln!(code, "%{prefix}.group.more = icmp ult i64 {group}, {groups}");
-		let _ = writeln!(code, "br i1 %{prefix}.group.more, label %{prefix}.item.loop, label %{prefix}.done");
-		let _ = writeln!(code, "{prefix}.item.loop:");
-		let _ = writeln!(code, "%{prefix}.p = phi i64 [ 0, %{prefix}.group.loop ], [ %{prefix}.p.next, %{prefix}.item.step ]");
-		let _ = writeln!(code, "%{prefix}.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.sum.next, %{prefix}.item.step ]", ty = context.state_type, zero = context.state_zero);
-		let _ = writeln!(
-			code,
-			"%{prefix}.projected = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.projected.next, %{prefix}.item.step ]",
-			ty = context.state_type,
-			zero = context.state_zero
-		);
-		let _ = writeln!(code, "%{prefix}.item.more = icmp ult i64 %{prefix}.p, {items}");
-		let _ = writeln!(code, "br i1 %{prefix}.item.more, label %{prefix}.item.step, label %{prefix}.store");
-		let _ = writeln!(code, "{prefix}.item.step:");
-		match context.mode {
-			NormalizeMode::Batch => {
-				let _ = writeln!(code, "%{prefix}.row = udiv i64 %{prefix}.p, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.position = urem i64 %{prefix}.p, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.row.base = mul i64 %{prefix}.row, {elements}");
-				let _ = writeln!(code, "%{prefix}.channel.base = mul i64 {group}, {}", context.length);
-			}
-			NormalizeMode::Layer | NormalizeMode::Rms | NormalizeMode::L2 => {
-				let _ = writeln!(code, "%{prefix}.row = udiv i64 {group}, {}", context.length * heads);
-				let _ = writeln!(code, "%{prefix}.row.local = urem i64 {group}, {}", context.length * heads);
-				let _ = writeln!(code, "%{prefix}.head = udiv i64 %{prefix}.row.local, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.position = urem i64 %{prefix}.row.local, {}", context.length);
-				let _ = writeln!(code, "%{prefix}.head.base = mul i64 %{prefix}.head, {}", context.width);
-				let _ = writeln!(code, "%{prefix}.channel = add i64 %{prefix}.head.base, %{prefix}.p");
-				let _ = writeln!(code, "%{prefix}.row.base = mul i64 %{prefix}.row, {elements}");
-				let _ = writeln!(code, "%{prefix}.channel.base = mul i64 %{prefix}.channel, {}", context.length);
-			}
-			NormalizeMode::Evaluation => unreachable!(),
-		}
-		let _ = writeln!(code, "%{prefix}.local = add i64 %{prefix}.channel.base, %{prefix}.position");
-		let _ = writeln!(code, "%{prefix}.index = add i64 %{prefix}.row.base, %{prefix}.local");
-		let _ = writeln!(code, "%{prefix}.delta.ptr = getelementptr inbounds {ty}, {ptrty} {delta}, i64 %{prefix}.index", ty = context.value_type, ptrty = context.pointer_type);
-		let _ = writeln!(
-			code,
-			"%{prefix}.output.ptr = getelementptr inbounds {ty}, {ptrty} {output}, i64 %{prefix}.index",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			output = output_value
-		);
-		let _ = writeln!(code, "%{prefix}.delta.model = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-		let _ = writeln!(code, "%{prefix}.output.model = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-		// A weighted node stored `weight * normalized`, so the reverse formula takes
-		// the delta scaled by the weight and re-normalizes the input for the projection.
-		let (delta_model, output_model) = match context.weight {
-			Some(weight) => {
-				let _ = writeln!(code, "%{prefix}.scale.index = add i64 {groups}, {group}");
-				let _ = writeln!(
-					code,
-					"%{prefix}.scale.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 %{prefix}.scale.index",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					context_ptr = context.context
-				);
-				let _ = writeln!(
-					code,
-					"%{prefix}.scale = load {ty}, {ptrty} %{prefix}.scale.ptr, align {align}",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					align = context.alignment
-				);
-				let _ = writeln!(
-					code,
-					"%{prefix}.source.ptr = getelementptr inbounds {ty}, {ptrty} {source}, i64 %{prefix}.index",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					source = context.source
-				);
-				let _ = writeln!(
-					code,
-					"%{prefix}.source.model = load {ty}, {ptrty} %{prefix}.source.ptr, align {align}",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					align = context.alignment
-				);
-				let _ = writeln!(code, "%{prefix}.normalized = call {ty} @recipe.mul{suffix}({ty} %{prefix}.source.model, {ty} %{prefix}.scale)", ty = context.value_type);
-				let _ = writeln!(code, "%{prefix}.weight.ptr = getelementptr inbounds {ty}, {ptrty} {weight}, i64 %{prefix}.channel", ty = context.value_type, ptrty = context.pointer_type);
-				let _ = writeln!(
-					code,
-					"%{prefix}.weight = load {ty}, {ptrty} %{prefix}.weight.ptr, align {align}",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					align = context.alignment
-				);
-				let _ = writeln!(code, "%{prefix}.delta.weighted = call {ty} @recipe.mul{suffix}({ty} %{prefix}.delta.model, {ty} %{prefix}.weight)", ty = context.value_type);
-				(format!("%{prefix}.delta.weighted"), format!("%{prefix}.normalized"))
-			}
-			None => (format!("%{prefix}.delta.model"), format!("%{prefix}.output.model")),
-		};
-		let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model{suffix}({ty} {delta_model})", state = context.state_type, ty = context.value_type);
-		let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model{suffix}({ty} {output_model})", state = context.state_type, ty = context.value_type);
-		if matches!(context.mode, NormalizeMode::Rms | NormalizeMode::L2) {
-			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add{suffix}({ty} %{prefix}.sum, {ty} {zero})", ty = context.state_type, zero = context.state_zero);
+		let (mt, st, ptr, suffix) = (context.value_type, context.state_type, context.pointer_type, context.suffix);
+		let state_align = if st == "double" { 8 } else { 4 };
+		let zero = context.state_zero;
+		let per_row = context.mode.per_row();
+		let groups_per_row = context.length * (context.span / context.width);
+		let _ = writeln!(code, "%{prefix}.rows = zext i32 {rows} to i64\n%{prefix}.threads = zext i32 %threads to i64\n%{prefix}.tid = zext i32 %tid to i64", rows = context.rows);
+		if per_row {
+			let _ = writeln!(code, "%{prefix}.groups = mul i64 %{prefix}.rows, {groups_per_row}\n%{prefix}.items = add i64 0, {width}", width = context.width);
 		} else {
-			let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add{suffix}({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.state_type);
+			let _ = writeln!(code, "%{prefix}.groups = add i64 0, {channels}\n%{prefix}.items = mul i64 %{prefix}.rows, {length}", channels = context.channels, length = context.length);
 		}
-		let _ = writeln!(code, "%{prefix}.projection = call {ty} @recipe.state.mul{suffix}({ty} %{prefix}.delta, {ty} %{prefix}.output)", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.projected.next = call {ty} @recipe.state.add{suffix}({ty} %{prefix}.projected, {ty} %{prefix}.projection)", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.p.next = add i64 %{prefix}.p, 1");
-		let _ = writeln!(code, "br label %{prefix}.item.loop");
-		let _ = writeln!(code, "{prefix}.store:");
-		let _ = writeln!(code, "%{prefix}.items.value = uitofp i64 {items} to {ty}", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.sum.mean = call {ty} @recipe.state.div{suffix}({ty} %{prefix}.sum, {ty} %{prefix}.items.value)", ty = context.state_type);
-		// An L2 group scales by its norm rather than its root mean square, so its
-		// reverse projection is the whole sum over the group.
-		let projected_divisor = if context.mode == NormalizeMode::L2 { "one" } else { "items.value" };
-		let _ = writeln!(code, "%{prefix}.one = call {ty} @recipe.state.from.u32{suffix}(i32 1)", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div{suffix}({ty} %{prefix}.projected, {ty} %{prefix}.{projected_divisor})", ty = context.state_type);
-		let _ = writeln!(code, "%{prefix}.sum.model = call {ty} @recipe.model.from.state{suffix}({state} %{prefix}.sum.mean)", ty = context.value_type, state = context.state_type);
-		let _ = writeln!(code, "%{prefix}.projected.model = call {ty} @recipe.model.from.state{suffix}({state} %{prefix}.projected.mean)", ty = context.value_type, state = context.state_type);
-		let _ = writeln!(code, "%{prefix}.sum.base = mul i64 {groups}, 2");
-		let _ = writeln!(code, "%{prefix}.projected.base = mul i64 {groups}, 3");
-		let _ = writeln!(code, "%{prefix}.sum.index = add i64 %{prefix}.sum.base, {group}");
-		let _ = writeln!(code, "%{prefix}.projected.index = add i64 %{prefix}.projected.base, {group}");
-		let _ = writeln!(
-			code,
-			"%{prefix}.sum.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 %{prefix}.sum.index",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			context_ptr = context.context
-		);
-		let _ = writeln!(
-			code,
-			"%{prefix}.projected.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 %{prefix}.projected.index",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			context_ptr = context.context
-		);
-		let _ = writeln!(code, "store {ty} %{prefix}.sum.model, {ptrty} %{prefix}.sum.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-		let _ = writeln!(
-			code,
-			"store {ty} %{prefix}.projected.model, {ptrty} %{prefix}.projected.ptr, align {align}",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			align = context.alignment
-		);
-		let _ = writeln!(code, "%{prefix}.group.next = add i64 {group}, {threads}");
-		let _ = writeln!(code, "br label %{prefix}.group.loop");
-		let _ = writeln!(code, "{prefix}.done:");
+		let _ = writeln!(code, "br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n%{prefix}.group = phi i64 [ %{prefix}.tid, %{prefix}.entry ], [ %{prefix}.group.next, %{prefix}.store ]\n%{prefix}.group.more = icmp ult i64 %{prefix}.group, %{prefix}.groups\nbr i1 %{prefix}.group.more, label %{prefix}.item.loop, label %{prefix}.done\n{prefix}.item.loop:\n%{prefix}.p = phi i64 [ 0, %{prefix}.group.loop ], [ %{prefix}.p.next, %{prefix}.item.step ]\n%{prefix}.sum = phi {st} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.sum.next, %{prefix}.item.step ]\n%{prefix}.projected = phi {st} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.projected.next, %{prefix}.item.step ]\n%{prefix}.more = icmp ult i64 %{prefix}.p, %{prefix}.items\nbr i1 %{prefix}.more, label %{prefix}.item.step, label %{prefix}.store\n{prefix}.item.step:");
+		if per_row {
+			let _ = writeln!(code, "%{prefix}.row = udiv i64 %{prefix}.group, {groups_per_row}\n%{prefix}.group.local = urem i64 %{prefix}.group, {groups_per_row}\n%{prefix}.head = udiv i64 %{prefix}.group.local, {length}\n%{prefix}.position = urem i64 %{prefix}.group.local, {length}\n%{prefix}.head.base = mul i64 %{prefix}.head, {width}\n%{prefix}.channel = add i64 %{prefix}.head.base, %{prefix}.p", length = context.length, width = context.width);
+		} else {
+			let _ = writeln!(code, "%{prefix}.row = udiv i64 %{prefix}.p, {length}\n%{prefix}.position = urem i64 %{prefix}.p, {length}\n%{prefix}.channel = add i64 %{prefix}.group, 0", length = context.length);
+		}
+		let _ = writeln!(code, "%{prefix}.row.base = mul i64 %{prefix}.row, {elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {length}\n%{prefix}.local = add i64 %{prefix}.channel.base, %{prefix}.position\n%{prefix}.index = add i64 %{prefix}.row.base, %{prefix}.local\n%{prefix}.delta.ptr = getelementptr {st}, {ptr} {delta}, i64 %{prefix}.index\n%{prefix}.delta = load {st}, {ptr} %{prefix}.delta.ptr, align {state_align}\n%{prefix}.output.ptr = getelementptr {mt}, {ptr} {output_value}, i64 %{prefix}.index\n%{prefix}.output = load {mt}, {ptr} %{prefix}.output.ptr, align {model_align}", elements = context.channels * context.length, length = context.length, model_align = context.alignment);
+		let (weighted, normalized) = normalize_backward_values(&mut code, context, &format!("{prefix}.values"), &format!("%{prefix}.index"), &format!("%{prefix}.channel"), &format!("%{prefix}.delta"), &format!("%{prefix}.output"));
+		let mean_term = if matches!(context.mode, NormalizeMode::Rms | NormalizeMode::L2) { zero } else { &weighted };
+		let _ = writeln!(code, "%{prefix}.sum.next = call {st} @recipe.state.add{suffix}({st} %{prefix}.sum, {st} {mean_term})\n%{prefix}.product = call {st} @recipe.state.mul{suffix}({st} {weighted}, {st} {normalized})\n%{prefix}.projected.next = call {st} @recipe.state.add{suffix}({st} %{prefix}.projected, {st} %{prefix}.product)\n%{prefix}.p.next = add i64 %{prefix}.p, 1\nbr label %{prefix}.item.loop\n{prefix}.store:\n%{prefix}.count = uitofp i64 %{prefix}.items to {st}\n%{prefix}.sum.mean = call {st} @recipe.state.div{suffix}({st} %{prefix}.sum, {st} %{prefix}.count)");
+		let projection = if context.mode == NormalizeMode::L2 { format!("%{prefix}.projected") } else {
+			let _ = writeln!(code, "%{prefix}.projected.mean = call {st} @recipe.state.div{suffix}({st} %{prefix}.projected, {st} %{prefix}.count)");
+			format!("%{prefix}.projected.mean")
+		};
+		let (sum_ptr, projection_ptr) = normalize_adjoint_pointers(&mut code, context, prefix, &format!("%{prefix}.groups"), &format!("%{prefix}.group"));
+		let _ = writeln!(code, "store {st} %{prefix}.sum.mean, {ptr} {sum_ptr}, align {state_align}\nstore {st} {projection}, {ptr} {projection_ptr}, align {state_align}\n%{prefix}.group.next = add i64 %{prefix}.group, %{prefix}.threads\nbr label %{prefix}.group.loop\n{prefix}.done:");
 		code
 	}
-
-	/// Emit the fixed reverse formula for a normalized element. In training modes
-	/// the stats pass must have populated the per-item delta mean and projection
-	/// mean for each group in the context arena; keeping the group reductions as
-	/// means bounds them by the item magnitudes, so no batch-sized count or sum
-	/// ever has to be representable in the model arithmetic format. Evaluation
-	/// uses stored scale directly because its stats are not differentiated.
+	/// Derivatives and their group reductions stay in the accumulator format.
 	pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &str, delta: &str, output_value: &str) -> NormalizeReverseFragment {
-		let suffix = context.suffix;
 		let mut code = String::new();
 		let prefix = format!("{}.normalize.reverse", context.prefix);
+		let (mt, st, ptr, suffix) = (context.value_type, context.state_type, context.pointer_type, context.suffix);
+		let state_align = if st == "double" { 8 } else { 4 };
 		let rows = format!("%{prefix}.rows.wide");
 		let _ = writeln!(code, "{rows} = zext i32 {} to i64", context.rows);
 		let index = emit_group_index(&mut code, &prefix, context.shape_with_rows(&rows), element);
-		let (group, groups) = (&index.group, &index.groups);
-		let passing = delta;
-		let scale_index = format!("%{prefix}.scale.index");
-		let sum_base = format!("%{prefix}.sum.base");
-		let projected_base = format!("%{prefix}.projected.base");
-		let sum_index = format!("%{prefix}.sum.index");
-		let projected_index = format!("%{prefix}.projected.index");
-		let scale_pointer = format!("%{prefix}.scale.ptr");
-		let sum_pointer = format!("%{prefix}.sum.ptr");
-		let projected_pointer = format!("%{prefix}.projected.ptr");
-		let scale = format!("%{prefix}.scale");
-		let sum = format!("%{prefix}.sum");
-		let projected = format!("%{prefix}.projected");
-		let _ = writeln!(code, "{scale_index} = add i64 {groups}, {group}");
-		let _ = writeln!(code, "{sum_base} = mul i64 {groups}, 2");
-		let _ = writeln!(code, "{projected_base} = mul i64 {groups}, 3");
-		let _ = writeln!(code, "{sum_index} = add i64 {sum_base}, {group}");
-		let _ = writeln!(code, "{projected_index} = add i64 {projected_base}, {group}");
-		let _ = writeln!(
-			code,
-			"{scale_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 {scale_index}",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			context_ptr = context.context
-		);
-		let _ = writeln!(
-			code,
-			"{sum_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 {sum_index}",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			context_ptr = context.context
-		);
-		let _ = writeln!(
-			code,
-			"{projected_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i64 {projected_index}",
-			ty = context.value_type,
-			ptrty = context.pointer_type,
-			context_ptr = context.context
-		);
-		let align = context.alignment;
-		let _ = writeln!(code, "{scale} = load {ty}, {ptrty} {scale_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-		if context.mode == NormalizeMode::Evaluation {
-			let contribution = format!("%{}.normalize.reverse.fixed", context.prefix);
-			let _ = writeln!(code, "{contribution} = call {ty} @recipe.mul{suffix}({ty} {delta}, {ty} {scale})", ty = context.value_type);
-			return NormalizeReverseFragment { code, contribution };
-		}
-		let _ = writeln!(code, "{sum} = load {ty}, {ptrty} {sum_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-		let _ = writeln!(code, "{projected} = load {ty}, {ptrty} {projected_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-		let output_projection = format!("%{prefix}.output.projection");
-		let centered = format!("%{prefix}.centered");
-		let numerator = format!("%{prefix}.numerator");
-		let contribution = format!("%{prefix}.contribution");
-		// A weighted node stored `weight * normalized`: the formula takes the delta
-		// scaled by the weight and the re-normalized input.
-		let (delta, output_value) = match context.weight {
-			Some(weight) => {
-				let source_pointer = format!("%{prefix}.source.ptr");
-				let source_value = format!("%{prefix}.source");
-				let normalized = format!("%{prefix}.normalized");
-				let weight_pointer = format!("%{prefix}.weight.ptr");
-				let weight_value = format!("%{prefix}.weight");
-				let weighted = format!("%{prefix}.delta.weighted");
-				let _ = writeln!(
-					code,
-					"{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i64 {element}",
-					ty = context.value_type,
-					ptrty = context.pointer_type,
-					source = context.source
-				);
-				let _ = writeln!(code, "{source_value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-				let _ = writeln!(code, "{normalized} = call {ty} @recipe.mul{suffix}({ty} {source_value}, {ty} {scale})", ty = context.value_type);
-				let column = weight_column(&mut code, &prefix, &index);
-				let _ = writeln!(code, "{weight_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i64 {column}", ty = context.value_type, ptrty = context.pointer_type);
-				let _ = writeln!(code, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-				let _ = writeln!(code, "{weighted} = call {ty} @recipe.mul{suffix}({ty} {delta}, {ty} {weight_value})", ty = context.value_type);
-				(weighted, normalized)
-			}
-			None => (delta.to_owned(), output_value.to_owned()),
+		let _ = writeln!(code, "%{prefix}.scale.index = add i64 {groups}, {group}\n%{prefix}.scale.ptr = getelementptr {mt}, {ptr} {base}, i64 %{prefix}.scale.index\n%{prefix}.scale = load {mt}, {ptr} %{prefix}.scale.ptr, align {align}\n%{prefix}.scale.state = call {st} @recipe.state.from.model{suffix}({mt} %{prefix}.scale)", groups = index.groups, group = index.group, base = context.context, align = context.alignment);
+		let channel = weight_column(&mut code, &format!("{prefix}.weight"), &index);
+		let (weighted, normalized) = normalize_backward_values(&mut code, context, &format!("{prefix}.values"), element, &channel, delta, output_value);
+		let numerator = if context.mode == NormalizeMode::Evaluation { weighted } else {
+			let (sum, projection) = normalize_adjoint_pointers(&mut code, context, &prefix, &index.groups, &index.group);
+			let _ = writeln!(code, "%{prefix}.mean = load {st}, {ptr} {sum}, align {state_align}\n%{prefix}.projection = load {st}, {ptr} {projection}, align {state_align}\n%{prefix}.projected = call {st} @recipe.state.mul{suffix}({st} {normalized}, {st} %{prefix}.projection)\n%{prefix}.centered = call {st} @recipe.state.sub{suffix}({st} {weighted}, {st} %{prefix}.mean)\n%{prefix}.numerator = call {st} @recipe.state.sub{suffix}({st} %{prefix}.centered, {st} %{prefix}.projected)");
+			format!("%{prefix}.numerator")
 		};
-		let _ = writeln!(code, "{output_projection} = call {ty} @recipe.mul{suffix}({ty} {output_value}, {ty} {projected})", ty = context.value_type);
-		let _ = writeln!(code, "{centered} = call {ty} @recipe.sub{suffix}({ty} {delta}, {ty} {sum})", ty = context.value_type);
-		let _ = writeln!(code, "{numerator} = call {ty} @recipe.sub{suffix}({ty} {centered}, {ty} {output_projection})", ty = context.value_type);
-		let _ = writeln!(code, "{contribution} = call {ty} @recipe.mul{suffix}({ty} {scale}, {ty} {numerator})", ty = context.value_type);
-		// A channel outside the span keeps its own adjoint, so the delta passes through.
-		let Some(inside) = &index.inside else { return NormalizeReverseFragment { code, contribution } };
-		let passed = format!("%{prefix}.passed");
-		let _ = writeln!(code, "{passed} = select i1 {inside}, {ty} {contribution}, {ty} {passing}", ty = context.value_type);
-		NormalizeReverseFragment { code, contribution: passed }
+		let contribution = format!("%{prefix}.contribution");
+		let _ = writeln!(code, "{contribution} = call {st} @recipe.state.mul{suffix}({st} %{prefix}.scale.state, {st} {numerator})");
+		if let Some(inside) = index.inside {
+			let passed = format!("%{prefix}.passed");
+			let _ = writeln!(code, "{passed} = select i1 {inside}, {st} {contribution}, {st} {delta}");
+			NormalizeReverseFragment { code, contribution: passed }
+		} else { NormalizeReverseFragment { code, contribution } }
 	}
 }
 
@@ -1414,7 +1354,7 @@ impl ScheduleRat {
 			fitted: Vec::new(),
 			bound: None,
 		};
-		let model = recipe.model().layer(config.surrogate_width).tanh().layer(SCHEDULE_RAT_ACTION);
+		let model = recipe.model().layer(config.surrogate_width).arithmetic(config.precision).tanh().arithmetic(config.precision).layer(SCHEDULE_RAT_ACTION).arithmetic(config.precision);
 		let proposer = compile(&model, &data, &data.targets, 1, gpu, config, true)?;
 		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new() })
 	}
@@ -1599,7 +1539,7 @@ fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, b
 		let Some(current_tiles) = heuristic[node] else { continue };
 		for (direction, (limits, current)) in [(shape.forward, current_tiles.forward), (shape.gradient, current_tiles.gradient), (shape.previous, current_tiles.previous)].into_iter().enumerate() {
 			let reference = ScheduleCandidate { node, direction, limits, current, extent: current };
-			let candidates = schedule_candidates(limits, current, &tape.program.schedule, ratio, config.schedule_candidates)?
+			let candidates = schedule_candidates(limits, current, &tape.program.schedule, direction == 0, ratio, config.schedule_candidates)?
 				.into_iter()
 				.filter(|extent| *extent != current)
 				.map(|extent| ScheduleCandidate { node, direction, limits, current, extent })
@@ -1723,8 +1663,11 @@ use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
+	pub window_positions: usize,
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
+	pub contexts_in_values: Vec<bool>,
+	pub context_resets: Vec<(usize, usize)>,
 	/// The persistent K/V history region for an inference attention node, or
 	/// `None` for training and non-attention nodes.
 	pub attention_kv: Vec<Option<usize>>,
@@ -1733,18 +1676,30 @@ pub(crate) struct NativeLayout {
 	/// the context arena. Nodes without a schedule use `usize::MAX`.
 	pub schedule: Vec<usize>,
 	pub values_bytes: usize,
+	pub dead_bytes: usize,
+	pub dead_buffers: usize,
 	pub contexts_bytes: usize,
 	pub adjoints_bytes: usize,
+	/// Two i64 device timestamps for the current forward: entry and completion.
+	pub timing: usize,
+	/// Under a traced run, the byte offset in the context arena of one i64
+	/// device clock per node, written by thread 0 as each node begins; a
+	/// traced forward reads them back and logs the time between nodes.
+	pub clocks: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
 	/// The type of the model input: the arithmetic of the first node.
 	pub input_precision: Compute,
+	pub input_adjoint_precision: Compute,
 	/// The type of the model output: the arithmetic of the last node.
 	pub output_precision: Compute,
-	/// Byte offset of each node's weight span in the weight arena; the gradient
-	/// arena mirrors it.
+	pub output_adjoint_precision: Compute,
+	/// Byte offsets in the independently typed weight and gradient arenas.
 	pub weights: Vec<usize>,
+	pub gradients: Vec<usize>,
+	pub gradient_precisions: Vec<Compute>,
+	pub gradient_bytes: usize,
 	/// Each node's parameter span: first parameter index and count.
 	pub spans: Vec<(usize, usize)>,
 	/// For each node, a value slot per operand (source, second) whose node
@@ -1752,7 +1707,7 @@ pub(crate) struct NativeLayout {
 	/// node's type live there. `None` when the types agree.
 	pub casts: Vec<[Option<usize>; 2]>,
 	/// The adjoint slot each such operand's contribution is written to in this
-	/// node's type before it is converted and added to the operand's adjoint.
+	/// state type before it is converted and added to the operand's adjoint.
 	pub cast_adjoints: Vec<[Option<usize>; 2]>,
 }
 
@@ -1776,7 +1731,7 @@ impl BackendTarget {
 		match self {
 			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
-			Self::Nvidia { .. } => "ptx",
+			Self::Nvidia { .. } => if native_nvidia_assembler().is_some() { "cubin" } else { "ptx" },
 		}
 	}
 
@@ -1877,6 +1832,36 @@ pub(crate) struct NativeArtifact {
 	pub(crate) path: PathBuf,
 	pub(crate) storage: StorageImage,
 	pub(crate) training: bool,
+	llvm: LlvmNames,
+	compile_seconds: f64,
+}
+
+#[derive(Clone, Default)]
+struct LlvmNames {
+	instructions: Vec<String>,
+	intrinsics: Vec<String>,
+}
+
+fn llvm_names(ir: &str) -> LlvmNames {
+	const OPCODES: &[&str] = &[
+		"add", "addrspacecast", "alloca", "and", "ashr", "atomicrmw", "bitcast", "br", "call", "cmpxchg", "extractelement", "extractvalue", "fadd", "fcmp", "fdiv", "fence", "fmul", "fneg", "fpext", "fptosi", "fptoui", "fptrunc", "freeze", "fsub", "getelementptr", "icmp", "insertelement", "insertvalue", "inttoptr", "invoke", "load", "lshr", "mul", "or", "phi", "ptrtoint", "ret", "select", "sext", "shl", "shufflevector", "sitofp", "store", "sub", "switch", "trunc", "udiv", "uitofp", "urem", "va_arg", "xor", "zext",
+	];
+	let mut instructions = std::collections::BTreeSet::new();
+	for line in ir.lines() {
+		let code = line.split(';').next().unwrap_or_default();
+		for token in code.split(|character: char| character.is_ascii_whitespace() || matches!(character, '=' | ',' | '(' | ')' | '[' | ']' | '{' | '}')) {
+			if OPCODES.contains(&token) { instructions.insert(token.to_owned()); }
+		}
+	}
+	let mut intrinsics = std::collections::BTreeSet::new();
+	let mut rest = ir;
+	while let Some(start) = rest.find("@llvm.") {
+		rest = &rest[start + 1..];
+		let end = rest.find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_'))).unwrap_or(rest.len());
+		intrinsics.insert(rest[..end].to_owned());
+		rest = &rest[end..];
+	}
+	LlvmNames { instructions: instructions.into_iter().collect(), intrinsics: intrinsics.into_iter().collect() }
 }
 
 /// The model-load storage arena as stored bytes at their arena offsets, so the
@@ -1899,6 +1884,9 @@ impl StorageImage {
 pub(crate) struct NativePrecision {
 	model: Compute,
 	state: Compute,
+	/// The accumulator the block declared: fp32 or fp64. A double state over
+	/// a float-state base links the base's `-acc64` sibling.
+	acc: Compute,
 	source: &'static str,
 	model_type: &'static str,
 	state_type: &'static str,
@@ -1923,26 +1911,51 @@ fn native_epoch_layout(state_bytes: usize) -> Result<&'static [u8]> {
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
 		impl NativePrecision {
-			fn new(model: Compute) -> Result<Self> {
+			fn base(model: Compute) -> Result<Self> {
 				match model {
-					$($pattern $(if $guard)? => Ok(Self { model, state: $state, source: $source, model_type: $model_type, state_type: $state_type, epoch_layout: $layout }),)+
+					$($pattern $(if $guard)? => Ok(Self { model, state: $state, acc: $state, source: $source, model_type: $model_type, state_type: $state_type, epoch_layout: $layout }),)+
 					_ => Err(RecipeError::new(format!("{} has no native precision composition", model.label()))),
 				}
 			}
+			/// The composition of a model precision under a declared accumulator:
+			/// fp32 leaves a float-state base as it is; fp64 over a float-state base
+			/// takes the base's `-acc64` sibling, whose state is double.
+			fn new(model: Compute, acc: Compute) -> Result<Self> {
+				let base = Self::base(model)?;
+				require(matches!(acc, Compute::FP32 | Compute::FP64), format!("an accumulator is fp32 or fp64, not {}", acc.label()))?;
+				if acc == Compute::FP64 && base.state_type == "float" {
+					let source = acc64_source(base.source)?;
+					return Ok(Self { acc, state: Compute::FP64, state_type: "double", epoch_layout: NATIVE_EPOCH_LAYOUT_FP64, source, ..base });
+				}
+				Ok(Self { acc: if base.state_type == "double" { Compute::FP64 } else { Compute::FP32 }, ..base })
+			}
+		}
+		/// The `-acc64` sibling key of a float-state base, as build.rs names it.
+		fn acc64_source(source: &str) -> Result<&'static str> {
+			Ok(match source {
+				"-f32" => "-f32-acc64",
+				"-f16" => "-f16-acc64",
+				"-f8" => "-f8-acc64",
+				"-f8e5m2" => "-f8e5m2-acc64",
+				"-bf16" => "-bf16-acc64",
+				"-tf32" => "-tf32-acc64",
+				"-int8" => "-int8-acc64",
+				"-int4" => "-int4-acc64",
+				other => return Err(RecipeError::new(format!("template {other} has no fp64 accumulator sibling"))),
+			})
 		}
 	};
 }
 native_precisions! {
-	Compute::F(_) => ("-f", "double", Compute::FP64, "double", NATIVE_EPOCH_LAYOUT_FP64),
 	Compute::Fp(format) if format == FloatFormat::FP64 => ("default", "double", Compute::FP64, "double", NATIVE_EPOCH_LAYOUT_FP64),
 	Compute::Fp(format) if format == FloatFormat::FP32 => ("-f32", "float", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Fp(format) if format == FloatFormat::FP16 => ("-f16", "half", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Fp(format) if format == FloatFormat::FP8 => ("-f8", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Fp(format) if format == FloatFormat::FP8_E5M2 => ("-f8e5m2", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Bf(format) if format == FloatFormat::BF16 => ("-bf16", "i16", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Tf(format) if format == FloatFormat::TF32 => ("-tf32", "float", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Int(format) if format == IntFormat::INT8 => ("-int8", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 	Compute::Int(format) if format == IntFormat::INT4 => ("-int4", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
-	Compute::Int(format) if format == IntFormat::INT1 => ("-int1", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
 }
 /// Runtime schedule words per contraction or scan node: three i32 extents for
 /// each of the forward, gradient, and previous directions.
@@ -1960,6 +1973,10 @@ fn encode_floats(values: &[f64], precision: Compute) -> Vec<u8> {
 
 /// The stored representation a packed node keeps, or `None` when the node decodes at
 /// load. A gather's table is its context rather than a weight span, so it never packs.
+fn runtime_stored_weight(graph: &Graph, index: usize, inference: bool) -> Option<&StoredWeight> {
+	if !inference && graph.nodes[index].int_bits != 0 { return None; }
+	graph.stored.get(index)?.as_ref()
+}
 fn packed_weight(graph: &Graph, index: usize, inference: bool) -> Option<&StoredWeight> {
 	if !inference || !graph.nodes[index].packed {
 		return None;
@@ -1973,13 +1990,26 @@ fn packed_weight(graph: &Graph, index: usize, inference: bool) -> Option<&Stored
 fn widest_precision(graph: &Graph, precision: Compute) -> Compute {
 	graph.nodes.iter().flat_map(|node| [node.precision, node.kv_precision]).chain([precision]).max_by_key(|precision| precision.bytes()).unwrap_or(precision)
 }
+fn native_gradient_arena(graph: &Graph) -> Result<(Vec<usize>, usize)> {
+	let mut offsets = Vec::with_capacity(graph.nodes.len());
+	let mut bytes = 0;
+	for node in &graph.nodes {
+		let element = NativePrecision::new(node.precision, node.acc)?.state.bytes();
+		let offset = align(bytes, 16)?;
+		offsets.push(offset);
+		bytes = checked_add(offset, checked_mul(node.parameters, element, "gradient span")?, "gradient arena")?;
+	}
+	Ok((offsets, bytes))
+}
 fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Result<(Vec<usize>, usize)> {
 	let mut offsets = Vec::with_capacity(graph.nodes.len());
 	let mut bytes = 0;
 	let _ = precision;
 	for index in 0..graph.nodes.len() {
 		let element = graph.nodes[index].precision.bytes();
-		let offset = align(bytes, element.max(8))?;
+		// Sixteen-byte alignment: a packed node's 144-byte Q4_K blocks are then
+		// read sixteen bytes at a time by the block dots.
+		let offset = align(bytes, element.max(16))?;
 		let span = match packed_weight(graph, index, inference) {
 			Some(weight) => weight.bytes.len(),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
@@ -1987,7 +2017,10 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 		offsets.push(offset);
 		bytes = checked_add(offset, span, "native weight arena")?;
 	}
-	Ok((offsets, bytes))
+	// Sixteen bytes of slack: the block dots read a two-aligned slice as the
+	// two aligned lines that cover it, and the last slice's second line may
+	// lie past the last block.
+	Ok((offsets, checked_add(bytes, 16, "native weight arena slack")?))
 }
 
 /// Whether a node's forward kernel reads its operands at positions outside the
@@ -2020,6 +2053,14 @@ fn window_signatures(graph: &Graph) -> Vec<String> {
 	signatures
 }
 
+fn retained_operand(graph: &Graph, index: usize, position: usize, signatures: &[String]) -> bool {
+	let node = &graph.nodes[index];
+	let operand = [node.source, node.second][position];
+	let Ok(operand) = usize::try_from(operand) else { return false };
+	if position == 0 { node.op != Primitive::Attention && reads_beyond_window(node) }
+	else { reads_beyond_window(node) || signatures[operand] != signatures[index] }
+}
+
 /// The outputs a later forward window reads, so their slots must outlive the
 /// window that writes them: the graph output, an operand a kernel reads beyond
 /// its own window, a scan's own carried output, and a second operand whose
@@ -2032,20 +2073,16 @@ fn retained_outputs(graph: &Graph) -> Vec<bool> {
 		*last = true;
 	}
 	for (index, node) in graph.nodes.iter().enumerate() {
-		let beyond = reads_beyond_window(node);
 		if node.op == Primitive::Scan {
 			retained[index] = true;
 		}
 		// Inference attention writes its settled keys and values to the dedicated
 		// context region. Its combined QKV source therefore only needs to live for
 		// the current window; training keeps the old full source for the reverse pass.
-		if node.op != Primitive::Attention
-			&& let Ok(source) = usize::try_from(node.source)
-		{
-			retained[source] |= beyond;
-		}
-		if let Ok(second) = usize::try_from(node.second) {
-			retained[second] |= beyond || signatures[second] != signatures[index];
+		for (position, operand) in [node.source, node.second].into_iter().enumerate() {
+			if let Ok(operand) = usize::try_from(operand) {
+				retained[operand] |= retained_operand(graph, index, position, &signatures);
+			}
 		}
 	}
 	retained
@@ -2065,38 +2102,188 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 	last
 }
 
+/// A causal token graph keeps history in K/V, not in intermediate tensors.
+/// Other temporal operators retain their existing full-sequence layout until
+/// they declare an independent history buffer and a position-local interface.
+fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
+	const POSITIONS: usize = 128;
+	let length = graph.input.length;
+	let bounded = inference && rows == 1 && graph.input.channels == 1 && graph.output.length == 1
+		&& graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather)
+		&& graph.nodes.iter().enumerate().all(|(index, node)| {
+			(node.input.length == length || node.input.length == 1) && (node.output.length == length || node.output.length == 1)
+				&& (index == 0 || node.source >= 0) && node.second != -1
+				&& match node.op {
+					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last => true,
+					Primitive::Contraction => node.argument[0] <= 1.0,
+					Primitive::Normalize => normalize_mode(node.argument[0]).is_ok_and(|mode| mode.per_row()),
+					Primitive::Attention => attention_blocks(node) == 0,
+					_ => false,
+				}
+		});
+	if bounded { length.min(POSITIONS) } else { length }
+}
+
+fn window_shape(shape: Shape, sequence: usize, positions: usize) -> Shape {
+	Shape { length: if shape.length == sequence { positions } else { shape.length }, ..shape }
+}
+
+#[derive(Clone, Copy)]
+enum BufferLifetime {
+	Unused,
+	Until(usize),
+	Retained,
+	ReadOnly,
+}
+
+struct BufferSpan {
+	begin: usize,
+	end: usize,
+	first: usize,
+	last: Option<usize>,
+	read_only: bool,
+}
+
+#[derive(Default)]
+struct BufferPlan {
+	bytes: usize,
+	spans: Vec<BufferSpan>,
+}
+
+impl BufferPlan {
+	/// Choose storage from the same lifetimes the report reads. Every transient
+	/// allocation can use expired ranges, regardless of tensor kind or size.
+	fn allocate(&mut self, regions: &[(usize, BufferLifetime)], alignment: usize, first: usize, reuse: bool) -> Result<usize> {
+		let bytes = regions.iter().try_fold(0, |total, (bytes, _)| checked_add(total, *bytes, "buffer reservation"))?;
+		let retained = regions.iter().any(|(bytes, lifetime)| *bytes != 0 && matches!(lifetime, BufferLifetime::Retained | BufferLifetime::ReadOnly));
+		let last = regions.iter().filter_map(|(bytes, lifetime)| match lifetime { BufferLifetime::Until(last) if *bytes != 0 => Some(*last), _ => None }).max();
+		let offset = if reuse && !retained && let Some(last) = last {
+			let mut occupied = self.spans.iter().filter(|span| span.first <= last && span.last.is_none_or(|last| last >= first))
+				.map(|span| (span.begin, span.end)).collect::<Vec<_>>();
+			occupied.sort_unstable();
+			let mut offset = 0;
+			for (begin, end) in occupied {
+				if end <= offset { continue; }
+				if checked_add(offset, bytes, "buffer reservation")? <= begin { break; }
+				offset = align(end, alignment)?;
+			}
+			offset
+		} else { align(self.bytes, alignment)? };
+		let mut end = offset;
+		for &(bytes, lifetime) in regions {
+			let begin = end;
+			end = checked_add(begin, bytes, "planned buffer bytes")?;
+			if bytes == 0 || matches!(lifetime, BufferLifetime::Unused) { continue; }
+			let last = match lifetime { BufferLifetime::Until(last) => Some(last), _ => None };
+			require(last.is_none_or(|last| last >= first), "buffer expires before its first write")?;
+			// A retained region can contain history from an earlier forward window.
+			// No operation in this window may borrow it before its writer runs.
+			self.spans.push(BufferSpan { begin, end, first: if last.is_none() { 0 } else { first }, last, read_only: matches!(lifetime, BufferLifetime::ReadOnly) });
+		}
+		self.bytes = self.bytes.max(end);
+		Ok(offset)
+	}
+
+	fn reset_ranges(&self) -> Vec<(usize, usize)> {
+		let mut spans = self.spans.iter().filter(|span| !span.read_only).map(|span| (span.begin, span.end)).collect::<Vec<_>>();
+		spans.sort_unstable();
+		let mut ranges = Vec::<(usize, usize)>::new();
+		for (begin, end) in spans {
+			if let Some((_, previous_end)) = ranges.last_mut().filter(|(_, previous_end)| begin <= *previous_end) {
+				*previous_end = (*previous_end).max(end);
+			} else {
+				ranges.push((begin, end));
+			}
+		}
+		ranges
+	}
+
+	/// Count storage that is never actually reused in this forward plan, whose
+	/// contents finish being read before a later buffer write. Merely putting a
+	/// slot on the reuse list does not exclude it; an actual overlapping write
+	/// does. Split at every boundary so partial reuse excludes only reused bytes.
+	fn unreused_dead_storage(plans: &[&Self]) -> Result<(usize, usize)> {
+		let (mut spans, mut base) = (Vec::new(), 0);
+		for plan in plans {
+			for span in &plan.spans {
+				spans.push(BufferSpan { begin: checked_add(base, span.begin, "buffer range")?, end: checked_add(base, span.end, "buffer range")?, first: span.first, last: span.last, read_only: span.read_only });
+			}
+			base = checked_add(base, plan.bytes, "planned buffer total")?;
+		}
+		let mut boundaries = spans.iter().flat_map(|span| [span.begin, span.end]).collect::<Vec<_>>();
+		boundaries.sort_unstable();
+		boundaries.dedup();
+		let mut owners = vec![None; boundaries.len().saturating_sub(1)];
+		let mut reused = vec![false; owners.len()];
+		let mut writes = spans.iter().enumerate().map(|(id, span)| (span.first, id)).collect::<Vec<_>>();
+		writes.sort_unstable();
+		let last_write = writes.last().map_or(0, |(step, _)| *step);
+		for (step, id) in writes {
+			let span = &spans[id];
+			let range = boundaries.binary_search(&span.begin).unwrap()..boundaries.binary_search(&span.end).unwrap();
+			for cell in range {
+				if let Some(owner) = owners[cell] {
+					let previous: &BufferSpan = &spans[owner];
+					require(previous.last.is_some_and(|last| last < step), "buffer reuse overlaps a live value")?;
+					reused[cell] = true;
+				}
+				owners[cell] = Some(id);
+			}
+		}
+		let mut dead_owners = vec![false; spans.len()];
+		let bytes = owners.into_iter().enumerate().try_fold(0, |dead, (cell, owner)| {
+			if !reused[cell] && let Some(id) = owner && spans[id].last.is_some_and(|last| last < last_write) {
+				dead_owners[id] = true;
+				checked_add(dead, boundaries[cell + 1] - boundaries[cell], "unreused dead buffer bytes")
+			} else { Ok(dead) }
+		})?;
+		Ok((bytes, dead_owners.into_iter().filter(|dead| *dead).count()))
+	}
+}
+
 impl NativeLayout {
+
 	/// Training gives every node its own value, context and adjoint slot for the
 	/// whole run, because the reverse pass reads each output after every later
 	/// node has run. An inference tape holds no adjoints, drops the context
-	/// regions only the reverse pass fills, and shares value slots: a retained
-	/// output keeps a slot of its own, and a transient one takes a released slot
-	/// of the same size when one exists. A slot is released after the last node
-	/// that reads it, and a barrier follows every node, so no reader overlaps the
-	/// writer that follows.
+	/// regions only the reverse pass fills. Values, conversions, and workspace
+	/// use the same lifetime-based allocator. Retained regions stay private;
+	/// transient regions share storage after their last reader's barrier.
 	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
 		let mut values = Vec::with_capacity(graph.nodes.len());
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
+		let mut contexts_in_values = Vec::with_capacity(graph.nodes.len());
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
-		let (mut value_offset, mut context_offset, mut adjoint_offset) = (0, 0, 0);
+		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
-		let mut released: Vec<(usize, usize)> = Vec::new();
+		let signatures = window_signatures(graph);
+		let lifetimes = (0..graph.nodes.len()).map(|index| {
+			let observed = tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
+			if inference && !retained[index] && !observed {
+				Ok(BufferLifetime::Until(checked_add(checked_mul(last[index], 2, "buffer lifetime")?, 1, "buffer lifetime")?))
+			} else { Ok(BufferLifetime::Retained) }
+		}).collect::<Result<Vec<_>>>()?;
 		for (index, node) in graph.nodes.iter().enumerate() {
-			let bytes = graph_rows_buffer(node.output, rows, node.precision.bytes())?;
-			let reuse = inference && !retained[index] && !tracing();
-			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
-				Some(position) => released.remove(position).1,
-				None => {
-					let slot = align(value_offset, unit)?;
-					value_offset = checked_add(slot, bytes, "model value arena")?;
-					slot
-				}
-			};
+			let output = window_shape(node.output, graph.input.length, window_positions);
+			let bytes = graph_rows_buffer(output, rows, node.precision.bytes())?;
+			let state = NativePrecision::new(node.precision, node.acc)?.state;
+			let cast_step = checked_mul(index, 2, "buffer step")?;
+			let step = checked_add(cast_step, 1, "buffer step")?;
+			// A traced run keeps the nodes its dump reads: the first forty and the
+			// last four, or the RECIPE_TRACE_NODES=a..b range; every other slot is
+			// reused as in an untraced run.
+			// RECIPE_TRACE_REUSE=1 keeps the reuse under a trace, to read the values
+			// a reused slot held when a run without the trace went wrong.
+			let slot = value_plan.allocate(&[(bytes, lifetimes[index])], unit, step, inference)?;
+			if tracing() {
+				trace(&format!("layout node {index} slot {slot} bytes {bytes} last {} retained {} source {} second {}", last.get(index).copied().unwrap_or(0), retained.get(index).copied().unwrap_or(false), node.source, node.second))?;
+			}
 			values.push(slot);
 			// An operand computed in another arithmetic is converted into this
 			// node's type first; the converted copy and, in training, the adjoint
@@ -2104,31 +2291,38 @@ impl NativeLayout {
 			let mut node_casts = [None, None];
 			let mut node_cast_adjoints = [None, None];
 			for (position, operand) in [node.source, node.second].into_iter().enumerate() {
-				let Ok(operand) = usize::try_from(operand) else {
-					require(operand != -1 || node.precision == graph.nodes[0].precision, format!("{} computes in {} but reads the model input, which the first block holds in {}", node.identity(index), node.precision.label(), graph.nodes[0].precision.label()))?;
-					continue;
-				};
-				if graph.nodes[operand].precision == node.precision {
-					continue;
+				let (source, shape) = if let Ok(operand) = usize::try_from(operand) {
+					(&graph.nodes[operand], graph.nodes[operand].output)
+				} else if operand == -1 {
+					require(node.precision == graph.nodes[0].precision, format!("{} computes in {} but reads the model input in {}", node.identity(index), node.precision.label(), graph.nodes[0].precision.label()))?;
+					(&graph.nodes[0], graph.input)
+				} else { continue };
+				if source.precision != node.precision && !(inference && matches!(node.op, Primitive::Elementwise | Primitive::Last)) {
+					let converted = graph_rows_buffer(window_shape(shape, graph.input.length, window_positions), rows, node.precision.bytes())?;
+					let lifetime = if inference && !retained_operand(graph, index, position, &signatures) { BufferLifetime::Until(step) } else { BufferLifetime::Retained };
+					let slot = value_plan.allocate(&[(converted, lifetime)], unit, cast_step, inference)?;
+					node_casts[position] = Some(slot);
 				}
-				let converted = graph_rows_buffer(graph.nodes[operand].output, rows, node.precision.bytes())?;
-				let slot = align(value_offset, unit)?;
-				value_offset = checked_add(slot, converted, "model cast arena")?;
-				node_casts[position] = Some(slot);
-				if !inference {
-					let slot = align(adjoint_offset, unit)?;
-					adjoint_offset = checked_add(slot, converted, "model cast adjoint arena")?;
+				if !inference && NativePrecision::new(source.precision, source.acc)?.state != state {
+					let converted = graph_rows_buffer(shape, rows, state.bytes())?;
+					let slot = adjoint_plan.allocate(&[(converted, BufferLifetime::Retained)], unit, 0, false)?;
 					node_cast_adjoints[position] = Some(slot);
 				}
 			}
 			casts.push(node_casts);
 			cast_adjoints.push(node_cast_adjoints);
-			context_offset = align(context_offset, unit)?;
-			contexts.push(context_offset);
-			context_offset = checked_add(context_offset, node_context(graph, node, rows, node.precision, inference)?, "model context arena")?;
+			let mut context_node = node.clone();
+			if node.op != Primitive::Attention {
+				context_node.input = window_shape(node.input, graph.input.length, window_positions);
+				context_node.output = output;
+			}
+			let regions = node_context(graph, &context_node, rows, node.precision, inference, step)?;
+			let temporary = inference && regions.iter().all(|(_, lifetime)| matches!(lifetime, BufferLifetime::Until(_) | BufferLifetime::Unused));
+			let plan = if temporary { &mut value_plan } else { &mut context_plan };
+			contexts.push(plan.allocate(&regions, unit, step, inference)?);
+			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
-				let offset = align(context_offset, unit)?;
-				context_offset = checked_add(offset, attention_kv_bytes(node, rows, node.kv_precision)?, "attention K/V context")?;
+				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
 				Some(offset)
 			} else {
 				None
@@ -2136,39 +2330,33 @@ impl NativeLayout {
 			attention_kv.push(kv);
 			if inference {
 				adjoints.push(0);
-				let mut operands = [node.source, node.second, index as i32];
-				operands.sort_unstable();
-				for (position, operand) in operands.into_iter().enumerate() {
-					let Ok(operand) = usize::try_from(operand) else { continue };
-					if position > 0 && operands[position - 1] == operand as i32 {
-						continue;
-					}
-					if last[operand] == index && !retained[operand] {
-						released.push((graph_rows_buffer(graph.nodes[operand].output, rows, graph.nodes[operand].precision.bytes())?, values[operand]));
-					}
-				}
 			} else {
-				adjoint_offset = align(adjoint_offset, unit)?;
-				adjoints.push(adjoint_offset);
-				adjoint_offset = checked_add(adjoint_offset, bytes, "model adjoint arena")?;
+				adjoints.push(adjoint_plan.allocate(&[(graph_rows_buffer(node.output, rows, state.bytes())?, BufferLifetime::Retained)], unit, 0, false)?);
 			}
 		}
 		let mut schedule = Vec::with_capacity(graph.nodes.len());
 		for node in &graph.nodes {
 			if matches!(node.op, Primitive::Contraction | Primitive::Scan) {
-				context_offset = align(context_offset, 8)?;
-				schedule.push(context_offset);
-				context_offset = checked_add(context_offset, NATIVE_SCHEDULE_WORDS * size_of::<i32>(), "model schedule arena")?;
+				schedule.push(context_plan.allocate(&[(NATIVE_SCHEDULE_WORDS * size_of::<i32>(), BufferLifetime::ReadOnly)], 8, 0, false)?);
 			} else {
 				schedule.push(usize::MAX);
 			}
 		}
 		let precisions = graph.nodes.iter().map(|node| node.precision).collect::<Vec<_>>();
 		let (weights, _) = native_weight_arena(graph, precision, inference)?;
+		let (gradients, gradient_bytes) = native_gradient_arena(graph)?;
+		let gradient_precisions = graph.nodes.iter().map(|node| NativePrecision::new(node.precision, node.acc).map(|precision| precision.state)).collect::<Result<Vec<_>>>()?;
 		let spans = graph.nodes.iter().map(|node| (node.offset, node.parameters)).collect::<Vec<_>>();
 		let input_precision = graph.nodes.first().map_or(precision, |node| node.precision);
+		let input_adjoint_precision = gradient_precisions.first().copied().unwrap_or(Compute::FP32);
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
-		Ok(Self { precisions, input_precision, output_precision, weights, spans, casts, cast_adjoints, values, contexts, attention_kv, adjoints, schedule, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
+		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
+		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
+		let clocks = if tracing() {
+			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
+		} else { None };
+		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks })
 	}
 }
 
@@ -2182,6 +2370,7 @@ struct NodePlan {
 	/// The file bytes the load kernel requantizes into `stored`'s format.
 	requantize: Option<StoredWeight>,
 	weight_offset: usize,
+	gradient_offset: usize,
 	packed: bool,
 }
 
@@ -2212,7 +2401,7 @@ struct RecurBodyLayout {
 	gradient_offsets: Vec<usize>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum NativeMatrix {
 	Gfx11,
 	Gfx12,
@@ -2227,6 +2416,163 @@ impl NativeMatrix {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContractFormat { Int4, Int8, Int16, Int32, Fp8, Fp16, Fp32, Fp64, Bf16, Tf32 }
+impl ContractFormat {
+	fn of(precision: Compute, int_bits: u8) -> Result<Self> {
+		if int_bits != 0 {
+			return Ok(match int_bits {
+				4 => Self::Int4,
+				8 => Self::Int8,
+				16 => Self::Int16,
+				32 => Self::Int32,
+				_ => return Err(RecipeError::new(format!("int{int_bits} is not a compute format"))),
+			});
+		}
+		Ok(match precision {
+			Compute::Fp(format) if format == FloatFormat::FP8 || format == FloatFormat::FP8_E5M2 => Self::Fp8,
+			Compute::Fp(format) if format == FloatFormat::FP16 => Self::Fp16,
+			Compute::Fp(format) if format == FloatFormat::FP32 => Self::Fp32,
+			Compute::Fp(format) if format == FloatFormat::FP64 => Self::Fp64,
+			Compute::Bf(format) if format == FloatFormat::BF16 => Self::Bf16,
+			Compute::Tf(format) if format == FloatFormat::TF32 => Self::Tf32,
+			Compute::Int(format) if format == IntFormat::INT4 => Self::Int4,
+			Compute::Int(format) if format == IntFormat::INT8 => Self::Int8,
+			Compute::Int(format) if format == IntFormat::INT16 => Self::Int16,
+			Compute::Int(format) if format == IntFormat::INT32 => Self::Int32,
+			_ => return Err(RecipeError::new(format!("{} is not a compute format", precision.label()))),
+		})
+	}
+	fn name(self) -> &'static str {
+		match self { Self::Int4 => "int4", Self::Int8 => "int8", Self::Int16 => "int16", Self::Int32 => "int32", Self::Fp8 => "fp8", Self::Fp16 => "fp16", Self::Fp32 => "fp32", Self::Fp64 => "fp64", Self::Bf16 => "bf16", Self::Tf32 => "tf32" }
+	}
+}
+#[derive(Clone, Copy)]
+enum TargetMatch { Cpu, Amd(&'static str), NvidiaAtLeast(u32), Nvidia }
+fn nvidia_sm(architecture: &str) -> Option<u32> {
+	architecture.strip_prefix("sm_").or_else(|| architecture.strip_prefix("sm")).and_then(|value| value.parse().ok())
+}
+impl TargetMatch {
+	fn matches(self, target: &BackendTarget) -> bool {
+		match (self, target) {
+			(Self::Cpu, BackendTarget::Cpu { .. }) => true,
+			(Self::Amd(prefix), BackendTarget::Amd { architecture }) => architecture.starts_with(prefix),
+			(Self::NvidiaAtLeast(minimum), BackendTarget::Nvidia { architecture }) => nvidia_sm(architecture).is_some_and(|sm| sm >= minimum),
+			(Self::Nvidia, BackendTarget::Nvidia { .. }) => true,
+			_ => false,
+		}
+	}
+}
+#[derive(Clone, Copy, Debug)]
+struct FormatCapability {
+	format: ContractFormat,
+	vector: Option<&'static str>,
+	matrix: Option<(NativeMatrix, &'static str)>,
+}
+struct CapabilityRow {
+	target: TargetMatch,
+	formats: &'static [FormatCapability],
+}
+const CPU_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: Some("scalar packed dot"), matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("scalar packed dot"), matrix: None },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const NVIDIA_WIDEN_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("fp32 dot of packed i8 codes"), matrix: None },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const NVIDIA_DP4A_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("dp4a"), matrix: None },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const AMD_GFX11_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: Some("sudot4 with int8 activations"), matrix: Some((NativeMatrix::Gfx11, "wmma iu4")) },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("sudot4"), matrix: Some((NativeMatrix::Gfx11, "wmma iu8")) },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: Some((NativeMatrix::Gfx11, "wmma f16")) },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: Some((NativeMatrix::Gfx11, "wmma bf16")) },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const AMD_GFX12_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: Some("sudot4 with int8 activations"), matrix: Some((NativeMatrix::Gfx12, "wmma iu8 after int4 unpack")) },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("sudot4"), matrix: Some((NativeMatrix::Gfx12, "wmma iu8")) },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: Some((NativeMatrix::Gfx12, "wmma f16")) },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: Some((NativeMatrix::Gfx12, "wmma bf16")) },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const AMD_GENERIC_CAPABILITIES: &[FormatCapability] = &[
+	FormatCapability { format: ContractFormat::Int4, vector: Some("dot4 with int8 activations"), matrix: None },
+	FormatCapability { format: ContractFormat::Int8, vector: Some("dot4"), matrix: None },
+	FormatCapability { format: ContractFormat::Int16, vector: Some("scalar i16 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Int32, vector: Some("fp32 x i8"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp8, vector: None, matrix: None },
+	FormatCapability { format: ContractFormat::Fp16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp32, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Fp64, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Bf16, vector: Some("generic IR"), matrix: None },
+	FormatCapability { format: ContractFormat::Tf32, vector: None, matrix: None },
+];
+const CAPABILITY_ROWS: &[CapabilityRow] = &[
+	CapabilityRow { target: TargetMatch::Amd("gfx12"), formats: AMD_GFX12_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::Amd("gfx11"), formats: AMD_GFX11_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::Amd("gfx"), formats: AMD_GENERIC_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::NvidiaAtLeast(61), formats: NVIDIA_DP4A_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::Nvidia, formats: NVIDIA_WIDEN_CAPABILITIES },
+	CapabilityRow { target: TargetMatch::Cpu, formats: CPU_CAPABILITIES },
+];
+fn capability_row(target: &BackendTarget) -> Result<&'static CapabilityRow> {
+	CAPABILITY_ROWS.iter().find(|row| row.target.matches(target)).ok_or_else(|| RecipeError::new(format!("{} has no capability row", native_target_label(target))))
+}
+fn resolve_capability(target: &BackendTarget, format: ContractFormat) -> Result<FormatCapability> {
+	let row = capability_row(target)?;
+	let capability = row.formats.iter().find(|capability| capability.format == format).copied().ok_or_else(|| RecipeError::new(format!("{} has no {} capability entry", native_target_label(target), format.name())))?;
+	if capability.vector.is_none() && capability.matrix.is_none() {
+		let vectors = row.formats.iter().filter(|entry| entry.vector.is_some()).map(|entry| entry.format.name()).collect::<Vec<_>>().join(" ");
+		let matrices = row.formats.iter().filter(|entry| entry.matrix.is_some()).map(|entry| entry.format.name()).collect::<Vec<_>>().join(" ");
+		return Err(RecipeError::new(format!("{} has no {} instruction. Vector: {}. Matrix: {}.", native_target_label(target), format.name(), if vectors.is_empty() { "none" } else { &vectors }, if matrices.is_empty() { "none" } else { &matrices })));
+	}
+	Ok(capability)
+}
+fn validate_capabilities(target: &BackendTarget, graph: &Graph) -> Result<()> {
+	for (index, node) in graph.nodes.iter().enumerate() {
+		resolve_capability(target, ContractFormat::of(node.precision, node.int_bits)?).map_err(|error| RecipeError::new(format!("{}: {error}", node.identity(index))))?;
+	}
+	Ok(())
+}
+
 pub(crate) struct NativeModelIr {
 	graph: Graph,
 	layout: NativeLayout,
@@ -2234,8 +2580,6 @@ pub(crate) struct NativeModelIr {
 	/// Every arithmetic a block named other than the run's: its template links
 	/// beside the run's with this suffix on every definition.
 	variants: Vec<NativeVariant>,
-	/// The weight arena's size; the gradient arena mirrors its layout.
-	weight_bytes: usize,
 	rows: usize,
 	schedule: NativeSchedule,
 	plans: Vec<NodePlan>,
@@ -2247,23 +2591,40 @@ pub(crate) struct NativeModelIr {
 
 impl NativeModelIr {
 	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
+		// Integer inference stages activation codes; training uses the declared
+		// float arithmetic and keeps packed storage for checkpoint output only.
+		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if !inference && NativePrecision::new(node.precision, node.acc)?.state != node.precision {
+				require(node.block_kind != "recur_body" && recurrent_body_regions(graph, node, rows, false, 0)?.is_none(), format!("{} has no accumulator-width backward kernel for a custom recurrent body in {} yet", node.identity(index), node.precision.label()))?;
+			}
+			if inference && matches!(node.int_bits, 16 | 32) {
+				let storage = packed_weight(graph, index, true).ok_or_else(|| RecipeError::new(format!("{} int{} requires packed int8 weights", node.identity(index), node.int_bits)))?;
+				require(!storage.segments.is_empty() && storage.segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q8_0)), format!("{} int{} requires only int8 Q8_0 blocks after load conversion", node.identity(index), node.int_bits))?;
+			}
+			if !inference || node.int_bits == 0 || node.int_bits == 32 {
+				continue;
+			}
+			let needed = node.input.channels.div_ceil(32).saturating_mul(32 * usize::from(node.int_bits.max(8) / 8) + NativePrecision::new(node.precision, node.acc)?.state.bytes());
+			require(needed <= tile_bytes, format!("{} computes in int{} over {} inputs, whose activation codes take {needed} bytes of the {tile_bytes}-byte tile; increase contraction-cpu-shared-values", node.identity(index), node.int_bits, node.input.channels))?;
+		}
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
-		let (weight_offsets, weight_bytes) = native_weight_arena(graph, precision, inference)?;
-		let precision = NativePrecision::new(precision)?;
+		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
+		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
 		for node in &graph.nodes {
-			let base = node.precision == precision.model && node.kv_precision == node.precision;
-			if !base && !variants.iter().any(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision) {
-				let native = NativePrecision::new(node.precision)?;
-				let own = if node.precision == precision.model { String::new() } else { variant_suffix(native.source) };
+			let native = NativePrecision::new(node.precision, node.acc)?;
+			let base = native.source == precision.source && node.kv_precision == node.precision;
+			if !base && !variants.iter().any(|variant| variant.precision.source == native.source && variant.kv == node.kv_precision) {
+				let own = if native.source == precision.source { String::new() } else { variant_suffix(native.source) };
 				let suffix = if node.kv_precision == node.precision { own } else { format!("{own}_kv{}", kv_key(node.kv_precision)?) };
 				variants.push(NativeVariant { suffix, precision: native, kv: node.kv_precision });
 			}
 		}
 		let mut plans = Vec::with_capacity(graph.nodes.len());
 		let mut storage_bytes = 0usize;
-		for (index, node) in graph.nodes.iter().cloned().enumerate() {
+		for (index, mut node) in graph.nodes.iter().cloned().enumerate() {
 			let id = || node.identity(index);
 			// A lookup reads its ids on the host, so it names no device source.
 			require((node.source >= -1 || (node.source == -2 && node.op == Primitive::Lookup)) && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
@@ -2280,11 +2641,11 @@ impl NativeModelIr {
 			let width = if node.op == Primitive::Predictor { 2 } else { 3 };
 			let program_width = node.program_count.checked_mul(width).ok_or_else(|| RecipeError::new(format!("{} program length overflows", id())))?;
 			require(node.program_offset.checked_add(program_width).is_some_and(|end| end <= graph.programs.len()), format!("{} program range exceeds {} values", id(), graph.programs.len()))?;
-			let stored = graph.stored.get(index).cloned().unwrap_or(None);
+			let stored = runtime_stored_weight(graph, index, inference).cloned();
 			if let Some(weight) = &stored {
 				require(weight.count == node.weights(), format!("{} stored weight count {} does not match tensor count {}", id(), weight.count, node.weights()))?;
 			}
-			let requantize = graph.requantize.get(index).cloned().unwrap_or(None);
+			let requantize = if !inference && node.int_bits != 0 { None } else { graph.requantize.get(index).cloned().unwrap_or(None) };
 			// The load kernel reads one node's source at a time: a weight it
 			// expands, or the file bytes it requantizes into the block's format.
 			// The total only says whether there is anything to load.
@@ -2293,7 +2654,10 @@ impl NativeModelIr {
 			} else if let Some(weight) = arena_weight(&node, &stored).filter(|_| !kept) {
 				storage_bytes = checked_add(storage_bytes, weight.bytes.len(), "native storage arena")?;
 			}
+			node.input = window_shape(node.input, graph.input.length, layout.window_positions);
+			node.output = window_shape(node.output, graph.input.length, layout.window_positions);
 			plans.push(NodePlan {
+				gradient_offset: layout.gradients[index],
 				node,
 				value: layout.values[index],
 				context: layout.contexts[index],
@@ -2305,20 +2669,25 @@ impl NativeModelIr {
 				packed: kept,
 			});
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, variants, weight_bytes, rows, schedule, plans, storage_bytes, inference })
+		Ok(Self { graph: graph.clone(), layout, precision, variants, rows, schedule, plans, storage_bytes, inference })
 	}
 	/// The suffix on every template symbol a node calls: empty for the run's own
 	/// arithmetic, the variant's suffix for any other.
-	fn variant(&self, node: &Node) -> &str {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
+	/// The template a node computes in, by its source key: a declared acc of
+	/// fp32 over a double-state base is that base, as `NativePrecision::new`
+	/// resolves it, so the key and not the raw declaration is compared.
+	fn node_source(&self, node: &Node) -> &'static str {
+		NativePrecision::new(node.precision, node.acc).map_or("", |native| native.source)
 	}
-	/// A node's gradient span starts where its weight span starts; the reverse
-	/// bodies index the gradient arena in the node's own element type, so the
-	/// byte offset is expressed in those elements.
+	fn variant(&self, node: &Node) -> &str {
+		let source = self.node_source(node);
+		self.variants.iter().find(|variant| variant.precision.source == source && variant.kv == node.kv_precision).map_or("", |variant| variant.suffix.as_str())
+	}
+	/// The node's gradient offset in elements of its accumulator type.
 	fn gradient_base(&self, plan: &NodePlan) -> Result<usize> {
-		let bytes = self.node_precision(&plan.node).model.bytes();
-		require(plan.weight_offset % bytes == 0, format!("{} weight span is not aligned to its element", plan.node.identity(0)))?;
-		Ok(plan.weight_offset / bytes)
+		let bytes = self.node_precision(&plan.node).state.bytes();
+		require(plan.gradient_offset % bytes == 0, "gradient span is not aligned to its element")?;
+		Ok(plan.gradient_offset / bytes)
 	}
 	/// The run's arithmetic first, then every variant a block named.
 	fn precisions(&self) -> Vec<(NativePrecision, String)> {
@@ -2326,7 +2695,8 @@ impl NativeModelIr {
 	}
 	/// The native precision a node computes in.
 	fn node_precision(&self, node: &Node) -> NativePrecision {
-		self.variants.iter().find(|variant| variant.precision.model == node.precision).map_or(self.precision, |variant| variant.precision)
+		let source = self.node_source(node);
+		self.variants.iter().find(|variant| variant.precision.source == source).map_or(self.precision, |variant| variant.precision)
 	}
 	fn storage(&self) -> StorageImage {
 		let segments: Vec<(usize, StoredBytes)> = self
@@ -2370,29 +2740,24 @@ fn kv_key(kv: Compute) -> Result<&'static str> {
 /// The symbol suffix of a template variant: `-f16` links as `_f16`, the
 /// fp64 template, whose source key is `default`, as `_f64`.
 fn variant_suffix(source: &str) -> String {
-	if source == "default" { "_f64".to_owned() } else { format!("_{}", source.trim_start_matches('-')) }
+	if source == "default" { "_f64".to_owned() } else { format!("_{}", source.trim_start_matches('-').replace('-', "_")) }
 }
-/// Every `@name` in `text` that is a whole symbol, renamed.
-fn rename_symbol(text: &str, name: &str, renamed: &str) -> String {
-	let needle = format!("@{name}");
-	let mut out = String::with_capacity(text.len() + 64);
-	let mut at = 0;
-	for (start, _) in text.match_indices(&needle) {
-		if start < at {
-			continue;
-		}
-		let end = start + needle.len();
-		let whole = text[end..].chars().next().is_none_or(|next| !(next.is_ascii_alphanumeric() || next == '_' || next == '.'));
-		if !whole {
-			continue;
-		}
-		out.push_str(&text[at..start]);
-		out.push('@');
-		out.push_str(renamed);
-		at = end;
+fn rename_symbols(text: &str, names: &HashMap<&str, String>) -> String {
+	let mut output = String::with_capacity(text.len() + names.len() * 16);
+	let mut at = 0usize;
+	while let Some(found) = text[at..].find('@') {
+		let start = at + found;
+		let name_start = start + 1;
+		let name_end = text[name_start..]
+			.find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.')))
+			.map_or(text.len(), |offset| name_start + offset);
+		output.push_str(&text[at..start]);
+		output.push('@');
+		if let Some(renamed) = names.get(&text[name_start..name_end]) { output.push_str(renamed); } else { output.push_str(&text[name_start..name_end]); }
+		at = name_end;
 	}
-	out.push_str(&text[at..]);
-	out
+	output.push_str(&text[at..]);
+	output
 }
 /// The end of the parameter list that opens at `open` in `text`.
 fn parameter_list_end(text: &str, open: usize) -> Option<usize> {
@@ -2452,9 +2817,8 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 		renamed = strip_definition(renamed, name);
 		renamed = renamed.lines().filter(|line| !line.starts_with(&format!("@{name} ="))).collect::<Vec<_>>().join("\n");
 	}
-	for name in names.iter().filter(|name| !shared(name)) {
-		renamed = rename_symbol(&renamed, name, &format!("{name}{suffix}"));
-	}
+	let replacements = names.iter().filter(|name| !shared(name)).map(|name| (name.as_str(), format!("{name}{suffix}"))).collect::<HashMap<_, _>>();
+	renamed = rename_symbols(&renamed, &replacements);
 	let mut out = String::with_capacity(renamed.len());
 	for line in renamed.lines() {
 		if line.starts_with("attributes #") || line.starts_with('!') || line.starts_with("target ") || line.starts_with("source_filename") {
@@ -2495,6 +2859,9 @@ fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
 		.split(';')
 		.find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key).map(|(_, path)| PathBuf::from(path)))
 		.ok_or_else(|| RecipeError::new(format!("native LLVM template {key:?} is absent")))?;
+	if let Some(root) = std::env::var_os("RECIPE_TEMPLATE_ROOT") {
+		return Ok(PathBuf::from(root).join(path.file_name().ok_or_else(|| RecipeError::new("native template has no filename"))?));
+	}
 	Ok(path)
 }
 
@@ -2503,7 +2870,10 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 		Some(kv) => format!("-kv{}", kv_key(kv)?),
 		None => String::new(),
 	};
-	let suffix = format!("{}{cache}", precision.source);
+	// The fp64 base is listed as "default"; its cache variants carry the bare
+	// "-kv..." suffix, so the base name drops out when a cache is named.
+	let base = if precision.source == "default" && !cache.is_empty() { "" } else { precision.source };
+	let suffix = format!("{base}{cache}");
 	let suffix = suffix.as_str();
 	let mapping = match backend {
 		Backend::Cpu => option_env!("RECIPE_CPU_IR").ok_or_else(|| RecipeError::new("CPU native LLVM templates are unavailable"))?,
@@ -2514,25 +2884,6 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	let mut ir = fs::read_to_string(template_path(mapping, &key)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
 	// Share NVIDIA contraction bodies to reduce PTX size and driver compilation time.
 	ir = ir.replace("RECIPE_CONTRACTION_BODY", if matches!(backend, Backend::Nvidia | Backend::Amd) { "#3" } else { "#1" });
-	if let Compute::F(format) = precision.model {
-		for address_space in [" addrspace(3)", ""] {
-			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_exp monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.exp));
-			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_man monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.man));
-		}
-		let narrow = if format.arithmetic == FloatFormat::FP16.arithmetic {
-			Some("half")
-		} else if format.arithmetic == FloatFormat::FP32.arithmetic {
-			Some("float")
-		} else {
-			None
-		};
-		if let Some(narrow) = narrow {
-			ir = strip_definition(ir, "recipe.round");
-			ir.push_str(&format!(
-				"define internal double @recipe.round(double %value) #1 {{ entry: %narrow = fptrunc double %value to {narrow} %result = fpext {narrow} %narrow to double ret double %result }}\n"
-			));
-		}
-	}
 	Ok(ir)
 }
 
@@ -2569,28 +2920,111 @@ fn strip_definition(mut ir: String, name: &str) -> String {
 	ir
 }
 
-fn prune_internal_definitions(mut ir: String) -> String {
-	loop {
-		let names = ir
-			.match_indices("define internal ")
-			.filter_map(|(start, _)| {
-				let signature = &ir[start..ir[start..].find('{').map(|offset| start + offset)?];
-				Some(signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned())
-			})
-			.collect::<Vec<_>>();
-		// A reference reads "@name(", so one pass over the module's '@' positions counts every name at once instead of searching the whole module again once per name, and no name outruns the window so a later '(' names nothing. The definitions arrive in ascending order, so removing their spans in reverse leaves the earlier spans valid.
-		let (bytes, window, mut counts) = (ir.as_bytes(), names.iter().map(|name| name.len() + 1).max().unwrap_or(0), HashMap::new());
-		ir.match_indices('@')
-			.filter_map(|(at, _)| bytes[at + 1..(at + 1 + window).min(bytes.len())].iter().position(|&byte| byte == b'(').map(|stop| &bytes[at + 1..at + 1 + stop]))
-			.for_each(|name| *counts.entry(name).or_insert(0usize) += 1);
-		let spans: Vec<_> = names.iter().filter(|name| counts[name.as_bytes()] == 1).filter_map(|name| definition_span(&ir, name)).collect();
-		if spans.is_empty() {
-			return ir;
-		}
-		for (start, end) in spans.into_iter().rev() {
-			ir.replace_range(start..end, "")
+/// Replaces the portable four-byte products in every linked arithmetic variant
+/// with Pascal's named signed and mixed-sign dot instructions. The weight bytes
+/// remain packed and the intrinsic contributes directly to the i32 block sum.
+fn nvidia_dp4a_helpers(mut ir: String, variants: &[NativeVariant]) -> String {
+	let suffixes = std::iter::once("").chain(variants.iter().map(|variant| variant.suffix.as_str())).collect::<Vec<_>>();
+	for suffix in &suffixes {
+		ir = strip_definition(ir, &format!("recipe.dot4.su{suffix}"));
+		ir = strip_definition(ir, &format!("recipe.dot4.ss{suffix}"));
+	}
+	ir.push_str("declare i32 @llvm.nvvm.idp4a.u.s(i32, i32, i32)\ndeclare i32 @llvm.nvvm.idp4a.s.s(i32, i32, i32)\n");
+	for suffix in suffixes {
+		ir.push_str(&format!(
+			"define internal i32 @recipe.dot4.su{suffix}(i32 %a, i32 %b) #1 {{ entry: %r = call i32 @llvm.nvvm.idp4a.u.s(i32 %a, i32 %b, i32 0) ret i32 %r }}\n\
+define internal i32 @recipe.dot4.ss{suffix}(i32 %a, i32 %b) #1 {{ entry: %r = call i32 @llvm.nvvm.idp4a.s.s(i32 %a, i32 %b, i32 0) ret i32 %r }}\n"
+		));
+	}
+	ir
+}
+
+/// Pre-Pascal NVIDIA has no integer dot instruction. Keep the same packed i8
+/// codes and scales, but widen each four-byte product into fp32 registers. The
+/// largest four-product partial is exactly representable, so the returned i32
+/// block sum has the same integer value as the named int8 operation.
+fn nvidia_float_dot4_helpers(mut ir: String, variants: &[NativeVariant]) -> String {
+	let suffixes = std::iter::once("").chain(variants.iter().map(|variant| variant.suffix.as_str())).collect::<Vec<_>>();
+	for suffix in &suffixes {
+		ir = strip_definition(ir, &format!("recipe.dot4.su{suffix}"));
+		ir = strip_definition(ir, &format!("recipe.dot4.ss{suffix}"));
+	}
+	for suffix in suffixes {
+		for (name, signed) in [("su", false), ("ss", true)] {
+			ir.push_str(&format!("define internal i32 @recipe.dot4.{name}{suffix}(i32 %a, i32 %b) #1 {{ entry:\n"));
+			let mut sum = String::new();
+			for byte in 0..4 {
+				let shift = 24 - byte * 8;
+				if signed {
+					ir.push_str(&format!("%a{byte}.s = shl i32 %a, {shift}\n%a{byte} = ashr i32 %a{byte}.s, 24\n"));
+				} else {
+					ir.push_str(&format!("%a{byte}.s = lshr i32 %a, {}\n%a{byte} = and i32 %a{byte}.s, 255\n", byte * 8));
+				}
+				ir.push_str(&format!("%b{byte}.s = shl i32 %b, {shift}\n%b{byte} = ashr i32 %b{byte}.s, 24\n%a{byte}.f = sitofp i32 %a{byte} to float\n%b{byte}.f = sitofp i32 %b{byte} to float\n%p{byte} = fmul float %a{byte}.f, %b{byte}.f\n"));
+				if byte == 0 {
+					sum = "%p0".to_owned();
+				} else {
+					ir.push_str(&format!("%s{byte} = fadd float {sum}, %p{byte}\n"));
+					sum = format!("%s{byte}");
+				}
+			}
+			ir.push_str(&format!("%result = fptosi float {sum} to i32\nret i32 %result\n}}\n"));
 		}
 	}
+	ir
+}
+
+fn prune_internal_definitions(mut ir: String) -> String {
+	let definitions = ir
+		.match_indices("define internal ")
+		.filter_map(|(start, _)| {
+			let open = start + ir[start..].find('{')?;
+			let signature = &ir[start..open];
+			let name = signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned();
+			let mut depth = 0usize;
+			let end = ir[open..].bytes().enumerate().find_map(|(offset, byte)| match byte {
+				b'{' => { depth += 1; None }
+				b'}' => { depth = depth.saturating_sub(1); (depth == 0).then_some(open + offset + 1) }
+				_ => None,
+			})?;
+			Some((name, start, end))
+		})
+		.collect::<Vec<_>>();
+	if definitions.is_empty() { return ir; }
+	let names = definitions.iter().enumerate().map(|(index, (name, _, _))| (name.as_str(), index)).collect::<HashMap<_, _>>();
+	let references = |text: &str| {
+		let mut found = Vec::new();
+		let mut at = 0usize;
+		while let Some(offset) = text[at..].find('@') {
+			let start = at + offset + 1;
+			let end = text[start..].find('(').map_or(text.len(), |length| start + length);
+			if end != text.len() && !text[start..end].bytes().any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'@' | b'=' | b','))
+				&& let Some(index) = names.get(&text[start..end])
+			{
+				found.push(*index);
+			}
+			at = start;
+		}
+		found
+	};
+	let edges = definitions.iter().map(|(_, start, end)| references(&ir[*start..*end])).collect::<Vec<_>>();
+	let mut roots = Vec::new();
+	let mut outside = 0usize;
+	for (_, start, end) in &definitions {
+		roots.extend(references(&ir[outside..*start]));
+		outside = *end;
+	}
+	roots.extend(references(&ir[outside..]));
+	let mut reachable = vec![false; definitions.len()];
+	while let Some(index) = roots.pop() {
+		if reachable[index] { continue; }
+		reachable[index] = true;
+		roots.extend(edges[index].iter().copied());
+	}
+	for (index, (_, start, end)) in definitions.iter().enumerate().rev() {
+		if !reachable[index] { ir.replace_range(*start..*end, ""); }
+	}
+	ir
 }
 
 fn barrier(backend: Backend) -> &'static str {
@@ -3283,6 +3717,9 @@ mod quantized {
 		pub(super) ir: String,
 		pub(super) backend: Backend,
 		pub(super) precision: NativePrecision,
+		/// The variant suffix of the block the decoder serves: its state helpers
+		/// are the ones linked under that suffix, in that state type.
+		pub(super) suffix: String,
 		pub(super) next: usize,
 	}
 
@@ -3350,20 +3787,20 @@ mod quantized {
 			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load half, {pointer} {address}, align 2"));
-			self.instruction(format!("call {state} @recipe.state.from.f16(half {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {loaded})", self.suffix))
 		}
 		fn float(&mut self, offset: Self::Int) -> Self::Value {
 			let pointer = pointer_type(self.backend);
 			let state = self.precision.state_type;
 			let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 			let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
-			self.instruction(format!("call {state} @recipe.state.from.f32(float {loaded})"))
+			self.instruction(format!("call {state} @recipe.state.from.f32{}(float {loaded})", self.suffix))
 		}
 		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
 			let state = self.precision.state_type;
 			let bits = self.instruction(format!("trunc i64 {bits} to i16"));
 			let half = self.instruction(format!("bitcast i16 {bits} to half"));
-			self.instruction(format!("call {state} @recipe.state.from.f16(half {half})"))
+			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {half})", self.suffix))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
 			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
@@ -3390,7 +3827,7 @@ mod quantized {
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
 			let ty = self.precision.state_type;
 			let value = self.instruction(format!("trunc i64 {value} to i32"));
-			self.instruction(format!("call {ty} @recipe.state.from.{}32(i32 {value})", if signed { "s" } else { "u" }))
+			self.instruction(format!("call {ty} @recipe.state.from.{}32{}(i32 {value})", if signed { "s" } else { "u" }, self.suffix))
 		}
 		fn literal(&self, value: f64) -> Self::Value {
 			native_literal(self.precision.state, self.precision.state_type, value)
@@ -3402,7 +3839,7 @@ mod quantized {
 				QuantValueOp::Subtract => "sub",
 				QuantValueOp::Multiply => "mul",
 			};
-			self.instruction(format!("call {ty} @recipe.state.{operation}({ty} {left}, {ty} {right})"))
+			self.instruction(format!("call {ty} @recipe.state.{operation}{}({ty} {left}, {ty} {right})", self.suffix))
 		}
 		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -3411,7 +3848,7 @@ mod quantized {
 		}
 		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
-			let negative = self.instruction(format!("call {ty} @recipe.state.neg({ty} {magnitude})"));
+			let negative = self.instruction(format!("call {ty} @recipe.state.neg{}({ty} {magnitude})", self.suffix));
 			let sign = self.instruction(format!("icmp ne i64 {sign}, 0"));
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
@@ -3460,6 +3897,13 @@ impl NativeModelIr {
 				continue;
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
+			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
+				let pointer = pointer_type(backend);
+				ir.push_str(&format!(
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+					at = clocks + index * 8
+				));
+			}
 			let node = &plan.node;
 			let v = self.variant(node);
 			let matrix = matrix && matrix_capable(self.node_precision(node));
@@ -3546,18 +3990,22 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(reverse, Primitive::Rope) => {
+					let body = if reverse { "rope_body_adjoint" } else { "rope_body" };
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
 					let ty = self.node_precision(node).model_type;
 					let base = native_literal(self.node_precision(node).model, ty, node.argument[1]);
 					let mscale = native_literal(self.node_precision(node).model, ty, node.argument[4]);
 					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
-					let context = native_literal(self.node_precision(node).model, ty, node.argument[6]);
+					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
 					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
 					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @rope_body{v}( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {context}, {ty} {fast}, {ty} {slow}, i1 {reverse} )\n",
+							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							position_origin = if reverse { "" } else if self.layout.window_positions < self.graph.input.length { ", i32 %begin" } else { ", i32 0" },
 							pointer = pointer_type(backend),
+							weights = pointers.weights,
+							has_factors = node.parameters != 0,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -3672,17 +4120,14 @@ impl NativeModelIr {
 					let source_elements = node.input.elements();
 					emit_runtime_window_loop(&mut ir, index, "last", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.position = sub i32 {source_end}, 1\n%{prefix}.position.wide = zext i32 %{prefix}.position to i64\n%{prefix}.source.local = add i64 %{prefix}.channel.base, %{prefix}.position.wide\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.source.index\n%{prefix}.source.value = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.source.value, {pointer} %{prefix}.output.ptr, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.position = sub i32 {source_end}, 1\n%{prefix}.position.wide = zext i32 %{prefix}.position to i64\n%{prefix}.source.local = add i64 %{prefix}.channel.base, %{prefix}.position.wide\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n",
 							channels = node.output.channels,
 							source_elements = source_elements,
 							source_length = node.input.length,
 							source_end = source_end,
-							ty = ty,
-							pointer = pointer,
-							source = pointers.source,
-							value = pointers.value,
-							align = alignment(ty),
 						));
+						self.emit_operand_load(backend, index, 0, &pointers.source, &format!("%{prefix}.source.index"), &format!("%{prefix}.source.value"), ir);
+						ir.push_str(&format!("%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.source.value, {pointer} %{prefix}.output.ptr, align {align}\n", value = pointers.value, align = alignment(ty)));
 					})?;
 					ir.push_str(barrier(backend));
 				}
@@ -3765,8 +4210,14 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Attention) => {
+					let buffer_length = node.output.length;
+					let compact = self.layout.window_positions < self.graph.input.length;
+					let buffer_origin = if compact { "%begin" } else { "0" };
+					let begin = if compact { "%begin" } else { begin.as_str() };
+					let node = &self.graph.nodes[index];
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
-					let attention = if matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let online_order = self.inference && self.graph.profile.online_softmax;
+					let attention = if !compact && !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
@@ -3812,6 +4263,7 @@ impl NativeModelIr {
 					// The single-query step body is written in the block's own types, so
 					// every precision takes it.
 					let fast_attention = self.inference
+						&& !online_order
 						&& self.rows == 1
 						&& backend == Backend::Amd
 						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
@@ -3834,11 +4286,11 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
 						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
@@ -3862,6 +4314,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -3875,22 +4329,10 @@ impl NativeModelIr {
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
-						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
-						ir.push_str(&format!(
-							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
-							source = pointers.source,
-							wide = wide,
-							align = alignment(ty)
-						));
+						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
-							let second_pointer = format!("%{prefix}.second.ptr");
-							ir.push_str(&format!(
-								"{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i64 {wide}\n",
-								second_source = pointers.second,
-								wide = wide
-							));
-							ir.push_str(&format!("{second} = load {ty}, {pointer} {second_pointer}, align {align}\n", align = alignment(ty)));
+							self.emit_operand_load(backend, index, 1, &pointers.second, wide, &second, ir);
 						}
 						ir.push_str(&forward.code);
 						ir.push_str(&format!(
@@ -3955,13 +4397,7 @@ impl NativeModelIr {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
-					let composed_previous = kernel <= 1;
-					let matrix_gradient = matrix;
-					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, bias = node.argument[2] == 0.0, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = gradient_base, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
-					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body{v}( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i64 0, i32 0 )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
-					}
+					ir.push_str(&format!("call void @contraction_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = true, bias = node.argument[2] == 0.0, matrix_gradient = false, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = gradient_base, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					ir.push_str(barrier(backend));
 				}
 				// The gather reads the packed table the run was given and the optimizer
@@ -4052,13 +4488,13 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Last) => {
 					let pointer = pointer_type(backend);
-					let ty = self.node_precision(node).model_type;
+					let ty = self.node_precision(node).state_type;
 					let prefix = format!("n{index}.last.reverse");
 					let source_elements = node.input.elements();
 					let source_last = node.input.length - 1;
 					emit_fixed_loop(&mut ir, index, "last.reverse", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.source.local = add i64 %{prefix}.channel.base, {source_last}\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.delta.ptr = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n%{prefix}.delta = load {ty}, {pointer} %{prefix}.delta.ptr, align {align}\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 %{prefix}.source.index\n%{prefix}.source.prior = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.source.next = call {ty} @recipe.add{v}({ty} %{prefix}.source.prior, {ty} %{prefix}.delta)\nstore {ty} %{prefix}.source.next, {pointer} %{prefix}.source.ptr, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {channels}\n%{prefix}.channel = urem i64 {wide}, {channels}\n%{prefix}.row.base = mul i64 %{prefix}.row, {source_elements}\n%{prefix}.channel.base = mul i64 %{prefix}.channel, {source_length}\n%{prefix}.source.local = add i64 %{prefix}.channel.base, {source_last}\n%{prefix}.source.index = add i64 %{prefix}.row.base, %{prefix}.source.local\n%{prefix}.delta.ptr = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n%{prefix}.delta = load {ty}, {pointer} %{prefix}.delta.ptr, align {align}\n%{prefix}.source.ptr = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 %{prefix}.source.index\n%{prefix}.source.prior = load {ty}, {pointer} %{prefix}.source.ptr, align {align}\n%{prefix}.source.next = call {ty} @recipe.state.add{v}({ty} %{prefix}.source.prior, {ty} %{prefix}.delta)\nstore {ty} %{prefix}.source.next, {pointer} %{prefix}.source.ptr, align {align}\n",
 							channels = node.output.channels,
 							source_elements = source_elements,
 							source_length = node.input.length,
@@ -4150,12 +4586,13 @@ impl NativeModelIr {
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
+							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
 							weights = pointers.weights,
 							context = pointers.context,
+							backward = pointers.backward_context,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							gate = pointers.second_adjoint,
@@ -4168,7 +4605,7 @@ impl NativeModelIr {
 						ir.push_str(&format!(
 							"call void @delta_reverse_decay_body{v}( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
-							context = pointers.context,
+							context = pointers.backward_context,
 							heads = shape.heads,
 							partials = shape.partials,
 							offset = gradient_base
@@ -4221,7 +4658,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Pool) => {
 					let pointer = pointer_type(backend);
-					let ty = self.node_precision(node).model_type;
+					let ty = self.node_precision(node).state_type;
 					let prefix = format!("n{index}.pool.reverse");
 					emit_fixed_loop(&mut ir, index, "pool.reverse", self.rows, node.output, &window, |ir, _p, wide| {
 						let context_pointer = format!("%{prefix}.context.ptr");
@@ -4231,13 +4668,13 @@ impl NativeModelIr {
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
 						let source_value = format!("%{prefix}.source.adjoint.value");
 						let source_sum = format!("%{prefix}.source.adjoint.sum");
-						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i64 {wide}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {context_wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.add{v}({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty, wide = wide));
+						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i64 {wide}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {context_wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.state.add{v}({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty, wide = wide));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
-					let attention = if matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
+					let attention = "attention_reverse_body";
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
@@ -4258,10 +4695,10 @@ impl NativeModelIr {
 						ir.push_str(&format!("{cell_delta} = getelementptr inbounds {ty}, {pointer} {context}, i32 {offset}\n", offset = layout.cell_delta, context = pointers.context));
 						ir.push_str(&format!("call void @recipe_recur_body_reverse_{index}( {pointer} {weights}, {pointer} {context}, {pointer} {value}, {pointer} {delta}, {pointer} {cell_delta}, {pointer} %gradient, i32 %rows, i32 %threads, i32 {length} )\n", pointer = pointer, weights = pointers.weights, context = pointers.context, value = pointers.value, delta = pointers.delta, cell_delta = cell_delta, length = node.output.length));
 						ir.push_str(barrier(backend));
-						ir.push_str(&format!("call void @scan_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {cell_delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, cell_delta = cell_delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = gradient_base, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5], coded = coded, cell = cell));
+						ir.push_str(&format!("call void @scan_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {backward}, {pointer} {cell_delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer, source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, backward = pointers.backward_context, cell_delta = cell_delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = gradient_base, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5], coded = coded, cell = cell));
 					} else {
 						require(stages == 0, "staged recurrent bodies require the generic body emitter")?;
-						ir.push_str(&format!("call void @scan_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = gradient_base, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5], coded = coded, cell = cell));
+						ir.push_str(&format!("call void @scan_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i1 {has_bias}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i1 {coded}, i32 {cell} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, backward = pointers.backward_context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, has_bias = node.argument[2] == 0.0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = gradient_base, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5], coded = coded, cell = cell));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -4271,6 +4708,7 @@ impl NativeModelIr {
 				(true, Primitive::Elementwise) => {
 					let pointer = pointer_type(backend);
 					let ty = self.node_precision(node).model_type;
+					let st = self.node_precision(node).state_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar.reverse");
 					let first = format!("%{prefix}.first");
@@ -4285,6 +4723,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -4302,6 +4742,8 @@ impl NativeModelIr {
 						code,
 						program_ir::ScalarContext {
 							value_type: ty,
+							state_type: self.node_precision(node).state_type,
+							libm: self.graph.profile.libm,
 							suffix: v,
 							pointer_type: pointer,
 							alignment: alignment(ty),
@@ -4313,6 +4755,7 @@ impl NativeModelIr {
 							literal: &literal,
 						},
 						&incoming,
+						true,
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
@@ -4336,35 +4779,35 @@ impl NativeModelIr {
 							));
 						}
 						ir.push_str(&format!(
-							"{incoming_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{incoming} = load {ty}, {pointer} {incoming_pointer}, align {align}\n",
+							"{incoming_pointer} = getelementptr inbounds {st}, {pointer} {delta}, i64 {wide}\n{incoming} = load {st}, {pointer} {incoming_pointer}, align {state_align}\n",
 							delta = pointers.delta,
-							wide = wide,
-							align = alignment(ty)
+							state_align = alignment(st),
+							wide = wide
 						));
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
 						ir.push_str(&format!(
-							"{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {wide}\n",
+							"{first_adjoint_pointer} = getelementptr inbounds {st}, {pointer} {source_adjoint}, i64 {wide}\n",
 							source_adjoint = pointers.source_adjoint,
 							wide = wide
 						));
 						if node.second != -2 {
 							let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
-							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, v, &format!("{prefix}.first.owned")));
+							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, st, pointer, v, &format!("{prefix}.first.owned")));
 							ir.push_str(&format!(
-								"{second_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {second_adjoint}, i64 {wide}\n",
+								"{second_adjoint_pointer} = getelementptr inbounds {st}, {pointer} {second_adjoint}, i64 {wide}\n",
 								second_adjoint = pointers.second_adjoint,
 								wide = wide
 							));
-							ir.push_str(&accumulate_owned(&second_adjoint_pointer, &reverse.second_adjoint, ty, pointer, v, &format!("{prefix}.second.owned")));
+							ir.push_str(&accumulate_owned(&second_adjoint_pointer, &reverse.second_adjoint, st, pointer, v, &format!("{prefix}.second.owned")));
 						} else {
 							let combined = format!("%{prefix}.combined");
 							ir.push_str(&format!(
-								"{combined} = call {ty} @recipe.add{v}({ty} {first_adjoint}, {ty} {second_adjoint})\n",
+								"{combined} = call {st} @recipe.state.add{v}({st} {first_adjoint}, {st} {second_adjoint})\n",
 								first_adjoint = reverse.first_adjoint,
 								second_adjoint = reverse.second_adjoint
 							));
-							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, ty, pointer, v, &format!("{prefix}.combined.owned")));
+							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, st, pointer, v, &format!("{prefix}.combined.owned")));
 						}
 					};
 					if gradients.is_empty() {
@@ -4387,10 +4830,10 @@ impl NativeModelIr {
 								count,
 								partitions,
 								columns: node.parameters,
-								value_type: ty,
+								value_type: st,
 								pointer_type: pointer,
 								scratch: &pointers.context,
-								zero: &literal(0.0, ty),
+								zero: &literal(0.0, st),
 								gradients: &gradients,
 							},
 							|ir, p| {
@@ -4402,7 +4845,7 @@ impl NativeModelIr {
 						ir.push_str(barrier(backend));
 						let (columns, offset) = (narrow(node.parameters, "scalar gradient columns")?, narrow(gradient_base, "scalar gradient offset")?);
 						ir.push_str(&format!(
-							"call void @reduce_rows({pointer} {context}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n",
+							"call void @reduce_rows_state{v}({pointer} {context}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n",
 							context = pointers.context
 						));
 						ir.push_str(barrier(backend));
@@ -4462,6 +4905,7 @@ impl NativeModelIr {
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
 					let ty = self.node_precision(node).model_type;
+					let st = self.node_precision(node).state_type;
 					let prefix = format!("n{index}.normalize.reverse");
 					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
 					if mode != program_ir::NormalizeMode::Evaluation {
@@ -4496,7 +4940,7 @@ impl NativeModelIr {
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						let output_value = format!("%{prefix}.output.value");
-						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, value = pointers.value, align = alignment(ty), wide = wide));
+						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {st}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {st}, {pointer} {delta_pointer}, align {state_align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, state_align = alignment(st), value = pointers.value, align = alignment(ty), wide = wide));
 						let state_zero = native_literal(self.node_precision(node).state, self.node_precision(node).state_type, 0.0);
 						let fragment = program_ir::emit_normalize_reverse(
 							program_ir::NormalizeReverseContext {
@@ -4524,11 +4968,11 @@ impl NativeModelIr {
 						ir.push_str(&fragment.code);
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
 						ir.push_str(&format!(
-							"{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {wide}\n",
+							"{source_pointer} = getelementptr inbounds {st}, {pointer} {source_adjoint}, i64 {wide}\n",
 							source_adjoint = pointers.source_adjoint,
 							wide = wide
 						));
-						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, v, &format!("{prefix}.owned")));
+						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, st, pointer, v, &format!("{prefix}.owned")));
 					})?;
 					ir.push_str(barrier(backend));
 					if node.parameters != 0 {
@@ -4538,10 +4982,10 @@ impl NativeModelIr {
 						let count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
 						let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
 						let (columns, offset) = (narrow(node.parameters, "normalization weight columns")?, narrow(gradient_base, "normalization weight offset")?);
-						let statistics = narrow(checked_mul(4, normalize_groups(node, self.rows)?, "normalization statistics")?, "normalization statistics")?;
+						let statistics = normalize_gradient_scratch(node, self.rows)?;
 						let scratch = format!("%{prefix}.scratch");
-						let zero = native_literal(self.node_precision(node).model, ty, 0.0);
-						ir.push_str(&format!("{scratch} = getelementptr inbounds {ty}, {pointer} {context}, i32 {statistics}\n", context = pointers.context));
+						let zero = native_literal(self.node_precision(node).state, st, 0.0);
+						ir.push_str(&format!("{scratch} = getelementptr inbounds i8, {pointer} {context}, i64 {statistics}\n", context = pointers.context));
 						let name = "normalize.weight";
 						let row = format!("%n{index}.{name}.partition.row");
 						let weight_prefix = format!("{prefix}.weight");
@@ -4549,7 +4993,7 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
 							|ir, p| {
 								let wide = format!("%{weight_prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
@@ -4557,7 +5001,7 @@ impl NativeModelIr {
 								let source_value = format!("%{weight_prefix}.source.value");
 								let delta_pointer = format!("%{weight_prefix}.delta.ptr");
 								let delta_value = format!("%{weight_prefix}.delta.value");
-								ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n", source = pointers.source, delta = pointers.delta, align = alignment(ty), wide = wide));
+								ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{delta_pointer} = getelementptr inbounds {st}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {st}, {pointer} {delta_pointer}, align {state_align}\n", source = pointers.source, delta = pointers.delta, state_align = alignment(st), align = alignment(ty), wide = wide));
 								// The forward fragment without its weight is the normalized input.
 								let fragment = program_ir::emit_normalize(
 									program_ir::NormalizeContext {
@@ -4589,12 +5033,13 @@ impl NativeModelIr {
 								} else {
 									format!("%{weight_prefix}.live = icmp ult i64 %{weight_prefix}.normalize.row, %{weight_prefix}.normalize.rows.wide\n")
 								};
-								ir.push_str(&format!("%{weight_prefix}.product = call {ty} @recipe.mul{v}({ty} {delta_value}, {ty} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {ty} %{weight_prefix}.product, {ty} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i64 %{weight_prefix}.normalize.channel, i64 0\n%{weight_prefix}.partition.row.wide = zext i32 {row} to i64\n%{weight_prefix}.column = add i64 %{weight_prefix}.partition.row.wide, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i64 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {ty}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {ty} @recipe.add{v}({ty} %{weight_prefix}.column.value, {ty} %{weight_prefix}.contribution)\nstore {ty} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = fragment.value, align = alignment(ty), row = row));
+								ir.push_str(&format!("%{weight_prefix}.normalized.state = call {st} @recipe.state.from.model{v}({ty} {})\n", fragment.value));
+								ir.push_str(&format!("%{weight_prefix}.product = call {st} @recipe.state.mul{v}({st} {delta_value}, {st} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {st} %{weight_prefix}.product, {st} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i64 %{weight_prefix}.normalize.channel, i64 0\n%{weight_prefix}.partition.row.wide = zext i32 {row} to i64\n%{weight_prefix}.column = add i64 %{weight_prefix}.partition.row.wide, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {st}, {pointer} {scratch}, i64 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {st}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {st} @recipe.state.add{v}({st} %{weight_prefix}.column.value, {st} %{weight_prefix}.contribution)\nstore {st} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = format!("%{weight_prefix}.normalized.state"), align = alignment(st), row = row));
 							},
 						)?;
 						ir.push_str(barrier(backend));
 						ir.push_str(&format!(
-							"call void @reduce_rows({pointer} {scratch}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n"
+							"call void @reduce_rows_state{v}({pointer} {scratch}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n"
 						));
 						ir.push_str(barrier(backend));
 					}
@@ -4854,7 +5299,7 @@ impl NativeModelIr {
 					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
 					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
 					writeln!(ir, "br label %{name}.p.loop")?;
 					writeln!(ir, "{name}.p.loop:")?;
@@ -5340,10 +5785,10 @@ impl NativeModelIr {
 						writeln!(ir, "{second_value} = load {ty}, {pointer} %recur{index}.reverse{node_index}.second.ptr, align {align}")?;
 					}
 					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
-					let scalar_context = program_ir::ScalarContext { value_type: ty, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
+					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
 					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&forward.code);
-					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming")).map_err(|error| RecipeError::new(error.to_string()))?;
+					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming"), false).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&reverse.code);
 					let destination = |source: i32, which: &str, value: &str, ir: &mut String| -> Result<()> {
 						let pointer_name = format!("%recur{index}.reverse{node_index}.{which}.dst");
@@ -5471,6 +5916,15 @@ impl NativeModelIr {
 		let zero = native_literal(self.node_precision(node).state, state_ty, 0.0);
 		let one = native_literal(self.node_precision(node).state, state_ty, 1.0);
 		let epsilon = native_literal(self.node_precision(node).state, state_ty, node.argument[1]);
+		// A declared accumulator wider than the block widens the sum alone: the
+		// squares, the mean, the epsilon shift, the root and the reciprocal stay
+		// at the block's precision, the way llama.cpp's rms_norm sums fp32
+		// squares in double and finishes in fp32. The block's own state keeps
+		// every step wide.
+		let precision = self.node_precision(node);
+		let wide_sum_only = precision.acc == Compute::FP64 && precision.model != Compute::FP64 && precision.state == Compute::FP64;
+		let epsilon_model = native_literal(precision.model, ty, node.argument[1]);
+		let one_model = native_literal(precision.model, ty, 1.0);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
 		let width = normalize_width(node);
@@ -5610,6 +6064,12 @@ impl NativeModelIr {
 				"%{prefix}.norm = call {state_ty} @recipe.state.sqrt{v}({state_ty} {variance_total})\n%{prefix}.floored = call i1 @recipe.state.ogt{v}({state_ty} %{prefix}.norm, {state_ty} {epsilon})\n%{prefix}.deviation = select i1 %{prefix}.floored, {state_ty} %{prefix}.norm, {state_ty} {epsilon}\n",
 				variance_total = variance_total,
 			)
+		} else if wide_sum_only {
+			format!(
+				"%{prefix}.variance.wide = call {state_ty} @recipe.state.div{v}({state_ty} {variance_total}, {state_ty} {variance_items})\n%{prefix}.variance = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.wide)\n%{prefix}.adjusted = call {ty} @recipe.add{v}({ty} %{prefix}.variance, {ty} {epsilon_model})\n%{prefix}.deviation.model = call {ty} @recipe.sqrt{v}({ty} %{prefix}.adjusted)\n%{prefix}.scale = call {ty} @recipe.div{v}({ty} {one_model}, {ty} %{prefix}.deviation.model)\n",
+				variance_total = variance_total,
+				variance_items = variance_items,
+			)
 		} else {
 			format!(
 				"%{prefix}.variance = call {state_ty} @recipe.state.div{v}({state_ty} {variance_total}, {state_ty} {variance_items})\n%{prefix}.adjusted = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt{v}({state_ty} %{prefix}.adjusted)\n",
@@ -5617,22 +6077,30 @@ impl NativeModelIr {
 				variance_items = variance_items,
 			)
 		};
+		let scale_code = if wide_sum_only && mode != program_ir::NormalizeMode::L2 {
+			scale_code
+		} else {
+			format!("{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n")
+		};
+		let square_code = if wide_sum_only {
+			format!("%{prefix}.variance.square.model = call {ty} @recipe.mul{v}({ty} {difference_model}, {ty} {difference_model})\n%{prefix}.variance.square = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.square.model)\n", difference_model = if zero_mean { format!("%{prefix}.variance.model") } else { format!("%{prefix}.variance.centered.model") })
+		} else {
+			format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n")
+		};
 		ir.push_str(&format!(
-			"%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
 			prefix = prefix,
 			state_ty = state_ty,
-			difference = difference,
+			centered_model = if wide_sum_only && !zero_mean { format!("%{prefix}.variance.centered.model = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.centered)\n") } else { String::new() },
 			item_step = item_step,
 			variance_next = variance_next,
 		));
 		let stored_mean = if zero_mean { model_zero } else { format!("%{prefix}.mean.stored") };
 		let store_code = if mode.per_row() {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\n%{prefix}.owner = icmp eq i64 {wave_lane}, 0\nbr i1 %{prefix}.owner, label %{prefix}.store.context, label %{prefix}.group.advance\n{prefix}.store.context:\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\nbr label %{prefix}.group.advance\n{prefix}.group.advance:\n{counter}.next = add i64 {counter}, {wave_count}\nbr label %{prefix}.group.loop\n",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
-				state_ty = state_ty,
-				one = one,
 				ty = ty,
 				pointer = pointer,
 				context = pointers.context,
@@ -5646,11 +6114,10 @@ impl NativeModelIr {
 			)
 		} else {
 			format!(
-				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.scale.state = call {state_ty} @recipe.state.div{v}({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
+				"{variance_reduce_code}{prefix}.store:\n{scale_code}%{prefix}.mean.stored = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.mean)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 {group}\n%{prefix}.scale.index = add i64 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.scale.index\nstore {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n{group_next}",
 				variance_reduce_code = variance_reduce_code,
 				scale_code = scale_code,
 				state_ty = state_ty,
-				one = one,
 				ty = ty,
 				pointer = pointer,
 				context = pointers.context,
@@ -5673,7 +6140,11 @@ impl NativeModelIr {
 	/// and never rewrites a position whose inputs are already present.
 	fn emit_node_window(&self, index: usize, node: &Node, ir: &mut String) -> Result<NodeWindow> {
 		let prefix = format!("n{index}");
-		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) } else { ("%begin".to_owned(), "%end".to_owned()) };
+		let (begin, end) = if node.source >= 0 { (format!("%n{}.begin", node.source), format!("%n{}.end", node.source)) }
+		else if self.layout.window_positions < self.graph.input.length {
+			ir.push_str(&format!("%{prefix}.input.span = sub i32 %end, %begin\n"));
+			("0".to_owned(), format!("%{prefix}.input.span"))
+		} else { ("%begin".to_owned(), "%end".to_owned()) };
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
 		match node.op {
@@ -5725,6 +6196,25 @@ impl NativeModelIr {
 		ir.push_str(&format!("%{prefix}.model = call {} @recipe.model.from.state{tv}({} {state})\n", target.model_type, target.state_type));
 		format!("%{prefix}.model")
 	}
+	/// Read the operand's stored type and convert in registers when this consumer
+	/// does not need a materialized conversion. Training keeps its saved copies.
+	fn emit_operand_load(&self, backend: Backend, index: usize, position: usize, base: &str, offset: &str, result: &str, ir: &mut String) {
+		let node = &self.plans[index].node;
+		let operand = [node.source, node.second][position];
+		let source = if self.layout.casts[index][position].is_some() { node }
+		else if let Ok(operand) = usize::try_from(operand) { &self.plans[operand].node }
+		else { &self.plans[0].node };
+		let pointer = pointer_type(backend);
+		let from_ty = self.node_precision(source).model_type;
+		let prefix = result.trim_start_matches('%');
+		let convert = source.precision != node.precision;
+		let raw = if convert { format!("%{prefix}.raw") } else { result.to_owned() };
+		ir.push_str(&format!("%{prefix}.ptr = getelementptr inbounds {from_ty}, {pointer} {base}, i64 {offset}\n{raw} = load {from_ty}, {pointer} %{prefix}.ptr, align {align}\n", align = alignment(from_ty)));
+		if convert {
+			let converted = self.emit_convert(ir, &format!("{prefix}.convert"), source, node, &raw);
+			ir.push_str(&format!("{result} = freeze {} {converted}\n", self.node_precision(node).model_type));
+		}
+	}
 	/// Before a node runs, each operand held in another arithmetic is converted
 	/// into the node's own over the positions the node writes, and the node reads
 	/// the converted copy. On the reverse pass the node writes its adjoint
@@ -5733,71 +6223,54 @@ impl NativeModelIr {
 		let node = &self.plans[index].node;
 		let pointer = pointer_type(backend);
 		for (position, operand) in [node.source, node.second].into_iter().enumerate() {
-			let Ok(operand) = usize::try_from(operand) else { continue };
-			let (Some(slot), adjoint) = (self.layout.casts[index][position], self.layout.cast_adjoints[index][position]) else { continue };
-			let source = &self.plans[operand].node;
-			let name = format!("n{index}.cast{position}");
-			ir.push_str(&ptr_gep(backend, "values", slot, &name));
-			if reverse {
-				let adjoint = adjoint.ok_or_else(|| RecipeError::new(format!("{} has no cast adjoint slot for its operand", node.identity(index))))?;
-				let adjoint_name = format!("{name}.adjoint");
-				ir.push_str(&ptr_gep(backend, "adjoints", adjoint, &adjoint_name));
-				match position {
-					0 => pointers.source_adjoint = format!("%{adjoint_name}"),
-					_ => pointers.second_adjoint = format!("%{adjoint_name}"),
+			if let Some(slot) = self.layout.casts[index][position] {
+				let source = &self.plans[operand as usize].node;
+				let name = format!("n{index}.cast{position}");
+				ir.push_str(&ptr_gep(backend, "values", slot, &name));
+				if !reverse {
+					let whole = NodeWindow { begin: "0".to_owned(), span: source.output.length.to_string() };
+					let window = if node.input.length == node.output.length { window } else { &whole };
+					let (from_ty, to_ty) = (self.node_precision(source).model_type, self.node_precision(node).model_type);
+					let operand_pointer = if position == 0 { &pointers.source } else { &pointers.second };
+					emit_runtime_window_loop(ir, index, &format!("cast{position}"), source.output, window, |ir, _p, wide| {
+						let prefix = format!("{name}.at");
+						ir.push_str(&format!("%{prefix}.from = getelementptr {from_ty}, {pointer} {operand_pointer}, i64 {wide}\n%{prefix}.raw = load {from_ty}, {pointer} %{prefix}.from, align {from_align}\n", from_align = alignment(from_ty)));
+						let converted = self.emit_convert(ir, &prefix, source, node, &format!("%{prefix}.raw"));
+						ir.push_str(&format!("%{prefix}.to = getelementptr {to_ty}, {pointer} %{name}, i64 {wide}\nstore {to_ty} {converted}, {pointer} %{prefix}.to, align {to_align}\n", to_align = alignment(to_ty)));
+					})?;
+					ir.push_str(barrier(backend));
 				}
-			} else {
-				// A node whose output positions are not its input positions reads
-				// the whole operand; every other node reads its own window.
-				let whole = NodeWindow { begin: "0".to_owned(), span: source.output.length.to_string() };
-				let window = if node.input.length == node.output.length { window } else { &whole };
-				let (from_ty, to_ty) = (self.node_precision(source).model_type, self.node_precision(node).model_type);
-				let (from_align, to_align) = (alignment(from_ty), alignment(to_ty));
-				let operand_pointer = match position {
-					0 => pointers.source.clone(),
-					_ => pointers.second.clone(),
-				};
-				emit_runtime_window_loop(ir, index, &format!("cast{position}"), source.output, window, |ir, _p, wide| {
-					let prefix = format!("{name}.at");
-					ir.push_str(&format!("%{prefix}.from = getelementptr {from_ty}, {pointer} {operand_pointer}, i64 {wide}\n%{prefix}.raw = load {from_ty}, {pointer} %{prefix}.from, align {from_align}\n"));
-					let converted = self.emit_convert(ir, &prefix, source, node, &format!("%{prefix}.raw"));
-					ir.push_str(&format!("%{prefix}.to = getelementptr {to_ty}, {pointer} %{name}, i64 {wide}\nstore {to_ty} {converted}, {pointer} %{prefix}.to, align {to_align}\n"));
-				})?;
-				ir.push_str(barrier(backend));
+				if position == 0 { pointers.source = format!("%{name}"); } else { pointers.second = format!("%{name}"); }
 			}
-			match position {
-				0 => pointers.source = format!("%{name}"),
-				_ => pointers.second = format!("%{name}"),
+			if reverse && let Some(slot) = self.layout.cast_adjoints[index][position] {
+				let name = format!("n{index}.cast{position}.adjoint");
+				ir.push_str(&ptr_gep(backend, "adjoints", slot, &name));
+				if position == 0 { pointers.source_adjoint = format!("%{name}"); } else { pointers.second_adjoint = format!("%{name}"); }
 			}
 		}
 		Ok(())
 	}
-	/// After a node's reverse pass, each adjoint contribution it wrote in its own
-	/// type is converted into the operand's arithmetic and added to the operand's
-	/// adjoint.
+	/// Convert only between accumulator widths when derivatives cross an edge.
 	fn emit_cast_adjoints(&self, backend: Backend, index: usize, ir: &mut String) -> Result<()> {
 		let node = &self.plans[index].node;
 		let pointer = pointer_type(backend);
 		for (position, operand) in [node.source, node.second].into_iter().enumerate() {
-			let Ok(operand) = usize::try_from(operand) else { continue };
 			let Some(slot) = self.layout.cast_adjoints[index][position] else { continue };
-			let source = &self.plans[operand].node;
 			let name = format!("n{index}.castback{position}");
 			ir.push_str(&ptr_gep(backend, "adjoints", slot, &format!("{name}.own")));
-			ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[operand], &format!("{name}.real")));
-			let (own_ty, real_ty) = (self.node_precision(node).model_type, self.node_precision(source).model_type);
-			let (own_align, real_align) = (alignment(own_ty), alignment(real_ty));
-			let real = self.node_precision(source);
+			let (source, shape, target) = if let Ok(operand) = usize::try_from(operand) {
+				ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[operand], &format!("{name}.real")));
+				(&self.plans[operand].node, self.plans[operand].node.output, format!("%{name}.real"))
+			} else {
+				(&self.plans[0].node, self.graph.input, "%input_adjoint".to_owned())
+			};
+			let (own_ty, real_ty) = (self.node_precision(node).state_type, self.node_precision(source).state_type);
 			let rv = self.variant(source);
-			let whole = NodeWindow { begin: "0".to_owned(), span: source.output.length.to_string() };
-			emit_runtime_window_loop(ir, index, &format!("castback{position}"), source.output, &whole, |ir, _p, wide| {
+			let whole = NodeWindow { begin: "0".to_owned(), span: shape.length.to_string() };
+			emit_runtime_window_loop(ir, index, &format!("castback{position}"), shape, &whole, |ir, _p, wide| {
 				let prefix = format!("{name}.at");
-				ir.push_str(&format!("%{prefix}.from = getelementptr {own_ty}, {pointer} %{name}.own, i64 {wide}\n%{prefix}.raw = load {own_ty}, {pointer} %{prefix}.from, align {own_align}\n"));
-				let converted = self.emit_convert(ir, &prefix, node, source, &format!("%{prefix}.raw"));
-				ir.push_str(&format!(
-					"%{prefix}.to = getelementptr {real_ty}, {pointer} %{name}.real, i64 {wide}\n%{prefix}.old = load {real_ty}, {pointer} %{prefix}.to, align {real_align}\n%{prefix}.old.state = call {st} @recipe.state.from.model{rv}({real_ty} %{prefix}.old)\n%{prefix}.add.state = call {st} @recipe.state.from.model{rv}({real_ty} {converted})\n%{prefix}.sum = call {st} @recipe.state.add{rv}({st} %{prefix}.old.state, {st} %{prefix}.add.state)\n%{prefix}.new = call {real_ty} @recipe.model.from.state{rv}({st} %{prefix}.sum)\nstore {real_ty} %{prefix}.new, {pointer} %{prefix}.to, align {real_align}\n",
-					st = real.state_type
-				));
+				let cast = if own_ty == "double" { "fptrunc" } else { "fpext" };
+				ir.push_str(&format!("%{prefix}.from = getelementptr {own_ty}, {pointer} %{name}.own, i64 {wide}\n%{prefix}.raw = load {own_ty}, {pointer} %{prefix}.from, align {own_align}\n%{prefix}.converted = {cast} {own_ty} %{prefix}.raw to {real_ty}\n%{prefix}.to = getelementptr {real_ty}, {pointer} {target}, i64 {wide}\n%{prefix}.old = load {real_ty}, {pointer} %{prefix}.to, align {real_align}\n%{prefix}.sum = call {real_ty} @recipe.state.add{rv}({real_ty} %{prefix}.old, {real_ty} %{prefix}.converted)\nstore {real_ty} %{prefix}.sum, {pointer} %{prefix}.to, align {real_align}\n", own_align = alignment(own_ty), real_align = alignment(real_ty)));
 			})?;
 			ir.push_str(barrier(backend));
 		}
@@ -5805,7 +6278,11 @@ impl NativeModelIr {
 	}
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
-		let source = if plan.node.source >= 0 { format!("%{prefix}.source") } else { "%samples".to_owned() };
+		let source = if plan.node.source >= 0 { format!("%{prefix}.source") }
+		else if self.layout.window_positions < self.graph.input.length {
+			ir.push_str(&format!("%{prefix}.input.begin = zext i32 %begin to i64\n%{prefix}.input = getelementptr i32, {} %samples, i64 %{prefix}.input.begin\n", pointer_type(backend)));
+			format!("%{prefix}.input")
+		} else { "%samples".to_owned() };
 		if plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source node is invalid"))?;
 			ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &format!("{prefix}.source")));
@@ -5821,6 +6298,7 @@ impl NativeModelIr {
 		};
 		let value = format!("%{prefix}.value");
 		let context = format!("%{prefix}.context");
+		let backward_context = format!("%{prefix}.backward.context");
 		let attention_kv = plan.attention_kv.map(|offset| {
 			let pointer = format!("{prefix}.attention.keys");
 			ir.push_str(&ptr_gep(backend, "contexts", offset, &pointer));
@@ -5829,7 +6307,11 @@ impl NativeModelIr {
 		let delta = format!("%{prefix}.delta");
 		let weights = format!("%{prefix}.weights");
 		ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("{prefix}.value")));
-		ir.push_str(&ptr_gep(backend, "contexts", plan.context, &format!("{prefix}.context")));
+		ir.push_str(&ptr_gep(backend, if self.layout.contexts_in_values[index] { "values" } else { "contexts" }, plan.context, &format!("{prefix}.context")));
+		if reverse && matches!(plan.node.op, Primitive::Scan | Primitive::Delta) {
+			let offset = checked_add(plan.context, backward_context_offset(&plan.node, self.rows)?, "backward context offset")?;
+			ir.push_str(&ptr_gep(backend, "contexts", offset, &format!("{prefix}.backward.context")));
+		}
 		if reverse {
 			ir.push_str(&ptr_gep(backend, "adjoints", plan.adjoint, &format!("{prefix}.delta")));
 		}
@@ -5850,12 +6332,12 @@ impl NativeModelIr {
 		} else {
 			source_adjoint.clone()
 		};
-		Ok(ModelPointers { source, second, value, context, attention_kv, delta, weights, source_adjoint, second_adjoint })
+		Ok(ModelPointers { source, second, value, context, backward_context, attention_kv, delta, weights, source_adjoint, second_adjoint })
 	}
 
 	fn emit_native_quantization(&self, backend: Backend, format: &'static Quantization, native: NativeDequant, precision: NativePrecision, suffix: &str) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), precision.model_type);
-		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, next: 0 };
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		require(!matches!(native, NativeDequant::Nf4), "NF4 native dequantization requires its model codebook")?;
 		let result = native.decode(&mut operations);
 		let result = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({} {result})", precision.state_type));
@@ -5877,7 +6359,7 @@ impl NativeModelIr {
 		let name = format!("q4_nf_n{index}");
 		let table_name = format!("{name}_table");
 		let scales_name = format!("{name}_scales");
-		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, next: 0 };
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		let result = dequant_nf4(&mut operations, block, &table_name, table, &scales_name, scales);
 		let result = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({} {result})", precision.state_type));
 		Ok(format!(
@@ -5932,20 +6414,132 @@ impl NativeModelIr {
 		Ok(emitted)
 	}
 
+	/// Whether the activation codes and scales, or the unchanged float activation
+	/// column, fit the shared tile for a packed contraction.
+	fn block_dot_fits(&self, backend: Backend, plan: &NodePlan) -> bool {
+		let precision = self.node_precision(&plan.node);
+		if precision.model.bytes() < 2 || !plan.packed || plan.node.op != Primitive::Contraction {
+			return false;
+		}
+		let tile_bytes = self.schedule.shared_values as usize * self.schedule.element.bytes();
+		let _ = backend;
+		if plan.node.int_bits != 0 && plan.node.int_bits != 32 {
+			// Each record holds a state-width scale and 32 int8 or int16 codes.
+			matches!(precision.state_type, "float" | "double") && plan.node.input.channels.div_ceil(32).saturating_mul(32 * usize::from(plan.node.int_bits.max(8) / 8) + precision.state.bytes()) <= tile_bytes
+		} else {
+			// The column is staged in chunks of whole 256-value blocks.
+			256 * precision.model.bytes() <= tile_bytes
+		}
+	}
+
+	/// The sums whose activations are rounded to int codes before the dot: the
+	/// int(n) blocks, on every backend. Every other packed sum stages its
+	/// activations as they are.
+	fn emit_int_activation_support(&self, backend: Backend) -> String {
+		let mut arms = String::new();
+		if self.inference {
+			for (index, plan) in self.plans.iter().enumerate() {
+				if plan.node.int_bits != 0 && plan.node.int_bits != 32 && self.block_dot_fits(backend, plan) {
+					arms.push_str(&format!("i32 {}, label %int.yes\n", index + 1));
+				}
+			}
+		}
+		let mut steps = String::new();
+		let mut widths = String::new();
+		let mut width_arms = String::new();
+		for (index, plan) in self.plans.iter().enumerate() {
+			if plan.node.int_bits != 0 {
+				width_arms.push_str(&format!("i32 {}, label %width.n{}\n", index + 1, index + 1));
+				widths.push_str(&format!("width.n{}:\nret i32 {}\n", index + 1, plan.node.int_bits));
+			}
+		}
+		let width_ir = format!("define internal i32 @recipe.model.int.width(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %width.default [\n{width_arms}]\n{widths}width.default:\nret i32 0\n}}\n");
+		let mut step_arms = String::new();
+		for (index, plan) in self.plans.iter().enumerate() {
+			if plan.node.int_bits != 0 && plan.node.int_step != 32 {
+				step_arms.push_str(&format!("i32 {}, label %step.n{}\n", index + 1, index + 1));
+				steps.push_str(&format!("step.n{}:\nret i32 {}\n", index + 1, plan.node.int_step));
+			}
+		}
+		// The tail: the sums after the last attention's output projection of an
+		// inference graph. llama.cpp keeps only the batch's last row from there
+		// on and takes it through its gemv, so a 256-step Q4_K sum in the tail
+		// folds that row's blocks whole whatever the batch length.
+		let last_attention = self.plans.iter().rposition(|plan| plan.node.op == Primitive::Attention);
+		let projection = last_attention.and_then(|attention| self.plans.iter().enumerate().position(|(index, plan)| index > attention && plan.node.op == Primitive::Contraction));
+		let mut tail_arms = String::new();
+		if self.inference {
+			for (index, plan) in self.plans.iter().enumerate() {
+				if plan.node.int_bits != 0 && projection.is_some_and(|projection| index > projection) {
+					tail_arms.push_str(&format!("i32 {}, label %tail.yes\n", index + 1));
+				}
+			}
+		}
+		format!("{width_ir}define internal i1 @recipe.model.int.activations(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %int.no [\n{arms}]\nint.yes:\nret i1 true\nint.no:\nret i1 false\n}}\ndefine internal i32 @recipe.model.int.step(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %step.default [\n{step_arms}]\n{steps}step.default:\nret i32 32\n}}\ndefine internal i1 @recipe.model.tail(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %tail.no [\n{tail_arms}]\ntail.yes:\nret i1 true\ntail.no:\nret i1 false\n}}\n")
+	}
+
+	/// The bytes of the shared tile a workgroup owns: the schedule's values in
+	/// the widest element any node declares.
+	fn emit_tile_bytes(&self) -> String {
+		let bytes = self.schedule.shared_values as usize * self.schedule.element.bytes();
+		format!("define internal i32 @recipe.tile.bytes() #1 {{\nentry:\nret i32 {bytes}\n}}\n")
+	}
+
+	/// The K-quant planes of a packed sum on the block path: one or two planes
+	/// of Q4_K (kind 1) or Q6_K (kind 2), the second plane's rows after the
+	/// first's. Empty for a sum that takes another path.
+	fn block_planes(&self, backend: Backend, plan: &NodePlan) -> Vec<(u8, usize)> {
+		if !self.inference || !self.block_dot_fits(backend, plan) {
+			return Vec::new();
+		}
+		let Some(stored) = plan.stored.as_ref() else { return Vec::new() };
+		let segments = stored.format_segments();
+		if segments.is_empty() || segments.len() > 2 || plan.node.input.channels == 0 {
+			return Vec::new();
+		}
+		let mut planes = Vec::new();
+		for (format, count) in segments {
+			let Some(spec) = format.spec() else { return Vec::new() };
+			let kind = match spec.codec {
+				StorageCodec::Q4K => 1,
+				StorageCodec::Q6K => 2,
+				_ => return Vec::new(),
+			};
+			if count % plan.node.input.channels != 0 {
+				return Vec::new();
+			}
+			planes.push((kind, count));
+		}
+		planes
+	}
+	fn emit_plane_support(&self, backend: Backend) -> String {
+		let (mut kind_arms, mut kind_bodies, mut row_arms, mut row_bodies, mut base_arms, mut base_bodies) = (String::new(), String::new(), String::new(), String::new(), String::new(), String::new());
+		for (index, plan) in self.plans.iter().enumerate() {
+			let planes = self.block_planes(backend, plan);
+			if planes.is_empty() {
+				continue;
+			}
+			let node = index + 1;
+			let kind = |plane: usize| planes.get(plane).map_or(0, |(kind, _)| *kind);
+			let first_rows = planes[0].1 / plan.node.input.channels;
+			let first_bytes = planes[0].1 / 256 * if planes[0].0 == 1 { 144 } else { 210 };
+			kind_arms.push_str(&format!("i32 {node}, label %kind.n{node}\n"));
+			kind_bodies.push_str(&format!("kind.n{node}:\n%kind.n{node}.first = icmp eq i32 %plane, 0\n%kind.n{node}.value = select i1 %kind.n{node}.first, i32 {}, i32 {}\nret i32 %kind.n{node}.value\n", kind(0), kind(1)));
+			row_arms.push_str(&format!("i32 {node}, label %rows.n{node}\n"));
+			row_bodies.push_str(&format!("rows.n{node}:\nret i32 {first_rows}\n"));
+			base_arms.push_str(&format!("i32 {node}, label %base.n{node}\n"));
+			base_bodies.push_str(&format!("base.n{node}:\nret i64 {first_bytes}\n"));
+		}
+		format!(
+			"define internal i32 @recipe.model.plane.kind(i32 %node, i32 %plane) #1 {{\nentry:\nswitch i32 %node, label %kind.none [\n{kind_arms}]\n{kind_bodies}kind.none:\nret i32 0\n}}\ndefine internal i32 @recipe.model.plane.rows(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %rows.none [\n{row_arms}]\n{row_bodies}rows.none:\nret i32 -1\n}}\ndefine internal i64 @recipe.model.plane.base(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %base.none [\n{base_arms}]\n{base_bodies}base.none:\nret i64 0\n}}\n"
+		)
+	}
+
 	fn emit_q4k_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let q4k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
-					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
-						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K))
-				});
+				let q4k = self.block_planes(backend, plan).iter().any(|(kind, _)| *kind == 1);
 				if q4k {
 					arms.push_str(&format!("i32 {}, label %q4k.yes\n", index + 1));
 				}
@@ -5956,18 +6550,9 @@ impl NativeModelIr {
 
 	fn emit_q6k_support(&self, backend: Backend) -> String {
 		let mut arms = String::new();
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let q6k = plan.packed && plan.stored.as_ref().is_some_and(|stored| {
-					let segments = stored.format_segments();
-					plan.node.op == Primitive::Contraction && segments.len() == 1 && scratch <= self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes()
-						&& segments.iter().all(|(format, _)| format.spec().is_some_and(|spec| spec.codec == StorageCodec::Q6K))
-				});
+				let q6k = self.block_planes(backend, plan).iter().any(|(kind, _)| *kind == 2);
 				if q6k {
 					arms.push_str(&format!("i32 {}, label %q6k.yes\n", index + 1));
 				}
@@ -5981,16 +6566,11 @@ impl NativeModelIr {
 	/// Every other packed format takes the per-value decoder.
 	fn emit_block32_support(&self, backend: Backend) -> String {
 		let (mut kinds, mut strides) = (String::new(), String::new());
-		if self.inference && backend == Backend::Amd {
+		if self.inference {
 			for (index, plan) in self.plans.iter().enumerate() {
-				let precision = self.node_precision(&plan.node);
-				if precision.state_type != "float" || precision.model.bytes() < 2 {
-					continue;
-				}
-				let scratch = plan.node.input.channels.div_ceil(32).saturating_mul(36);
-				let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed && plan.node.op == Primitive::Contraction) else { continue };
+				let Some(stored) = plan.stored.as_ref().filter(|_| self.block_dot_fits(backend, plan)) else { continue };
 				let segments = stored.format_segments();
-				if segments.len() != 1 || scratch > self.schedule.shared_values as usize * widest_precision(&self.graph, precision.model).bytes() {
+				if segments.len() != 1 {
 					continue;
 				}
 				let Some(spec) = segments[0].0.spec() else { continue };
@@ -6260,7 +6840,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, nvidia_dp4a: bool, nvidia_widen: bool) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let substitute = |template: String, element: usize| {
 			template
@@ -6276,20 +6856,26 @@ impl NativeModelIr {
 				.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
 				.replace("RECIPE_GRADIENT_SCRATCH_BASE", &(self.schedule.scratch_base as usize / element.max(1)).to_string())
 		};
-		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.model.bytes());
+		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.state.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
-			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.model.bytes()), "recipe.model.decode");
+			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
+		}
+		if nvidia_dp4a {
+			ir = nvidia_dp4a_helpers(ir, &self.variants);
+		} else if nvidia_widen {
+			ir = nvidia_float_dot4_helpers(ir, &self.variants);
 		}
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let source_decode = self.emit_source_decode(backend)?;
 		let q4k_support = self.emit_q4k_support(backend);
+		let int_activation_support = self.emit_int_activation_support(backend);
 		let q6k_support = self.emit_q6k_support(backend);
 		let block32_support = self.emit_block32_support(backend);
 		let model_load = self.emit_model_load(backend)?;
@@ -6299,27 +6885,37 @@ impl NativeModelIr {
 		ir.push_str(&weight_decode);
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
+		ir.push_str(&int_activation_support);
+		ir.push_str(&self.emit_tile_bytes());
+		ir.push_str(&self.emit_plane_support(backend));
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
 		let state_ty = self.precision.state_type;
 		let (kernel, thread) = native_entry(backend)?;
+		let timing_start = |prefix: &str, slot: usize| format!("%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.write, label %{prefix}.done\n{prefix}.write:\n%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\nstore i64 %{prefix}.clock, {pointer} %{prefix}.base, align 8\nbr label %{prefix}.done\n{prefix}.done:\n");
+		let timing_end = |prefix: &str, slot: usize| format!("%{prefix}.clock = call i64 @recipe.clock()\n%{prefix}.base = getelementptr i8, {pointer} %contexts, i64 {slot}\n%{prefix}.prior = atomicrmw umax {pointer} %{prefix}.base, i64 %{prefix}.clock monotonic\n");
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
 		body.push_str(&inference_forward);
+		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
 			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
 			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #3 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&timing_start("timing.training.start", self.layout.timing));
 			body.push_str(&training_forward);
+			body.push_str(&timing_end("timing.training.end", self.layout.timing + 8));
 			body.push_str("ret void\n}\n");
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
-		if loss.is_none() && matches!(backend, Backend::Amd) {
-			ir.push_str("declare void @llvm.assume(i1)\nattributes #4 = { nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }\n");
+		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
+			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
+			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
 			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
 		}
@@ -6332,29 +6928,33 @@ impl NativeModelIr {
 		}
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
-			let gradient_bytes = self.weight_bytes;
-			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.layout.input_precision.bytes(), "native input clear bytes")?;
+			let gradient_bytes = self.layout.gradient_bytes;
+			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.layout.input_adjoint_precision.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
-			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&timing_start("timing.epoch.start", self.layout.timing));
+			body.push_str("%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %gradient.skip\ngradient.skip:\nbr i1 %epoch.optimizer, label %optimizer.entry, label %metrics.forward.entry\ngradient.entry:\n");
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 			body.push_str(barrier(backend));
 			body.push_str(&format!(
-				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\n",
+				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.forward.entry:\ncall void @recipe_model_inference_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\nbr label %metrics.entry\nmetrics.entry:\n",
 				positions = graph_positions(&self.graph)
 			));
-			body.push('\n');
 			let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
 			let (output, ov) = (self.node_precision(&last.node), self.variant(&last.node));
 			body.push_str(&self.emit_loss_and_seed(backend, loss, output.model_type, output.state, output.state_type, pointer, alignment(output.model_type), alignment(output.state_type), ov)?);
+			body.push_str("br i1 %epoch.gradient, label %reverse.entry, label %gradient.done\nreverse.entry:\n");
 			body.push_str(barrier(backend));
 			body.push_str(&reverse);
-			body.push_str("br i1 %epoch.optimizer, label %optimizer.entry, label %epoch.done\n");
+			body.push_str("br label %gradient.done\ngradient.done:\nbr i1 %epoch.optimizer, label %optimizer.entry, label %epoch.done\n");
 			body.push_str(&self.emit_adamw(pointer)?);
-			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
+			body.push_str("br label %epoch.done\nepoch.done:\n");
+			body.push_str(&timing_end("timing.epoch.end", self.layout.timing + 8));
+			body.push_str("ret void\n}\n");
 		}
 		ir.push_str(&body);
 		let mut ir = prune_internal_definitions(ir);
@@ -6373,12 +6973,13 @@ impl NativeModelIr {
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
+		let one = native_literal(state_precision, state_ty, 1.0);
 		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.count = mul i32 %rows, {output}\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
 		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32{v}(i32 %loss.count)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%prediction.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %prediction.sum.next, %loss.item ]\n%r2.target.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.sum.next, %loss.item ]\n%r2.target.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.square.next, %loss.item ]\n%r2.residual.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.residual.square.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -6393,14 +6994,15 @@ impl NativeModelIr {
 			"%loss.contribution".to_owned()
 		};
 		ir.push_str(&format!(
-			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
+			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%prediction.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %prediction.sum, {state_ty} {prediction})\n%r2.target.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.sum, {state_ty} {target})\n%r2.target.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} {target}, {state_ty} {target})\n%r2.target.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.square, {state_ty} %r2.target.item.square)\n%r2.residual = call {state_ty} @recipe.state.sub{v}({state_ty} {prediction}, {state_ty} {target})\n%r2.residual.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.residual, {state_ty} %r2.residual)\n%r2.residual.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.residual.square, {state_ty} %r2.residual.item.square)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
 		));
 		if loss.0 == 1 {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.mean)\n"));
 		} else {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {zero})\n"));
 		}
-		ir.push_str(&format!("store {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str(&format!("%r2.target.mean.part = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.target.sum, {state_ty} %r2.target.sum)\n%r2.target.mean.square = call {state_ty} @recipe.state.div{v}({state_ty} %r2.target.mean.part, {state_ty} %loss.items)\n%r2.total = call {state_ty} @recipe.state.sub{v}({state_ty} %r2.target.square, {state_ty} %r2.target.mean.square)\n%r2.ratio = call {state_ty} @recipe.state.div{v}({state_ty} %r2.residual.square, {state_ty} %r2.total)\n%r2.value.raw = call {state_ty} @recipe.state.sub{v}({state_ty} {one}, {state_ty} %r2.ratio)\n%r2.total.zero = call i1 @recipe.state.oeq{v}({state_ty} %r2.total, {state_ty} {zero})\n%r2.value = select i1 %r2.total.zero, {state_ty} {zero}, {state_ty} %r2.value.raw\n%metric.target.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 1\n%metric.target.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 2\n%metric.residual.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 3\n%metric.r2.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 4\n%metric.prediction.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 5\nstore {state_ty} %prediction.sum, {pointer} %metric.prediction.sum.ptr, align {state_align}\nstore {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nstore {state_ty} %r2.target.sum, {pointer} %metric.target.sum.ptr, align {state_align}\nstore {state_ty} %r2.target.square, {pointer} %metric.target.square.ptr, align {state_align}\nstore {state_ty} %r2.residual.square, {pointer} %metric.residual.square.ptr, align {state_align}\nstore {state_ty} %r2.value, {pointer} %metric.r2.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str("br i1 %epoch.gradient, label %seed.prepare, label %metrics.done\nseed.prepare:\n");
 		let loss_value = if loss.0 == 1 {
 			ir.push_str(barrier(backend));
 			ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n"));
@@ -6408,16 +7010,15 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, %loss.count\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.target.model)\n",));
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %seed.prepare ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, %loss.count\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model{v}({model_ty} %seed.target.model)\n",));
 		let gradient = emit_loss_gradient(&mut ir, v, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%loss.count")?;
-		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state{v}({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
+		ir.push_str(&format!("%seed.ptr = getelementptr {state_ty}, {pointer} %adjoint, i32 %seed.p\nstore {state_ty} {gradient}, {pointer} %seed.ptr, align {state_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\nbr label %metrics.done\nmetrics.done:\n"));
 		Ok(ir)
 	}
 
-	/// One optimizer loop per parameterized node. The gradient and weight arenas
-	/// hold each node's span in that node's model type at the node's arena offset;
-	/// the frozen mask, moments and variances stay indexed by parameter in the
-	/// run's state type, converted at the boundary when a node's state differs.
+	/// One optimizer loop per parameterized node. Weights use model storage;
+	/// gradients use independent state-width spans. Moments and variances use
+	/// the run's state type and are converted when a node's accumulator differs.
 	fn emit_adamw(&self, pointer: &str) -> Result<String> {
 		let run = self.precision;
 		let mut ir = String::from("optimizer.entry:\n");
@@ -6433,6 +7034,7 @@ impl NativeModelIr {
 			let (model_align, run_align) = (alignment(model_ty), alignment(run.state_type));
 			let one = native_literal(precision.state, state_ty, 1.0);
 			let base = narrow(self.gradient_base(plan)?, "optimizer arena base")?;
+			let weight_base = narrow(plan.weight_offset / precision.model.bytes(), "optimizer weight base")?;
 			let first = narrow(node.offset, "optimizer parameter base")?;
 			let count = narrow(node.parameters, "optimizer parameter count")?;
 			let o = format!("optimizer.n{index}");
@@ -6456,9 +7058,9 @@ impl NativeModelIr {
 				converted
 			};
 			ir.push_str(&format!("br label %{o}.loop\n{o}.loop:\n%{o}.p = phi i32 [ %tid, %{previous} ], [ %{o}.next, %{o}.advance ]\n%{o}.more = icmp ult i32 %{o}.p, {count}\nbr i1 %{o}.more, label %{o}.step, label %{o}.done\n{o}.step:\n%{o}.q = add i32 %{o}.p, {first}\n%{o}.e = add i32 %{o}.p, {base}\n"));
-			ir.push_str(&format!("%{o}.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %{o}.q\n%{o}.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %{o}.e\n%{o}.moment.ptr = getelementptr {}, {pointer} %moments, i32 %{o}.q\n%{o}.variance.ptr = getelementptr {}, {pointer} %variances, i32 %{o}.q\n%{o}.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %{o}.e\n", run.state_type, run.state_type));
+			ir.push_str(&format!("%{o}.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %{o}.q\n%{o}.gradient.ptr = getelementptr {state_ty}, {pointer} %gradient, i32 %{o}.e\n%{o}.moment.ptr = getelementptr {}, {pointer} %moments, i32 %{o}.q\n%{o}.variance.ptr = getelementptr {}, {pointer} %variances, i32 %{o}.q\n%{o}.weight.index = add i32 %{o}.p, {weight_base}\n%{o}.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %{o}.weight.index\n", run.state_type, run.state_type));
 			ir.push_str(&format!("%{o}.frozen.value = load i8, {pointer} %{o}.frozen.ptr, align 1\n%{o}.is.frozen = icmp ne i8 %{o}.frozen.value, 0\nbr i1 %{o}.is.frozen, label %{o}.advance, label %{o}.update\n{o}.update:\n"));
-			ir.push_str(&format!("%{o}.gradient.model = load {model_ty}, {pointer} %{o}.gradient.ptr, align {model_align}\n%{o}.gradient.value = call {state_ty} @recipe.state.from.model{v}({model_ty} %{o}.gradient.model)\n%{o}.moment.run = load {}, {pointer} %{o}.moment.ptr, align {run_align}\n%{o}.variance.run = load {}, {pointer} %{o}.variance.ptr, align {run_align}\n%{o}.weight.model = load {model_ty}, {pointer} %{o}.weight.ptr, align {model_align}\n%{o}.weight.value = call {state_ty} @recipe.state.from.model{v}({model_ty} %{o}.weight.model)\n", run.state_type, run.state_type));
+			ir.push_str(&format!("%{o}.gradient.value = load {state_ty}, {pointer} %{o}.gradient.ptr, align {state_align}\n%{o}.moment.run = load {}, {pointer} %{o}.moment.ptr, align {run_align}\n%{o}.variance.run = load {}, {pointer} %{o}.variance.ptr, align {run_align}\n%{o}.weight.model = load {model_ty}, {pointer} %{o}.weight.ptr, align {model_align}\n%{o}.weight.value = call {state_ty} @recipe.state.from.model{v}({model_ty} %{o}.weight.model)\n", run.state_type, run.state_type, state_align = precision.state.bytes()));
 			let moment_old = to_node(&mut ir, &format!("%{o}.moment.run"));
 			let variance_old = to_node(&mut ir, &format!("%{o}.variance.run"));
 			let (rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay) = (to_node(&mut ir, "%rate"), to_node(&mut ir, "%beta1"), to_node(&mut ir, "%beta2"), to_node(&mut ir, "%beta1.power"), to_node(&mut ir, "%beta2.power"), to_node(&mut ir, "%epsilon"), to_node(&mut ir, "%decay"));
@@ -6506,6 +7108,7 @@ struct ModelPointers {
 	second: String,
 	value: String,
 	context: String,
+	backward_context: String,
 	attention_kv: Option<String>,
 	delta: String,
 	weights: String,
@@ -6581,13 +7184,14 @@ impl NativeModelIr {
 /// state so narrow or integer model encodings cannot clip it.
 fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { node.argument[1] as usize } else { node.argument[8] as usize } }
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
+	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
 		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
-		block = integer_argument(node.argument[3], "indexer block")?,
+		block = block,
 		gate = node.argument[2] != 0.0,
 		model_ty = precision.model_type,
 		state_ty = precision.state_type,
@@ -6597,6 +7201,24 @@ fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32
 		pooled = index_pooled,
 		index_base = native_literal(precision.state, precision.state_type, index_base),
 	))
+}
+/// Whether a traced run dumps (and so keeps the arena of) node `index` of
+/// `total`: the first forty and the last four, or the RECIPE_TRACE_NODES=a..b
+/// range when one is named.
+fn traced_node(index: usize, total: usize) -> bool {
+	// A comma-separated list of ranges names several: 0..8,256..264.
+	let ranges = std::env::var("RECIPE_TRACE_NODES").ok().map(|text| {
+		text.split(',')
+			.filter_map(|part| {
+				let (from, to) = part.split_once("..")?;
+				Some((from.trim().parse::<usize>().ok()?, to.trim().parse::<usize>().ok()?))
+			})
+			.collect::<Vec<_>>()
+	});
+	match ranges {
+		Some(ranges) => ranges.iter().any(|(from, to)| (*from..*to).contains(&index)),
+		None => index < 40 || index + 4 >= total,
+	}
 }
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
 	match ty {
@@ -6630,6 +7252,12 @@ fn normalize_span(node: &Node) -> usize {
 }
 
 /// The statistics arena holds four values per group for either group shape.
+fn normalize_gradient_scratch(node: &Node, rows: usize) -> Result<usize> {
+	let groups = normalize_groups(node, rows)?;
+	let state = NativePrecision::new(node.precision, node.acc)?.state.bytes();
+	let forward = checked_mul(checked_mul(2, groups, "normalization groups")?, node.precision.bytes(), "normalization forward statistics")?;
+	checked_add(align(forward, state)?, checked_mul(checked_mul(2, groups, "normalization gradient groups")?, state, "normalization gradient statistics")?, "normalization scratch offset")
+}
 fn normalize_groups(node: &Node, rows: usize) -> Result<usize> {
 	match normalize_mode(node.argument[0])? {
 		// Batch statistics and saved evaluation statistics are one group per
@@ -6789,7 +7417,7 @@ fn integer_argument(value: f64, role: &str) -> Result<i32> {
 /// caller must own the destination element for the current barrier interval.
 fn accumulate_owned(target: &str, value: &str, ty: &str, pointer: &str, v: &str, prefix: &str) -> String {
 	format!(
-		"%{prefix}.prior = load {ty}, {pointer} {target}, align {align}\n%{prefix}.sum = call {ty} @recipe.add{v}({ty} %{prefix}.prior, {ty} {value})\nstore {ty} %{prefix}.sum, {pointer} {target}, align {align}\n",
+		"%{prefix}.prior = load {ty}, {pointer} {target}, align {align}\n%{prefix}.sum = call {ty} @recipe.state.add{v}({ty} %{prefix}.prior, {ty} {value})\nstore {ty} %{prefix}.sum, {pointer} {target}, align {align}\n",
 		align = alignment(ty)
 	)
 }
@@ -6848,7 +7476,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	body(ir, &format!("%{prefix}.p"));
 	ir.push_str(&format!("br label %{prefix}.fold\n{prefix}.fold:\n"));
 	for (parameter, value) in gradients {
-		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.add{v}({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
+		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.state.add{v}({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
 	}
 	ir.push_str(&format!("%{prefix}.p.next = add i32 %{prefix}.p, 1\nbr label %{prefix}.inner\n{prefix}.store:\n"));
 	// Every column of the row is written, including the parameters this program
@@ -6941,9 +7569,8 @@ fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 	let chunk = integer_argument(node.argument[2], "delta chunk")?;
 	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?);
 	let chunks = node.output.length.div_ceil(chunk as usize);
-	let spans = checked_add(chunks, checked_add(chunk as usize, 2, "delta live states")?, "delta state spans")?;
 	let partials = narrow(
-		checked_mul(pairs, checked_add(checked_mul(spans, state, "delta state span")?, checked_mul(2, width as usize, "delta vectors")?, "delta pair span")?, "delta partials")?,
+		checked_mul(pairs, checked_add(state, checked_mul(2, width as usize, "delta vectors")?, "delta backward pair span")?, "delta partials")?,
 		"delta partials",
 	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
@@ -7186,6 +7813,28 @@ fn native_nvidia_compiler() -> Result<&'static str> {
 fn native_nvidia_codegen() -> Result<&'static str> {
 	option_env!("RECIPE_NV_CODEGEN").ok_or_else(|| RecipeError::new("NVIDIA native code generator is unavailable"))
 }
+/// The CUDA version of the driver that opened the device, as cuDriverGetVersion
+/// reports it (11040 for 11.4); zero until a device is opened in this process.
+static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The toolkit assembler that turns the PTX into the device object at
+/// compile time, so a run never waits on the driver to assemble it. A driver
+/// loads only objects from an assembler no newer than itself, so an assembler
+/// past the driver is left alone and the PTX goes to the driver as before.
+fn native_nvidia_assembler() -> Option<&'static str> {
+	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
+	fn release_of(path: &str) -> Option<u32> {
+		let output = Command::new(path).arg("--version").output().ok()?;
+		let text = String::from_utf8_lossy(&output.stdout);
+		let after = text.split("release ").nth(1)?;
+		let mut parts = after.split(|character: char| !character.is_ascii_digit()).filter(|part| !part.is_empty());
+		let (major, minor) = (parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?);
+		Some(major * 1000 + minor * 10)
+	}
+	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
+	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
+	(driver != 0 && release <= driver).then_some(path)
+}
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY")
@@ -7295,6 +7944,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
 				generated?;
 			}
+			if let Some(assembler) = native_nvidia_assembler() {
+				let ptx = output.with_extension("ptx");
+				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
+				let mut command = Command::new(assembler);
+				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
+				let assembled = native_command(command, "NVIDIA PTX assembler", key);
+				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
+				assembled?;
+				return Ok(Vec::new());
+			}
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -7307,15 +7966,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 }
 
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+	let compile_started = Instant::now();
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
-	let matrix = match target {
-		BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11),
-		BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12),
-		_ => None,
-	}
-	.filter(|_| model.schedule.matrix);
-	let ir = model.emit(target.backend(), matrix, loss)?;
+	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
+	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
+	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
+	let ir = model.emit(target.backend(), matrix, loss, dp4a, widen)?;
+	let llvm = llvm_names(&ir);
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -7355,7 +8013,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some(), llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7441,26 +8099,29 @@ struct FloatFormat {
 	storage: FloatLayout,
 }
 impl FloatFormat {
-	const FP8: Self = Self::native(1, 5, 2);
-	const FP16: Self = Self::native(1, 5, 10);
-	const FP32: Self = Self::native(1, 8, 23);
-	const FP64: Self = Self::native(1, 11, 52);
-	const BF16: Self = Self::native(1, 8, 7);
-	const TF32: Self = Self { arithmetic: FloatLayout::new(1, 8, 10), storage: FloatLayout::new(1, 8, 23) };
-	const fn computed(exp: u8, man: u8) -> Self {
-		Self { arithmetic: FloatLayout::new(1, exp, man), storage: Self::FP64.storage }
-	}
-	const fn native(sign: u8, exp: u8, man: u8) -> Self {
-		let layout = FloatLayout::new(sign, exp, man);
-		Self { arithmetic: layout, storage: layout }
+	const FP8: Self = Self::configured("fp8-e4m3", "fp8-e4m3");
+	const FP8_E5M2: Self = Self::configured("fp8-e5m2", "fp8-e5m2");
+	const FP16: Self = Self::configured("fp16", "fp16");
+	const FP32: Self = Self::configured("fp32", "fp32");
+	const FP64: Self = Self::configured("fp64", "fp64");
+	const BF16: Self = Self::configured("bf16", "bf16");
+	const TF32: Self = Self::configured("tf32", "tf32-storage");
+	const fn configured(arithmetic: &str, storage: &str) -> Self {
+		let [s, e, m] = encoding::fields(arithmetic);
+		let [ss, se, sm] = encoding::fields(storage);
+		Self { arithmetic: FloatLayout::new(s, e, m), storage: FloatLayout::new(ss, se, sm) }
 	}
 	const fn bytes(self) -> usize {
 		self.storage.bits().div_ceil(8) as usize
 	}
 	fn pack(self, value: f64) -> u64 {
+		if self == Self::FP8 { return fp8::Encoding::E4M3.pack(value); }
+		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.pack(value); }
 		self.storage.pack(self.arithmetic.unpack(self.arithmetic.pack(value)))
 	}
 	fn unpack(self, bits: u64) -> f64 {
+		if self == Self::FP8 { return fp8::Encoding::E4M3.unpack(bits); }
+		if self == Self::FP8_E5M2 { return fp8::Encoding::E5M2.unpack(bits); }
 		self.arithmetic.unpack(self.arithmetic.pack(self.storage.unpack(bits)))
 	}
 }
@@ -7469,9 +8130,10 @@ struct IntFormat {
 	bits: u8,
 }
 impl IntFormat {
-	const INT1: Self = Self { bits: 1 };
 	const INT4: Self = Self { bits: 4 };
 	const INT8: Self = Self { bits: 8 };
+	const INT16: Self = Self { bits: 16 };
+	const INT32: Self = Self { bits: 32 };
 	const fn bytes(self) -> usize {
 		self.bits.div_ceil(8) as usize
 	}
@@ -7741,7 +8403,6 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
-		pub(super) quantization: u16,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
@@ -7762,7 +8423,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, quantization: 0 })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -7999,6 +8660,7 @@ mod tokenizer {
 		Gpt2,
 		Llama3,
 		Qwen2,
+		Gemma4,
 	}
 
 	fn letter(value: char) -> bool {
@@ -8044,7 +8706,7 @@ mod tokenizer {
 		fn named(pre: &str) -> Result<Self> {
 			Ok(match pre {
 				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
-				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" => Self::Llama3,
+				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" | "lfm2" => Self::Llama3,
 				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
 				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
 			})
@@ -8101,6 +8763,17 @@ mod tokenizer {
 			run(chars, at, space).max(1)
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+			if self == Self::Gemma4 {
+				let mut pieces = Vec::new();
+				let mut start = 0;
+				while start < text.len() {
+					let newlines = text[start..].starts_with('\n');
+					let end = text[start..].char_indices().find_map(|(offset, value)| ((value == '\n') != newlines).then_some(start + offset)).unwrap_or(text.len());
+					pieces.push(&text[start..end]);
+					start = end;
+				}
+				return pieces;
+			}
 			let (offsets, chars): (Vec<usize>, Vec<char>) = text.char_indices().unzip();
 			let (mut at, mut words) = (0, Vec::new());
 			while at < chars.len() {
@@ -8177,8 +8850,10 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			require(kind == "gpt2", format!("tokenizer model {kind:?} is not byte-level BPE"))?;
-			let family = Family::named(text("tokenizer.ggml.pre")?)?;
+			let family = if kind == "gemma4" { Family::Gemma4 } else {
+				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
+				Family::named(text("tokenizer.ggml.pre")?)?
+			};
 			let array = |key: &str| match model.value(key) {
 				Some(GgufValue::Array(items)) => Ok(items.as_slice()),
 				_ => Err(RecipeError::new(format!("{key} is absent"))),
@@ -8203,9 +8878,11 @@ mod tokenizer {
 				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
 			};
 			let map = byte_map();
-			let mut bytes = [0; 256];
-			for (byte, symbol) in map.iter().enumerate() {
-				bytes[byte] = id(&symbol.to_string())?;
+			let mut bytes = [*ids.get("<unk>").unwrap_or(&0); 256];
+			let mut byte_of = HashMap::new();
+			if family != Family::Gemma4 {
+				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = id(&symbol.to_string())?; }
+				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
 			// Control and user-defined tokens are the added tokens: `encode` matches
 			// them whole and no merge ever spells one out of ordinary pieces.
@@ -8220,7 +8897,7 @@ mod tokenizer {
 			let special_id = |key: &str| model.value(key).and_then(GgufValue::integer).map(|value| value as u32);
 			let flag = |key: &str| matches!(model.value(key), Some(GgufValue::Bool(true)));
 			Ok(Self {
-				byte_of: map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect(),
+				byte_of,
 				ids,
 				ranks,
 				added,
@@ -8285,8 +8962,19 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
+			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
-				let mut symbols = word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>();
+				let mut symbols = if self.family == Family::Gemma4 {
+					if word.chars().all(|value| value == '\n') && let Some(id) = self.ids.get(word) {
+						vec![*id]
+					} else {
+						word.chars().flat_map(|value| {
+							let text = value.to_string();
+							self.ids.get(&text).copied().map(|id| vec![id]).unwrap_or_else(|| text.as_bytes().iter().map(|byte| self.ids.get(&format!("<0x{byte:02X}>")).copied().unwrap_or(self.bytes[usize::from(*byte)])).collect())
+						}).collect()
+					}
+				} else { word.bytes().map(|byte| self.bytes[usize::from(byte)]).collect::<Vec<_>>() };
 				// Llama 3 vocabularies take a whole word that is already a token as is.
 				if self.family == Family::Llama3
 					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
@@ -8320,7 +9008,8 @@ mod tokenizer {
 					}
 				}
 			}
-			String::from_utf8_lossy(&bytes).into_owned()
+			let text = String::from_utf8_lossy(&bytes).into_owned();
+			if self.family == Family::Gemma4 { text.replace('▁', " ") } else { text }
 		}
 		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
 		/// content. `generation` sets `add_generation_prompt`, which the template
@@ -8328,7 +9017,18 @@ mod tokenizer {
 		pub fn chat(&self, messages: &[(&str, &str)], generation: bool) -> String {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
-		pub(crate) fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
+			if self.family == Family::Gemma4 {
+				let mut prompt = String::new();
+				for (role, content) in messages {
+					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
+					prompt.push_str(&format!("<|turn>{role}\n{}<turn|>\n", content.trim()));
+				}
+				if generation {
+					prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+				}
+				return Ok(prompt);
+			}
 			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
 			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
 			let conversation = messages
@@ -9540,27 +10240,38 @@ mod bundle {
 	}
 	fn product_branch_text(value: &ProductBranch) -> String {
 		let blocks = value.blocks.iter().map(residual_text).collect::<Vec<_>>().join(";");
-		format!("{}:{}:{blocks}", value.quantization, value.exclusions)
+		format!("{}:{blocks}", value.exclusions)
 	}
 	fn product_branch(value: &str) -> Result<ProductBranch> {
-		// Product records written before branch settings were carried contain only
-		// escaped block lists. New records prefix quantization and exclusions, so
-		// split only the first two colons and leave nested product text untouched.
+		// Product records that carried a run-level quantization prefix are adapted
+		// at load into block-local legacy storage. New records carry only exclusions.
 		let mut fields = value.splitn(3, ':');
 		let first = fields.next().unwrap_or("");
 		if let (Some(exclusions), Some(blocks)) = (fields.next(), fields.next())
 			&& let Ok(quantization) = first.parse::<u16>()
 			&& let Ok(exclusions) = exclusions.parse::<u8>()
 		{
+			let mut blocks = split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?;
+			if quantization != 0 {
+				for block in &mut blocks {
+					if block.quantization == 0 {
+						block.quantization = quantization;
+						block.profile = StorageFormat(quantization).selection().is_some();
+					}
+				}
+			}
+			return Ok(ProductBranch { blocks, exclusions });
+		}
+		if let Some((exclusions, blocks)) = value.split_once(':')
+			&& let Ok(exclusions) = exclusions.parse::<u8>()
+		{
 			return Ok(ProductBranch {
 				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-				quantization,
 				exclusions,
 			});
 		}
 		Ok(ProductBranch {
 			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-			quantization: 0,
 			exclusions: 0,
 		})
 	}
@@ -9644,9 +10355,12 @@ mod bundle {
 				let index = attention.index.unwrap_or(Indexer::NONE);
 				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
+				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
+				let factors = if attention.factors { ",f=1" } else { "" };
+				let unscaled = if attention.unscaled { ",s=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}",
+					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -9747,9 +10461,9 @@ mod bundle {
 				// value-head marker may appear immediately after width when YaRN is
 				// absent, so it cannot be mistaken for a yarn factor.
 				let first_optional = fields.next();
-				let (yarn, value_marker) = match first_optional {
+				let (yarn, first_marker) = match first_optional {
 					None => (None, None),
-					Some(value) if value.starts_with("v=") => (None, Some(value)),
+					Some(value) if value.contains('=') => (None, Some(value)),
 					Some(factor) => (
 						Some((
 							value_at::<f64>(Some(factor), "yarn factor")?.to_bits(),
@@ -9760,11 +10474,21 @@ mod bundle {
 						fields.next(),
 					),
 				};
-				let values = match value_marker {
-					None => keys,
-					Some(value) => value.strip_prefix("v=").ok_or_else(|| RecipeError::new("attention record has extra fields"))?.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?,
-				};
-				require(fields.next().is_none(), "attention record has extra fields")?;
+				let mut values = keys;
+				let (mut window, mut factors, mut unscaled) = (0, false, false);
+				for marker in first_marker.into_iter().chain(fields) {
+					if let Some(value) = marker.strip_prefix("v=") {
+						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
+					} else if let Some(value) = marker.strip_prefix("w=") {
+						window = value.parse().map_err(|error| RecipeError::new(format!("invalid attention window: {error}")))?;
+					} else if marker == "f=1" {
+						factors = true;
+					} else if marker == "s=1" {
+						unscaled = true;
+					} else {
+						return Err(RecipeError::new("attention record has extra fields"));
+					}
+				}
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					width,
@@ -9774,6 +10498,9 @@ mod bundle {
 					yarn,
 					index: (index.block != 0).then_some(index),
 					gate,
+					window,
+					factors,
+					unscaled,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -9868,7 +10595,7 @@ mod bundle {
 	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}||-|{}|{}|{}|{}",
 			operation_text(&block.operation),
 			activation_text(block.activation),
 			normalization_text(block.normalization),
@@ -9879,12 +10606,17 @@ mod bundle {
 			0,
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
-			precision_token(block.blck_precision)
+			precision_token(block.blck_precision),
+			precision_token(block.qk_precision),
+			precision_token(block.rope_precision),
+			precision_token(block.activation_precision),
+			precision_token(block.norm_precision)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11), "semantic model block has the wrong width")?;
+		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17), "semantic model block has the wrong width")?;
+		require(fields.get(11).is_none_or(|field| field.is_empty()), "saved block accumulator overrides are no longer supported; configure acc in the precision table")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			activation: activation(&fields[1])?,
@@ -9896,6 +10628,10 @@ mod bundle {
 			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
 			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
 			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
+			qk_precision: fields.get(13).map_or(Ok(None), |field| precision_from_token(field))?,
+			rope_precision: fields.get(14).map_or(Ok(None), |field| precision_from_token(field))?,
+			activation_precision: fields.get(15).map_or(Ok(None), |field| precision_from_token(field))?,
+			norm_precision: fields.get(16).map_or(Ok(None), |field| precision_from_token(field))?,
 			suffix: Suffix::End,
 		})
 	}
@@ -9923,10 +10659,18 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64, exclusions: u8, precision: Option<Compute>) -> Result<Model> {
+	fn model(mut blocks: Vec<Block>, loss: u8, legacy_quantization: u16, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, quantization, precision, epsilon, exclusions, pending_frozen: false }))
+		if legacy_quantization != 0 {
+			for block in &mut blocks {
+				if block.quantization == 0 {
+					block.quantization = legacy_quantization;
+					block.profile = StorageFormat(legacy_quantization).selection().is_some();
+				}
+			}
+		}
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, exclusions, pending_frozen: false }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -10009,7 +10753,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.epsilon.to_bits() == b.epsilon.to_bits() && a.exclusions == b.exclusions && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.epsilon.to_bits() == b.epsilon.to_bits() && a.exclusions == b.exclusions && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -10037,10 +10781,9 @@ mod bundle {
 	#[derive(Default)]
 	struct ModelParts {
 		loss: Option<u8>,
-		quantization: Option<u16>,
+		legacy_quantization: Option<u16>,
 		epsilon: Option<f64>,
 		exclusions: u8,
-		precision: Option<Compute>,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -10070,11 +10813,10 @@ mod bundle {
 			let model = model(
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
-				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				parts.legacy_quantization.unwrap_or(0),
 				// A bundle saved before models carried an epsilon was lowered with the Cargo default.
 				parts.epsilon.map_or_else(default_epsilon, Ok)?,
 				parts.exclusions,
-				parts.precision,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -10164,6 +10906,17 @@ mod bundle {
 			}
 			let builder = current.as_mut().ok_or_else(|| RecipeError::new("semantic model value precedes graph"))?;
 			match kind {
+				"model2" => {
+					let fields = value.split_whitespace().collect::<Vec<_>>();
+					require(fields.len() == 3, "semantic model2 header has the wrong width")?;
+					require(builder.model.is_none(), "semantic graph has more than one model")?;
+					builder.model = Some(ModelParts {
+						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
+						epsilon: Some(number("semantic model epsilon", fields[1])?),
+						exclusions: value_at(fields.get(2).copied(), "semantic model exclusions")?,
+						..ModelParts::default()
+					});
+				}
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
 					require((2..=5).contains(&fields.len()), "semantic model header has the wrong width")?;
@@ -10174,13 +10927,14 @@ mod bundle {
 						Some(field) => (None, value_at(Some(*field), "semantic model exclusions")?),
 					};
 					let exclusions = fields.get(3).map_or(Ok(exclusions), |field| value_at(Some(*field), "semantic model exclusions"))?;
-					let precision = fields.get(4).map_or(Ok(None), |field| precision_from_token(field))?;
+					if let Some(field) = fields.get(4) {
+						precision_from_token(field)?;
+					}
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
-						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						legacy_quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
 						epsilon,
 						exclusions,
-						precision,
 						..ModelParts::default()
 					});
 				}
@@ -10264,7 +11018,7 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {} {} {} {}", semantic.model.loss.0, semantic.model.quantization, semantic.model.epsilon, semantic.model.exclusions, precision_token(semantic.model.precision)));
+			field(&mut document, "model2", &format!("{} {} {}", semantic.model.loss.0, semantic.model.epsilon, semantic.model.exclusions));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -10356,9 +11110,9 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.quantization, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
+		feed(&format!("loss:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
-			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
+		feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.storage, node.output.elements()));
 		}
 		format!("recipe-native-{hash:016x}")
 	}
@@ -10451,6 +11205,24 @@ mod bundle {
 		}
 		Ok(result)
 	}
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		#[test]
+		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
+			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
+			let text = block_text(&original);
+			assert_eq!(split_escaped(&text, '|').len(), 17);
+			assert_eq!(block(&text).unwrap(), original);
+			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
+			let legacy = block(legacy).unwrap();
+			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
+			assert_eq!(legacy.qk_precision, None);
+			assert_eq!(legacy.rope_precision, None);
+			assert_eq!(legacy.activation_precision, None);
+			assert_eq!(legacy.norm_precision, None);
+		}
+	}
 }
 #[cfg(unix)]
 use std::os::unix::{
@@ -10480,17 +11252,50 @@ static RUN: AtomicU64 = AtomicU64::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_CHECKPOINTED: AtomicBool = AtomicBool::new(false);
 static DEBUG_LOG: OnceLock<std::io::Result<Mutex<fs::File>>> = OnceLock::new();
+#[derive(Clone, Copy, Default)]
+struct TransferTotals { to_device_bytes: usize, to_device_seconds: f64, to_ram_bytes: usize, to_ram_seconds: f64 }
+type TransferCollection = Arc<Mutex<HashMap<String, TransferTotals>>>;
+std::thread_local! {
+	static TRANSFER_TOTALS: std::cell::RefCell<Option<TransferCollection>> = const { std::cell::RefCell::new(None) };
+}
+/// Each run owns its measurements. Nested runs restore their caller's collection;
+/// concurrent shards explicitly inherit the collection of their parent run.
+struct TransferScope(Option<TransferCollection>);
+impl TransferScope {
+	fn new() -> Self { Self::enter(Some(Arc::new(Mutex::new(HashMap::new())))) }
+	fn current() -> Option<TransferCollection> { TRANSFER_TOTALS.with(|slot| slot.borrow().clone()) }
+	fn enter(collection: Option<TransferCollection>) -> Self { Self(TRANSFER_TOTALS.with(|slot| slot.replace(collection))) }
+}
+impl Drop for TransferScope {
+	fn drop(&mut self) { TRANSFER_TOTALS.with(|slot| slot.replace(self.0.take())); }
+}
+fn record_transfer(device: &str, to_device: bool, bytes: usize, seconds: f64) {
+	if bytes == 0 || !seconds.is_finite() || seconds <= 0.0 { return; }
+	let Some(collection) = TransferScope::current() else { return };
+	if let Ok(mut totals) = collection.lock() {
+		let total = totals.entry(device.to_owned()).or_default();
+		if to_device { total.to_device_bytes += bytes; total.to_device_seconds += seconds; } else { total.to_ram_bytes += bytes; total.to_ram_seconds += seconds; }
+	}
+}
+fn transfer_report(gpus: impl IntoIterator<Item = &'static Gpu>) -> Result<ReportLines> {
+	let Some(collection) = TransferScope::current() else { return Ok(ReportLines::default()) };
+	let totals = collection.lock().map_err(|_| RecipeError::new("transfer observations are unavailable"))?;
+	let mut lines = Vec::new();
+	for gpu in gpus {
+		let Some(total) = totals.get(&gpu.name) else { continue };
+		let device = device_label(gpu)?;
+		let machine = device.split(':').next().unwrap_or("machine");
+		if total.to_ram_seconds > 0.0 { lines.push(format!("{device}  link: {device} -> {machine}:ram {:.1} MB/s", total.to_ram_bytes as f64 / total.to_ram_seconds / 1e6)); }
+		if total.to_device_seconds > 0.0 { lines.push(format!("{device}  link: {machine}:ram -> {device} {:.1} MB/s", total.to_device_bytes as f64 / total.to_device_seconds / 1e6)); }
+	}
+	Ok(ReportLines::new(lines))
+}
 const DEBUG_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recipe.log");
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
 fn record_interrupt() {
-	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
-		let message = b"\ninterrupt received, finishing checkpoint\n";
-		unsafe {
-			write(2, message.as_ptr().cast(), message.len());
-		}
-	}
+	INTERRUPTED.store(true, Ordering::Release);
 }
 #[cfg(unix)]
 extern "C" fn interrupt(_: i32) {
@@ -10510,6 +11315,29 @@ fn register_interrupt() -> usize {
 		return signal(SIGINT, interrupt);
 		#[cfg(windows)]
 		return SetConsoleCtrlHandler(Some(interrupt), 1) as usize;
+	}
+}
+#[cfg(unix)]
+#[repr(C)]
+struct PollFd { fd: i32, events: i16, revents: i16 }
+fn chat_line() -> Result<Option<String>> {
+	#[cfg(unix)]
+	loop {
+		if INTERRUPTED.load(Ordering::Acquire) { if std::io::stderr().is_terminal() { eprintln!(); } return Ok(None); }
+		let mut descriptor = PollFd { fd: 0, events: 1, revents: 0 };
+		let ready = unsafe { poll(&mut descriptor, 1, 100) };
+		if ready < 0 {
+			if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+			return Err(RecipeError::new(format!("cannot wait for chat input: {}", std::io::Error::last_os_error())));
+		}
+		if ready == 0 { continue; }
+		let mut line = String::new();
+		return std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")));
+	}
+	#[cfg(windows)]
+	{
+		let mut line = String::new();
+		std::io::stdin().read_line(&mut line).map(|read| (read != 0).then_some(line)).map_err(|error| RecipeError::new(format!("cannot read chat message: {error}")))
 	}
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
@@ -10617,7 +11445,7 @@ pub const fn conv(filters: usize, kernel: usize) -> Block {
 }
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
-	Block { normalization: Some(normalization.normalization()), ..Block::of(Operation::Identity) }
+	Block { normalization: Some(normalization.normalization()), suffix: Suffix::Norm, ..Block::of(Operation::Identity) }
 }
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
@@ -10764,10 +11592,17 @@ struct AttentionBlock {
 	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
+	/// A sliding layer attends fully only up to this many positions. Longer
+	/// contexts are rejected until the attention kernel carries the mask.
+	window: usize,
+	/// Whether the Rope node binds one proportional-frequency factor per pair.
+	factors: bool,
+	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
+	unscaled: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false }
 	}
 
 
@@ -10971,7 +11806,7 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::End } })+}; }
+	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Activation } })+}; }
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
@@ -10994,19 +11829,16 @@ fn fp_format(bits: u8) -> Compute {
 macro_rules! precision_methods {
 	($carrier:ty => $target:ty) => {
 		impl $carrier {
-			pub fn f(&self, exp: u8, man: u8) -> $target {
-				assert!(exp != 0 && man != 0 && u16::from(exp) + u16::from(man) < 64, "f requires a representation no wider than 64 bits");
-				self.arithmetic(Compute::F(FloatFormat::computed(exp, man)))
-			}
 			pub fn fp(&self, bits: u8) -> $target {
 				self.arithmetic(fp_format(bits))
 			}
 			pub fn int(&self, bits: u8) -> $target {
 				let format = match bits {
-					1 => Compute::INT1,
 					4 => Compute::INT4,
 					8 => Compute::INT8,
-					_ => panic!("int bits must be 1, 4, or 8"),
+					16 => Compute::INT16,
+					32 => Compute::INT32,
+					_ => panic!("int bits must be 4, 8, 16, or 32"),
 				};
 				self.arithmetic(format)
 			}
@@ -11031,8 +11863,8 @@ pub struct Block {
 	quantization: u16,
 	profile: bool,
 	frozen: bool,
-	/// The precision of the block's other ops (its atvn, norm, qk, rope, yarn,
-	/// or a residual's add), named by a precision after one of them.
+	/// The precision of an activation, output normalization, composition, or
+	/// residual add named by a suffix immediately after that operation.
 	precision: Option<Compute>,
 	/// The precision of the op that holds the block's numbers (a layer's sum,
 	/// attention, an embedding's lookup), named by a precision right after it.
@@ -11040,11 +11872,18 @@ pub struct Block {
 	/// The format an attention block keeps its key-value cache in, named by a
 	/// precision after `.kv(heads)`.
 	kv_precision: Option<Compute>,
+	/// The arithmetic of the query and key normalization named after `.qk(...)`.
+	qk_precision: Option<Compute>,
+	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
+	rope_precision: Option<Compute>,
+	activation_precision: Option<Compute>,
+	norm_precision: Option<Compute>,
+	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
 }
-/// What a precision suffix names: the blck right before it, the cache, or the
-/// block's other ops.
+/// What a precision suffix names inside one block. Each operation has its own
+/// slot so a later suffix cannot rewrite an earlier operation's arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Suffix {
 	/// Nothing has followed the constructor yet: a precision names the blck
@@ -11052,11 +11891,24 @@ enum Suffix {
 	Fresh,
 	Blck,
 	Kv,
+	Qk,
+	Rope,
+	Activation,
+	Norm,
 	End,
 }
 impl Suffix {
 	fn for_operation(operation: &Operation) -> Self {
-		if operation.weighted() || matches!(operation, Operation::Embed(..)) { Self::Blck } else { Self::End }
+		match operation {
+			// These operations lower their declared arithmetic through a sum,
+			// table lookup, or attention node. Their trailing suffix therefore
+			// names the block's primary numeric operation, not a later activation.
+			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::Moe(..) => Self::Blck,
+			// Every other operation lowers its primary node through the ordinary
+			// operation precision. Weight ownership alone does not choose a slot:
+			// a depthwise convolution owns taps but is not a matrix sum.
+			_ => Self::End,
+		}
 	}
 }
 impl PartialEq for Block {
@@ -11071,6 +11923,10 @@ impl PartialEq for Block {
 			&& self.precision == other.precision
 			&& self.blck_precision == other.blck_precision
 			&& self.kv_precision == other.kv_precision
+			&& self.qk_precision == other.qk_precision
+			&& self.rope_precision == other.rope_precision
+			&& self.activation_precision == other.activation_precision
+			&& self.norm_precision == other.norm_precision
 	}
 }
 impl Eq for Block {}
@@ -11080,7 +11936,6 @@ impl Eq for Block {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductBranch {
 	blocks: Vec<Block>,
-	quantization: u16,
 	exclusions: u8,
 }
 /// The blocks and model-level forward settings captured by one product branch.
@@ -11091,31 +11946,30 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, suffix: Suffix::Fresh }
+		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Fresh }
 	}
 	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
 	/// the pair `layer(8), relu()` are the same step written two ways.
 	pub fn act(mut self, activation: Activation) -> Self {
-		self.suffix = Suffix::End;
+		self.suffix = Suffix::Activation;
 		assert!(self.normalization.is_none(), "activation must precede normalization");
 		self.activation = activation;
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::End;
+		self.suffix = Suffix::Norm;
 		self.normalization = Some(normalization.normalization());
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::End;
 		let normalization = normalization.normalization();
 		assert!(matches!(self.operation, Operation::Attention(_)), "query and key normalization requires an attention block");
 		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "query and key normalization must be rms or l2");
 		self.qk = Some(normalization);
+		self.suffix = Suffix::Qk;
 		self
 	}
 	fn attention(mut self, selector: &str, apply: impl FnOnce(&mut AttentionBlock)) -> Self {
-		self.suffix = Suffix::End;
 		match &mut self.operation {
 			Operation::Attention(attention) => apply(attention),
 			_ => panic!("{selector} requires a preceding attn block"),
@@ -11139,57 +11993,51 @@ impl Block {
 		let layout = layout.layout();
 		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
 		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
-		self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())))
+		let mut block = self.attention("rope", |attention| attention.rope = Some((layout, dims, base.to_bits())));
+		block.suffix = Suffix::Rope;
+		block
 	}
 	/// YaRN frequency scaling for this `rope`.
 	pub fn yarn(self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
-		self.attention("yarn", |attention| {
+		let mut block = self.attention("yarn", |attention| {
 			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
 			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
 			assert!(context != 0, "yarn context must be positive");
 			assert!(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered");
 			attention.yarn = Some((factor.to_bits(), context, fast.to_bits(), slow.to_bits()));
-		})
+		});
+		block.suffix = Suffix::Rope;
+		block
 	}
 	/// Sparse key selection on this `attn` block.
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
+		let mut value = self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }));
+		value.suffix = Suffix::End;
+		value
 	}
 	/// Sigmoid gate on the output of this `attn` block.
 	pub fn gate(self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
-	}
-	/// A step inside a fragment keeps its own storage format, exactly as a step
-	/// of the model does.
-	pub fn quantize(mut self, family: u16, bits: u8, variant: u16) -> Self {
-		let format = family << 12 | variant << 8 | u16::from(bits);
-		self.quantization = format;
-		self.profile = StorageFormat(format).selection().is_some();
-		self
-	}
-	pub fn profile(mut self, profile: bool) -> Self {
-		self.profile = profile;
-		self
+		let mut block = self.attention("gate", |attention| attention.gate = true);
+		block.suffix = Suffix::End;
+		block
 	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
 		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
 		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
 	}
-	pub fn qi(&self, bits: u8) -> Qi<Self> {
-		qi_of(self, bits)
-	}
-	pub fn iq(&self, bits: u8) -> Iq<Self> {
-		iq_of(self, bits)
-	}
-	/// A precision names the blck right before it, the cache after `.kv(heads)`,
-	/// or the block's other ops after any of them.
+	/// A precision names only the operation immediately before it: the primary
+	/// block op, key-value cache, Q/K normalization, rotary embedding, or output op.
 	fn arithmetic(&self, format: Compute) -> Self {
 		let mut block = self.clone();
 		let suffix = if block.suffix == Suffix::Fresh { Suffix::for_operation(&block.operation) } else { block.suffix };
 		match suffix {
 			Suffix::Fresh | Suffix::Blck => block.blck_precision = Some(format),
 			Suffix::Kv => block.kv_precision = Some(format),
+			Suffix::Qk => block.qk_precision = Some(format),
+			Suffix::Rope => block.rope_precision = Some(format),
+			Suffix::Activation => block.activation_precision = Some(format),
+			Suffix::Norm => block.norm_precision = Some(format),
 			Suffix::End => block.precision = Some(format),
 		}
 		block
@@ -11199,13 +12047,7 @@ impl Block {
 		self.act(Activation::Scale(factor.to_bits()))
 	}
 }
-impl Quantized for Block {
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
-		self.clone().quantize(family, bits, variant)
-	}
-}
 precision_methods!(Block => Block);
-precision_methods!(Qk<Block> => Block);
 precision_methods!(attn => Block);
 /// A model: the blocks pushed so far and the settings every later block takes.
 /// The handle shares its data, so `model.frozen` is the same model with a
@@ -11222,9 +12064,6 @@ pub struct ModelData {
 	loss: LossFunction,
 	/// The evaluator a command-RAT proposer is scored through, from `.loss(&evaluator)`.
 	downstream: Option<Box<Model>>,
-	quantization: u16,
-	/// The arithmetic the blocks that named none compute in, when the model set one before its first block.
-	precision: Option<Compute>,
 	/// The epsilon every normalization the model lowers is built with; saved with the model.
 	epsilon: f64,
 	/// The qualifier pending for the next block.
@@ -11327,12 +12166,16 @@ impl Model {
 				activation: Activation::Linear,
 				normalization: None,
 				qk: None,
-				quantization: model.quantization,
-				profile: StorageFormat(model.quantization).selection().is_some(),
+				quantization: 0,
+				profile: false,
 				frozen: model.pending_frozen,
 				precision: None,
 				blck_precision: None,
 				kv_precision: None,
+				qk_precision: None,
+				rope_precision: None,
+				activation_precision: None,
+				norm_precision: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -11361,7 +12204,7 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap();
 			block.activation = activation;
-			block.suffix = Suffix::End;
+			block.suffix = Suffix::Activation;
 		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
@@ -11540,7 +12383,7 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
 			block.normalization = Some(normalization);
-			block.suffix = Suffix::End;
+			block.suffix = Suffix::Norm;
 		})
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
@@ -11577,24 +12420,7 @@ impl Model {
 		assert!(value.is_finite() && value > 0.0, "normalization epsilon must be finite and positive");
 		self.edit(|model| model.epsilon = value)
 	}
-	pub fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
-		let format = family << 12 | variant << 8 | u16::from(bits);
-		self.edit(|model| {
-			if let Some(block) = model.blocks.last_mut() {
-				block.quantization = format;
-				block.profile = StorageFormat(format).selection().is_some()
-			} else {
-				model.quantization = format
-			}
-		})
-	}
-	pub fn qi(&self, bits: u8) -> Qi<Self> {
-		qi_of(self, bits)
-	}
-	pub fn iq(&self, bits: u8) -> Iq<Self> {
-		iq_of(self, bits)
-	}
-	/// `.fp(16)`, `.int(4)`, `.bf(16)`, `.tf(32)`, `.f(e, m)` after a block set that
+	/// `.fp(16)`, `.int(4)`, `.bf(16)`, or `.tf(32)` after a block sets that
 	/// block's arithmetic; before any block they set the default for every block
 	/// that names none.
 	fn arithmetic(&self, format: Compute) -> Self {
@@ -11630,6 +12456,19 @@ impl Model {
 			})
 			.collect::<Vec<_>>()
 			.join("/")
+	}
+	/// Inspect the planned inference arenas before compiling or allocating GPU
+	/// kernels. This uses the same graph and arena layout as a real run.
+	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
+		require(positions > 0, "memory inspection requires context positions")?;
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
+		let model = with_last_projection(self);
+		let plan = conventional_plan(file, &model)?;
+		let gpu = selected_gpu()?;
+		let graph = bound_graph_on(file, &model, &plan, &vec![0.0; positions], 1, gpu)?;
+		let mut memory = part_memory(&graph, Config::load()?.precision)?;
+		memory.device = gpu.name.clone();
+		Ok(memory)
 	}
 }
 fn quantization(code: u16) -> String {
@@ -12479,7 +13318,7 @@ impl StoredBytes {
 	/// row of a mapped table is read without touching the rest of it.
 	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
 		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
-		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
 		for (_, run) in self.runs() {
 			let start = (at.max(skipped) - skipped).min(run.len());
@@ -12493,7 +13332,7 @@ impl StoredBytes {
 	}
 	/// Every run end to end, which is the only point a mapped weight is copied.
 	fn to_vec(&self) -> Result<Vec<u8>> {
-		require(!self.absent_runs(), "stored bytes are written on the device at load and have no host copy")?;
+		require(!self.absent_runs(), "stored bytes are written on the device at load and have no machine-RAM copy")?;
 		let mut out = Vec::with_capacity(self.len());
 		for (_, run) in self.runs() {
 			out.extend_from_slice(run);
@@ -13024,71 +13863,7 @@ impl Integer for StorageFormat {
 		self.spec().ok_or_else(|| self.unavailable())?.codec.dequantize(data, codebook, count)
 	}
 }
-/// Anything a storage format can be named on: a block, a model, a training or
-/// an inference run. The run's format is the default for blocks that name none.
-pub trait Quantized: Sized {
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self;
-}
-/// `.qi(bits)`: `.0` and `.1` are the legacy variants, `.nf` the normal float,
-/// `.k` the K family with `.s`, `.m`, `.l` sizes.
-pub struct Qi<T>(pub T, pub T, QiSuffix<T>);
-#[doc(hidden)]
-pub struct QiSuffix<T> {
-	pub nf: T,
-	pub k: Qk<T>,
-}
-pub struct Qk<T> {
-	model: T,
-	pub s: T,
-	pub m: T,
-	pub l: T,
-}
-pub struct Iq<T> {
-	pub xxs: T,
-	pub xs: T,
-	pub s: T,
-	pub m: T,
-	pub nl: T,
-}
-impl<T> std::ops::Deref for Qk<T> {
-	type Target = T;
-	fn deref(&self) -> &T {
-		&self.model
-	}
-}
-impl<T> std::ops::Deref for Qi<T> {
-	type Target = QiSuffix<T>;
-	fn deref(&self) -> &QiSuffix<T> {
-		&self.2
-	}
-}
-fn qi_of<T: Quantized>(carrier: &T, bits: u8) -> Qi<T> {
-	assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
-	let q = |variant| carrier.quantize(0, bits, variant);
-	Qi(q(0), q(1), QiSuffix { nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } })
-}
-fn iq_of<T: Quantized>(carrier: &T, bits: u8) -> Iq<T> {
-	assert!((1..=4).contains(&bits), "iq bits must be 1 through 4");
-	let q = |variant| carrier.quantize(1, bits, variant);
-	Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
-}
-impl Quantized for Model {
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
-		Model::quantize(self, family, bits, variant)
-	}
-}
 precision_methods!(Model => Model);
-precision_methods!(Qk<Model> => Model);
-impl Qk<Model> {
-	fn arithmetic(&self, format: Compute) -> Model {
-		self.model.arithmetic(format)
-	}
-}
-impl Qk<Block> {
-	fn arithmetic(&self, format: Compute) -> Block {
-		self.model.arithmetic(format)
-	}
-}
 impl Estimator {
 	const fn name(&self) -> &'static str {
 		self.name
@@ -13208,8 +13983,8 @@ impl std::ops::Mul for Model {
 		assert!(!left.pending_frozen && !right.pending_frozen, "product branch qualifier requires a following block");
 		assert!(left.epsilon.to_bits() == right.epsilon.to_bits(), "product branches must use the same normalization epsilon");
 		Block::of(Operation::Product(
-			ProductBranch { blocks: left.blocks, quantization: left.quantization, exclusions: left.exclusions },
-			ProductBranch { blocks: right.blocks, quantization: right.quantization, exclusions: right.exclusions },
+			ProductBranch { blocks: left.blocks, exclusions: left.exclusions },
+			ProductBranch { blocks: right.blocks, exclusions: right.exclusions },
 		))
 	}
 }
@@ -13225,8 +14000,8 @@ impl std::ops::Mul for Block {
 	type Output = Self;
 	fn mul(self, right: Self) -> Self {
 		Block::of(Operation::Product(
-			ProductBranch { blocks: vec![self], quantization: 0, exclusions: 0 },
-			ProductBranch { blocks: vec![right], quantization: 0, exclusions: 0 },
+			ProductBranch { blocks: vec![self], exclusions: 0 },
+			ProductBranch { blocks: vec![right], exclusions: 0 },
 		))
 	}
 }
@@ -13252,6 +14027,137 @@ impl<'a> From<&'a Model> for ModelLoss<'a> {
 }
 #[derive(Clone, Copy)]
 pub struct Metric(u8);
+
+#[derive(Clone, Default)]
+pub struct ReportLines(Vec<String>);
+impl ReportLines {
+	fn new(lines: impl IntoIterator<Item = String>) -> Self {
+		let lines = lines.into_iter().collect::<Vec<_>>();
+		assert!(lines.iter().all(|line| !line.contains('\n') && !line.contains('\r')), "a report item must fit on one line");
+		Self(lines)
+	}
+}
+impl fmt::Display for ReportLines {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0.join("\n")) }
+}
+impl std::ops::Deref for ReportLines {
+	type Target = [String];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[derive(Clone, Default)]
+pub struct NameList(Vec<String>);
+impl NameList {
+	fn new(values: impl IntoIterator<Item = String>) -> Self { Self(values.into_iter().collect()) }
+	fn extend(&mut self, values: impl IntoIterator<Item = String>) { self.0.extend(values); self.0.sort(); self.0.dedup(); }
+}
+impl fmt::Display for NameList {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0.join(", ")) }
+}
+impl std::ops::Deref for NameList {
+	type Target = [String];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[derive(Clone, Default)]
+pub struct LlvmReport { pub instructions: NameList, pub intrinsics: NameList }
+
+#[derive(Clone, Copy, Default)]
+pub struct DurationReport(f64);
+impl DurationReport {
+	pub const fn seconds(self) -> f64 { self.0 }
+}
+impl fmt::Display for DurationReport {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if self.0 < 1.0 { write!(formatter, "{:.3} ms", self.0 * 1e3) } else { write!(formatter, "{:.3} s", self.0) }
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct ScalarHistory(Vec<Vec<f64>>);
+impl ScalarHistory {
+	fn push(&mut self, epoch: usize, value: f64) {
+		while self.0.len() < epoch { self.0.push(Vec::new()); }
+		self.0[epoch - 1].push(value);
+	}
+}
+impl std::ops::Deref for ScalarHistory {
+	type Target = [Vec<f64>];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl fmt::Display for ScalarHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("{")?;
+		for (epoch, values) in self.0.iter().enumerate() {
+			if epoch != 0 { formatter.write_str(",")?; }
+			write!(formatter, "\"{}\":[", epoch + 1)?;
+			for (index, value) in values.iter().enumerate() {
+				if index != 0 { formatter.write_str(",")?; }
+				if value.is_finite() { write!(formatter, "{value}")?; } else { formatter.write_str("null")?; }
+			}
+			formatter.write_str("]")?;
+		}
+		formatter.write_str("}")
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct PredictionHistory(Vec<Vec<Vec<f64>>>);
+impl PredictionHistory {
+	fn push(&mut self, epoch: usize, values: Vec<f64>) {
+		while self.0.len() < epoch { self.0.push(Vec::new()); }
+		self.0[epoch - 1].push(values);
+	}
+}
+impl std::ops::Deref for PredictionHistory {
+	type Target = [Vec<Vec<f64>>];
+	fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl fmt::Display for PredictionHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("{")?;
+		for (epoch, observations) in self.0.iter().enumerate() {
+			if epoch != 0 { formatter.write_str(",")?; }
+			write!(formatter, "\"{}\":[", epoch + 1)?;
+			for (observation, values) in observations.iter().enumerate() {
+				if observation != 0 { formatter.write_str(",")?; }
+				formatter.write_str("[")?;
+				for (index, value) in values.iter().take(3).enumerate() {
+					if index != 0 { formatter.write_str(",")?; }
+					write!(formatter, "{value}")?;
+				}
+				formatter.write_str("]")?;
+			}
+			formatter.write_str("]")?;
+		}
+		formatter.write_str("}")
+	}
+}
+
+#[derive(Clone, Copy)]
+pub struct RatModelPoint { pub r2: f64, pub reward: f64 }
+impl Default for RatModelPoint {
+	fn default() -> Self { Self { r2: f64::NAN, reward: f64::NAN } }
+}
+#[derive(Clone, Copy, Default)]
+pub struct RatPoint { pub eval: RatModelPoint, pub pred: RatModelPoint }
+impl fmt::Display for RatPoint {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "eval.r2 {} eval.reward {} pred.r2 {} pred.reward {}", self.eval.r2, self.eval.reward, self.pred.r2, self.pred.reward)
+	}
+}
+#[derive(Clone, Default)]
+pub struct RatModelHistory { pub r2: ScalarHistory, pub reward: ScalarHistory }
+#[derive(Clone, Default)]
+pub struct RatHistory { pub eval: RatModelHistory, pub pred: RatModelHistory }
+impl fmt::Display for RatHistory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{{\"eval\":{{\"r2\":{},\"reward\":{}}},\"pred\":{{\"r2\":{},\"reward\":{}}}}}", self.eval.r2, self.eval.reward, self.pred.r2, self.pred.reward)
+	}
+}
+
+#[derive(Clone, Default)]
+pub struct TrainingPoint { pub loss: f64, pub predictions: Vec<f64>, pub r2: f64, pub rat: RatPoint }
 pub struct ZScore;
 pub type Normalization = fn(usize) -> Block;
 pub type Norm = Normalization;
@@ -13284,23 +14190,52 @@ pub const Score: Metric = Metric(11);
 pub const Window: Metric = Metric(12);
 /// The decisions the epoch scored, on a command-RAT run.
 pub const Choices: Metric = Metric(13);
-/// All progress fields except the native tile schedule.
-pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, Score, Choices, Window];
-/// All progress fields, including the native tile schedule.
-pub const dev: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window];
+/// The ordinary training fields: run, time, epoch, r2, loss, and model blocks.
+pub const all: Metric = Metric(16);
+/// The development fields: tile, score, choices, and window.
+pub const dev: Metric = Metric(17);
+/// Lowercase field selectors for `.log(...)`; groups and the uncommon `blck`
+/// and `tile` selectors remain available from the crate root.
+pub mod log {
+	use super::Metric;
+	pub const run: Metric = super::Run;
+	pub const time: Metric = super::Time;
+	pub const epoch: Metric = super::Epoch;
+	pub const r2: Metric = super::R2;
+	pub const loss: Metric = super::Loss;
+	pub const score: Metric = super::Score;
+	pub const choices: Metric = super::Choices;
+	pub const window: Metric = super::Window;
+}
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
 	fn into_metrics(self) -> Vec<Metric>;
 }
 impl IntoMetrics for Metric {
 	fn into_metrics(self) -> Vec<Metric> {
-		vec![self]
+		normalize_metrics(std::iter::once(self))
 	}
 }
 impl<const N: usize> IntoMetrics for [Metric; N] {
 	fn into_metrics(self) -> Vec<Metric> {
-		self.into()
+		normalize_metrics(self)
 	}
+}
+fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
+	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
+	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
+	const ORDER: [Metric; 12] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug];
+	let mut selected = Vec::new();
+	for metric in metrics {
+		match metric {
+			metric if metric.0 == all.0 => selected.extend(ALL),
+			metric if metric.0 == dev.0 => selected.extend(DEV),
+			metric => selected.push(metric),
+		}
+	}
+	let metrics = ORDER.into_iter().filter(|metric| selected.iter().any(|selected| selected.0 == metric.0)).collect::<Vec<_>>();
+	assert!(!metrics.is_empty(), "log requires at least one option");
+	metrics
 }
 pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
@@ -13361,7 +14296,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0, precision: None, epsilon, pending_frozen: false, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -13425,6 +14360,52 @@ impl Recipe {
 		infer_ids(&path, sequences, device).unwrap_or_else(|error| panic!("{error}"))
 	}
 }
+
+/// Print row-wise distribution statistics without expanding a whole tensor in
+/// memory. Participation is `(mean |w|)^2 / mean(w^2)`; outlier rows have RMS
+/// above the tensor's mean row RMS plus three standard deviations. Histogram
+/// bins cover `w / tensor_rms` from -4 through 4, with the ends including tails.
+pub fn stats(path: impl AsRef<Path>) -> Result<()> {
+	const BINS: usize = 17;
+	let path = resolve_path(path)?;
+	let file = Gguf::open(&path)?;
+	for tensor in file.tensors() {
+		let width = tensor.shape.first().copied().unwrap_or(0) as usize;
+		require(width != 0 && tensor.elements() % width == 0, format!("tensor {} has no complete rows", tensor.name))?;
+		let rows = tensor.elements() / width;
+		let (mut absolute, mut squares, mut count) = (0.0_f64, 0.0_f64, 0_usize);
+		let mut row_rms = Vec::with_capacity(rows);
+		for row in 0..rows {
+			let values = file.row(tensor, row)?;
+			let square = values.iter().map(|value| value * value).sum::<f64>();
+			absolute += values.iter().map(|value| value.abs()).sum::<f64>();
+			squares += square;
+			count = checked_add(count, values.len(), "statistics values")?;
+			row_rms.push((square / values.len() as f64).sqrt());
+		}
+		let mean_abs = absolute / count as f64;
+		let tensor_rms = (squares / count as f64).sqrt();
+		let participation = if squares == 0.0 { 0.0 } else { mean_abs * mean_abs / (squares / count as f64) };
+		let row_mean = row_rms.iter().sum::<f64>() / rows as f64;
+		let row_sigma = (row_rms.iter().map(|value| (value - row_mean).powi(2)).sum::<f64>() / rows as f64).sqrt();
+		let outliers = row_rms.iter().enumerate().filter_map(|(row, value)| (*value > row_mean + 3.0 * row_sigma).then_some(row)).collect::<Vec<_>>();
+		let mut histogram = [0_usize; BINS];
+		for row in 0..rows {
+			for value in file.row(tensor, row)? {
+				let normalized = if tensor_rms == 0.0 { 0.0 } else { value / tensor_rms };
+				let slot = (((normalized.clamp(-4.0, 4.0) + 4.0) / 8.0) * (BINS - 1) as f64).floor() as usize;
+				histogram[slot] += 1;
+			}
+		}
+		let shown = outliers.iter().take(16).map(usize::to_string).collect::<Vec<_>>().join(",");
+		let tail = if outliers.len() > 16 { ",..." } else { "" };
+		println!(
+			"{} kind={} shape={:?} mean_abs={mean_abs:.9e} rms={tensor_rms:.9e} p={participation:.6} outlier_rows={}[{shown}{tail}] histogram_z[-4..4]={:?}",
+			tensor.name, tensor.kind, tensor.shape, outliers.len(), histogram
+		);
+	}
+	Ok(())
+}
 impl Gguf {
 	/// Contracts `input` through the named tensor into `width` outputs: the
 	/// one-node plan of `infer`, so the tensor's mapped bytes are the
@@ -13458,6 +14439,15 @@ impl Gguf {
 	/// Emits each sampled token while generating from bound GGUF weights.
 	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
 		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Places a script-defined GGUF model once and keeps its weights and state
+	/// resident across every later decode. Standard tensor names bind the model
+	/// through the same checked plan used by `recipe.infer()`.
+	pub fn place(&self, blocks: &Model, positions: usize, split: &[usize]) -> Placed {
+		let model = with_last_projection(blocks);
+		let plan = conventional_plan(self, &model).unwrap_or_else(|error| panic!("{error}"));
+		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
@@ -13540,7 +14530,8 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Config::load()?.precision, None)?;
-	trace(&format!("model preparation {} s", load_started.elapsed().as_secs_f64()))?;
+	let prepared = load_started.elapsed().as_secs_f64();
+	trace(&format!("model preparation {prepared} s"))?;
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -13553,13 +14544,12 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 			let values = &samples[settled as usize..reached as usize];
 			tape.write_tokens(settled as usize, values)?;
 			tape.write_samples(settled as usize, values)?;
-			let mut begin = settled;
-			while begin < reached {
-				let end = reached.min(begin.saturating_add(tape.program.tile.m.max(1)));
-				tape.forward_window(begin, end, ForwardMode::Inference)?;
-				trace(&format!("decode window {begin}..{end} of {reached}"))?;
-				begin = end;
-			}
+			// The batch runs as one window: llama.cpp folds the rows of one
+			// matmul call together (the rows past 4*(N/4) and the last row
+			// whole), so a prefill split by the contraction tile would round
+			// those rows differently on a backend with a small tile.
+			tape.forward_window(settled, reached, ForwardMode::Inference)?;
+			trace(&format!("decode window {settled}..{reached} of {reached}"))?;
 			let predictions = tape.predictions()?;
 			let logits = tape.last_logits(&predictions, settled, reached)?;
 			Ok((predictions, logits))
@@ -13577,8 +14567,7 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	let mut config = Config::load()?;
-	config.quantization = model.quantization;
+	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
@@ -13630,6 +14619,8 @@ struct Architecture {
 const ARCHITECTURES: &[Architecture] = &[
 	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
 	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
 	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
 	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
@@ -13659,6 +14650,12 @@ impl Bound {
 	/// and its feed-forward, both on the residual stream.
 	pub fn blocks(&self) -> usize {
 		self.blocks
+	}
+	/// Top-level Recipe blocks the placement splitter assigns across devices.
+	/// This can exceed the architecture layer count because each transformer
+	/// layer has separate attention and feed-forward residual blocks.
+	pub fn placement_blocks(&self) -> usize {
+		self.model.blocks.len()
 	}
 	/// The stored tensors the plan reads, each counted once: as a mapped view, or
 	/// as the values the host rewrote from it.
@@ -13713,10 +14710,13 @@ struct Builder<'a> {
 struct Dimensions {
 	width: usize,
 	heads: usize,
-	kv: usize,
-	head: usize,
-	rope_dims: usize,
-	rope_base: f64,
+	kv: Vec<usize>,
+	head: Vec<usize>,
+	rope_dims: Vec<usize>,
+	rope_base: Vec<f64>,
+	swa: Vec<bool>,
+	window: usize,
+	shortconv: Option<usize>,
 	/// Every `interval`th block attends and the rest are delta blocks; absent,
 	/// every block attends.
 	interval: Option<usize>,
@@ -13763,6 +14763,9 @@ impl<'a> Builder<'a> {
 			model = model.epsilon(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
+		if matches!(architecture, "gemma3" | "gemma4") {
+			model = model.scale((dimensions.width as f64).sqrt());
+		}
 		// The gather addresses rows of the file's own layout, so the block's
 		// storage format is the tensor's format rather than a selection.
 		require(!model.blocks.is_empty(), "the embedding block is absent")?;
@@ -13777,18 +14780,33 @@ impl<'a> Builder<'a> {
 				model = model.ple(ple);
 				builder.ple(layer, ple, &dimensions)?;
 			}
-			let attends = dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
+			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
 			let branch = builder.open(layer, "attn", &dimensions)?;
-			let branch = if attends { builder.attention(branch, layer, &dimensions)? } else { builder.delta(branch, layer, &dimensions)? };
+			let branch = if attends {
+				builder.attention(branch, layer, &dimensions)?
+			} else if dimensions.shortconv.is_some() {
+				builder.shortconv(branch, layer, &dimensions)?
+			} else {
+				builder.delta(branch, layer, &dimensions)?
+			};
+			let branch = builder.post(layer, "attn", branch, &dimensions)?;
 			model = builder.close(model, branch, &dimensions);
 			let branch = builder.open(layer, "ffn", &dimensions)?;
 			let branch = match &dimensions.experts {
 				Some(experts) => builder.experts(branch, layer, experts, &dimensions)?,
 				None => builder.feed_forward(branch, layer, &dimensions)?,
 			};
+			let branch = builder.post(layer, "ffn", branch, &dimensions)?;
 			model = builder.close(model, branch, &dimensions);
+			if let Some(scale) = builder.optional(&format!("blk.{layer}.layer_output_scale.weight")) {
+				require(scale.elements() == 1, format!("{} holds {} values; block {layer} output scale is one value", scale.name, scale.elements()))?;
+				let value = file.values(&scale)?[0];
+				require(value.is_finite(), format!("{} is nonfinite", scale.name))?;
+				model = model.scale(value);
+			}
 		}
-		if let Some(scale) = builder.optional("output_norm.weight") {
+		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
+		if let Some(scale) = output_norm {
 			model = model.norm(rms);
 			builder.mapped(vec![scale]);
 		} else if dimensions.hyper.is_some_and(|(_, rank)| rank != 0) {
@@ -13803,7 +14821,12 @@ impl<'a> Builder<'a> {
 			Some(output) => output,
 			None => embedding,
 		};
-		builder.mapped(vec![output]);
+	builder.mapped(vec![output]);
+		if builder.present("final_logit_softcapping") {
+			let cap = file.float_at(&builder.key("final_logit_softcapping"))?;
+			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
+			model = model.scale(1.0 / cap).tanh().scale(cap);
+		}
 		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.consumed.len();
@@ -13824,16 +14847,52 @@ impl<'a> Builder<'a> {
 	fn present(&self, suffix: &str) -> bool {
 		self.file.value(&self.key(suffix)).is_some()
 	}
+	fn layer_integers(&self, suffix: &str, default: usize, layers: usize) -> Result<Vec<usize>> {
+		match self.file.value(&self.key(suffix)) {
+			None => Ok(vec![default; layers]),
+			Some(GgufValue::Array(values)) => {
+				require(values.len() == layers, format!("{}.{} holds {} values for {layers} layers", self.architecture, suffix, values.len()))?;
+				values.iter().map(|value| value.integer().and_then(|value| usize::try_from(value).ok()).ok_or_else(|| RecipeError::new(format!("{}.{} contains an invalid layer value", self.architecture, suffix)))).collect()
+			}
+			Some(value) => {
+				let value = value.integer().and_then(|value| usize::try_from(value).ok()).ok_or_else(|| RecipeError::new(format!("{}.{} is not a nonnegative integer", self.architecture, suffix)))?;
+				Ok(vec![value; layers])
+			}
+		}
+	}
+	fn layer_booleans(&self, suffix: &str, default: bool, layers: usize) -> Result<Vec<bool>> {
+		match self.file.value(&self.key(suffix)) {
+			None => Ok(vec![default; layers]),
+			Some(GgufValue::Array(values)) => {
+				require(values.len() == layers, format!("{}.{} holds {} values for {layers} layers", self.architecture, suffix, values.len()))?;
+				values.iter().map(|value| match value { GgufValue::Bool(value) => Ok(*value), _ => Err(RecipeError::new(format!("{}.{} contains a non-boolean layer value", self.architecture, suffix))) }).collect()
+			}
+			Some(GgufValue::Bool(value)) => Ok(vec![*value; layers]),
+			Some(_) => Err(RecipeError::new(format!("{}.{} is not a boolean or boolean array", self.architecture, suffix))),
+		}
+	}
 	fn dimensions(&self) -> Result<Dimensions> {
+		let layers = self.integer("block_count")?;
 		let width = self.integer("embedding_length")?;
 		let heads = self.integer("attention.head_count")?;
-		let kv = self.integer_or("attention.head_count_kv", heads)?;
-		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{} heads do not partition a stream of {width}", heads))?;
-		let head = self.integer_or("attention.key_length", width / heads.max(1))?;
-		let value = self.integer_or("attention.value_length", head)?;
-		require(value == head, format!("attention keys are {head} wide and values {value}; the attention block takes one head width"))?;
-		let rope_dims = self.integer_or("rope.dimension_count", head)?;
-		let rope_base = if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 };
+		let kv = self.layer_integers("attention.head_count_kv", heads, layers)?;
+		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{heads} heads do not partition a stream of {width}"))?;
+		let swa = self.layer_booleans("attention.sliding_window_pattern", false, layers)?;
+		let full_head = self.integer_or("attention.key_length", width / heads.max(1))?;
+		let full_value = self.integer_or("attention.value_length", full_head)?;
+		require(full_value == full_head, format!("attention keys are {full_head} wide and values {full_value}; the attention block takes one head width"))?;
+		let swa_head = self.integer_or("attention.key_length_swa", full_head)?;
+		let swa_value = self.integer_or("attention.value_length_swa", swa_head)?;
+		require(swa_value == swa_head, format!("sliding attention keys are {swa_head} wide and values {swa_value}; the attention block takes one head width"))?;
+		let head = swa.iter().map(|swa| if *swa { swa_head } else { full_head }).collect::<Vec<_>>();
+		let full_rope_dims = self.integer_or("rope.dimension_count", full_head)?;
+		let swa_rope_dims = self.integer_or("rope.dimension_count_swa", full_rope_dims)?;
+		let rope_dims = swa.iter().map(|swa| if *swa { swa_rope_dims } else { full_rope_dims }).collect::<Vec<_>>();
+		let full_rope_base = if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 };
+		let swa_rope_base = if self.present("rope.freq_base_swa") { self.file.float_at(&self.key("rope.freq_base_swa"))? } else { full_rope_base };
+		let rope_base = swa.iter().map(|swa| if *swa { swa_rope_base } else { full_rope_base }).collect::<Vec<_>>();
+		let window = self.integer_or("attention.sliding_window", 0)?;
+		let shortconv = self.file.value(&self.key("shortconv.l_cache")).map(|_| self.integer("shortconv.l_cache")).transpose()?;
 		let interval = if self.present("full_attention_interval") { Some(self.integer("full_attention_interval")?) } else { None };
 		let delta = match interval {
 			Some(_) => Some(DeltaDims {
@@ -13872,7 +14931,7 @@ impl<'a> Builder<'a> {
 			None
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
-		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
@@ -13939,7 +14998,9 @@ impl<'a> Builder<'a> {
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
-		let Dimensions { width, heads, kv, head, rope_dims, rope_base, .. } = *dimensions;
+		let (width, heads) = (dimensions.width, dimensions.heads);
+		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
+		let sliding = dimensions.swa[layer];
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
 		let query = self.tensor(&name("attn_q.weight"), &role)?;
@@ -13950,7 +15011,13 @@ impl<'a> Builder<'a> {
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
 		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = self.projection(&name("attn_v.weight"), &role, width, kv * head)?;
+		let value = match self.optional(&name("attn_v.weight")) {
+			Some(value) => {
+				require(value.shape.len() == 2 && value.shape[0] as usize == width && value.shape[1] as usize == kv * head, format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
+				value
+			}
+			None => key.clone(),
+		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
@@ -13973,11 +15040,22 @@ impl<'a> Builder<'a> {
 			block = block.qk(rms);
 		}
 		block = block.rope(self.rope, rope_dims, rope_base);
+		let factors = !sliding && self.file.tensor("rope_freqs.weight").is_some();
+		block = block.edit(|model| {
+			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
+			attention.window = if sliding { dimensions.window } else { 0 };
+			attention.factors = factors;
+		});
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
+		}
+		if factors {
+			let factors = self.tensor("rope_freqs.weight", &role)?;
+			require(factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			self.mapped(vec![factors]);
 		}
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
@@ -14006,6 +15084,38 @@ impl<'a> Builder<'a> {
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
 		Ok(block)
+	}
+	/// LFM2 short convolution: project B, C and X in one stored tensor, run
+	/// `C * depthwise_conv(B * X)`, then project back to the residual width.
+	fn shortconv(&mut self, branch: Model, layer_index: usize, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let kernel = dimensions.shortconv.ok_or_else(|| RecipeError::new("the architecture names no short-convolution cache"))?;
+		require(kernel > 1, "short-convolution cache must cover the current position and at least one prior position")?;
+		let name = |suffix: &str| format!("blk.{layer_index}.{suffix}");
+		let role = format!("block {layer_index} short convolution");
+		let input = self.tensor(&name("shortconv.in_proj.weight"), &role)?;
+		require(input.shape == [width as u64, (3 * width) as u64], format!("{} has shape {:?}; {role} projects three {width}-wide planes", input.name, input.shape))?;
+		let b = input.rows(0, width)?;
+		let c = input.rows(width, width)?;
+		let x = input.rows(2 * width, width)?;
+		let taps = self.tensor(&name("shortconv.conv.weight"), &role)?;
+		require(taps.shape == [kernel as u64, width as u64], format!("{} has shape {:?}; {role} holds {kernel} taps for {width} channels", taps.name, taps.shape))?;
+		let output = self.projection(&name("shortconv.out_proj.weight"), &role, width, width)?;
+		// Lowering walks the nested product's left branch first: B, X, taps,
+		// then the right C branch, followed by the output projection.
+		self.mapped(vec![b]);
+		self.mapped(vec![x]);
+		self.mapped(vec![taps]);
+		self.mapped(vec![c]);
+		self.mapped(vec![output]);
+		let bx = layer(width) * layer(width);
+		let dconv = Block::of(Operation::Dconv(kernel, 1));
+		let short = Block::of(Operation::Product(
+			ProductBranch { blocks: vec![bx, dconv], exclusions: 0 },
+			ProductBranch { blocks: vec![layer(width)], exclusions: 0 },
+		));
+		let branch = branch.edit(|model| model.blocks.push(short));
+		Ok(branch.layer(width))
 	}
 	/// One gated delta rule block and the plan of its gate projection, its
 	/// query-key-value projection, its convolution taps, its decay, its output
@@ -14162,11 +15272,24 @@ impl<'a> Builder<'a> {
 			}
 		}
 	}
+	/// Applies an architecture's post-attention or post-FFN normalization inside
+	/// the branch, before the residual add. Architectures without that tensor keep
+	/// the branch unchanged.
+	fn post(&mut self, layer: usize, part: &str, branch: Model, dimensions: &Dimensions) -> Result<Model> {
+		let suffix = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
+		let name = format!("blk.{layer}.{suffix}");
+		let Some(scale) = self.optional(&name) else { return Ok(branch) };
+		require(scale.elements() == dimensions.width, format!("{} holds {} values; block {layer} {part} post-normalization scales {} channels", scale.name, scale.elements(), dimensions.width))?;
+		self.mapped(vec![scale]);
+		Ok(branch.norm(rms))
+	}
 	/// Closes a branch: the mixer's lanes and rank under hyper-connections, and
 	/// one ungated lane, the plain residual, otherwise.
 	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
-		let (lanes, rank) = dimensions.hyper.unwrap_or((1, 0));
-		model.hyper(lanes, rank, &branch)
+		match dimensions.hyper {
+			Some((lanes, rank)) => model.hyper(lanes, rank, &branch),
+			None => model.push(Operation::Residual(branch.blocks.clone())),
+		}
 	}
 }
 /// The GGUF a model file opens through `recipe.data`, whose metadata the
@@ -14353,73 +15476,179 @@ fn arm_trace(metrics: &[Metric]) {
 #[derive(Clone)]
 pub struct Infer {
 	log: Vec<Metric>,
-	tokens: usize,
+	tokens: Option<usize>,
+	chat: Option<Vec<ChatMetric>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ChatMetric(u8);
+pub mod infer {
+	use super::ChatMetric;
+	pub const text: ChatMetric = ChatMetric(0);
+	pub const pp: ChatMetric = ChatMetric(1);
+	pub const tg: ChatMetric = ChatMetric(2);
+	pub const input: ChatMetric = ChatMetric(3);
+	pub const out: ChatMetric = ChatMetric(4);
+	pub const cached: ChatMetric = ChatMetric(5);
+	pub const time: ChatMetric = ChatMetric(6);
+}
+pub trait IntoChatMetrics { fn into_chat_metrics(self) -> Vec<ChatMetric>; }
+impl IntoChatMetrics for ChatMetric {
+	fn into_chat_metrics(self) -> Vec<ChatMetric> { vec![self] }
+}
+impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
+	fn into_chat_metrics(self) -> Vec<ChatMetric> {
+		assert!(N != 0, "chat requires at least one option");
+		let mut metrics = self.to_vec();
+		metrics.sort_by_key(|metric| metric.0);
+		metrics.dedup_by_key(|metric| metric.0);
+		metrics
+	}
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: 32 }
+		Infer { log: Vec::new(), tokens: None, chat: None }
 	}
 }
 impl Infer {
+	/// Keep the model resident and read successive messages from stdin. A supplied
+	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
+	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log = metrics.into_metrics();
 		arm_trace(&self.log);
 		self
 	}
-	/// The reply length in ids, 32 unless chosen.
+	/// An optional reply cap. Otherwise use the model's stop tokens and remaining context.
 	pub const fn tokens(mut self, count: usize) -> Self {
-		self.tokens = count;
+		self.tokens = Some(count);
 		self
 	}
-	pub fn run(&self, model: &Model, data: &Data) -> Generation {
+	pub fn run(&self, model: &Model, data: &Data) -> InferenceReport {
+		let _transfers = TransferScope::new();
 		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
 	}
-	fn try_run(&self, model: &Model, data: &Data) -> Result<Generation> {
+	fn try_run(&self, model: &Model, data: &Data) -> Result<InferenceReport> {
+		SIGNAL.get_or_init(register_interrupt);
+		INTERRUPTED.store(false, Ordering::Release);
+		let load_started = Instant::now();
+		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
+		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		let model = with_last_projection(model);
 		let plan = conventional_plan(&file, &model)?;
-		let device = selected_gpu()?;
+		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
+		let requested = std::env::var("RECIPE_CONTEXT").ok().map(|value| value.parse::<usize>().map_err(|_| RecipeError::new("RECIPE_CONTEXT must be a positive integer"))).transpose()?;
+		if let Some(context) = requested { require(context > 0 && context <= ceiling, format!("requested context {context} is outside this model's 1..={ceiling} positions"))?; }
 		let coder = file.tokenizer();
-		let message = std::env::args().nth(1).unwrap_or_else(|| "What is the capital of France?".to_owned());
-		let text = coder.prompt(&[("user", message.as_str())], true)?;
-		let mut prompt = coder.encode(&text);
-		// The template writes the sequence start itself when the file has one,
-		// and the encoder adds it again, so one of the pair goes.
-		if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos {
-			prompt.remove(0);
-		}
+		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
+		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
+		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
 		let stop = stop_ids(&coder)?;
-		trace(&format!("prompt ids {prompt:?}, stop ids {stop:?}, text {text:?}"))?;
-		let budget = self.tokens;
-		let sequence = fitting_context(&file, &model, &plan, device, ceiling)?;
-		eprintln!("{architecture}: {} prompt tokens, {sequence} context positions", prompt.len());
-		require(prompt.len() + budget <= sequence, format!("Context full: {} prompt tokens plus {budget} reply tokens exceed {sequence}. Start a new chat or reduce reply length.", prompt.len()))?;
-		let streaming = self.log.iter().any(|metric| metric.0 == chat.0);
-		let (mut ids, mut printed) = (Vec::new(), 0);
-		let generation = decode_gguf(&file, &model, &plan, sequence, &prompt, &mut recipe.sampler().temperature(0.0), &stop, budget, |id| {
-			if !streaming || stop.contains(&id) {
-				return;
+		let sequence = match requested {
+			Some(context) => context,
+			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
+			None => ceiling,
+		};
+		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		let placed = place_bound(&bound, sequence, &[], devices)?;
+		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
+		drop(loading);
+		let memory = placed.memory();
+		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
+		let mut conversation: Vec<(String, String)> = Vec::new();
+		let mut request_history = Vec::new();
+		loop {
+			let start_progress = |started| {
+				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
+			};
+			let progress;
+			let request_started;
+			let text = if interactive {
+				if INTERRUPTED.load(Ordering::Acquire) { break; }
+				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
+				let Some(line) = chat_line()? else { break };
+				if line.trim() == "/exit" { break; }
+				if line.trim() == "/clear" { conversation.clear(); placed.clear(); continue; }
+				if line.trim().is_empty() { continue; }
+				request_started = Instant::now();
+				progress = start_progress(request_started);
+				conversation.push(("user".to_owned(), line.trim_end().to_owned()));
+				coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+			} else {
+				request_started = Instant::now();
+				progress = start_progress(request_started);
+				match &supplied {
+					Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
+					Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
+					None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
+				}
+			};
+			let mut prompt = coder.encode(&text);
+			if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
+			if let Some(progress) = &progress { progress.prompt(prompt.len()); }
+			if prompt.len() >= sequence && interactive {
+				conversation.pop();
+				drop(progress);
+				eprintln!("context full: {} prompt tokens leave no reply positions in {sequence}; use /clear", prompt.len());
+				continue;
 			}
-			ids.push(id);
-			let text = coder.decode(&ids);
-			let text = text.trim_end_matches('\u{FFFD}');
-			if text.len() >= printed {
-				print!("{}", &text[printed..]);
-				std::io::stdout().flush().ok();
-				printed = text.len();
-			}
-		})?;
-		if streaming {
-			println!();
-			let seconds = generation.step_seconds.iter().sum::<f64>();
-			eprintln!("prefill {} s; {} decode steps in {} s", generation.prefill_seconds, generation.step_seconds.len(), seconds);
-			if seconds > 0.0 {
-				eprintln!("{} tok/s", generation.step_seconds.len() as f64 / seconds);
-			}
+			require(prompt.len() < sequence, format!("{} prompt tokens leave no reply positions in {sequence} context positions", prompt.len()))?;
+			let available = sequence - prompt.len();
+			let budget = self.tokens.map_or(available, |limit| limit.min(available));
+			let show_reply = self.chat.is_some() || self.log.iter().any(|metric| metric.0 == chat.0);
+			let streaming = show_reply;
+			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
+			let (mut ids, mut printed) = (Vec::new(), 0);
+			if streaming && !framed { print!("~ "); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot print reply prefix: {error}")))?; }
+			let generation = placed.decode_observed(&prompt, &mut recipe.sampler().temperature(0.0), &stop, budget, progress.as_ref(), |id| {
+				if stop.contains(&id) { return Ok(()); }
+				ids.push(id);
+				if streaming {
+					let text = coder.decode(&ids);
+					let text = text.trim_end_matches('\u{FFFD}');
+					if framed {
+						if let Some(progress) = &progress { progress.reply(text.to_owned()); }
+					} else if text.len() >= printed {
+						print!("{}", &text[printed..]);
+						std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot print reply: {error}")))?;
+						printed = text.len();
+					}
+				}
+				Ok(())
+			})?;
+			let seconds = progress.as_ref().map_or_else(|| request_started.elapsed().as_secs_f64(), InferenceLive::finish);
+			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
+			drop(progress);
+			let reply = coder.decode(&ids);
+			request_history.push(Arc::new(InferenceRequest {
+				time: DurationReport(seconds),
+				input: prompt.len(), out: ids.len(), cached: generation.cached, reply_limit: budget,
+				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
+				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds,
+			}));
+			if !interactive { break; }
+			conversation.push(("assistant".to_owned(), reply));
 		}
-		Ok(generation)
+		Ok(InferenceReport {
+			llvm: placed.llvm_report(),
+			path: data.report_path()?,
+			formats: placed.format_report()?,
+			memory: placed.memory_report()?,
+			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
+			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
+			links: placed.link_report()?,
+			aot: placed.aot_report()?,
+			tiles: placed.tile_report()?,
+			grids: placed.grid_report()?,
+			load: DurationReport(load_seconds),
+			compile: DurationReport(placed.compile_seconds()),
+			context: sequence,
+			requests: request_history.len(),
+			last: request_history.last().cloned().unwrap_or_default(),
+			history: request_history,
+		})
 	}
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
@@ -14439,6 +15668,14 @@ fn stop_ids(coder: &Tokenizer) -> Result<Vec<u32>> {
 	}
 	Ok(stop)
 }
+impl Tokenizer {
+	/// End-of-turn ids rendered by this tokenizer's own chat template, including
+	/// its declared EOS id. A resident chat process can use the same stop set as
+	/// `recipe.infer()` without restating model-specific tokens.
+	pub fn stop_ids(&self) -> Vec<u32> {
+		stop_ids(self).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
 /// The model with its output projection evaluated at the newest position
 /// alone: a `last` before the projection onto the vocabulary, unless the
 /// model already places one.
@@ -14456,24 +15693,45 @@ fn with_last_projection(model: &Model) -> Model {
 	}
 	model
 }
-/// The longest sequence the model fits on `device`, from `ceiling` down by
-/// halves: the weights, the input row, and the value and context arenas of
-/// one row's inference tape, against the device's free memory less its launch
-/// reserve.
+/// The longest sequence the model fits on `device`: the weights, the input
+/// row, and the value and context arenas of one row's inference tape, against
+/// the device's free memory less its launch reserve. Resident bytes grow
+/// linearly with the context, so the ceiling and its half give the slope, the
+/// longest fitting length follows from it, and that length is checked and
+/// stepped down while it is over.
 fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static Gpu, ceiling: usize) -> Result<usize> {
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let free = device.free_bytes()?.saturating_sub(reserve);
-	let mut length = ceiling.max(1);
-	loop {
+	let bytes_at = |length: usize| -> Result<u64> {
 		let samples = vec![0.0; length];
 		let graph = bound_graph_on(file, model, plan, &samples, 1, device)?;
 		let bytes = part_bytes(&graph, Config::load()?.precision)? as u64;
 		trace(&format!("context {length}: {bytes} bytes resident, {free} bytes free"))?;
+		Ok(bytes)
+	};
+	let ceiling = ceiling.max(1);
+	let top = bytes_at(ceiling)?;
+	if top <= free {
+		return Ok(ceiling);
+	}
+	require(ceiling > 1, format!("device {} cannot hold one position: {top} bytes required, {free} bytes free", device.name))?;
+	let half = ceiling / 2;
+	let low = bytes_at(half)?;
+	let per_position = top.saturating_sub(low) as f64 / (ceiling - half) as f64;
+	let fixed = low as f64 - per_position * half as f64;
+	let estimate = if per_position > 0.0 { ((free as f64 - fixed) / per_position).floor().max(1.0) as usize } else { half };
+	// The largest power of two under the estimate, as the halving found: the
+	// arenas the estimate counts are not everything a run holds on the device
+	// (the load scratch, the driver's own buffers, a compositor's framebuffers),
+	// and a length that fills the card to its estimate starved the desktop.
+	let mut length = (1_usize << estimate.max(1).ilog2()).clamp(1, ceiling);
+	loop {
+		let bytes = bytes_at(length)?;
 		if bytes <= free {
 			return Ok(length);
 		}
 		require(length > 1, format!("device {} cannot hold one position: {bytes} bytes required, {free} bytes free", device.name))?;
-		length /= 2;
+		length = (length - (length / 16).max(1)).max(1);
 	}
 }
 /// The plan that binds a composed model to a GGUF file by the standard tensor
@@ -14636,6 +15894,7 @@ pub struct Sampler {
 	penalty: f64,
 	window: usize,
 	state: u64,
+	suppressed: Vec<u32>,
 }
 impl Sampler {
 	pub fn temperature(mut self, value: f64) -> Self {
@@ -14674,6 +15933,8 @@ impl Sampler {
 			let logit = &mut candidates[*id as usize].1;
 			*logit = if *logit > 0.0 { *logit / self.penalty } else { *logit * self.penalty };
 		}
+		candidates.retain(|(id, _)| !self.suppressed.contains(id));
+		assert!(!candidates.is_empty(), "sampler suppressed every logit");
 		if self.temperature <= 0.0 {
 			return candidates.iter().max_by(|left, right| left.1.total_cmp(&right.1).then(right.0.cmp(&left.0))).unwrap().0;
 		}
@@ -14707,17 +15968,330 @@ impl Sampler {
 	}
 }
 /// What `decode` produced: the prompt followed by the generated ids, the logits
-/// of the last forward, the seconds of the prefill, and the seconds of each
-/// later step.
+/// of the last forward, and elapsed seconds for prefill and generation.
 pub struct Generation {
 	pub ids: Vec<u32>,
 	pub logits: Vec<f64>,
+	/// Prompt positions whose previously computed state this request reused.
+	pub cached: usize,
 	pub prefill_seconds: f64,
-	pub step_seconds: Vec<f64>,
+	pub generation_seconds: f64,
+}
+/// Only evaluated tokens belong here. The final sampled token has no KV state
+/// until the next forward evaluates it. Logits stay in machine RAM.
+#[derive(Default)]
+struct DecodeState {
+	ids: Vec<u32>,
+	predictions: Vec<f64>,
+	logits: Vec<f64>,
+}
+pub struct InferenceReport {
+	pub llvm: LlvmReport,
+	pub path: String,
+	pub formats: ReportLines,
+	pub memory: ReportLines,
+	/// Planned buffers containing dead storage as defined by `DeviceMemory::dead`.
+	pub dead_buffers: usize,
+	/// Dead storage bytes already included in the reported memory allocations.
+	pub dead_bytes: usize,
+	pub links: ReportLines,
+	pub aot: ReportLines,
+	pub tiles: ReportLines,
+	pub grids: ReportLines,
+	pub load: DurationReport,
+	pub compile: DurationReport,
+	pub context: usize,
+	pub requests: usize,
+	/// Completed requests in execution order, retained across `/clear`.
+	pub history: Vec<Arc<InferenceRequest>>,
+	last: Arc<InferenceRequest>,
+}
+impl std::ops::Deref for InferenceReport {
+	type Target = InferenceRequest;
+	fn deref(&self) -> &Self::Target { &self.last }
+}
+/// Observations from one request. The flat report fields refer to its last request.
+#[derive(Default)]
+pub struct InferenceRequest {
+	/// Elapsed request time, from submission through the end of generation.
+	pub time: DurationReport,
+	pub reply_limit: usize,
+	pub input: usize,
+	pub out: usize,
+	pub cached: usize,
+	pub input_ids: Vec<u32>,
+	pub output_ids: Vec<u32>,
+	pub logits: Vec<f64>,
+	pub prediction: String,
+	pp_seconds: f64,
+	tg_seconds: f64,
+}
+impl InferenceRequest {
+	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.input.saturating_sub(self.cached) as f64 / self.pp_seconds } }
+	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
+}
+/// Measured inference state passed to the model script's live formatter.
+#[derive(Clone, Default)]
+pub struct InferenceProgress {
+	pub phase: &'static str,
+	pub seconds: f64,
+	pub in_tokens: usize,
+	pub out_tokens: usize,
+	pub cached: usize,
+	pub prefill_seconds: f64,
+	pub prefill_tokens: usize,
+	pub generation_seconds: f64,
+	pub context: usize,
+	pub devices: String,
+	pub memory: Vec<DeviceMemory>,
+	started: Option<Instant>,
+	phase_started: Option<Instant>,
+	finished: bool,
+	reply: String,
+	version: usize,
+}
+impl InferenceProgress {
+	pub fn pp(&self) -> f64 { if self.prefill_seconds > 0.0 { self.prefill_tokens as f64 / self.prefill_seconds } else { 0.0 } }
+	pub fn tg(&self) -> f64 { if self.generation_seconds > 0.0 { self.out_tokens as f64 / self.generation_seconds } else { 0.0 } }
+	fn observe(&mut self, now: Instant) {
+		if self.finished { return; }
+		if let Some(started) = self.started { self.seconds = now.duration_since(started).as_secs_f64(); }
+		if let Some(started) = self.phase_started {
+			let seconds = now.duration_since(started).as_secs_f64();
+			match self.phase { "prefill" => self.prefill_seconds = seconds, "tg" => self.generation_seconds = seconds, _ => {} }
+		}
+	}
+	fn line(&self, metrics: &[ChatMetric]) -> String {
+		let mut values = Vec::new();
+		for metric in metrics {
+			match metric.0 {
+				1 if self.prefill_seconds > 0.0 => values.push(format!("pp {:.2} tok/s", self.pp())),
+				1 => values.push("pp ...".to_owned()),
+				2 if self.generation_seconds > 0.0 => values.push(format!("tg {:.2} tok/s", self.tg())),
+				2 => values.push("tg ...".to_owned()),
+				3 if self.in_tokens != 0 => values.push(format!("input {}", self.in_tokens)),
+				3 => values.push("input ...".to_owned()),
+				4 if !matches!(self.phase, "load" | "ready") => values.push(format!("out {}", self.out_tokens)),
+				4 => values.push("out ...".to_owned()),
+				5 if self.in_tokens != 0 => values.push(format!("cached {}", self.cached)),
+				5 => values.push("cached ...".to_owned()),
+				6 => values.push(format!("time {:.3}s", self.seconds)),
+				_ => {}
+			}
+		}
+		values.join("  ")
+	}
+}
+struct InferenceLive {
+	state: Arc<Mutex<InferenceProgress>>,
+	stop: std::sync::mpsc::Sender<()>,
+	thread: Option<std::thread::JoinHandle<()>>,
+	terminal: bool,
+}
+/// Only the unfinished reply row and the metrics row can be redrawn. Earlier
+/// reply rows are committed to the terminal and its native scrollback.
+struct ChatTerminal {
+	committed: usize,
+	printed: usize,
+	tail: String,
+	status: String,
+	drawn: bool,
+	has_reply: bool,
+	columns: usize,
+	#[cfg(unix)]
+	locale: usize,
+}
+impl ChatTerminal {
+	fn size() -> Option<(usize, usize)> {
+		#[cfg(unix)]
+		{
+			unsafe extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			const SIZE: usize = 0x5413;
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			const SIZE: usize = 0x40087468;
+			let mut size = [0_u16; 4];
+			if unsafe { ioctl(2, SIZE, size.as_mut_ptr()) } == 0 && size[0] >= 2 && size[1] >= 2 {
+				return Some((usize::from(size[0]), usize::from(size[1])));
+			}
+		}
+		None
+	}
+	fn new() -> Option<Self> {
+		Self::size()?;
+		#[cfg(unix)]
+		let locale = {
+			unsafe extern "C" { fn newlocale(mask: i32, name: *const std::ffi::c_char, base: *mut std::ffi::c_void) -> *mut std::ffi::c_void; }
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			const CTYPE: i32 = 1;
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			const CTYPE: i32 = 4;
+			let locale = unsafe { newlocale(CTYPE, c"C.UTF-8".as_ptr(), std::ptr::null_mut()) };
+			let locale = if locale.is_null() { unsafe { newlocale(CTYPE, c"en_US.UTF-8".as_ptr(), std::ptr::null_mut()) } } else { locale };
+			if locale.is_null() { return None; }
+			locale as usize
+		};
+		Some(Self { committed: 0, printed: 0, tail: String::new(), status: String::new(), drawn: false, has_reply: false, columns: 0, #[cfg(unix)] locale })
+	}
+	/// The final physical row starts at a UTF-8 boundary. Query the machine's
+	/// Unicode cell widths rather than treating bytes or characters as columns.
+	fn last_row(&self, text: &str, columns: usize) -> (usize, usize) {
+		#[cfg(unix)]
+		unsafe extern "C" {
+			fn uselocale(locale: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+			fn wcwidth(character: i32) -> i32;
+		}
+		#[cfg(unix)]
+		let previous = unsafe { uselocale(self.locale as *mut std::ffi::c_void) };
+		let (mut start, mut column, mut rows) = (0, 0, 1);
+		for (index, character) in text.char_indices() {
+			if character == '\n' { start = index + 1; column = 0; rows += 1; continue; }
+			if character == '\t' { column = ((column / 8 + 1) * 8).min(columns - 1); continue; }
+			#[cfg(unix)]
+			let width = unsafe { wcwidth(character as i32) }.max(0) as usize;
+			#[cfg(not(unix))]
+			let width = usize::from(!character.is_control());
+			if column + width > columns { start = index; column = 0; rows += 1; }
+			column += width;
+		}
+		#[cfg(unix)]
+		unsafe { uselocale(previous); }
+		(start, rows)
+	}
+	fn render(&mut self, reply: Option<&str>, line: &str, complete: bool) -> std::io::Result<()> {
+		let mut output = std::io::stderr().lock();
+		let text = reply.map(|reply| format!("~ {reply}")).unwrap_or_default();
+		let Some((height, columns)) = Self::size() else { return Ok(()); };
+		if !self.drawn { write!(output, "\x1b[?7h")?; }
+		if self.drawn {
+			let rows = if self.has_reply { self.last_row(&self.tail, self.columns).1 } else { 0 } + self.last_row(&self.status, self.columns).1;
+			if columns == self.columns && rows <= height {
+				write!(output, "\r")?;
+				if rows > 1 { write!(output, "\x1b[{}A", rows - 1)?; }
+				for row in 0..rows { write!(output, "\x1b[2K")?; if row + 1 < rows { write!(output, "\x1b[1B")?; } }
+				if rows > 1 { write!(output, "\x1b[{}A", rows - 1)?; }
+			} else {
+				// Resize reflow differs across terminals. Preserve the old frame
+				// rather than moving into text whose screen position is unknown.
+				writeln!(output)?;
+				self.committed = self.printed;
+			}
+		}
+		let suffix = &text[self.committed..];
+		if reply.is_some() { writeln!(output, "{suffix}")?; }
+		let tail = self.last_row(suffix, columns).0;
+		self.tail = suffix[tail..].to_owned();
+		self.committed += tail;
+		self.printed = text.len();
+		self.status = line.to_owned();
+		write!(output, "{}", self.status)?;
+		if complete { writeln!(output)?; }
+		self.drawn = true;
+		self.has_reply = reply.is_some();
+		self.columns = columns;
+		output.flush()
+	}
+}
+#[cfg(unix)]
+impl Drop for ChatTerminal {
+	fn drop(&mut self) {
+		unsafe extern "C" { fn freelocale(locale: *mut std::ffi::c_void); }
+		unsafe { freelocale(self.locale as *mut std::ffi::c_void); }
+	}
+}
+impl InferenceLive {
+	fn new(state: InferenceProgress, metrics: Vec<ChatMetric>) -> Self {
+		let mut renderer = std::io::stderr().is_terminal().then(ChatTerminal::new).flatten();
+		if let Some(renderer) = &mut renderer {
+			if let Err(error) = renderer.render((state.phase != "load").then_some(state.reply.as_str()), &state.line(&metrics), false) { eprintln!("cannot print chat progress: {error}"); }
+		}
+		let state = Arc::new(Mutex::new(state));
+		let (stop, receiver) = std::sync::mpsc::channel();
+		let shared = Arc::clone(&state);
+		let terminal = renderer.is_some();
+		let refresh = Duration::from_secs_f64(1.0 / Config::load().map_or(5, |config| config.progress_refresh_hz).max(1) as f64);
+		let thread = std::thread::spawn(move || {
+			let mut version = Some(0);
+			loop {
+				let complete = !matches!(receiver.recv_timeout(refresh), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+				let mut view = {
+					let state = shared.lock().unwrap();
+					let ticking = !state.finished && (metrics.contains(&infer::time)
+						|| state.phase == "prefill" && metrics.contains(&infer::pp) || state.phase == "tg" && metrics.contains(&infer::tg));
+					if !complete && !ticking && version == Some(state.version) { continue; }
+					state.clone()
+				};
+				view.observe(Instant::now());
+				if terminal || complete {
+					let line = view.line(&metrics);
+					if let Some(renderer) = &mut renderer {
+						let reply = (!matches!(view.phase, "load" | "ready")).then_some(view.reply.as_str());
+						if let Err(error) = renderer.render(reply, &line, complete) { eprintln!("cannot print chat progress: {error}"); break; }
+					} else if complete && !line.is_empty() {
+						let _ = Train::write_progress(&line, false, true);
+					}
+					version = Some(view.version);
+				}
+				if complete { break; }
+			}
+		});
+		Self { state, stop, thread: Some(thread), terminal }
+	}
+	fn finish(&self) -> f64 {
+		let mut state = self.state.lock().unwrap();
+		if !state.finished {
+			state.observe(Instant::now());
+			state.finished = true;
+			state.version += 1;
+		}
+		state.seconds
+	}
+	fn prompt(&self, tokens: usize) {
+		let mut state = self.state.lock().unwrap();
+		state.in_tokens = tokens;
+		state.phase = "prefill";
+		state.version += 1;
+	}
+	fn prefilled(&self, tokens: usize) {
+		let mut state = self.state.lock().unwrap();
+		state.prefill_tokens = tokens.saturating_sub(state.cached);
+		state.version += 1;
+	}
+	fn cached(&self, tokens: usize) {
+		let mut state = self.state.lock().unwrap();
+		state.cached = tokens;
+		state.version += 1;
+	}
+	fn phase(&self, phase: &'static str, now: Instant) {
+		let mut state = self.state.lock().unwrap();
+		state.observe(now);
+		state.phase = phase;
+		state.phase_started = Some(now);
+		state.version += 1;
+	}
+	fn generated(&self, visible: bool) {
+		if !visible { return; }
+		let mut state = self.state.lock().unwrap();
+		state.out_tokens += 1;
+		state.version += 1;
+	}
+	fn reply(&self, text: String) {
+		let mut state = self.state.lock().unwrap();
+		state.reply = text;
+		state.version += 1;
+	}
+	fn renders_reply(&self) -> bool { self.terminal }
+}
+impl Drop for InferenceLive {
+	fn drop(&mut self) {
+		self.finish();
+		let _ = self.stop.send(());
+		if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+	}
 }
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
-		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15 }
+		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15, suppressed: Vec::new() }
 	}
 	/// Autoregressive decode over a saved model on the primary device: the
 	/// model placed as one range, decoded by [`Placed::decode`] over one tape.
@@ -14823,43 +16397,82 @@ fn trace_logits(step: usize, logits: &[f64]) -> Result<()> {
 	trace(&format!("logits step {step} first {:?} last {:?} sum {} argmax {} = {}", &logits[..3], &logits[logits.len() - 3..], logits.iter().sum::<f64>(), argmax.0, argmax.1))
 }
 fn decode_steps(
-	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
+	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32) -> Result<()>,
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-	let mut settled = 0;
-	let mut started = std::time::Instant::now();
-	for step in 0..=budget {
+	let exact = tape.profile.exact_cpu && tape.program.gpu.backend == Backend::Cpu;
+	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, &mut DecodeState::default(), emit, |samples, begin, end| logits(tape, samples, begin, end))
+}
+/// Both a single tape and a placed model measure and report through this loop.
+fn decode_sequence(
+	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>, state: &mut DecodeState,
+	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
+) -> Result<Generation> {
+	let mut reference = reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)?;
+	let mut cached = prompt.iter().zip(&state.ids).take_while(|(left, right)| left == right).count();
+	// A shorter prompt needs its own terminal logits. Earlier KV positions are
+	// still valid, but the last position must produce that output again.
+	if cached == prompt.len() && cached != state.ids.len() { cached = cached.saturating_sub(1); }
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0 };
+	let prefill_started = Instant::now();
+	let mut generation_started = None;
+	let mut ended = None;
+	if let Some(progress) = progress { progress.cached(cached); progress.phase("prefill", prefill_started); }
+	let mut settled = narrow(cached, "cached positions")? as u32;
+	for step in 0..budget.max(1) {
+		if INTERRUPTED.load(Ordering::Acquire) { break; }
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
-		trace_logits(step, &sample_logits)?;
-		let seconds = started.elapsed().as_secs_f64();
-		if step == 0 {
-			generation.prefill_seconds = seconds;
+		let (predictions, sample_logits) = if settled == reached {
+			(state.predictions.clone(), state.logits.clone())
 		} else {
-			generation.step_seconds.push(seconds);
+			let output = logits(samples, settled, reached)?;
+			state.ids.truncate(settled as usize);
+			state.ids.extend_from_slice(&generation.ids[settled as usize..reached as usize]);
+			state.predictions.clone_from(&output.0);
+			state.logits.clone_from(&output.1);
+			output
+		};
+		if step == 0 {
+			let boundary = Instant::now();
+			generation.prefill_seconds = boundary.duration_since(prefill_started).as_secs_f64();
+			if budget > 0 { generation_started = Some(boundary); }
+			if let Some(progress) = progress {
+				progress.prefilled(prompt.len());
+				progress.phase(if budget > 0 { "tg" } else { "done" }, boundary);
+			}
 		}
-		started = std::time::Instant::now();
+		let reference_id = reference.step(step, &sample_logits).map_err(RecipeError::new)?;
+		trace_logits(step, &sample_logits)?;
 		settled = reached;
 		generation.logits = predictions;
-		if step == budget {
+		if budget == 0 {
 			break;
 		}
-		let id = sampler.sample(&sample_logits, &generation.ids);
+		let id = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&sample_logits, &generation.ids));
+		let stopped = stop.contains(&id);
+		if stopped {
+			let now = Instant::now();
+			ended = Some(now);
+			if let Some(progress) = progress { progress.phase("done", now); }
+		} else if let Some(progress) = progress { progress.generated(true); }
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
-		if stop.contains(&id) {
+		if stopped {
 			break;
 		}
 	}
+	let ended = ended.unwrap_or_else(Instant::now);
+	if let Some(started) = generation_started { generation.generation_seconds = ended.duration_since(started).as_secs_f64(); }
+	if let Some(progress) = progress { progress.phase("done", ended); }
+	require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
 	Ok(generation)
 }
 /// The interface in front of placed tapes: a saved semantic pipeline applies
 /// its named-input transforms, while a bound graph reads its input directly.
 enum PlacedSource {
 	Saved(Vec<bundle::SemanticGraph>),
-	Bound(Shape),
+	Bound(Shape, Vec<u32>),
 }
 /// A model placed across the selected devices: contiguous block ranges, each
 /// held by one persistent tape on its own device, run in sequence with the
@@ -14867,10 +16480,13 @@ enum PlacedSource {
 /// extends them one position at a time.
 pub struct Placed {
 	source: PlacedSource,
+	decode: Mutex<DecodeState>,
+	devices: Vec<&'static Gpu>,
 	split: Vec<usize>,
 	/// One tape per range of every graph, on the range's device.
 	tapes: Vec<Vec<NativeTape>>,
 	resident: Vec<usize>,
+	movement: Vec<usize>,
 	moved: usize,
 }
 /// The saved statistics a batch normalization carries into inference, as the
@@ -14882,15 +16498,60 @@ fn saved_statistics(nodes: &[Node], rows: usize) -> Result<Vec<(usize, usize)>> 
 		.map(|(index, state)| (index, state.values))
 		.collect())
 }
-/// The bytes a device holds to run one row of a graph part: its input, weight
-/// arena, and value and context arenas for the part's own inference layout.
-fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+/// The bytes a device holds to run one row of a graph part, kept by arena so a
+/// placement failure identifies the allocation that exceeds the device.
+#[derive(Clone, Debug)]
+pub struct DeviceMemory {
+	pub device: String,
+	pub input: usize,
+	pub weights: usize,
+	pub values: usize,
+	pub contexts: usize,
+	pub scratch: usize,
+	/// Intermediate and workspace bytes never reused in the inference forward
+	/// plan, held past their last read while later buffers are written. Included
+	/// in `values` and `contexts`, not an additional allocation.
+	pub dead: usize,
+	/// Number of distinct planned buffers contributing to `dead`, including
+	/// partially reused buffers with an unreused portion. Each buffer counts once.
+	pub dead_buffers: usize,
+}
+impl fmt::Display for DeviceMemory {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+		write!(f, "{} memory: weights {:.3} GiB, values {:.3} GiB, contexts/KV {:.3} GiB, input {:.3} GiB, load scratch {:.3} GiB",
+			self.device, gib(self.weights), gib(self.values), gib(self.contexts), gib(self.input), gib(self.scratch))
+	}
+}
+impl DeviceMemory {
+	pub fn total(&self) -> Result<usize> {
+		checked_add(
+			checked_add(self.input, self.weights, "part resident bytes")?,
+			checked_add(checked_add(self.values, self.contexts, "part arena bytes")?, self.scratch, "part load bytes")?,
+			"part bytes",
+		)
+	}
+}
+fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
 	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
-	let resident = checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")?;
-	checked_add(resident, storage_scratch_bytes(part), "part load scratch bytes")
+	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
+}
+fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+	part_memory(part, precision)?.total()
+}
+/// Full-graph model data and working buffers, independent of the failed placement boundary.
+fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> Result<RecipeError> {
+	let memory = part_memory(graph, precision)?;
+	let model = graph.nodes.iter().filter(|node| node.op == Primitive::Gather).try_fold(memory.weights, |bytes, node| {
+		node_context(graph, node, 1, node.precision, true, 0)?.into_iter().try_fold(bytes, |total, (bytes, _)| checked_add(total, bytes, "model embedding bytes"))
+	})?;
+	let total = memory.total()?;
+	let buffers = total.checked_sub(model).ok_or_else(|| RecipeError::new("model data exceeds total planned memory"))?;
+	let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
@@ -14916,8 +16577,8 @@ fn storage_scratch_bytes(graph: &Graph) -> usize {
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
-	graph.nodes[start..].iter().flat_map(|node| [(node.source, 1), (node.second, 0)]).any(|(index, first)| match usize::try_from(index) {
-		Ok(from) => from + first < start,
+	graph.nodes[start..].iter().flat_map(|node| [node.source, node.second]).any(|index| match usize::try_from(index) {
+		Ok(from) => from + 1 < start,
 		Err(_) => index == -1 && start != 0,
 	})
 }
@@ -14938,17 +16599,32 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 		}
 	}
 	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
+	// A complete causal graph can have a smaller working window than a prefix
+	// whose output must retain every position. Check the actual single-device
+	// graph instead of assuming each prefix's allocation is monotonic.
+	if devices.len() == 1 {
+		require(!starts.is_empty(), "model has no block")?;
+		return if part_bytes(graph, precision)? as u64 <= free { Ok(vec![starts.len()]) } else { Err(placement_memory_error(graph, precision, free)?) };
+	}
+	let mut candidate: Option<(usize, usize, usize)> = None;
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
+		if taken != 0 && !cuts_connection(graph, start) {
+			let prior = part_bytes(&graph_part(graph, first, start)?, precision)? as u64;
+			if prior <= free {
+				candidate = Some((taken, start, block));
+			}
+		}
 		let mut resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
-		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
-			split.push(taken);
-			(taken, first, free) = (0, start, available(&devices[split.len()])?);
+		if resident > free && split.len() + 1 < devices.len()
+			&& let Some((before, boundary, boundary_block)) = candidate.take()
+		{
+			split.push(before);
+			(taken, first, free) = (block - boundary_block, boundary, available(&devices[split.len()])?);
 			resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		}
 		if resident > free {
-			let device = split.len();
-			return Err(RecipeError::new(format!("device {device} cannot hold placement blocks {}..{}: {resident} bytes required, {free} bytes available", first, end)));
+			return Err(placement_memory_error(graph, precision, free)?);
 		}
 		taken += 1;
 	}
@@ -15001,6 +16677,10 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_precision: None,
 		block_blck_precision: None,
 		block_kv_precision: None,
+		block_qk_precision: None,
+		block_rope_precision: None,
+		block_activation_precision: None,
+		block_norm_precision: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -15029,7 +16709,7 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
 /// Build one persistent tape for every contiguous device range of `graph`.
-fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, usize)> {
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
 	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
 	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
@@ -15040,43 +16720,49 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 	// multi-graph saved model.
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let parts = split_graph(graph, &split)?;
-	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
+	for (part, device) in parts.iter().zip(devices) {
 		let required = part_bytes(part, precision)? as u64;
 		let available = device.free_bytes()?.saturating_sub(reserve);
-		require(required <= available, format!("device {index} cannot hold placement blocks for explicit split: {required} bytes required, {available} bytes available"))?;
+		if required > available {
+			return Err(placement_memory_error(graph, precision, available)?);
+		}
 	}
-	let (mut ranges, mut resident, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], 0, 0);
+	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
 		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics)?;
 		resident[index] = tape.resident_bytes();
 		if index + 1 < split.len() {
-			moved += part.output.channels * precision.bytes();
+			movement[index] = part.output.channels * precision.bytes();
+			moved += movement[index];
 		}
 		ranges.push(tape);
 	}
 	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
-	Ok((split, ranges, resident, moved))
+	Ok((split, ranges, resident, movement, moved))
 }
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
 fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
 	let path = resolve_path(path)?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
-	let (mut chosen, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
+	let (mut chosen, mut tapes, mut resident, mut movement, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let (next, ranges, bytes, movement) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
 		if chosen.is_empty() {
 			chosen = next;
 		}
 		for (total, bytes) in resident.iter_mut().zip(bytes) {
 			*total += bytes;
 		}
-		moved += movement;
+		for (total, bytes) in movement.iter_mut().zip(graph_movement) {
+			*total += bytes;
+		}
+		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), split: chosen, tapes, resident, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -15085,13 +16771,90 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	let samples = vec![0.0; positions];
 	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
 	let input = graph.input;
-	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Compute::FP64, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
+	let suppressed = match model.file.value("tokenizer.ggml.suppress_tokens") {
+		Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| RecipeError::new("tokenizer suppress_tokens contains an invalid id"))).collect::<Result<Vec<_>>>()?,
+		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
+		None => Vec::new(),
+	};
+	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	fn llvm_report(&self) -> LlvmReport {
+		let mut report = LlvmReport::default();
+		for tape in self.tapes.iter().flatten() {
+			report.instructions.extend(tape.program.artifact.llvm.instructions.clone());
+			report.intrinsics.extend(tape.program.artifact.llvm.intrinsics.clone());
+		}
+		report
+	}
+	fn format_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::format_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn memory_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			let mut bytes = [0_usize; 8];
+			for tape in self.tapes.iter().filter_map(|ranges| ranges.get(index)) {
+				bytes[0] += tape.samples.bytes;
+				bytes[1] += tape.weights.bytes;
+				bytes[2] += tape.values.bytes;
+				bytes[3] += tape.contexts.bytes;
+				bytes[4] += tape.adjoints.bytes;
+				bytes[5] += tape.gradient.bytes;
+				bytes[6] += tape.moments.bytes + tape.variances.bytes;
+				bytes[7] += tape.program.artifact.storage.bytes;
+			}
+			lines.push(format!(
+				"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
+				device_label(gpu)?, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+			));
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn link_report(&self) -> Result<ReportLines> { transfer_report(self.tapes.iter().flatten().map(|tape| tape.program.gpu)) }
+	fn aot_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			let tapes = self.tapes.iter().filter_map(|ranges| ranges.get(index)).collect::<Vec<_>>();
+			let blocks = tapes
+				.iter()
+				.filter_map(|tape| Some((tape.nodes.first()?.block_index, tape.nodes.last()?.block_index)))
+				.map(|(first, last)| if first == last { first.to_string() } else { format!("{first}..{last}") })
+				.collect::<Vec<_>>();
+			let blocks = if blocks.is_empty() { "none".to_owned() } else { blocks.join(",") };
+			let matrix = tapes.iter().any(|tape| tape.program.schedule.matrix);
+			let vector = tapes.iter().any(|tape| !tape.program.schedule.matrix);
+			let pp = if matrix && vector { "mixed" } else if matrix { "matrix" } else if vector { "vector" } else { "none" };
+			let tg = if tapes.is_empty() { "none" } else { "vector" };
+			let moved = self.movement[index];
+			lines.push(format!("{}  aot: blocks {blocks} pp {pp} tg {tg} transfer {moved} bytes/token", device_label(gpu)?));
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn tile_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::tile_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn grid_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
+	/// Actual resident arena sizes, available directly to model scripts.
+	pub fn memory(&self) -> Vec<DeviceMemory> {
+		self.tapes.iter().flatten().map(|tape| DeviceMemory {
+			device: tape.program.gpu.name.clone(), input: tape.samples.bytes, weights: tape.weights.bytes,
+			values: tape.values.bytes, contexts: tape.contexts.bytes, scratch: 0, dead: tape.program.artifact.layout.dead_bytes, dead_buffers: tape.program.artifact.layout.dead_buffers,
+		}).collect()
+	}
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap();
+		*state = DecodeState::default();
 		let end = self.tapes.first().and_then(|ranges| ranges.first()).map_or(0, |tape| tape.positions);
 		self.run_window(input, 0, end).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Clear the cached sequence while keeping weights and compiled kernels resident.
+	pub fn clear(&self) {
+		*self.decode.lock().unwrap() = DecodeState::default();
 	}
 	/// Autoregressive decode over the placed model, whose input is a sequence
 	/// of ids and whose output is one logit per id. The tapes hold the state of
@@ -15122,7 +16885,17 @@ impl Placed {
 	pub fn moved_bytes(&self) -> usize {
 		self.moved
 	}
-	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		self.decode_observed(prompt, sampler, stop, budget, None, emit)
+	}
+	fn decode_observed(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		let mut state = self.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))?;
+		let first = self.tapes.first().and_then(|tapes| tapes.first()).ok_or_else(|| RecipeError::new("placement has no tape"))?;
+		let exact = first.profile.exact_cpu && self.tapes.iter().flatten().all(|tape| tape.program.gpu.backend == Backend::Cpu);
+		match &self.source {
+			PlacedSource::Bound(_, suppressed) => sampler.suppressed.clone_from(suppressed),
+			PlacedSource::Saved(_) => sampler.suppressed.clear(),
+		}
 		let sequence = match &self.source {
 			PlacedSource::Saved(graphs) => match graphs.as_slice() {
 				[only] => {
@@ -15131,7 +16904,7 @@ impl Placed {
 				}
 				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
 			},
-			PlacedSource::Bound(input) => {
+			PlacedSource::Bound(input, _) => {
 				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
 				input.elements()
 			}
@@ -15143,34 +16916,26 @@ impl Placed {
 		for (slot, id) in samples.iter_mut().zip(prompt) {
 			*slot = f64::from(*id);
 		}
-		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-		let mut settled = 0;
-		for step in 0..=budget {
-			let reached = narrow(generation.ids.len(), "decode position")? as u32;
-			let started = std::time::Instant::now();
-			let predictions = self.run_window(&samples, settled, reached)?;
-			let sample_logits = self.last_logits(&predictions, settled, reached)?;
-			trace_logits(step, &sample_logits)?;
-			let seconds = started.elapsed().as_secs_f64();
-			if step == 0 {
-				generation.prefill_seconds = seconds;
-			} else {
-				generation.step_seconds.push(seconds);
-			}
-			settled = reached;
-			generation.logits = predictions;
-			if step == budget {
-				break;
-			}
-			let id = sampler.sample(&sample_logits, &generation.ids);
-			emit(id)?;
-			samples[generation.ids.len()] = f64::from(id);
-			generation.ids.push(id);
-			if stop.contains(&id) {
-				break;
-			}
+		// A delta rule keeps a live state rather than a state at every position.
+		// Indexed attention also updates representatives shared by a whole block.
+		// These states can extend their prefix, but cannot rewind into a changed one.
+		if !prompt.starts_with(&state.ids) && self.tapes.iter().flatten().any(|tape| tape.nodes.iter().any(|node| node.op == Primitive::Delta || node.op == Primitive::Attention && attention_blocks(node) > 0)) {
+			*state = DecodeState::default();
 		}
-		Ok(generation)
+		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
+			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
+			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
+			if let PlacedSource::Bound(_, suppressed) = &self.source {
+				for id in suppressed {
+					if let Some(logit) = sample_logits.get_mut(*id as usize) {
+						*logit = -f64::MAX;
+					}
+				}
+			}
+			Ok((predictions, sample_logits))
+		});
+		if result.is_err() { *state = DecodeState::default(); }
+		result
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
@@ -15179,19 +16944,22 @@ impl Placed {
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
 	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		self.run_window_observed(samples, begin, end, None)
+	}
+	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		match &self.source {
 			PlacedSource::Saved(graphs) => {
 				let mut graph = 0;
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window(ranges, prepared, begin, end)
+					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None })
 				})
 			}
-			PlacedSource::Bound(input) => {
+			PlacedSource::Bound(input, _) => {
 				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
-				self.forward_window(ranges, samples, begin, end)
+				self.forward_window(ranges, samples, begin, end, progress)
 			}
 		}
 	}
@@ -15200,7 +16968,7 @@ impl Placed {
 	/// `samples` enter the first range, each range writes the positions the
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
-	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
@@ -15212,7 +16980,10 @@ impl Placed {
 		}
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
-			tape.forward_window(begin, end, ForwardMode::Inference)?;
+			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+				// A token has completed prefill only after the final placed range.
+				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize); }
+			})?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
 			for (start, count) in window_runs(tape.output, begin, end) {
@@ -15306,8 +17077,8 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
-	fn identity(&self, index: usize) -> String {
-		let prim = match self.op {
+	fn primitive_name(&self) -> &'static str {
+		match self.op {
 			Primitive::Contraction => "Contraction",
 			Primitive::Pool => "Pool",
 			Primitive::Attention => "Attention",
@@ -15328,10 +17099,12 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
-		};
+		}
+	}
+	fn identity(&self, index: usize) -> String {
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
-			self.block_index, self.block_kind, index, prim, self.input.channels, self.input.length, self.output.channels, self.output.length, self.offset, self.parameters, self.source
+			self.block_index, self.block_kind, index, self.primitive_name(), self.input.channels, self.input.length, self.output.channels, self.output.length, self.offset, self.parameters, self.source
 		)
 	}
 }
@@ -15347,12 +17120,24 @@ struct Node {
 	argument: [f64; 9],
 	program_offset: usize,
 	program_count: usize,
+	/// The private file/checkpoint layout of this node's weights. This is not an
+	/// operation argument and never aliases an op-specific structural value.
+	storage: u16,
 	block_index: usize,
 	block_kind: &'static str,
 	frozen: bool,
 	packed: bool,
+	/// The declared integer width. Int16 uses 16-bit activation codes; int32
+	/// keeps fp32 activations unchanged. Zero means no integer declaration.
+	int_bits: u8,
+	/// The inputs that share one step under int(n): 32, or what the block or
+	/// the table named.
+	int_step: u32,
 	/// The arithmetic this node computes in.
 	precision: Compute,
+	/// The accumulator its sums and reductions carry: fp32, or fp64 when the
+	/// precision table selects an fp64 accumulator.
+	acc: Compute,
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
@@ -15391,6 +17176,10 @@ struct Graph {
 	block_blck_precision: Option<Compute>,
 	/// The cache format of the attention nodes lowered next, when their block named one.
 	block_kv_precision: Option<Compute>,
+	block_qk_precision: Option<Compute>,
+	block_rope_precision: Option<Compute>,
+	block_activation_precision: Option<Compute>,
+	block_norm_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
 	/// The weights still to bind while a graph compiles over mapped tensors:
@@ -15427,6 +17216,10 @@ impl Graph {
 			block_precision: None,
 			block_blck_precision: None,
 			block_kv_precision: None,
+			block_qk_precision: None,
+			block_rope_precision: None,
+			block_activation_precision: None,
+			block_norm_precision: None,
 			profile: Precisions::default(),
 			bound: None,
 			bound_values: Vec::new(),
@@ -15435,6 +17228,23 @@ impl Graph {
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
 		encode_graph_storage(self, config)
+	}
+	fn training_graph(&self) -> Result<std::borrow::Cow<'_, Self>> {
+		if !self.nodes.iter().any(|node| node.int_bits != 0) {
+			return Ok(std::borrow::Cow::Borrowed(self));
+		}
+		let float = self.profile.train.ok_or_else(|| RecipeError::new("integer checkpoint blocks require an explicit train = fp16, bf16, fp32, or fp64 in the precision table"))?;
+		require(matches!(float, Compute::FP16 | Compute::BF16 | Compute::FP32 | Compute::FP64), "integer checkpoint training requires a float compute format")?;
+		let mut graph = self.clone();
+		if float == Compute::FP64 { graph.profile.acc = Compute::FP64; }
+		for node in &mut graph.nodes {
+			if node.int_bits != 0 {
+				node.precision = float;
+				node.kv_precision = float;
+				if float == Compute::FP64 { node.acc = Compute::FP64; }
+			}
+		}
+		Ok(std::borrow::Cow::Owned(graph))
 	}
 }
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
@@ -15449,13 +17259,13 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 		// one that carries no quantization stays as drawn.
 		let drawn = graph.stored[index].take().filter(|_| node.table()).map(|stored| stored.arithmetic);
 		let weights = drawn.as_deref().unwrap_or(&graph.parameters[node.offset..node.offset + node.parameters]);
-		if weights.is_empty() || node.argument[8] == 0.0 {
+		if weights.is_empty() || node.storage == 0 {
 			if let Some(arithmetic) = drawn {
 				graph.stored[index] = Some(bundle::raw_weight(&arithmetic));
 			}
 			continue;
 		}
-		let format = StorageFormat(node.argument[8] as u16);
+		let format = StorageFormat(node.storage);
 		require(format.spec().is_some(), format.unavailable().to_string())?;
 		// A node that never received gradient, like an unrouted expert, has an all-zero
 		// variance slice: it carries no importance signal, so weight it uniformly.
@@ -15480,8 +17290,8 @@ fn sequential_operation(operation: &Operation) -> bool {
 }
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
-	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
-		return Err(format.unavailable());
+	if let Some((index, format)) = model.blocks.iter().enumerate().map(|(index, block)| (index, StorageFormat(block.quantization))).find(|(_, format)| format.0 != 0 && !format.valid()) {
+		return Err(RecipeError::new(format!("block {index} {}: {}", model.blocks[index].operation.name(), format.unavailable())));
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
@@ -15503,6 +17313,11 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_frozen = false;
 	graph.block_precision = None;
 	graph.block_blck_precision = None;
+	graph.block_kv_precision = None;
+	graph.block_qk_precision = None;
+	graph.block_rope_precision = None;
+	graph.block_activation_precision = None;
+	graph.block_norm_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
@@ -15518,11 +17333,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
 		lower_conv(&mut graph, data.target_width, length)?;
-		let quantization = if model.quantization != 0 { model.quantization } else { config.quantization };
-		if quantization != 0 {
-			graph.nodes.last_mut().unwrap().argument[8] = f64::from(quantization)
-		}
-		output_profile = StorageFormat(quantization).selection().map(|_| StorageFormat(quantization));
+		output_profile = None;
 	}
 	if let Some(left) = graph.bound.take().filter(|plan| !plan.is_empty()) {
 		return Err(RecipeError::new(format!("the plan names {} more weights than the model has parameterized nodes, starting with {}", left.len(), left[0].names)));
@@ -15534,7 +17345,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
 	{
-		node.argument[8] = f64::from(format.tensor(0, false, true))
+		node.storage = format.tensor(0, false, true)
 	}
 	if initialize {
 		initialize_graph(&mut graph, config);
@@ -15643,7 +17454,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let program_base = graph.programs.len();
 	for node in &mut part.nodes {
 		node.source = if node.source < 0 { source } else { node.source + node_base };
-		if node.second >= 0 {
+		if node.second == -1 {
+			node.second = source;
+		} else if node.second >= 0 {
 			node.second += node_base
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
@@ -15669,11 +17482,15 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
+	graph.block_qk_precision = block.qk_precision;
+	graph.block_rope_precision = block.rope_precision;
+	graph.block_activation_precision = block.activation_precision;
+	graph.block_norm_precision = block.norm_precision;
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -15706,18 +17523,21 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		}
 	}
 	if block.activation != Activation::Linear {
+		let precision = graph.block_precision;
+		graph.block_precision = graph.block_activation_precision.or(precision);
 		lower_activation(graph, block.activation, config)?;
+		graph.block_precision = precision;
 	}
 	if let Some(normalization) = block.normalization {
+		let precision = graph.block_precision;
+		graph.block_precision = graph.block_norm_precision.or(precision);
 		let channels = graph.output.channels;
 		lower_normalize(graph, normalization, channels, channels)?;
+		graph.block_precision = precision;
 	}
-	// A block's own storage format wins; a block that names none takes the run's.
-	let (quantization, profile) = if block.quantization != 0 {
-		(block.quantization, block.profile)
-	} else {
-		(config.quantization, StorageFormat(config.quantization).selection().is_some())
-	};
+	// Only a legacy block record can name storage. New models take storage from
+	// each bound tensor or from the compute format selected for this operation.
+	let (quantization, profile) = (block.quantization, block.profile);
 	if quantization != 0 {
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
@@ -15726,7 +17546,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				let format = if profile { StorageFormat(quantization).tensor(role, more, false) } else { quantization };
-				node.argument[8] = f64::from(format);
+				node.storage = format;
 				parameter += 1;
 				requantize_bound(graph, index, StorageFormat(format), config)?;
 			}
@@ -15734,42 +17554,53 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
-	// int8 inputs and scaled once per block sum. The sum's own values are its
-	// state, fp32, which is what the int dot produces.
+	// int8 inputs and scaled once per block sum. The sum's own values are what
+	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
 	for index in first..graph.nodes.len() {
 		let Compute::Int(format) = graph.nodes[index].precision else { continue };
 		let node = &graph.nodes[index];
-		// int on attn names its sums; the attention itself runs in its state.
+		let values = node.acc;
+		// int on attn names its sums; the attention itself runs in its accumulator.
 		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = Compute::FP32;
+			graph.nodes[index].precision = values;
 			continue;
 		}
 		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
+		// kernel: a conv names fp or bf.
+		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
+		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
+		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
 		let storage = match format.bits {
-			8 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_0"),
+			8 | 16 | 32 => StorageFormat::named("q8_0"),
+			4 => StorageFormat::named("q4_1"),
 			_ => None,
 		}
 		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// int(n) names codes of at most n bits with their step sizes. A stored
-		// plane already in such a format is kept and multiplied as it is; only a
-		// wider plane is requantized to the n-bit block format.
+		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
+		// nodes remain together until the load kernel can emit multiple target
+		// layouts for one node; every single noncanonical plane converts at load.
 		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			weight.codebook.is_empty() && !weight.segments.is_empty() && weight.segments.iter().all(|(span, _)| span.0 >> 12 != 2 && span.bits() <= format.bits)
+			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
+			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
+			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
+			canonical || mixed_k
 		});
 		let kept = kept.map(|weight| weight.format);
 		let node = &mut graph.nodes[index];
-		node.argument[8] = f64::from(kept.unwrap_or(storage).0);
+		node.storage = kept.unwrap_or(storage).0;
 		node.packed = true;
-		node.precision = Compute::FP32;
-		node.kv_precision = Compute::FP32;
+		node.int_bits = format.bits;
+		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
+		node.kv_precision = node.precision;
 		if kept.is_none() {
 			requantize_bound(graph, index, storage, config)?;
 		}
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -15805,7 +17636,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
-		trace(&format!("requantize node {index} on the host: {} values, kept from the earlier compile", weight.count))?;
+		trace(&format!("requantize node {index} in machine RAM: {} values, kept from the earlier compile", weight.count))?;
 		graph.stored[index] = Some(encoded.clone());
 		return Ok(());
 	}
@@ -15822,7 +17653,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	}
 	let decoded = started.elapsed().as_secs_f64();
 	let mut encoded = format.encode(&values, &vec![1.0; values.len()], config)?;
-	trace(&format!("requantize node {index} on the host: {} values, decode {decoded:.2} s, encode {:.2} s", weight.count, started.elapsed().as_secs_f64() - decoded))?;
+	trace(&format!("requantize node {index} in machine RAM: {} values, decode {decoded:.2} s, encode {:.2} s", weight.count, started.elapsed().as_secs_f64() - decoded))?;
 	// A bound weight keeps only its stored bytes, as one read from a file does; the
 	// decoded values would otherwise hold the whole model in f64 on the host.
 	encoded.arithmetic = Vec::new();
@@ -15841,7 +17672,9 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	// The block's own suffix for this kind of op, else the run's table.
 	let kind = precision_kind(op, graph.block_kind);
 	let named = if kind.blck() { graph.block_blck_precision } else { graph.block_precision };
-	let precision = named.unwrap_or(graph.profile.of(kind));
+	let precision = graph.profile.resolve(named.unwrap_or(graph.profile.of(kind)));
+	let acc = graph.profile.acc_of(kind);
+	let int_step = graph.profile.step;
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
 		op,
@@ -15854,11 +17687,15 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		argument,
 		program_offset: 0,
 		program_count: 0,
+		storage: 0,
 		block_index: graph.block_index,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
 		packed: false,
+		int_bits: 0,
+		int_step,
 		precision,
+		acc,
 		kv_precision,
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
@@ -15875,7 +17712,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 				// The block's `packed` qualifier decides whether the bytes stay
 				// packed in the weight arena or the load expands them into it.
 				BoundWeight::Stored(weight) => {
-					if node.table() { node.argument[8] = f64::from(weight.format.0); }
+					if node.table() { node.storage = weight.format.0; }
 					Some(weight)
 				}
 				// A table has no parameter span: its rows decode from the bound
@@ -15930,10 +17767,13 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	if activation == Activation::Relu {
 		let source = graph.source;
 		let last = graph.nodes.len() as i32 - 1;
+		// An int sum keeps its relu as its own op: the int dot runs whole
+		// blocks in the wave body, which has no fused relu.
 		if let Some(node) = graph.nodes.last_mut()
 			&& source == last
 			&& node.op == Primitive::Contraction
 			&& node.argument[1] == 0.0
+			&& !matches!(node.precision, Compute::Int(_))
 		{
 			node.argument[1] = 1.0;
 			return Ok(());
@@ -16016,14 +17856,46 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
-		Activation::Gelu => {
-			let square = program.op(ScalarOpcode::Multiply, x, x);
-			let cube = program.op(ScalarOpcode::Multiply, square, x);
+		Activation::Gelu if graph.profile.gelu_table => {
+			// llama.cpp's fp16 gelu table: between -10 and 10 the input rounds to
+			// fp16, the tanh form above runs in fp32 on it, and the result rounds
+			// to fp16; at 10 and above the input passes as it is, at -10 and below
+			// the result is zero.
+			let ten = constant(&mut program, 10.0);
+			let minus_ten = constant(&mut program, -10.0);
+			let rounded = program.unary(ScalarOpcode::Half, x);
 			let cubic = constant(&mut program, config.activation[6]);
-			let curved = program.op(ScalarOpcode::Multiply, cubic, cube);
-			let sum = program.op(ScalarOpcode::Add, x, curved);
+			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, rounded);
+			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, rounded);
+			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
 			let scale = constant(&mut program, config.activation[5]);
-			let argument = program.op(ScalarOpcode::Multiply, scale, sum);
+			let scale_x = program.op(ScalarOpcode::Multiply, scale, rounded);
+			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
+			let tanh = program.unary(ScalarOpcode::Tanh, argument);
+			let shifted = program.op(ScalarOpcode::Add, one, tanh);
+			let half = constant(&mut program, 0.5);
+			let half_x = program.op(ScalarOpcode::Multiply, half, rounded);
+			let value = program.op(ScalarOpcode::Multiply, half_x, shifted);
+			let tabled = program.unary(ScalarOpcode::Half, value);
+			let above = program.op(ScalarOpcode::Greater, x, ten);
+			let below = program.op(ScalarOpcode::Greater, minus_ten, x);
+			let outside = program.op(ScalarOpcode::Add, above, below);
+			let inside = program.op(ScalarOpcode::Subtract, one, outside);
+			let passed = program.op(ScalarOpcode::Select, above, x);
+			let kept = program.op(ScalarOpcode::Select, inside, tabled);
+			program.op(ScalarOpcode::Add, passed, kept)
+		}
+		Activation::Gelu => {
+			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
+			// one fused step where its compiler fuses one, so an fp32 gelu prints
+			// the bits llama.cpp's does.
+			let cubic = constant(&mut program, config.activation[6]);
+			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, x);
+			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, x);
+			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
+			let scale = constant(&mut program, config.activation[5]);
+			let scale_x = program.op(ScalarOpcode::Multiply, scale, x);
+			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
 			let half = constant(&mut program, 0.5);
@@ -16240,8 +18112,11 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
 }
-fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64, chain: bool) -> Result<(f64, f64, f64)> {
 	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	if chain {
+		return yarn_parameters_chain(factor, context, dims, base, fast, slow);
+	}
 	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
 	require(base.is_finite() && base > 1.0, "yarn rotary base must exceed one")?;
 	require(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered")?;
@@ -16257,6 +18132,29 @@ fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f6
 	let mscale = 1.0 + 0.1 * factor.ln();
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((mscale, low, high))
+}
+/// The yarn values of a chain-angle rope, in fp32 and in llama.cpp's order:
+/// the correction dims as `n_dims * logf(n_ctx_orig / (n_rot * 2 * pi)) / (2 *
+/// logf(base))` floored and ceiled, and the magnitude scale as the attention
+/// factor `(0.1 ln s + 1) * (1 / (1 + 0.1 ln s))` times `1 + 0.1 ln(1 / freq_scale)`,
+/// every step rounded to fp32 as its own does.
+fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+	let (factor, base, fast, slow) = (factor as f32, base as f32, fast as f32, slow as f32);
+	let correction = |rot: f32| -> Result<f32> {
+		let value = dims as f32 * (context as f32 / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+		require(value.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(value)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f32);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if high == low { high + 0.001 } else { high };
+	let freq_scale = 1.0f32 / factor;
+	let scale = 1.0f32 / freq_scale;
+	let attention = (0.1f32 * scale.ln() + 1.0f32) * (1.0f32 / (1.0f32 + 0.1f32 * scale.ln()));
+	let mscale = attention * (1.0f32 + 0.1f32 * (1.0f32 / freq_scale).ln());
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((f64::from(mscale), f64::from(low), f64::from(high)))
 }
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
@@ -16302,7 +18200,11 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled } = attention;
+	let ordinary_precision = graph.block_precision;
+	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
+	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
+	require(!unscaled || index.is_none(), "unscaled attention and sparse indexing cannot share one block")?;
 	require(heads != 0, "attention head partition is invalid")?;
 	if width == 0 && keys == heads && values == heads && graph.output.channels % heads != 0 {
 		let requested = heads;
@@ -16310,10 +18212,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		heads = valid[0];
 		keys = heads;
 		values = heads;
-		eprintln!(
-			"invalid: attn({requested})  valid: {}  choosing attn({heads})",
-			valid.iter().map(|heads| format!("attn({heads})")).collect::<Vec<_>>().join("|")
-		);
+		trace(&format!("attention requested {requested} heads; valid {} selected {heads}", valid.iter().map(|heads| heads.to_string()).collect::<Vec<_>>().join(",")))?;
 	}
 	require(
 		keys != 0 && keys <= heads && heads % keys == 0,
@@ -16334,11 +18233,14 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let gated = if gate { inner } else { 0 };
 	lower_project(graph, checked_add(pairs, gated, "attention projection width")?)?;
 	if let Some(normalization) = qk {
+		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
 		lower_normalize(graph, normalization, width, checked_mul(width, checked_add(heads, keys, "attention query and key heads")?, "attention query and key span")?)?;
+		graph.block_precision = ordinary_precision;
 	}
 	if let Some((layout, dims, base)) = rope {
+		graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
 		match layout {
@@ -16349,11 +18251,24 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			None => (1.0, 1.0, 0.0, 0.0, 1.0),
 			Some((factor, context, fast, slow)) => {
 				let factor = f64::from_bits(factor);
-				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
-		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, mscale, factor, context, low, high], -2)?;
+		// The seventh argument names the angle: 0 direct, 1 chained. Under the
+		// chain the second argument carries base^(-2/dims) from the host's powf
+		// (llama.cpp's theta_scale) instead of the base, so every backend chains
+		// the same bits.
+		let _ = context;
+		let chain = f64::from(u8::from(graph.profile.chain_angle));
+		let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
+		let parameters = if factors { dims / 2 } else { 0 };
+		push_node(graph, Primitive::Rope, graph.output, parameters, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
+		if factors {
+			let precision = graph.nodes.last().unwrap().precision;
+			require(matches!(precision, Compute::FP32 | Compute::FP64), format!("proportional rope factors require fp32 or fp64, not {}", precision.label()))?;
+		}
+		graph.block_precision = ordinary_precision;
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
@@ -16377,25 +18292,34 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let query_channels = checked_mul(index.heads, index.width, "indexer query width")?;
 		let span = if scored { query_channels } else { graph.output.channels };
 		let parameters = if normalization == BlockNormalization::Rms { if scored { checked_add(query_channels, index.width, "indexer query and key scales")? } else { span } } else { 0 };
+		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		lower_normalize_parameters(graph, normalization, index.width, span, parameters)?;
+		graph.block_precision = ordinary_precision;
 		if dims != 0 {
+			graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 			let (_, _, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
 			let (mscale, factor, context, low, high) = match yarn {
 				None => (1.0, 1.0, 0.0, 0.0, 1.0),
 				Some((factor, context, fast, slow)) => {
 					let factor = f64::from_bits(factor);
-					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 					(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 				}
 			};
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, mscale, factor, context, low, high], -2)?;
+			let _ = context;
+			let chain = f64::from(u8::from(graph.profile.chain_angle));
+			let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
+			graph.block_precision = ordinary_precision;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
 	}
-	let epsilon = graph.epsilon;
-	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
+	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
+	graph.block_precision = ordinary_precision;
+	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
+	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
 	lower_project(graph, input.channels)
 }
@@ -16424,7 +18348,7 @@ fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalizati
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
 fn attention_blocks(node: &Node) -> usize {
-	let block = node.argument[3] as usize;
+	let block = if node.argument[3] > 0.0 { node.argument[3] as usize } else { 0 };
 	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
@@ -16691,6 +18615,9 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 	if body_start < parts.len() {
 		let mut body = Graph::new(Shape { channels: width, length: 1 }, graph.epsilon);
 		body.bias = graph.bias;
+		// The body's blocks name their own precisions or take the run's table,
+		// as the outer blocks do.
+		body.profile = graph.profile;
 		for (index, block) in parts[body_start..].iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
@@ -16700,7 +18627,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		if body.output.channels != width { lower_project(&mut body, width)?; }
 		for node in &mut body.nodes {
 			node.block_kind = "recur_body";
-			require(node.argument[8] == 0.0, "recurrent body quantization is not emitted yet")?;
+			require(node.storage == 0, "recurrent body quantization is not emitted yet")?;
 		}
 		let body_count = body.nodes.len();
 		require(body_count != 0, "a recurrent body has no lowered operation")?;
@@ -16928,7 +18855,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 				fitted: Vec::new(),
 				bound: None,
 			};
-			let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
+			let mut surrogate = compile(&surrogate_model(config.surrogate_width, config.precision), &blank, &blank.targets, 1, gpu, config, false)?;
 			surrogate.frozen.fill(1);
 			(program, surrogate)
 		} else {
@@ -16956,7 +18883,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 				let targets = predict_rows(&fitted, &inputs, input.elements())?;
 				fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
 			} else {
-				let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+				let mut untrained = compile(&surrogate_model(config.surrogate_width, config.precision), &prepared, &prepared.targets, rows, gpu, config, true)?;
 				untrained.frozen.fill(1);
 				untrained
 			};
@@ -17092,6 +19019,8 @@ struct Tile {
 }
 #[derive(Clone)]
 struct NativeSchedule {
+	/// Largest staged type, including derivatives during training.
+	element: Compute,
 	matrix: bool,
 	block: u32,
 	tile: Tile,
@@ -17142,6 +19071,19 @@ enum PrecisionKind {
 	Res,
 }
 impl PrecisionKind {
+	/// The kind a table key names.
+	fn named(name: &str) -> Option<Self> {
+		Some(match name {
+			"sum" => Self::Sum,
+			"embed" => Self::Embed,
+			"attn" => Self::Attn,
+			"rope" => Self::Rope,
+			"atvn" => Self::Atvn,
+			"norm" => Self::Norm,
+			"res" => Self::Res,
+			_ => return None,
+		})
+	}
 	/// The kinds a block's blck suffix names: the op that holds its numbers.
 	fn blck(self) -> bool {
 		matches!(self, Self::Sum | Self::Embed | Self::Attn)
@@ -17152,6 +19094,13 @@ impl PrecisionKind {
 /// overrides its op's entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Precisions {
+	/// Encoding selected for every fp(8) declaration.
+	fp8: Compute,
+	/// Float arithmetic used to train blocks that declare integer checkpoints.
+	train: Option<Compute>,
+	/// Absolute logit tolerance, stored as bits so profiles remain Eq.
+	tolerance: u64,
+	exact_cpu: bool,
 	sum: Compute,
 	embed: Compute,
 	attn: Compute,
@@ -17160,14 +19109,50 @@ pub(crate) struct Precisions {
 	atvn: Compute,
 	norm: Compute,
 	res: Compute,
+	/// The accumulator every block carries unless it names its own: fp32 or fp64.
+	acc: Compute,
+	/// An accumulator for one kind of op, when the table names it under
+	/// `kind-acc`: `norm-acc = "fp64"` gives every norm, the head norms inside
+	/// an attention block too, a wide sum while the sums keep the plain `acc`.
+	kind_acc: [Option<Compute>; 7],
+	/// The inputs that share one step under an int precision unless the block
+	/// names its own: 32 by default.
+	step: u32,
+	/// How a rope reaches its angles: `direct`, each pair's frequency from an
+	/// exponential; or `chain`, llama.cpp's way, the position times the base's
+	/// power one product at a time in the rope's precision, the yarn blend on
+	/// the angle, the magnitude scale on the cosine and sine, and the rotation
+	/// as two fused multiply-adds against the CPU's libm trig.
+	chain_angle: bool,
+	/// How attention takes its softmax: `full`, the scores of every key at
+	/// once; or `online`, llama.cpp's CPU order, one thread per query walking
+	/// the keys in position order with a running maximum, the query and the
+	/// value accumulator in the cache type, the exponentials from the CPU's
+	/// libm, and the key dot in four 16-lane fused accumulators folded by halves.
+	online_softmax: bool,
+	/// Where the transcendental steps of the elementwise programs come from:
+	/// `portable`, recipe's own double-evaluated exp, log, sin, cos and tanh,
+	/// the same bits on every backend; or `libm`, the platform's on the CPU.
+	libm: bool,
+	/// Whether gelu takes llama.cpp's fp16 table form: fp16 in and out between
+	/// -10 and 10, the input itself at 10 and above, zero at -10 and below.
+	gelu_table: bool,
 }
 impl Default for Precisions {
 	fn default() -> Self {
 		let fp16 = Compute::FP16;
-		Self { sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16 }
+		Self { fp8: Compute::FP8, train: None, tolerance: 0.01_f64.to_bits(), exact_cpu: false, sum: fp16, embed: fp16, attn: fp16, rope: fp16, kv: fp16, atvn: fp16, norm: fp16, res: fp16, acc: Compute::FP32, kind_acc: [None; 7], step: 32, chain_angle: false, online_softmax: false, libm: false, gelu_table: false }
 	}
 }
 impl Precisions {
+	fn resolve(&self, precision: Compute) -> Compute {
+		if precision == Compute::FP8 { self.fp8 } else { precision }
+	}
+	/// The accumulator of one kind of op: the kind's own when named, else the
+	/// table's.
+	fn acc_of(&self, kind: PrecisionKind) -> Compute {
+		self.kind_acc[kind as usize].unwrap_or(self.acc)
+	}
 	fn of(&self, kind: PrecisionKind) -> Compute {
 		match kind {
 			PrecisionKind::Sum => self.sum,
@@ -17188,26 +19173,581 @@ impl Precisions {
 			.split(';')
 			.find_map(|profile| profile.split_once(':').filter(|(candidate, _)| *candidate == name).map(|(_, body)| body))
 			.ok_or_else(|| RecipeError::new(format!("--config {name} names no [precision.{name}] table in Cargo.toml; the tables are {names}")))?;
+		Self::parse(&name, table)
+	}
+	fn parse(name: &str, table: &str) -> Result<Self> {
+		// A table names every key: the run takes nothing from a Rust default.
 		let mut precisions = Self::default();
+		let mut named = std::collections::BTreeSet::new();
 		for entry in table.split(',').filter(|entry| !entry.is_empty()) {
 			let (key, value) = entry.split_once('=').ok_or_else(|| RecipeError::new(format!("[precision.{name}] entry {entry} is not key = value")))?;
+			named.insert(key.to_owned());
+			if key == "fp8" {
+				precisions.fp8 = match value.trim().trim_matches('"') {
+					"e4m3" => Compute::FP8,
+					"e5m2" => Compute::FP8_E5M2,
+					other => return Err(RecipeError::new(format!("[precision.{name}] fp8 = {other}: encoding must be e4m3 or e5m2"))),
+				};
+				continue;
+			}
+			if key == "train" {
+				let format = precision_named(value)?;
+				require(matches!(format, Compute::FP16 | Compute::BF16 | Compute::FP32 | Compute::FP64), format!("[precision.{name}] train must be fp16, bf16, fp32, or fp64"))?;
+				precisions.train = Some(format);
+				continue;
+			}
+			if key == "tolerance" {
+				let tolerance = value.parse::<f64>().map_err(|_| RecipeError::new(format!("[precision.{name}] tolerance must be a finite nonnegative number")))?;
+				require(tolerance.is_finite() && tolerance >= 0.0, format!("[precision.{name}] tolerance must be finite and nonnegative"))?;
+				precisions.tolerance = tolerance.to_bits();
+				continue;
+			}
+			if key == "exact-cpu" {
+				precisions.exact_cpu = value.parse::<bool>().map_err(|_| RecipeError::new(format!("[precision.{name}] exact-cpu must be true or false")))?;
+				continue;
+			}
+			if key == "gelu-table" {
+				precisions.gelu_table = match value.trim().trim_matches('"') {
+					"none" => false,
+					"fp16" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] gelu-table = {other}: a gelu table is none or fp16"))),
+				};
+				continue;
+			}
+			if key == "math" {
+				precisions.libm = match value.trim().trim_matches('"') {
+					"portable" => false,
+					"libm" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] math = {other}: the math is portable or libm"))),
+				};
+				continue;
+			}
+			if key == "attn-softmax" {
+				precisions.online_softmax = match value.trim().trim_matches('"') {
+					"full" => false,
+					"online" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] attn-softmax = {other}: an attention softmax is full or online"))),
+				};
+				continue;
+			}
+			if key == "rope-angle" {
+				precisions.chain_angle = match value.trim().trim_matches('"') {
+					"direct" => false,
+					"chain" => true,
+					other => return Err(RecipeError::new(format!("[precision.{name}] rope-angle = {other}: a rope angle is direct or chain"))),
+				};
+				continue;
+			}
+			if key == "step" {
+				let step = value.trim().parse::<u32>().ok().filter(|step| *step != 0 && step % 32 == 0);
+				precisions.step = step.ok_or_else(|| RecipeError::new(format!("[precision.{name}] step = {value}: an int step covers a multiple of 32 inputs")))?;
+				continue;
+			}
 			let compute = precision_named(value).map_err(|error| RecipeError::new(format!("[precision.{name}] {key}: {error}")))?;
+			if let Some(kind) = key.strip_suffix("-acc") {
+				require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] {key} = {value}: an accumulator is fp32 or fp64"))?;
+				let kind = PrecisionKind::named(kind).ok_or_else(|| RecipeError::new(format!("[precision.{name}] {key}: a kind with an accumulator is sum, embed, attn, rope, atvn, norm or res")))?;
+				precisions.kind_acc[kind as usize] = Some(compute);
+				continue;
+			}
 			match key {
 				"sum" => precisions.sum = compute,
 				"embed" => precisions.embed = compute,
 				"attn" => precisions.attn = compute,
 				"rope" => precisions.rope = compute,
-				"kv" => precisions.kv = compute,
+				"kv" => {
+					require(matches!(compute, Compute::FP16 | Compute::FP32 | Compute::BF16), format!("[precision.{name}] kv = {value}: a key-value cache is fp16, fp32 or bf16"))?;
+					precisions.kv = compute
+				}
 				"atvn" => precisions.atvn = compute,
 				"norm" => precisions.norm = compute,
 				"res" => precisions.res = compute,
-				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res"))),
+				"acc" => {
+					require(matches!(compute, Compute::FP32 | Compute::FP64), format!("[precision.{name}] acc = {value}: an accumulator is fp32 or fp64"))?;
+					precisions.acc = compute
+				}
+				other => return Err(RecipeError::new(format!("[precision.{name}] names {other}, which is not a kind of op; the kinds are sum, embed, attn, rope, kv, atvn, norm, res; acc names the accumulator, kind-acc one kind's, step the int step, rope-angle the rope's angle, attn-softmax the attention's order, math the transcendentals' source and gelu-table the gelu's table"))),
 			}
 		}
+		let missing = ["fp8", "tolerance", "exact-cpu", "sum", "embed", "attn", "rope", "kv", "atvn", "norm", "res", "acc", "step", "rope-angle", "attn-softmax", "math", "gelu-table"].iter().filter(|key| !named.contains(**key)).copied().collect::<Vec<_>>();
+		require(missing.is_empty(), format!("[precision.{name}] names no {}; a table names every key, so nothing about a run's numbers comes from a default", missing.join(", ")))?;
 		Ok(precisions)
 	}
 }
-/// A precision by the name a table writes: fp8, fp16, fp32, fp64, bf16, tf32, int8, int4, int1.
+/// A precision by the name a table writes.
+#[cfg(test)]
+mod precision_contract_checks {
+	use super::*;
+	fn gradient_test_gpu() -> &'static Gpu {
+		if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
+			selected_gpu().unwrap()
+		} else {
+			Box::leak(Box::new(cpu_device().unwrap()))
+		}
+	}
+	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize, gated: bool) -> (Vec<f64>, Vec<f64>) {
+		let config = Config::load().unwrap();
+		let channels = width * (heads + 2 + if gated { heads } else { 0 });
+		assert_eq!(inputs.len(), channels * length);
+		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
+		graph.profile = config.profile;
+		graph.profile.attn = format;
+		graph.profile.atvn = Compute::FP32;
+		let args = [heads as f64, 1.0, f64::from(gated), 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
+		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
+		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
+		let targets = vec![0.25; width * heads * length];
+		let mut tape = NativeTape::new(&graph, TapeInput::Values(inputs), inputs, &targets, gpu, Compute::FP32, Some(mse)).unwrap();
+		tape.advance().unwrap();
+		tape.gradient_launch(0.01, config).unwrap();
+		(tape.predictions().unwrap(), tape.input_adjoint.download_float(inputs.len(), Compute::FP32).unwrap())
+	}
+	#[test]
+	fn narrow_sharded_training_preserves_wide_gradients() {
+		let gpu = gradient_test_gpu();
+		let devices: &'static [&'static Gpu] = if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
+			selected_gpus().unwrap()
+		} else { Box::leak(vec![gpu, gpu].into_boxed_slice()) };
+		assert_eq!(devices.len(), 2, "the sharded GPU check requires exactly two selected devices");
+		for format in [Compute::FP16, Compute::BF16] {
+			let mut config = Config::load().unwrap();
+			config.profile.train = Some(format);
+			config.multi_device = MultiDevice::Forced;
+			let samples: Vec<_> = (0..257 * 32).map(|i| 2.0_f64.powi(if i / 32 < 128 { -14 } else { -13 })).collect();
+			let prepared = Prepared::matrix(samples, vec![2.0_f64.powi(-14); 257], 257, 1).unwrap();
+			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
+			let mut graph = compile(&model, &prepared, &prepared.targets, 257, gpu, config, false).unwrap();
+			graph.parameters.fill(2.0_f64.powi(-14));
+			graph.refresh_storage(config).unwrap();
+			let mut single = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
+			single.advance().unwrap();
+			single.gradient_launch(0.01, config).unwrap();
+			let expected = single.download_gradient().unwrap();
+			let mut shards = DeviceTape::new(&graph, &prepared.samples, &prepared.targets, devices, Compute::FP32, mse, config).unwrap();
+			assert_eq!(shards.shards.len(), 2);
+			assert_eq!(shards.placement.gradient_to_primary.bytes, 128);
+			assert_eq!(shards.placement.weights_to_host.bytes, 64);
+			shards.advance().unwrap();
+			shards.epoch(0.01, 0.0, config).unwrap();
+			let actual = shards.shards[0].download_gradient().unwrap();
+			for (got, want) in actual.iter().zip(expected) { assert!((got - want).abs() < want.abs() * 2e-5, "{} sharded gradient {got} vs {want}", format.label()); }
+			assert_eq!(shards.shards[0].weights().unwrap(), shards.shards[1].weights().unwrap());
+		}
+	}
+	#[test]
+	fn narrow_attention_preserves_softmax_and_gate_gradients() {
+		let gpu = gradient_test_gpu();
+		let scale = 2.0_f64.powi(-24);
+		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
+			for heads in [1, 2] {
+				for gated in [false, true] {
+					let mut inputs = vec![0.5; (heads + 2) * 4];
+					inputs[(heads + 1) * 4..].fill(0.0625);
+					if gated { inputs.extend(vec![0.0; heads * 4]); }
+					let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1, gated);
+					let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
+					for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
+					for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
+						let expected = delta * heads as f64 * if gated { 0.5 } else { 1.0 };
+						assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
+					}
+					if gated {
+						for value in &derivative[(heads + 2) * 4..] { assert!((value - delta * 0.0625 * 0.25).abs() < 1e-12, "{} gate gradient {value}", format.label()); }
+					}
+				}
+			}
+			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
+				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
+				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2, false);
+				let d0 = (output[0] - 0.25) * scale;
+				let d1 = (output[1] - 0.25) * scale;
+				let score0 = d1 * 0.5 * (0.25 - 0.375);
+				let score1 = d1 * 0.5 * (0.5 - 0.375);
+				let expected = [0.0, score0 * k0 + score1 * k1, score0 * q, score1 * q, d0 + d1 * 0.5, d1 * 0.5];
+				for (i, (got, want)) in derivative.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} softmax gradient {i}: {got} vs {want}", format.label()); }
+			}
+		}
+	}
+	#[test]
+	fn narrow_recurrence_carries_small_gradients() {
+		let gpu = gradient_test_gpu();
+		let scale = 2.0_f64.powi(-24);
+		for format in [Compute::FP16, Compute::BF16] {
+			for gates in [1, 3, 4] {
+				let config = Config::load().unwrap();
+				let mut graph = Graph::new(Shape { channels: 1, length: 2 }, 1e-5);
+				graph.profile = config.profile;
+				graph.profile.sum = format;
+				lower_scan(&mut graph, 1, gates).unwrap();
+				graph.parameters.fill(0.0);
+				let candidate = if gates == 1 { 0 } else { gates - 1 };
+				graph.parameters[candidate * 3] = 1.0;
+				graph.parameters[candidate * 3 + 1] = 0.5;
+				graph.block_precision = Some(Compute::FP32);
+				lower_scale(&mut graph, scale).unwrap();
+				let mut tape = NativeTape::new(&graph, TapeInput::Values(&[0.0, 0.0]), &[0.0, 0.0], &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
+				tape.advance().unwrap();
+				tape.gradient_launch(0.01, config).unwrap();
+				let d = -0.25 * scale;
+				let factors = match gates { 1 => [1.5, 1.0], 3 => [0.8125, 0.5], _ => [0.40625, 0.25] };
+				let inputs = tape.input_adjoint.download_float(2, Compute::FP32).unwrap();
+				for (got, factor) in inputs.iter().zip(factors) { assert!((got - d * factor).abs() < 1e-12, "{} {gates}-gate input gradient {got} vs {}", format.label(), d * factor); }
+				let gradients = tape.download_gradient().unwrap();
+				let expected_bias = d * factors.iter().sum::<f64>();
+				assert!((gradients[candidate * 3 + 2] - expected_bias).abs() < 1e-12, "{} {gates}-gate bias {} vs {expected_bias}", format.label(), gradients[candidate * 3 + 2]);
+			}
+		}
+	}
+	#[test]
+	fn narrow_delta_rule_carries_small_gradients() {
+		let gpu = gradient_test_gpu();
+		let scale = 2.0_f64.powi(-24);
+		for format in [Compute::FP16, Compute::BF16] {
+			for chunk in [1, 2] {
+				let config = Config::load().unwrap();
+				let shape = Shape { channels: 3, length: 2 };
+				let mut graph = Graph::new(shape, 1e-5);
+				graph.profile = config.profile;
+				graph.profile.sum = format;
+				graph.profile.atvn = format;
+				let gates = constant(&mut graph, -1, Shape { channels: 2, length: 2 }, 0.0).unwrap();
+				reset(&mut graph, -1, shape);
+				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 1, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
+				graph.parameters.fill(0.0);
+				graph.block_precision = Some(Compute::FP32);
+				lower_scale(&mut graph, scale).unwrap();
+				// The existing forward predicts from the prior state before decay:
+				// S_next = a*S + b*k*(v-k*S). With a=b=k=0.5, carry is 0.375.
+				let inputs = [1.0, 1.0, 0.5, 0.5, 0.25, 0.5];
+				let mut tape = NativeTape::new(&graph, TapeInput::Values(&inputs), &inputs, &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
+				tape.advance().unwrap();
+				tape.gradient_launch(0.01, config).unwrap();
+				let predictions = tape.predictions().unwrap();
+				assert!((predictions[0] - 0.0625 * scale).abs() < 1e-12);
+				assert!((predictions[1] - 0.1484375 * scale).abs() < 1e-12);
+				let d0 = (predictions[0] - 0.25) * scale;
+				let d1 = (predictions[1] - 0.25) * scale;
+				let s0 = d0 + 0.375 * d1;
+				let expected = [0.0625 * d0, 0.1484375 * d1, 0.125 * s0, 0.21875 * d1, 0.25 * s0, 0.25 * d1];
+				let adjoints = tape.input_adjoint.download_float(6, Compute::FP32).unwrap();
+				for (i, (got, want)) in adjoints.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} delta input {i}: {got} vs {want}", format.label()); }
+				let gate_values = tape.adjoints.download_float_bytes(tape.program.artifact.layout.adjoints[gates as usize], 4, Compute::FP32).unwrap();
+				for (i, (got, want)) in gate_values.iter().zip([0.0, -0.015625 * d1, 0.03125 * s0, 0.05859375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
+				let softplus = format.unpack(format.pack(2.0_f64.ln()));
+				let expected_decay = -0.03125 * softplus * d1;
+				let decay = tape.download_gradient().unwrap()[0];
+				assert!((decay - expected_decay).abs() < 1e-12, "{} chunk {chunk} decay {decay} vs {expected_decay}", format.label());
+			}
+		}
+	}
+	fn table(name: &str) -> &'static str {
+		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
+	}
+	#[test]
+	fn fp8_selection_and_saved_encoding_are_explicit() {
+		let base = table("recipe");
+		let first = Precisions::parse("recipe", base).unwrap();
+		assert_eq!(first.resolve(fp_format(8)), Compute::FP8);
+		let second = Precisions::parse("e5m2", &base.replace("fp8=e4m3", "fp8=e5m2")).unwrap();
+		assert_eq!(second.resolve(fp_format(8)), Compute::FP8_E5M2);
+		for format in [Compute::FP8, Compute::FP8_E5M2, Compute::INT16, Compute::INT32] {
+			let (family, fields) = format.saved_fields();
+			assert_eq!(Compute::saved(family, fields), Some(format));
+		}
+		assert_eq!(Compute::saved("f", [8, 5, 2, 52]), None);
+		assert_eq!(Compute::saved("int", [1, 0, 0, 0]), None);
+		assert!(Precisions::parse("bad", &base.replace("fp8=e4m3", "fp8=unknown")).is_err());
+		assert!(Precisions::parse("missing", &base.replace("fp8=e4m3,", "")).is_err());
+	}
+	#[test]
+	fn capability_table_drives_routes_and_hard_errors() {
+		let cpu = BackendTarget::Cpu { target: "target=test;compiler=test;cpu=test;features=test".to_owned() };
+		let packed = resolve_capability(&cpu, ContractFormat::Int8).unwrap();
+		assert_eq!(packed.vector, Some("scalar packed dot"));
+		assert!(packed.matrix.is_none());
+		let error = resolve_capability(&cpu, ContractFormat::Fp8).unwrap_err().to_string();
+		assert!(error.contains("no fp8 instruction") && error.contains("Vector:") && error.contains("Matrix: none"));
+		let gfx11 = BackendTarget::Amd { architecture: "gfx1101".to_owned() };
+		let f16 = resolve_capability(&gfx11, ContractFormat::Fp16).unwrap();
+		assert!(matches!(f16.matrix, Some((NativeMatrix::Gfx11, "wmma f16"))));
+		let gfx12 = BackendTarget::Amd { architecture: "gfx1201".to_owned() };
+		assert!(matches!(resolve_capability(&gfx12, ContractFormat::Bf16).unwrap().matrix, Some((NativeMatrix::Gfx12, "wmma bf16"))));
+		let sm52 = BackendTarget::Nvidia { architecture: "sm_52".to_owned() };
+		assert_eq!(resolve_capability(&sm52, ContractFormat::Int8).unwrap().vector, Some("fp32 dot of packed i8 codes"));
+		assert!(resolve_capability(&sm52, ContractFormat::Int4).is_err());
+		let sm61 = BackendTarget::Nvidia { architecture: "sm_61".to_owned() };
+		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
+	}
+	#[test]
+	fn nvidia_dp4a_replaces_portable_helpers() {
+		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
+		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
+		assert!(replaced.contains("call i32 @llvm.nvvm.idp4a.u.s") && replaced.contains("call i32 @llvm.nvvm.idp4a.s.s"));
+		assert!(!replaced.contains("entry: ret i32 0"));
+		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
+		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
+		assert!(!widened.contains("entry: ret i32 0"));
+	}
+	#[test]
+	fn proportional_rope_factors_match_the_analytic_rotation() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let mut graph = Graph::new(Shape { channels: 4, length: 2 }, 1e-5);
+		graph.profile = Config::load().unwrap().profile;
+		graph.block_precision = Some(Compute::FP32);
+		push_node(&mut graph, Primitive::Rope, Shape { channels: 4, length: 2 }, 2, [4.0, 10000.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0, 1.0], -2).unwrap();
+		graph.parameters.copy_from_slice(&[1.0, 2.0]);
+		let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
+		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
+		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
+		assert_eq!(tape.nodes[0].parameters, 2);
+		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false).unwrap();
+		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
+		tape.forward(ForwardMode::Inference).unwrap();
+		let output = tape.predictions().unwrap();
+		let expected = [
+			1.0,
+			2.0 * 1.0_f64.cos() - 6.0 * 1.0_f64.sin(),
+			3.0,
+			4.0 * 0.005_f64.cos() - 8.0 * 0.005_f64.sin(),
+			5.0,
+			6.0 * 1.0_f64.cos() + 2.0 * 1.0_f64.sin(),
+			7.0,
+			8.0 * 0.005_f64.cos() + 4.0 * 0.005_f64.sin(),
+		];
+		for (actual, expected) in output.iter().zip(expected) {
+			assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+		}
+		let mut graph = Graph::new(Shape { channels: 4, length: 5 }, 1e-5);
+		let mut attention = AttentionBlock::new(1);
+		attention.width = 4;
+		attention.window = 4;
+		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
+		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
+	}
+	#[test]
+	fn placement_accepts_both_operands_from_the_immediate_boundary() {
+		let shape = Shape { channels: 1, length: 1 };
+		let mut graph = Graph::new(shape, 1e-5);
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], -2).unwrap();
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
+		assert!(!cuts_connection(&graph, 1));
+		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
+		assert!(cuts_connection(&graph, 2));
+	}
+	#[test]
+	fn sampler_never_selects_suppressed_tokens() {
+		let mut sampler = recipe.sampler().temperature(0.0);
+		sampler.suppressed = vec![1];
+		assert_eq!(sampler.sample(&[0.0, 10.0, 5.0], &[]), 2);
+	}
+	#[test]
+	fn precision_suffix_scope_is_local_and_explicit() {
+		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
+		assert_eq!(projection.blck_precision, Some(Compute::INT4));
+		assert_eq!(projection.activation_precision, Some(Compute::FP16));
+		assert_eq!(projection.norm_precision, Some(Compute::FP32));
+		assert_eq!(projection.precision, None);
+		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
+		assert_eq!(attention.blck_precision, Some(Compute::INT8));
+		assert_eq!(attention.kv_precision, Some(Compute::BF16));
+		assert_eq!(attention.qk_precision, Some(Compute::FP16));
+		assert_eq!(attention.rope_precision, Some(Compute::FP32));
+		assert_eq!(attention.precision, None);
+		let mut graph = Graph::new(Shape { channels: 8, length: 2 }, 1e-5);
+		graph.profile = Config::load().unwrap().profile;
+		graph.block_blck_precision = Some(Compute::FP32);
+		graph.block_qk_precision = attention.qk_precision;
+		graph.block_rope_precision = attention.rope_precision;
+		let mut operation = AttentionBlock::new(2);
+		operation.width = 4;
+		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
+		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
+		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
+		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
+		let model = recipe.model().res([projection.clone()]).fp(64);
+		let residual = model.blocks.last().unwrap();
+		assert_eq!(residual.precision, Some(Compute::FP64));
+		let Operation::Residual(parts) = &residual.operation else { panic!("residual block was not preserved") };
+		assert_eq!(parts[0], projection);
+		let depthwise = recipe.model().dconv(3).fp(32);
+		let depthwise = depthwise.blocks.last().unwrap();
+		assert_eq!(depthwise.precision, Some(Compute::FP32));
+		assert_eq!(depthwise.blck_precision, None);
+		assert!(std::panic::catch_unwind(|| layer(1).int(1)).is_err());
+	}
+	#[test]
+	fn reference_policy_and_training_validation() {
+		let base = table("recipe");
+		assert_eq!(f64::from_bits(Precisions::parse("recipe", base).unwrap().tolerance), 0.05);
+		assert!(Precisions::parse("llamacpp", table("llamacpp")).unwrap().exact_cpu);
+		for invalid in ["NaN", "inf", "-1"] {
+			assert!(Precisions::parse("bad", &base.replace("tolerance=0.05", &format!("tolerance={invalid}"))).is_err());
+		}
+		let mut graph = Graph::new(Shape { channels: 32, length: 1 }, 1e-5);
+		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1, length: 1 }, 32, [0.0; 9], -1).unwrap();
+		graph.nodes[0].int_bits = 16;
+		assert!(graph.training_graph().is_err());
+		graph.profile.train = Some(Compute::FP16);
+		let half_training = graph.training_graph().unwrap();
+		assert_eq!(half_training.nodes[0].precision, Compute::FP16);
+		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false).unwrap();
+		assert_eq!(layout.precisions[0].bytes(), 2);
+		assert_eq!(layout.gradient_precisions[0], Compute::FP32);
+		assert_eq!(layout.gradient_bytes, 32 * 4);
+		assert_eq!(layout.input_adjoint_precision, Compute::FP32);
+		graph.profile.train = Some(Compute::FP64);
+		let training = graph.training_graph().unwrap();
+		assert_eq!(training.nodes[0].precision, Compute::FP64);
+		assert_eq!(training.profile.acc, Compute::FP64);
+		assert_eq!(training.nodes[0].int_bits, 16);
+	}
+	#[test]
+	fn integer_compute_uses_only_canonical_storage() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let config = Config::load().unwrap();
+		let prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
+		for (bits, name, stride) in [(4, "q4_1", 20), (8, "q8_0", 34), (16, "q8_0", 34), (32, "q8_0", 34)] {
+			let model = recipe.model().no(bias).layer(1).int(bits).loss(mse);
+			let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+			let stored = graph.stored[0].as_ref().unwrap();
+			assert!(stored.format == StorageFormat::named(name).unwrap());
+			assert_eq!(stored.bytes.len(), stride);
+			assert!(stored.segments == vec![(stored.format, 32)]);
+		}
+	}
+	#[test]
+	fn quantized_source_converts_once_at_device_load() {
+		let gpu = gradient_test_gpu();
+		let config = Config::load().unwrap();
+		let values: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 8.0).collect();
+		let source_format = StorageFormat::named("q4_0").unwrap();
+		let mut source = source_format.encode(&values, &[1.0; 32], config).unwrap();
+		source.arithmetic.clear();
+		let mut prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
+		prepared.bound = Some(vec![BoundNode { names: "source.weight".to_owned(), elements: 32, weight: BoundWeight::Stored(source) }]);
+		let model = recipe.model().no(bias).layer(1).int(4).loss(mse);
+		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+		let target = graph.stored[0].as_ref().unwrap();
+		assert!(target.format == StorageFormat::named("q4_1").unwrap());
+		assert_eq!(target.bytes.len(), 20);
+		assert!(target.bytes.absent_runs());
+		let source = graph.requantize[0].as_ref().unwrap();
+		assert!(source.format == source_format);
+		assert_eq!(source.bytes.len(), 18);
+		let input: Vec<f64> = (0..32).map(|i| (i as f64 + 1.0) / 64.0).collect();
+		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
+		tape.forward(ForwardMode::Inference).unwrap();
+		let actual = tape.predictions().unwrap()[0];
+		let source_bytes = source.bytes.slice(0, source.bytes.len()).unwrap();
+		let source_values = source.format.decompress(&source_bytes, &source.codebook, 32).unwrap();
+		let canonical = StorageFormat::named("q4_1").unwrap().encode(&source_values, &[1.0; 32], config).unwrap();
+		let bytes = canonical.bytes.slice(0, canonical.bytes.len()).unwrap();
+		let decoded = canonical.format.decompress(&bytes, &canonical.codebook, 32).unwrap();
+		let extreme = *input.iter().max_by(|left, right| left.abs().total_cmp(&right.abs())).unwrap();
+		let inverse = -127.0 / extreme;
+		let step = 1.0 / inverse;
+		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
+		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
+	}
+	#[test]
+	fn narrow_training_preserves_small_and_large_gradients() {
+		let gpu = gradient_test_gpu();
+		for format in [Compute::FP16, Compute::BF16] {
+			for (rows, sample, weight, target, scale) in [(1, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (257, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (1, 256.0, 0.0, 256.0, 1.0), (1, 0.0625, 0.0625, 2.0_f64.powi(-14), 2.0_f64.powi(-14))] {
+				let mut config = Config::load().unwrap();
+				config.profile.train = Some(format);
+				let prepared = Prepared::matrix(vec![sample; rows * 32], vec![target; rows], rows, 1).unwrap();
+				let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
+				let model = if scale == 1.0 { model } else { model.scale(scale).arithmetic(format) };
+				let mut graph = compile(&model, &prepared, &prepared.targets, rows, gpu, config, false).unwrap();
+				graph.parameters.fill(weight);
+				graph.refresh_storage(config).unwrap();
+				let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
+				tape.advance().unwrap();
+				tape.gradient_launch(0.01, config).unwrap();
+				let prediction = tape.predictions().unwrap()[0];
+				assert_eq!(tape.weights().unwrap()[0], weight);
+				let expected = 2.0 * (prediction - target) * scale * sample;
+				let gradients = tape.download_gradient().unwrap();
+				assert_eq!(gradients.len(), 32);
+				for value in gradients { assert!((value - expected).abs() <= expected.abs() * 2e-5, "{} rows {rows}: gradient {value} vs {expected}", format.label()); }
+				let input = tape.input_adjoint.download_float(rows * 32, Compute::FP32).unwrap();
+				let expected_input = 2.0 * (prediction - target) * scale * weight / rows as f64;
+				for value in input { assert!((value - expected_input).abs() <= expected_input.abs() * 2e-5, "{} rows {rows}: input gradient {value} vs {expected_input}", format.label()); }
+			}
+		}
+	}
+	#[test]
+	fn narrow_training_with_double_accumulator_preserves_cast_adjoints() {
+		let gpu = gradient_test_gpu();
+		for tail in [false, true] {
+			let mut config = Config::load().unwrap();
+			config.profile.train = Some(Compute::FP16);
+			config.profile.acc = Compute::FP64;
+			let sample = 2.0_f64.powi(-14);
+			let target = sample;
+			let prepared = Prepared::matrix(vec![sample; 32], vec![target], 1, 1).unwrap();
+			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
+			let scale = if tail { 2.0_f64.powi(-14) } else { 1.0 };
+			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+			if tail {
+				graph.block_precision = Some(Compute::FP32);
+				graph.profile.acc = Compute::FP32;
+				lower_scale(&mut graph, scale).unwrap();
+			}
+			graph.parameters.fill(sample);
+			graph.refresh_storage(config).unwrap();
+			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
+			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
+			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
+			tape.advance().unwrap();
+			tape.gradient_launch(0.01, config).unwrap();
+			let expected = 2.0 * (tape.predictions().unwrap()[0] - target) * scale * sample;
+			for value in tape.download_gradient().unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
+			for value in tape.input_adjoint.download_float(32, Compute::FP64).unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
+		}
+	}
+	#[test]
+	fn narrow_normalization_backward_matches_analytic_derivative() {
+		let gpu = gradient_test_gpu();
+		for format in [Compute::FP16, Compute::BF16] {
+			let mut config = Config::load().unwrap();
+			config.profile.train = Some(format);
+			let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
+			let prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
+			let scale = 2.0_f64.powi(-24);
+			let model = recipe.model().no(bias).layer(32).int(16).norm(rms).arithmetic(format).layer(1).int(16).scale(scale).fp(32).loss(mse);
+			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+			graph.parameters.fill(0.0);
+			for i in 0..32 { graph.parameters[i * 32 + i] = 1.0; }
+			let norm = graph.nodes.iter().position(|node| node.op == Primitive::Normalize).unwrap();
+			let head = graph.nodes.iter().rposition(|node| node.op == Primitive::Contraction).unwrap();
+			let (norm_offset, head_offset) = (graph.nodes[norm].offset, graph.nodes[head].offset);
+			let head_weights: Vec<f64> = (0..32).map(|i| (i as f64 % 3.0 - 1.0) / 16.0).collect();
+			graph.parameters[norm_offset..norm_offset + 32].fill(1.0);
+			graph.parameters[head_offset..head_offset + 32].copy_from_slice(&head_weights);
+			graph.refresh_storage(config).unwrap();
+			let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
+			tape.advance().unwrap();
+			tape.gradient_launch(0.01, config).unwrap();
+			let layout = &tape.program.artifact.layout;
+			let normalized = tape.values.download_float_bytes(layout.values[norm], 32, format).unwrap();
+			let inverse = tape.contexts.download_float_bytes(layout.contexts[norm] + format.bytes(), 1, format).unwrap()[0];
+			let delta = 2.0 * (tape.predictions().unwrap()[0] - 0.25) * scale;
+			let projection = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).sum::<f64>() / 32.0;
+			let inputs = tape.input_adjoint.download_float(32, Compute::FP32).unwrap();
+			let gradients = tape.download_gradient().unwrap();
+			for i in 0..32 {
+				let expected = inverse * (delta * head_weights[i] - normalized[i] * projection);
+				assert!((inputs[i] - expected).abs() < 1e-12, "{} input {i}: {} vs {expected}", format.label(), inputs[i]);
+				let gamma = delta * head_weights[i] * normalized[i];
+				assert!((gradients[norm_offset + i] - gamma).abs() < 1e-12, "{} norm weight {i}: {} vs {gamma}", format.label(), gradients[norm_offset + i]);
+			}
+		}
+	}
+}
+
 fn precision_named(name: &str) -> Result<Compute> {
 	Ok(match name {
 		"fp8" => Compute::FP8,
@@ -17217,21 +19757,22 @@ fn precision_named(name: &str) -> Result<Compute> {
 		"bf16" => Compute::BF16,
 		"tf32" => Compute::TF32,
 		"int8" => Compute::INT8,
+		"int16" => Compute::INT16,
+		"int32" => Compute::INT32,
 		"int4" => Compute::INT4,
-		"int1" => Compute::INT1,
-		other => return Err(RecipeError::new(format!("{other} is not a precision; the precisions are fp8, fp16, fp32, fp64, bf16, tf32, int8, int4, int1"))),
+		other => return Err(RecipeError::new(format!("{other} is not a precision; the precisions are fp8, fp16, fp32, fp64, bf16, tf32, int32, int16, int8 and int4"))),
 	})
 }
 /// The kind of op a node is, for the table's precision of it.
 fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 	match op {
 		Primitive::Elementwise if block_kind == "residual" => PrecisionKind::Res,
-		Primitive::Elementwise | Primitive::Expand | Primitive::Read | Primitive::Last | Primitive::Fold | Primitive::TopK => PrecisionKind::Atvn,
 		Primitive::Normalize => PrecisionKind::Norm,
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		_ => PrecisionKind::Sum,
+		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		_ => PrecisionKind::Atvn,
 	}
 }
 #[derive(Clone, Copy)]
@@ -17277,11 +19818,10 @@ struct Config {
 	precision: Compute,
 	/// The precision of every kind of op a block names none for.
 	profile: Precisions,
-	/// The storage format for blocks that name none, 0 for unquantized.
-	quantization: u16,
 }
 impl Config {
 	fn load() -> Result<Self> {
+		let profile = Precisions::load()?;
 		Ok(Self {
 			multi_device: match env!("RECIPE_MULTI_DEVICE") {
 				"false" => MultiDevice::Local,
@@ -17334,9 +19874,8 @@ impl Config {
 				number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?,
 				number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?,
 			],
-			precision: Precisions::load()?.sum,
-			profile: Precisions::load()?,
-			quantization: 0,
+			precision: if matches!(profile.sum, Compute::Int(_)) { profile.acc } else { profile.resolve(profile.sum) },
+			profile,
 		})
 	}
 }
@@ -17392,6 +19931,7 @@ struct HostLookup {
 	length: usize,
 }
 struct NativeTape {
+	profile: Precisions,
 	program: NativeProgram,
 	precision: NativePrecision,
 	values: Buffer,
@@ -17418,11 +19958,16 @@ struct NativeTape {
 	input: Shape,
 	output: Shape,
 	nodes: Vec<Node>,
+	storage: Vec<String>,
 	capacity: usize,
 	positions: u32,
 	vocabulary: f64,
+	compile_seconds: f64,
+	load_seconds: f64,
+	last_device_seconds: AtomicU64,
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
+	window_begin: std::sync::atomic::AtomicU32,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -17438,6 +19983,39 @@ enum EpochOperation {
 	Full,
 	Gradient,
 	Optimizer,
+	Metrics,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EpochMetrics {
+	loss: f64,
+	target_sum: f64,
+	target_square: f64,
+	residual_square: f64,
+	prediction_sum: f64,
+	r2: f64,
+	count: usize,
+	device_seconds: f64,
+}
+impl EpochMetrics {
+	const VALUES: usize = 6;
+	fn read(values: &[f64], count: usize, device_seconds: f64) -> Self {
+		Self { loss: values[0], target_sum: values[1], target_square: values[2], residual_square: values[3], r2: values[4], prediction_sum: values[5], count, device_seconds }
+	}
+	fn predicted_mean(self) -> f64 { self.prediction_sum / self.count as f64 }
+	fn combine(parts: impl IntoIterator<Item = (Self, f64)>, root_loss: bool) -> Self {
+		let parts = parts.into_iter().collect::<Vec<_>>();
+		let target_sum = parts.iter().map(|(part, _)| part.target_sum).sum();
+		let target_square = parts.iter().map(|(part, _)| part.target_square).sum();
+		let residual_square = parts.iter().map(|(part, _)| part.residual_square).sum();
+		let prediction_sum = parts.iter().map(|(part, _)| part.prediction_sum).sum();
+		let count: usize = parts.iter().map(|(part, _)| part.count).sum();
+		let loss = if root_loss { parts.iter().map(|(part, share)| share * part.loss * part.loss).sum::<f64>().sqrt() } else { parts.iter().map(|(part, share)| share * part.loss).sum() };
+		let total = target_square - target_sum * target_sum / count.max(1) as f64;
+		let r2 = if total == 0.0 { 0.0 } else { 1.0 - residual_square / total };
+		let device_seconds = parts.iter().map(|(part, _)| part.device_seconds).fold(0.0, f64::max);
+		Self { loss, target_sum, target_square, residual_square, prediction_sum, r2, count, device_seconds }
+	}
 }
 
 impl EpochOperation {
@@ -17494,10 +20072,80 @@ fn native_context_regions(graph: &Graph, layout: &NativeLayout, weights: &Buffer
 	Ok(regions)
 }
 impl NativeTape {
+	fn llvm_report(&self) -> LlvmReport {
+		LlvmReport {
+			instructions: NameList::new(self.program.artifact.llvm.instructions.clone()),
+			intrinsics: NameList::new(self.program.artifact.llvm.intrinsics.clone()),
+		}
+	}
+	fn format_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		let mut lines = Vec::new();
+		let mut seen = std::collections::BTreeSet::new();
+		for (index, node) in self.nodes.iter().enumerate() {
+			let storage = &self.storage[index];
+			let operand = if node.int_bits == 32 { "fp32".to_owned() } else if node.int_bits != 0 { format!("int{}", node.int_bits) } else { node.precision.label() };
+			let item = format!("{} {} storage {storage} operand {operand} accumulator {} result {}", node.block_kind, node.primitive_name(), node.acc.label(), node.precision.label());
+			if seen.insert(item.clone()) { lines.push(format!("{device}  format: {item}")); }
+		}
+		Ok(lines)
+	}
+	fn memory_line(&self) -> Result<String> {
+		Ok(format!(
+			"{}  memory: input {} bytes weights {} bytes values {} bytes contexts {} bytes adjoints {} bytes gradients {} bytes optimizer {} bytes load-scratch {} bytes",
+			self.device_label()?,
+			self.samples.bytes,
+			self.weights.bytes,
+			self.values.bytes,
+			self.contexts.bytes,
+			self.adjoints.bytes,
+			self.gradient.bytes,
+			self.moments.bytes + self.variances.bytes,
+			self.program.artifact.storage.bytes
+		))
+	}
+	fn tile_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		Ok(self
+			.program
+			.schedule
+			.contractions
+			.iter()
+			.enumerate()
+			.filter_map(|(index, tiles)| tiles.map(|tiles| if self.program.epoch.is_some() {
+				format!("{device}  tile: {} fwd {}x{}x{} wgd {}x{}x{} igd {}x{}x{}", self.nodes[index].identity(index), tiles.forward.m, tiles.forward.n, tiles.forward.k, tiles.gradient.m, tiles.gradient.n, tiles.gradient.k, tiles.previous.m, tiles.previous.n, tiles.previous.k)
+			} else {
+				format!("{device}  tile: {} pp {}x{}x{}", self.nodes[index].identity(index), tiles.forward.m, tiles.forward.n, tiles.forward.k)
+			}))
+			.collect())
+	}
+	fn grid_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		let mut lines = Vec::new();
+		let forward = self.program.forward.geometry;
+		if let Some(epoch) = self.program.epoch {
+			lines.push(format!("{device}  grid: forward {}x1x1 workgroup {}x1x1", forward.groups, forward.block));
+			lines.push(format!("{device}  grid: epoch {}x1x1 workgroup {}x1x1", epoch.geometry.groups, epoch.geometry.block));
+		} else {
+			lines.push(format!("{device}  grid: pp {}x1x1 workgroup {}x1x1", forward.groups, forward.block));
+			if let Some(tg) = self.program.step_geometry() {
+				lines.push(format!("{device}  grid: tg {}x1x1 workgroup {}x1x1", tg.groups, tg.block));
+			}
+		}
+		if let Some(load) = self.program.model_load { lines.push(format!("{device}  grid: load {}x1x1 workgroup {}x1x1", load.geometry.groups, load.geometry.block)); }
+		Ok(lines)
+	}
 	/// `tokens` are the model's ids, one per position of every row, which the
 	/// lookups of this graph gather rows for; a whole graph reads its own
 	/// samples, and a part of a split graph reads the ids its stream came from.
 	fn new(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+		let prepare_started = Instant::now();
+		let training_graph;
+		let graph = if loss.is_some() {
+			training_graph = graph.training_graph()?;
+			training_graph.as_ref()
+		} else { graph };
+		let precision = if loss.is_some() && graph.profile.train == Some(Compute::FP64) && graph.nodes.iter().any(|node| node.int_bits != 0) { Compute::FP64 } else { precision };
 		let input = graph.input.elements();
 		require(input != 0 && samples.len() != 0 && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} {}, received {}", samples.label(), samples.len()))?;
 		let rows = samples.len() / input;
@@ -17505,6 +20153,23 @@ impl NativeTape {
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let inference = loss.is_none();
 		let program = gpu.native_program(graph, rows, precision, loss)?;
+		let mut resolutions = std::collections::BTreeSet::new();
+		for node in &graph.nodes {
+			let format = ContractFormat::of(node.precision, node.int_bits)?;
+			let capability = resolve_capability(&gpu.native_target, format)?;
+			let native = NativePrecision::new(node.precision, node.acc)?;
+			let route = if node.op == Primitive::Contraction && program.schedule.matrix && matrix_capable(native) {
+				capability.matrix.map(|(_, name)| name).or(capability.vector).unwrap_or("none")
+			} else { capability.vector.or(capability.matrix.map(|(_, name)| name)).unwrap_or("none") };
+			let storage = if node.int_bits == 4 { "q4_1" } else if node.int_bits != 0 { "q8_0" } else { "file" };
+			let detail = if node.int_bits != 0 && inference {
+				format!("; {storage} weights, {} activations", if node.int_bits == 32 { "unchanged fp32".to_owned() } else { format!("int{}", node.int_bits) })
+			} else if node.int_bits != 0 {
+				format!("; {} training, {} gradients, {} optimizer, {storage} checkpoint", node.precision.label(), native.state.label(), NativePrecision::new(precision, graph.profile.acc)?.state.label())
+			} else { String::new() };
+			let line = format!("{} {} -> {route}{detail}", node.block_kind, format.name());
+			if resolutions.insert(line.clone()) { trace(&format!("route {line}"))?; }
+		}
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
 		// Only the epoch entrypoint reads the optimizer state, the gradient and
 		// the adjoints, so an inference tape holds none of them on the device.
@@ -17527,7 +20192,7 @@ impl NativeTape {
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let adjoints_bytes = if training { layout.adjoints_bytes.max(1) } else { 1 };
-		let input_adjoint_bytes = if training { checked_mul(samples.len(), layout.input_precision.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
+		let input_adjoint_bytes = if training { checked_mul(samples.len(), layout.input_adjoint_precision.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
 		// A graph that starts with a gather reads its input as i32 token ids.
 		let vocabulary = graph.nodes.first().filter(|node| node.op == Primitive::Gather).map_or(0.0, |node| node.argument[0]);
 		let token_count = tokens.len();
@@ -17574,7 +20239,8 @@ impl NativeTape {
 					// The host reference is the file's own bytes: the requantize source when there is one.
 					let reference = graph.requantize.get(*node).and_then(Option::as_ref).unwrap_or(weight);
 					let host = reference.segments.first().and_then(|(span, _)| span.spec().map(|first| (span, first))).map(|(span, first)| stored_first_values(reference, *span, first.stride, first.block)).transpose()?.unwrap_or_default();
-					trace(&format!("load node {node} {} wrote {written:?} host {host:?}", quantization(weight.format.0)))?;
+					let raw = weights.download_range::<u8>(offsets[*node], 16)?;
+					trace(&format!("load node {node} {} wrote {written:?} machine {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
 		} else {
@@ -17582,8 +20248,12 @@ impl NativeTape {
 		}
 		// The arenas are cleared on the device rather than staged whole on the
 		// host: a later position reads the zeros the earlier windows left.
-		let values = Buffer::zeroed(gpu, layout.values_bytes)?;
-		let contexts = Buffer::zeroed(gpu, layout.contexts_bytes)?;
+		// RECIPE_ARENA_GUARD=bytes pads every arena on both sides by that many
+		// zeroed bytes: a kernel that writes past its region then lands in the
+		// guard, not the next arena.
+		let guard = std::env::var("RECIPE_ARENA_GUARD").ok().and_then(|text| text.parse::<usize>().ok()).unwrap_or(0);
+		let values = Buffer::zeroed_guarded(gpu, layout.values_bytes, guard)?;
+		let contexts = Buffer::zeroed_guarded(gpu, layout.contexts_bytes, guard)?;
 		// The packed embedding table is the gather's context, so it reaches the
 		// device whole once and the kernel then reads only the rows it addresses.
 		// A lookup's table never leaves the host: the tape keeps it with its hash
@@ -17606,22 +20276,7 @@ impl NativeTape {
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
 			}
 		}
-		// A new sequence clears every mutable context span. Packed embedding
-		// tables and saved evaluation statistics remain unchanged.
-		let mut context_resets = Vec::<(usize, usize)>::new();
-		for (index, node) in graph.nodes.iter().enumerate() {
-			let persistent = node.op == Primitive::Gather || (node.op == Primitive::Normalize && normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Evaluation);
-			if persistent {
-				continue;
-			}
-			let start = layout.contexts[index];
-			let end = layout.contexts.get(index + 1).copied().unwrap_or_else(|| layout.schedule.iter().copied().filter(|offset| *offset != usize::MAX).min().unwrap_or(layout.contexts_bytes));
-			if let Some((_, prior_end)) = context_resets.last_mut().filter(|(_, prior_end)| *prior_end == start) {
-				*prior_end = end;
-			} else {
-				context_resets.push((start, end));
-			}
-		}
+		let context_resets = layout.context_resets.clone();
 		for (offset, region) in native_context_regions(graph, &layout, &weights, precision.model)? {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
 			contexts.write_bytes(offset, &region)?;
@@ -17635,7 +20290,20 @@ impl NativeTape {
 			weights.bytes
 		))?;
 		write_contraction_schedule(&contexts, &layout, &program.schedule.contractions)?;
+		let compile_seconds = program.artifact.compile_seconds;
+		let load_seconds = (prepare_started.elapsed().as_secs_f64() - compile_seconds).max(0.0);
+		let storage = graph.nodes.iter().enumerate().map(|(index, node)| {
+			if node.weights() == 0 { return "none".to_owned(); }
+			let Some(weight) = graph.stored.get(index).and_then(Option::as_ref).filter(|_| node.packed || node.table()) else { return node.precision.label(); };
+			let mut formats = Vec::new();
+			for (format, _) in weight.format_segments() {
+				let format = if format.0 == 0 { node.precision.label() } else { quantization(format.0) };
+				if !formats.contains(&format) { formats.push(format); }
+			}
+			formats.join("+")
+		}).collect();
 		let tape = Self {
+			profile: graph.profile,
 			program,
 			precision,
 			values,
@@ -17653,7 +20321,7 @@ impl NativeTape {
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
-			metrics: Buffer::upload_float(gpu, &[0.0], NativePrecision::new(layout.output_precision)?.state)?,
+			metrics: Buffer::zeroed(gpu, EpochMetrics::VALUES * layout.output_adjoint_precision.bytes())?,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -17661,10 +20329,15 @@ impl NativeTape {
 			input: graph.input,
 			output: graph.output,
 			nodes: graph.nodes.clone(),
+			storage,
 			capacity: rows,
 			positions: narrow(positions, "native input positions")? as u32,
 			vocabulary,
+			compile_seconds,
+			load_seconds,
+			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
 			reached: std::sync::atomic::AtomicU32::new(0),
+			window_begin: std::sync::atomic::AtomicU32::new(0),
 		};
 		tape.stage_lookups(0, tape.positions)?;
 		Ok(tape)
@@ -17778,8 +20451,24 @@ impl NativeTape {
 		self.forward_window_with_samples(self.samples.pointer, begin, end, mode)
 	}
 	fn forward_window_with_samples(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode) -> Result<()> {
+		self.forward_window_observed(samples, begin, end, mode, &mut |_, _| {})
+	}
+	fn forward_window_observed(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64)) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		let capacity = self.program.artifact.layout.window_positions as u32;
+		if end - begin > capacity {
+			let (mut cursor, mut seconds) = (begin, 0.0);
+			while cursor < end {
+				let stop = cursor.saturating_add(capacity).min(end);
+				self.forward_window_observed(samples, cursor, stop, mode, observed)?;
+				seconds += f64::from_bits(self.last_device_seconds.load(Ordering::Acquire));
+				cursor = stop;
+			}
+			self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+			return Ok(());
+		}
 		self.reached.store(end, Ordering::Relaxed);
+		self.window_begin.store(begin, Ordering::Relaxed);
 		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
@@ -17787,39 +20476,67 @@ impl NativeTape {
 		let single = matches!(mode, ForwardMode::Inference) && end - begin == 1;
 		#[cfg(amd)]
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
+		#[cfg(nvidia)]
+		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
+		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.program.gpu.synchronize()?;
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
+		observed(end, seconds);
+		if let Some(clocks) = self.program.artifact.layout.clocks {
+			let count = self.program.artifact.layout.precisions.len();
+			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+			let mut line = format!("clocks window {begin}..{end} {unit}");
+			for index in 1..count {
+				line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+			}
+			trace(&line)?;
+		}
 		Ok(())
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
 	/// holdout does not compile a second artifact or read stale rows.
-	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], targets: &[f64], first: usize, loss: LossFunction, config: Config) -> Result<(Vec<f64>, EpochMetrics)> {
 		let input = graph.input.elements();
+		let output = graph.output.elements();
 		require(input != 0 && samples.len() % input == 0, format!("evaluation samples must be a multiple of {input} values"))?;
 		let rows = samples.len() / input;
+		require(targets.len() == rows * output, format!("evaluation targets must hold {rows} rows of {output} values"))?;
 		require(first <= rows, format!("evaluation start row {first} exceeds {rows} rows"))?;
 		let saved_rows = self.rows;
 		let result = (|| {
 			self.upload_weights(&graph.parameters)?;
 			let evaluation_count = checked_mul(self.capacity, input, "native evaluation sample allocation")?;
+			let target_count = checked_mul(self.capacity, output, "native evaluation target allocation")?;
 			let evaluation_samples = Buffer::upload_float(self.program.gpu, &vec![0.0; evaluation_count], self.program.artifact.layout.input_precision)?;
+			let evaluation_targets = Buffer::upload_float(self.program.gpu, &vec![0.0; target_count], self.program.artifact.layout.output_precision)?;
 			let mut predictions = Vec::new();
+			let mut measured = Vec::new();
 			let mut row = first;
 			while row < rows {
 				let end = row.checked_add(self.capacity).map_or(rows, |end| end.min(rows));
 				self.rows = narrow(end - row, "native evaluation rows")? as u32;
 				evaluation_samples.write_float_bytes(0, &samples[row * input..end * input], self.program.artifact.layout.input_precision)?;
+				evaluation_targets.write_float_bytes(0, &targets[row * output..end * output], self.program.artifact.layout.output_precision)?;
 				self.values.clear()?;
 				for &(start, stop) in &self.context_resets {
 					self.contexts.clear_range(start, stop - start)?;
 				}
-				self.forward_window_with_samples(evaluation_samples.pointer, 0, self.positions, ForwardMode::Inference)?;
+				measured.push(self.metric_launch_with(evaluation_samples.pointer, evaluation_targets.pointer, config)?);
 				predictions.extend(self.predictions()?);
 				row = end;
 			}
-			Ok(predictions)
+			let count = measured.iter().map(|part| part.count).sum::<usize>().max(1);
+			let seconds = measured.iter().map(|part| part.device_seconds).sum();
+			let mut metrics = EpochMetrics::combine(measured.into_iter().map(|part| { let share = part.count as f64 / count as f64; (part, share) }), loss.0 == 1);
+			metrics.device_seconds = seconds;
+			Ok((predictions, metrics))
 		})();
 		self.rows = saved_rows;
 		result
@@ -17932,17 +20649,69 @@ impl NativeTape {
 			let reached = self.reached.load(Ordering::Relaxed) as usize;
 			// The first two blocks and the model's last nodes: enough to place a
 			// divergence, without reading every arena of a deep model.
+			// RECIPE_TRACE_NODES=a..b names another range of nodes instead.
 			let total = layout.values.len();
-			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| *index < 40 || *index + 4 >= total) {
-				let shape = self.nodes[index].output;
+			// RECIPE_TRACE_DUMP=a..b also prints nodes whose slots stay reusable: what
+			// a slot holds after the forward, not what the node wrote.
+			let extra = std::env::var("RECIPE_TRACE_DUMP").ok().and_then(|text| { let (from, to) = text.split_once("..")?; Some((from.trim().parse::<usize>().ok()?, to.trim().parse::<usize>().ok()?)) });
+			for (index, (slot, precision)) in layout.values.iter().zip(&layout.precisions).enumerate().filter(|(index, _)| traced_node(*index, total) || extra.is_some_and(|(from, to)| (from..to).contains(index))) {
+				let shape = window_shape(self.nodes[index].output, self.input.length, layout.window_positions);
 				let (channels, length) = (shape.channels, shape.length);
-				let positions = reached.clamp(1, length.max(1));
-				let region = self.values.download_float_bytes(*slot, channels * length, *precision)?;
-				let at = |channel: usize, position: usize| region.get(channel * length + position).copied().unwrap_or(f64::NAN);
-				let first = (0..3.min(channels)).map(|channel| at(channel, 0)).collect::<Vec<_>>();
-				let last = (channels.saturating_sub(3)..channels).map(|channel| at(channel, positions - 1)).collect::<Vec<_>>();
-				let sum = (0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| at(channel, position)).sum::<f64>();
-				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?} sum {sum}", self.nodes[index].identity(index)))?;
+				let positions = if layout.window_positions < self.input.length { reached.saturating_sub(self.window_begin.load(Ordering::Relaxed) as usize) } else { reached }.clamp(1, length.max(1));
+				// The arena is channel-major over the whole context, so the bytes up
+				// to the last reached position of the last channel come back raw and
+				// only the reached positions are unpacked.
+				let bytes = precision.bytes();
+				let needed = checked_mul(channels.saturating_sub(1) * length + positions, bytes, "traced node bytes")?;
+				// A wide arena over a long context is read whole only up to 64 MB;
+				// past that the head and the tail come back on their own and the sum
+				// is left out, so a traced deep model still answers inside a cap.
+				let whole = needed <= 64 << 20;
+				let region = if whole { self.values.download_range::<u8>(*slot, needed)? } else { Vec::new() };
+				let one = |channel: usize, position: usize| -> Result<f64> {
+					let start = (channel * length + position) * bytes;
+					let chunk = if whole { region.get(start..start + bytes).map(<[u8]>::to_vec) } else { Some(self.values.download_range::<u8>(*slot + start, bytes)?) };
+					Ok(chunk.map_or(f64::NAN, |chunk| {
+						let mut bits = [0_u8; 8];
+						bits[..bytes].copy_from_slice(&chunk);
+						precision.unpack(u64::from_le_bytes(bits))
+					}))
+				};
+				let first = (0..3.min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
+				let last = (channels.saturating_sub(3)..channels).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
+				// RECIPE_TRACE_CHANNELS=4096,5120 also prints three values from each
+				// named channel at the first and the last position: a joined
+				// projection's later heads against a reference that dumps them apart.
+				let mut at = String::new();
+				for start in std::env::var("RECIPE_TRACE_CHANNELS").ok().into_iter().flat_map(|list| list.split(',').filter_map(|text| text.trim().parse::<usize>().ok()).collect::<Vec<_>>()) {
+					if start < channels {
+						let values = (start..(start + 3).min(channels)).map(|channel| one(channel, 0)).collect::<Result<Vec<_>>>()?;
+						let ending = (start..(start + 3).min(channels)).map(|channel| one(channel, positions - 1)).collect::<Result<Vec<_>>>()?;
+						at.push_str(&format!(" at {start} {values:?} ending {ending:?}"));
+						// RECIPE_TRACE_ROW=p prints every channel at position p, once per node;
+						// RECIPE_TRACE_ROW=all prints every reached position.
+						if start == 0 {
+							if let Ok(text) = std::env::var("RECIPE_TRACE_ROW") {
+								let rows = if text == "all" { (0..positions).collect::<Vec<_>>() } else { text.parse::<usize>().ok().filter(|position| *position < positions).into_iter().collect() };
+								for position in rows {
+									let row = (0..channels).map(|channel| one(channel, position)).collect::<Result<Vec<_>>>()?;
+									at.push_str(&format!(" row {position} {row:?}"));
+								}
+							}
+						}
+						// RECIPE_TRACE_POSITIONS=1 also prints the three values at every position.
+						if std::env::var("RECIPE_TRACE_POSITIONS").is_ok() {
+							let rows = (0..positions).map(|position| (start..(start + 3).min(channels)).map(|channel| one(channel, position)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+							at.push_str(&format!(" positions {rows:?}"));
+						}
+					}
+				}
+				let sum = if whole {
+					(0..channels).flat_map(|channel| (0..positions).map(move |position| (channel, position))).map(|(channel, position)| one(channel, position)).sum::<Result<f64>>()?.to_string()
+				} else {
+					"-".to_owned()
+				};
+				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
@@ -17954,7 +20723,10 @@ impl NativeTape {
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
-		require(self.step != 0, "optimizer epoch is absent")?;
+		self.epoch_launch_with(rate, config, operation, self.samples.pointer, self.targets.pointer)
+	}
+	fn epoch_launch_with(&mut self, rate: f64, config: Config, operation: EpochOperation, samples: u64, targets: u64) -> Result<()> {
+		require(self.step != 0 || matches!(operation, EpochOperation::Metrics), "optimizer epoch is absent")?;
 		let threads = self.program.dispatch(NativeEntry::Epoch)?.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
@@ -17968,8 +20740,8 @@ impl NativeTape {
 		let run_gradient = u32::from(operation.gradient());
 		let run_optimizer = u32::from(operation.optimizer());
 		let mut call = ptrs![
-			self.samples.pointer,
-			self.targets.pointer,
+			samples,
+			targets,
 			self.weights.pointer,
 			self.frozen.pointer,
 			self.moments.pointer,
@@ -17993,14 +20765,30 @@ impl NativeTape {
 			run_optimizer
 		];
 		trace(&format!("epoch {} {operation:?} launch", self.step))?;
+		let machine_started = Instant::now();
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
+		self.program.gpu.synchronize()?;
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
 	}
-	fn objective(&self) -> Result<f64> {
-		let objective = self.metrics.download_float(1, NativePrecision::new(self.program.artifact.layout.output_precision)?.state)?[0];
+	fn epoch_metrics(&self) -> Result<EpochMetrics> {
+		let values = self.metrics.download_float(EpochMetrics::VALUES, self.program.artifact.layout.output_adjoint_precision)?;
 		trace(&format!("epoch {} metric complete", self.step))?;
-		Ok(objective)
+		Ok(EpochMetrics::read(&values, self.rows as usize * self.output.elements(), f64::from_bits(self.last_device_seconds.load(Ordering::Acquire))))
+	}
+	fn metric_launch(&mut self, config: Config) -> Result<EpochMetrics> {
+		self.epoch_launch(0.0, config, EpochOperation::Metrics)?;
+		self.epoch_metrics()
+	}
+	fn metric_launch_with(&mut self, samples: u64, targets: u64, config: Config) -> Result<EpochMetrics> {
+		self.epoch_launch_with(0.0, config, EpochOperation::Metrics, samples, targets)?;
+		self.epoch_metrics()
+	}
+	fn objective(&self) -> Result<f64> {
+		Ok(self.epoch_metrics()?.loss)
 	}
 	fn full_epoch(&mut self, rate: f64, config: Config) -> Result<f64> {
 		self.epoch_launch(rate, config, EpochOperation::Full)?;
@@ -18034,18 +20822,22 @@ impl NativeTape {
 		}
 		Ok(values)
 	}
+	fn gradient_segments(&self) -> Vec<(usize, usize, Compute)> {
+		let layout = &self.program.artifact.layout;
+		layout.gradients.iter().zip(&layout.spans).zip(&layout.gradient_precisions).filter(|((_, (_, count)), _)| *count != 0).map(|((offset, (_, count)), precision)| (*offset, *count, *precision)).collect()
+	}
 	/// The reduced full-shard parameter gradient the last epoch dispatch left
 	/// on the device.
 	fn download_gradient(&self) -> Result<Vec<f64>> {
 		let mut values = Vec::with_capacity(self.parameters);
-		for (offset, count, precision) in self.weight_segments() {
+		for (offset, count, precision) in self.gradient_segments() {
 			values.extend(self.gradient.download_float_bytes(offset, count, precision)?);
 		}
 		Ok(values)
 	}
 	fn upload_gradient(&self, gradient: &[f64]) -> Result<()> {
 		let mut at = 0;
-		for (offset, count, precision) in self.weight_segments() {
+		for (offset, count, precision) in self.gradient_segments() {
 			let span = gradient.get(at..at + count).ok_or_else(|| RecipeError::new("gradient upload is shorter than the parameters"))?;
 			self.gradient.write_float_bytes(offset, span, precision)?;
 			at += count;
@@ -18134,13 +20926,8 @@ struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
 }
-impl TransferCost {
-	fn seconds(self, bytes: usize) -> f64 {
-		self.latency.as_secs_f64() + bytes as f64 / self.bandwidth
-	}
-}
 /// The measured behavior of one device: the two transfer directions between it and the coordinating
-/// host, the gradient work it retires each second, and the fixed cost of one dispatch on it.
+/// machine, the gradient work it retires each second, and the fixed cost of one dispatch on it.
 #[derive(Clone, Copy)]
 struct Link {
 	to_host: TransferCost,
@@ -18188,11 +20975,6 @@ struct Transfer {
 	to: usize,
 	bytes: usize,
 	cost: TransferCost,
-}
-impl Transfer {
-	fn seconds(self) -> f64 {
-		self.cost.seconds(self.bytes)
-	}
 }
 /// The route one training run takes: the row share of every shard, the movement its fused epoch performs, and the
 /// complete epoch predicted for it from computation, transfers, synchronization, and persistent-state movement.
@@ -18261,7 +21043,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		fitted: Vec::new(),
 		bound: None,
 	};
-	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
+	let graph = compile(&surrogate_model(config.surrogate_width, config.precision), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?;
@@ -18315,17 +21097,18 @@ fn route_counts(route: &[usize], links: &[Link], rows: usize, policy: MultiDevic
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
-fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
+fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: (usize, usize), loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
 	let counts = route_counts(route, links, rows, policy)?;
+	let (gradient_bytes, weight_bytes) = bytes;
 	let (gradient_to_host, weights_from_host) = (
-		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
-		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
+		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes: gradient_bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
+		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes: weight_bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
 	);
 	let placement = Placement {
 		shares: counts.iter().map(|count| *count as f64 / rows as f64).collect(),
 		gradient_to_host,
-		gradient_to_primary: Transfer { from: 0, to: 1, bytes, cost: links[route[0]].from_host },
-		weights_to_host: Transfer { from: 1, to: 0, bytes, cost: links[route[0]].to_host },
+		gradient_to_primary: Transfer { from: 0, to: 1, bytes: gradient_bytes, cost: links[route[0]].from_host },
+		weights_to_host: Transfer { from: 1, to: 0, bytes: weight_bytes, cost: links[route[0]].to_host },
 		weights_from_host,
 		loss,
 		predicted: [0.0; 4],
@@ -18345,21 +21128,28 @@ fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes
 /// complete epoch of every valid candidate route from the established workload,
 /// the storage plan, and measured device behavior, then takes the lowest. No
 /// policy allocates or dispatches the model being placed to decide.
-fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
-	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
-	for (gpu, link) in gpus.iter().zip(links) {
-		eprintln!(
-			"measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}",
-			device_label(gpu)?,
-			link.work,
-			link.overhead,
-			link.to_host.bandwidth / 1e6,
-			link.to_host.latency,
-			link.from_host.bandwidth / 1e6,
-			link.from_host.latency
-		);
+fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
+	let bytes = graph.nodes.iter().try_fold((0, 0), |(gradients, weights), node| {
+		let state = NativePrecision::new(node.precision, node.acc)?.state;
+		Ok::<_, RecipeError>((checked_add(gradients, checked_mul(node.parameters, state.bytes(), "gradient transfer")?, "gradient transfers")?, checked_add(weights, checked_mul(node.parameters, node.precision.bytes(), "weight transfer")?, "weight transfers")?))
+	})?;
+	if gpus.len() == 1 {
+		let zero = TransferCost { latency: Duration::ZERO, bandwidth: f64::INFINITY };
+		return Ok((
+			vec![0],
+			vec![rows],
+			Placement {
+				shares: vec![1.0],
+				gradient_to_host: vec![Transfer { from: 1, to: 0, bytes: bytes.0, cost: zero }],
+				gradient_to_primary: Transfer { from: 0, to: 1, bytes: bytes.0, cost: zero },
+				weights_to_host: Transfer { from: 1, to: 0, bytes: bytes.1, cost: zero },
+				weights_from_host: Vec::new(),
+				loss,
+				predicted: [0.0; 4],
+			},
+		));
 	}
+	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
 	let candidates: Vec<Vec<usize>> = match config.multi_device {
 		MultiDevice::Local => vec![vec![0]],
 		MultiDevice::Forced => vec![(0..gpus.len()).collect()],
@@ -18370,13 +21160,6 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 		// The fastest device leads the route and applies the one update.
 		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
 		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
-		let [computation, transfers, synchronization, movement] = placement.predicted;
-		eprintln!(
-			"route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}",
-			route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","),
-			counts.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
-			placement.seconds()
-		);
 		best = if best.as_ref().is_none_or(|previous| placement.seconds() < previous.2.seconds()) { Some((route, counts, placement)) } else { best };
 	}
 	best.ok_or_else(|| RecipeError::new("no candidate route fits this workload"))
@@ -18386,11 +21169,60 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 /// devices the rows shard contiguously, every device computes a gradient, the
 /// primary device applies the one emitted optimizer, and its weights broadcast.
 struct DeviceTape {
+	devices: Vec<&'static Gpu>,
+	route: Vec<usize>,
 	shards: Vec<NativeTape>,
 	placement: Placement,
 }
 impl DeviceTape {
+	fn llvm_report(&self) -> LlvmReport {
+		let mut report = LlvmReport::default();
+		for shard in &self.shards {
+			report.instructions.extend(shard.program.artifact.llvm.instructions.clone());
+			report.intrinsics.extend(shard.program.artifact.llvm.intrinsics.clone());
+		}
+		report
+	}
+	fn format_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::format_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn memory_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			if let Some(position) = self.route.iter().position(|selected| *selected == index) {
+				lines.push(self.shards[position].memory_line()?);
+			} else {
+				lines.push(format!("{}  memory: input 0 bytes weights 0 bytes values 0 bytes contexts 0 bytes adjoints 0 bytes gradients 0 bytes optimizer 0 bytes load-scratch 0 bytes", device_label(gpu)?));
+			}
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn link_report(&self) -> Result<ReportLines> { transfer_report(self.shards.iter().map(|shard| shard.program.gpu)) }
+	fn aot_report(&self) -> Result<ReportLines> {
+		let mut lines = Vec::with_capacity(self.devices.len());
+		for (index, gpu) in self.devices.iter().enumerate() {
+			if let Some(position) = self.route.iter().position(|selected| *selected == index) {
+				let shard = &self.shards[position];
+				lines.push(format!("{}  aot: rows {} share {:.6} predicted epoch {:.3} µs", device_label(gpu)?, shard.rows, self.placement.shares[position], self.placement.seconds() * 1e6));
+			} else {
+				lines.push(format!("{}  aot: rows 0 share 0.000000", device_label(gpu)?));
+			}
+		}
+		Ok(ReportLines::new(lines))
+	}
+	fn tile_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::tile_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn grid_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn compile_seconds(&self) -> f64 { self.shards.iter().map(|shard| shard.compile_seconds).sum() }
+	fn load_seconds(&self) -> f64 { self.shards.iter().map(|shard| shard.load_seconds).sum() }
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction, config: Config) -> Result<Self> {
+		// Validate and resolve training before route calibration builds any kernels.
+		let training_graph = graph.training_graph()?;
+		let graph = training_graph.as_ref();
+		let precision = if graph.profile.train == Some(Compute::FP64) && graph.nodes.iter().any(|node| node.int_bits != 0) { Compute::FP64 } else { precision };
 		let (input, output) = (graph.input.elements(), graph.output.elements());
 		require(input != 0 && samples.len() % input == 0, "model input batch is not a whole number of rows")?;
 		let rows = samples.len() / input;
@@ -18399,8 +21231,7 @@ impl DeviceTape {
 			gpus.len() == 1 || !graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0),
 			"batch normalization computes whole-batch statistics, so this model trains on one device",
 		)?;
-		let (route, counts, placement) = select_route(gpus, graph, rows, precision, loss, config)?;
-		eprintln!("selected route {} predicted epoch {:.9}s", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), placement.seconds());
+		let (route, counts, placement) = select_route(gpus, graph, rows, loss, config)?;
 		let (mut shards, mut start) = (Vec::new(), 0);
 		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
@@ -18415,10 +21246,22 @@ impl DeviceTape {
 			)?);
 			start = end;
 		}
-		Ok(Self { shards, placement })
+		Ok(Self { devices: gpus.to_vec(), route, shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
 		self.shards.iter().try_for_each(|tape| tape.forward(ForwardMode::Inference))
+	}
+	fn metrics(&mut self, config: Config) -> Result<EpochMetrics> {
+		let transfers = TransferScope::current();
+		let parts = std::thread::scope(|scope| {
+			let measured = self.shards.iter_mut().map(|shard| {
+				let transfers = transfers.clone();
+				scope.spawn(move || { let _transfers = TransferScope::enter(transfers); shard.metric_launch(config) })
+			}).collect::<Vec<_>>();
+			measured.into_iter().map(|part| part.join().map_err(|_| RecipeError::new("device metrics panicked"))?).collect::<Result<Vec<_>>>()
+		})?;
+		let root_loss = self.placement.loss.0 == 1;
+		Ok(EpochMetrics::combine(parts.into_iter().zip(self.placement.shares.iter().copied()), root_loss))
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let mut predictions = Vec::new();
@@ -18427,8 +21270,8 @@ impl DeviceTape {
 		}
 		Ok(predictions)
 	}
-	fn evaluate(&mut self, graph: &Graph, samples: &[f64], first: usize) -> Result<Vec<f64>> {
-		self.shards.first_mut().ok_or_else(|| RecipeError::new("training placement has no device"))?.evaluate(graph, samples, first)
+	fn evaluate(&mut self, graph: &Graph, samples: &[f64], targets: &[f64], first: usize, loss: LossFunction, config: Config) -> Result<(Vec<f64>, EpochMetrics)> {
+		self.shards.first_mut().ok_or_else(|| RecipeError::new("training placement has no device"))?.evaluate(graph, samples, targets, first, loss, config)
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		if self.shards.len() > 1 {
@@ -18488,54 +21331,55 @@ impl DeviceTape {
 	/// The one fused epoch every policy runs: each shard computes its gradient
 	/// concurrently, the leading device applies the one emitted optimizer to the
 	/// aggregate, and the updated persistent weights return to every shard.
-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(EpochMetrics, bool)> {
 		if self.shards.len() == 1 {
 			let loss = self.shards[0].full_epoch(rate, config)?;
 			let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-			return Ok((loss, checkpoint_requested));
+			return Ok((self.shards[0].epoch_metrics()?, checkpoint_requested));
 		}
 		let placement = &self.placement;
 		let shards = &mut self.shards;
+		let transfers = TransferScope::current();
 		let measured = std::thread::scope(|scope| {
 			let dispatched = shards.iter_mut().zip(&placement.gradient_to_host).map(|(shard, transfer)| {
 				let transfer = *transfer;
-				scope.spawn(move || -> Result<(f64, Vec<f64>)> {
-					require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
-					let objective = shard.gradient_launch(rate, config)?;
-					Ok((objective, shard.download_gradient()?))
+				let transfers = transfers.clone();
+				scope.spawn(move || -> Result<(EpochMetrics, Vec<f64>)> {
+					let _transfers = TransferScope::enter(transfers);
+					require(transfer.to == 0, "gradient transfer must end on the master")?;
+					shard.gradient_launch(rate, config)?;
+					Ok((shard.epoch_metrics()?, shard.download_gradient()?))
 				})
 			});
 			dispatched.collect::<Vec<_>>().into_iter().map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?).collect::<Result<Vec<_>>>()
 		})?;
 		let root_metric = placement.loss.0 == 1;
-		let loss = if root_metric {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective * objective).sum::<f64>().sqrt()
-		} else {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective).sum()
-		};
+		let mut metrics = EpochMetrics::combine(measured.iter().zip(&placement.shares).map(|((metrics, _), share)| (*metrics, *share)), root_metric);
+		let loss = metrics.loss;
 		let parameters = self.shards[0].parameters;
 		let mut gradient = vec![0.0; parameters];
-		for ((objective, shard_gradient), share) in measured.iter().zip(&placement.shares) {
+		for ((metrics, shard_gradient), share) in measured.iter().zip(&placement.shares) {
 			// The RMSE seed divides by the shard-local loss, so restoring the
 			// whole-batch gradient rescales each shard by its loss ratio.
-			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { objective / loss } } else { 1.0 };
+			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { metrics.loss / loss } } else { 1.0 };
 			for (total, partial) in gradient.iter_mut().zip(shard_gradient) {
 				*total += scale * partial;
 			}
 		}
 		require(
 			placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1 && placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0,
-			"the aggregate gradient and the updated weights must cross the coordinating host",
+			"the aggregate gradient and the updated weights must cross the master",
 		)?;
 		self.shards[0].upload_gradient(&gradient)?;
 		self.shards[0].optimizer_launch(rate, config)?;
+		metrics.device_seconds += f64::from_bits(self.shards[0].last_device_seconds.load(Ordering::Acquire));
 		let weights = self.shards[0].weights()?;
 		for (shard, transfer) in self.shards.iter().skip(1).zip(&placement.weights_from_host) {
-			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
+			require(transfer.from == 0, "weight transfer must originate on the master")?;
 			shard.upload_weights(&weights)?;
 		}
 		let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-		Ok((loss, checkpoint_requested))
+		Ok((metrics, checkpoint_requested))
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.shards[0].weights()
@@ -18543,38 +21387,80 @@ impl DeviceTape {
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		self.shards[0].capture(graph)
 	}
-	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
-	fn print_devices(&self, graph: &Graph) -> Result<()> {
-		for (index, node) in graph.nodes.iter().enumerate() {
-			if node.op == Primitive::Gather {
-				let (layout, row) = embedding_row(node)?;
-				let table = checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, row, "embedding table bytes")?;
-				eprintln!("movement gather {} {row} bytes per token of a {table} byte table", layout.name);
-			}
-			if node.op == Primitive::Lookup
-				&& let Some(table) = graph.stored.get(index).and_then(Option::as_ref)
-			{
-				let (heads, rows) = (node.argument[0] as usize, (node.argument[2] as usize).max(1));
-				eprintln!("movement lookup {heads} rows of {} bytes per token from a {} byte host table", table.bytes.len() / rows, table.bytes.len());
-			}
-		}
-		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
-			eprintln!("{}.{} rows {} share {share:.6}", shard.device_label()?, shard.precision.model.label(), shard.rows);
-		}
-		for (index, movement) in self.placement.movements().enumerate() {
-			let kind = ["gradient", "aggregate", "weights"][(index >= self.shards.len()) as usize + (index > self.shards.len()) as usize];
-			eprintln!(
-				"movement {kind} {}>{} {} bytes {:.0?} {:.1} MB/s {:.6} ms",
-				movement.from,
-				movement.to,
-				movement.bytes,
-				movement.cost.latency,
-				movement.cost.bandwidth / 1e6,
-				movement.seconds() * 1e3
-			);
-		}
-		Ok(())
-	}
+}
+
+fn training_observability(
+	data: &Data,
+	rows: usize,
+	tape: &DeviceTape,
+	itl: TrainingPoint,
+	loss: ScalarHistory,
+	predictions: PredictionHistory,
+	r2: ScalarHistory,
+	rat: RatHistory,
+	fnl: TrainingPoint,
+	epochs: usize,
+	epoch_seconds: f64,
+) -> Result<TrainingObservability> {
+	Ok(TrainingObservability {
+		llvm: tape.llvm_report(),
+		path: data.report_path()?,
+		rows,
+		formats: tape.format_report()?,
+		memory: tape.memory_report()?,
+		links: tape.link_report()?,
+		aot: tape.aot_report()?,
+		tiles: tape.tile_report()?,
+		grids: tape.grid_report()?,
+		load: DurationReport(tape.load_seconds()),
+		compile: DurationReport(tape.compile_seconds()),
+		itl,
+		loss,
+		predictions,
+		r2,
+		rat,
+		fnl,
+		eps: if epoch_seconds == 0.0 { 0.0 } else { epochs as f64 / epoch_seconds },
+	})
+}
+
+fn single_training_observability(
+	path: String,
+	rows: usize,
+	tape: &NativeTape,
+	_link: Option<Link>,
+	predicted_epoch: Option<f64>,
+	itl: TrainingPoint,
+	loss: ScalarHistory,
+	predictions: PredictionHistory,
+	r2: ScalarHistory,
+	rat: RatHistory,
+	fnl: TrainingPoint,
+	epochs: usize,
+	epoch_seconds: f64,
+) -> Result<TrainingObservability> {
+	let device = tape.device_label()?;
+	let links = transfer_report([tape.program.gpu])?;
+	Ok(TrainingObservability {
+		llvm: tape.llvm_report(),
+		path,
+		rows,
+		formats: ReportLines::new(tape.format_lines()?),
+		memory: ReportLines::new([tape.memory_line()?]),
+		links,
+		aot: ReportLines::new([predicted_epoch.map_or_else(|| format!("{device}  aot: rows {rows}"), |seconds| format!("{device}  aot: rows {rows} predicted epoch {:.3} µs", seconds * 1e6))]),
+		tiles: ReportLines::new(tape.tile_lines()?),
+		grids: ReportLines::new(tape.grid_lines()?),
+		load: DurationReport(tape.load_seconds),
+		compile: DurationReport(tape.compile_seconds),
+		itl,
+		loss,
+		predictions,
+		r2,
+		rat,
+		fnl,
+		eps: if epoch_seconds == 0.0 { 0.0 } else { epochs as f64 / epoch_seconds },
+	})
 }
 #[derive(Clone, Copy)]
 enum CheckpointStatus {
@@ -18615,7 +21501,7 @@ fn attention_kv_bytes(node: &Node, rows: usize, precision: Compute) -> Result<us
 // An embedding row is addressed inside the packed table, so the row must span
 // whole blocks and the layout must keep one row's blocks together.
 fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
-	let format = StorageFormat(node.argument[8] as u16);
+	let format = StorageFormat(node.storage);
 	let layout = format.spec().ok_or_else(|| RecipeError::new("embedding table must be stored in a quantization"))?.codec.quantization();
 	require(!matches!(layout.native, NativeDequant::Nf4), format!("embedding table cannot use {}: its codebook addresses the whole tensor", layout.name))?;
 	require(node.output.channels % layout.block == 0, format!("embedding width {} must be a multiple of the {} block of {}", node.output.channels, layout.name, layout.block))?;
@@ -18672,14 +21558,14 @@ fn carried(node: &Node, rows: usize) -> Result<Carried> {
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
-			Carried { history: History::Positions(1), values: checked_mul(2 * gates + 1, state_count, "scan states")? }
+			Carried { history: History::Positions(1), values: checked_mul(gates + 1, state_count, "scan states")? }
 		}
 		// One thread owns one row and head: the chunk entry states, the live state
 		// and the chunk the reverse pass replays.
 		Primitive::Delta => {
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
-			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
+			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 1, "delta live states")?, "delta state spans")?;
 			let states = checked_mul(checked_mul(rows, heads, "delta pairs")?, checked_mul(spans, state, "delta state span")?, "delta states")?;
 			Carried { history: History::Positions(1), values: states }
 		}
@@ -18733,12 +21619,9 @@ fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize,
 	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
 	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
 }
-/// Returns the context arena size, in model elements, for a generic recurrent
-/// body. The first part is the ordinary scan state arena; the remainder is a
-/// cell scratch row, a value/adjoint tape for every position, a temporary body
-/// gradient vector, and the cell-output adjoint tape consumed by the legacy
-/// recurrent reverse kernel.
-fn recurrent_body_elements(graph: &Graph, node: &Node, rows: usize) -> Result<Option<usize>> {
+/// Context regions in model elements, including which forward data survives
+/// the next window and which storage only the backward pass uses.
+fn recurrent_body_regions(graph: &Graph, node: &Node, rows: usize, inference: bool, step: usize) -> Result<Option<Vec<(usize, BufferLifetime)>>> {
 	if node.op != Primitive::Scan || node.argument[5] != 1.0 {
 		return Ok(None);
 	}
@@ -18768,23 +21651,77 @@ fn recurrent_body_elements(graph: &Graph, node: &Node, rows: usize) -> Result<Op
 	let temporary_gradient = checked_add(adjoints, adjoints_total, "recurrent body temporary gradient")?;
 	let cell_delta = checked_add(temporary_gradient, body_gradient, "recurrent body cell adjoint")?;
 	let total = checked_add(cell_delta, checked_mul(rows, node.output.elements(), "recurrent body cell adjoint")?, "recurrent body context")?;
-	Ok(Some(total.max(1)))
+	if !inference { return Ok(Some(vec![(total.max(1), BufferLifetime::Retained)])); }
+	let local = BufferLifetime::Until(step);
+	let gates = checked_mul(node.argument[0] as usize, state_count, "recurrent gate context")?;
+	let forward = checked_add(gates, state_count, "recurrent forward context")?;
+	Ok(Some(vec![
+		(gates, local),
+		(state_count, if node.argument[0] == 4.0 { BufferLifetime::Retained } else { BufferLifetime::Unused }),
+		(scan_base - forward, BufferLifetime::Unused),
+		(cell, local),
+		(values - cell_values, BufferLifetime::Retained),
+		(values_total, local),
+		(total - adjoints, BufferLifetime::Unused),
+	]))
 }
-fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool) -> Result<usize> {
+fn backward_context_offset(node: &Node, rows: usize) -> Result<usize> {
+	let elements = match node.op {
+		Primitive::Scan => checked_mul(checked_mul(node.argument[0] as usize + 1, rows, "scan forward rows")?, node.output.elements(), "scan forward states")?,
+		Primitive::Delta => {
+			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let chunk = (node.argument[2] as usize).max(1);
+			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 1, "delta forward spans")?, "delta forward spans")?;
+			checked_mul(checked_mul(rows, heads, "delta pairs")?, checked_mul(spans, checked_mul(key_width, width, "delta state")?, "delta forward states")?, "delta forward context")?
+		}
+		_ => return Err(RecipeError::new("this op has no separate backward context")),
+	};
+	align(checked_mul(elements, node.precision.bytes(), "forward context bytes")?, NativePrecision::new(node.precision, node.acc)?.state.bytes())
+}
+fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
+	let elements = match node.op {
+		Primitive::Scan => {
+			let deltas = checked_mul(checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize, "scan gate derivatives")?;
+			let gradients = checked_mul(rows, node.parameters, "scan gradient partials")?;
+			let scratch = checked_mul(2, checked_mul(rows, node.output.channels, "scan scratch rows")?, "scan scratch")?;
+			checked_add(deltas, checked_add(gradients, scratch, "scan backward scratch")?, "scan backward context")?
+		}
+		Primitive::Delta => {
+			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let state = checked_mul(key_width, width, "delta adjoint state")?;
+			let vectors = checked_add(checked_mul(2, width, "delta adjoint vectors")?, 1, "delta decay partial")?;
+			checked_mul(checked_mul(rows, heads, "delta backward pairs")?, checked_add(state, vectors, "delta backward pair")?, "delta backward context")?
+		}
+		_ => return Err(RecipeError::new("this op has no separate backward context")),
+	};
+	checked_mul(elements, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "backward context bytes")
+}
+/// Context sizing and lifetimes are one declaration consumed by allocation.
+/// Regions remain contiguous and in the order the kernel reads them.
+fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool, step: usize) -> Result<Vec<(usize, BufferLifetime)>> {
+	use BufferLifetime::{ReadOnly, Retained, Unused};
+	let local = if inference { BufferLifetime::Until(step) } else { Retained };
+	let unused = if inference { Unused } else { Retained };
 	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
-		return Ok(bytes);
+		return Ok(vec![(bytes, ReadOnly)]);
 	}
-	if let Some(elements) = recurrent_body_elements(graph, node, rows)? {
-		return checked_mul(elements, precision.bytes(), "recurrent body context bytes");
+	if let Some(regions) = recurrent_body_regions(graph, node, rows, inference, step)? {
+		return regions.into_iter().map(|(elements, lifetime)| Ok((checked_mul(elements, precision.bytes(), "recurrent body context bytes")?, lifetime))).collect();
 	}
 	let state = carried(node, rows)?.values;
-	let elements = match node.op {
+	let regions = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
-		Primitive::Elementwise if inference => 1,
-		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
-		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		Primitive::Elementwise if inference => vec![(precision.bytes(), Unused)],
+		Primitive::Elementwise => {
+			let partials = checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?;
+			vec![(checked_mul(partials.max(1), NativePrecision::new(node.precision, node.acc)?.state.bytes(), "scalar gradient partial bytes")?, Retained)]
+		}
+		Primitive::Predictor => {
+			let elements = checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?;
+			vec![(checked_mul(elements.max(1), precision.bytes(), "predictor workspace bytes")?, local)]
+		}
 		// Softmax statistics, then the indexer block representatives, then one
 		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
@@ -18793,58 +21730,71 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
 			let derivatives = if inference { 0 } else { checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")? };
-			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
+			vec![
+				(checked_mul(statistics, precision.bytes(), "attention statistics bytes")?, local),
+				(checked_mul(representatives, precision.bytes(), "indexer representatives bytes")?, Retained),
+				(checked_mul(scores, precision.bytes(), "indexer scores bytes")?, local),
+				(checked_mul(derivatives, precision.bytes(), "indexer derivatives bytes")?, Retained),
+			]
 		}
 		// The gate states, then the weight gradient rows only the reverse pass
 		// accumulates, then the reduction scratch.
 		Primitive::Scan => {
+			if !inference { return Ok(vec![(checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "scan context")?, Retained)]); }
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
-			let state_spans = if inference { gates.checked_add(1).ok_or_else(|| RecipeError::new("scan state spans overflow"))? } else { 2 * gates + 1 };
-			let states = checked_mul(state_spans.checked_add(node.argument[1] as usize).ok_or_else(|| RecipeError::new("scan state spans overflow"))?, state_count, "scan states")?;
-			let gradients = if inference { 0 } else { checked_mul(rows, node.parameters, "scan gradients")? };
-			let scratch = if inference { 0 } else { checked_mul(2, checked_mul(rows, node.output.channels, "scan scratch rows")?, "scan scratch")? };
-			checked_add(states, checked_add(gradients, scratch, "scan scratch")?, "scan")?
+			let state_bytes = checked_mul(state_count, precision.bytes(), "scan state bytes")?;
+			vec![
+				(checked_mul(gates, state_bytes, "scan gate bytes")?, local),
+				(state_bytes, if gates == 4 { Retained } else { Unused }),
+				(checked_mul(node.argument[1] as usize, state_bytes, "scan reserved bytes")?, Unused),
+			]
 		}
 		// One thread owns one row and head: the chunk entry states, the live state,
 		// the chunk the reverse pass replays, the state adjoint, the readout error
 		// and key weight vectors, and one decay partial. The forward pass carries
 		// the live state alone, so an inference pair holds no entry or replay span.
 		Primitive::Delta => {
+			if !inference { return Ok(vec![(checked_add(backward_context_offset(node, rows)?, backward_context_bytes(node, rows)?, "delta context")?, Retained)]); }
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
-			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
-			let spans = if inference { 1 } else { checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")? };
-			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
-			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
+			let state = checked_mul(key_width, width, "delta state")?;
+			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
+			vec![
+				(checked_mul(pair_bytes, state, "delta carried state bytes")?, Retained),
+				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+			]
 		}
-		Primitive::Pool if inference => return Ok(0),
-		Primitive::Pool => return checked_mul(state, size_of::<u64>(), "pool context bytes"),
+		Primitive::Pool if inference => Vec::new(),
+		Primitive::Pool => vec![(checked_mul(state, size_of::<u64>(), "pool context bytes")?, Retained)],
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
-		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
-		Primitive::Lookup => state,
+		Primitive::Gather => vec![(checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes")?, ReadOnly)],
+		Primitive::Lookup => vec![(checked_mul(state.max(1), precision.bytes(), "lookup context bytes")?, Retained)],
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order. Only the weight gradients walk
 		// the lists, so an inference tape holds none.
-		Primitive::ExpertIn | Primitive::ExpertOut if inference => 1,
+		Primitive::ExpertIn | Primitive::ExpertOut if inference => vec![(precision.bytes(), Unused)],
 		Primitive::ExpertIn | Primitive::ExpertOut => {
 			let entries = checked_mul(checked_mul(rows, node.output.length, "routed positions")?, node.argument[1] as usize, "routed slots")?;
-			return checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes");
+			vec![(checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes")?, Retained)]
 		}
 		// Four statistics per group; for an evaluation mode that span is the saved
 		// mean and variance the node declares, so it is counted once.
 		Primitive::Normalize => {
-			let statistic_spans = if inference { 2 } else { 4 };
-			let statistics = checked_mul(statistic_spans, normalize_groups(node, rows)?, "normalization context")?;
-			let partials = if inference {
-				0
-			} else {
-				checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?
-			};
-			checked_add(statistics, partials, "normalization")?
+			if inference {
+				let lifetime = match normalize_mode(node.argument[0])? {
+					program_ir::NormalizeMode::Evaluation => ReadOnly,
+					program_ir::NormalizeMode::Batch => Retained,
+					_ => local,
+				};
+				return Ok(vec![(checked_mul(checked_mul(2, normalize_groups(node, rows)?, "normalization statistics")?, precision.bytes(), "normalization context")?, lifetime)]);
+			}
+			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
+			let partial_bytes = checked_mul(partials, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "normalization weight partial bytes")?;
+			vec![(checked_add(normalize_gradient_scratch(node, rows)?, partial_bytes, "normalization context")?, Retained)]
 		}
-		_ => 1,
+		_ => vec![(precision.bytes(), unused)],
 	};
-	checked_mul(elements.max(1), precision.bytes(), "context bytes")
+	Ok(regions)
 }
 fn narrow(value: usize, role: &str) -> Result<i32> {
 	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
@@ -18863,6 +21813,17 @@ impl Buffer {
 		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
 	}
 	/// A device buffer of `bytes` zeros, filled one bounded host block at a time.
+	/// A zeroed buffer with `guard` zeroed bytes on both sides of it; the
+	/// allocation is leaked, as the buffer never frees a pointer inside one.
+	fn zeroed_guarded(runtime: &'static Gpu, bytes: usize, guard: usize) -> Result<Self> {
+		if guard == 0 {
+			return Self::zeroed(runtime, bytes);
+		}
+		let whole = Self::zeroed(runtime, bytes.max(1) + 2 * guard)?;
+		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1) };
+		std::mem::forget(whole);
+		Ok(inner)
+	}
 	fn zeroed(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
 		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
@@ -18898,7 +21859,7 @@ impl Buffer {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
 				buffer.write_runs(offsets[index], &weight.bytes)?;
-			} else if graph.stored.get(index).is_some_and(|stored| arena_weight(node, stored).is_some()) {
+			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
 				continue;
 			} else {
@@ -19042,8 +22003,12 @@ struct NativeHsaProgram {
 	step: Option<Dispatch>,
 	kernarg: usize,
 	kernarg_size: usize,
+	/// The grid barrier's words, in device memory: ockl's grid sync promises
+	/// its atomics coarse-grained memory (`!amdgpu.no.fine.grained.memory`),
+	/// and on the fine-grained KERNARG pool they released workgroups early.
 	grid_sync: usize,
 	free: unsafe extern "C" fn(Ptr) -> i32,
+	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32,
 }
 
 #[cfg(amd)]
@@ -19062,6 +22027,7 @@ const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 #[cfg(nvidia)]
 struct NativeCudaProgram {
 	module: usize,
+	step: Option<Dispatch>,
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 }
 
@@ -19103,6 +22069,9 @@ impl Drop for NativeHsaProgram {
 	fn drop(&mut self) {
 		if self.kernarg != 0 {
 			unsafe { (self.free)(self.kernarg as Ptr) };
+		}
+		if self.grid_sync != 0 {
+			unsafe { (self.free)(self.grid_sync as Ptr) };
 		}
 	}
 }
@@ -19435,13 +22404,20 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
 			1
 		} else {
 			narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32
 		};
-		let element = widest_precision(graph, precision);
+		let mut element = widest_precision(graph, precision);
+		if loss.is_some() {
+			for node in &graph.nodes {
+				let state = NativePrecision::new(node.precision, node.acc)?.state;
+				if state.bytes() > element.bytes() { element = state; }
+			}
+		}
 		let shared_values = if cpu {
 			narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32
 		} else {
@@ -19479,8 +22455,7 @@ impl Gpu {
 			let plain = node.argument[1] == node.argument[0] && node.argument[2] == node.argument[0] && node.argument[3] == 0.0 && node.argument[4] == 0.0;
 			Ok::<_, RecipeError>(aligned && plain && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
-		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
-			&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
+		let matrix = resolve_capability(&self.native_target, ContractFormat::of(precision, 0)?)?.matrix.is_some()
 			&& dominant_shape.m >= fragment_k
 			&& dominant_shape.n >= fragment_k
 			&& dominant_shape.k >= fragment_k
@@ -19494,10 +22469,10 @@ impl Gpu {
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
 		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
-		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
+		let waves = if cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
 		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
-			/ precision.bytes() as u32
+			/ element.bytes() as u32
 			/ block / register_m
 			.checked_add(1)
 			.ok_or_else(|| RecipeError::new("native contraction register width overflows"))?)
@@ -19513,7 +22488,9 @@ impl Gpu {
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
-		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(element.bytes()), "native contraction state ratio")? as u32;
+		// The chunk partials are in the widest state any node declares.
+		let state_bytes = graph.nodes.iter().map(|node| NativePrecision::new(node.precision, node.acc).map(|native| native.state.bytes())).chain([NativePrecision::new(precision, graph.profile.acc).map(|native| native.state.bytes())]).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(4);
+		let ratio = narrow(state_bytes.div_ceil(element.bytes()), "native contraction state ratio")? as u32;
 		let mut extent = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
 		let contractions = shapes
 			.iter()
@@ -19521,8 +22498,8 @@ impl Gpu {
 				shape.map(|shape| {
 					Ok(NativeContractionTiles {
 						forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-						gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-						previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+						gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, false)?,
+						previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, false)?,
 						gradient_shape: shape.gradient,
 						parameters: shape.parameters,
 					})
@@ -19534,8 +22511,8 @@ impl Gpu {
 		let contraction_shared_values = contractions
 			.iter()
 			.flatten()
-			.flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous])
-			.map(|extent| native_contraction_shared_values(extent, register_m, register_n, block, chunk_k, ratio, matrix))
+			.flat_map(|contraction| [(contraction.forward, matrix), (contraction.gradient, false), (contraction.previous, false)])
+			.map(|(extent, matrix)| native_contraction_shared_values(extent, register_m, register_n, block, chunk_k, ratio, matrix))
 			.collect::<Result<Vec<_>>>()?
 			.into_iter()
 			.max()
@@ -19572,11 +22549,12 @@ impl Gpu {
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		// The gradient scratch rows follow the parameters in the gradient buffer,
 		// which only the epoch entry reads, so an inference program has none.
-		// In bytes: the gradient arena mirrors the weight arena, and the scratch rows
-		// follow it on a boundary every element width divides.
-		let scratch_base = if loss.is_none() { 0 } else { narrow(native_weight_arena(graph, Compute::FP64, false)?.1.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES * 8), "native gradient scratch base")? };
+		// State-width gradient spans precede scratch rows on a boundary that
+		// every supported accumulator width divides.
+		let scratch_base = if loss.is_none() { 0 } else { narrow(native_gradient_arena(graph)?.1.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES * 8), "native gradient scratch base")? };
 		trace(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
 		let schedule = NativeSchedule {
+			element,
 			matrix,
 			block,
 			tile: extent,
@@ -19631,7 +22609,7 @@ impl Gpu {
 					if status == 4104 && std::env::var("RECIPE_HOST_SPILL").as_deref() == Ok("1") {
 						self.status((driver.allocate)(driver.kernarg_pool, bytes, 0, &mut pointer), "system memory allocation")?;
 						self.status((driver.allow)(1, &driver.agent, ptr::null(), pointer), "GPU system memory access")?;
-						eprintln!("Using {} MiB of system memory for GPU allocation", bytes.div_ceil(1024 * 1024));
+						trace(&format!("GPU allocation uses {} MiB of machine memory", bytes.div_ceil(1024 * 1024)))?;
 					} else {
 						self.status(status, "allocation")?;
 					}
@@ -19679,7 +22657,8 @@ impl Gpu {
 	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
 		self.activate()?;
 		let dst = if dst == 0 { self.allocate(bytes)? } else { dst };
-		unsafe {
+		let started = Instant::now();
+		let result = unsafe {
 			match &self.driver {
 				Driver::Cpu => {
 					ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes);
@@ -19699,7 +22678,9 @@ impl Gpu {
 					channel.read_status("upload").map(|_| dst)
 				}
 			}
-		}
+		};
+		if result.is_ok() { record_transfer(&self.name, true, bytes, started.elapsed().as_secs_f64()); }
+		result
 	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn clear(&self, pointer: u64, bytes: usize) -> Result<()> {
@@ -19737,7 +22718,8 @@ impl Gpu {
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		self.activate()?;
-		unsafe {
+		let started = Instant::now();
+		let result = unsafe {
 			match &self.driver {
 				Driver::Cpu => {
 					ptr::copy_nonoverlapping(src as *const u8, dst.cast::<u8>(), bytes);
@@ -19757,7 +22739,9 @@ impl Gpu {
 					channel.read_into(std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes))
 				}
 			}
-		}
+		};
+		if result.is_ok() { record_transfer(&self.name, false, bytes, started.elapsed().as_secs_f64()); }
+		result
 	}
 	/// The memory the device has free now. The host is not bounded by device
 	/// memory, so the CPU reports its whole capacity.
@@ -19775,8 +22759,20 @@ impl Gpu {
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
+					// HSA_AMD_AGENT_INFO_MEMORY_AVAIL counts what the runtime may still
+					// take, not what a compositor and other processes already hold: on
+					// the desktop card it said 11.8 GB free with 2.4 GB in use. The DRM
+					// counters of the same device (matched by its bus address,
+					// HSA_AMD_AGENT_INFO_BDFID) bound it.
 					let mut free = 0_u64;
 					self.status((driver.info)(driver.agent, 0xA015, (&mut free as *mut u64).cast()), "free memory")?;
+					let (mut bdf, mut domain) = (0_u32, 0_u32);
+					if (driver.info)(driver.agent, 0xA006, (&mut bdf as *mut u32).cast()) == 0
+						&& (driver.info)(driver.agent, 0xA00F, (&mut domain as *mut u32).cast()) == 0
+						&& let Some(drm_free) = amd_drm_free_bytes(domain, bdf)
+					{
+						free = free.min(drm_free);
+					}
 					Ok(free)
 				}
 				Driver::Remote(remote) => {
@@ -19819,6 +22815,30 @@ fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
 /// The host's available memory in bytes, from /proc/meminfo where there is one.
+/// The DRM counters of the AMD device at `domain`:`bdf` (bus << 8 |
+/// device << 3 | function, HSA_AMD_AGENT_INFO_BDFID and _DOMAIN): its VRAM
+/// total less the bytes every process holds, from /sys/class/drm/card*/device,
+/// or None when no card carries that address.
+#[cfg(amd)]
+fn amd_drm_free_bytes(domain: u32, bdf: u32) -> Option<u64> {
+	let address = format!("{domain:04x}:{:02x}:{:02x}.{}", (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 7);
+	for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+		if !name.starts_with("card") || name.contains('-') {
+			continue;
+		}
+		let device = entry.path().join("device");
+		let Ok(target) = fs::read_link(&device) else { continue };
+		if !target.file_name().is_some_and(|file| file.to_string_lossy() == address) {
+			continue;
+		}
+		let read = |file: &str| fs::read_to_string(device.join(file)).ok()?.trim().parse::<u64>().ok();
+		let (total, used) = (read("mem_info_vram_total")?, read("mem_info_vram_used")?);
+		return Some(total.saturating_sub(used));
+	}
+	None
+}
 fn host_available_bytes() -> Option<u64> {
 	let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
 	let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
@@ -19838,7 +22858,7 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 	for part in selection.split('.') {
 		require(!part.is_empty(), "device selection contains an empty component")?;
 		let name = if let Some((prefix, name)) = part.split_once(':') {
-			require(!prefix.is_empty(), "device host is empty")?;
+			require(!prefix.is_empty(), "device node is empty")?;
 			hostname.push(prefix);
 			host = hostname.join(".");
 			hostname.clear();
@@ -19851,11 +22871,11 @@ pub fn device_names(selection: &str) -> Result<Vec<String>> {
 			hostname.push(part);
 			continue;
 		}
-		require(hostname.is_empty(), format!("host {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
+		require(hostname.is_empty(), format!("node {:?} requires ':' before device {name:?} in {selection:?}", hostname.join(".")))?;
 		require(gpu || name == "cpu", format!("invalid device selector {name:?}; expected amd<number>, nv<number>, or cpu"))?;
 		names.push(if host.is_empty() { name.to_owned() } else { format!("{host}:{name}") });
 	}
-	require(hostname.is_empty(), format!("host {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
+	require(hostname.is_empty(), format!("node {:?} requires ':<device>' in {selection:?}", hostname.join(".")))?;
 	Ok(names)
 }
 /// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
@@ -19910,24 +22930,24 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 fn local_host() -> Result<String> {
 	// gethostname(3) rather than the hostname(1) executable, which a minimal
 	// image need not carry: a container without it failed device selection
-	// with "cannot read hostname: No such file or directory".
+	// with "cannot read machine name: No such file or directory".
 	unsafe extern "C" {
 		fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
 	}
 	let mut bytes = [0_u8; 256];
 	// The call truncates rather than failing on a long name, and POSIX leaves
 	// truncated output possibly unterminated, so the last byte stays reserved.
-	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query hostname")?;
+	require(unsafe { gethostname(bytes.as_mut_ptr().cast(), bytes.len() - 1) } == 0, "cannot query machine name")?;
 	let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
-	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))?;
+	let host = std::str::from_utf8(&bytes[..end]).map_err(|error| RecipeError::new(format!("machine name is not UTF-8: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 #[cfg(windows)]
 fn local_host() -> Result<String> {
 	let mut words = [0_u16; 256];
 	let mut length = words.len() as u32;
-	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
-	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
+	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query machine name")?;
+	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("machine name is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list.
@@ -19983,6 +23003,60 @@ fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
 	require(output.status.success(), format!("cannot {action}: {}", String::from_utf8_lossy(&output.stderr)))?;
 	Ok(output.stdout)
 }
+fn shell_argument(value: &str) -> String {
+	format!("'{}'", value.replace('\'', "'\\''"))
+}
+fn copy_remote(host: &str, source: &Path, destination: &str) -> Result<()> {
+	let status = Command::new("scp").args(["-q", "-o", "BatchMode=yes"]).arg(source).arg(format!("{host}:{destination}"))
+		.status().map_err(|error| RecipeError::new(format!("cannot copy {} to {host}: {error}", source.display())))?;
+	require(status.success(), format!("cannot copy {} to {host}: {status}", source.display()))
+}
+/// Run a locally compiled model on its selected machine. Files opened by the model
+/// belong to that machine, and stdin, stdout, stderr, and exit status remain attached
+/// to the calling terminal. Chains across machines retain the device worker protocol.
+pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&str>) -> Result<Option<std::process::ExitStatus>> {
+	let names = device_names(selection)?;
+	let Some((host, _)) = names.first().and_then(|name| name.split_once(':')) else { return Ok(None) };
+	require(host.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("unsafe execution node {host:?}"))?;
+	if host == local_host()? || names.iter().any(|name| name.split_once(':').is_none_or(|(candidate, _)| candidate != host)) {
+		return Ok(None);
+	}
+	let devices = names.iter().map(|name| name.split_once(':').unwrap().1).collect::<Vec<_>>().join(".");
+	let directory = remote_directory(host)?;
+	let remote_script = format!("{}/model", directory.path);
+	let remote_recipe = format!("{}/recipe", directory.path);
+	copy_remote(host, script, &remote_script)?;
+	copy_remote(host, &std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate recipe: {error}")))?, &remote_recipe)?;
+	let mut templates = std::collections::BTreeSet::new();
+	for (prefix, mapping) in [("cpu", option_env!("RECIPE_CPU_IR")), ("amd", option_env!("RECIPE_AMD_IR")), ("nv", option_env!("RECIPE_NV_IR"))] {
+		if names.iter().any(|name| name.split_once(':').unwrap().1.starts_with(prefix)) {
+			let mapping = mapping.ok_or_else(|| RecipeError::new(format!("this build has no {prefix} templates for {selection}")))?;
+			templates.extend(mapping.split(';').filter_map(|entry| entry.split_once('=').map(|(_, path)| path)));
+		}
+	}
+	if !templates.is_empty() {
+		let status = Command::new("rsync").args(["-az", "-e", "ssh -o BatchMode=yes", "--"]).args(templates).arg(format!("{host}:{}/", directory.path))
+			.status().map_err(|error| RecipeError::new(format!("cannot send runtime templates to {host}: {error}")))?;
+		require(status.success(), format!("cannot send runtime templates to {host}: {status}"))?;
+	}
+	let mut environment = std::env::vars().filter(|(name, _)| (name.starts_with("RECIPE_") || name.starts_with("RNJ_") || name == "TERM") && !matches!(name.as_str(), "RECIPE_DEVICE" | "RECIPE_BINARY" | "RECIPE_CONFIG")).collect::<Vec<_>>();
+	environment.push(("RECIPE_DEVICE".to_owned(), devices));
+	environment.push(("RECIPE_BINARY".to_owned(), remote_recipe));
+	environment.push(("RECIPE_TEMPLATE_ROOT".to_owned(), directory.path.clone()));
+	if let Some(config) = configuration.map(str::to_owned).or_else(|| std::env::var("RECIPE_CONFIG").ok()) {
+		environment.push(("RECIPE_CONFIG".to_owned(), config));
+	}
+	let environment = environment.iter().map(|(key, value)| shell_argument(&format!("{key}={value}"))).collect::<Vec<_>>().join(" ");
+	let cwd = std::env::current_dir().map_err(|error| RecipeError::new(format!("cannot read model working directory: {error}")))?;
+	let command = format!("chmod 700 {remote_script} && cd {cwd} && exec env {environment} {remote_script}", cwd = shell_argument(&cwd.to_string_lossy()));
+	let mut ssh = Command::new("ssh");
+	ssh.args(["-q", "-o", "BatchMode=yes"]);
+	if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() { ssh.arg("-tt"); }
+	let status = ssh.args([host, &command]).status().map_err(|error| RecipeError::new(format!("cannot run model on {host}: {error}")))?;
+	// The remote process can exit by signal before its progress guard unwinds.
+	if std::io::stderr().is_terminal() { eprint!("\x1b[?7h"); }
+	Ok(Some(status))
+}
 fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	let mut command = Command::new("ssh");
 	command.args(["-o", "BatchMode=yes", host, "umask 077; base=\"$HOME/.cache/recipe/native\"; mkdir -p -- \"$base\" && chmod 700 -- \"$base\" && mktemp -d \"$base/remote-worker.XXXXXXXX\""]);
@@ -20007,14 +23081,14 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 /// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
 	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
-	for (kind, value) in [("host", host), ("device", device_name)] {
+	for (kind, value) in [("node", host), ("device", device_name)] {
 		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
 	}
 	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
 	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
 		return Ok(gpu);
 	}
-	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
+	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach node {host:?}")))?;
 	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
 	let directory = remote_directory(host)?;
 	let remote_path = format!("{}/recipe", directory.path);
@@ -20190,12 +23264,14 @@ impl Hsa {
 			let epoch = training.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 			let kernarg_size = [Some(forward), step, epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
-			let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
-			let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
+			let allocation_size = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT).max(HSA_GRID_SYNC_ALIGNMENT);
 			let mut kernarg = ptr::null_mut();
 			driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, allocation_size, 0, &mut kernarg), "native KERNARG allocation")?;
 			driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), kernarg), "native GPU KERNARG access")?;
-			Ok((NativeHsaProgram { executable, step, kernarg: kernarg as usize, kernarg_size, grid_sync: kernarg.add(grid_sync) as usize, free: self.free }, forward, epoch, model_load))
+			let mut grid_sync = ptr::null_mut();
+			driver_status(Backend::Amd, (self.allocate)(self.vram_pool, HSA_GRID_SYNC_BYTES, 0, &mut grid_sync), "native grid sync allocation")?;
+			driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), grid_sync), "native GPU grid sync access")?;
+			Ok((NativeHsaProgram { executable, step, kernarg: kernarg as usize, kernarg_size, grid_sync: grid_sync as usize, free: self.free, copy: self.copy }, forward, epoch, model_load))
 		}
 	}
 }
@@ -20224,7 +23300,10 @@ impl Cuda {
 			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
 			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+			// Every workgroup the SMs hold at once is launched: the grid stays
+			// cooperative, and the work is spread over that many more warps.
+			let groups = geometry.groups.checked_mul(active as u32).ok_or_else(|| RecipeError::new("NVIDIA native grid overflows"))?;
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry: Geometry { groups, block: geometry.block } })
 		}
 	}
 
@@ -20235,8 +23314,15 @@ impl Cuda {
 			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
-			let program = NativeCudaProgram { module: module as usize, unload: self.unload };
+			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
 			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+			// The single-position step fills every SM with as many warps as the
+			// kernel allows, as the AMD step does; the forward keeps the schedule
+			// width. Its launch carries the forward's reduction buffer, so its
+			// residency is asked with that buffer and not one scaled to its own block.
+			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
+			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
+			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 			Ok((program, forward, epoch, model_load))
@@ -20350,11 +23436,20 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 }
 
 impl NativeProgram {
+	fn step_geometry(&self) -> Option<Geometry> {
+		match &self.backend {
+			#[cfg(amd)]
+			NativeBackend::Amd(program) => program.step.map(|dispatch| dispatch.geometry),
+			#[cfg(nvidia)]
+			NativeBackend::Nvidia(program) => program.step.map(|dispatch| dispatch.geometry),
+			_ => None,
+		}
+	}
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, shapes: Vec<Option<NativeContractionShapes>>, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		native_epoch_layout(artifact.precision.state.bytes())?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
-		let element = u8::try_from(widest_precision(graph, artifact.precision.model).bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
+		let element = u8::try_from(schedule.element.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
 				let cpu = load_native_cpu(&artifact)?;
@@ -20437,6 +23532,10 @@ impl NativeProgram {
 		if single && let NativeBackend::Amd(program) = &self.backend && let Some(dispatch) = program.step {
 			return self.launch_dispatch(NativeEntry::Forward, arguments, dispatch.geometry.threads()?, dispatch);
 		}
+		#[cfg(nvidia)]
+		if single && let NativeBackend::Nvidia(program) = &self.backend && let Some(dispatch) = program.step {
+			return self.launch_dispatch(NativeEntry::Forward, arguments, dispatch.geometry.threads()?, dispatch);
+		}
 		let _ = single;
 		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?)
 	}
@@ -20515,11 +23614,22 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					.filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX))
 					.ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
 				let grid_sync = program.grid_sync as Ptr;
+				// The words live in device memory; the host writes them whole before
+				// each launch, the group count at its offset.
+				let mut sync_image = [0_u8; HSA_GRID_SYNC_BYTES];
+				let sync_words = |image: &mut [u8; HSA_GRID_SYNC_BYTES], program: &NativeHsaProgram| -> [u32; 2] {
+					let copied = (program.copy)(image.as_mut_ptr().cast(), program.grid_sync as *const c_void, HSA_GRID_SYNC_BYTES);
+					if copied != 0 {
+						return [u32::MAX; 2];
+					}
+					[u32::from_le_bytes([image[0], image[1], image[2], image[3]]), u32::from_le_bytes([image[4], image[5], image[6], image[7]])]
+				};
 				if tracing() {
-					trace(&format!("AMD grid sync before reset {:?}", std::slice::from_raw_parts(grid_sync.cast::<u32>(), HSA_GRID_SYNC_BYTES / size_of::<u32>())))?;
+					trace(&format!("AMD grid sync before reset {:?}", sync_words(&mut sync_image, program)))?;
 				}
-				ptr::write_bytes(grid_sync.cast::<u8>(), 0, HSA_GRID_SYNC_BYTES);
-				grid_sync.cast::<u8>().add(HSA_GRID_SYNC_GROUPS_OFFSET).cast::<u32>().write(groups);
+				sync_image = [0_u8; HSA_GRID_SYNC_BYTES];
+				sync_image[HSA_GRID_SYNC_GROUPS_OFFSET..HSA_GRID_SYNC_GROUPS_OFFSET + 4].copy_from_slice(&groups.to_le_bytes());
+				driver_status(Backend::Amd, (program.copy)(grid_sync, sync_image.as_ptr().cast(), HSA_GRID_SYNC_BYTES), "native grid sync reset")?;
 				if implicit_bytes != 0 {
 					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
 				}
@@ -20556,12 +23666,11 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					if completed == 0 {
 						break completed;
 					}
-					let words = std::slice::from_raw_parts(grid_sync.cast::<u32>(), HSA_GRID_SYNC_BYTES / size_of::<u32>());
-					let snapshot = [words[0], words[1]];
+					let snapshot = sync_words(&mut sync_image, program);
 					stalled = if snapshot == last { stalled + 1 } else { 0 };
 					last = snapshot;
 					if stalled >= 60 {
-						eprintln!("AMD dispatch {entry:?} stalled for 60s: grid sync words {words:?} groups={groups} threads={threads} block={block}");
+						eprintln!("AMD dispatch {entry:?} stalled for 60s: grid sync words {snapshot:?} groups={groups} threads={threads} block={block}");
 						break completed;
 					}
 				};
@@ -20738,7 +23847,11 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32 = runtime.function(b"cuModuleGetFunction\0")?;
 		let function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32 = runtime.function(b"cuFuncGetAttribute\0")?;
 		let occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32 = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
+		let driver_version: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDriverGetVersion\0")?;
 		let check = |s, a| driver_status(Backend::Nvidia, s, a);
+		let mut version = 0_i32;
+		check(driver_version(&mut version), "driver version query")?;
+		NVIDIA_DRIVER_VERSION.store(version.max(0) as u32, Ordering::Relaxed);
 		let mut count = 0;
 		check(init(0), "initialization")?;
 		check(count_devices(&mut count), "device enumeration")?;
@@ -21022,8 +24135,8 @@ unsafe extern "system" {
 unsafe extern "C" {
 	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
-	#[cfg_attr(windows, link_name = "_write")]
-	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
+	#[cfg(unix)]
+	fn poll(descriptors: *mut PollFd, count: usize, timeout: i32) -> i32;
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
@@ -21046,14 +24159,14 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 	tape.forward(ForwardMode::Training)?;
 	tape.predictions_at(graph.source, graph.output.elements())
 }
-fn surrogate_model(hidden: usize) -> Model {
-	recipe.model().layer(hidden).tanh().layer(1)
+fn surrogate_model(hidden: usize, precision: Compute) -> Model {
+	recipe.model().layer(hidden).arithmetic(precision).tanh().arithmetic(precision).layer(1).arithmetic(precision)
 }
 fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	require(!targets.is_empty(), "surrogate requires teacher outputs")?;
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
-	let model = surrogate_model(hidden);
+	let model = surrogate_model(hidden, config.precision);
 	let prepared = Prepared {
 		samples: samples.to_vec(),
 		targets: targets.to_vec(),
@@ -22252,7 +25365,7 @@ fn load_schedule_cache(path: &Path, identity: &str, schedule: &NativeSchedule, s
 		let current = [slot.forward, slot.gradient, slot.previous];
 		for direction in 0..3 {
 			let limits = [shape.forward, shape.gradient, shape.previous][direction];
-			let candidates = schedule_candidates(limits, current[direction], schedule, ratio, usize::MAX).ok()?;
+			let candidates = schedule_candidates(limits, current[direction], schedule, direction == 0, ratio, usize::MAX).ok()?;
 			if !candidates.contains(&cached[direction]) {
 				return None;
 			}
@@ -22316,12 +25429,12 @@ fn dominant_tile(shapes: &[Option<NativeContractionShapes>], contractions: &[Opt
 /// so every candidate preserves the reduction order. The current tile comes
 /// first, and at most `budget` alternatives follow it. Matrix candidates keep
 /// the compiled 16x16 fragment mapping and only narrow its mapped M/N span.
-fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, ratio: u32, budget: usize) -> Result<Vec<Tile>> {
+fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, forward: bool, ratio: u32, budget: usize) -> Result<Vec<Tile>> {
 	let mut candidates = vec![current];
 	if budget == 0 {
 		return Ok(candidates);
 	}
-	if schedule.matrix {
+	if schedule.matrix && forward {
 		for m_fragments in (1..=current.m / 16).rev() {
 			for n_fragments in (1..=current.n / 16).rev() {
 				let extent = Tile { m: m_fragments * 16, n: n_fragments * 16, k: current.k };
@@ -22453,7 +25566,8 @@ fn native_gradient_bytes(graph: &Graph, scratch_base: usize, contractions: &[Opt
 	let mut scratch = 0_usize;
 	for (index, contraction) in contractions.iter().enumerate() {
 		let Some(contraction) = contraction else { continue };
-		let element = graph.nodes.get(index).map_or(8, |node| node.precision.bytes());
+		let node = &graph.nodes[index];
+		let element = NativePrecision::new(node.precision, node.acc)?.state.bytes();
 		// The allocation covers either scalar or matrix partitioning. A backend
 		// using the larger span leaves the extra rows untouched.
 		let extent = contraction.gradient_shape.k as usize;
@@ -22586,6 +25700,11 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	}
 }
 impl Data {
+	fn report_path(&self) -> Result<String> {
+		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
+		Ok(format!("{}:{}", local_host()?, path.display()))
+	}
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
 		self.target = target.into_data_sources();
 		self
@@ -23821,7 +26940,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
 		let percentage = count as f64 * 100.0 / row_count as f64;
 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
-		eprintln!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]);
+		trace(&format!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]))?;
 	}
 	let schema = columns
 		.iter()
@@ -25719,7 +28838,11 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 fn embed(graph: &mut Graph, source: i32, shape: Shape, channels: impl IntoIterator<Item = Option<usize>>) -> Result<i32> {
 	let channels = channels.into_iter().collect::<Vec<_>>();
 	reset(graph, source, shape);
+	let precision = (graph.block_precision, graph.block_blck_precision);
+	graph.block_precision = Some(Compute::FP32);
+	graph.block_blck_precision = Some(Compute::FP32);
 	lower_project(graph, channels.len())?;
+	(graph.block_precision, graph.block_blck_precision) = precision;
 	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("channel embedding node is absent"))?;
 	let (offset, inputs, count) = (node.offset, node.input.channels, node.parameters);
 	for (output, input) in channels.into_iter().enumerate() {
@@ -25856,6 +28979,14 @@ impl RatFit {
 		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
 		self.tape.forward(ForwardMode::Inference)?;
 		self.tape.predictions()
+	}
+	/// Replace a scoring forward with forward plus reductions in the same dispatch.
+	fn measure(&mut self, samples: &[f64], targets: &[f64], config: Config) -> Result<EpochMetrics> {
+		require(!targets.is_empty() && samples.len() == targets.len() * self.width, "RAT metric target shape differs from its inputs")?;
+		self.reserve(targets.len())?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.program.artifact.layout.input_precision)?;
+		self.tape.targets.write_float_bytes(0, targets, self.tape.program.artifact.layout.output_precision)?;
+		self.tape.metric_launch(config)
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.tape.weights()
@@ -26018,9 +29149,7 @@ impl LearnedReplay {
 		// An empty selection is a valid outcome: the fit performs no optimizer
 		// step for it, and no fallback or rank heuristic stands in.
 		target.fit(samples, targets, &selected, steps, rate, config)?;
-		let predictions = target.predict(samples)?;
-		require(predictions.len() == targets.len(), "learned RAT target prediction count differs from observations")?;
-		let quality = coefficient(targets, &predictions);
+		let quality = target.measure(samples, targets, config)?.r2;
 		require(quality.is_finite(), "learned RAT primary surrogate R2 is not finite")?;
 		let score_input = learned_selection_input(&context, self.context_width, &proposals)?;
 		let scorer = self.selection_score.as_mut().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
@@ -26103,7 +29232,6 @@ pub struct Train {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
-	F(FloatFormat),
 	Fp(FloatFormat),
 	Int(IntFormat),
 	Bf(FloatFormat),
@@ -26111,55 +29239,52 @@ enum Compute {
 }
 impl Compute {
 	const FP8: Self = Self::Fp(FloatFormat::FP8);
+	const FP8_E5M2: Self = Self::Fp(FloatFormat::FP8_E5M2);
 	const FP16: Self = Self::Fp(FloatFormat::FP16);
 	const FP32: Self = Self::Fp(FloatFormat::FP32);
 	const FP64: Self = Self::Fp(FloatFormat::FP64);
-	const INT1: Self = Self::Int(IntFormat::INT1);
 	const INT4: Self = Self::Int(IntFormat::INT4);
 	const INT8: Self = Self::Int(IntFormat::INT8);
+	const INT16: Self = Self::Int(IntFormat::INT16);
+	const INT32: Self = Self::Int(IntFormat::INT32);
 	const BF16: Self = Self::Bf(FloatFormat::BF16);
 	const TF32: Self = Self::Tf(FloatFormat::TF32);
 	const fn bytes(self) -> usize {
 		match self {
-			Self::F(_) => FloatFormat::FP64.bytes(),
 			Self::Fp(value) | Self::Bf(value) | Self::Tf(value) => value.bytes(),
 			Self::Int(value) => value.bytes(),
 		}
 	}
 	fn pack(self, value: f64) -> u64 {
 		match self {
-			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.pack(value),
+			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.pack(value),
 			Self::Int(format) => format.pack(value),
 		}
 	}
 	fn unpack(self, bits: u64) -> f64 {
 		match self {
-			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.unpack(bits),
+			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.unpack(bits),
 			Self::Int(format) => format.unpack(bits),
 		}
 	}
 	fn optimizer_epsilon(self, value: f64) -> f64 {
 		let rounded = self.unpack(self.pack(value));
 		match self {
-			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded == 0.0 => format.arithmetic.unpack(1u64 << format.arithmetic.man),
+			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded == 0.0 => format.arithmetic.unpack(1u64 << format.arithmetic.man),
 			_ => rounded,
 		}
 	}
 	fn below_one(self, value: f64) -> f64 {
 		let rounded = self.unpack(self.pack(value));
 		match self {
-			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded >= 1.0 => format.arithmetic.unpack(format.arithmetic.pack(1.0) - 1),
+			Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded >= 1.0 => format.arithmetic.unpack(format.arithmetic.pack(1.0) - 1),
 			_ => rounded,
 		}
 	}
 	fn saved(family: &str, values: [u8; 4]) -> Option<Self> {
-		let [bits, exp, man, storage_man] = values;
 		match family {
-			"f" if bits == FloatFormat::FP64.storage.bits() && storage_man == FloatFormat::FP64.storage.man && exp != 0 && man != 0 && u16::from(exp) + u16::from(man) < 64 => {
-				Some(Self::F(FloatFormat::computed(exp, man)))
-			}
-			"fp" => [Self::FP8, Self::FP16, Self::FP32, Self::FP64].into_iter().find(|format| format.saved_fields().1 == values),
-			"int" => [Self::INT1, Self::INT4, Self::INT8].into_iter().find(|format| format.saved_fields().1 == values),
+			"fp" => [Self::FP8, Self::FP8_E5M2, Self::FP16, Self::FP32, Self::FP64].into_iter().find(|format| format.saved_fields().1 == values),
+			"int" => [Self::INT4, Self::INT8, Self::INT16, Self::INT32].into_iter().find(|format| format.saved_fields().1 == values),
 			"bf" if values == Self::BF16.saved_fields().1 => Some(Self::BF16),
 			"tf" if values == Self::TF32.saved_fields().1 => Some(Self::TF32),
 			_ => None,
@@ -26167,7 +29292,6 @@ impl Compute {
 	}
 	fn saved_fields(self) -> (&'static str, [u8; 4]) {
 		match self {
-			Self::F(value) => ("f", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
 			Self::Fp(value) => ("fp", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
 			Self::Int(value) => ("int", [value.bits, 0, 0, 0]),
 			Self::Bf(value) => ("bf", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
@@ -26176,7 +29300,8 @@ impl Compute {
 	}
 	fn label(self) -> String {
 		match self {
-			Self::F(value) => format!("f({},{})", value.arithmetic.exp, value.arithmetic.man),
+			Self::Fp(value) if value == FloatFormat::FP8 => "fp8(e4m3)".to_owned(),
+			Self::Fp(value) if value == FloatFormat::FP8_E5M2 => "fp8(e5m2)".to_owned(),
 			Self::Fp(value) => format!("fp{}", value.storage.bits()),
 			Self::Int(value) => format!("int{}", value.bits),
 			Self::Bf(value) => format!("bf{}", value.storage.bits()),
@@ -26219,6 +29344,7 @@ impl Train {
 		self
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
+		let _transfers = TransferScope::new();
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
@@ -26304,7 +29430,7 @@ impl Train {
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
 		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(samples), samples, &objectives, gpu, config.precision, Some(composition.loss))?;
-		tape.forward(ForwardMode::Inference)?;
+		let initial_composed = tape.metric_launch(config)?;
 		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
 		let node_values = |tape: &NativeTape| -> Result<Vec<f64>> {
 			let values = tape.predictions_at(composition.proposal as i32, proposal_width)?;
@@ -26322,7 +29448,6 @@ impl Train {
 			let initial_observation = observation(samples, &initial_predictions)?;
 			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
 		};
-		let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
 		// The `Loss` field reports the evaluator model's loss. The external
 		// command score is reported separately through `Score`; it is not a
 		// substitute for the evaluator's loss.
@@ -26331,8 +29456,11 @@ impl Train {
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
-		let mut last_evaluator_r2 = None;
-		let mut last_evaluator_loss = f64::NAN;
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
+		let mut rat_history = RatHistory::default();
+		let mut initial_rat = RatPoint::default();
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -26364,26 +29492,37 @@ impl Train {
 				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
 				indices.len()
 			};
-			let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-			let evaluator_r2 = coefficient(&evaluation_targets, &evaluator_predictions);
-			let evaluator_loss = model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7]);
-			last_evaluator_r2 = Some(evaluator_r2);
-			last_evaluator_loss = evaluator_loss;
+			let before_fit = (iteration == 0 && fitting.tape.step != 0).then(|| fitting.tape.epoch_metrics()).transpose()?;
+			let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
+			let evaluator_r2 = evaluated.r2;
+			let evaluator_loss = evaluated.loss;
 			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
-			tape.forward(ForwardMode::Inference)?;
+			let composed = tape.metric_launch(config)?;
 			let predictions = node_values(&tape)?;
 			let (measured_score, reward) = if full_set {
-				(replay.raw.iter().sum::<f64>() / replay.raw.len() as f64, mean(&evaluation_targets))
+				let reward = evaluated.target_sum / evaluated.count as f64;
+				(reward, reward)
 			} else {
 				let observed = observation(sample, &predictions)?;
 				let raw_score = command.evaluate(&input_names, &observed)?[0];
 				(raw_score, replay.observe(&observed, raw_score)?)
 			};
 			if iteration == 0 {
-				initial_loss = evaluator_loss;
+				let before_fit = before_fit.unwrap_or(evaluated);
+				initial_loss = before_fit.loss;
+				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: if full_set { evaluated.target_sum / evaluated.count as f64 } else { initial_reward } }, pred: RatModelPoint { r2: f64::NAN, reward: initial_composed.predicted_mean() } };
 			}
 			measured_reward = reward;
-			measured_predictions = predictions;
+			measured_predictions = predictions.clone();
+			let epoch = iteration + 1;
+			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: measured_score }, pred: RatModelPoint { r2: f64::NAN, reward: composed.predicted_mean() } };
+			loss_history.push(epoch, evaluator_loss);
+			prediction_history.push(epoch, predictions);
+			r2_history.push(epoch, evaluator_r2);
+			rat_history.eval.r2.push(epoch, rat.eval.r2);
+			rat_history.eval.reward.push(epoch, rat.eval.reward);
+			rat_history.pred.r2.push(epoch, rat.pred.r2);
+			rat_history.pred.reward.push(epoch, rat.pred.reward);
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
 			self.print_rat(model, composition.loss.name(), run, tape.step as usize, self.epochs, evaluator_loss, evaluator_r2, seconds, &tape.schedule(), measured_score, fitted_rows, proposal_rows)?;
@@ -26401,26 +29540,13 @@ impl Train {
 			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
 				replay.observe(row, value)?;
 			}
-			let (_, final_targets) = replay.snapshot();
-			measured_reward = mean(&final_targets);
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
-		let evaluator_predictions = fitting.predict(&evaluation_samples)?;
-		let evaluator_r2 = last_evaluator_r2.or_else(|| (!evaluation_targets.is_empty()).then(|| coefficient(&evaluation_targets, &evaluator_predictions)));
-		let predicted_reward = if evaluation_targets.is_empty() {
-			None
-		} else if full_set {
-			Some(mean(&evaluator_predictions))
-		} else {
-			Some(mean(&fitting.predict(&evaluation_samples[evaluation_samples.len() - observation_width..])?))
-		};
-		let final_loss = if last_evaluator_loss.is_finite() {
-			last_evaluator_loss
-		} else if evaluator_r2.is_some() {
-			model_loss(&evaluator_predictions, &evaluation_targets, composition.loss, config.activation[7])
-		} else {
-			f64::NAN
-		};
+		let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
+		if full_set { measured_reward = evaluated.target_sum / evaluated.count as f64; }
+		let evaluator_r2 = Some(evaluated.r2);
+		let predicted_reward = Some(tape.epoch_metrics()?.predicted_mean());
+		let final_loss = evaluated.loss;
 		let selected_tile = tape.tile();
 		let schedule = tape.schedule();
 		tape.capture(&mut composition.graph)?;
@@ -26444,12 +29570,21 @@ impl Train {
 			stored.artifact = bundle::artifact_key(&composition.storage_model, &prepared.schema, config.precision, &composition.proposer, native_target_label(&gpu.native_target));
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
+		let final_evaluator_r2 = evaluator_r2.unwrap_or(f64::NAN);
+		let final_predicted_reward = predicted_reward.unwrap_or(f64::NAN);
+		let final_measured_reward = measured_reward;
+		let final_rat = RatPoint { eval: RatModelPoint { r2: final_evaluator_r2, reward: final_measured_reward }, pred: RatModelPoint { r2: f64::NAN, reward: final_predicted_reward } };
+		if self.epochs == 0 { initial_loss = final_loss; initial_rat = final_rat; }
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_rat.eval.r2, rat: initial_rat };
+		let fnl = TrainingPoint { loss: final_loss, predictions: measured_predictions.clone(), r2: final_evaluator_r2, rat: final_rat };
+		let observability = single_training_observability(data.report_path()?, proposal_rows, &tape, None, None, itl, loss_history, prediction_history, r2_history, rat_history, fnl, self.epochs, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions: measured_predictions,
-			r2: f64::NAN,
+			final_predictions: measured_predictions,
+			final_r2: f64::NAN,
 			evaluator_r2,
 			validation_r2: None,
 			predicted_reward,
@@ -26495,7 +29630,15 @@ impl Train {
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(width, gpu, config)).transpose()?;
 		let mut episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
 		let initial_predictions = episode.action.clone();
+		let initial_reward = episode.score;
+		let initial_predicted_reward = tape.predictions()?[0];
+		let mut predicted_reward = initial_predicted_reward;
 		let (mut initial_loss, mut final_loss, mut evaluator_r2, mut epoch_seconds) = (f64::NAN, f64::NAN, f64::NAN, 0.0);
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
+		let mut rat_history = RatHistory::default();
+		let mut initial_rat = RatPoint::default();
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
 		for iteration in 0..self.epochs {
 			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during stateful RAT training")?;
@@ -26519,11 +29662,14 @@ impl Train {
 				fitting.fit(&samples, &targets, &(0..targets.len()).collect::<Vec<_>>(), 1, config.surrogate_rate, config)?;
 				targets.len()
 			};
-			let predictions = fitting.predict(&samples)?;
-			final_loss = model_loss(&predictions, &targets, composition.loss, config.activation[7]);
-			evaluator_r2 = coefficient(&targets, &predictions);
+			let before_fit = (iteration == 0 && fitting.tape.step != 0).then(|| fitting.tape.epoch_metrics()).transpose()?;
+			let evaluated = fitting.measure(&samples, &targets, config)?;
+			final_loss = evaluated.loss;
+			evaluator_r2 = evaluated.r2;
 			if iteration == 0 {
-				initial_loss = final_loss;
+				let before_fit = before_fit.unwrap_or(evaluated);
+				initial_loss = before_fit.loss;
+				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: initial_reward }, pred: RatModelPoint { r2: f64::NAN, reward: initial_predicted_reward } };
 			}
 			// One proposer update uses a retained decision state. All labels are
 			// the evaluator's terminal score, never a fabricated intermediate score.
@@ -26535,14 +29681,22 @@ impl Train {
 				RatFrame::Score(_) => return Err(RecipeError::new("stateful RAT reset did not produce a decision state")),
 			};
 			episode = rat_episode(&mut session, first, &names, &outputs, &mut tape, composition.proposal)?;
+			predicted_reward = episode.observations.last().map(|observation| fitting.measure(observation, &[episode.score], config).map(EpochMetrics::predicted_mean)).transpose()?.unwrap_or(f64::NAN);
+			let epoch = iteration + 1;
+			let rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward: episode.score }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
+			loss_history.push(epoch, final_loss);
+			prediction_history.push(epoch, episode.action.clone());
+			r2_history.push(epoch, evaluator_r2);
+			rat_history.eval.r2.push(epoch, rat.eval.r2);
+			rat_history.eval.reward.push(epoch, rat.eval.reward);
+			rat_history.pred.r2.push(epoch, rat.pred.r2);
+			rat_history.pred.reward.push(epoch, rat.pred.reward);
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
 			self.print_rat(model, composition.loss.name(), run, iteration + 1, self.epochs, final_loss, evaluator_r2, seconds, &tape.schedule(), episode.score, fitted_rows, episode.observations.len())?;
 		}
 		session.finish()?;
 		let reward = episode.score;
-		let final_observation = episode.observations.last().ok_or_else(|| RecipeError::new("stateful RAT episode has no decisions"))?;
-		let predicted_reward = fitting.predict(final_observation)?[0];
 		tape.capture(&mut composition.graph)?;
 		extract_rat_proposer(&composition.graph, &mut composition.proposer, proposer_parameters);
 		if let Some(path) = &self.save {
@@ -26565,12 +29719,18 @@ impl Train {
 			stored.bn_stats.truncate(proposer_bn);
 			bundle::save_semantic(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 		}
+		let path = format!("{}:{}", local_host()?, command.path.display());
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_rat.eval.r2, rat: initial_rat };
+		let final_rat = RatPoint { eval: RatModelPoint { r2: evaluator_r2, reward }, pred: RatModelPoint { r2: f64::NAN, reward: predicted_reward } };
+		let fnl = TrainingPoint { loss: final_loss, predictions: episode.action.clone(), r2: evaluator_r2, rat: final_rat };
+		let observability = single_training_observability(path, 1, &tape, None, None, itl, loss_history, prediction_history, r2_history, rat_history, fnl, self.epochs, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions: episode.action,
-			r2: f64::NAN,
+			final_predictions: episode.action,
+			final_r2: f64::NAN,
 			evaluator_r2: Some(evaluator_r2),
 			validation_r2: None,
 			predicted_reward: Some(predicted_reward),
@@ -26600,7 +29760,7 @@ impl Train {
 			}
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
-				if let Some(seed) = self.seed {
+			if let Some(seed) = self.seed {
 				config.random_seed = seed;
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
@@ -26646,7 +29806,6 @@ impl Train {
 			&tape,
 			None,
 		)?;
-		tape.print_devices(&stored.graph)?;
 		if let Err(error) = tape.tune(self.learning_rate, self.epochs, config) {
 			// An interrupt during pre-epoch tuning restores the measured state and
 			// follows the same one-checkpoint exit path as an interrupted real epoch.
@@ -26655,12 +29814,15 @@ impl Train {
 		}
 		// The initial report must come from the selected runtime schedule, not
 		// from the heuristic forward that initialized the tape before tuning.
-		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
-		stored.bn_stats = tape.extract_bn_stats()?;
+		let (initial_metrics, _) = self.finish_dispatch(tape.metrics(config), &mut stored, &prepared.schema, &tape, None)?;
 		let initial_predictions = tape.predictions()?;
-		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
+		stored.bn_stats = tape.extract_bn_stats()?;
+		let initial_loss = initial_metrics.loss;
+		let initial_r2 = initial_metrics.r2;
+		let mut loss_history = ScalarHistory::default();
+		let mut prediction_history = PredictionHistory::default();
+		let mut r2_history = ScalarHistory::default();
 		let tolerance = self.stop.unwrap_or(0.0);
-		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		for _ in 0..self.epochs {
@@ -26672,29 +29834,32 @@ impl Train {
 			let epoch = tape.step() as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
-			let ((loss, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+			let ((metrics, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
-				let ((loss, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
-				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
+				let ((metrics, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+				let predictions = tape.predictions()?;
 				if checkpoint_requested {
 					stored.bn_stats = tape.extract_bn_stats()?
 				}
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, checkpoint_requested.then_some(()))?;
 				let checkpoint = checkpoint.or(persisted);
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
-				Ok((loss, checkpoint.or(persisted), predictions))
+				Ok((metrics, checkpoint.or(persisted), predictions))
 			})?;
-			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, checkpoint, live, &schedule)?;
+			epoch_seconds += if metrics.device_seconds > 0.0 { metrics.device_seconds } else { seconds };
+			loss_history.push(epoch, metrics.loss);
+			prediction_history.push(epoch, predictions.clone());
+			r2_history.push(epoch, metrics.r2);
+			self.print(model, run, epoch, self.epochs, metrics.loss, metrics.r2, seconds, checkpoint, live, &schedule)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
 		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
-		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
+		let (mut final_metrics, _) = self.finish_dispatch(tape.metrics(config), &mut stored, &prepared.schema, &tape, None)?;
 		let raw_predictions = tape.predictions()?;
-		let mut final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
+		let mut final_loss = final_metrics.loss;
 		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
 		let mut evaluated = Vec::new();
 		if evaluation && data.autoregressive {
@@ -26726,28 +29891,32 @@ impl Train {
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let validation_targets = &target_values[training_values..];
-			let raw = tape.evaluate(&graph, &prepared.samples, training_rows)?;
-			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
+			let (raw, validation_metrics) = tape.evaluate(&graph, &prepared.samples, &target_values, training_rows, model.loss, config)?;
+			final_loss = validation_metrics.loss;
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
+			final_metrics.r2 = validation_metrics.r2;
 		}
 		let r2 = if training_rows == prepared.rows {
-			coefficient(&prepared.targets, &predictions)
+			final_metrics.r2
 		} else if evaluation && data.autoregressive {
 			coefficient(&prepared.targets[training_rows..], &predictions[training_rows..])
 		} else {
-			coefficient(&prepared.targets[training_values..], &evaluated)
+			final_metrics.r2
 		};
 		if !evaluated.is_empty() {
 			predictions = evaluated
 		}
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
+		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_r2, rat: RatPoint::default() };
+		let fnl = TrainingPoint { loss: final_loss, predictions: predictions.clone(), r2, rat: RatPoint::default() };
+		let observability = training_observability(data, training_rows, &tape, itl, loss_history, prediction_history, r2_history, RatHistory::default(), fnl, tape.step() as usize, epoch_seconds)?;
 		Ok(TrainingReport {
+			observability,
 			initial_loss,
 			final_loss,
 			initial_predictions,
-			predictions,
-			r2,
+			final_predictions: predictions,
+			final_r2: r2,
 			evaluator_r2: None,
 			validation_r2: None,
 			predicted_reward: None,
@@ -26772,13 +29941,13 @@ impl Train {
 		result.map(|value| (value, checkpoint))
 	}
 	fn print(
-		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
+		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, r2: f64, seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
 		schedule: &str,
 	) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
 		}
-		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then(|| coefficient(targets, predictions));
+		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then_some(r2);
 		Self::write_progress(
 			&Self::metric_line(
 				model.loss.name(),
@@ -26793,8 +29962,8 @@ impl Train {
 		)
 	}
 	fn print_evaluation(&self, model: &Model, report: &TrainingReport) {
-		let defaults = [Loss, R2];
-		let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics };
+		if self.log_metrics.is_empty() { return; }
+		let metrics = &self.log_metrics;
 		Self::write_progress(
 			&Self::metric_line(
 				model.loss.name(),
@@ -26802,7 +29971,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.final_r2), seconds: report.seconds, checkpoint: None, evaluation: true, score: None, window: None, choices: None },
 			),
 			false,
 			true,
@@ -26947,12 +30116,38 @@ struct Metrics {
 	window: Option<usize>,
 	choices: Option<usize>,
 }
+#[derive(Default)]
+pub struct TrainingObservability {
+	pub llvm: LlvmReport,
+	pub path: String,
+	pub rows: usize,
+	pub formats: ReportLines,
+	pub memory: ReportLines,
+	pub links: ReportLines,
+	pub aot: ReportLines,
+	pub tiles: ReportLines,
+	pub grids: ReportLines,
+	pub load: DurationReport,
+	pub compile: DurationReport,
+	pub itl: TrainingPoint,
+	pub loss: ScalarHistory,
+	pub predictions: PredictionHistory,
+	pub r2: ScalarHistory,
+	pub rat: RatHistory,
+	pub fnl: TrainingPoint,
+	eps: f64,
+}
+impl TrainingObservability {
+	pub fn eps(&self) -> f64 { self.eps }
+}
+
 pub struct TrainingReport {
+	observability: TrainingObservability,
 	initial_loss: f64,
 	final_loss: f64,
 	initial_predictions: Vec<f64>,
-	predictions: Vec<f64>,
-	r2: f64,
+	final_predictions: Vec<f64>,
+	final_r2: f64,
 	/// On a command-RAT run: the evaluator's R-squared over the observations it
 	/// fitted, over measured proposals withheld from fitting when there are any,
 	/// its predicted raw score for the last proposal, and the command's measured
@@ -26968,6 +30163,10 @@ pub struct TrainingReport {
 	seconds: f64,
 	epoch_seconds: f64,
 }
+impl std::ops::Deref for TrainingReport {
+	type Target = TrainingObservability;
+	fn deref(&self) -> &Self::Target { &self.observability }
+}
 impl TrainingReport {
 	pub const fn initial_loss(&self) -> f64 {
 		self.initial_loss
@@ -26979,10 +30178,10 @@ impl TrainingReport {
 		&self.initial_predictions
 	}
 	pub fn predictions(&self) -> &[f64] {
-		&self.predictions
+		&self.final_predictions
 	}
 	pub const fn r2(&self) -> f64 {
-		self.r2
+		self.final_r2
 	}
 	/// The evaluator's R-squared over the observations it fitted, on a command-RAT run.
 	pub const fn evaluator_r2(&self) -> Option<f64> {
@@ -27049,4 +30248,3 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
-

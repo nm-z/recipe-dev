@@ -40,35 +40,35 @@ let model = recipe.model()
 ```
 ```rust
 	.loss(mae|mse|...)|.loss(&evaluator)
-```
 ```r
-frozen.blck.atvn.norm.quant.prec = block
-  │      │    │    │    │     └─ precision it computes in
-  │      │    │    │    └─────── quantization it is stored in
-  │      │    │    └──────────── normalization
-  │      │    └───────────────── activation
-  │      └────────────────────── ""
-  └───────────────────────────── frozen qualifier
+frozen.blck.atvn.norm.prec = block
+	│      │    │    │    └─ precision it computes in
+	│      │    │    └────── normalization
+	│      │    └─────────── activation
+	│      └──────────────── ""
+	└─────────────────────── frozen qualifier
 ```
-
-Every block may name its own `quant` and `prec`: train writes the `quant`, infer reads what the file holds unless the block names another, and both compute in the `prec`. A precision names the op right before it: right after `layer(n)`, `attn(h)` or `embed(v, d)` it is that op's, the sum and how its numbers are stored; after `.kv(k)` it is the cache's; after `.gelu()`, `.norm(rms)`, `.qk(rms)`, `.rope(...)` or `.yarn(...)` it is the block's other ops'. `layer(n).int(8).gelu().fp(32)` is an int8 sum and an fp32 gelu. An int precision on a sum is its storage: int8 weights sit in VRAM as Q8_0 blocks and int4 as Q4_0, one step size per 32, multiplied as ints against int8 inputs and scaled once per block; every other precision loads its weights into itself once. Nothing decodes a weight in a kernel. A precision on `res([...])` is the add's alone; each part inside names its own. An op that names none takes the run's table: `[precision.<name>]` in Cargo.toml, chosen by `recipe run x.rs --config <name>`, with `default-config` under `[precision]`. Train and infer take no precision, and neither does `recipe.model()` before a block.
 
 ```rust
 let model = recipe.model()
-	.embed(tokenizer.ggml.tokens, gemma3.embedding_length)
-	.layer(gemma3.feed_forward_length).gelu().qi(4).k.m.int(4)
-	.layer(gemma3.embedding_length).qi(8).0.fp(16)
-	.layer(tokenizer.ggml.tokens).qi(6).k.int(8);
+	.embed(tokenizer.ggml.tokens, gemma3.embedding_length).fp(16)
+	.layer(gemma3.feed_forward_length).int(4).gelu().fp(16)
+	.layer(gemma3.embedding_length).int(8)
+	.layer(tokenizer.ggml.tokens).int(8);
 
 recipe.train().run(&model, &data);
 recipe.infer().run(&model, &data);
 ```
 
-**blocks:**
+```rb
+attn(heads).int(8)
+	.kv(kv_heads).fp(16)
+	.qk(rms).fp(16)
+	.rope(neox, head_width, rope_base)
+	.yarn(factor, original_context, fast, slow).fp(32)
+```
 
 ```rust
-blck:
-	layer(neurons)
 	conv(filters, kernel)
 	rnn(hidden)
 	gru(hidden)
@@ -84,7 +84,7 @@ blck:
 	attention:
 		attn(heads)
 			.width(d)
-			.kv(heads)            // key and value heads; a precision right after names the cache: .kv(heads).fp(16)
+			.kv(heads).fp(...)
 			.qk(rms|l2)
 			.rope(neox, dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
@@ -116,27 +116,15 @@ norm:
 	.norm(layer)
 	.norm(rms)
 	.norm(l2)
-quant:
-	quantized integer:
-		.qi(4|5|8).(0|1)
-		.qi(2|6|8).k
-		.qi(3).k.[s|m|l]
-		.qi(4|5).k.[s|m]
-		.qi(4).nf
-	importance quantized:
-		.iq(1).(s|m)
-		.iq(2|3).(xxs|xs|s|m)
-		.iq(4).(xs|nl)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
 	.no(bias)
 prec:
 	.fp(8|16|32|64)
-	.int(1|4|8)
+	.int(4|8|16|32)
 	.bf(16)
 	.tf(32)
-	.f(exp, mantissa)
 ```
 
 **compositions**
@@ -171,16 +159,52 @@ recipe.train()
 .rat(history|rolling|online|learned|full, "./evaluate")
 .target(value)
 observe:
-	.log(Run|Loss|R2|Time|Epoch|blck|tile|Score|Choices|Window|chat|debug|all|dev)
+	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window])
+	.log(all) // run, time, epoch, r2, loss, blck
+	.log(dev) // tile, score, choices, window
 ```
 
 ## **Infer**
 
 ```rust
 let prediction = recipe.predict("model.ogdl", &input);
-recipe.infer().log([chat]).run(&model, &data);
+recipe.infer().chat(recipe::infer::text).run(&model, &data);
 ```
 
 ```rust
 .tokens(count)
+```
+
+## Terminal chat and remote execution
+
+```bash
+recipe run rnj-1.rs --device archy:nv6.nv7 --context 128
+```
+
+```rust
+use recipe::infer::{cached, input, out, pp, tg, time};
+let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+println!("prediction {:?}", report.prediction);
+println!("dead buffers {}", report.dead_buffers);
+println!("dead bytes {}", report.dead_bytes);
+```
+
+```rust
+println!("{}", model.memory(&data, 32768).unwrap());
+```
+
+## GGUF statistics
+
+```bash
+recipe stats model.gguf
+```
+
+## Precision and reference checks
+
+
+```toml
+fp8 = "e4m3"       # or e5m2
+train = "fp32"
+tolerance = 0.05   # Maximum logit difference
+exact-cpu = false  # compared to cpu
 ```

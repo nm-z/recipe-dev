@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <device[.device...]>] [--config <precision table>] [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--config <precision table>] [--context <positions>] [--message <text>] [export]\n\trecipe stats <file.gguf>\n\trecipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -58,7 +58,7 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
-fn run(source: &Path, device: Option<&str>, config: Option<&str>) {
+fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)]) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -79,6 +79,20 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>) {
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
+	}
+	// Set the launch settings before the remote boundary so the model receives
+	// the same configuration whether its files are local or on the target machine.
+	for (key, value) in settings { unsafe { std::env::set_var(key, value); } }
+	let inherited_device = std::env::var("RECIPE_DEVICE").ok();
+	if let Some(selection) = device.or(inherited_device.as_deref()) {
+		match recipe::run_remote_script(&output, selection, config) {
+			Ok(Some(status)) => {
+				fs::remove_file(&output).ok();
+				std::process::exit(status.code().unwrap_or(1));
+			}
+			Ok(None) => {}
+			Err(error) => { fs::remove_file(&output).ok(); invalid(&error.to_string()); }
+		}
 	}
 	let mut command = Command::new(&output);
 	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
@@ -102,7 +116,23 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device, mut config) = (None::<String>, None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
+	let mut settings = Vec::new();
 	while let Some(argument) = arguments.next() {
+		if matches!(argument.as_str(), "--help" | "-h") { println!("{USAGE}"); return; }
+		if matches!(argument.as_str(), "--context" | "--message") {
+			let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			let key = if argument == "--context" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
+			if argument == "--context" && value.parse::<usize>().ok().is_none_or(|n| n == 0) { invalid("context must be a positive integer"); }
+			if settings.iter().any(|(name, _)| name == key) { invalid("a run option may be specified only once"); }
+			settings.push((key.to_owned(), value));
+			continue;
+		}
+		if argument == "stats" && source.is_none() {
+			let path = arguments.next().unwrap_or_else(|| invalid("recipe stats requires a GGUF file"));
+			if arguments.next().is_some() { invalid(USAGE); }
+			recipe::stats(&path).unwrap_or_else(|error| invalid(&error.to_string()));
+			return;
+		}
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
 			recipe::worker_serve(&name).unwrap_or_else(|error| {
@@ -155,7 +185,7 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		None => run(source, device, config.as_deref()),
+		None => run(source, device, config.as_deref(), &settings),
 		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
 		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),
