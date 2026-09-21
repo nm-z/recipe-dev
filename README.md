@@ -2,16 +2,13 @@
 
 GPU/CPU ML training and inference in Rust.
 
-key:<br>
-`.`       optional continue<br>
-`[...]`   optional children<br>
-`|`       chain alternative<br>
-`(...)`   multiple children
-
 **Devices**
 
 ```bash
-recipe run train.rs --device amd0.cpu.archy:cpu.nv7.nv8
+recipe run train.rs --config recipe --device amd0.cpu.archy:nv7.nv8 --context 4096 --message "text"
+recipe run model.rs --config llamacpp --context 4096 --message "text"
+recipe run model.rs --device amd0 export
+recipe --worker nv0
 ```
 
 ## **Data**
@@ -27,6 +24,13 @@ let data = recipe.data("measurements/")
 data(path|auto)
 	.set(add)
 	.include([features])|exclude([features])
+	.test(sources)
+```
+
+```rust
+data.value("gemma3.embedding_length")
+data.tensor("blk.0.attn_q.weight").unwrap().shape[1]
+data.ngram().layer()
 ```
 
 ## **Model**
@@ -69,11 +73,31 @@ attn(heads).int(8)
 ```
 
 ```rust
+let attention = recipe.model()
+	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
+	.delta_activations(Activation::Silu, Activation::Sigmoid)
+	.norm(rms);
+let model = recipe.model()
+	.epsilon(qwen35.attention.layer_norm_rms_epsilon)
+	.embed(tokenizer.ggml.tokens, qwen35.embedding_length)
+	.hyper(4, 320, &attention);
+```
+
+```rust
 	conv(filters, kernel)
+	dconv(kernel)
+		.dilate(steps)
 	rnn(hidden)
 	gru(hidden)
 	lstm(hidden)
+	delta(heads, kernel)
+		.keys(count, width)
+		.values(width)
+		.out(width)
+		.delta_activations(convolution, output)
 	perc(width)
+	glu(hidden, activation)
+	ple(&ngram)
 	estimators:
 		svm()
 		bayes()
@@ -84,11 +108,14 @@ attn(heads).int(8)
 	attention:
 		attn(heads)
 			.width(d)
+			.head(width)
 			.kv(heads).fp(...)
 			.qk(rms|l2)
 			.rope(neox, dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
+				.budget(tokens)
+				.score(rms|l2, dims)
 			.gate()
 atvn:
 	relu()
@@ -107,6 +134,8 @@ atvn:
 	huber()
 	tan()
 	scale(factor)
+	act(Activation::Silu)
+	activate(Activation::Silu)
 	feature reduction:
 		pool(size)
 		kmeans(clusters)
@@ -116,6 +145,8 @@ norm:
 	.norm(layer)
 	.norm(rms)
 	.norm(l2)
+	.epsilon(value)
+	.scale(factor)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
@@ -133,13 +164,19 @@ prec:
 	res([blocks])
 	ensemble([blocks])
 	recur([layer(width), activation])
+	hyper(lanes, rank, &branch)
 	block * block
+	block + block
 ```
 
-**operations:**
 ```rust
-left * right
-.scale(factor)
+let expert = [
+	layer(640).silu() * layer(640),
+	layer(2560),
+];
+let routed = moe(10, [expert; 512]);
+let shared = expert * layer(1).sigmoid();
+let combined = routed + shared;
 ```
 
 ## **Train**
@@ -153,44 +190,66 @@ recipe.train()
 	.run(&model, &data);
 ```
 
+---
+
+chopping block boundry welcome to sloptown:
+
+---
+
 ```rust
-.seed(value)
-.resume(path)
-.rat(history|rolling|online|learned|full, "./evaluate")
-.target(value)
-observe:
-	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window])
-	.log(all) // run, time, epoch, r2, loss, blck
-	.log(dev) // tile, score, choices, window
+train()
+	.lr(rate)
+	.stop(loss)
+	.epochs(count)
+	.seed(value)
+	.optimizer(adamw)
+	.save(path)|.resume(path)
+	.rat(history|rolling|online|learned|full, command)
+	.target(value)
+	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window]|all|dev)
+	.run(&model, &data)
+all:
+	run, time, epoch, r2, loss, blck
+dev:
+	tile, score, choices, window
 ```
 
 ## **Infer**
 
 ```rust
+let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
 let prediction = recipe.predict("model.ogdl", &input);
-recipe.infer().chat(recipe::infer::text).run(&model, &data);
 ```
 
 ```rust
-.tokens(count)
+infer()
+	.tokens(count)
+	.mtp(path)
+	.chat(text|[time, pp, tg, input, out, cached, mtp])
+	.log([chat, debug])
+	.run(&model, &data)
+predict(path, &input)
+gguf(path)
+	.tokenizer()
+		.encode(text)|.decode(&ids)|.stop_ids()
+sampler()
+	.temperature(value)|.top_k(count)|.top_p(mass)|.min_p(ratio)|.repeat(penalty, window)|.seed(value)
+	.sample(&logits, &previous)
+decode(path, &prompt, &mut sampler, &stop, budget)
+infer_ids(path, &[&ids])
+serve(path, address, requests)
+place(path, &[blocks])
+	.decode(&prompt, &mut sampler, &stop, budget)
+	.serve(address, requests)
+	.clear()
+	.split()[]|.resident_bytes()[]|.moved_bytes()
+	.memory()[]
 ```
 
 ## Terminal chat and remote execution
 
 ```bash
 recipe run rnj-1.rs --device archy:nv6.nv7 --context 128
-```
-
-```rust
-use recipe::infer::{cached, input, out, pp, tg, time};
-let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
-println!("prediction {:?}", report.prediction);
-println!("dead buffers {}", report.dead_buffers);
-println!("dead bytes {}", report.dead_bytes);
-```
-
-```rust
-println!("{}", model.memory(&data, 32768).unwrap());
 ```
 
 ## GGUF statistics
@@ -201,10 +260,94 @@ recipe stats model.gguf
 
 ## Precision and reference checks
 
-
 ```toml
-fp8 = "e4m3"       # or e5m2
-train = "fp32"
-tolerance = 0.05   # Maximum logit difference
-exact-cpu = false  # compared to cpu
+[precision]
+default-config = "recipe"
+
+[precision.<name>]
+sum|embed|attn|rope|atvn|norm|res = "int4"|"int8"|"int16"|"int32"|"fp8"|"fp16"|"bf16"|"tf32"|"fp32"|"fp64"
+acc|<kind>-acc = "fp32"|"fp64"
+train = "fp16"|"bf16"|"fp32"|"fp64"
+fp8 = "e4m3"|"e5m2"
+rope-angle = "direct"|"chain"
+attn-softmax = "full"|"online"
+math = "portable"|"libm"
+gelu-table = "none"|"fp16"
+exact-cpu = true|false
+tolerance = 0.05
+step = 32
+
+[storage.<name>]
+kv = "fp8"|"fp16"|"bf16"|"fp32"
+fp8 = "e4m3"|"e5m2"
+```
+
+```bash
+RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run model.rs --device archy:nv0
+RECIPE_REFERENCE=/path/reference.bin recipe run model.rs --device archy:nv0
+```
+
+## Reporting
+
+```rust
+let trained = recipe.train().run(&model, &data);
+let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+println!("loss {} r2 {}", trained.fnl.loss, trained.fnl.r2);
+println!("prediction {:?} tok/s {}", report.prediction, report.tg());
+println!("dead {} buffers {} bytes", report.dead_buffers, report.dead_bytes);
+println!("reference {:?}", report.reference);
+for operation in &report.operations {
+	println!("{} {} {:?} {:?}", operation.node, operation.operation, operation.fingerprints, operation.cache_fingerprints);
+}
+println!("{}", model.memory(&data, 32768));
+```
+
+```rust
+report.*
+	(load|compile).seconds()
+	path
+	(formats|memory|links|aot|tiles|grids)[]
+	llvm.(instructions|intrinsics)[]
+train().run().*
+	(itl|fnl).*
+		(loss|r2)
+		predictions[]
+		rat.(eval|pred).(r2|reward)
+	(loss|r2)[][]
+	predictions[][][]
+	rat.(eval|pred).(r2|reward)[][]
+	(initial_loss|final_loss|r2|epoch_seconds)()
+	(initial_predictions|predictions)()[]
+	(evaluator_r2|validation_r2|predicted_reward|measured_reward)()
+	tile()[]
+	rows
+infer().run().*
+	(pp|tg)()
+	time.seconds()
+	prediction
+	(input_ids|output_ids|logits)[]
+	(input|out|cached|reply_limit)
+	mtp.(drafted|accepted|verifications)
+	(context|requests)
+	history[].*
+		(time|prediction|input_ids|output_ids|logits|input|out|cached|reply_limit|mtp|reference|operations)
+	(dead_buffers|dead_bytes)
+	reference.*
+		(steps|worst)
+		flips[]
+			(step, reference, actual, gap)
+		failures[]
+			(step, message)
+	operations[].*
+		(device|model|block|node|operation)
+		(begin|end|positions|ticks|seconds)
+		(fingerprints|cache_fingerprints|cache_channel_fingerprints)[]
+			(position, fingerprint)
+decode().*
+	(ids|logits)[]
+	(cached|prefill_seconds|generation_seconds)
+	mtp.(drafted|accepted|verifications)
+	reference.(steps|worst|flips[]|failures[])
+model.memory(&data, positions).*|place().memory()[].*
+	(device|input|weights|values|contexts|scratch|dead|dead_buffers|total())
 ```
