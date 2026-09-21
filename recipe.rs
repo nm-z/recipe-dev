@@ -14419,12 +14419,6 @@ fn infer_ids(path: &Path, sequences: &[&[u32]], device: &'static Gpu) -> Result<
 	Ok(predictions.chunks(outputs).map(<[f64]>::to_vec).collect())
 }
 impl Recipe {
-	/// Opens a GGUF model, following every shard of a split, with its tensor data
-	/// mapped rather than read.
-	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf {
-		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
-		Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))
-	}
 	/// One output row of a saved model over `input`.
 	pub fn predict(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
