@@ -134,6 +134,17 @@ prec:
 	ensemble([blocks])
 	recur([layer(width), activation])
 	block * block
+	block + block
+```
+
+```rust
+let expert = [
+	layer(640).silu() * layer(640),
+	layer(2560),
+];
+let routed = moe(10, [expert; 512]);
+let shared = expert * layer(1).sigmoid();
+let combined = routed + shared;
 ```
 
 **operations:**
@@ -203,8 +214,31 @@ recipe stats model.gguf
 
 
 ```toml
+[precision.recipe]
 fp8 = "e4m3"       # or e5m2
 train = "fp32"
 tolerance = 0.05   # Maximum logit difference
 exact-cpu = false  # compared to cpu
+
+[storage.recipe]
+kv = "fp8"
+fp8 = "e4m3"       # or e5m2
 ```
+
+```bash
+RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run model.rs --device archy:nv0
+RECIPE_REFERENCE=/path/reference.bin recipe run model.rs --device archy:nv0
+```
+
+```rust
+println!("reference {:?}", report.reference);
+for operation in &report.operations {
+	println!("{} {} {:?}", operation.node, operation.operation, operation.fingerprints);
+	println!("KV {:?}", operation.cache_fingerprints);
+	println!("KV channels {:?}", operation.cache_channel_fingerprints);
+}
+```
+
+Reference runs collect `(position, fingerprint)` pairs for position-preserving outputs and final length-one outputs in the final execution window. Other outputs and non-reference runs leave `fingerprints` empty.
+`cache_fingerprints` contains stored K/V bit fingerprints after attention, covering up to one execution window ending at the operation's `end`, including retained positions before `begin`.
+`cache_channel_fingerprints` hashes the same window separately for each K/V channel.

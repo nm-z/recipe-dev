@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--config <precision table>] [--context <positions>] [--message <text>] [export]\n\trecipe stats <file.gguf>\n\trecipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--config <name>] [--context <positions>] [--message <text>] [export]\n\trecipe stats <file.gguf>\n\trecipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
