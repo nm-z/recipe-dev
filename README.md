@@ -6,9 +6,6 @@ GPU/CPU ML training and inference in Rust.
 
 ```bash
 recipe run train.rs --config recipe --device amd0.cpu.archy:nv7.nv8 --context 4096 --message "text"
-recipe run model.rs --config llamacpp --context 4096 --message "text"
-recipe run model.rs --device amd0 export
-recipe --worker nv0
 ```
 
 ## **Data**
@@ -21,16 +18,10 @@ let data = recipe.data("measurements/")
 ```
 
 ```rust
-data(path|auto)
-	.set(add)
+data("path or file"|auto)
+	.set("additional")
+	.test("test set")
 	.include([features])|exclude([features])
-	.test(sources)
-```
-
-```rust
-data.value("gemma3.embedding_length")
-data.tensor("blk.0.attn_q.weight").unwrap().shape[1]
-data.ngram().layer()
 ```
 
 ## **Model**
@@ -42,9 +33,8 @@ let model = recipe.model()
 	.layer(1)
 	.loss(mae);
 ```
+
 ```rust
-	.loss(mae|mse|...)|.loss(&evaluator)
-```r
 frozen.blck.atvn.norm.prec = block
 	│      │    │    │    └─ precision it computes in
 	│      │    │    └────── normalization
@@ -160,13 +150,13 @@ prec:
 
 **compositions**
 ```rust
-	moe(topk, [blocks])
-	res([blocks])
-	ensemble([blocks])
-	recur([layer(width), activation])
-	hyper(lanes, rank, &branch)
-	block * block
-	block + block
+	block * block  // f(x) * g(x) = z
+	block + block  // f(x) + g(x) = z
+	.res([blocks]) // f(x) + x = y
+	.recur([blocks]])
+	.ensemble([blocks])
+	.moe(topk, [blocks])
+	.hyper(lanes, rank, [blocks])
 ```
 
 ```rust
@@ -212,6 +202,12 @@ all:
 	run, time, epoch, r2, loss, blck
 dev:
 	tile, score, choices, window
+```
+
+## **RAT**
+
+```rust
+	.loss(mae|mse|...)|.loss(&evaluator)
 ```
 
 ## **Infer**
@@ -350,4 +346,39 @@ decode().*
 	reference.(steps|worst|flips[]|failures[])
 model.memory(&data, positions).*|place().memory()[].*
 	(device|input|weights|values|contexts|scratch|dead|dead_buffers|total())
+```
+
+## Approved
+
+```rust
+.rope(neox|pairs, dims, base)
+```
+
+## Proposed
+
+```rust
+.yarn(factor, og_ctx, b_fast, b_slow).scale(direct|chain)       // .yarn(factor, og_ctx, b_fast, b_slow)
+
+delta(heads, kernel)
+	.keys(count, width, tiled)                                  // .keys(count, width)
+	.qk(l2|rms)
+	.decay(softplus|sigmoid)
+
+attn(heads)
+	.gate(sigmoid|silu|tanh)                                    // .gate()
+
+hyper(lanes, [blocks])                                          // hyper(lanes, rank, &branch)
+hyper(lanes, [blocks], [blocks])
+
+moe(topk, [experts])                                            // moe(topk, [blocks])
+	.route(softmax|sigmoid)
+	.renorm()
+
+ple(&ngram)                                                     // ple(&ngram)
+	.norm(rms)
+	.gate(sigmoid|silu)
+	.act(silu)
+
+mtp([blocks])                                                   // .mtp(path)
+	.file(path)
 ```
