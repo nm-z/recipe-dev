@@ -14377,6 +14377,12 @@ impl Recipe {
 	}
 }
 
+pub fn keys(path: impl AsRef<Path>) -> Result<()> {
+	let file = Gguf::open(&resolve_path(path)?)?;
+	for (key, _) in file.metadata() { println!("key {key}"); }
+	for tensor in file.tensors() { println!("tensor {} kind={} shape={:?}", tensor.name, tensor.kind, tensor.shape); }
+	Ok(())
+}
 /// Print row-wise distribution statistics without expanding a whole tensor in
 /// memory. Participation is `(mean |w|)^2 / mean(w^2)`; outlier rows have RMS
 /// above the tensor's mean row RMS plus three standard deviations. Histogram

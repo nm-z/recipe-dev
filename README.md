@@ -245,6 +245,7 @@ recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 
 ```bash
 recipe stats model.gguf
+recipe keys model.gguf
 ```
 
 ## Precision and reference checks

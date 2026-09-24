@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -102,7 +102,6 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	}
 	#[cfg(unix)]
 	{
-		// Restore the terminal after Ctrl+C.
 		extern "C" fn wait_for_script(_: i32) {}
 		unsafe extern "C" { fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }
 		unsafe { signal(2, wait_for_script); }
@@ -132,14 +131,14 @@ fn main() {
 			let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			let key = if argument == "--ctx" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
 			if argument == "--ctx" && value.parse::<usize>().ok().is_none_or(|n| n == 0) { invalid("context must be a positive integer"); }
-			if settings.iter().any(|(name, _)| name == key) { invalid("a run option may be specified only once"); }
+			if settings.iter().any(|(name, _)| name == key) { invalid("run option repeated"); }
 			settings.push((key.to_owned(), value));
 			continue;
 		}
-		if argument == "stats" && source.is_none() {
-			let path = arguments.next().unwrap_or_else(|| invalid("recipe stats requires a GGUF file"));
+		if source.is_none() && (argument == "stats" || argument == "keys") {
+			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if arguments.next().is_some() { invalid(USAGE); }
-			recipe::stats(&path).unwrap_or_else(|error| invalid(&error.to_string()));
+			(if argument == "stats" { recipe::stats(&path) } else { recipe::keys(&path) }).unwrap_or_else(|error| invalid(&error.to_string()));
 			return;
 		}
 		if argument == "--device" {
