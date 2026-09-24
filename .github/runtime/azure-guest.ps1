@@ -313,9 +313,23 @@ try {
 	$runProcess = Start-Process `
 		-FilePath (Join-Path $work "target\release\recipe.exe") `
 		-ArgumentList @("--device", "nv0", (Join-Path $runtime "suite.rs")) `
-		-Wait -PassThru `
+		-PassThru `
 		-RedirectStandardOutput $runStdout `
 		-RedirectStandardError $runStderr
+	$runStarted = [DateTime]::UtcNow
+	$lastChecks = -1
+	while (!$runProcess.HasExited) {
+		Start-Sleep -Seconds 10
+		$checks = @(Select-String -LiteralPath $runStdout -Pattern '^check ' -ErrorAction SilentlyContinue).Count
+		$last = [string](Get-Content -LiteralPath $runStderr -Tail 1 -ErrorAction SilentlyContinue)
+		if ($last.Length -gt 180) { $last = $last.Substring(0, 180) }
+		if ($checks -ne $lastChecks) { Report-Phase "suite-checks-$checks stderr=$last"; $lastChecks = $checks }
+		if (([DateTime]::UtcNow - $runStarted).TotalSeconds -ge 300) {
+			Report-Phase "suite-timeout-checks-$checks stderr=$last"
+			& taskkill.exe /PID $runProcess.Id /T /F *> $null
+			throw "the runtime suite exceeded 300s after $checks completed checks"
+		}
+	}
 	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
 	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
 	Write-Output $log
