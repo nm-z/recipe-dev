@@ -1731,7 +1731,7 @@ impl BackendTarget {
 		match self {
 			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
-			Self::Nvidia { .. } => if native_nvidia_assembler().is_some() { "cubin" } else { "ptx" },
+			Self::Nvidia { architecture } => if native_nvidia_assembler(architecture).is_some() { "cubin" } else { "ptx" },
 		}
 	}
 
@@ -2456,6 +2456,7 @@ impl TargetMatch {
 	fn matches(self, target: &BackendTarget) -> bool {
 		match (self, target) {
 			(Self::Cpu, BackendTarget::Cpu { .. }) => true,
+			(Self::Amd("gfx12"), BackendTarget::Amd { architecture }) => matches!(architecture.as_str(), "gfx1200" | "gfx1201"),
 			(Self::Amd(prefix), BackendTarget::Amd { architecture }) => architecture.starts_with(prefix),
 			(Self::NvidiaAtLeast(minimum), BackendTarget::Nvidia { architecture }) => nvidia_sm(architecture).is_some_and(|sm| sm >= minimum),
 			(Self::Nvidia, BackendTarget::Nvidia { .. }) => true,
@@ -7839,8 +7840,9 @@ static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::
 /// compile time, so a run never waits on the driver to assemble it. A driver
 /// loads only objects from an assembler no newer than itself, so an assembler
 /// past the driver is left alone and the PTX goes to the driver as before.
-fn native_nvidia_assembler() -> Option<&'static str> {
+fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
 	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+	static TARGETS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
 	fn release_of(path: &str) -> Option<u32> {
 		let output = Command::new(path).arg("--version").output().ok()?;
@@ -7852,7 +7854,10 @@ fn native_nvidia_assembler() -> Option<&'static str> {
 	}
 	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
 	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
-	(driver != 0 && release <= driver).then_some(path)
+	if driver == 0 || release > driver { return None; }
+	let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+	let supported = *targets.entry(architecture.to_owned()).or_insert_with(|| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()));
+	supported.then_some(path)
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
@@ -7963,7 +7968,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
 				generated?;
 			}
-			if let Some(assembler) = native_nvidia_assembler() {
+			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
 				let mut command = Command::new(assembler);
@@ -18456,9 +18461,6 @@ fn expert(graph: &mut Graph, source: i32, shape: Shape, value: &Block, total: us
 	lower_block(graph, value, total, data, targets, rows, gpu, config)?;
 	Ok((graph.source, graph.output))
 }
-/// Adapt one branch to the canonical shape selected by the first MoE expert.
-/// The projection is learned over the flattened row, so it preserves every
-/// declared expert even when its sequence is shorter or longer.
 /// Adapt an expert's output to the mixture's shape: a per-position projection
 /// when only the channel count differs, and a projection over every element
 /// of the row only when the lengths differ, as the routers project.
@@ -22281,6 +22283,7 @@ struct Hsa {
 	simd_per_cu: u32,
 	waves_per_simd: u32,
 	vgprs_per_simd: u32,
+	vgpr_granule: u32,
 }
 const REMOTE_ALLOCATE: u8 = 1;
 const REMOTE_FREE: u8 = 2;
@@ -23337,7 +23340,7 @@ impl Hsa {
 			let vgprs = amd_kernel_vgprs(bytes, name)?;
 			let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
 			let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, element, layout)?;
-			let residency = AmdResidency { vgprs, vgprs_per_simd: self.vgprs_per_simd, waves_per_simd: self.waves_per_simd, simd_per_cu: self.simd_per_cu };
+			let residency = AmdResidency { vgprs, vgprs_per_simd: self.vgprs_per_simd, vgpr_granule: self.vgpr_granule, waves_per_simd: self.waves_per_simd, simd_per_cu: self.simd_per_cu };
 			let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup }, residency)?;
 			Ok(Dispatch { kernel, geometry })
 		}
@@ -23844,7 +23847,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
-		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
+		let target = format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100);
 		let native_target = BackendTarget::Amd { architecture: target.clone() };
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let reader_destroy: unsafe extern "C" fn(u64) -> i32 = runtime.function(b"hsa_code_object_reader_destroy\0")?;
@@ -23857,9 +23860,13 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
 		let simd_per_cu = kfd_property(&properties, "simd_per_cu")?.max(1);
 		let waves_per_simd = kfd_property(&properties, "max_waves_per_simd")?.max(1);
-		// The vector register file of one SIMD, in registers per lane: 1536 from gfx11,
-		// 1024 on gfx10, 512 before that.
-		let vgprs_per_simd = if gfx >= 110000 { 1536 } else if gfx >= 100000 { 1024 } else { 512 };
+		let (vgprs_per_simd, vgpr_granule) = match gfx {
+			120500..130000 => (1024, if wave == 32 { 16 } else { 8 }),
+			110000..120500 => (1536, if wave == 32 { 24 } else { 12 }),
+			100000..110000 => (1024, if wave == 32 { 16 } else { 8 }),
+			90010 | 90012 | 90400..90500 => (512, 8),
+			_ => (256, 4),
+		};
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
@@ -23899,6 +23906,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			simd_per_cu,
 			waves_per_simd,
 			vgprs_per_simd,
+			vgpr_granule,
 		};
 		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
@@ -23912,7 +23920,6 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		const BLOCK_LDS: i32 = 8;
 		const WAVE: i32 = 10;
 		const CUS: i32 = 16;
-		const INTEGRATED: i32 = 18;
 		const THREADS_PER_SM: i32 = 39;
 		const SM_LDS: i32 = 81;
 		const REGISTERS_PER_SM: i32 = 82;
@@ -23995,17 +24002,14 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				dispatch: Mutex::new(()),
 			})
 		};
-		let mut discrete = Vec::new();
+		let mut devices = Vec::new();
 		for ordinal in 0..count {
-			let (mut gpu, mut integrated) = (0, 0);
+			let mut gpu = 0;
 			check(get_device(&mut gpu, ordinal), "device enumeration")?;
-			check(attribute(&mut integrated, INTEGRATED, gpu), "device probe")?;
-			if integrated == 0 {
-				discrete.push(gpu)
-			}
+			devices.push(gpu);
 		}
-		require(!discrete.is_empty(), "Nvidia has no discrete GPU")?;
-		discrete.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
+		require(!devices.is_empty(), "Nvidia has no GPU")?;
+		devices.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
@@ -25700,6 +25704,7 @@ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, r
 struct AmdResidency {
 	vgprs: u32,
 	vgprs_per_simd: u32,
+	vgpr_granule: u32,
 	waves_per_simd: u32,
 	simd_per_cu: u32,
 }
@@ -25711,8 +25716,9 @@ fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, waves: u32, resources: Res
 	// once, or the grid barrier never completes. The register allocation bounds
 	// the waves one SIMD holds, so a workgroup wider than its compute unit is
 	// halved until it fits.
-	let allocated = residency.vgprs.next_multiple_of(8).max(8);
-	let simd_waves = (residency.vgprs_per_simd / allocated).clamp(1, residency.waves_per_simd);
+	let allocated = residency.vgprs.next_multiple_of(residency.vgpr_granule).max(residency.vgpr_granule);
+	require(allocated <= residency.vgprs_per_simd, "AMD kernel exceeds one SIMD register file")?;
+	let simd_waves = (residency.vgprs_per_simd / allocated).min(residency.waves_per_simd);
 	let cu_waves = simd_waves.saturating_mul(residency.simd_per_cu);
 	let mut waves = waves;
 	while waves > 1 && waves > cu_waves {
