@@ -345,18 +345,23 @@ try {
 			throw "the runtime suite exceeded 600s after $checks completed checks"
 		}
 	}
+	$runProcess.WaitForExit()
+	$exitCode = $runProcess.ExitCode
 	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
 	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
 	Write-Output $log
-	if ($runProcess.ExitCode -ne 0) { throw "the runtime suite failed with exit code $($runProcess.ExitCode)" }
-	Report-Phase "suite-ready"
+	if ($null -ne $exitCode -and $exitCode -ne 0) { throw "the runtime suite failed with exit code $exitCode" }
 	Pop-Location
 
-	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
+	if ($log -notmatch "SUITE PASS executed=8") { throw "the suite did not report eight passing checks" }
 	$route = ([regex]::Match($log, '(?m)^suite device (\S+)')).Groups[1].Value
 	if (-not $route) { throw "no suite device: training did not report its device" }
 	$device = $route.Split(':')[-1]
 	if ($device -notlike "nv*") { throw "expected an nv device, got '$device'; CPU fallback is a failure" }
+	$evidence = Get-Content -Raw -LiteralPath (Join-Path $work "evidence\suite.json") | ConvertFrom-Json
+	if ($evidence.executed -ne 8 -or $evidence.failed -ne 0) { throw "the suite evidence does not contain eight passing checks" }
+	$exitLabel = if ($null -eq $exitCode) { "unavailable" } else { [string]$exitCode }
+	Report-Phase "suite-ready checks=8 exit=$exitLabel"
 	Write-Output "executed on $route"
 
 	Write-Output "SUITE-EVIDENCE-BEGIN"
