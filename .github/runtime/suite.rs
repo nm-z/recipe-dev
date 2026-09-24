@@ -116,6 +116,8 @@ fn main() {
 	let model = recipe.model().layer(1).fp(PRECISION_BITS).loss(mse);
 	let bundle = work.join("linear.ogdl");
 	let trained = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).save(&bundle).run(&model, &linear);
+	let device = trained.memory.first().and_then(|line| line.split_whitespace().next()).expect("training reported no device memory");
+	println!("suite device {device}");
 	assert_eq!(trained.predictions().len(), LINEAR_ROWS, "linear.csv did not produce one prediction per row");
 	let worst = worst_absolute(&sorted(trained.predictions().iter().copied()), &sorted(linear_targets()));
 	report.record("linear_closed_form", worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={worst:.9} tolerance={CLOSED_FORM_TOLERANCE}"));

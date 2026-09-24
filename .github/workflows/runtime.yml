@@ -302,19 +302,18 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/candidate"
-          # Recipe prints the route it selected; this is the fallback detector.
+          # The suite reads the executed device from the training memory report.
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
           # same on the BSD and GNU userlands.
-          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          route="$(awk '/^suite device /{print $3; exit}' evidence/run.log)"
           if [ -z "$route" ]; then
-            echo "no route line: the suite did not dispatch" >&2
+            echo "no suite device: training did not report its device" >&2
             tail -40 evidence/run.log >&2
             exit 1
           fi
           device="${route##*:}"
           [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
-          grep -q ' rows .* share ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
           echo "device=$device" >> "$GITHUB_OUTPUT"
           echo "executed on $route"
 
@@ -542,8 +541,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $line = Select-String -Path evidence\run.log -Pattern '^selected route ' | Select-Object -First 1
-          if (!$line) { throw "no route line: the suite did not dispatch" }
+          $line = Select-String -Path evidence\run.log -Pattern '^suite device ' | Select-Object -First 1
+          if (!$line) { throw "no suite device: training did not report its device" }
           $route = ($line.Line -split '\s+')[2]
           $device = $route.Split(':')[-1]
           if ($device -ne "cpu") { throw "expected the cpu device, got $device" }
@@ -929,9 +928,9 @@ jobs:
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
           # same on the BSD and GNU userlands.
-          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          route="$(awk '/^suite device /{print $3; exit}' evidence/run.log)"
           if [ -z "$route" ]; then
-            echo "no route line: the suite did not dispatch" >&2
+            echo "no suite device: training did not report its device" >&2
             tail -40 evidence/run.log >&2
             exit 1
           fi

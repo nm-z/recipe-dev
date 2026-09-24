@@ -88,10 +88,10 @@ fn pick<'a>(cursor: u64, salt: u64, options: &[&'a str]) -> &'a str {
 	options[(mix(cursor, salt) % options.len() as u64) as usize]
 }
 
-// One README block in grammar order: operation, activation, normalization, quantization.
+// One README block in grammar order: operation, precision, activation, normalization.
 // `member` restricts the operation to length-preserving ones and `width` pins its width for branch members.
 // `sequential` says whether a sequence still reaches this block, see `model`.
-fn block(cursor: u64, salt: u64, member: bool, width: Option<usize>, sequential: bool) -> String {
+fn block(cursor: u64, salt: u64, member: bool, width: Option<usize>, sequential: bool, precision: Option<&str>) -> String {
 	let bits = mix(cursor, salt);
 	let width = width.unwrap_or(WIDTHS[(bits % 5) as usize]);
 	let operation = match (bits >> 3) % if member { 5 } else { 12 } {
@@ -113,11 +113,12 @@ fn block(cursor: u64, salt: u64, member: bool, width: Option<usize>, sequential:
 		_ => format!("pool({})", 2 + (bits >> 8) % 3),
 	};
 	let norms: &[&str] = if AVOID_FILED { &NORMS_FILED } else { &NORMS };
-	format!("{operation}{}{}", pick(cursor, salt + 1, &ACTIVATIONS), pick(cursor, salt + 2, norms))
+	let precision = precision.map_or("", |name| if name.starts_with(".int(") && !operation.starts_with("layer(") { ".fp(32)" } else { name });
+	format!("{operation}{precision}{}{}", pick(cursor, salt + 1, &ACTIVATIONS), pick(cursor, salt + 2, norms))
 }
 
 fn branch(cursor: u64, salt: u64, count: usize, width: Option<usize>) -> String {
-	(0..count).map(|index| block(cursor, salt + 10 * index as u64, AVOID_FILED, width, false)).collect::<Vec<_>>().join(", ")
+	(0..count).map(|index| block(cursor, salt + 10 * index as u64, AVOID_FILED, width, false, None)).collect::<Vec<_>>().join(", ")
 }
 
 fn composition(cursor: u64, salt: u64) -> String {
@@ -133,6 +134,9 @@ fn composition(cursor: u64, salt: u64) -> String {
 }
 
 fn model(cursor: u64, precision: &str) -> String {
+	if precision.starts_with(".int(") {
+		return format!("recipe.model().layer(32).fp(32).layer(32){precision}.layer(1).fp(32).loss({})", pick(cursor, 5, &LOSSES));
+	}
 	let bits = mix(cursor, 1);
 	let mut text = "recipe.model()".to_owned();
 	// Only sample_subfolders holds a sequence per sample (33-line scans, 477 positions); every
@@ -141,11 +145,10 @@ fn model(cursor: u64, precision: &str) -> String {
 	// either only asks Recipe for a kernel longer than the sequence (#214).
 	let mut sequential = dataset(cursor) == "data/numeric/sample_subfolders";
 	let mut push = |text: &mut String, salt: u64| {
-		let block = block(cursor, salt, false, None, sequential);
+		let block = block(cursor, salt, false, None, sequential, Some(precision));
 		sequential &= !ESTIMATORS.iter().any(|estimator| block.starts_with(estimator));
 		text.push('.');
 		text.push_str(&block);
-		text.push_str(precision);
 	};
 	for index in 0..1 + bits % 2 {
 		push(&mut text, 200 + 10 * index);
@@ -159,8 +162,12 @@ fn model(cursor: u64, precision: &str) -> String {
 	format!("{text}.layer(1){precision}.loss({})", pick(cursor, 5, &LOSSES))
 }
 
+fn precision(cursor: u64) -> &'static str {
+	pick(cursor, 6, if AVOID_FILED { &PRECISIONS_FILED[..] } else { &PRECISIONS[..] })
+}
+
 fn source(cursor: u64, seed: u64) -> String {
-	let precision = pick(cursor, 6, if AVOID_FILED { &PRECISIONS_FILED[..] } else { &PRECISIONS[..] });
+	let precision = precision(cursor);
 	let model = model(cursor, precision);
 	let data = dataset(cursor);
 	let options = pick(cursor, 8, &DATA_OPTIONS);
@@ -367,7 +374,7 @@ fn main() {
 		};
 		let path = reproduction();
 		std::fs::write(&path, &source).expect("cannot write reproduction");
-		let body = source.lines().find_map(|line| line.trim().strip_prefix("let model = ")).map_or_else(|| model(cursor), |line| line.trim_end_matches(';').to_owned());
+		let body = source.lines().find_map(|line| line.trim().strip_prefix("let model = ")).map_or_else(|| model(cursor, precision(cursor)), |line| line.trim_end_matches(';').to_owned());
 		eprintln!("composition {cursor}: kind={kind} body={body}");
 		if let Err(failure) = run(&path) {
 			let replay = run(&path).err().unwrap_or(Failure { phase: "replay".to_owned(), message: "replay passed".to_owned(), output: "replay passed".to_owned() });

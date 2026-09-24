@@ -624,7 +624,7 @@ awk '
 [ -s evidence/suite.json ] || { echo "the guest returned no suite evidence" >&2; exit 1; }
 echo "recovered suite evidence"
 
-route="$(grep -m1 '^selected route ' evidence/guest.log | awk '{print $3}')"
+route="$(grep -m1 '^suite device ' evidence/guest.log | awk '{print $3}')"
 device="${route##*:}"
 case "$device" in
 	nv*) ;;

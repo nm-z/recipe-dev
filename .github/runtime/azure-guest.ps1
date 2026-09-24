@@ -302,8 +302,8 @@ try {
 	Pop-Location
 
 	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
-	$route = ([regex]::Match($log, '(?m)^selected route (\S+)')).Groups[1].Value
-	if (-not $route) { throw "no route line: the suite did not dispatch" }
+	$route = ([regex]::Match($log, '(?m)^suite device (\S+)')).Groups[1].Value
+	if (-not $route) { throw "no suite device: training did not report its device" }
 	$device = $route.Split(':')[-1]
 	if ($device -notlike "nv*") { throw "expected an nv device, got '$device'; CPU fallback is a failure" }
 	Write-Output "executed on $route"
