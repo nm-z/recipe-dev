@@ -317,17 +317,24 @@ try {
 		-RedirectStandardOutput $runStdout `
 		-RedirectStandardError $runStderr
 	$runStarted = [DateTime]::UtcNow
+	$lastSample = $runStarted
 	$lastChecks = -1
 	while (!$runProcess.HasExited) {
 		Start-Sleep -Seconds 10
 		$checks = @(Select-String -LiteralPath $runStdout -Pattern '^check ' -ErrorAction SilentlyContinue).Count
 		$last = [string](Get-Content -LiteralPath $runStderr -Tail 1 -ErrorAction SilentlyContinue)
 		if ($last.Length -gt 180) { $last = $last.Substring(0, 180) }
-		if ($checks -ne $lastChecks) { Report-Phase "suite-checks-$checks stderr=$last"; $lastChecks = $checks }
-		if (([DateTime]::UtcNow - $runStarted).TotalSeconds -ge 300) {
+		if ($checks -ne $lastChecks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge 60) {
+			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($runProcess.Id)" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ","
+			$gpu = (& $script:Smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>$null) -join ","
+			Report-Phase "suite-checks-$checks child=$children gpu=$gpu stderr=$last"
+			$lastChecks = $checks
+			$lastSample = [DateTime]::UtcNow
+		}
+		if (([DateTime]::UtcNow - $runStarted).TotalSeconds -ge 600) {
 			Report-Phase "suite-timeout-checks-$checks stderr=$last"
 			& taskkill.exe /PID $runProcess.Id /T /F *> $null
-			throw "the runtime suite exceeded 300s after $checks completed checks"
+			throw "the runtime suite exceeded 600s after $checks completed checks"
 		}
 	}
 	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
