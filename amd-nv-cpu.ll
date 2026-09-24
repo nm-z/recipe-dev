@@ -1338,8 +1338,7 @@ br label %stage.loop
 stage.done:
 call void @recipe.local.barrier()
 br label %job.loop
-; The activation column as int8 codes with one float step per 32 values,
-; |max|/127, the codes rounded to even: an int8 input with its step size.
+; Quantize each 32-value activation block with one stored step.
 q8.entry:
 br label %q8.group.loop
 q8.group.loop:
@@ -1398,17 +1397,18 @@ q8.max.step:
 %q8.max.partner.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.partner)
 %q8.max.value.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.value)
 %q8.max.greater = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.partner.abs, RECIPE_STATE %q8.max.value.abs)
-%q8.max.next = select i1 %q8.max.greater, RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value
+%q8.max.equal = fcmp oeq RECIPE_STATE %q8.max.partner.abs, %q8.max.value.abs
+%q8.max.signed = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value)
+%q8.max.tie = and i1 %q8.max.equal, %q8.max.signed
+%q8.max.choose = or i1 %q8.max.greater, %q8.max.tie
+%q8.max.next = select i1 %q8.max.choose, RECIPE_STATE %q8.max.partner, RECIPE_STATE %q8.max.value
 %q8.max.offset.next = udiv i32 %q8.max.offset, 2
 br label %q8.max.loop
 q8.max.done:
 %q8.max.abs = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %q8.max.value)
 %q8.nonzero = call i1 @recipe.state.ogt(RECIPE_STATE %q8.max.abs, RECIPE_STATE %q8.zero)
 %q8.max.safe = select i1 %q8.nonzero, RECIPE_STATE %q8.max.value, RECIPE_STATE %q8.one
-; The step as llama.cpp's Q8 quantizers form it: the code scale is -127
-; over the signed extreme (one division), the step its reciprocal, so a
-; code is the input times that scale rounded to even and the products come
-; out the same whichever backend rounds them.
+; Match signed scale and reciprocal before rounding codes.
 %q8.levels.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %q8.levels)
 %q8.inverse.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.levels.negative, RECIPE_STATE %q8.max.safe)
 %q8.d.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %q8.one, RECIPE_STATE %q8.inverse.raw)
@@ -3191,14 +3191,14 @@ define internal void @topk_reverse_body( ptr addrspace(1) %scores, ptr addrspace
 %row = udiv i64 %p, %length.wide %position = urem i64 %p, %length.wide %per.row = mul i64 %experts.wide, %length.wide %row.base = mul i64 %row, %per.row %base = add i64 %row.base, %position
 %sigmoid = icmp ne i32 %scoring, 0 %renorm = icmp ne i32 %renormalize, 0 %every = xor i1 %renorm, true %plain = xor i1 %sigmoid, true %divide = or i1 %renorm, %plain
 br label %max.loop
-max.loop: %m = phi i64 [ 0, %entry ], [ %m.next, %max.step ] %maximum = phi RECIPE_STATE [ %state.zero, %entry ], [ %maximum.next, %max.step ] %m.first = phi i1 [ true, %entry ], [ %m.first.next, %max.step ]
+max.loop: %m = phi i64 [ 0, %entry ], [ %m.next, %max.step ] %maximum = phi double [ 0.0, %entry ], [ %maximum.next, %max.step ] %m.first = phi i1 [ true, %entry ], [ %m.first.next, %max.step ]
 %max.more = icmp ult i64 %m, %experts.wide br i1 %max.more, label %max.step, label %sum.entry
 max.step: %m.offset = mul i64 %m, %length.wide %m.index = add i64 %base, %m.offset
 %m.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %m.index %m.weight = load double, ptr addrspace(1) %m.weight.ptr, align 8
 %m.zero = call i1 @recipe.oeq(double %m.weight, double 0.0) %m.marked = xor i1 %m.zero, true %m.member = or i1 %m.marked, %every
 %m.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %m.index %m.score = load double, ptr addrspace(1) %m.score.ptr, align 8
 %m.higher = call i1 @recipe.ogt(double %m.score, double %maximum) %m.better = or i1 %m.first, %m.higher %m.take = and i1 %m.member, %m.better
-%maximum.next = select i1 %m.take, RECIPE_STATE %m.score, RECIPE_STATE %maximum %m.first.next = select i1 %m.take, i1 false, i1 %m.first %m.next = add i64 %m, 1 br label %max.loop
+%maximum.next = select i1 %m.take, double %m.score, double %maximum %m.first.next = select i1 %m.take, i1 false, i1 %m.first %m.next = add i64 %m, 1 br label %max.loop
 sum.entry: br label %sum.loop
 sum.loop: %s = phi i64 [ 0, %sum.entry ], [ %s.next, %sum.step ] %total = phi RECIPE_STATE [ %state.zero, %sum.entry ], [ %total.next, %sum.step ] %inner = phi RECIPE_STATE [ %state.zero, %sum.entry ], [ %inner.next, %sum.step ]
 %sum.more = icmp ult i64 %s, %experts.wide br i1 %sum.more, label %sum.step, label %write.entry

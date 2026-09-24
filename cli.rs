@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--config <precision table>] [--context <positions>] [--message <text>] [export]\n\trecipe stats <file.gguf>\n\trecipe --worker <device>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats <file.gguf>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -58,11 +58,10 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
-fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)]) {
+fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
-	// Each invocation compiles to its own output, so concurrent invocations never share one.
 	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc")
@@ -80,12 +79,10 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
 	}
-	// Set the launch settings before the remote boundary so the model receives
-	// the same configuration whether its files are local or on the target machine.
 	for (key, value) in settings { unsafe { std::env::set_var(key, value); } }
 	let inherited_device = std::env::var("RECIPE_DEVICE").ok();
 	if let Some(selection) = device.or(inherited_device.as_deref()) {
-		match recipe::run_remote_script(&output, selection, config) {
+		match recipe::run_remote_script(&output, selection, config, arguments) {
 			Ok(Some(status)) => {
 				fs::remove_file(&output).ok();
 				std::process::exit(status.code().unwrap_or(1));
@@ -95,6 +92,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		}
 	}
 	let mut command = Command::new(&output);
+	command.args(arguments);
 	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
@@ -104,8 +102,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	}
 	#[cfg(unix)]
 	{
-		// Wait for the script to restore the terminal after Ctrl+C. The child
-		// receives the same signal directly from the foreground process group.
+		// Restore the terminal after Ctrl+C.
 		extern "C" fn wait_for_script(_: i32) {}
 		unsafe extern "C" { fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }
 		unsafe { signal(2, wait_for_script); }
@@ -122,15 +119,19 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
-	let (mut source, mut operation, mut device, mut config) = (None::<String>, None::<String>, None::<String>, None::<String>);
+	let (mut source, mut device, mut config) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
+	let mut export_seen = false;
 	let mut settings = Vec::new();
+	let mut script_args = Vec::new();
 	while let Some(argument) = arguments.next() {
+		if !script_args.is_empty() { script_args.push(argument); continue; }
+		if argument == "--" && run_seen && source.is_some() { script_args.extend(arguments); break; }
 		if matches!(argument.as_str(), "--help" | "-h") { println!("{USAGE}"); return; }
-		if matches!(argument.as_str(), "--context" | "--message") {
+		if matches!(argument.as_str(), "--ctx" | "-p") {
 			let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			let key = if argument == "--context" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
-			if argument == "--context" && value.parse::<usize>().ok().is_none_or(|n| n == 0) { invalid("context must be a positive integer"); }
+			let key = if argument == "--ctx" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
+			if argument == "--ctx" && value.parse::<usize>().ok().is_none_or(|n| n == 0) { invalid("context must be a positive integer"); }
 			if settings.iter().any(|(name, _)| name == key) { invalid("a run option may be specified only once"); }
 			settings.push((key.to_owned(), value));
 			continue;
@@ -141,14 +142,6 @@ fn main() {
 			recipe::stats(&path).unwrap_or_else(|error| invalid(&error.to_string()));
 			return;
 		}
-		if argument == "--worker" {
-			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
-			recipe::worker_serve(&name).unwrap_or_else(|error| {
-				eprintln!("{error}");
-				std::process::exit(1)
-			});
-			return;
-		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if device.is_some() {
@@ -157,16 +150,13 @@ fn main() {
 			device = Some(selected);
 			continue;
 		}
-		if argument == "--config" {
+		if argument == "--cfg" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if config.is_some() {
-				invalid("--config may be specified only once")
+				invalid("--cfg may be specified only once")
 			}
 			config = Some(selected);
 			continue;
-		}
-		if argument.starts_with("--") {
-			invalid(USAGE)
 		}
 		if argument == "run" && source.is_none() {
 			if run_seen {
@@ -179,11 +169,15 @@ fn main() {
 			source = Some(argument);
 			continue;
 		}
-		if operation.is_none() {
-			operation = Some(argument);
-			continue;
-		}
+		if run_seen { script_args.push(argument); continue; }
+		if argument == "export" && !export_seen { export_seen = true; continue; }
 		invalid(USAGE)
+	}
+	if source.is_none() && !run_seen && !export_seen && config.is_none() && settings.is_empty() && let Some(selection) = device.as_deref() {
+		let names = recipe::device_names(selection).unwrap_or_else(|error| invalid(&error.to_string()));
+		if names.len() != 1 || names[0].contains(':') { invalid("a device worker requires one local device"); }
+		recipe::worker_serve(&names[0]).unwrap_or_else(|error| { eprintln!("{error}"); std::process::exit(1) });
+		return;
 	}
 	let source = source.unwrap_or_else(|| invalid(USAGE));
 	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
@@ -192,10 +186,6 @@ fn main() {
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
-	match operation.as_deref() {
-		None => run(source, device, config.as_deref(), &settings),
-		Some("export") if devices.as_ref().is_some_and(|names| names.len() != 1) => invalid("export requires one device"),
-		Some("export") => export(source, device),
-		Some(_) => invalid(USAGE),
-	}
+	if export_seen && devices.as_ref().is_some_and(|names| names.len() != 1) { invalid("export requires one device"); }
+	if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
 }

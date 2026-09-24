@@ -4216,19 +4216,16 @@ impl NativeModelIr {
 					let begin = if compact { "%begin" } else { begin.as_str() };
 					let node = &self.graph.nodes[index];
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
+					let heads = integer_argument(node.argument[0], "attention heads")?;
 					let online_order = self.inference && self.graph.profile.online_softmax;
+					require(!online_order || node.output.channels <= 256 * heads.max(1) as usize, "online attention head width exceeds 256")?;
 					let attention = if !compact && !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
-					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
+					let (from, channels) = (node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
-						// The indexer reads its own projection, the node's second source, and
-						// keeps its state in the context arena: one running sum of indexer
-						// keys per block. The index loop visits only the blocks the window's
-						// positions land in and extends their sums by those positions, and
-						// the select loop scores only the window's queries, so a step costs
-						// the blocks it touches and a whole forward costs the sequence once.
+						// Keep running key sums in context and score only touched window blocks.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
 						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
@@ -7001,7 +6998,7 @@ impl NativeModelIr {
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%prediction.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %prediction.sum.next, %loss.item ]\n%r2.target.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.sum.next, %loss.item ]\n%r2.target.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.square.next, %loss.item ]\n%r2.residual.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.residual.square.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%prediction.sum = phi {state_ty} [ {zero}, %loss.entry ], [ %prediction.sum.next, %loss.item ]\n%r2.target.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.mean.next, %loss.item ]\n%r2.target.m2 = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.target.m2.next, %loss.item ]\n%r2.residual.square = phi {state_ty} [ {zero}, %loss.entry ], [ %r2.residual.square.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, %loss.count\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -7016,14 +7013,14 @@ impl NativeModelIr {
 			"%loss.contribution".to_owned()
 		};
 		ir.push_str(&format!(
-			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%prediction.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %prediction.sum, {state_ty} {prediction})\n%r2.target.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.sum, {state_ty} {target})\n%r2.target.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} {target}, {state_ty} {target})\n%r2.target.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.square, {state_ty} %r2.target.item.square)\n%r2.residual = call {state_ty} @recipe.state.sub{v}({state_ty} {prediction}, {state_ty} {target})\n%r2.residual.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.residual, {state_ty} %r2.residual)\n%r2.residual.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.residual.square, {state_ty} %r2.residual.item.square)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
+			"%loss.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {contribution})\n%prediction.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %prediction.sum, {state_ty} {prediction})\n%r2.count = add i32 %loss.p, 1\n%r2.count.state = call {state_ty} @recipe.state.from.u32{v}(i32 %r2.count)\n%r2.delta = call {state_ty} @recipe.state.sub{v}({state_ty} {target}, {state_ty} %r2.target.mean)\n%r2.mean.step = call {state_ty} @recipe.state.div{v}({state_ty} %r2.delta, {state_ty} %r2.count.state)\n%r2.target.mean.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.mean, {state_ty} %r2.mean.step)\n%r2.delta.after = call {state_ty} @recipe.state.sub{v}({state_ty} {target}, {state_ty} %r2.target.mean.next)\n%r2.m2.term = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.delta, {state_ty} %r2.delta.after)\n%r2.target.m2.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.target.m2, {state_ty} %r2.m2.term)\n%r2.residual = call {state_ty} @recipe.state.sub{v}({state_ty} {prediction}, {state_ty} {target})\n%r2.residual.item.square = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.residual, {state_ty} %r2.residual)\n%r2.residual.square.next = call {state_ty} @recipe.state.add{v}({state_ty} %r2.residual.square, {state_ty} %r2.residual.item.square)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"
 		));
 		if loss.0 == 1 {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.sqrt{v}({state_ty} %loss.mean)\n"));
 		} else {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.add{v}({state_ty} %loss.mean, {state_ty} {zero})\n"));
 		}
-		ir.push_str(&format!("%r2.target.mean.part = call {state_ty} @recipe.state.mul{v}({state_ty} %r2.target.sum, {state_ty} %r2.target.sum)\n%r2.target.mean.square = call {state_ty} @recipe.state.div{v}({state_ty} %r2.target.mean.part, {state_ty} %loss.items)\n%r2.total = call {state_ty} @recipe.state.sub{v}({state_ty} %r2.target.square, {state_ty} %r2.target.mean.square)\n%r2.ratio = call {state_ty} @recipe.state.div{v}({state_ty} %r2.residual.square, {state_ty} %r2.total)\n%r2.value.raw = call {state_ty} @recipe.state.sub{v}({state_ty} {one}, {state_ty} %r2.ratio)\n%r2.total.zero = call i1 @recipe.state.oeq{v}({state_ty} %r2.total, {state_ty} {zero})\n%r2.value = select i1 %r2.total.zero, {state_ty} {zero}, {state_ty} %r2.value.raw\n%metric.target.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 1\n%metric.target.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 2\n%metric.residual.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 3\n%metric.r2.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 4\n%metric.prediction.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 5\nstore {state_ty} %prediction.sum, {pointer} %metric.prediction.sum.ptr, align {state_align}\nstore {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nstore {state_ty} %r2.target.sum, {pointer} %metric.target.sum.ptr, align {state_align}\nstore {state_ty} %r2.target.square, {pointer} %metric.target.square.ptr, align {state_align}\nstore {state_ty} %r2.residual.square, {pointer} %metric.residual.square.ptr, align {state_align}\nstore {state_ty} %r2.value, {pointer} %metric.r2.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str(&format!("%r2.ratio = call {state_ty} @recipe.state.div{v}({state_ty} %r2.residual.square, {state_ty} %r2.target.m2)\n%r2.value.raw = call {state_ty} @recipe.state.sub{v}({state_ty} {one}, {state_ty} %r2.ratio)\n%r2.total.zero = call i1 @recipe.state.oeq{v}({state_ty} %r2.target.m2, {state_ty} {zero})\n%r2.value = select i1 %r2.total.zero, {state_ty} {zero}, {state_ty} %r2.value.raw\n%metric.target.mean.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 1\n%metric.target.m2.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 2\n%metric.residual.square.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 3\n%metric.r2.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 4\n%metric.prediction.sum.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 5\nstore {state_ty} %prediction.sum, {pointer} %metric.prediction.sum.ptr, align {state_align}\nstore {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nstore {state_ty} %r2.target.mean, {pointer} %metric.target.mean.ptr, align {state_align}\nstore {state_ty} %r2.target.m2, {pointer} %metric.target.m2.ptr, align {state_align}\nstore {state_ty} %r2.residual.square, {pointer} %metric.residual.square.ptr, align {state_align}\nstore {state_ty} %r2.value, {pointer} %metric.r2.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
 		ir.push_str("br i1 %epoch.gradient, label %seed.prepare, label %metrics.done\nseed.prepare:\n");
 		let loss_value = if loss.0 == 1 {
 			ir.push_str(barrier(backend));
@@ -7047,7 +7044,7 @@ impl NativeModelIr {
 		let mut previous = "optimizer.entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let node = &plan.node;
-			if node.parameters == 0 || plan.packed {
+			if node.parameters == 0 || plan.packed || plan.stored.is_some() {
 				continue;
 			}
 			let precision = self.node_precision(node);
@@ -9093,7 +9090,7 @@ mod tokenizer {
 	/// Splits a chat template into its pieces, applying the `-` controls that trim
 	/// the whitespace around a tag or a comment.
 	fn parse(template: &str) -> Result<Vec<Piece>> {
-		let (mut pieces, mut rest, mut start) = (Vec::new(), template, false);
+		let (mut pieces, mut rest, mut start, mut line_start) = (Vec::new(), template, false, true);
 		while let Some(open) = rest.as_bytes().windows(2).position(|pair| pair == b"{{" || pair == b"{%" || pair == b"{#") {
 			let kind = rest.as_bytes()[open + 1];
 			let close = match kind {
@@ -9106,13 +9103,13 @@ mod tokenizer {
 			// A statement or comment strips the indentation before it on its own
 			// line and the line break after it, as the transformers and llama.cpp
 			// renderers do; a substitution keeps both.
-			let block = kind != b'{';
-			let mut text = &rest[..open];
-			if block {
-				let line = text.rfind('\n').map_or(0, |at| at + 1);
-				if text[line..].bytes().all(|byte| byte == b' ' || byte == b'\t') {
-					text = &text[..line];
-				}
+		let block = kind != b'{';
+		let mut text = &rest[..open];
+		if block {
+			let line = text.rfind('\n').map(|at| at + 1).or(line_start.then_some(0));
+			if let Some(line) = line && text[line..].bytes().all(|byte| byte == b' ' || byte == b'\t') {
+				text = &text[..line];
+			}
 			}
 			push_text(&mut pieces, text, start, body.starts_with('-'));
 			let source = body[..end].trim_matches('-').trim().to_owned();
@@ -9121,9 +9118,10 @@ mod tokenizer {
 				b'%' => pieces.push(Piece::Tag(source)),
 				_ => {}
 			}
-			start = body[..end].ends_with('-');
-			rest = &body[end + close.len()..];
-			if block {
+		start = body[..end].ends_with('-');
+		rest = &body[end + close.len()..];
+		line_start = block && (rest.starts_with("\r\n") || rest.starts_with('\n'));
+		if block {
 				rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')).unwrap_or(rest);
 			}
 		}
@@ -9433,14 +9431,26 @@ mod tokenizer {
 			}
 		}
 		fn expression(&mut self, live: bool) -> Result<Value> {
-			let value = self.or(live)?;
+			let start = self.at;
+			let scanned = self.or(false)?;
+			let end = self.at;
 			if self.eat_name("if") {
 				let condition = self.or(live)?;
+				let resume = self.at;
 				let taken = live && condition.truth();
+				let value = if taken {
+					self.at = start;
+					let value = self.or(true)?;
+					require(self.at == end, "chat template conditional branch changed during evaluation")?;
+					self.at = resume;
+					value
+				} else { Value::Undefined };
 				let other = if self.eat_name("else") { self.expression(live && !taken)? } else { Value::Undefined };
 				return Ok(if taken { value } else { other });
 			}
-			Ok(value)
+			if !live { return Ok(scanned); }
+			self.at = start;
+			self.or(true)
 		}
 		fn or(&mut self, live: bool) -> Result<Value> {
 			let mut value = self.and(live)?;
@@ -9661,6 +9671,11 @@ mod tokenizer {
 							_ => return Err(RecipeError::new("chat template range takes one or two bounds")),
 						};
 						Ok(Value::List((start..end).map(Value::Int).collect()))
+					}
+					"raise_exception" if self.eat_op("(") => {
+						let arguments = self.arguments(live)?;
+						if live { return Err(RecipeError::new(arguments.first().map(Value::text).unwrap_or_else(|| "chat template raise_exception needs a message".to_owned()))); }
+						Ok(Value::Undefined)
 					}
 					_ => Ok(self.scope.get(&name)),
 				},
@@ -10382,7 +10397,7 @@ mod bundle {
 				let unscaled = if attention.unscaled { ",s=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,{},{},{dims},{base},{},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
+					"attn,v2,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -10391,7 +10406,6 @@ mod bundle {
 					index.keep,
 					u8::from(attention.gate),
 					attention.width,
-					index.tokens,
 					normalization_text(score_normalization)
 				)
 			}
@@ -10444,20 +10458,10 @@ mod bundle {
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
-				let raw = rest.split(',').collect::<Vec<_>>();
-				let len = raw.len() - usize::from(raw.last().is_some_and(|v| v.starts_with("v=")));
-				let mut compatible = Vec::new();
-				if matches!(len, 10 | 11 | 15) {
-					compatible.extend_from_slice(&raw[..9]);
-					compatible.extend([raw.get(10).copied().unwrap_or("0"), "0", "0", "0", raw[9]]);
-					compatible.extend_from_slice(&raw[11.min(raw.len())..]);
-				}
-				let mut fields = if compatible.is_empty() { raw } else { compatible }.into_iter();
+				let mut fields = rest.split(',');
+				require(fields.next() == Some("v2"), "saved attention record is not current format")?;
 				let heads = value_at(fields.next(), "attention heads")?;
-				let Some(keys) = fields.next() else {
-					return Ok(Operation::Attention(AttentionBlock::new(heads)));
-				};
-				let keys = value_at(Some(keys), "attention key-value heads")?;
+				let keys = value_at(fields.next(), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
 				let base = value_at::<f64>(fields.next(), "rotary base")?;
 				let mut index = Indexer {
@@ -10468,12 +10472,9 @@ mod bundle {
 					..Indexer::NONE
 				};
 				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
-				let width = fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.unwrap_or(0);
-				// The token budget and the scoring geometry follow the head width, so a
-				// model saved without them reads as a block budget over raw planes.
-				index.tokens = fields.next().map(|field| value_at(Some(field), "indexer token budget")).transpose()?.unwrap_or(0);
-				let score_normalization = fields.next().map(|field| normalization(Some(field), "indexer scoring normalization")).transpose()?.flatten();
-				let score_dims = fields.next().map(|field| value_at(Some(field), "indexer rotary dimensions")).transpose()?.unwrap_or(0);
+				let width = value_at(fields.next(), "attention head width")?;
+				let score_normalization = normalization(fields.next(), "indexer scoring normalization")?;
+				let score_dims = value_at(fields.next(), "indexer rotary dimensions")?;
 				index.score = score_normalization.map(|normalization| (normalization, score_dims));
 				let layout = match fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(1) {
 					0 | 1 => RopeLayout::Neox,
@@ -11636,8 +11637,7 @@ impl PartialEq for Estimator {
 impl Eq for Estimator {}
 /// Indexer that scores every key block and keeps the best `keep` blocks per
 /// query. `heads` query projections and one shared key projection, both
-/// `width` wide, compress `block` keys into one block score. A `tokens` budget
-/// states the admission in keys instead and keeps the blocks that cover it.
+/// `width` wide, compress `block` keys into one block score.
 /// `score` normalizes each indexer head with a trained scale and rotates its
 /// leading dimensions before scoring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11646,15 +11646,10 @@ struct Indexer {
 	width: usize,
 	block: usize,
 	keep: usize,
-	tokens: usize,
 	score: Option<(BlockNormalization, usize)>,
 }
 impl Indexer {
-	const NONE: Self = Self { heads: 0, width: 0, block: 0, keep: 0, tokens: 0, score: None };
-	/// Blocks a query keeps: the blocks that cover the token budget, or `keep`.
-	fn admitted(self) -> usize {
-		if self.tokens == 0 { self.keep } else { self.tokens.div_ceil(self.block) }
-	}
+	const NONE: Self = Self { heads: 0, width: 0, block: 0, keep: 0, score: None };
 }
 /// The attention head counts: one count for all three, or explicit query, key,
 /// and value counts. The array form is the typed Rust spelling of the three
@@ -12028,15 +12023,13 @@ struct ProductBranch {
 /// Product lowering applies exclusions locally, so one branch cannot alter the
 /// bias configuration of its sibling.
 macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => {$(pub fn $method(self) -> Self {
-	self.act(Activation::$activation)
+	self.with_activation(Activation::$activation)
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Fresh }
 	}
-	/// The activation closing this step. `layer(8).act(Activation::Relu)` and
-	/// the pair `layer(8), relu()` are the same step written two ways.
-	pub fn act(mut self, activation: Activation) -> Self {
+	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Activation;
 		assert!(self.normalization.is_none(), "activation must precede normalization");
 		self.activation = activation;
@@ -12130,7 +12123,7 @@ impl Block {
 	}
 	pub fn scale(self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
-		self.act(Activation::Scale(factor.to_bits()))
+		self.with_activation(Activation::Scale(factor.to_bits()))
 	}
 }
 precision_methods!(Block => Block);
@@ -12278,12 +12271,9 @@ impl Model {
 		let mask = option.mask();
 		self.edit(|model| model.exclusions |= mask)
 	}
-	/// The activation closing the last step. A step that already ends in an
-	/// activation or a normalization is complete, so the activation opens a step
-	/// of its own after it.
-	pub fn activate(&self, activation: Activation) -> Self {
+	fn with_activation(&self, activation: Activation) -> Self {
 		if self.blocks.last().is_some_and(|block| block.activation != Activation::Linear || block.normalization.is_some()) {
-			return self.push(Operation::Identity).activate(activation);
+			return self.push(Operation::Identity).with_activation(activation);
 		}
 		let model = self.suffix();
 		assert!(!model.blocks.is_empty(), "activation requires a preceding block");
@@ -12417,12 +12407,6 @@ impl Model {
 	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
 		self.attention("index", |value| value.index(heads, width, block, keep))
 	}
-	/// Token budget of the preceding `index`: each query keeps the blocks that
-	/// cover `tokens` keys, which is how a checkpoint's `attention.indexer.top_k`
-	/// states its admission. A budget that covers the sequence is dense attention.
-	pub fn budget(&self, tokens: usize) -> Self {
-		self.indexer("budget", |index| index.tokens = tokens)
-	}
 	/// Trained scoring geometry of the preceding `index`: every indexer query and
 	/// key head normalizes under `normalization` with its own trained scale, and
 	/// its leading `dims` channels rotate at the block's `rope` base before the
@@ -12502,7 +12486,7 @@ impl Model {
 	/// L2 norm and the shift under a batch, layer, or RMS variance, in every block,
 	/// query and key normalization, delta rule, and hyper-connection gate. It is
 	/// saved with the model, so a bundle reloads with the value it was trained with.
-	pub fn epsilon(&self, value: f64) -> Self {
+	pub fn e(&self, value: f64) -> Self {
 		assert!(value.is_finite() && value > 0.0, "normalization epsilon must be finite and positive");
 		self.edit(|model| model.epsilon = value)
 	}
@@ -14032,7 +14016,7 @@ impl BlockNormalization {
 	}
 }
 macro_rules! activations { ($(fn $method:ident = $activation:ident;)+) => {$(impl Model { pub fn $method(&self) -> Self {
-self.activate(Activation::$activation) } })+}; }
+self.with_activation(Activation::$activation) } })+}; }
 activations! {
 fn cos = Cos;
 fn exp = Exp;
@@ -14054,7 +14038,7 @@ impl Model {
 	/// weights, preserves shape, and stores the factor with the model.
 	pub fn scale(&self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
-		self.activate(Activation::Scale(factor.to_bits()))
+		self.with_activation(Activation::Scale(factor.to_bits()))
 	}
 }
 /// Rust multiplication composes two model fragments from the same incoming
@@ -14840,7 +14824,7 @@ impl<'a> Builder<'a> {
 		let format = gguf::embedding_format(&embedding)?;
 		let mut model = recipe.model();
 		if builder.present("attention.layer_norm_rms_epsilon") {
-			model = model.epsilon(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
+			model = model.e(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
 		if matches!(architecture, "gemma3" | "gemma4") {
@@ -15151,7 +15135,7 @@ impl<'a> Builder<'a> {
 			}
 			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
 			self.mapped(index_planes);
-			block = block.index(index_heads, index_width, block_size, 1).budget(top_k);
+			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size));
 			let query_norm = name("indexer.q_norm.weight");
 			let key_norm = name("indexer.k_norm.weight");
 			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
@@ -15863,8 +15847,8 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 						Operation::Product(left, right) => {
 							// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
 							let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.activation != Activation::Linear);
-							let (gate, up) = if activated(right) && !activated(left) { (right, left) } else { (left, right) };
-							for (branch, suffix) in [(gate, "ffn_gate.weight"), (up, "ffn_up.weight")] {
+							let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
+							for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
 								let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
 								require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 								hidden = widths[0];
@@ -17520,6 +17504,7 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 	let mut tail = graph.clone();
 	tail.nodes = graph.nodes[at..].to_vec();
 	tail.stored = graph.stored[at..].to_vec();
+	tail.requantize = graph.requantize[at..].to_vec();
 	for node in &mut tail.nodes {
 		node.source = rebase(node.source)?;
 		node.second = rebase(node.second)?;
@@ -17530,6 +17515,7 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 		let mut head = graph.clone();
 		head.nodes.truncate(at);
 		head.stored.truncate(at);
+		head.requantize.truncate(at);
 		head.output = graph.nodes[at - 1].output;
 		head.source = boundary;
 		head
@@ -17571,6 +17557,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.frozen.extend(part.frozen);
 	graph.programs.extend(part.programs);
 	graph.stored.extend(part.stored);
+	graph.requantize.extend(part.requantize);
 	graph.nodes.extend(part.nodes);
 	graph.output = part.output;
 	graph.source = narrow(graph.nodes.len(), "model graph nodes")? - 1;
@@ -17710,11 +17697,12 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 /// a different one, the weight is decoded and encoded again into it here, once,
 /// so every kernel sees the block's format whatever the file held.
 fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, config: Config) -> Result<()> {
-	let Some(Some(weight)) = graph.stored.get(index) else { return Ok(()) };
-	if weight.format == format || format.spec().is_none() {
+	let Some(Some(current)) = graph.stored.get(index) else { return Ok(()) };
+	if current.format == format || format.spec().is_none() {
 		return Ok(());
 	}
-	let weight = weight.clone();
+	let weight = graph.requantize.get(index).and_then(Option::as_ref).unwrap_or(current).clone();
+	require(weight.bytes.0.iter().all(|run| !matches!(run, StoredSegment::Absent(_))), "requantization source bytes are absent")?;
 	// A format with a device encoder is written by the load kernel from the file
 	// bytes, so the host neither decodes nor encodes the weight. A table decodes
 	// its rows on the host, so it keeps the host path.
@@ -17870,6 +17858,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	if activation == Activation::Relu {
 		let source = graph.source;
 		let last = graph.nodes.len() as i32 - 1;
+		let precision = graph.profile.resolve(graph.block_precision.unwrap_or(graph.profile.atvn));
 		// An int sum keeps its relu as its own op: the int dot runs whole
 		// blocks in the wave body, which has no fused relu.
 		if let Some(node) = graph.nodes.last_mut()
@@ -17877,6 +17866,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			&& node.op == Primitive::Contraction
 			&& node.argument[1] == 0.0
 			&& !matches!(node.precision, Compute::Int(_))
+			&& node.precision == precision
 		{
 			node.argument[1] = 1.0;
 			return Ok(());
@@ -18382,7 +18372,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let mut side = -2;
 	if let Some(index) = index {
 		require(index.heads != 0 && index.width != 0, "indexer projection must be positive")?;
-		require(index.block != 0 && index.admitted() != 0, "indexer selection must be positive")?;
+		require(index.block != 0 && index.keep != 0, "indexer selection must be positive")?;
 		reset(graph, source, input);
 		lower_project(graph, checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?)?;
 		let (normalization, dims) = index.score.unwrap_or((BlockNormalization::L2, 0));
@@ -18422,7 +18412,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
 	graph.block_precision = ordinary_precision;
 	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
-	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.admitted() as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
+	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
 	lower_project(graph, input.channels)
 }
@@ -18845,7 +18835,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.bias = inherited_bias && left.exclusions & bias.mask() == 0;
 	for block in &left.blocks {
-		graph.block_frozen = block.frozen;
+		graph.block_frozen = outer_frozen || block.frozen;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
@@ -18853,7 +18843,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	reset(graph, source, input);
 	graph.bias = inherited_bias && right.exclusions & bias.mask() == 0;
 	for block in &right.blocks {
-		graph.block_frozen = block.frozen;
+		graph.block_frozen = outer_frozen || block.frozen;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
@@ -18879,7 +18869,7 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
 	for block in blocks {
-		graph.block_frozen = block.frozen;
+		graph.block_frozen = outer_frozen || block.frozen;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
@@ -19206,7 +19196,7 @@ impl PrecisionKind {
 	}
 }
 /// The precision of every kind of op, one named `[precision.<name>]` table in
-/// Cargo.toml chosen by `recipe run --config <name>`; a block's own suffix
+/// Cargo.toml chosen by `recipe run --cfg <name>`; a block's own suffix
 /// overrides its op's entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Precisions {
@@ -19288,7 +19278,7 @@ impl Precisions {
 		let table = profiles
 			.split(';')
 			.find_map(|profile| profile.split_once(':').filter(|(candidate, _)| *candidate == name).map(|(_, body)| body))
-			.ok_or_else(|| RecipeError::new(format!("--config {name} names no [precision.{name}] table in Cargo.toml; the tables are {names}")))?;
+			.ok_or_else(|| RecipeError::new(format!("--cfg {name} names no [precision.{name}] table in Cargo.toml; the tables are {names}")))?;
 		Self::parse(&name, table)
 	}
 	fn parse(name: &str, table: &str) -> Result<Self> {
@@ -20105,8 +20095,8 @@ enum EpochOperation {
 #[derive(Clone, Copy, Default)]
 struct EpochMetrics {
 	loss: f64,
-	target_sum: f64,
-	target_square: f64,
+	target_mean: f64,
+	target_m2: f64,
 	residual_square: f64,
 	prediction_sum: f64,
 	r2: f64,
@@ -20116,21 +20106,26 @@ struct EpochMetrics {
 impl EpochMetrics {
 	const VALUES: usize = 6;
 	fn read(values: &[f64], count: usize, device_seconds: f64) -> Self {
-		Self { loss: values[0], target_sum: values[1], target_square: values[2], residual_square: values[3], r2: values[4], prediction_sum: values[5], count, device_seconds }
+		Self { loss: values[0], target_mean: values[1], target_m2: values[2], residual_square: values[3], r2: values[4], prediction_sum: values[5], count, device_seconds }
 	}
 	fn predicted_mean(self) -> f64 { self.prediction_sum / self.count as f64 }
 	fn combine(parts: impl IntoIterator<Item = (Self, f64)>, root_loss: bool) -> Self {
 		let parts = parts.into_iter().collect::<Vec<_>>();
-		let target_sum = parts.iter().map(|(part, _)| part.target_sum).sum();
-		let target_square = parts.iter().map(|(part, _)| part.target_square).sum();
+		let (mut target_mean, mut target_m2, mut count) = (0.0, 0.0, 0_usize);
+		for (part, _) in &parts {
+			if part.count == 0 { continue; }
+			let next = count + part.count;
+			let delta = part.target_mean - target_mean;
+			target_m2 += part.target_m2 + delta * delta * count as f64 * part.count as f64 / next as f64;
+			target_mean += delta * part.count as f64 / next as f64;
+			count = next;
+		}
 		let residual_square = parts.iter().map(|(part, _)| part.residual_square).sum();
 		let prediction_sum = parts.iter().map(|(part, _)| part.prediction_sum).sum();
-		let count: usize = parts.iter().map(|(part, _)| part.count).sum();
 		let loss = if root_loss { parts.iter().map(|(part, share)| share * part.loss * part.loss).sum::<f64>().sqrt() } else { parts.iter().map(|(part, share)| share * part.loss).sum() };
-		let total = target_square - target_sum * target_sum / count.max(1) as f64;
-		let r2 = if total == 0.0 { 0.0 } else { 1.0 - residual_square / total };
+		let r2 = if target_m2 == 0.0 { 0.0 } else { 1.0 - residual_square / target_m2 };
 		let device_seconds = parts.iter().map(|(part, _)| part.device_seconds).fold(0.0, f64::max);
-		Self { loss, target_sum, target_square, residual_square, prediction_sum, r2, count, device_seconds }
+		Self { loss, target_mean, target_m2, residual_square, prediction_sum, r2, count, device_seconds }
 	}
 }
 
@@ -23130,7 +23125,7 @@ fn copy_remote(host: &str, source: &Path, destination: &str) -> Result<()> {
 /// Run a locally compiled model on its selected machine. Files opened by the model
 /// belong to that machine, and stdin, stdout, stderr, and exit status remain attached
 /// to the calling terminal. Chains across machines retain the device worker protocol.
-pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&str>) -> Result<Option<std::process::ExitStatus>> {
+pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&str>, arguments: &[String]) -> Result<Option<std::process::ExitStatus>> {
 	let names = device_names(selection)?;
 	let Some((host, _)) = names.first().and_then(|name| name.split_once(':')) else { return Ok(None) };
 	require(host.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("unsafe execution node {host:?}"))?;
@@ -23164,7 +23159,8 @@ pub fn run_remote_script(script: &Path, selection: &str, configuration: Option<&
 	}
 	let environment = environment.iter().map(|(key, value)| shell_argument(&format!("{key}={value}"))).collect::<Vec<_>>().join(" ");
 	let cwd = std::env::current_dir().map_err(|error| RecipeError::new(format!("cannot read model working directory: {error}")))?;
-	let command = format!("chmod 700 {remote_script} && cd {cwd} && exec env {environment} {remote_script}", cwd = shell_argument(&cwd.to_string_lossy()));
+	let arguments = arguments.iter().map(|argument| shell_argument(argument)).collect::<Vec<_>>().join(" ");
+	let command = format!("chmod 700 {remote_script} && cd {cwd} && exec env {environment} {remote_script} {arguments}", cwd = shell_argument(&cwd.to_string_lossy()));
 	let mut ssh = Command::new("ssh");
 	ssh.args(["-q", "-o", "BatchMode=yes"]);
 	if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() { ssh.arg("-tt"); }
@@ -23223,7 +23219,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let remote_hash = command_output(&mut remote_hash, &format!("hash the copied worker on {host}"))?;
 	require(local_hash.split(|byte| byte.is_ascii_whitespace()).next() == remote_hash.split(|byte| byte.is_ascii_whitespace()).next(), format!("copied worker hash differs on {host}"))?;
 	let mut child = Command::new("ssh")
-		.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --worker {device_name}")])
+		.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --device {device_name}")])
 		.stdin(std::process::Stdio::piped())
 		.stdout(std::process::Stdio::piped())
 		.spawn()
@@ -23775,23 +23771,10 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 				header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
 				(driver.store)(queue.doorbell, index as i64);
 				trace("AMD dispatch submitted")?;
-				let mut last = [u32::MAX; 2];
-				let mut stalled = 0_u32;
-				let completed = loop {
-					let completed = (driver.wait)(driver.signal, 0, 0, 1_000_000_000, 1);
-					if completed == 0 {
-						break completed;
-					}
-					let snapshot = sync_words(&mut sync_image, program);
-					stalled = if snapshot == last { stalled + 1 } else { 0 };
-					last = snapshot;
-					if stalled >= 60 {
-						eprintln!("AMD dispatch {entry:?} stalled for 60s: grid sync words {snapshot:?} groups={groups} threads={threads} block={block}");
-						break completed;
-					}
-				};
-				trace(&format!("AMD dispatch completed with signal {completed}"))?;
-				require(completed == 0, "native AMD dispatch failed")
+				// Keep the kernel's buffers alive until its completion signal changes.
+				while (driver.wait)(driver.signal, 0, 0, u64::MAX, 1) != 0 {}
+				trace("AMD dispatch completed")?;
+				Ok(())
 			}
 			#[cfg(nvidia)]
 			(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
@@ -29616,7 +29599,7 @@ impl Train {
 			let composed = tape.metric_launch(config)?;
 			let predictions = node_values(&tape)?;
 			let (measured_score, reward) = if full_set {
-				let reward = evaluated.target_sum / evaluated.count as f64;
+				let reward = evaluated.target_mean;
 				(reward, reward)
 			} else {
 				let observed = observation(sample, &predictions)?;
@@ -29626,7 +29609,7 @@ impl Train {
 			if iteration == 0 {
 				let before_fit = before_fit.unwrap_or(evaluated);
 				initial_loss = before_fit.loss;
-				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: if full_set { evaluated.target_sum / evaluated.count as f64 } else { initial_reward } }, pred: RatModelPoint { r2: f64::NAN, reward: initial_composed.predicted_mean() } };
+				initial_rat = RatPoint { eval: RatModelPoint { r2: before_fit.r2, reward: if full_set { evaluated.target_mean } else { initial_reward } }, pred: RatModelPoint { r2: f64::NAN, reward: initial_composed.predicted_mean() } };
 			}
 			measured_reward = reward;
 			measured_predictions = predictions.clone();
@@ -29659,7 +29642,7 @@ impl Train {
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
 		let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
-		if full_set { measured_reward = evaluated.target_sum / evaluated.count as f64; }
+		if full_set { measured_reward = evaluated.target_mean; }
 		let evaluator_r2 = Some(evaluated.r2);
 		let predicted_reward = Some(tape.epoch_metrics()?.predicted_mean());
 		let final_loss = evaluated.loss;

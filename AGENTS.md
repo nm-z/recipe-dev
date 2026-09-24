@@ -15,7 +15,7 @@ Recipe targets inexpensive GPUs and CPUs. Follow `.docs/nums.ogdl`.
 - `cargo check --lib --bin recipe`: check compilation.
 - `cargo build --release --lib --bin recipe`: build optimized binaries.
 - `cargo fmt --check`: check formatting against `rustfmt.toml`.
-- `recipe run rnj-1.rs --device archy:nv6.nv7 --context 128`: run the model on Archy's K80.
+- `recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128`: run the model on Archy's K80.
 
 Edit locally; rsync for remote development. Recipe owns execution and file resolution.
 
@@ -129,7 +129,7 @@ from GGUF metadata and its chat template, or when the available context is full.
 ## Terminal chat and remote execution
 
 ```bash
-recipe run rnj-1.rs --device archy:nv6.nv7 --context 128
+recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128
 ```
 
 The local source compiles locally. When every selected device is on one remote
@@ -143,8 +143,8 @@ executables and the configured compiler toolchain on the machine doing the compu
 
 `.chat(...)` keeps one placement resident across messages. Each request uses the
 whole conversation. `/clear` clears the conversation without reloading weights;
-`/exit` or EOF exits. `--message "text"` instead performs one measured request.
-`--context` is an explicit capacity: Recipe reports an allocation error if it
+`/exit` or EOF exits. `-p "text"` instead performs one measured request.
+`--ctx` is an explicit capacity: Recipe reports an allocation error if it
 cannot fit, rather than silently reducing it. The outstanding full-sequence
 intermediate-buffer allocation issue still prevents the RNJ 32K configuration from fitting on the K80.
 

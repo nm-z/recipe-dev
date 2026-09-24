@@ -62,7 +62,7 @@ PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-1200}"
 ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
 ADMISSION_LEASE_SECONDS=60
-ADMISSION_BLOB="runtime/windows/admission.lock"
+ADMISSION_BLOB="runtime/windows/admission.$((RUN_ID % 4)).lock"
 admission_lease_id=""
 admission_renew_pid=""
 admission_started="$(date +%s)"
@@ -211,8 +211,8 @@ JSON
 			cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-admission-timeout",
-  "detail": "Another Windows GPU runtime owns the shared Azure admission lease, and this run waited ${ADMISSION_WAIT_SECONDS} seconds without a slot.",
-  "resolution": "Retry this run after the active Windows GPU runtime releases its worker."
+  "detail": "This Windows GPU admission slot stayed occupied for ${ADMISSION_WAIT_SECONDS} seconds.",
+  "resolution": "Retry after its active worker releases the slot."
 }
 JSON
 			cat evidence/blocker.json
@@ -256,9 +256,7 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITO
 	done < <(jq -r --arg current "$WORKER" '.[] | select(.name != $current) | [.name, .resource_group] | @tsv' <<< "$inventory")
 fi
 
-# Refresh after reclamation, then fail closed if an earlier Recipe worker is
-# still present. The lease normally prevents this state; the inventory guard
-# also prevents overlap if a hard-canceled controller outlives its lease.
+# Refresh after reclamation and keep at most four active Recipe workers.
 inventory="$(az vm list --show-details \
 	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
 	--only-show-errors -o json)"
@@ -269,12 +267,13 @@ active_workers="$(jq -r --arg current "$WORKER" '
 	| select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")
 	| .name
 ' <<< "$inventory")"
-if [ -n "$active_workers" ]; then
+active_count="$(jq -r --arg current "$WORKER" '[.[] | select(.name != $current) | select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith("recipe-wgpu-"))) | select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")] | length' <<< "$inventory")"
+if [ "$active_count" -ge 4 ]; then
 	cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-worker-active",
-  "detail": "A prior Recipe Windows GPU worker is still present: ${active_workers//$'\n'/, }.",
-  "resolution": "Wait for the owning run's cleanup to delete the worker, then retry. No second worker was provisioned."
+  "detail": "Four Recipe Windows GPU workers are active: ${active_workers//$'\n'/, }.",
+  "resolution": "Wait for one worker's verified cleanup, then retry."
 }
 JSON
 	cat evidence/blocker.json

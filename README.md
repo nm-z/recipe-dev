@@ -5,7 +5,7 @@ GPU/CPU ML training and inference in Rust.
 **Devices**
 
 ```bash
-recipe run train.rs --config recipe --device amd0.cpu.archy:nv7.nv8 --context 4096 --message "text"
+recipe run train.rs --cfg recipe --device amd0.cpu.archy:nv7.nv8 --ctx 4096 -p "text"
 ```
 
 ## **Data**
@@ -68,7 +68,7 @@ let attention = recipe.model()
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
 	.norm(rms);
 let model = recipe.model()
-	.epsilon(qwen35.attention.layer_norm_rms_epsilon)
+	.e(qwen35.attention.layer_norm_rms_epsilon)
 	.embed(tokenizer.ggml.tokens, qwen35.embedding_length)
 	.hyper(4, 320, &attention);
 ```
@@ -104,7 +104,6 @@ let model = recipe.model()
 			.rope(neox, dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
-				.budget(tokens)
 				.score(rms|l2, dims)
 			.gate()
 atvn:
@@ -124,19 +123,13 @@ atvn:
 	huber()
 	tan()
 	scale(factor)
-	act(Activation::Silu)
-	activate(Activation::Silu)
-	feature reduction:
-		pool(size)
-		kmeans(clusters)
-		knn(neighbors)
+	e(value)
+feature reduction:
+	pool(size)
+	kmeans(clusters)
+	knn(neighbors)
 norm:
-	.norm(batch)
-	.norm(layer)
-	.norm(rms)
-	.norm(l2)
-	.epsilon(value)
-	.scale(factor)
+	.norm(batch|layer|rms|l2)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
@@ -245,7 +238,7 @@ place(path, &[blocks])
 ## Terminal chat and remote execution
 
 ```bash
-recipe run rnj-1.rs --device archy:nv6.nv7 --context 128
+recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 ```
 
 ## GGUF statistics
@@ -377,7 +370,7 @@ moe(topk, [experts])                                            // moe(topk, [bl
 ple(&ngram)                                                     // ple(&ngram)
 	.norm(rms)
 	.gate(sigmoid|silu)
-	.act(silu)
+	.silu()
 
 mtp([blocks])                                                   // .mtp(path)
 	.file(path)
