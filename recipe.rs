@@ -1408,7 +1408,7 @@ impl ScheduleRat {
 		let held_out = predict_rows(&validation, &self.samples, SCHEDULE_RAT_ACTION)?;
 		trace(&format!("schedule RAT observations={rows} held_out_r2={:.6}", coefficient(&targets, &held_out)))?;
 		let rat_config = config;
-		let surrogate = fit_surrogate(Shape { channels: SCHEDULE_RAT_ACTION, length: 1 }, &self.samples, &targets, rat_config.surrogate_width, self.gpu, rat_config)?;
+		let surrogate = fit_surrogate(Shape { channels: SCHEDULE_RAT_ACTION, length: 1 }, &self.samples, &targets, rat_config.surrogate_width, self.gpu, rat_config.precision, rat_config)?;
 		let mut composition = self.proposer.clone();
 		let proposal_source = composition.source;
 		let proposer_parameters = composition.parameters.len();
@@ -5164,7 +5164,7 @@ impl NativeModelIr {
 		let cell_width = node.output.channels;
 		let length = node.output.length;
 		let cell_elements = checked_mul(cell_width, length, "recurrent cell elements")?;
-		let scan_offset = node.offset;
+		let scan_weight_offset = self.plans[index].weight_offset;
 		let mut ir = String::new();
 		let body_name = format!("recipe_recur_body_forward_{index}");
 		writeln!(ir, "define internal void @{body_name}( {pointer} %weights, {pointer} %context, {pointer} %cell, {pointer} %output, i32 %rows, i32 %threads, i32 %time, i32 %length ) #3 {{")?;
@@ -5209,8 +5209,8 @@ impl NativeModelIr {
 			let name = format!("body{node_index}");
 			writeln!(source_defs, "%{name}.value.offset = add i32 %time.base, {}", layout.value_offsets[relative])?;
 			writeln!(source_defs, "%{name}.value.base = getelementptr inbounds {ty}, {pointer} %context, i32 %{name}.value.offset")?;
-			let weight_offset = plan.node.offset.checked_sub(scan_offset).ok_or_else(|| RecipeError::new("recurrent body weight offset precedes scan"))?;
-			writeln!(source_defs, "%{name}.weights = getelementptr inbounds {ty}, {pointer} %weights, i32 {weight_offset}")?;
+			let weight_offset = plan.weight_offset.checked_sub(scan_weight_offset).ok_or_else(|| RecipeError::new("recurrent body weight offset precedes scan"))?;
+			writeln!(source_defs, "%{name}.weights = getelementptr inbounds i8, {pointer} %weights, i64 {weight_offset}")?;
 			for (label, source) in [("source", plan.node.source), ("second", plan.node.second)] {
 				if source == index as i32 || source == -1 {
 					writeln!(source_defs, "%{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %cell, i32 0")?;
@@ -5512,7 +5512,7 @@ impl NativeModelIr {
 		let cell_width = node.output.channels;
 		let length = node.output.length;
 		let cell_elements = checked_mul(cell_width, length, "recurrent cell elements")?;
-		let scan_offset = node.offset;
+		let scan_weight_offset = self.plans[index].weight_offset;
 		let mut ir = String::new();
 		let zero = native_literal(self.node_precision(node).model, ty, 0.0);
 		writeln!(ir, "define internal void @recipe_recur_body_reverse_{index}( {pointer} %weights, {pointer} %context, {pointer} %output, {pointer} %delta, {pointer} %cell.delta, {pointer} %gradient, i32 %rows, i32 %threads, i32 %length ) #3 {{")?;
@@ -5557,8 +5557,8 @@ impl NativeModelIr {
 			let name = format!("body{node_index}");
 			writeln!(ir, "%recur{index}.{name}.value.offset = add i32 %recur{index}.value.time, {}", layout.value_offsets[relative])?;
 			writeln!(ir, "%recur{index}.{name}.value.base = getelementptr inbounds {ty}, {pointer} %context, i32 %recur{index}.{name}.value.offset")?;
-			let weight_offset = plan.node.offset.checked_sub(scan_offset).ok_or_else(|| RecipeError::new("recurrent body weight offset precedes scan"))?;
-			writeln!(ir, "%recur{index}.{name}.weights = getelementptr inbounds {ty}, {pointer} %weights, i32 {weight_offset}")?;
+			let weight_offset = plan.weight_offset.checked_sub(scan_weight_offset).ok_or_else(|| RecipeError::new("recurrent body weight offset precedes scan"))?;
+			writeln!(ir, "%recur{index}.{name}.weights = getelementptr inbounds i8, {pointer} %weights, i64 {weight_offset}")?;
 			for (label, source) in [("source", plan.node.source), ("second", plan.node.second)] {
 				if source == index as i32 || source == -1 {
 					writeln!(ir, "%recur{index}.{name}.{label}.base = getelementptr inbounds {ty}, {pointer} %recur{index}.cell.value.base, i32 0")?;
@@ -5856,7 +5856,7 @@ impl NativeModelIr {
 			writeln!(ir, "{name}.step:")?;
 			writeln!(ir, "%{name}.temp.offset = add i32 {}, %{name}", layout.temporary_gradient + layout.gradient_offsets[relative])?;
 			writeln!(ir, "%{name}.temp.ptr = getelementptr inbounds {ty}, {pointer} %context, i32 %{name}.temp.offset")?;
-			writeln!(ir, "%{name}.global.offset = add i32 {}, %{name}", plan.node.offset)?;
+			writeln!(ir, "%{name}.global.offset = add i32 {}, %{name}", narrow(self.gradient_base(plan)?, "recurrent body gradient base")?)?;
 			writeln!(ir, "%{name}.global.ptr = getelementptr inbounds {ty}, {pointer} %gradient, i32 %{name}.global.offset")?;
 			writeln!(ir, "%{name}.temp = load {ty}, {pointer} %{name}.temp.ptr, align {align}")?;
 			writeln!(ir, "%{name}.global = load {ty}, {pointer} %{name}.global.ptr, align {align}")?;
@@ -18764,7 +18764,9 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 	}
 	// The add, and any projection the skip path needs, run in the residual's own
 	// precision, or the table's res entry.
+	let (outer_precision, outer_blck_precision) = (graph.block_precision, graph.block_blck_precision);
 	graph.block_precision = precision;
+	graph.block_blck_precision = precision;
 	let outer_kind = graph.block_kind;
 	graph.block_kind = "residual";
 	let branch = graph.source;
@@ -18789,6 +18791,8 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	let second = if branch_shape == shape { skip } else { branch };
 	push_program(graph, second, &[], program)?;
+	graph.block_precision = outer_precision;
+	graph.block_blck_precision = outer_blck_precision;
 	graph.block_kind = outer_kind;
 	Ok(())
 }
@@ -18899,6 +18903,7 @@ fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
+	let input_precision = if source >= 0 { graph.nodes[source as usize].precision } else { graph.profile.resolve(graph.block_precision.unwrap_or(graph.profile.atvn)) };
 	let width = data.target_width;
 	let scalar = Shape { channels: 1, length: 1 };
 	let base = graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count();
@@ -18928,7 +18933,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 				fitted: Vec::new(),
 				bound: None,
 			};
-			let mut surrogate = compile(&surrogate_model(config.surrogate_width, config.precision), &blank, &blank.targets, 1, gpu, config, false)?;
+			let mut surrogate = compile(&surrogate_model(config.surrogate_width, input_precision, config.precision), &blank, &blank.targets, 1, gpu, config, false)?;
 			surrogate.frozen.fill(1);
 			(program, surrogate)
 		} else {
@@ -18954,9 +18959,9 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			// update, so retain the existing no-fit path in that case.
 			let surrogate = if graph.frozen.contains(&0) {
 				let targets = predict_rows(&fitted, &inputs, input.elements())?;
-				fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+				fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, input_precision, config)?
 			} else {
-				let mut untrained = compile(&surrogate_model(config.surrogate_width, config.precision), &prepared, &prepared.targets, rows, gpu, config, true)?;
+				let mut untrained = compile(&surrogate_model(config.surrogate_width, input_precision, config.precision), &prepared, &prepared.targets, rows, gpu, config, true)?;
 				untrained.frozen.fill(1);
 				untrained
 			};
@@ -21121,7 +21126,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		fitted: Vec::new(),
 		bound: None,
 	};
-	let graph = compile(&surrogate_model(config.surrogate_width, config.precision), &prepared, &targets, rows, gpu, config, true)?;
+	let graph = compile(&surrogate_model(config.surrogate_width, config.precision, config.precision), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?;
@@ -24225,14 +24230,14 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 	tape.forward(ForwardMode::Training)?;
 	tape.predictions_at(graph.source, graph.output.elements())
 }
-fn surrogate_model(hidden: usize, precision: Compute) -> Model {
-	recipe.model().layer(hidden).arithmetic(precision).tanh().arithmetic(precision).layer(1).arithmetic(precision)
+fn surrogate_model(hidden: usize, input_precision: Compute, precision: Compute) -> Model {
+	recipe.model().layer(hidden).arithmetic(input_precision).tanh().arithmetic(precision).layer(1).arithmetic(precision)
 }
-fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
+fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, gpu: &'static Gpu, input_precision: Compute, config: Config) -> Result<Graph> {
 	require(!targets.is_empty(), "surrogate requires teacher outputs")?;
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
-	let model = surrogate_model(hidden, config.precision);
+	let model = surrogate_model(hidden, input_precision, config.precision);
 	let prepared = Prepared {
 		samples: samples.to_vec(),
 		targets: targets.to_vec(),

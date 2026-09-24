@@ -21,6 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$script:ProgressHistory = [Collections.Generic.List[string]]::new()
 
 function Invoke-Native {
 	param([string] $Path, [string[]] $Arguments, [string] $What)
@@ -57,7 +58,8 @@ function Report-Phase {
 	param([string] $Name)
 	try {
 		$uri = Convert-EncodedUri $progressUriEncoded
-		$body = [Text.Encoding]::UTF8.GetBytes("$candidateSha $phase $Name $([DateTime]::UtcNow.ToString('o'))")
+		$script:ProgressHistory.Add("$candidateSha $phase $Name $([DateTime]::UtcNow.ToString('o'))")
+		$body = [Text.Encoding]::UTF8.GetBytes(($script:ProgressHistory -join "`n"))
 		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $uri -Body $body -Headers @{ "x-ms-blob-type" = "BlockBlob" } -TimeoutSec 30 | Out-Null
 	} catch {
 		Write-Output "guest progress upload failed at $Name"
@@ -271,6 +273,7 @@ try {
 		New-Item -ItemType Directory -Force -Path $trial | Out-Null
 		Copy-Item -LiteralPath (Join-Path $runtime "harness.rs") -Destination (Join-Path $work "harness.rs")
 		$env:RECIPE_DEVICE = "nv0"
+		$env:RECIPE_COMPOSITION_CAPABILITY = "sm75"
 		$env:RECIPE_COMPOSITION_RUNNER = Join-Path $work "target\release\recipe.exe"
 		$env:RECIPE_COMPOSITION_CURSOR = $trialCursor
 		$env:RECIPE_COMPOSITION_COUNT = $trialCount

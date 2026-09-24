@@ -1684,7 +1684,7 @@ fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
 		"@contraction_tile = external addrspace(3) global [0 x double], align 16",
-		"@contraction_tile = internal thread_local global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16",
+		"@contraction_tile = internal thread_local global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x RECIPE_STATE] zeroinitializer, align 16",
 	),
 	(" addrspace(3)", ""),
 	("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @recipe.cpu.thread.id()"),
@@ -1705,9 +1705,8 @@ const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global 
 define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
 define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
-/// Compile-time contraction shape. A reverse K extent is cut into one contiguous
-/// partition per `split_span` elements, capped at `partitions`, so the summation
-/// order is a property of the program rather than of the device it runs on.
+/// Contraction shape. Reverse K partitions use `split_span`, capped at
+/// `partitions`, for a fixed summation order across devices.
 #[derive(Clone, Copy)]
 struct Schedule {
 	swizzle_m: u32,

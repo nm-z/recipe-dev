@@ -70,6 +70,7 @@ const LOSSES: [&str; 6] = ["mse", "rmse", "huber", "mae", "bce", "focal"];
 // fp(32) keeps three entries so a third of trials stay at the reference precision.
 const PRECISIONS: [&str; 12] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
 const PRECISIONS_FILED: [&str; 11] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
+const PRECISIONS_T4: [&str; 8] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".int(8)", ".int(16)", ".int(32)"];
 const ATTENTION_OPTIONS: [&str; 6] = ["", ".kv(1)", ".qk(rms)", ".qk(l2)", ".gate()", ".rope(neox, {width}, 10000.0)"];
 // Estimators take no activation, normalization or quantization.
 const ESTIMATORS: [&str; 7] = ["svm()", "bayes()", "cbst(8)", "xgbst(8)", "lgbm(8)", "kmeans(4)", "knn(3)"];
@@ -118,7 +119,7 @@ fn block(cursor: u64, salt: u64, member: bool, width: Option<usize>, sequential:
 }
 
 fn branch(cursor: u64, salt: u64, count: usize, width: Option<usize>) -> String {
-	(0..count).map(|index| block(cursor, salt + 10 * index as u64, AVOID_FILED, width, false, None)).collect::<Vec<_>>().join(", ")
+	(0..count).map(|index| block(cursor, salt + 10 * index as u64, AVOID_FILED, width, false, Some(".fp(32)"))).collect::<Vec<_>>().join(", ")
 }
 
 fn composition(cursor: u64, salt: u64) -> String {
@@ -126,10 +127,10 @@ fn composition(cursor: u64, salt: u64) -> String {
 	let count = 1 + (bits % 4) as usize;
 	let shared = AVOID_FILED.then_some(WIDTHS[((bits >> 12) % 5) as usize]);
 	match (bits >> 4) % 4 {
-		0 => format!(".res([{}])", branch(cursor, salt + 100, count, None)),
-		1 => format!(".moe({}, [{}])", 1 + (bits >> 8) as usize % count, branch(cursor, salt + 100, count, None)),
-		2 => format!(".ensemble([{}])", branch(cursor, salt + 100, count, shared)),
-		_ => format!(".res([{}]).scale({})", branch(cursor, salt + 100, count, None), ["0.5", "1.5", "2.0"][((bits >> 8) % 3) as usize]),
+		0 => format!(".res([{}]).fp(32)", branch(cursor, salt + 100, count, None)),
+		1 => format!(".moe({}, [{}]).fp(32)", 1 + (bits >> 8) as usize % count, branch(cursor, salt + 100, count, None)),
+		2 => format!(".ensemble([{}]).fp(32)", branch(cursor, salt + 100, count, shared)),
+		_ => format!(".res([{}]).fp(32).scale({})", branch(cursor, salt + 100, count, None), ["0.5", "1.5", "2.0"][((bits >> 8) % 3) as usize]),
 	}
 }
 
@@ -163,7 +164,8 @@ fn model(cursor: u64, precision: &str) -> String {
 }
 
 fn precision(cursor: u64) -> &'static str {
-	pick(cursor, 6, if AVOID_FILED { &PRECISIONS_FILED[..] } else { &PRECISIONS[..] })
+	let options = if std::env::var("RECIPE_COMPOSITION_CAPABILITY").ok().as_deref() == Some("sm75") { &PRECISIONS_T4[..] } else if AVOID_FILED { &PRECISIONS_FILED[..] } else { &PRECISIONS[..] };
+	pick(cursor, 6, options)
 }
 
 fn source(cursor: u64, seed: u64) -> String {
