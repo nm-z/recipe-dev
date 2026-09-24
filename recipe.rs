@@ -4220,7 +4220,7 @@ impl NativeModelIr {
 					let heads = integer_argument(node.argument[0], "attention heads")?;
 					let online_order = self.inference && self.graph.profile.online_softmax;
 					require(!online_order || node.output.channels <= 256 * heads.max(1) as usize, "online attention head width exceeds 256")?;
-					let attention = if !compact && !online_order && matrix && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let attention = if !compact && !online_order && matrix && node.kv_precision == node.precision && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (from, channels) = (node.output.elements(), node.output.channels);
