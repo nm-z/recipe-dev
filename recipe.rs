@@ -5468,7 +5468,7 @@ impl NativeModelIr {
 				format!("%recur{index}.tanh")
 			}
 			3 => {
-				writeln!(ir, "%recur{index}.sigmoid = call {ty} @sigmoid({ty} %recur{index}.linear)")?;
+				writeln!(ir, "%recur{index}.sigmoid = call {ty} @sigmoid{v}({ty} %recur{index}.linear)")?;
 				format!("%recur{index}.sigmoid")
 			}
 			other => return Err(RecipeError::new(format!("recurrent cell activation code {other} is invalid"))),
@@ -10693,7 +10693,7 @@ mod bundle {
 				}
 			}
 		}
-		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, exclusions, pending_frozen: false }))
+		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false }))
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -12112,6 +12112,7 @@ pub struct ModelData {
 	downstream: Option<Box<Model>>,
 	/// The epsilon every normalization the model lowers is built with; saved with the model.
 	epsilon: f64,
+	epsilon_explicit: bool,
 	/// The qualifier pending for the next block.
 	pending_frozen: bool,
 	/// The default behavior this model excludes, one bit each. Bit 0 is the bias.
@@ -12455,7 +12456,10 @@ impl Model {
 	/// saved with the model, so a bundle reloads with the value it was trained with.
 	pub fn e(&self, value: f64) -> Self {
 		assert!(value.is_finite() && value > 0.0, "normalization epsilon must be finite and positive");
-		self.edit(|model| model.epsilon = value)
+		self.edit(|model| { model.epsilon = value; model.epsilon_explicit = true; })
+	}
+	fn for_file(&self, file: &Gguf) -> Self {
+		if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) }
 	}
 	/// `.fp(16)`, `.int(4)`, `.bf(16)`, or `.tf(32)` after a block sets that
 	/// block's arithmetic; before any block they set the default for every block
@@ -14333,7 +14337,7 @@ impl Recipe {
 	/// declares, or the Cargo default when no file is open.
 	pub fn model(&self) -> Model {
 		let epsilon = SCRIPT_FILE.get().and_then(|(_, file)| file.rms_epsilon()).unwrap_or_else(|| default_epsilon().unwrap_or_else(|error| panic!("{error}")));
-		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, pending_frozen: false, exclusions: 0 })
+		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
@@ -14617,7 +14621,7 @@ fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], c
 		fitted: Vec::new(),
 		bound: Some(model.bound(plan)?),
 	};
-	compile(blocks, &data, &data.targets, 1, device, config, false)
+	compile(&blocks.for_file(model), &data, &data.targets, 1, device, config, false)
 }
 /// How an architecture pairs the channels its rotary embedding rotates. Recipe's
 /// rope pairs each channel with the one half the rotated span away; an
@@ -17366,7 +17370,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	graph.block_frozen = false;
 	graph.block_precision = None;
-	graph.block_blck_precision = None;
+	graph.block_blck_precision = Some(graph.profile.atvn);
 	graph.block_kv_precision = None;
 	graph.block_qk_precision = None;
 	graph.block_rope_precision = None;
@@ -18463,11 +18467,15 @@ fn project_moe_shape(graph: &mut Graph, source: i32, from: Shape, target: Shape)
 	if from == target {
 		return Ok(source);
 	}
-	if from.length == target.length {
-		lower_project(graph, target.channels)?;
+	let named = graph.block_blck_precision;
+	graph.block_blck_precision = graph.block_precision.or(Some(graph.profile.atvn));
+	let projected = if from.length == target.length {
+		lower_project(graph, target.channels)
 	} else {
-		lower_flatten_project(graph, target)?;
-	}
+		lower_flatten_project(graph, target)
+	};
+	graph.block_blck_precision = named;
+	projected?;
 	Ok(graph.source)
 }
 fn maximum(graph: &mut Graph, first: i32, second: i32, shape: Shape) -> Result<i32> {
@@ -18623,11 +18631,15 @@ fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: u
 		// router must not disappear when its input already has the canonical shape:
 		// identical input and output shapes still require a distinct projection.
 		reset(graph, source, input);
-		if input.length == output.length {
-			lower_project(graph, output.channels)?;
+		let named = graph.block_blck_precision;
+		graph.block_blck_precision = graph.block_precision.or(Some(graph.profile.atvn));
+		let projected = if input.length == output.length {
+			lower_project(graph, output.channels)
 		} else {
-			lower_flatten_project(graph, output)?;
-		}
+			lower_flatten_project(graph, output)
+		};
+		graph.block_blck_precision = named;
+		projected?;
 		scores.push(graph.source);
 	}
 	select(graph, &branches, &scores, output, top_k)
