@@ -28863,7 +28863,7 @@ fn rat_episode(session: &mut RatSession, first: RatState, names: &[String], outp
 	let mut observations = Vec::new();
 	loop {
 		require(state.names == names && state.outputs == outputs, "RAT evaluator changed state or action schema")?;
-		tape.samples.write_float_bytes(0, &state.values, tape.precision.model)?;
+		tape.samples.write_float_bytes(0, &state.values, tape.program.artifact.layout.input_precision)?;
 		tape.forward(ForwardMode::Inference)?;
 		let proposal = tape.predictions_at(proposal_node as i32, outputs.len())?;
 		let action = state.select(&proposal)?;
@@ -29034,7 +29034,7 @@ impl RatFit {
 				std::borrow::Cow::Owned(indices.iter().map(|&index| targets[index]).collect::<Vec<_>>()),
 			)
 		};
-		self.tape.samples.write_float_bytes(0, &selected_samples, self.tape.precision.model)?;
+		self.tape.samples.write_float_bytes(0, &selected_samples, self.tape.program.artifact.layout.input_precision)?;
 		self.tape.targets.write_float_bytes(0, &selected_targets, self.tape.program.artifact.layout.output_precision)?;
 		rat_fit_steps(&mut self.tape, steps, rate, config)?;
 		self.tape.objective().map(Some)
@@ -29045,7 +29045,7 @@ impl RatFit {
 			return Ok(Vec::new());
 		}
 		self.reserve(samples.len() / self.width)?;
-		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.program.artifact.layout.input_precision)?;
 		self.tape.forward(ForwardMode::Inference)?;
 		self.tape.predictions()
 	}
@@ -29064,17 +29064,25 @@ impl RatFit {
 	fn fit_sequence(&mut self, samples: &[f64], target: f64, rate: f64, config: Config) -> Result<()> {
 		require(samples.len() == self.width, "RAT sequence input has the wrong shape")?;
 		self.reserve(1)?;
-		self.tape.samples.write_float_bytes(0, samples, self.tape.precision.model)?;
+		self.tape.samples.write_float_bytes(0, samples, self.tape.program.artifact.layout.input_precision)?;
 		self.tape.targets.write_float_bytes(0, &[target], self.tape.program.artifact.layout.output_precision)?;
 		rat_fit_steps(&mut self.tape, 1, rate, config)
 	}
 }
-/// One proposer update: the evaluator's current weights enter the composition
-/// at `offset`, the sample enters the input, and one epoch moves the proposer
-/// toward the target through the frozen evaluator.
+/// Update the proposer once through the fitted evaluator.
 fn rat_backward(tape: &mut NativeTape, offset: usize, teacher_weights: &[f64], input: &[f64], rate: f64, config: Config) -> Result<()> {
-	tape.weights.write_float_bytes(checked_mul(offset, tape.precision.model.bytes(), "RAT evaluator weight offset")?, teacher_weights, tape.precision.model)?;
-	tape.samples.write_float_bytes(0, input, tape.precision.model)?;
+	let layout = &tape.program.artifact.layout;
+	let mut written = 0;
+	for (index, &(start, count)) in layout.spans.iter().enumerate() {
+		if start < offset || count == 0 { continue; }
+		let first = start - offset;
+		let end = checked_add(first, count, "RAT evaluator weight span")?;
+		let values = teacher_weights.get(first..end).ok_or_else(|| RecipeError::new("RAT evaluator weights do not match the composed graph"))?;
+		tape.weights.write_float_bytes(layout.weights[index], values, layout.precisions[index])?;
+		written = checked_add(written, count, "RAT evaluator weights")?;
+	}
+	require(written == teacher_weights.len(), "RAT evaluator weights are incomplete")?;
+	tape.samples.write_float_bytes(0, input, layout.input_precision)?;
 	rat_fit_steps(tape, 1, rate, config)
 }
 /// The models of the learned replay policy. A selector reads the sequence of
@@ -29207,7 +29215,7 @@ impl LearnedReplay {
 		let context = samples.chunks_exact(self.width).zip(targets).zip(&before).flat_map(|((row, target), prediction)| row.iter().copied().chain([*target, *prediction])).collect::<Vec<_>>();
 		let selector_input = learned_channels(&context, self.context_width, length)?;
 		let actor = self.actor.as_mut().ok_or_else(|| RecipeError::new("learned RAT actor is absent"))?;
-		actor.tape.samples.write_float_bytes(0, &selector_input, actor.tape.precision.model)?;
+		actor.tape.samples.write_float_bytes(0, &selector_input, actor.tape.program.artifact.layout.input_precision)?;
 		let selector_node = actor.selector_node;
 		let score_offset = actor.score_offset;
 		let selector_tape = &mut actor.tape;
