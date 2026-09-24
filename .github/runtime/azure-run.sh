@@ -57,8 +57,9 @@ case "$RECIPE_WORKLOAD" in
 	*) echo "RECIPE_WORKLOAD must be suite or trial" >&2; exit 1 ;;
 esac
 TRIAL_BLOB="$TRANSFER_ROOT/trial.txt"
+PROGRESS_BLOB="$TRANSFER_ROOT/progress.txt"
 PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
-DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-2700}"
+DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-1200}"
 ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
 ADMISSION_LEASE_SECONDS=60
 ADMISSION_BLOB="runtime/windows/admission.lock"
@@ -532,6 +533,15 @@ if [ "$(curl --silent --fail --max-time 120 "$RUNTIME_URI" | sha256sum | cut -d'
 fi
 snapshot_uri_encoded="$(printf '%s' "$SNAPSHOT_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 runtime_uri_encoded="$(printf '%s' "$RUNTIME_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+PROGRESS_URI="$(az storage blob generate-sas \
+	--auth-mode login --as-user --full-uri --https-only \
+	--account-name "$AZURE_STORAGE_ACCOUNT" \
+	--container-name "$AZURE_STORAGE_CONTAINER" \
+	--name "$PROGRESS_BLOB" \
+	--permissions cw --start "$sas_start" --expiry "$sas_expiry" \
+	-o tsv --only-show-errors)"
+case "$PROGRESS_URI" in https://*\?*) ;; *) echo "progress write URL generation failed" >&2; exit 1 ;; esac
+progress_uri_encoded="$(printf '%s' "$PROGRESS_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 echo "uploaded and verified the private per-run archives"
 # A trial returns its harness stderr through the same private container: the guest gets a
 # short-lived create/write URL for one blob, since Run Command output is capped.
@@ -566,10 +576,15 @@ invoke_guest() {
 			--resource-group "$GROUP" --name "$WORKER" \
 			--command-id RunPowerShellScript \
 			--scripts "@guest.ps1" \
-			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" "workload=$RECIPE_WORKLOAD" "trialCursor=${RECIPE_TRIAL_CURSOR:-0}" "trialCount=${RECIPE_TRIAL_COUNT:-0}" "trialUriEncoded=$trial_uri_encoded" \
+			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" "progressUriEncoded=$progress_uri_encoded" "workload=$RECIPE_WORKLOAD" "trialCursor=${RECIPE_TRIAL_CURSOR:-0}" "trialCount=${RECIPE_TRIAL_COUNT:-0}" "trialUriEncoded=$trial_uri_encoded" \
 			--only-show-errors -o json > "$document"
 	status=$?
 	set -e
+	if az storage blob download --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT" --container-name "$AZURE_STORAGE_CONTAINER" --name "$PROGRESS_BLOB" --file evidence/guest-progress.txt --overwrite true --only-show-errors --no-progress -o none 2>evidence/progress-download.log; then
+		cat evidence/guest-progress.txt
+	else
+		echo "guest progress is unavailable"
+	fi
 	elapsed=$(( $(date +%s) - started ))
 	echo "$phase command returned after ${elapsed}s with controller status $status"
 	if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then

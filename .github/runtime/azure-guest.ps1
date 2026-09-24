@@ -5,6 +5,7 @@ param(
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
 	[Parameter(Mandatory = $true)] [string] $snapshotUriEncoded,
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded,
+	[Parameter(Mandatory = $true)] [string] $progressUriEncoded,
 	[string] $workload = "suite",
 	[string] $trialCursor = "0",
 	[string] $trialCount = "0",
@@ -50,6 +51,17 @@ function Convert-EncodedUri {
 		default { throw "protected URL encoding has an invalid length" }
 	}
 	return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+}
+
+function Report-Phase {
+	param([string] $Name)
+	try {
+		$uri = Convert-EncodedUri $progressUriEncoded
+		$body = [Text.Encoding]::UTF8.GetBytes("$candidateSha $phase $Name $([DateTime]::UtcNow.ToString('o'))")
+		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $uri -Body $body -Headers @{ "x-ms-blob-type" = "BlockBlob" } -TimeoutSec 30 | Out-Null
+	} catch {
+		Write-Output "guest progress upload failed at $Name"
+	}
 }
 
 function Enter-VsDeveloperEnvironment {
@@ -212,8 +224,11 @@ function Initialize-Toolchain {
 
 try {
 	$root = "C:\recipe"
+	Report-Phase "gpu-check"
 	Confirm-Gpu
+	Report-Phase "toolchain-start"
 	Initialize-Toolchain -Root $root -AllowInstall ($phase -eq "execute")
+	Report-Phase "toolchain-ready"
 	if ($phase -eq "preflight") {
 		Write-Output "PREFLIGHT EXIT 0"
 		exit 0
@@ -241,12 +256,16 @@ try {
 	New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 	Invoke-Native "tar.exe" @("-xzf", $runtimeArchive, "-C", $runtime) "trusted runtime extraction"
 	Write-Output "trusted runtime verified sha256=$runtimeActual"
+	Report-Phase "snapshot-ready"
 
 	Write-Output "== guest: building with the NVIDIA backend =="
+	Report-Phase "build-start"
 	Push-Location $work
 	Invoke-Native "cargo" @("build", "--release", "--lib", "--bin", "recipe") "the native GPU build"
+	Report-Phase "build-ready"
 
 	if ($workload -eq "trial") {
+		Report-Phase "trial-start"
 		Write-Output "== guest: running the composition harness on nv0, cursor $trialCursor count $trialCount =="
 		$trial = Join-Path $work "trial"
 		New-Item -ItemType Directory -Force -Path $trial | Out-Null
@@ -272,6 +291,7 @@ try {
 		$packets = @(Select-String -LiteralPath $trialStderr -Pattern '^RECIPE FAILURE BEGIN$' -SimpleMatch:$false).Count
 		$compositions = @(Select-String -LiteralPath $trialStderr -Pattern '^composition [0-9]+:').Count
 		Write-Output "TRIAL EXIT $($trialProcess.ExitCode) compositions=$compositions packets=$packets"
+		Report-Phase "trial-ready"
 		# Run Command output is capped, so the log goes back through the private container.
 		$trialUri = Convert-EncodedUri $trialUriEncoded
 		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $trialUri -InFile $trialStderr -Headers @{ "x-ms-blob-type" = "BlockBlob" } | Out-Null
@@ -281,6 +301,7 @@ try {
 	}
 
 	Write-Output "== guest: executing the suite on nv0 =="
+	Report-Phase "suite-start"
 	New-Item -ItemType Directory -Force -Path (Join-Path $work "evidence"), (Join-Path $work "gpu-work") | Out-Null
 	$env:RECIPE_SUITE_ROOT = $runtime
 	$env:RECIPE_SUITE_WORK = Join-Path $work "gpu-work"
@@ -299,6 +320,7 @@ try {
 	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
 	Write-Output $log
 	if ($runProcess.ExitCode -ne 0) { throw "the runtime suite failed with exit code $($runProcess.ExitCode)" }
+	Report-Phase "suite-ready"
 	Pop-Location
 
 	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
