@@ -637,8 +637,10 @@ awk '
 ' evidence/guest.log > evidence/suite.json
 [ -s evidence/suite.json ] || { echo "the guest returned no suite evidence" >&2; exit 1; }
 echo "recovered suite evidence"
+jq -e '.schema == "recipe-runtime-suite/1" and .executed == 8 and .failed == 0 and ([.checks[] | select(.passed)] | length) == 8' evidence/suite.json >/dev/null || { echo "the guest suite evidence has fewer than eight passing checks" >&2; exit 1; }
 
-route="$(grep -m1 '^suite device ' evidence/guest.log | awk '{print $3}')"
+route="$(sed -n 's/^executed on //p' evidence/guest.log | head -n 1)"
+[ -n "$route" ] || { echo "the guest did not report its executed device" >&2; exit 1; }
 device="${route##*:}"
 case "$device" in
 	nv*) ;;
