@@ -20844,6 +20844,7 @@ impl NativeTape {
 		trace(&format!("epoch {} {operation:?} launch", self.step))?;
 		let machine_started = Instant::now();
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
+		trace(&format!("epoch {} {operation:?} submitted", self.step))?;
 		self.program.gpu.synchronize()?;
 		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
@@ -23379,10 +23380,8 @@ impl Cuda {
 			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
 			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
-			// Every workgroup the SMs hold at once is launched: the grid stays
-			// cooperative, and the work is spread over that many more warps.
-			let groups = geometry.groups.checked_mul(active as u32).ok_or_else(|| RecipeError::new("NVIDIA native grid overflows"))?;
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry: Geometry { groups, block: geometry.block } })
+			// One workgroup per SM leaves every block room to reach the grid barrier.
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
 		}
 	}
 
