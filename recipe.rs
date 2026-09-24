@@ -11535,36 +11535,8 @@ pub fn pool(size: usize) -> Block {
 /// An attention step of `heads` query heads, `attn(heads)` inside a
 /// fragment, taking the same selectors as the model's `.attn`; `.kv(heads)`
 /// names its key and value heads.
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy)]
-pub struct attn(pub usize);
-impl From<attn> for Block {
-	fn from(heads: attn) -> Self {
-		Block::of(Operation::Attention(AttentionBlock::new(heads.0)))
-	}
-}
-impl attn {
-	fn arithmetic(&self, format: Compute) -> Block {
-		Block::from(*self).arithmetic(format)
-	}
-	pub fn qk(self, normalization: impl NormalizationSelector) -> Block {
-		Block::from(self).qk(normalization)
-	}
-	pub fn width(self, width: usize) -> Block {
-		Block::from(self).width(width)
-	}
-	pub fn kv(self, heads: usize) -> Block {
-		Block::from(self).kv(heads)
-	}
-	pub fn rope(self, layout: impl RopeSelector, dims: usize, base: f64) -> Block {
-		Block::from(self).rope(layout, dims, base)
-	}
-	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Block {
-		Block::from(self).index(heads, width, block, keep)
-	}
-	pub fn gate(self) -> Block {
-		Block::from(self).gate()
-	}
+pub fn attn(heads: usize) -> Block {
+	Block::of(Operation::Attention(AttentionBlock::new(heads)))
 }
 pub fn rnn(width: usize) -> Block {
 	Block::of(Operation::Rnn(width))
@@ -12090,15 +12062,11 @@ impl Block {
 	}
 	/// Sparse key selection on this `attn` block.
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
-		let mut value = self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }));
-		value.suffix = Suffix::End;
-		value
+		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
 	}
 	/// Sigmoid gate on the output of this `attn` block.
 	pub fn gate(self) -> Self {
-		let mut block = self.attention("gate", |attention| attention.gate = true);
-		block.suffix = Suffix::End;
-		block
+		self.attention("gate", |attention| attention.gate = true)
 	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
@@ -12127,7 +12095,6 @@ impl Block {
 	}
 }
 precision_methods!(Block => Block);
-precision_methods!(attn => Block);
 /// A model: the blocks pushed so far and the settings every later block takes.
 /// The handle shares its data, so `model.frozen` is the same model with a
 /// qualifier pending for the block written next.
