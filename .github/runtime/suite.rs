@@ -116,7 +116,7 @@ fn main() {
 	let model = recipe.model().layer(1).fp(PRECISION_BITS).loss(mse);
 	let bundle = work.join("linear.ogdl");
 	let training = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).save(&bundle);
-	let training = if std::env::var_os("RECIPE_SUITE_PROGRESS").is_some() { training.log([Epoch, Loss]) } else { training };
+	let training = if std::env::var_os("RECIPE_SUITE_PROGRESS").is_some() { training.log([Epoch, Loss, debug]) } else { training };
 	let trained = training.run(&model, &linear);
 	let device = trained.memory.first().and_then(|line| line.split_whitespace().next()).expect("training reported no device memory");
 	println!("suite device {device}");

@@ -310,6 +310,7 @@ try {
 	$env:RECIPE_SUITE_WORK = Join-Path $work "gpu-work"
 	$env:RECIPE_EVIDENCE = Join-Path $work "evidence\suite.json"
 	$env:RECIPE_SUITE_PROGRESS = "1"
+	$env:RECIPE_TRACE_PATH = Join-Path $root "suite-trace-$candidateSha.log"
 	# --device nv0 hard-errors when the device is absent; a build carrying the
 	# nvidia cfg does not add a CPU device, so there is no silent fallback.
 	$runStdout = Join-Path $work "run.stdout.log"
@@ -328,6 +329,8 @@ try {
 		$checks = @(Select-String -LiteralPath $runStdout -Pattern '^check ' -ErrorAction SilentlyContinue).Count
 		$last = [string](Get-Content -LiteralPath $runStdout -Tail 1 -ErrorAction SilentlyContinue)
 		if (!$last) { $last = [string](Get-Content -LiteralPath $runStderr -Tail 1 -ErrorAction SilentlyContinue) }
+		$trace = [string](Get-Content -LiteralPath $env:RECIPE_TRACE_PATH -Tail 1 -ErrorAction SilentlyContinue)
+		if ($trace) { $last = $trace }
 		if ($last.Length -gt 180) { $last = $last.Substring(0, 180) }
 		if ($checks -ne $lastChecks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge 60) {
 			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($runProcess.Id)" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ","

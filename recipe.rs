@@ -1,4 +1,4 @@
-//! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
+//! Recipe executes one model graph after automatically probing a compiled device backend.
 //! Attention uses learned Q/K/V and output projections.
 #![allow(non_upper_case_globals)]
 // Compile the same numeric definitions as the template generator, without separate source files.
@@ -10687,17 +10687,9 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(mut blocks: Vec<Block>, loss: u8, legacy_quantization: u16, epsilon: f64, exclusions: u8) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, epsilon: f64, exclusions: u8) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		if legacy_quantization != 0 {
-			for block in &mut blocks {
-				if block.quantization == 0 {
-					block.quantization = legacy_quantization;
-					block.profile = StorageFormat(legacy_quantization).selection().is_some();
-				}
-			}
-		}
 		Ok(Model::wrap(ModelData { blocks, loss: LossFunction(loss), downstream: None, epsilon, epsilon_explicit: true, exclusions, pending_frozen: false }))
 	}
 	#[derive(Clone)]
@@ -10809,7 +10801,6 @@ mod bundle {
 	#[derive(Default)]
 	struct ModelParts {
 		loss: Option<u8>,
-		legacy_quantization: Option<u16>,
 		epsilon: Option<f64>,
 		exclusions: u8,
 		blocks: Vec<Block>,
@@ -10841,9 +10832,7 @@ mod bundle {
 			let model = model(
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
-				parts.legacy_quantization.unwrap_or(0),
-				// A bundle saved before models carried an epsilon was lowered with the Cargo default.
-				parts.epsilon.map_or_else(default_epsilon, Ok)?,
+				parts.epsilon.ok_or_else(|| RecipeError::new("semantic model has no epsilon"))?,
 				parts.exclusions,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
@@ -10942,27 +10931,6 @@ mod bundle {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						epsilon: Some(number("semantic model epsilon", fields[1])?),
 						exclusions: value_at(fields.get(2).copied(), "semantic model exclusions")?,
-						..ModelParts::default()
-					});
-				}
-				"model" => {
-					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require((2..=5).contains(&fields.len()), "semantic model header has the wrong width")?;
-					require(builder.model.is_none(), "semantic graph has more than one model")?;
-					let (epsilon, exclusions) = match fields.get(2) {
-						None => (None, 0),
-						Some(field) if field.contains('.') || field.contains('e') || field.contains('E') => (Some(number("semantic model epsilon", field)?), 0),
-						Some(field) => (None, value_at(Some(*field), "semantic model exclusions")?),
-					};
-					let exclusions = fields.get(3).map_or(Ok(exclusions), |field| value_at(Some(*field), "semantic model exclusions"))?;
-					if let Some(field) = fields.get(4) {
-						precision_from_token(field)?;
-					}
-					builder.model = Some(ModelParts {
-						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
-						legacy_quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
-						epsilon,
-						exclusions,
 						..ModelParts::default()
 					});
 				}
@@ -11113,8 +11081,11 @@ mod bundle {
 	fn join<T: ToString>(values: &[T]) -> String {
 		values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
 	}
+	fn same_profile(a: &SemanticGraph, b: &SemanticGraph) -> bool {
+		a.artifact.rsplit_once('/').is_some_and(|(_, profile)| b.artifact.ends_with(&format!("/{profile}")))
+	}
 	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
-		a.precision == b.precision
+		same_profile(a, b) && a.precision == b.precision
 			&& a.input == b.input
 			&& a.output == b.output
 			&& a.inputs == b.inputs
@@ -11123,6 +11094,9 @@ mod bundle {
 			&& a.tensors.len() == b.tensors.len()
 			&& a.tensors.iter().zip(&b.tensors).all(|(a, b)| a.format.0 == b.format.0 && a.count == b.count)
 			&& a.frozen.len() == b.frozen.len()
+	}
+	pub(super) fn profile_key(profile: Precisions) -> String {
+		format!("{profile:?}")
 	}
 	pub(super) fn artifact_key(model: &Model, schema: &DataSchema, precision: Compute, graph: &Graph, target: &str) -> String {
 		let mut hash = 0xcbf29ce484222325_u64;
@@ -11140,9 +11114,9 @@ mod bundle {
 		feed(&format!("precision:{precision:?};"));
 		feed(&format!("loss:{};epsilon:{};no:{};blocks:{};", model.loss.0, model.epsilon.to_bits(), model.exclusions, model_text(model).join("/")));
 		for node in &graph.nodes {
-		feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.storage, node.output.elements()));
+		feed(&format!("node:{}:{}:{}:{}:{:?}:{:?}:{:?};", node.offset, node.parameters, node.storage, node.output.elements(), node.precision, node.acc, node.kv_precision));
 		}
-		format!("recipe-native-{hash:016x}")
+		format!("recipe-native-{hash:016x}/{}", profile_key(graph.profile))
 	}
 	pub(super) fn restore(path: &Path, schema: &DataSchema, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? {
@@ -11150,6 +11124,7 @@ mod bundle {
 		}
 		let (stored_schema, stored) = load_semantic(path)?;
 		let current = graphs.iter().map(semantic_graph).collect::<Result<Vec<_>>>()?;
+		require(stored.iter().zip(&current).all(|(saved, current)| same_profile(saved, current)), "saved precision profile is absent or differs from the selected table")?;
 		let matches = &stored_schema == schema && stored.len() == current.len() && stored.iter().zip(&current).all(|(a, b)| same_structure(a, b));
 		if matches {
 			for (current, saved) in graphs.iter_mut().zip(&stored) {
@@ -11436,12 +11411,13 @@ fn trace(message: &str) -> Result<()> {
 	if !tracing() {
 		return Ok(());
 	}
+	let path = std::env::var_os("RECIPE_TRACE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEBUG_LOG_PATH));
 	let file = DEBUG_LOG
-		.get_or_init(|| fs::OpenOptions::new().create(true).write(true).truncate(true).open(DEBUG_LOG_PATH).map(Mutex::new))
+		.get_or_init(|| fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path).map(Mutex::new))
 		.as_ref()
-		.map_err(|error| RecipeError::new(format!("cannot open {DEBUG_LOG_PATH}: {error}")))?;
+		.map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
 	let mut file = file.lock().map_err(|_| RecipeError::new("debug log lock is poisoned"))?;
-	writeln!(file, "{message}").and_then(|_| file.flush()).map_err(|error| RecipeError::new(format!("cannot write {DEBUG_LOG_PATH}: {error}")))
+	writeln!(file, "{message}").and_then(|_| file.flush()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
@@ -17426,6 +17402,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
+	require(saved.artifact.ends_with(&format!("/{}", bundle::profile_key(config.profile))), "saved precision profile is absent or differs from the selected table")?;
 	let prepared = Prepared {
 		samples: samples.to_vec(),
 		targets: vec![0.0; saved.output.elements()],
@@ -19012,7 +18989,10 @@ fn place_estimator_channel(graph: &mut Graph, channel: usize, width: usize) -> R
 	let input = graph.output;
 	let matrix = checked_mul(input.channels, width, "estimator channel matrix")?;
 	let output = Shape { channels: width, length: input.length };
-	push_node(graph, Primitive::Contraction, output, matrix, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let named = graph.block_blck_precision.replace(Compute::FP32);
+	let added = push_node(graph, Primitive::Contraction, output, matrix, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2);
+	graph.block_blck_precision = named;
+	added?;
 	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("estimator channel projection is absent"))?;
 	let (offset, parameters) = (node.offset, node.parameters);
 	graph.parameters[offset..offset + parameters].fill(0.0);
