@@ -142,9 +142,16 @@ function Confirm-Gpu {
 	if (-not $script:Smi) { throw "nvidia-smi is absent from the DSVM image" }
 	$nvcuda = "C:\Windows\System32\nvcuda.dll"
 	if (![IO.File]::Exists($nvcuda)) { throw "the NVIDIA runtime library is absent: $nvcuda" }
-	Invoke-Native $script:Smi @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader") "nvidia-smi"
-	$script:Gpu = (& $script:Smi --query-gpu=name --format=csv,noheader) -join ""
-	if ($LASTEXITCODE -ne 0) { throw "GPU identity query failed with exit code $LASTEXITCODE" }
+	for ($attempt = 1; $attempt -le 12; $attempt++) {
+		$inventory = & $script:Smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null
+		$code = $LASTEXITCODE
+		if ($code -eq 0 -and $inventory) { break }
+		if ($attempt -eq 12) { throw "nvidia-smi could not see the GPU after 12 checks (exit code $code)" }
+		Write-Output "nvidia-smi not ready (exit code $code); retrying"
+		Start-Sleep -Seconds 5
+	}
+	Write-Output $inventory
+	$script:Gpu = ([string]($inventory | Select-Object -First 1)).Split(',')[0].Trim()
 	if ($script:Gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $script:Gpu" }
 }
 
