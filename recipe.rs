@@ -14380,22 +14380,24 @@ pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
 	let file = Gguf::open(&resolve_path(path)?)?;
 	for (key, value) in file.metadata() {
-		if let Array(values) = value {
+		if key == "tokenizer.chat_template" { continue; }
+		if let String(text) = value {
+			println!("{key}.\"{text}\"");
+		} else if let Array(values) = value {
 			let kind = match values.first() {
 				Some(String(_)) => "strings", Some(Bool(_)) => "booleans", Some(F32(_) | F64(_)) => "floats",
 				Some(Array(_)) => "arrays", Some(_) => "integers", None => "values",
 			};
 			println!("{key}.[{} {kind}]", values.len());
 		} else {
-			let rendered = format!("{value:?}");
-			let scalar = rendered.split_once('(').and_then(|(_, value)| value.strip_suffix(')')).unwrap_or(&rendered);
-			println!("{key}.{scalar}");
+			let s = format!("{value:?}");
+			println!("{key}.{}", s.split_once('(').unwrap().1.trim_end_matches(')'));
 		}
 	}
 	for tensor in file.tensors() { println!("{}.{:?}", tensor.name, tensor.shape); }
 	Ok(())
 }
-/// Prints row-wise GGUF statistics.
+/// Stats.
 pub fn stats(path: impl AsRef<Path>) -> Result<()> {
 	const BINS: usize = 17;
 	let path = resolve_path(path)?;
