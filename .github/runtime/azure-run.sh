@@ -49,15 +49,15 @@ case "$PROFILE" in
 		;;
 	windows-amd)
 		# Standard_NV4ads_V710_v5 is the smallest Radeon PRO V710 (gfx1101) shape: 1/6 GPU.
-		# V710 boots only Generation 2 images, which the DSVM image is not; the Visual Studio
-		# image carries the Visual C++ tools the Windows guest builds with.
+		# V710 boots only Generation 2 images, which the DSVM image is not. The stock Gen2
+		# Windows Server image has no Visual C++ tools; the guest installs Build Tools.
 		DEFAULT_SIZE=Standard_NV4ads_V710_v5
-		DEFAULT_IMAGE=MicrosoftVisualStudio:visualstudio2022:vs-2022-comm-latest-ws2022:latest
+		DEFAULT_IMAGE=MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest
 		FAMILY=""
 		GUEST_OS=windows
 		VENDOR=amd
 		CELL_NAME=recipe/windows-amd
-		OS_LABEL="Windows Server 2022 with Visual Studio 2022"
+		OS_LABEL="Windows Server 2022 Datacenter (Gen2)"
 		GPU_PATTERN='Radeon[^,]*V710|V710'
 		DRIVER_EXTENSION="AmdGpuDriverWindows 1.1"
 		DEVICE_TAG=v710
@@ -450,11 +450,23 @@ fi
 echo "selected $LOCATION for $SIZE"
 
 echo "== resolving the $GUEST_OS image =="
-az vm image show \
+if ! az vm image show \
 	--location "$LOCATION" \
 	--urn "$IMAGE" \
 	--query '{urn:urn, id:id, architecture:architecture, hyperVGeneration:hyperVGeneration}' \
-	--only-show-errors -o json | tee evidence/azure-image.json
+	--only-show-errors -o json > evidence/azure-image.json 2> evidence/azure-image.log; then
+	detail="$(jq -Rs . < evidence/azure-image.log)"
+	cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-image-unresolved",
+  "detail": $detail,
+  "resolution": "$IMAGE does not resolve in $LOCATION; set AZURE_VM_IMAGE to an image this size can boot."
+}
+JSON
+	cat evidence/blocker.json
+	exit 1
+fi
+cat evidence/azure-image.json
 
 list_worker() {
 	az vm list \

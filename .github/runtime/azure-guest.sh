@@ -105,7 +105,8 @@ install_driver() {
 	local attempt codename
 	if [ ! -e /dev/kfd ]; then
 		codename="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"
-		quiet "kernel headers" apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" dkms gnupg
+		# amdgpu links against DRM helper modules the Azure kernel ships only in modules-extra.
+		quiet "kernel headers and modules" apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" dkms gnupg
 		install -d -m 0755 /etc/apt/keyrings
 		curl --silent --show-error --fail --retry 3 https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/rocm.gpg || fail "the AMD driver repository key download failed"
 		printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/%s/ubuntu %s main\n' "${AMDGPU_RELEASE:-31.50}" "$codename" > /etc/apt/sources.list.d/amdgpu.list
@@ -113,7 +114,12 @@ install_driver() {
 		quiet "amdgpu-dkms build for $(uname -r)" apt-get install -y amdgpu-dkms
 		# Explicit modprobe ignores a blocklist; removing it keeps the driver across reboots.
 		sed -i '/^blacklist amdgpu/d' /etc/modprobe.d/*.conf
-		modprobe amdgpu > "$LOGS/modprobe.log" 2>&1 || { tail -n 5 "$LOGS/modprobe.log"; fail "amdgpu did not load on kernel $(uname -r)"; }
+		depmod -a
+		if ! modprobe amdgpu > "$LOGS/modprobe.log" 2>&1; then
+			tail -n 5 "$LOGS/modprobe.log"
+			echo "dmesg: $(dmesg 2> /dev/null | grep -i -E 'amdgpu|unknown symbol' | tail -n 6 | tr '\n' ' ')"
+			fail "amdgpu did not load on kernel $(uname -r)"
+		fi
 	fi
 	for attempt in $(seq 1 24); do
 		[ -e /dev/kfd ] && break

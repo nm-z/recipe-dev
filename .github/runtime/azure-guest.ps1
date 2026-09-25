@@ -93,14 +93,34 @@ function Enter-VsDeveloperEnvironment {
 	}
 }
 
-function Resolve-VsRoot {
+function Find-VsRoot {
 	$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-	if (![IO.File]::Exists($vswhere)) { throw "Visual Studio discovery is absent: $vswhere" }
+	if (![IO.File]::Exists($vswhere)) { return $null }
 	$roots = @(& $vswhere "-latest" "-products" "*" "-requires" "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" "-property" "installationPath")
 	if ($LASTEXITCODE -ne 0) { throw "Visual Studio discovery failed with exit code $LASTEXITCODE" }
 	$roots = @($roots | Where-Object { [IO.Directory]::Exists($_) })
-	if ($roots.Count -eq 0) { throw "the DSVM image has no Visual Studio instance with x64 C++ tools" }
+	if ($roots.Count -eq 0) { return $null }
 	return [string]$roots[0]
+}
+
+# The DSVM image carries Visual C++; a stock Windows Server image gets the Build Tools.
+function Resolve-VsRoot {
+	param([string] $Bootstrap, [bool] $AllowInstall)
+	$root = Find-VsRoot
+	if ($root) { return $root }
+	if (!$AllowInstall) { return $null }
+	$installer = Join-Path $Bootstrap "vs_buildtools.exe"
+	try {
+		Invoke-WebRequest -UseBasicParsing -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile $installer
+	} catch {
+		throw "the Visual C++ Build Tools download failed"
+	}
+	$process = Start-Process -FilePath $installer -ArgumentList @("--quiet", "--wait", "--norestart", "--nocache", "--add", "Microsoft.VisualStudio.Workload.VCTools", "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621") -Wait -PassThru
+	# 3010 is success with a pending reboot, which the build does not need.
+	if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { throw "the Visual C++ Build Tools installation failed with exit code $($process.ExitCode)" }
+	$root = Find-VsRoot
+	if (!$root) { throw "the Visual C++ Build Tools installed no x64 C++ tools" }
+	return $root
 }
 
 function Resolve-CudaRoot {
@@ -179,8 +199,14 @@ function Initialize-Toolchain {
 	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-	$script:VsRoot = Resolve-VsRoot
-	Enter-VsDeveloperEnvironment -VsRoot $script:VsRoot
+	if ($AllowInstall -and !(Find-VsRoot)) { Write-Output "== guest: installing the Visual C++ Build Tools ==" }
+	$script:VsRoot = Resolve-VsRoot -Bootstrap $bootstrap -AllowInstall $AllowInstall
+	if ($script:VsRoot) {
+		Enter-VsDeveloperEnvironment -VsRoot $script:VsRoot
+	} else {
+		Write-Output "visual-c++=install-required"
+		$script:VsRoot = "install-required"
+	}
 	$script:CudaRoot = "none"
 	if ($vendor -eq "nvidia") {
 		$script:CudaRoot = Resolve-CudaRoot

@@ -1201,6 +1201,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           AZURE_VM_SIZE: ${{ vars.AZURE_AMD_VM_SIZE }}
           AZURE_VM_IMAGE: ${{ vars.AZURE_AMD_WINDOWS_IMAGE }}
+          # The guest installs the Visual C++ Build Tools, LLVM and Rust before the build.
+          AZURE_DEADLINE_SECONDS: "3600"
           # linux/amd shares the V710 admission slot and may hold it for up to an hour.
           AZURE_ADMISSION_WAIT_SECONDS: "4800"
 
