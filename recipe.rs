@@ -1690,6 +1690,9 @@ pub(crate) struct NativeLayout {
 	/// values at the last position a forward reached, one per output channel,
 	/// gathered on the device so a decode reads one column and not the tensor.
 	pub last_column: Option<usize>,
+	/// At inference, the byte offset in the context arena of the parts a packed
+	/// sum with too few rows for the device leaves before it adds them up.
+	pub split_scratch: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -2363,8 +2366,11 @@ impl NativeLayout {
 			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
 			None => None,
 		};
+		// One part per 32 inputs of every row: the most segments a row splits into.
+		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
+		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
 	}
 }
 
@@ -2900,19 +2906,27 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 /// A packed node's one stored format when the run dot reads it: the format,
 /// its decoder, and its block's values and bytes.
 fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	// Dense weights in the arena are values of the node's own float type.
+	if !plan.packed && plan.stored.is_none() && plan.node.parameters != 0 {
+		let name = match plan.node.precision { Compute::FP32 => "f32", Compute::FP16 => "f16", _ => return None };
+		let spec = StorageFormat::named(name)?.spec()?;
+		return Some((spec.codec.quantization(), spec.codec.quantization().native, spec.block, spec.stride));
+	}
 	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
 	let [(segment, _)] = stored.format_segments()[..] else { return None };
 	let spec = segment.spec()?;
 	let format = spec.codec.quantization();
-	if matches!(format.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % DOT_RUN == 0 || DOT_RUN % spec.block == 0) {
+	if matches!(format.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % 32 == 0 || 32 % spec.block == 0) {
 		return None;
 	}
 	Some((format, format.native, spec.block, spec.stride))
 }
-/// Adjacent stored weights one lane decodes and dots at a time in a packed
-/// matrix-vector product: adjacent lanes read adjacent bytes, and the values of
-/// a run share their block fields.
-const DOT_RUN: usize = 32;
+/// The adjacent stored weights one lane decodes and dots at a time in a packed
+/// matrix-vector product: a whole block, so the lane reads each block once with
+/// wide loads, or 32 values of smaller blocks.
+fn dot_run(block: usize) -> usize {
+	if block >= 32 { block } else { 32 }
+}
 fn pointer_type(backend: Backend) -> &'static str {
 	if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" }
 }
@@ -4129,7 +4143,34 @@ impl NativeModelIr {
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
+				// A float sum over a stored format, one row at a time: the packed body.
+				(false, Primitive::Contraction)
+					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
+				{
+					ir.push_str(&format!(
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch} )\n",
+						node = index + 1,
+						scratch_gep = self.split_scratch_gep(backend, index),
+						scratch = self.split_scratch_name(backend, index),
+						pointer = pointer_type(backend),
+						decode = plan.decode(index),
+						source = pointers.source,
+						weights = pointers.weights,
+						value = pointers.value,
+						rows = node.output.channels,
+						terms = node.input.channels,
+						in_length = node.input.length,
+						out_length = node.output.length,
+						bias = node.argument[2] == 0.0,
+						relu = node.argument[1] == 1.0,
+					));
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Contraction) => {
+					if self.inference && tracing() {
+						let segments = plan.stored.as_ref().map(|stored| stored.format_segments().iter().map(|(format, count)| format!("{}x{count}", quantization(format.0))).collect::<Vec<_>>().join("+"));
+						trace(&format!("contraction node {index} takes the general body: packed {} segments {segments:?} int {} kernel {} inputs {}", plan.packed, node.int_bits, node.argument[0], node.input.channels))?;
+					}
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
@@ -4259,12 +4300,15 @@ impl NativeModelIr {
 				// whose rows or inputs the position's routed experts select.
 				(false, Primitive::ExpertIn | Primitive::ExpertOut)
 					if self.inference && self.rows == 1 && node.int_bits == 0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| {
-						let unit = block.max(DOT_RUN);
+						let unit = dot_run(block);
 						node.input.channels % unit == 0 && (node.op == Primitive::ExpertIn || (node.argument[2] as usize) % unit == 0)
 					}) =>
 				{
 					ir.push_str(&format!(
-						"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch} )\n",
+						node = index + 1,
+						scratch_gep = self.split_scratch_gep(backend, index),
+						scratch = self.split_scratch_name(backend, index),
 						pointer = pointer_type(backend),
 						decode = plan.decode(index),
 						source = pointers.source,
@@ -6911,10 +6955,18 @@ impl NativeModelIr {
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
 	}
-	/// The dot of one run of `DOT_RUN` adjacent weights of each packed node in one
+	/// The dot of one run of `dot_run(block)` adjacent weights of each packed node in one
 	/// format, and the switch that says which nodes have it. The run's values go
 	/// through the node's own decoder with constant offsets, so the inliner shares
 	/// the block fields every value of a run reads.
+	/// The pointer to the split scratch a packed sum hands its body, defined before its call.
+	fn split_scratch_gep(&self, backend: Backend, index: usize) -> String {
+		self.layout.split_scratch.map_or(String::new(), |offset| ptr_gep(backend, "contexts", offset, &format!("n{index}.split")))
+	}
+	fn split_scratch_name(&self, backend: Backend, index: usize) -> String {
+		let _ = backend;
+		if self.layout.split_scratch.is_some() { format!("%n{index}.split") } else { "null".to_owned() }
+	}
 	/// Copies the output node's values at the last position this forward reached
 	/// into the layout's last column, one value per channel.
 	fn emit_last_column(&self, backend: Backend) -> Result<String> {
@@ -6938,13 +6990,13 @@ impl NativeModelIr {
 		for (index, plan) in self.plans.iter().enumerate() {
 			if let Some((_, _, block, _)) = eligible(plan) {
 				available.push_str(&format!("i32 {}, label %yes\n", index + 1));
-				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, (block / DOT_RUN).max(1)));
+				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, dot_run(block)));
 			}
 		}
 		ir.push_str(&format!("define internal i1 @recipe.model.dot.run.available(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %no [\n{available}]\nyes:\nret i1 true\nno:\nret i1 false\n}}\n"));
 		// The runs a block holds: the places a run can start at inside one block.
-		let counts = (1..=256 / DOT_RUN).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
-		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.cases(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 1\n}}\n"));
+		let counts = (1..=256).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
+		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.length(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 32\n}}\n"));
 		for (precision, suffix) in self.precisions() {
 			let (ty, state) = (precision.model_type, precision.state_type);
 			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(&str, NativeDequant, usize, usize)>::new());
@@ -6967,9 +7019,9 @@ impl NativeModelIr {
 		}
 		Ok(ir)
 	}
-	/// One format's dot of a run of `DOT_RUN` adjacent weights from `%index` (a
-	/// multiple of `DOT_RUN`) with activations `%stride` apart. A run inside one
-	/// block starts at one of `block / DOT_RUN` places, each its own case, so the
+	/// One format's dot of a run of `dot_run(block)` adjacent weights from `%index`
+	/// (a multiple of the run) with activations `%stride` apart. A run is a whole
+	/// block, or several smaller blocks, so the
 	/// place of every value is known here and its block fields fold into
 	/// constant offsets; a run over several smaller blocks steps block by block.
 	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize) -> String {
@@ -6983,17 +7035,13 @@ impl NativeModelIr {
 			a
 		};
 		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
-		let cases = (block / DOT_RUN).max(1);
-		operations.ir.push_str(&format!(
-			"%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n%run.within = urem i64 %index, {block}\n%run.case = udiv i64 %run.within, {DOT_RUN}\nswitch i64 %run.case, label %case0 [\n{}]\n",
-			(1..cases).map(|case| format!("i64 {case}, label %case{case}\n")).collect::<String>()
-		));
-		for case in 0..cases {
-			operations.ir.push_str(&format!("case{case}:\n"));
+		let run = dot_run(block);
+		operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
+		{
 			let mut words = std::collections::HashMap::new();
 			let mut sum = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
-			for j in 0..DOT_RUN {
-				let (relative, local) = if block >= DOT_RUN { (0, case * DOT_RUN + j) } else { (j / block, j % block) };
+			for j in 0..run {
+				let (relative, local) = if block >= run { (0, j) } else { (j / block, j % block) };
 				let base = if relative == 0 { "%run.base".to_owned() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} %run.base, i64 {}", relative * stride)) };
 				let value = {
 					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: base, align, words: &mut words };
@@ -7269,7 +7317,7 @@ impl NativeModelIr {
 				.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
 				.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
 				.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
-				.replace("RECIPE_DOT_RUN", &DOT_RUN.to_string())
+				
 				.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
 				.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 				.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
@@ -7338,7 +7386,14 @@ impl NativeModelIr {
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
 		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
-			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
+			// An NVIDIA step may cap its registers so more warps stay resident to hide the
+			// latency of its weight reads; 0 leaves the choice to the compiler.
+			let registers = natural("nvidia step registers", env!("RECIPE_NVIDIA_STEP_REGISTERS")).unwrap_or(0);
+			let step_attributes = match backend {
+				Backend::Amd => "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }".to_owned(),
+				Backend::Nvidia if registers != 0 => format!("{{ nounwind \"nvvm.maxnreg\"=\"{registers}\" }}"),
+				_ => "{ nounwind }".to_owned(),
+			};
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
 			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));

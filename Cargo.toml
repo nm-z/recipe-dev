@@ -32,6 +32,7 @@ attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 134217728
+nvidia-step-registers = 128
 # archy nv0 has bad VRAM from ~5.9 GB up
 device-usable-bytes = { "archy:nv0" = 6186598400 }
 cpu-worker-threads = 0

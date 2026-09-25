@@ -1084,9 +1084,9 @@ ret void
 }
 ; The model compiler replaces this with one arm per packed node.
 define internal double @recipe.model.decode(ptr addrspace(1) %matrix, i64 %index, i32 %node) #1 { entry: unreachable }
-; The dot of RECIPE_DOT_RUN consecutive stored weights of a node, from %index
-; (a multiple of RECIPE_DOT_RUN) on, with as many staged activations %stride
-; apart: the node's format decodes each value where it lies.
+; The dot of one run of consecutive stored weights of a node (a whole block,
+; or 32 values of smaller blocks), from %index on, with as many staged
+; activations %stride apart: the node's format decodes each value where it lies.
 define internal RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %matrix, i64 %index, i32 %node, ptr addrspace(3) %x, i32 %stride) #1 { entry: unreachable }
 ; One weight of a node-relative span: a dense node loads it, a packed node decodes it.
 define internal double @recipe.model.weight(ptr addrspace(1) %weights, i64 %index, i32 %decode) #1 { entry:
@@ -2209,21 +2209,6 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %wave.f = and i1 %wave.e, %transpose.off
 %wave.or.blocked = or i1 %wave.available, %blocked
 %wave.fast = and i1 %wave.f, %wave.or.blocked
-%dot.node = call i1 @recipe.model.dot.run.available(i32 %decode)
-%dot.int = call i1 @recipe.model.int.activations(i32 %decode)
-%dot.float = xor i1 %dot.int, true
-%dot.a = and i1 %dot.node, %blocked.a32
-%dot.b = and i1 %dot.a, %dot.float
-%dot.c = and i1 %dot.b, %kernel.zero
-%dot.d = and i1 %dot.c, %rows.one
-%dot.e = and i1 %dot.d, %reverse.off
-%dot.f = and i1 %dot.e, %accumulate.off
-%dot.go = and i1 %dot.f, %transpose.off
-br i1 %dot.go, label %packed, label %wave.check
-packed:
-call void @packed_rows_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %input, i32 %out.channels, i32 %in.channels, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span, i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 0, i32 0, i32 0, i32 0)
-ret void
-wave.check:
 br i1 %wave.fast, label %wave, label %scalar.check
 wave:
 call void @contraction_forward_gemv_wave_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
@@ -2237,6 +2222,105 @@ gemm:
 call void @contraction_forward_gemm_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel, i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode)
 ret void
 }
+; The part of one unit (a block, or a run of smaller blocks) of row %row of a
+; packed sum: the run dot of every place in the unit against the staged column,
+; scaled by the slot's routing weight for an expert's down table; zero when the
+; unit is inactive.
+define internal RECIPE_STATE @packed_unit_dot( ptr addrspace(1) %weights, i32 %node, i1 %expert, i1 %down, i32 %hidden.nonzero, i64 %hidden.wide, i64 %rows.wide, i64 %terms.wide, i64 %weight.base,
+i32 %chunk.base, i64 %chunk.base.wide, i32 %unit, i32 %cases, i32 %upr, ptr addrspace(3) %ids.base, ptr addrspace(3) %scales.base, i32 %row, i32 %unit.index, i1 %active ) #1 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%row.safe = select i1 %active, i32 %row, i32 0
+%unit.safe = select i1 %active, i32 %unit.index, i32 0
+%unit.start = mul i32 %unit.safe, %unit
+%k0 = add i32 %chunk.base, %unit.start
+; The weight row this unit reads, as the index of its first value less k0.
+%in.slot = udiv i32 %row.safe, %hidden.nonzero
+%down.slot = udiv i32 %k0, %hidden.nonzero
+%slot.any = select i1 %down, i32 %down.slot, i32 %in.slot
+%slot = select i1 %expert, i32 %slot.any, i32 0
+%slot.id.ptr = getelementptr i32, ptr addrspace(3) %ids.base, i32 %slot
+%slot.id = load i32, ptr addrspace(3) %slot.id.ptr, align 4
+%slot.scale.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %scales.base, i32 %slot
+%slot.scale = load RECIPE_STATE, ptr addrspace(3) %slot.scale.ptr, align RECIPE_STATE_ALIGN
+%slot.id.wide = zext i32 %slot.id to i64
+%row.wide = zext i32 %row.safe to i64
+%in.f = urem i32 %row.safe, %hidden.nonzero
+%in.f.wide = zext i32 %in.f to i64
+%in.erow.base = mul i64 %slot.id.wide, %hidden.wide
+%in.erow = add i64 %in.erow.base, %in.f.wide
+%in.row.index = mul i64 %in.erow, %terms.wide
+%down.erow.base = mul i64 %slot.id.wide, %rows.wide
+%down.erow = add i64 %down.erow.base, %row.wide
+%down.row.index = mul i64 %down.erow, %hidden.wide
+%down.slot.wide = zext i32 %slot to i64
+%down.slot.start = mul i64 %down.slot.wide, %hidden.wide
+%down.row.shifted = sub i64 %down.row.index, %down.slot.start
+%plain.row.index = mul i64 %row.wide, %terms.wide
+%expert.row.index = select i1 %down, i64 %down.row.shifted, i64 %in.row.index
+%row.index = select i1 %expert, i64 %expert.row.index, i64 %plain.row.index
+%row.base = add i64 %weight.base, %row.index
+%k0.wide = zext i32 %k0 to i64
+%run.first = add i64 %row.base, %k0.wide
+br label %case.loop
+case.loop:
+%case = phi i32 [ 0, %entry ], [ %case.next, %case.step ]
+%part = phi RECIPE_STATE [ %state.zero, %entry ], [ %part.next, %case.step ]
+%case.more = icmp ult i32 %case, %cases
+br i1 %case.more, label %case.step, label %case.done
+case.step:
+%case.values = mul i32 %case, %unit
+%case.wide = zext i32 %case.values to i64
+%run.index = add i64 %run.first, %case.wide
+%x.row = mul i32 %case.values, %upr
+%x.at = add i32 %x.row, %unit.safe
+%x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %x.at
+%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 %upr)
+%part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %part, RECIPE_STATE %value)
+%case.next = add i32 %case, 1
+br label %case.loop
+case.done:
+%part.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %part, RECIPE_STATE %slot.scale)
+%part.add = select i1 %down, RECIPE_STATE %part.scaled, RECIPE_STATE %part
+%part.active = select i1 %active, RECIPE_STATE %part.add, RECIPE_STATE %state.zero
+ret RECIPE_STATE %part.active
+}
+; Row %out.row of a packed sum at %position: the sum plus the bias on the first
+; chunk, plus what earlier chunks left in the output, rectified on the last chunk.
+define internal void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last,
+i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position, i64 %weight.base, RECIPE_STATE %sum ) #1 { entry:
+%bias.row = mul i32 %rows, %terms
+%bias.at = add i32 %bias.row, %out.row
+%bias.wide = zext i32 %bias.at to i64
+%bias.index = add i64 %weight.base, %bias.wide
+%bias.now = and i1 %has.bias, %chunk.first
+br i1 %bias.now, label %bias, label %biased
+bias:
+%bias.model = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %bias.index, i32 %decode)
+%bias.state = call RECIPE_STATE @recipe.decode(double %bias.model)
+%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %bias.state)
+br label %biased
+biased:
+%sum.b = phi RECIPE_STATE [ %sum, %entry ], [ %sum.bias, %bias ]
+%out.channel = zext i32 %out.row to i64
+%out.base = mul i64 %out.channel, %out.length.wide
+%out.index = add i64 %out.base, %position
+%out.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %out.index
+br i1 %chunk.first, label %store, label %carry
+carry:
+%prior.model = load double, ptr addrspace(1) %out.ptr, align 8
+%prior = call RECIPE_STATE @recipe.decode(double %prior.model)
+%sum.carried = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.b, RECIPE_STATE %prior)
+br label %store
+store:
+%total = phi RECIPE_STATE [ %sum.b, %biased ], [ %sum.carried, %carry ]
+%result.model = call double @recipe.encode(RECIPE_STATE %total)
+%positive = call i1 @recipe.ogt(double %result.model, double 0.0)
+%activated = select i1 %positive, double %result.model, double 0.0
+%relu.now = and i1 %relu, %chunk.last
+%result = select i1 %relu.now, double %activated, double %result.model
+store double %result, ptr addrspace(1) %out.ptr, align 8
+ret void
+}
 ; Rows of a sum over stored weights at the positions %out.begin to %out.begin +
 ; %out.span, for any stored format with a run dot. Mode 0 reads row r of the
 ; weight; mode 1 (an expert's gate or up table) reads row r % hidden of the
@@ -2248,7 +2332,7 @@ ret void
 ; a time, and each adds its row's part into the wave's row sums.
 define internal void @packed_rows_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %routing, i32 %rows, i32 %terms, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span,
-i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %mode, i32 %hidden, i32 %experts, i32 %top ) RECIPE_CONTRACTION_BODY { entry:
+i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %mode, i32 %hidden, i32 %experts, i32 %top, ptr addrspace(1) %split.scratch ) RECIPE_CONTRACTION_BODY { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -2266,8 +2350,8 @@ i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %mode, 
 %hidden.zero = icmp eq i32 %hidden, 0
 %hidden.nonzero = select i1 %hidden.zero, i32 1, i32 %hidden
 %out.end = add i32 %out.begin, %out.span
-%cases = call i32 @recipe.model.dot.run.cases(i32 %decode)
-%unit = mul i32 %cases, RECIPE_DOT_RUN
+%cases = add i32 1, 0
+%unit = call i32 @recipe.model.dot.run.length(i32 %node)
 %expert = icmp ne i32 %mode, 0
 %down = icmp eq i32 %mode, 2
 ; The tile holds the staged column, then per wave 32 row sums, 32 slot experts
@@ -2399,7 +2483,102 @@ call void @recipe.local.barrier()
 %jobs.raised = sub i32 %jobs.over, 1
 %jobs = udiv i32 %jobs.raised, %waves
 %lane.owns = icmp ult i32 %lane, %m
-br label %job.loop
+; Too few rows to give every wave work: each row splits into segments of up to
+; a wave of units, each wave writes its segment's part, and after a grid
+; barrier every row sums its parts in segment order.
+%total.units = mul i32 %rows, %upr
+%all.waves = udiv i32 %threads, %width
+%target.jobs = mul i32 %all.waves, 2
+%per.job.over = add i32 %total.units, %target.jobs
+%per.job.raised = sub i32 %per.job.over, 1
+%per.job.raw = udiv i32 %per.job.raised, %target.jobs
+%per.job.some = icmp ugt i32 %per.job.raw, 0
+%per.job.min = select i1 %per.job.some, i32 %per.job.raw, i32 1
+%per.job.big = icmp ugt i32 %per.job.min, %width
+%per.job = select i1 %per.job.big, i32 %width, i32 %per.job.min
+%split.fewer = icmp ult i32 %per.job, %upr
+%split.able = icmp ne ptr addrspace(1) %split.scratch, null
+%split = and i1 %split.fewer, %split.able
+br i1 %split, label %split.entry, label %job.loop
+split.entry:
+%segments.over = add i32 %upr, %per.job
+%segments.raised = sub i32 %segments.over, 1
+%segments = udiv i32 %segments.raised, %per.job
+%split.jobs = mul i32 %rows, %segments
+%split.wave.base = mul i32 %group, %waves
+%split.wave = add i32 %split.wave.base, %wave
+%reduce.start = udiv i32 %width, 2
+br label %split.loop
+split.loop:
+%sj = phi i32 [ %split.wave, %split.entry ], [ %sj.next, %split.next ]
+%sj.more = icmp ult i32 %sj, %split.jobs
+br i1 %sj.more, label %split.step, label %split.gather
+split.step:
+%sj.row = udiv i32 %sj, %segments
+%sj.segment = urem i32 %sj, %segments
+%sj.first = mul i32 %sj.segment, %per.job
+%sj.unit = add i32 %sj.first, %lane
+%sj.unit.in = icmp ult i32 %sj.unit, %upr
+%sj.lane.in = icmp ult i32 %lane, %per.job
+%sj.active = and i1 %sj.unit.in, %sj.lane.in
+%sj.part = call RECIPE_STATE @packed_unit_dot( ptr addrspace(1) %weights, i32 %node, i1 %expert, i1 %down, i32 %hidden.nonzero, i64 %hidden.wide, i64 %rows.wide, i64 %terms.wide, i64 %weight.base, i32 %chunk.base, i64 %chunk.base.wide, i32 %unit, i32 %cases, i32 %upr, ptr addrspace(3) %ids.base, ptr addrspace(3) %scales.base, i32 %sj.row, i32 %sj.unit, i1 %sj.active )
+br label %split.reduce
+split.reduce:
+%sr.offset = phi i32 [ %reduce.start, %split.step ], [ %sr.offset.next, %split.reduce.step ]
+%sr.value = phi RECIPE_STATE [ %sj.part, %split.step ], [ %sr.value.next, %split.reduce.step ]
+%sr.more = icmp ugt i32 %sr.offset, 0
+br i1 %sr.more, label %split.reduce.step, label %split.write
+split.reduce.step:
+%sr.partner.lane = xor i32 %lane, %sr.offset
+%sr.partner.index = mul i32 %sr.partner.lane, 4
+%sr.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %sr.value, i32 %sr.partner.index)
+%sr.value.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sr.value, RECIPE_STATE %sr.partner)
+%sr.offset.next = udiv i32 %sr.offset, 2
+br label %split.reduce
+split.write:
+%sj.leader = icmp eq i32 %lane, 0
+br i1 %sj.leader, label %split.store, label %split.next
+split.store:
+%sj.slot = getelementptr RECIPE_STATE, ptr addrspace(1) %split.scratch, i32 %sj
+store RECIPE_STATE %sr.value, ptr addrspace(1) %sj.slot, align RECIPE_STATE_ALIGN
+br label %split.next
+split.next:
+%sj.next = add i32 %sj, %all.waves
+br label %split.loop
+split.gather:
+call void @grid_barrier(i32 %threads)
+%gather.base = mul i32 %group, %block
+%gather.first = add i32 %gather.base, %lid
+br label %gather.loop
+gather.loop:
+%gr = phi i32 [ %gather.first, %split.gather ], [ %gr.next, %gather.stored ]
+%gr.more = icmp ult i32 %gr, %rows
+br i1 %gr.more, label %gather.row, label %split.done
+gather.row:
+%gr.first = mul i32 %gr, %segments
+br label %gather.sum
+gather.sum:
+%gs = phi i32 [ 0, %gather.row ], [ %gs.next, %gather.add ]
+%gs.total = phi RECIPE_STATE [ %state.zero, %gather.row ], [ %gs.total.next, %gather.add ]
+%gs.more = icmp ult i32 %gs, %segments
+br i1 %gs.more, label %gather.add, label %gather.store
+gather.add:
+%gs.at = add i32 %gr.first, %gs
+%gs.slot = getelementptr RECIPE_STATE, ptr addrspace(1) %split.scratch, i32 %gs.at
+%gs.part = load RECIPE_STATE, ptr addrspace(1) %gs.slot, align RECIPE_STATE_ALIGN
+%gs.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %gs.total, RECIPE_STATE %gs.part)
+%gs.next = add i32 %gs, 1
+br label %gather.sum
+gather.store:
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %gr, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position, i64 %weight.base, RECIPE_STATE %gs.total )
+br label %gather.stored
+gather.stored:
+%gr.next = add i32 %gr, %threads
+br label %gather.loop
+split.done:
+; The next chunk or position writes the scratch again only after every row read it.
+call void @grid_barrier(i32 %threads)
+br label %chunk.done
 job.loop:
 %job = phi i32 [ %group, %stage.done ], [ %job.next, %job.done ]
 %job.more = icmp ult i32 %job, %jobs
@@ -2425,60 +2604,9 @@ sweep.step:
 %item.in = icmp ult i32 %item, %items
 %row.in = icmp ult i32 %row, %rows
 %active = and i1 %item.in, %row.in
-%row.safe = select i1 %active, i32 %row, i32 0
-%unit.safe = select i1 %active, i32 %unit.index, i32 0
-%unit.start = mul i32 %unit.safe, %unit
-%k0 = add i32 %chunk.base, %unit.start
-; The weight row this unit reads, as the index of its first value less k0.
-%in.slot = udiv i32 %row.safe, %hidden.nonzero
-%down.slot = udiv i32 %k0, %hidden.nonzero
-%slot.any = select i1 %down, i32 %down.slot, i32 %in.slot
-%slot = select i1 %expert, i32 %slot.any, i32 0
-%slot.id.ptr = getelementptr i32, ptr addrspace(3) %ids.base, i32 %slot
-%slot.id = load i32, ptr addrspace(3) %slot.id.ptr, align 4
-%slot.scale.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %scales.base, i32 %slot
-%slot.scale = load RECIPE_STATE, ptr addrspace(3) %slot.scale.ptr, align RECIPE_STATE_ALIGN
-%slot.id.wide = zext i32 %slot.id to i64
-%row.wide = zext i32 %row.safe to i64
-%in.f = urem i32 %row.safe, %hidden.nonzero
-%in.f.wide = zext i32 %in.f to i64
-%in.erow.base = mul i64 %slot.id.wide, %hidden.wide
-%in.erow = add i64 %in.erow.base, %in.f.wide
-%in.row.index = mul i64 %in.erow, %terms.wide
-%down.erow.base = mul i64 %slot.id.wide, %rows.wide
-%down.erow = add i64 %down.erow.base, %row.wide
-%down.row.index = mul i64 %down.erow, %hidden.wide
-%down.slot.wide = zext i32 %slot to i64
-%down.slot.start = mul i64 %down.slot.wide, %hidden.wide
-%down.row.shifted = sub i64 %down.row.index, %down.slot.start
-%plain.row.index = mul i64 %row.wide, %terms.wide
-%expert.row.index = select i1 %down, i64 %down.row.shifted, i64 %in.row.index
-%row.index = select i1 %expert, i64 %expert.row.index, i64 %plain.row.index
-%row.base = add i64 %weight.base, %row.index
-%k0.wide = zext i32 %k0 to i64
-%run.first = add i64 %row.base, %k0.wide
-br label %case.loop
-case.loop:
-%case = phi i32 [ 0, %sweep.step ], [ %case.next, %case.step ]
-%part = phi RECIPE_STATE [ %state.zero, %sweep.step ], [ %part.next, %case.step ]
-%case.more = icmp ult i32 %case, %cases
-br i1 %case.more, label %case.step, label %case.done
-case.step:
-%case.values = mul i32 %case, RECIPE_DOT_RUN
-%case.wide = zext i32 %case.values to i64
-%run.index = add i64 %run.first, %case.wide
-%x.row = mul i32 %case.values, %upr
-%x.at = add i32 %x.row, %unit.safe
-%x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %x.at
-%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %decode, ptr addrspace(3) %x, i32 %upr)
-%part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %part, RECIPE_STATE %value)
-%case.next = add i32 %case, 1
-br label %case.loop
-case.done:
+%part.add = call RECIPE_STATE @packed_unit_dot( ptr addrspace(1) %weights, i32 %node, i1 %expert, i1 %down, i32 %hidden.nonzero, i64 %hidden.wide, i64 %rows.wide, i64 %terms.wide, i64 %weight.base, i32 %chunk.base, i64 %chunk.base.wide, i32 %unit, i32 %cases, i32 %upr, ptr addrspace(3) %ids.base, ptr addrspace(3) %scales.base, i32 %row, i32 %unit.index, i1 %active )
 br i1 %active, label %add, label %sweep.done
 add:
-%part.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %part, RECIPE_STATE %slot.scale)
-%part.add = select i1 %down, RECIPE_STATE %part.scaled, RECIPE_STATE %part
 %add.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %row.local
 %add.prior = atomicrmw fadd ptr addrspace(3) %add.ptr, RECIPE_STATE %part.add monotonic
 br label %sweep.done
@@ -2492,37 +2620,7 @@ sweep.exit:
 br i1 %out.write, label %write, label %job.done
 write:
 %sum = load RECIPE_STATE, ptr addrspace(3) %lane.sum, align RECIPE_STATE_ALIGN
-%bias.row = mul i32 %rows, %terms
-%bias.at = add i32 %bias.row, %out.row
-%bias.wide = zext i32 %bias.at to i64
-%bias.index = add i64 %weight.base, %bias.wide
-%bias.now = and i1 %has.bias, %chunk.first
-br i1 %bias.now, label %bias, label %biased
-bias:
-%bias.model = call double @recipe.model.decode(ptr addrspace(1) %weights, i64 %bias.index, i32 %decode)
-%bias.state = call RECIPE_STATE @recipe.decode(double %bias.model)
-%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %bias.state)
-br label %biased
-biased:
-%sum.b = phi RECIPE_STATE [ %sum, %write ], [ %sum.bias, %bias ]
-%out.channel = zext i32 %out.row to i64
-%out.base = mul i64 %out.channel, %out.length.wide
-%out.index = add i64 %out.base, %position
-%out.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %out.index
-br i1 %chunk.first, label %store, label %carry
-carry:
-%prior.model = load double, ptr addrspace(1) %out.ptr, align 8
-%prior = call RECIPE_STATE @recipe.decode(double %prior.model)
-%sum.carried = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.b, RECIPE_STATE %prior)
-br label %store
-store:
-%total = phi RECIPE_STATE [ %sum.b, %biased ], [ %sum.carried, %carry ]
-%result.model = call double @recipe.encode(RECIPE_STATE %total)
-%positive = call i1 @recipe.ogt(double %result.model, double 0.0)
-%activated = select i1 %positive, double %result.model, double 0.0
-%relu.now = and i1 %relu, %chunk.last
-%result = select i1 %relu.now, double %activated, double %result.model
-store double %result, ptr addrspace(1) %out.ptr, align 8
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position, i64 %weight.base, RECIPE_STATE %sum )
 br label %job.done
 job.done:
 %job.next = add i32 %job, %groups
