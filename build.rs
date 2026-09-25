@@ -273,7 +273,8 @@ define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_g
 // follows a divergent spin (bar.sync is per warp before sm_70 and would count the
 // leader's warp as arrived on the lanes that skipped the spin) and only one lane in
 // thirty-two loads the phase while the grid drains. The acquire fence is the spinner's
-// alone: before sm_70 a fence is membar.sys, and one per thread cost a millisecond a node;
+// alone: before sm_70 a system fence is membar.sys, and one per thread cost a millisecond a
+// node; the fences are device scope (membar.gl), as every block of the grid shares the device;
 // the warp's other lanes issue their loads after the spinner's fence by program order.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
@@ -284,17 +285,17 @@ call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
 %leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
-fence release
+fence syncscope("device") release
 %prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
 %last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
-fence acquire
+fence syncscope("device") acquire
 store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
-fence release
+fence syncscope("device") release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
 br i1 %spinner, label %wait, label %waited wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %acquired, label %wait acquired:
-fence acquire br label %waited waited:
+fence syncscope("device") acquire br label %waited waited:
 call void @llvm.nvvm.bar.warp.sync(i32 -1)
 ret void }"#;
 // A workgroup barrier on AMD is s_barrier between two workgroup-scope

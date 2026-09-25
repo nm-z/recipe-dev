@@ -2305,11 +2305,25 @@ position.step:
 %position = zext i32 %position.index to i64
 %route.leader = icmp eq i32 %lane, 0
 %route.now = and i1 %expert, %route.leader
-br i1 %route.now, label %route.loop, label %chunk.entry
+br i1 %route.now, label %route.clear, label %chunk.entry
+; A slot no expert fills reads expert 0 and adds nothing, as the serial bodies do.
+route.clear:
+%route.c = phi i32 [ 0, %position.step ], [ %route.c.next, %route.clear.step ]
+%route.c.more = icmp ult i32 %route.c, %top
+br i1 %route.c.more, label %route.clear.step, label %route.start
+route.clear.step:
+%route.c.id = getelementptr i32, ptr addrspace(3) %ids.base, i32 %route.c
+store i32 0, ptr addrspace(3) %route.c.id, align 4
+%route.c.scale = getelementptr RECIPE_STATE, ptr addrspace(3) %scales.base, i32 %route.c
+store RECIPE_STATE %state.zero, ptr addrspace(3) %route.c.scale, align RECIPE_STATE_ALIGN
+%route.c.next = add i32 %route.c, 1
+br label %route.clear
+route.start:
+br label %route.loop
 ; Lane 0 lists the experts the position routed to, in ascending order.
 route.loop:
-%route.e = phi i32 [ 0, %position.step ], [ %route.e.next, %route.advance ]
-%route.slot = phi i32 [ 0, %position.step ], [ %route.slot.next, %route.advance ]
+%route.e = phi i32 [ 0, %route.start ], [ %route.e.next, %route.advance ]
+%route.slot = phi i32 [ 0, %route.start ], [ %route.slot.next, %route.advance ]
 %route.more.e = icmp ult i32 %route.e, %experts
 %route.more.slot = icmp ult i32 %route.slot, %top
 %route.more = and i1 %route.more.e, %route.more.slot
