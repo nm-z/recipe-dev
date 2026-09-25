@@ -8248,9 +8248,7 @@ mod gguf {
 		pub fn elements(&self) -> usize {
 			self.shape.iter().product::<u64>() as usize
 		}
-		/// The `[k, n]` slice of a `[k, n, experts]` tensor at `index`. The slice is the
-		/// expert's own blocks where the file is mapped, so reading one expert leaves
-		/// the others untouched.
+		/// The mapped `[k, n]` view of one expert in `[k, n, experts]`.
 		pub fn expert(&self, index: usize) -> Result<Self> {
 			require(self.shape.len() == 3, format!("tensor {} has {} dimensions; an expert slice takes a [k, n, experts] tensor", self.name, self.shape.len()))?;
 			let experts = self.shape[2] as usize;
@@ -8258,14 +8256,11 @@ mod gguf {
 			let rows = self.shape[1] as usize;
 			self.slice(self.shape[..2].to_vec(), index * rows, rows)
 		}
-		/// Whether the device block decoders read this tensor's layout, so it binds
-		/// as a view of its mapping rather than as decoded parameters.
+		/// Whether tensor blocks bind as mapped views.
 		pub fn blocked(&self) -> bool {
 			layout(self.kind).is_ok_and(|(_, _, _, format)| format.is_some())
 		}
-		/// The `[k, count]` slice holding output rows `start .. start + count`.
-		/// Rows are the tensor's slowest axis, so the slice is one contiguous run
-		/// of the mapping and stays a view of it.
+		/// A contiguous mapped view of `count` output rows from `start`.
 		pub fn rows(&self, start: usize, count: usize) -> Result<Self> {
 			require(self.shape.len() >= 2, format!("tensor {} has {} dimensions; a row slice takes at least [k, n]", self.name, self.shape.len()))?;
 			let rows = self.elements() / self.shape[0] as usize;
@@ -14376,11 +14371,17 @@ impl Recipe {
 	}
 }
 
+fn key_color(name: &str, color: bool) -> String {
+	if !color { return name.to_owned(); }
+	name.split('.').enumerate().map(|(index, part)| format!("\x1b[{}m{part}\x1b[0m", [96, 95, 94, 93, 92, 91][index % 6])).collect::<Vec<_>>().join(".")
+}
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
 	let file = Gguf::open(&resolve_path(path)?)?;
+	let color = std::io::stdout().is_terminal();
 	for (key, value) in file.metadata() {
 		if key == "tokenizer.chat_template" { continue; }
+		let key = key_color(key, color);
 		if let String(text) = value {
 			println!("{key}.\"{text}\"");
 		} else if let Array(values) = value {
@@ -14394,7 +14395,7 @@ pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 			println!("{key}.{}", s.split_once('(').unwrap().1.trim_end_matches(')'));
 		}
 	}
-	for tensor in file.tensors() { println!("{}.{:?}", tensor.name, tensor.shape); }
+	for tensor in file.tensors() { println!("{}.{:?}", key_color(&tensor.name, color), tensor.shape); }
 	Ok(())
 }
 /// Stats.
