@@ -1,6 +1,5 @@
 1. `.gate()` was not typing attn keys, was not typing which blks in the gguf, was not typing where norm happens and was not typing the Wq splitting. It was also not typing the "gate" and the "factor". This led to a separate internal GGUF model builder to have to read and check if the Qout contains extra values if so, then it split and specifically routed to q and the factor mult. [Loader](/home/nate/Desktop/recipe-dev/recipe.rs:15022), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18248), [kernel](/home/nate/Desktop/recipe-dev/amd-nv-cpu.ll:5532).
 
-
 ```rust
 let block = attn(heads).gate();
 ```
@@ -18,50 +17,36 @@ for a in [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47] {
 }
 ```
 
-2. **All GGUFs with `.gate()`: Also no.** The automatic builder accepts 11 `general.architecture` names and rejects names outside its table. GGUF defines architecture as file metadata and documents other architecture names. [Recipe table](/home/nate/Desktop/recipe-dev/recipe.rs:14635), [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).
+2. **all key paths are hardcoded** The GGUF has a key named `qwen4exp.block_count`, but a model script can't even read `qwen4exp.block_count` because Recipe hardcodes all of its architecture keys, except `qwen4exp.block_count`. [Namespaces](/home/nate/Desktop/recipe-dev/recipe.rs:15409).
 
 ```rust
-file.model(); // Hidden: general.architecture
+// have to go hunt the shit down: recipe keys qwen.gguf | rg temp
+// general.sampling.temp.1.0
+recipe.sampler().temperature(1.0)
 ```
-
+Proposed:
 ```rust
-recipe.model(gguf.architecture)
-	.blocks(model_definition)
+// resolves directly from the gguf
+recipe.sampler().temperature(general.sampling.temp)
 ```
 
-
-3. **Arbitrary metadata paths in a model script: No.** Scripts can use fixed names such as `tokenizer.ggml.tokens` and `gemma3.rope.freq_base`. `Gguf::value(key)` exists, but `recipe.data(...)` keeps its `Gguf` private and does not expose that lookup to the script. The named namespaces cover only eight architecture names. [Data](/home/nate/Desktop/recipe-dev/recipe.rs:11448), [namespaces](/home/nate/Desktop/recipe-dev/recipe.rs:15409).
-
-```rust
-let data = recipe.data(path);
-let width = gemma3.embedding_length; // No data.value("some.other.key").
-```
-
-**Proposed user-facing spelling (API sketch):**
-
-```rust
-let width = gguf.arch.embedding_length;
-let tokens = tokenizer.ggml.tokens;
-```
-
-
-4. **Explicit GGUF tensor binding from the usual `recipe.infer().run(&model, &data)` path: No.** That path calls `conventional_plan`, which assigns weights using fixed tensor names and recognized model shapes. A public `Binding::named` exists, but the usual `Data` path does not give the script the `Gguf` value it requires. [Inference](/home/nate/Desktop/recipe-dev/recipe.rs:15549), [binding](/home/nate/Desktop/recipe-dev/recipe.rs:14520).
+3. **Explicit GGUF tensor binding from the usual `recipe.infer().run(&model, &data)` path: No.** That path calls `conventional_plan`, which assigns weights using fixed tensor names and recognized model shapes. A public `Binding::named` exists, but the usual `Data` path does not give the script the `Gguf` value it requires. [Inference](/home/nate/Desktop/recipe-dev/recipe.rs:15549), [binding](/home/nate/Desktop/recipe-dev/recipe.rs:14520).
 
 ```rust
 let data = recipe.data(path);
 recipe.infer().run(&model, &data); // conventional_plan chooses tensor names.
 ```
 
-**Proposed user-facing spelling (API sketch):**
-
 ```rust
-attn(heads).q(blk[layer].attn.q.weight)
-	.k(blk[layer].attn.k.weight)
-	.v(blk[layer].attn.v.weight)
+for a in [0, 3, 5] {
+	attn(heads)
+		.q(blk.a.attn.q)
+		.k(blk.a.attn.k)
+		.v(blk.a.attn.v);
+}
 ```
 
-
-5. **Which product branch gets `ffn_gate.weight`: Inferred.** The conventional binder checks which branch has an activation; it assigns `ffn_gate.weight` to that branch and `ffn_up.weight` to the other. If that test does not distinguish them, it uses branch order. The model expression does not name either tensor. [Binder](/home/nate/Desktop/recipe-dev/recipe.rs:15800).
+4. **Which product branch gets `ffn_gate.weight`: Inferred.** The conventional binder checks which branch has an activation; it assigns `ffn_gate.weight` to that branch and `ffn_up.weight` to the other. If that test does not distinguish them, it uses branch order. The model expression does not name either tensor. [Binder](/home/nate/Desktop/recipe-dev/recipe.rs:15800).
 
 ```rust
 let product = layer(8).gelu() * layer(8);
@@ -76,7 +61,7 @@ layer(hidden).weights(blk[layer].ffn.gate.weight).gelu()
 ```
 
 
-6. **Automatic feed-forward activation: Hard-coded.** The GGUF builder emits `glu(hidden, SiLU)` for ordinary feed-forward blocks. The repository’s handwritten Gemma3 RNJ model instead spells `layer(...).gelu() * layer(...)`. Those definitions disagree in source; this audit did not measure the numerical difference. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15187), [RNJ model](/home/nate/Desktop/recipe-dev/rnj-1.rs:39).
+5. **Automatic feed-forward activation: Hard-coded.** The GGUF builder emits `glu(hidden, SiLU)` for ordinary feed-forward blocks. The repository’s handwritten Gemma3 RNJ model instead spells `layer(...).gelu() * layer(...)`. Those definitions disagree in source; this audit did not measure the numerical difference. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15187), [RNJ model](/home/nate/Desktop/recipe-dev/rnj-1.rs:39).
 
 ```rust
 let automatic = file.model(); // Builder inserts GLU with SiLU.
@@ -92,7 +77,7 @@ let handwritten = layer(hidden).gelu() * layer(hidden); // RNJ uses GELU.
 ```
 
 
-7. **Attention details: Chosen from tensor shape or presence.** The builder decides whether there is an attention gate from query-tensor width, uses the key tensor as values if `attn_v.weight` is absent, adds Q/K RMS normalization when norm tensors exist, and adds indexer and rotary-factor paths when their metadata or tensors exist. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15016).
+6. **Attention details: Chosen from tensor shape or presence.** The builder decides whether there is an attention gate from query-tensor width, uses the key tensor as values if `attn_v.weight` is absent, adds Q/K RMS normalization when norm tensors exist, and adds indexer and rotary-factor paths when their metadata or tensors exist. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15016).
 
 ```rust
 let automatic = file.model();
@@ -108,7 +93,7 @@ attn(heads).q(blk[layer].attn.q.weight).k(blk[layer].attn.k.weight).v(blk[layer]
 ```
 
 
-8. **Rotary pairing and YaRN: Not fully declared by the automatic model.** The architecture table chooses neighboring versus half-channel rotary pairing. The automatic attention builder calls `.rope(...)` but does not call `.yarn(...)`; the handwritten RNJ model does call `.yarn(...)` with a model-specific constant. [Pairing table](/home/nate/Desktop/recipe-dev/recipe.rs:14635), [builder](/home/nate/Desktop/recipe-dev/recipe.rs:15054), [RNJ model](/home/nate/Desktop/recipe-dev/rnj-1.rs:27).
+7. **Rotary pairing and YaRN: Not fully declared by the automatic model.** The architecture table chooses neighboring versus half-channel rotary pairing. The automatic attention builder calls `.rope(...)` but does not call `.yarn(...)`; the handwritten RNJ model does call `.yarn(...)` with a model-specific constant. [Pairing table](/home/nate/Desktop/recipe-dev/recipe.rs:14635), [builder](/home/nate/Desktop/recipe-dev/recipe.rs:15054), [RNJ model](/home/nate/Desktop/recipe-dev/rnj-1.rs:27).
 
 ```rust
 let automatic = file.model(); // Builder calls rope but not yarn.
@@ -123,7 +108,7 @@ attn(heads).rope(pairs, gguf.arch.rope.dimension_count, gguf.arch.rope.freq_base
 ```
 
 
-9. **Per-layer block type: Inferred.** Metadata and a fixed interval rule choose attention, short convolution, or delta for each layer. The automatic builder also chooses residual versus hyper-connection wrapping. [Model loop](/home/nate/Desktop/recipe-dev/recipe.rs:14793), [dimensions](/home/nate/Desktop/recipe-dev/recipe.rs:14889).
+8. **Per-layer block type: Inferred.** Metadata and a fixed interval rule choose attention, short convolution, or delta for each layer. The automatic builder also chooses residual versus hyper-connection wrapping. [Model loop](/home/nate/Desktop/recipe-dev/recipe.rs:14793), [dimensions](/home/nate/Desktop/recipe-dev/recipe.rs:14889).
 
 ```rust
 let automatic = file.model();
@@ -139,7 +124,7 @@ res([norm(rms), delta(delta_heads, kernel)])
 ```
 
 
-10. **Delta block math: Partly private.** The lowering fixes its projections, convolution, Q/K L2 normalization, value RMS normalization, decay conversion, and output multiplication. Convolution and output activations come from an architecture-name row or private defaults; the public delta selectors do not expose that full choice. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15139), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18211).
+9. **Delta block math: Partly private.** The lowering fixes its projections, convolution, Q/K L2 normalization, value RMS normalization, decay conversion, and output multiplication. Convolution and output activations come from an architecture-name row or private defaults; the public delta selectors do not expose that full choice. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15139), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18211).
 
 ```rust
 let block = recipe.model().delta(heads, kernel);
@@ -154,7 +139,7 @@ delta(heads, kernel).conv(silu).qk(l2).values(rms)
 ```
 
 
-11. **Short convolution: Built as an internal product.** The builder slices one stored projection into B, C, and X, then constructs `C × depthwise_conv(B × X)` and an output projection. That expression is assembled inside the GGUF builder rather than supplied as the user’s model definition. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15106).
+10. **Short convolution: Built as an internal product.** The builder slices one stored projection into B, C, and X, then constructs `C × depthwise_conv(B × X)` and an output projection. That expression is assembled inside the GGUF builder rather than supplied as the user’s model definition. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15106).
 
 ```rust
 let automatic = file.model();
@@ -171,7 +156,7 @@ let automatic = file.model();
 ```
 
 
-12. **GGUF MoE: Uses a private model operation.** Expert scoring comes from metadata, renormalization defaults to true, and a shared expert is selected by tensor presence. The GGUF builder calls private `gguf_moe`; public `.moe(...)` lowers through a different route. [Metadata](/home/nate/Desktop/recipe-dev/recipe.rs:14923), [builder](/home/nate/Desktop/recipe-dev/recipe.rs:15195), [public and private forms](/home/nate/Desktop/recipe-dev/recipe.rs:12275).
+11. **GGUF MoE: Uses a private model operation.** Expert scoring comes from metadata, renormalization defaults to true, and a shared expert is selected by tensor presence. The GGUF builder calls private `gguf_moe`; public `.moe(...)` lowers through a different route. [Metadata](/home/nate/Desktop/recipe-dev/recipe.rs:14923), [builder](/home/nate/Desktop/recipe-dev/recipe.rs:15195), [public and private forms](/home/nate/Desktop/recipe-dev/recipe.rs:12275).
 
 ```rust
 let public = recipe.model().moe(top_k, experts);
@@ -187,7 +172,7 @@ moe(experts)
 ```
 
 
-13. **Hyper-connections: Fixed internal formula.** The public `hyper(lanes, rank, branch)` names the branch and sizes, while lowering supplies RMS, SiLU, sigmoid read and write factors, a factor of two, and lane reduction. The model definition cannot spell or change that whole sequence. [Lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18817).
+12. **Hyper-connections: Fixed internal formula.** The public `hyper(lanes, rank, branch)` names the branch and sizes, while lowering supplies RMS, SiLU, sigmoid read and write factors, a factor of two, and lane reduction. The model definition cannot spell or change that whole sequence. [Lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18817).
 
 ```rust
 let model = recipe.model().hyper(lanes, rank, &branch);
@@ -204,7 +189,7 @@ hyper(lanes, branch)
 ```
 
 
-14. **Per-layer embedding: Fixed internal formula.** `ple(...)` hides the n-gram lookup, grouped RMS operations, signed-square-root sigmoid factor, convolution, and SiLU path. Metadata selects its table and placement. [Lookup construction](/home/nate/Desktop/recipe-dev/recipe.rs:10007), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18096).
+13. **Per-layer embedding: Fixed internal formula.** `ple(...)` hides the n-gram lookup, grouped RMS operations, signed-square-root sigmoid factor, convolution, and SiLU path. Metadata selects its table and placement. [Lookup construction](/home/nate/Desktop/recipe-dev/recipe.rs:10007), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18096).
 
 ```rust
 let model = recipe.model().ple(&table);
@@ -222,7 +207,7 @@ ple(per_layer_token_embd.weight)
 ```
 
 
-15. **Normalization and residual placement: Inferred from tensor names.** The automatic builder chooses RMS pre-normalization and optional post-normalization from which weight tensors exist, then wraps the branch in a residual or hyper operation. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15258).
+14. **Normalization and residual placement: Inferred from tensor names.** The automatic builder chooses RMS pre-normalization and optional post-normalization from which weight tensors exist, then wraps the branch in a residual or hyper operation. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:15258).
 
 ```rust
 let automatic = file.model();
@@ -237,7 +222,7 @@ res([norm(rms), ffn(hidden), norm(rms)])
 ```
 
 
-16. **Embedding and output operations: Some are inserted automatically.** The builder adds a square-root embedding scale for Gemma3/4, ties output weights to embedding when `output.weight` is absent, and inserts optional layer-output scaling and final logit softcapping. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:14779), [output](/home/nate/Desktop/recipe-dev/recipe.rs:14817).
+15. **Embedding and output operations: Some are inserted automatically.** The builder adds a square-root embedding scale for Gemma3/4, ties output weights to embedding when `output.weight` is absent, and inserts optional layer-output scaling and final logit softcapping. [Builder](/home/nate/Desktop/recipe-dev/recipe.rs:14779), [output](/home/nate/Desktop/recipe-dev/recipe.rs:14817).
 
 ```rust
 let automatic = file.model();
@@ -256,7 +241,7 @@ let output = norm(rms).layer(tokenizer.ggml.tokens)
 ```
 
 
-17. **Activation and normalization order: Not an arbitrary visible chain.** A `Block` stores one activation and one normalization slot; another call replaces a slot, and lowering applies them in a fixed order. That prevents the model definition from expressing every ordered sequence of maps. [Block](/home/nate/Desktop/recipe-dev/recipe.rs:11891), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:17519), [open issue #888](https://github.com/nm-z/recipe-dev/issues/888).
+16. **Activation and normalization order: Not an arbitrary visible chain.** A `Block` stores one activation and one normalization slot; another call replaces a slot, and lowering applies them in a fixed order. That prevents the model definition from expressing every ordered sequence of maps. [Block](/home/nate/Desktop/recipe-dev/recipe.rs:11891), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:17519), [open issue #888](https://github.com/nm-z/recipe-dev/issues/888).
 
 ```rust
 let block = layer(8).norm(l2).norm(rms);
@@ -271,7 +256,7 @@ layer(8).norm(l2).norm(rms)
 ```
 
 
-18. **Tokenizer and chat behavior: Restricted and partly hard-coded.** The tokenizer accepts a limited set of families; Gemma4 constructs its prompt in code instead of rendering the file’s chat template. EOS, inferred turn-stop tokens, and suppressed tokens also affect decoding outside the model definition. [Families](/home/nate/Desktop/recipe-dev/recipe.rs:8729), [Gemma4 prompt](/home/nate/Desktop/recipe-dev/recipe.rs:9044), [stop IDs](/home/nate/Desktop/recipe-dev/recipe.rs:15673).
+17. **Tokenizer and chat behavior: Restricted and partly hard-coded.** The tokenizer accepts a limited set of families; Gemma4 constructs its prompt in code instead of rendering the file’s chat template. EOS, inferred turn-stop tokens, and suppressed tokens also affect decoding outside the model definition. [Families](/home/nate/Desktop/recipe-dev/recipe.rs:8729), [Gemma4 prompt](/home/nate/Desktop/recipe-dev/recipe.rs:9044), [stop IDs](/home/nate/Desktop/recipe-dev/recipe.rs:15673).
 
 ```rust
 let coder = file.tokenizer();
@@ -287,7 +272,7 @@ tokenizer(gguf.tokenizer.ggml).chat(gguf.tokenizer.chat_template)
 ```
 
 
-19. **GGUF file coverage: Restricted before model execution.** Recipe accepts GGUF version 3 and a finite list of tensor types. Its automatic builder rejects tensors it did not assign to a node, and its attention dimensions reject differing key and value widths. [Parser](/home/nate/Desktop/recipe-dev/recipe.rs:8453), [types](/home/nate/Desktop/recipe-dev/recipe.rs:8289), [builder checks](/home/nate/Desktop/recipe-dev/recipe.rs:14848).
+18. **GGUF file coverage: Restricted before model execution.** Recipe accepts GGUF version 3 and a finite list of tensor types. Its automatic builder rejects tensors it did not assign to a node, and its attention dimensions reject differing key and value widths. [Parser](/home/nate/Desktop/recipe-dev/recipe.rs:8453), [types](/home/nate/Desktop/recipe-dev/recipe.rs:8289), [builder checks](/home/nate/Desktop/recipe-dev/recipe.rs:14848).
 
 ```rust
 let data = recipe.data(path);
@@ -302,7 +287,7 @@ let support = data.report(gguf.support);
 ```
 
 
-20. **This is a source audit, not a claim that every listed path has been run.** The direct answer to your design requirement is **no**: today, Recipe cannot represent 100% of every GGUF model’s operations and weight assignments in the user-visible model definition. [Open issue #945](https://github.com/nm-z/recipe-dev/issues/945) tracks the broader hidden-math problem; [#944](https://github.com/nm-z/recipe-dev/issues/944) tracks GGUF contents and named-key access.
+19. **This is a source audit, not a claim that every listed path has been run.** The direct answer to your design requirement is **no**: today, Recipe cannot represent 100% of every GGUF model’s operations and weight assignments in the user-visible model definition. [Open issue #945](https://github.com/nm-z/recipe-dev/issues/945) tracks the broader hidden-math problem; [#944](https://github.com/nm-z/recipe-dev/issues/944) tracks GGUF contents and named-key access.
 
 ```rust
 let data = recipe.data(one_path);
