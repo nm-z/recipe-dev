@@ -595,7 +595,11 @@ JSON
 		cat evidence/blocker.json
 		exit 1
 	fi
-	# The extension may reboot the guest; Run Command needs it running again.
+	# The extension finishes asynchronously and may reboot the guest later, which
+	# would kill a running guest script; restart once now so the driver is in
+	# place and no reboot is pending before Run Command starts.
+	az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors
+	az vm restart --resource-group "$GROUP" --name "$WORKER" --only-show-errors -o none
 	az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors
 	echo "$extension_name $extension_version installed"
 fi

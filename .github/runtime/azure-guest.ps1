@@ -199,8 +199,9 @@ function Initialize-Toolchain {
 	New-Item -ItemType Directory -Force -Path $bootstrap | Out-Null
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-	if ($AllowInstall -and !(Find-VsRoot)) { Write-Output "== guest: installing the Visual C++ Build Tools ==" }
+	if ($AllowInstall -and !(Find-VsRoot)) { Write-Output "== guest: installing the Visual C++ Build Tools =="; Report-Phase "buildtools-start" }
 	$script:VsRoot = Resolve-VsRoot -Bootstrap $bootstrap -AllowInstall $AllowInstall
+	if ($AllowInstall) { Report-Phase "buildtools-ready" }
 	if ($script:VsRoot) {
 		Enter-VsDeveloperEnvironment -VsRoot $script:VsRoot
 	} else {

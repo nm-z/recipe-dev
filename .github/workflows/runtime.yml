@@ -1237,6 +1237,10 @@ jobs:
           if [ "$WORKER_OUTCOME" = success ]; then
             reason="AMD execution completed on Windows"
           fi
+          # A guest that stopped without reporting is recorded by the last phase it reached.
+          if [ -z "$reason" ] && [ -s evidence/guest-progress.txt ]; then
+            reason="the guest stopped without reporting after phase: $(tail -n 1 evidence/guest-progress.txt | cut -d' ' -f3-)"
+          fi
           [ -n "$reason" ] || reason="the controller stopped before the guest reported; the worker step log has the cause"
           jq -n \
             --arg cell "$CELL" \
