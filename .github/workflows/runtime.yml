@@ -988,7 +988,7 @@ jobs:
     runs-on: ubuntu-24.04
     # The Azure OIDC federation trusts this environment; every Azure GPU cell uses it.
     environment: recipe-windows-gpu
-    timeout-minutes: 120
+    timeout-minutes: 180
     concurrency:
       group: recipe-linux-amd-${{ github.run_id }}
       cancel-in-progress: false
@@ -1063,6 +1063,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           # The guest installs LLVM, ROCm and Rust before the build.
           AZURE_DEADLINE_SECONDS: "3600"
+          # win/amd shares the V710 admission slot and may hold it first.
+          AZURE_ADMISSION_WAIT_SECONDS: "3000"
           AZURE_VM_SIZE: ${{ vars.AZURE_AMD_VM_SIZE }}
           AZURE_VM_IMAGE: ${{ vars.AZURE_AMD_LINUX_IMAGE }}
 
@@ -1122,7 +1124,7 @@ jobs:
     runs-on: ubuntu-24.04
     # The Azure OIDC federation trusts this environment; every Azure GPU cell uses it.
     environment: recipe-windows-gpu
-    timeout-minutes: 90
+    timeout-minutes: 150
     concurrency:
       group: recipe-windows-amd-${{ github.run_id }}
       cancel-in-progress: false
@@ -1199,6 +1201,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           AZURE_VM_SIZE: ${{ vars.AZURE_AMD_VM_SIZE }}
           AZURE_VM_IMAGE: ${{ vars.AZURE_AMD_WINDOWS_IMAGE }}
+          # linux/amd shares the V710 admission slot and may hold it for up to an hour.
+          AZURE_ADMISSION_WAIT_SECONDS: "4800"
 
       - name: Deallocate and clean up the worker
         if: always()

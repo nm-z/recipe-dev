@@ -95,9 +95,18 @@ confirm_gpu() {
 	[ -n "$gpu" ] || fail "no AMD PCI function is attached to this worker"
 	gpu="$(dirname "$gpu")"
 	echo "pci: ${gpu##*/} device=$(cat "$gpu/device") class=$(cat "$gpu/class")"
+	# The driver extension installs amdgpu but may leave it unloaded until a reboot.
+	[ -e /dev/kfd ] || modprobe amdgpu > "$LOGS/modprobe.log" 2>&1 || true
 	for attempt in $(seq 1 24); do
 		[ -e /dev/kfd ] && break
-		[ "$attempt" -lt 24 ] || fail "/dev/kfd is absent: the amdgpu kernel driver did not load (lsmod: $(lsmod | grep -c '^amdgpu' || true) amdgpu modules)"
+		if [ "$attempt" -eq 24 ]; then
+			echo "modprobe: $(tail -n 2 "$LOGS/modprobe.log" 2> /dev/null | tr '\n' ' ')"
+			echo "module files: $(find "/lib/modules/$(uname -r)" -name 'amdgpu.ko*' 2> /dev/null | head -n 2 | tr '\n' ' ')"
+			echo "dkms: $(dkms status 2> /dev/null | grep -i amdgpu | head -n 2 | tr '\n' ' ')"
+			echo "blocklist: $(grep -rhs '^blacklist amdgpu' /etc/modprobe.d | head -n 1)"
+			echo "extension log: $(find /var/log/azure -iname '*.log' -path '*mdGpu*' -print0 2> /dev/null | xargs -0 -r tail -q -n 3 2> /dev/null | tail -n 3 | tr '\n' ' ')"
+			fail "/dev/kfd is absent: amdgpu is not loaded on kernel $(uname -r)"
+		fi
 		sleep 5
 	done
 	renders=(/dev/dri/renderD*)
@@ -133,10 +142,11 @@ initialize_toolchain() {
 			# libraries and HSA runtime come from AMD's ROCm repository for this release.
 			install -d -m 0755 /etc/apt/keyrings
 			curl --silent --show-error --fail --retry 3 https://stable.repo.amd.com/rocm/gpg/packages.gpg | gpg --dearmor --yes -o /etc/apt/keyrings/amdrocm.gpg || fail "the ROCm repository key download failed"
-			cat > /etc/apt/sources.list.d/amdrocm-stable.sources <<-'SOURCES'
+			release="$(. /etc/os-release && printf '%s' "${VERSION_ID//./}")"
+			cat > /etc/apt/sources.list.d/amdrocm-stable.sources <<-SOURCES
 			X-Repo-Id: amdrocm-stable
 			Types: deb
-			URIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu2404/
+			URIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu${release}/
 			Suites: stable
 			Components: main
 			Architectures: amd64

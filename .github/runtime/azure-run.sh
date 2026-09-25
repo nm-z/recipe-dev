@@ -45,6 +45,7 @@ case "$PROFILE" in
 		DEVICE_TAG=t4
 		WORKER_PREFIX=recipe-wgpu
 		TRANSFER_PREFIX=runtime/windows
+		ADMISSION_PREFIX=runtime/windows
 		;;
 	windows-amd)
 		# Standard_NV4ads_V710_v5 is the smallest Radeon PRO V710 (gfx1101) shape: 1/6 GPU.
@@ -61,20 +62,25 @@ case "$PROFILE" in
 		DEVICE_TAG=v710
 		WORKER_PREFIX=recipe-wamd
 		TRANSFER_PREFIX=runtime/windows-amd
+		# Both AMD cells share admission: they draw on the same V710 quota.
+		ADMISSION_PREFIX=runtime/amd
 		;;
 	linux-amd)
 		DEFAULT_SIZE=Standard_NV4ads_V710_v5
-		DEFAULT_IMAGE=Canonical:ubuntu-24_04-lts:server:latest
+		# Ubuntu 22.04 boots the 6.8 Azure kernel the V710 driver builds against; the
+		# 24.04 image boots 6.17, where the driver extension leaves amdgpu unloaded.
+		DEFAULT_IMAGE=Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest
 		FAMILY=""
 		GUEST_OS=linux
 		VENDOR=amd
 		CELL_NAME=recipe/linux-amd
-		OS_LABEL="Ubuntu 24.04 LTS"
+		OS_LABEL="Ubuntu 22.04 LTS"
 		GPU_PATTERN='gfx1101'
 		DRIVER_EXTENSION="AmdGpuDriverLinux 1.0"
 		DEVICE_TAG=v710
 		WORKER_PREFIX=recipe-lamd
 		TRANSFER_PREFIX=runtime/linux-amd
+		ADMISSION_PREFIX=runtime/amd
 		;;
 	*) echo "AZURE_GPU_PROFILE must be windows-nvidia, windows-amd or linux-amd" >&2; exit 2 ;;
 esac
@@ -112,7 +118,7 @@ PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-1200}"
 ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
 ADMISSION_LEASE_SECONDS=60
-ADMISSION_BLOB="$TRANSFER_PREFIX/admission.$((RUN_ID % 4)).lock"
+ADMISSION_BLOB="$ADMISSION_PREFIX/admission.$((RUN_ID % 4)).lock"
 admission_lease_id=""
 admission_renew_pid=""
 admission_started="$(date +%s)"
