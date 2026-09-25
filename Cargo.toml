@@ -184,6 +184,6 @@ acc = "fp32"
 gelu-table = "fp16"
 norm-acc = "fp64"
 rope-angle = "chain"
-attn-softmax = "online"
+attn-softmax = "full"
 math = "libm"
 step = 256

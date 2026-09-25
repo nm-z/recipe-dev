@@ -3502,6 +3502,170 @@ store RECIPE_STATE %sum, ptr addrspace(1) %gradient.pointer, align RECIPE_STATE_
 define internal double @topk_score( double %score, double %maximum, i1 %sigmoid ) #1 { entry:
 %shifted = call double @recipe.sub(double %score, double %maximum) %exponential = call double @recipe.exp(double %shifted)
 %logistic = call double @sigmoid(double %score) %result = select i1 %sigmoid, double %logistic, double %exponential ret double %result }
+; The router of one position on one wave: each lane holds the experts
+; lane, lane + width, ..., and the wave picks the top scores one at a time by
+; a wave maximum that prefers the lower expert on a tie, as the serial scan
+; does. The maximum, the total and the written weights follow the serial body.
+define internal void @topk_forward_wave_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize, i32 %lane, i32 %width ) #1 { entry:
+%length.wide = zext i32 %length to i64
+%sigmoid = icmp ne i32 %scoring, 0 %renorm = icmp ne i32 %renormalize, 0 %every = xor i1 %renorm, true %plain = xor i1 %sigmoid, true %divide = or i1 %renorm, %plain
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%lanes.over = add i32 %experts, %width %lanes.raised = sub i32 %lanes.over, 1 %slots = udiv i32 %lanes.raised, %width
+%reduce.start = udiv i32 %width, 2
+br label %pick.loop
+pick.loop:
+%pick = phi i32 [ 0, %entry ], [ %pick.next, %pick.mark ]
+%mask = phi i64 [ 0, %entry ], [ %mask.next, %pick.mark ]
+%pick.more = icmp ult i32 %pick, %top
+br i1 %pick.more, label %own.loop, label %max.entry
+own.loop:
+%own.j = phi i32 [ 0, %pick.loop ], [ %own.j.next, %own.step ]
+%own.best = phi i32 [ -1, %pick.loop ], [ %own.best.next, %own.step ]
+%own.score = phi RECIPE_STATE [ %state.zero, %pick.loop ], [ %own.score.next, %own.step ]
+%own.more = icmp ult i32 %own.j, %slots
+br i1 %own.more, label %own.step, label %reduce.entry
+own.step:
+%own.base = mul i32 %own.j, %width %own.e = add i32 %own.base, %lane
+%own.in = icmp ult i32 %own.e, %experts
+%own.bit = zext i32 %own.j to i64 %own.flag = shl i64 1, %own.bit %own.taken.bits = and i64 %mask, %own.flag %own.taken = icmp ne i64 %own.taken.bits, 0
+%own.free = xor i1 %own.taken, true %own.open = and i1 %own.in, %own.free
+%own.e.safe = select i1 %own.in, i32 %own.e, i32 0 %own.e.wide = zext i32 %own.e.safe to i64 %own.offset = mul i64 %own.e.wide, %length.wide %own.index = add i64 %p, %own.offset
+%own.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %own.index %own.model = load double, ptr addrspace(1) %own.ptr, align 8
+%own.value = call RECIPE_STATE @recipe.decode(double %own.model)
+%own.none = icmp slt i32 %own.best, 0 %own.higher = call i1 @recipe.state.ogt(RECIPE_STATE %own.value, RECIPE_STATE %own.score) %own.better = or i1 %own.none, %own.higher %own.take = and i1 %own.open, %own.better
+%own.best.next = select i1 %own.take, i32 %own.e, i32 %own.best %own.score.next = select i1 %own.take, RECIPE_STATE %own.value, RECIPE_STATE %own.score
+%own.j.next = add i32 %own.j, 1
+br label %own.loop
+reduce.entry:
+br label %reduce.loop
+reduce.loop:
+%reduce.offset = phi i32 [ %reduce.start, %reduce.entry ], [ %reduce.offset.next, %reduce.step ]
+%best = phi i32 [ %own.best, %reduce.entry ], [ %best.next, %reduce.step ]
+%best.score = phi RECIPE_STATE [ %own.score, %reduce.entry ], [ %best.score.next, %reduce.step ]
+%reduce.more = icmp ugt i32 %reduce.offset, 0
+br i1 %reduce.more, label %reduce.step, label %pick.mark
+reduce.step:
+%partner.lane = xor i32 %lane, %reduce.offset %partner.index = mul i32 %partner.lane, 4
+%partner.score = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %best.score, i32 %partner.index)
+%best.float = bitcast i32 %best to float
+%partner.best.float = call float @recipe.wave.partner.f32(float %best.float, i32 %partner.index)
+%partner.best = bitcast float %partner.best.float to i32
+%partner.valid = icmp sge i32 %partner.best, 0 %mine.invalid = icmp slt i32 %best, 0
+%partner.higher = call i1 @recipe.state.ogt(RECIPE_STATE %partner.score, RECIPE_STATE %best.score)
+%partner.equal = call i1 @recipe.state.oeq(RECIPE_STATE %partner.score, RECIPE_STATE %best.score)
+%partner.lower = icmp slt i32 %partner.best, %best
+%partner.tie = and i1 %partner.equal, %partner.lower
+%partner.wins.valid = or i1 %partner.higher, %partner.tie
+%partner.wins.any = or i1 %mine.invalid, %partner.wins.valid
+%partner.wins = and i1 %partner.valid, %partner.wins.any
+%best.next = select i1 %partner.wins, i32 %partner.best, i32 %best
+%best.score.next = select i1 %partner.wins, RECIPE_STATE %partner.score, RECIPE_STATE %best.score
+%reduce.offset.next = udiv i32 %reduce.offset, 2
+br label %reduce.loop
+pick.mark:
+%mark.lane = urem i32 %best, %width %mark.mine = icmp eq i32 %mark.lane, %lane %mark.valid = icmp sge i32 %best, 0 %mark.set = and i1 %mark.mine, %mark.valid
+%mark.slot = udiv i32 %best, %width %mark.bit = zext i32 %mark.slot to i64 %mark.flag = shl i64 1, %mark.bit
+%mark.masked = or i64 %mask, %mark.flag
+%mask.next = select i1 %mark.set, i64 %mark.masked, i64 %mask
+%pick.next = add i32 %pick, 1
+br label %pick.loop
+max.entry:
+br label %max.loop
+max.loop:
+%m.j = phi i32 [ 0, %max.entry ], [ %m.j.next, %max.step ]
+%m.value = phi RECIPE_STATE [ %state.zero, %max.entry ], [ %m.value.next, %max.step ]
+%m.first = phi i1 [ true, %max.entry ], [ %m.first.next, %max.step ]
+%m.more = icmp ult i32 %m.j, %slots
+br i1 %m.more, label %max.step, label %max.reduce.entry
+max.step:
+%m.base = mul i32 %m.j, %width %m.e = add i32 %m.base, %lane %m.in = icmp ult i32 %m.e, %experts
+%m.bit = zext i32 %m.j to i64 %m.flag = shl i64 1, %m.bit %m.marked.bits = and i64 %mask, %m.flag %m.marked = icmp ne i64 %m.marked.bits, 0
+%m.kind = or i1 %m.marked, %every %m.member = and i1 %m.kind, %m.in
+%m.e.safe = select i1 %m.in, i32 %m.e, i32 0 %m.e.wide = zext i32 %m.e.safe to i64 %m.offset = mul i64 %m.e.wide, %length.wide %m.index = add i64 %p, %m.offset
+%m.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %m.index %m.model = load double, ptr addrspace(1) %m.ptr, align 8 %m.score = call RECIPE_STATE @recipe.decode(double %m.model)
+%m.higher = call i1 @recipe.state.ogt(RECIPE_STATE %m.score, RECIPE_STATE %m.value) %m.better = or i1 %m.first, %m.higher %m.take = and i1 %m.member, %m.better
+%m.value.next = select i1 %m.take, RECIPE_STATE %m.score, RECIPE_STATE %m.value %m.first.next = select i1 %m.take, i1 false, i1 %m.first
+%m.j.next = add i32 %m.j, 1
+br label %max.loop
+max.reduce.entry:
+br label %max.reduce.loop
+max.reduce.loop:
+%mr.offset = phi i32 [ %reduce.start, %max.reduce.entry ], [ %mr.offset.next, %max.reduce.step ]
+%mr.value = phi RECIPE_STATE [ %m.value, %max.reduce.entry ], [ %mr.value.next, %max.reduce.step ]
+%mr.empty = phi i1 [ %m.first, %max.reduce.entry ], [ %mr.empty.next, %max.reduce.step ]
+%mr.more = icmp ugt i32 %mr.offset, 0
+br i1 %mr.more, label %max.reduce.step, label %sum.entry
+max.reduce.step:
+%mr.partner.lane = xor i32 %lane, %mr.offset %mr.partner.index = mul i32 %mr.partner.lane, 4
+%mr.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %mr.value, i32 %mr.partner.index)
+%mr.empty.float = select i1 %mr.empty, float 1.0, float 0.0
+%mr.partner.empty.float = call float @recipe.wave.partner.f32(float %mr.empty.float, i32 %mr.partner.index)
+%mr.partner.empty = fcmp une float %mr.partner.empty.float, 0.0
+%mr.partner.full = xor i1 %mr.partner.empty, true
+%mr.higher = call i1 @recipe.state.ogt(RECIPE_STATE %mr.partner, RECIPE_STATE %mr.value)
+%mr.better = or i1 %mr.empty, %mr.higher
+%mr.take = and i1 %mr.partner.full, %mr.better
+%mr.value.next = select i1 %mr.take, RECIPE_STATE %mr.partner, RECIPE_STATE %mr.value
+%mr.empty.next = and i1 %mr.empty, %mr.partner.empty
+%mr.offset.next = udiv i32 %mr.offset, 2
+br label %max.reduce.loop
+sum.entry:
+%maximum.state = select i1 %mr.empty, RECIPE_STATE %state.zero, RECIPE_STATE %mr.value
+%maximum = call double @recipe.encode(RECIPE_STATE %maximum.state)
+br label %sum.loop
+sum.loop:
+%s.j = phi i32 [ 0, %sum.entry ], [ %s.j.next, %sum.step ]
+%s.total = phi RECIPE_STATE [ %state.zero, %sum.entry ], [ %s.total.next, %sum.step ]
+%s.more = icmp ult i32 %s.j, %slots
+br i1 %s.more, label %sum.step, label %sum.reduce.entry
+sum.step:
+%s.base = mul i32 %s.j, %width %s.e = add i32 %s.base, %lane %s.in = icmp ult i32 %s.e, %experts
+%s.bit = zext i32 %s.j to i64 %s.flag = shl i64 1, %s.bit %s.marked.bits = and i64 %mask, %s.flag %s.marked = icmp ne i64 %s.marked.bits, 0
+%s.kind = or i1 %s.marked, %every %s.member = and i1 %s.kind, %s.in
+%s.e.safe = select i1 %s.in, i32 %s.e, i32 0 %s.e.wide = zext i32 %s.e.safe to i64 %s.offset = mul i64 %s.e.wide, %length.wide %s.index = add i64 %p, %s.offset
+%s.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %s.index %s.model = load double, ptr addrspace(1) %s.ptr, align 8
+%s.raw = call double @topk_score(double %s.model, double %maximum, i1 %sigmoid) %s.raw.state = call RECIPE_STATE @recipe.decode(double %s.raw)
+%s.term = select i1 %s.member, RECIPE_STATE %s.raw.state, RECIPE_STATE %state.zero
+%s.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %s.total, RECIPE_STATE %s.term)
+%s.j.next = add i32 %s.j, 1
+br label %sum.loop
+sum.reduce.entry:
+br label %sum.reduce.loop
+sum.reduce.loop:
+%sr.offset = phi i32 [ %reduce.start, %sum.reduce.entry ], [ %sr.offset.next, %sum.reduce.step ]
+%sr.total = phi RECIPE_STATE [ %s.total, %sum.reduce.entry ], [ %sr.total.next, %sum.reduce.step ]
+%sr.more = icmp ugt i32 %sr.offset, 0
+br i1 %sr.more, label %sum.reduce.step, label %write.entry
+sum.reduce.step:
+%sr.partner.lane = xor i32 %lane, %sr.offset %sr.partner.index = mul i32 %sr.partner.lane, 4
+%sr.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %sr.total, i32 %sr.partner.index)
+%sr.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sr.total, RECIPE_STATE %sr.partner)
+%sr.offset.next = udiv i32 %sr.offset, 2
+br label %sum.reduce.loop
+write.entry:
+%total = call double @recipe.encode(RECIPE_STATE %sr.total)
+%denominator = select i1 %divide, double %total, double 1.0
+br label %write.loop
+write.loop:
+%w.j = phi i32 [ 0, %write.entry ], [ %w.j.next, %write.next ]
+%w.more = icmp ult i32 %w.j, %slots
+br i1 %w.more, label %write.step, label %exit
+write.step:
+%w.base = mul i32 %w.j, %width %w.e = add i32 %w.base, %lane %w.in = icmp ult i32 %w.e, %experts
+%w.bit = zext i32 %w.j to i64 %w.flag = shl i64 1, %w.bit %w.marked.bits = and i64 %mask, %w.flag %w.marked = icmp ne i64 %w.marked.bits, 0
+br i1 %w.in, label %write.store, label %write.next
+write.store:
+%w.e.wide = zext i32 %w.e to i64 %w.offset = mul i64 %w.e.wide, %length.wide %w.index = add i64 %p, %w.offset
+%w.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %w.index %w.score = load double, ptr addrspace(1) %w.score.ptr, align 8
+%w.raw = call double @topk_score(double %w.score, double %maximum, i1 %sigmoid) %w.probability = call double @recipe.div(double %w.raw, double %denominator)
+%w.value = select i1 %w.marked, double %w.probability, double 0.0
+%w.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %w.index
+store double %w.value, ptr addrspace(1) %w.ptr, align 8
+br label %write.next
+write.next:
+%w.j.next = add i32 %w.j, 1
+br label %write.loop
+exit: ret void }
 ; The routing weights of one position. The top scores are kept by rank, scored
 ; by softmax over every expert or by sigmoid, and divided by the kept total when
 ; the block renormalizes. A plain softmax divides by every expert instead, which

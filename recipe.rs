@@ -2357,7 +2357,7 @@ impl NativeLayout {
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
 		let clocks = if tracing() {
-			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
+			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
 		let last_column = match graph.nodes.last().filter(|_| inference) {
 			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
@@ -4113,8 +4113,11 @@ impl NativeModelIr {
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
 				let pointer = pointer_type(backend);
 				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
-					at = clocks + index * 8
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.slot = select i1 %clk.n{index}.zero, i64 {at}, i64 {trash}\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 %clk.n{index}.slot\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\n",
+					at = clocks + index * 8,
+					// Every other thread stores to one spare slot past the nodes, so no branch
+					// parts thread 0 from its wave before a node that meets a barrier.
+					trash = clocks + self.graph.nodes.len().max(1) * 8
 				));
 			}
 			let node = &plan.node;
@@ -4168,6 +4171,25 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::TopK) if self.inference && self.rows == 1 && backend != Backend::Cpu && node.output.channels <= 64 * 32 => {
+					// A lane keeps its experts' picks in 64 bits, so a 32-lane wave takes up to 2048 experts.
+					// One wave per position: the lanes pick the top experts together.
+					let prefix = format!("n{index}.topk");
+					ir.push_str(&format!(
+						"%{prefix}.width = call i32 @recipe.wavefront.width()\n%{prefix}.wave = udiv i32 %tid, %{prefix}.width\n%{prefix}.lane = urem i32 %tid, %{prefix}.width\n%{prefix}.waves = udiv i32 %threads, %{prefix}.width\n%{prefix}.end = add i32 {begin}, {span}\n%{prefix}.first = add i32 {begin}, %{prefix}.wave\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.position = phi i32 [ %{prefix}.first, %{prefix}.entry ], [ %{prefix}.position.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.position, %{prefix}.end\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.p = zext i32 %{prefix}.position to i64\ncall void @topk_forward_wave_body{v}( {pointer} {source}, {pointer} {value}, i64 %{prefix}.p, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 %{prefix}.lane, i32 %{prefix}.width )\n%{prefix}.position.next = add i32 %{prefix}.position, %{prefix}.waves\nbr label %{prefix}.loop\n{prefix}.done:\n",
+						pointer = pointer_type(backend),
+						begin = window.begin,
+						span = window.span,
+						source = pointers.source,
+						value = pointers.value,
+						experts = node.output.channels,
+						length = node.output.length,
+						top = node.argument[0],
+						scoring = node.argument[1],
+						renormalize = node.argument[2]
+					));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::TopK) => {
@@ -4490,6 +4512,20 @@ impl NativeModelIr {
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (from, channels) = (node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
+					// The single-query step body is written in the block's own types, so
+					// every precision and backend takes it. It reads every cached position,
+					// so an indexed block takes it only while its selection keeps every block.
+					let fast_attention = self.inference
+						&& !online_order
+						&& self.rows == 1
+						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
+						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
+						&& attention == "attention_forward_body"
+						&& node.argument[2] == 0.0
+						&& pointers.attention_kv.is_some() && attention_value_heads(node) == node.argument[1] as usize;
+					let fast = format!("%n{index}.attention.fast");
+					ir.push_str(&format!("%n{index}.attention.single = icmp eq i32 {span}, 1
+"));
 					if blocks != 0 {
 						// Keep running key sums in context and score only touched window blocks.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
@@ -4506,16 +4542,24 @@ impl NativeModelIr {
 							last = block - 1
 						));
 						let touched = NodeWindow { begin: first, span: count };
+						// Every block up to the window's end is kept while their count is at most the kept count.
+						ir.push_str(&format!("%n{index}.index.all = icmp ule i32 %n{index}.index.last, {keep}\n{fast} = and i1 %n{index}.attention.single, %n{index}.index.all\n"));
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!("call void @attention_index_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
+						// A step that keeps every block needs no selection.
+						let skip = if fast_attention { fast.clone() } else { "false".to_owned() };
+						ir.push_str(&format!("br i1 {skip}, label %n{index}.select.skip, label %n{index}.select.run\nn{index}.select.run:\n"));
 						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
 								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
+						ir.push_str(&format!("br label %n{index}.select.skip\nn{index}.select.skip:\n"));
+					} else {
+						ir.push_str(&format!("{fast} = and i1 %n{index}.attention.single, true\n"));
 					}
 					// The matrix body scores the whole sequence at once. Its keys past
 					// the window are zero and the causal mask drops them, so it stays
@@ -4523,18 +4567,6 @@ impl NativeModelIr {
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
 					let attention_carry = i32::from(pointers.attention_kv.is_some());
-					// The single-query step body is written in the block's own types, so
-					// every precision takes it.
-					let fast_attention = self.inference
-						&& !online_order
-						&& self.rows == 1
-						&& backend == Backend::Amd
-						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
-						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
-						&& attention == "attention_forward_body"
-						&& blocks == 0
-						&& node.argument[2] == 0.0
-						&& pointers.attention_kv.is_some() && attention_value_heads(node) == node.argument[1] as usize;
 					let (tile_m, tile_n) = if self.inference && attention == "attention_forward_body" {
 						let step = native_attention_tile(
 							narrow(node.output.length, "attention length")? as u32,
@@ -4554,7 +4586,7 @@ impl NativeModelIr {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
 						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
-						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
+						ir.push_str(&format!("br i1 {fast}, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
 					}
@@ -8429,6 +8461,13 @@ impl FloatLayout {
 		self.sign + self.exp + self.man
 	}
 	fn pack(self, value: f64) -> u64 {
+		// A finite value rounds to IEEE single or double exactly as the hardware does.
+		if value.abs() <= f64::from(f32::MAX) && (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return u64::from((value as f32).to_bits());
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return value.to_bits();
+		}
 		let sign = value.to_bits() >> (u64::BITS - 1) << (self.exp + self.man);
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -8465,6 +8504,13 @@ impl FloatLayout {
 		}
 	}
 	fn unpack(self, bits: u64) -> f64 {
+		// IEEE single and double decode exactly by the hardware conversion.
+		if (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return f64::from(f32::from_bits(bits as u32));
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return f64::from_bits(bits);
+		}
 		let negative = bits >> (self.exp + self.man) != 0;
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -15566,9 +15612,12 @@ impl<'a> Builder<'a> {
 		}
 		planes.push(value);
 		let mut block = branch.attn(heads).kv(kv).head(head);
+		// The gate rows of the query tensor bind the gate projection, which lowers
+		// after the attention and its indexer.
+		let mut gate_planes = Vec::new();
 		if gated {
 			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?);
+				gate_planes.push(query.rows(index * stride + head, head)?);
 			}
 			block = block.gate();
 		}
@@ -15617,6 +15666,9 @@ impl<'a> Builder<'a> {
 				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
 				self.slot(scales);
 			}
+		}
+		if !gate_planes.is_empty() {
+			self.mapped(gate_planes);
 		}
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
@@ -16416,16 +16468,18 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&key, index * head, &order)?);
 		}
 		planes.push(value);
-		if gated {
-			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?);
-			}
-		}
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
+		}
+		if gated {
+			let mut gate_planes = Vec::new();
+			for index in 0..heads {
+				gate_planes.push(query.rows(index * stride + head, head)?);
+			}
+			self.mapped(gate_planes);
 		}
 		let output = if let Some(path) = &attention.output { self.projection_path(path, &role, heads * head, width)? } else { self.projection(&name("attn_output.weight"), &role, heads * head, width)? };
 		self.mapped(vec![output]);
@@ -18078,7 +18132,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
-		Operation::Attention(attention) => lower_attention(graph, attention.clone(), block.qk)?,
+		Operation::Attention(attention) => lower_attention(graph, attention.clone(), block.qk, config)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -18790,7 +18844,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// normalization and rotary nodes, the attention node and the output
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
-fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>, config: Config) -> Result<()> {
 	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled, .. } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
@@ -18821,8 +18875,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	// width.
 	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
-	let gated = if gate { inner } else { 0 };
-	lower_project(graph, checked_add(pairs, gated, "attention projection width")?)?;
+	lower_project(graph, pairs)?;
 	if let Some(normalization) = qk {
 		graph.block_precision = graph.block_qk_precision.or(ordinary_precision);
 		// The projection lays the queries and keys out ahead of the values, so the
@@ -18910,8 +18963,18 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
 	graph.block_precision = ordinary_precision;
 	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
-	let argument = [heads as f64, keys as f64, f64::from(u8::from(gate)), block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
-	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, side)?;
+	let argument = [heads as f64, keys as f64, 0.0, block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
+	let attended = Shape { channels: inner, length: input.length };
+	push_node(graph, Primitive::Attention, attended, 0, argument, side)?;
+	if gate {
+		// The output gate is its own projection of the block input, a sigmoid of
+		// it multiplying the attention output: two plain branches, not an attention mode.
+		let attention = graph.source;
+		reset(graph, source, input);
+		lower_project(graph, inner)?;
+		let (factor, shape) = activation(graph, graph.source, attended, Activation::Sigmoid, config)?;
+		binary(graph, attention, factor, shape, ScalarOpcode::Multiply)?;
+	}
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
