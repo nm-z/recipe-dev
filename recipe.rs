@@ -1686,6 +1686,10 @@ pub(crate) struct NativeLayout {
 	/// device clock per node, written by thread 0 as each node begins; a
 	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
+	/// At inference, the byte offset in the context arena of the output node's
+	/// values at the last position a forward reached, one per output channel,
+	/// gathered on the device so a decode reads one column and not the tensor.
+	pub last_column: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -2355,8 +2359,12 @@ impl NativeLayout {
 		let clocks = if tracing() {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
+		let last_column = match graph.nodes.last().filter(|_| inference) {
+			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
+			None => None,
+		};
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column })
 	}
 }
 
@@ -2806,6 +2814,7 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 		}
 	}
 	names.push("recipe.model.decode".to_owned());
+	names.push("recipe.model.dot.run".to_owned());
 	names.sort();
 	names.dedup();
 	// Backend plumbing has no arithmetic in it and, on the CPU, owns the
@@ -2888,6 +2897,22 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	Ok(ir)
 }
 
+/// A packed node's one stored format when the run dot reads it: the format,
+/// its decoder, and its block's values and bytes.
+fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
+	let [(segment, _)] = stored.format_segments()[..] else { return None };
+	let spec = segment.spec()?;
+	let format = spec.codec.quantization();
+	if matches!(format.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % DOT_RUN == 0 || DOT_RUN % spec.block == 0) {
+		return None;
+	}
+	Some((format, format.native, spec.block, spec.stride))
+}
+/// Adjacent stored weights one lane decodes and dots at a time in a packed
+/// matrix-vector product: adjacent lanes read adjacent bytes, and the values of
+/// a run share their block fields.
+const DOT_RUN: usize = 32;
 fn pointer_type(backend: Backend) -> &'static str {
 	if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" }
 }
@@ -3854,8 +3879,195 @@ mod quantized {
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
 	}
+
+	/// An integer of a run decoder: known when the generator can compute it, IR otherwise.
+	#[derive(Clone)]
+	pub(super) enum RunInt {
+		Known(u64),
+		Ir(String),
+	}
+	impl RunInt {
+		fn text(&self) -> String {
+			match self {
+				Self::Known(value) => value.to_string(),
+				Self::Ir(name) => name.clone(),
+			}
+		}
+	}
+
+	/// Decodes one value of a block whose place in the block is known when the IR
+	/// is generated. Every integer the format derives from that place folds to a
+	/// constant, so its byte offsets are constants too, and the bytes come from
+	/// aligned words loaded once per block and shared by every value decoded
+	/// through the same `RunQuantOps`.
+	pub(super) struct RunQuantOps<'a> {
+		pub(super) inner: &'a mut NativeQuantOps,
+		/// The value's place in its block.
+		pub(super) local: u64,
+		/// The block's byte address and the alignment it is known to have.
+		pub(super) block: String,
+		pub(super) align: u64,
+		pub(super) words: &'a mut std::collections::HashMap<(String, u64), String>,
+	}
+	impl RunQuantOps<'_> {
+		fn word_bytes(&self) -> u64 {
+			self.align.min(4)
+		}
+		fn word(&mut self, word: u64) -> String {
+			let key = (self.block.clone(), word);
+			if let Some(name) = self.words.get(&key) {
+				return name.clone();
+			}
+			let (bytes, pointer) = (self.word_bytes(), pointer_type(self.inner.backend));
+			let offset = word * bytes;
+			let align = if offset == 0 { self.align } else { self.align.min(1 << offset.trailing_zeros()) };
+			let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {offset}", self.block));
+			let loaded = self.inner.instruction(format!("load i{}, {pointer} {address}, align {align}, !invariant.load !{{}}", bytes * 8));
+			let wide = self.inner.instruction(format!("zext i{} {loaded} to i64", bytes * 8));
+			self.words.insert(key, wide.clone());
+			wide
+		}
+		/// The little-endian integer of `bits` bits at byte `offset`, assembled from words.
+		fn bytes(&mut self, offset: u64, bits: u8) -> String {
+			let per = self.word_bytes();
+			let mut value = "0".to_owned();
+			for byte in 0..u64::from(bits / 8) {
+				let at = offset + byte;
+				let word = self.word(at / per);
+				let shifted = self.inner.instruction(format!("lshr i64 {word}, {}", (at % per) * 8));
+				let masked = self.inner.instruction(format!("and i64 {shifted}, 255"));
+				let placed = self.inner.instruction(format!("shl i64 {masked}, {}", byte * 8));
+				value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+			}
+			value
+		}
+	}
+	impl QuantOps for RunQuantOps<'_> {
+		type Int = RunInt;
+		type Value = String;
+		fn index(&self) -> Self::Int {
+			RunInt::Known(self.local)
+		}
+		fn integer(&self, value: u64) -> Self::Int {
+			RunInt::Known(value)
+		}
+		fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int {
+			if let (RunInt::Known(left), RunInt::Known(right)) = (&left, &right) {
+				let (left, right) = (*left, *right);
+				let folded = match operation {
+					QuantIntOp::Add => Some(left.wrapping_add(right)),
+					QuantIntOp::Subtract => Some(left.wrapping_sub(right)),
+					QuantIntOp::Multiply => Some(left.wrapping_mul(right)),
+					QuantIntOp::Divide => left.checked_div(right),
+					QuantIntOp::Remainder => left.checked_rem(right),
+					QuantIntOp::ShiftLeft => (right < 64).then(|| left << right),
+					QuantIntOp::ShiftRight => (right < 64).then(|| left >> right),
+					QuantIntOp::And => Some(left & right),
+					QuantIntOp::Or => Some(left | right),
+					QuantIntOp::Xor => Some(left ^ right),
+				};
+				if let Some(value) = folded {
+					return RunInt::Known(value);
+				}
+			}
+			RunInt::Ir(self.inner.int(operation, left.text(), right.text()))
+		}
+		fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left == right)),
+				_ => RunInt::Ir(self.inner.equal(left.text(), right.text())),
+			}
+		}
+		fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left < right)),
+				_ => RunInt::Ir(self.inner.less(left.text(), right.text())),
+			}
+		}
+		fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => RunInt::Ir(self.inner.select_int(condition, yes.text(), no.text())),
+			}
+		}
+		fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int {
+			match value {
+				RunInt::Known(value) => {
+					let shift = 64 - u32::from(bits);
+					RunInt::Known((((value << shift) as i64) >> shift) as u64)
+				}
+				RunInt::Ir(value) => RunInt::Ir(self.inner.sign_extend(value, bits)),
+			}
+		}
+		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
+			match offset {
+				RunInt::Known(offset) => RunInt::Ir(self.bytes(offset, bits)),
+				RunInt::Ir(offset) => {
+					let address = self.inner.instruction(format!("getelementptr inbounds i8, {} {}, i64 {offset}", pointer_type(self.inner.backend), self.block));
+					let loaded = self.inner.instruction(format!("load i{bits}, {} {address}, align 1, !invariant.load !{{}}", pointer_type(self.inner.backend)));
+					RunInt::Ir(if bits == 64 { loaded } else { self.inner.instruction(format!("zext i{bits} {loaded} to i64")) })
+				}
+			}
+		}
+		fn half(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(16, offset);
+			self.half_bits(bits)
+		}
+		fn float(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(32, offset).text();
+			let state = self.inner.precision.state_type;
+			let narrow = self.inner.instruction(format!("trunc i64 {bits} to i32"));
+			let float = self.inner.instruction(format!("bitcast i32 {narrow} to float"));
+			self.inner.instruction(format!("call {state} @recipe.state.from.f32{}(float {float})", self.inner.suffix))
+		}
+		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
+			self.inner.half_bits(bits.text())
+		}
+		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(u64::from(values[index as usize])),
+				RunInt::Ir(index) => RunInt::Ir(self.inner.table(name, values, index)),
+			}
+		}
+		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(i64::from(values[index as usize]) as u64),
+				RunInt::Ir(index) => RunInt::Ir(self.inner.signed_table(name, values, index)),
+			}
+		}
+		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
+			match index {
+				RunInt::Known(index) => self.inner.literal(values[index as usize]),
+				RunInt::Ir(index) => self.inner.value_table(name, values, index),
+			}
+		}
+		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
+			match value {
+				RunInt::Known(value) => self.inner.literal(if signed { value as i64 as f64 } else { value as f64 }),
+				RunInt::Ir(value) => self.inner.number(value, signed),
+			}
+		}
+		fn literal(&self, value: f64) -> Self::Value {
+			self.inner.literal(value)
+		}
+		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value {
+			self.inner.value(operation, left, right)
+		}
+		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => self.inner.select_value(condition, yes, no),
+			}
+		}
+		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
+			match sign {
+				RunInt::Known(0) => magnitude,
+				sign => self.inner.signed(magnitude, sign.text()),
+			}
+		}
+	}
 }
-use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
+use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, RunQuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
 	/// Emits loads of a runtime schedule slot from the context arena. Keeping
@@ -4021,6 +4233,33 @@ impl NativeModelIr {
 					}
 					ir.push_str(barrier(backend));
 				}
+				// An expert table in a stored format with a run dot is a contraction
+				// whose rows or inputs the position's routed experts select.
+				(false, Primitive::ExpertIn | Primitive::ExpertOut)
+					if self.inference && self.rows == 1 && node.int_bits == 0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| {
+						let unit = block.max(DOT_RUN);
+						node.input.channels % unit == 0 && (node.op == Primitive::ExpertIn || (node.argument[2] as usize) % unit == 0)
+					}) =>
+				{
+					ir.push_str(&format!(
+						"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+						pointer = pointer_type(backend),
+						decode = plan.decode(index),
+						source = pointers.source,
+						routing = pointers.second,
+						weights = pointers.weights,
+						value = pointers.value,
+						rows = node.output.channels,
+						terms = node.input.channels,
+						in_length = node.input.length,
+						out_length = node.output.length,
+						mode = if node.op == Primitive::ExpertIn { 1 } else { 2 },
+						hidden = node.argument[2],
+						experts = node.argument[0],
+						top = node.argument[1]
+					));
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::ExpertIn) => {
 					emit_runtime_window_loop(&mut ir, index, "expert.in", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
@@ -4148,7 +4387,33 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Delta) if self.inference => {
+					// One row, head and value column per element: columns of the state
+					// never read each other, and the live state walks only the window.
+					let (key_heads, key_width, heads, width) = delta_extent(node)?;
+					let pairs = checked_mul(self.rows, heads as usize, "delta pairs")?;
+					let columns = Shape { channels: checked_mul(pairs, width as usize, "delta columns")?, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let length = narrow(node.output.length, "delta length")?;
+					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale} )\n",
+							tiled = node.argument[5] == 1.0,
+							ty = self.node_precision(node).model_type,
+							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
+							pointer = pointer_type(backend),
+							decode = plan.decode(index),
+							source = pointers.source,
+							second = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							context = pointers.context,
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Delta) => {
+					require(node.argument[5] == 0.0 && (node.argument[6] == 0.0 || node.argument[6] == 1.0), "a delta block with tiled key heads or a scaled output runs at inference only")?;
 					// One row and head per element: a `[heads, 1]` shape walked whole.
 					let shape = delta_shape(node, self.rows)?;
 					let pairs = Shape { channels: shape.heads as usize, length: 1 };
@@ -6614,6 +6879,108 @@ impl NativeModelIr {
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
 	}
+	/// The dot of one run of `DOT_RUN` adjacent weights of each packed node in one
+	/// format, and the switch that says which nodes have it. The run's values go
+	/// through the node's own decoder with constant offsets, so the inliner shares
+	/// the block fields every value of a run reads.
+	/// Copies the output node's values at the last position this forward reached
+	/// into the layout's last column, one value per channel.
+	fn emit_last_column(&self, backend: Backend) -> Result<String> {
+		let (Some(column), Some(last)) = (self.layout.last_column, self.graph.nodes.len().checked_sub(1)) else { return Ok(String::new()) };
+		let node = &self.graph.nodes[last];
+		let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+		let (channels, length) = (node.output.channels, node.output.length);
+		let mut ir = String::new();
+		ir.push_str(&ptr_gep(backend, "values", self.layout.values[last], "lc.values"));
+		ir.push_str(&ptr_gep(backend, "contexts", column, "lc.column"));
+		ir.push_str(&format!(
+			"%lc.position = sub i32 %n{last}.end, 1\n%lc.position.wide = zext i32 %lc.position to i64\nbr label %lc.entry\nlc.entry:\nbr label %lc.loop\nlc.loop:\n%lc.c = phi i32 [ %tid, %lc.entry ], [ %lc.c.next, %lc.step ]\n%lc.more = icmp ult i32 %lc.c, {channels}\nbr i1 %lc.more, label %lc.step, label %lc.done\nlc.step:\n%lc.c.wide = zext i32 %lc.c to i64\n%lc.row = mul i64 %lc.c.wide, {length}\n%lc.index = add i64 %lc.row, %lc.position.wide\n%lc.from = getelementptr inbounds {ty}, {pointer} %lc.values, i64 %lc.index\n%lc.value = load {ty}, {pointer} %lc.from\n%lc.to = getelementptr inbounds {ty}, {pointer} %lc.column, i64 %lc.c.wide\nstore {ty} %lc.value, {pointer} %lc.to\n%lc.c.next = add i32 %lc.c, %threads\nbr label %lc.loop\nlc.done:\n"
+		));
+		Ok(ir)
+	}
+	fn emit_dot_run(&self, backend: Backend) -> Result<String> {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let eligible = dot_run_format;
+		let mut ir = String::new();
+		let (mut available, mut cases) = (String::new(), String::new());
+		for (index, plan) in self.plans.iter().enumerate() {
+			if let Some((_, _, block, _)) = eligible(plan) {
+				available.push_str(&format!("i32 {}, label %yes\n", index + 1));
+				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, (block / DOT_RUN).max(1)));
+			}
+		}
+		ir.push_str(&format!("define internal i1 @recipe.model.dot.run.available(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %no [\n{available}]\nyes:\nret i1 true\nno:\nret i1 false\n}}\n"));
+		// The runs a block holds: the places a run can start at inside one block.
+		let counts = (1..=256 / DOT_RUN).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
+		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.cases(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 1\n}}\n"));
+		for (precision, suffix) in self.precisions() {
+			let (ty, state) = (precision.model_type, precision.state_type);
+			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(&str, NativeDequant, usize, usize)>::new());
+			for (index, plan) in self.plans.iter().enumerate() {
+				if self.variant(&plan.node) != suffix {
+					continue;
+				}
+				let Some((format, native, block, stride)) = eligible(plan) else { continue };
+				arms.push_str(&format!("i32 {}, label %n{index}\n", index + 1));
+				bodies.push_str(&format!("n{index}:\n%n{index}.sum = call {state} @recipe_model_run_{}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride)\nret {state} %n{index}.sum\n", format.name));
+				if !formats.iter().any(|(name, ..)| *name == format.name) {
+					formats.push((format.name, native, block, stride));
+				}
+			}
+			for (name, native, block, stride) in formats {
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride));
+			}
+			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			let _ = ty;
+		}
+		Ok(ir)
+	}
+	/// One format's dot of a run of `DOT_RUN` adjacent weights from `%index` (a
+	/// multiple of `DOT_RUN`) with activations `%stride` apart. A run inside one
+	/// block starts at one of `block / DOT_RUN` places, each its own case, so the
+	/// place of every value is known here and its block fields fold into
+	/// constant offsets; a run over several smaller blocks steps block by block.
+	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize) -> String {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let (ty, state) = (precision.model_type, precision.state_type);
+		let align = {
+			let (mut a, mut b) = (stride as u64, 16_u64);
+			while b != 0 {
+				(a, b) = (b, a % b);
+			}
+			a
+		};
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
+		let cases = (block / DOT_RUN).max(1);
+		operations.ir.push_str(&format!(
+			"%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n%run.within = urem i64 %index, {block}\n%run.case = udiv i64 %run.within, {DOT_RUN}\nswitch i64 %run.case, label %case0 [\n{}]\n",
+			(1..cases).map(|case| format!("i64 {case}, label %case{case}\n")).collect::<String>()
+		));
+		for case in 0..cases {
+			operations.ir.push_str(&format!("case{case}:\n"));
+			let mut words = std::collections::HashMap::new();
+			let mut sum = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+			for j in 0..DOT_RUN {
+				let (relative, local) = if block >= DOT_RUN { (0, case * DOT_RUN + j) } else { (j / block, j % block) };
+				let base = if relative == 0 { "%run.base".to_owned() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} %run.base, i64 {}", relative * stride)) };
+				let value = {
+					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: base, align, words: &mut words };
+					native.decode(&mut run)
+				};
+				// The weight rounds to the model type as the per-value decoder does.
+				let model = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({state} {value})"));
+				let weight = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {model})"));
+				let offset = operations.instruction(format!("mul i32 %stride, {j}"));
+				let address = operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"));
+				let input = operations.instruction(format!("load {ty}, {shared} {address}"));
+				let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
+				let product = operations.instruction(format!("call {state} @recipe.state.mul{suffix}({state} {weight}, {state} {input})"));
+				sum = operations.instruction(format!("call {state} @recipe.state.add{suffix}({state} {sum}, {state} {product})"));
+			}
+			operations.ir.push_str(&format!("ret {state} {sum}\n"));
+		}
+		format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
 	/// requantized node's file bytes, or the stored weight an unpacked node
 	/// expands, each plane in its own format.
@@ -6870,6 +7237,7 @@ impl NativeModelIr {
 				.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
 				.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
 				.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
+				.replace("RECIPE_DOT_RUN", &DOT_RUN.to_string())
 				.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
 				.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 				.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
@@ -6878,11 +7246,13 @@ impl NativeModelIr {
 		};
 		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.state.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
+		ir = strip_definition(ir, "recipe.model.dot.run");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
 			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
+			let template = strip_definition(template, "recipe.model.dot.run");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
 		}
@@ -6903,6 +7273,7 @@ impl NativeModelIr {
 		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
+		ir.push_str(&self.emit_dot_run(backend)?);
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
@@ -6922,6 +7293,7 @@ impl NativeModelIr {
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
 		body.push_str(&inference_forward);
+		body.push_str(&self.emit_last_column(backend)?);
 		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
@@ -10523,6 +10895,10 @@ mod bundle {
 					window,
 					factors,
 					unscaled,
+					query: None,
+					key: None,
+					value: None,
+					output: None,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -10587,7 +10963,7 @@ mod bundle {
 				// Keep those defaults when the optional activation selectors are absent.
 				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
 				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, tiled_keys: false, scaled_query: false }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -11453,6 +11829,92 @@ pub struct Data {
 	/// The GGUF model file `recipe.data` opened, which `recipe.infer` runs.
 	file: Option<Gguf>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyPart {
+	Static(String),
+	Value(String),
+}
+impl KeyPart {
+	pub fn from_static(value: &'static str) -> Self {
+		Self::Static(value.to_owned())
+	}
+	pub fn from_value(value: impl fmt::Display) -> Self {
+		Self::Value(value.to_string())
+	}
+	fn text(&self) -> &str {
+		match self {
+			Self::Static(value) | Self::Value(value) => value,
+		}
+	}
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPath(Vec<KeyPart>);
+impl KeyPath {
+	pub fn new(parts: Vec<KeyPart>) -> Self {
+		Self(parts)
+	}
+	fn text(&self) -> String {
+		self.0.iter().map(KeyPart::text).collect::<Vec<_>>().join(".")
+	}
+	fn matches(&self, name: &str, implicit_weight: bool) -> bool {
+		fn match_parts(path: &[String], path_at: usize, key: &[&str], key_at: usize) -> bool {
+			if path_at == path.len() || key_at == key.len() {
+				return path_at == path.len() && key_at == key.len();
+			}
+			let mut component = String::new();
+			for end in path_at..path.len() {
+				if end != path_at { component.push('_'); }
+				component.push_str(&path[end]);
+				if component == key[key_at] && match_parts(path, end + 1, key, key_at + 1) {
+					return true;
+				}
+			}
+			false
+		}
+		let path = self.0.iter().map(|part| part.text().to_owned()).collect::<Vec<_>>();
+		let mut key = name.split('.').collect::<Vec<_>>();
+		if implicit_weight && key.last() == Some(&"weight") {
+			key.pop();
+		}
+		match_parts(&path, 0, &key, 0)
+	}
+	fn metadata<'a>(&self, file: &'a Gguf) -> Result<&'a GgufValue> {
+		let found = file.metadata().iter().filter(|(name, _)| self.matches(name, false)).collect::<Vec<_>>();
+		match found.as_slice() {
+			[(_, value)] => Ok(value),
+			[] => Err(RecipeError::new(format!("GGUF metadata key {} is absent", self.text()))),
+			_ => Err(RecipeError::new(format!("GGUF metadata path {} matches more than one key", self.text()))),
+		}
+	}
+	fn tensor(&self, file: &Gguf) -> Result<GgufTensor> {
+		let found = file.tensors().iter().filter(|tensor| self.matches(&tensor.name, true)).collect::<Vec<_>>();
+		match found.as_slice() {
+			[tensor] => Ok((*tensor).clone()),
+			[] => Err(RecipeError::new(format!("GGUF tensor path {} does not identify a tensor", self.text()))),
+			_ => Err(RecipeError::new(format!("GGUF tensor path {} matches more than one tensor", self.text()))),
+		}
+	}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+	Q,
+	K,
+	V,
+}
+impl fmt::Display for Projection {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(match self { Self::Q => "q", Self::K => "k", Self::V => "v" })
+	}
+}
+pub fn metadata_f64(path: KeyPath) -> f64 {
+	path.metadata(script_file()).unwrap_or_else(|error| panic!("{error}"))
+		.float().unwrap_or_else(|| panic!("GGUF metadata path {} is not numeric", path.text()))
+}
+pub fn metadata_usize(path: KeyPath) -> usize {
+	let value = path.metadata(script_file()).unwrap_or_else(|error| panic!("{error}"))
+		.integer().unwrap_or_else(|| panic!("GGUF metadata path {} is not an integer", path.text()));
+	usize::try_from(value).unwrap_or_else(|_| panic!("GGUF metadata path {} exceeds usize", path.text()))
+}
 #[derive(Clone)]
 enum FeatureSelection {
 	All,
@@ -11603,7 +12065,7 @@ impl Indexer {
 /// count API; the scalar form remains the equal-head shorthand.
 /// One attention block: query, key, and value heads, plus the rotary, indexer,
 /// and output-gate selectors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AttentionBlock {
 	heads: usize,
 	/// The width of one query, key and value head. `None` derives it from the
@@ -11627,13 +12089,15 @@ struct AttentionBlock {
 	factors: bool,
 	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
 	unscaled: bool,
+	query: Option<KeyPath>,
+	key: Option<KeyPath>,
+	value: Option<KeyPath>,
+	output: Option<KeyPath>,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false, query: None, key: None, value: None, output: None }
 	}
-
-
 }
 /// One gated delta rule block: value heads, the convolution kernel, and the key
 /// and value extents. A zero extent takes it from the stream, so the value heads
@@ -11653,10 +12117,16 @@ struct DeltaBlock {
 	/// Activation applied to the output gate. Existing hand-built models
 	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
 	output_activation: Activation,
+	/// Which key head a value head reads: grouped (head / group), or tiled
+	/// (head modulo the key heads), the layout ggml's broadcast gives a file.
+	tiled_keys: bool,
+	/// Whether the recurrence output takes 1 / sqrt(key width): the scaled query
+	/// of the standard gated delta rule.
+	scaled_query: bool,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid, tiled_keys: false, scaled_query: false }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -12002,6 +12472,20 @@ impl Block {
 		}
 		self
 	}
+	fn bind_projection(self, role: Projection, path: KeyPath) -> Self {
+		self.attention("projection binding", |attention| match role {
+			Projection::Q => attention.query = Some(path),
+			Projection::K => attention.key = Some(path),
+			Projection::V => attention.value = Some(path),
+		})
+	}
+	pub fn q(self, path: KeyPath) -> Self { self.bind_projection(Projection::Q, path) }
+	pub fn k(self, path: KeyPath) -> Self { self.bind_projection(Projection::K, path) }
+	pub fn v(self, path: KeyPath) -> Self { self.bind_projection(Projection::V, path) }
+	pub fn o(self, path: KeyPath) -> Self {
+		self.attention("output projection binding", |attention| attention.output = Some(path))
+	}
+	pub fn bind(self, role: Projection, path: KeyPath) -> Self { self.bind_projection(role, path) }
 	/// Head width of this `attn` block. Without it, the width comes from the
 	/// residual stream and the heads partition the input.
 	pub fn width(self, width: usize) -> Self {
@@ -12258,6 +12742,11 @@ impl Model {
 	pub fn attn(&self, heads: usize) -> Self {
 		self.push(Operation::Attention(AttentionBlock::new(heads)))
 	}
+	pub fn q(&self, path: KeyPath) -> Self { self.attention("q", |block| block.q(path)) }
+	pub fn k(&self, path: KeyPath) -> Self { self.attention("k", |block| block.k(path)) }
+	pub fn v(&self, path: KeyPath) -> Self { self.attention("v", |block| block.v(path)) }
+	pub fn o(&self, path: KeyPath) -> Self { self.attention("o", |block| block.o(path)) }
+	pub fn bind(&self, role: Projection, path: KeyPath) -> Self { self.attention("projection binding", |block| block.bind(role, path)) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(branch(parts)))
 	}
@@ -14373,7 +14862,8 @@ impl Recipe {
 
 fn key_color(name: &str, color: bool) -> String {
 	if !color { return name.to_owned(); }
-	name.split('.').enumerate().map(|(index, part)| format!("\x1b[{}m{part}\x1b[0m", [96, 95, 94, 93, 92, 91][index % 6])).collect::<Vec<_>>().join(".")
+	const COLORS: [&str; 5] = ["242;40;60", "0;174;107", "39;125;255", "255;194;0", "135;90;251"];
+	name.split('.').enumerate().map(|(index, part)| format!("\x1b[38;2;{}m{part}\x1b[0m", COLORS[index % COLORS.len()])).collect::<Vec<_>>().join(".")
 }
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
@@ -14973,6 +15463,11 @@ impl<'a> Builder<'a> {
 		self.consumed.insert(name.to_owned());
 		Ok(tensor)
 	}
+	fn keyed_tensor(&mut self, path: &KeyPath, role: &str) -> Result<GgufTensor> {
+		let tensor = path.tensor(self.file).map_err(|error| RecipeError::new(format!("{error}; {role} reads this path")))?;
+		self.consumed.insert(tensor.name.clone());
+		Ok(tensor)
+	}
 	fn optional(&mut self, name: &str) -> Option<GgufTensor> {
 		let tensor = self.file.tensor(name)?.clone();
 		self.consumed.insert(name.to_owned());
@@ -14998,6 +15493,14 @@ impl<'a> Builder<'a> {
 		require(
 			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
 			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
+		)?;
+		Ok(tensor)
+	}
+	fn projection_path(&mut self, path: &KeyPath, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
+		let tensor = self.keyed_tensor(path, role)?;
+		require(
+			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
+			format!("{} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.name, tensor.shape),
 		)?;
 		Ok(tensor)
 	}
@@ -15196,9 +15699,13 @@ impl<'a> Builder<'a> {
 		// architecture rows that use this block provide their trained pair.
 		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
 		let block = branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width);
+		// A GGUF delta block follows ggml's gated delta net: value heads tile the
+		// key heads, and the output takes the query scale 1 / sqrt(key width).
 		Ok(block.delta_block("activations", |delta| {
 			delta.conv_activation = conv_activation;
 			delta.output_activation = output_activation;
+			delta.tiled_keys = true;
+			delta.scaled_query = true;
 		}))
 	}
 	/// One gated feed-forward and the plan of its gate, up and down projections.
@@ -15889,7 +16396,7 @@ impl Builder<'_> {
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		let query = if let Some(path) = &attention.query { self.keyed_tensor(path, &role)? } else { self.tensor(&name("attn_q.weight"), &role)? };
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		let gated = match query.shape[1] as usize {
 			outputs if outputs == heads * head => false,
@@ -15897,8 +16404,8 @@ impl Builder<'_> {
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
 		require(gated == attention.gate, format!("{} {} an output gate, and the attention block {}", query.name, if gated { "holds" } else { "holds no" }, if attention.gate { "declares one" } else { "declares none" }))?;
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = self.projection(&name("attn_v.weight"), &role, width, kv * head)?;
+		let key = if let Some(path) = &attention.key { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
+		let value = if let Some(path) = &attention.value { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_v.weight"), &role, width, kv * head)? };
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
@@ -15920,7 +16427,7 @@ impl Builder<'_> {
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
 		}
-		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
+		let output = if let Some(path) = &attention.output { self.projection_path(path, &role, heads * head, width)? } else { self.projection(&name("attn_output.weight"), &role, heads * head, width)? };
 		self.mapped(vec![output]);
 		Ok(())
 	}
@@ -16980,8 +17487,9 @@ impl Placed {
 			*state = DecodeState::default();
 		}
 		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
-			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
-			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
+			let bound = matches!(self.source, PlacedSource::Bound(..));
+			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None }, bound)?;
+			let mut sample_logits = if bound { predictions.clone() } else { self.last_logits(&predictions, settled, reached)? };
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
 					if let Some(logit) = sample_logits.get_mut(*id as usize) {
@@ -17001,22 +17509,24 @@ impl Placed {
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
 	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		self.run_window_observed(samples, begin, end, None)
+		self.run_window_observed(samples, begin, end, None, false)
 	}
-	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	/// The window's output: every position of it, or with `last_only` a bound
+	/// model's last reached position alone.
+	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		match &self.source {
 			PlacedSource::Saved(graphs) => {
 				let mut graph = 0;
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None })
+					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None }, false)
 				})
 			}
 			PlacedSource::Bound(input, _) => {
 				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
-				self.forward_window(ranges, samples, begin, end, progress)
+				self.forward_window(ranges, samples, begin, end, progress, last_only)
 			}
 		}
 	}
@@ -17025,7 +17535,7 @@ impl Placed {
 	/// `samples` enter the first range, each range writes the positions the
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
-	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
@@ -17043,11 +17553,17 @@ impl Placed {
 			})?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
-			for (start, count) in window_runs(tape.output, begin, end) {
-				next.write_samples(start, &tape.output(start, count)?)?;
+			let runs = window_runs(tape.output, begin, end);
+			if runs.len() > 1 && next.vocabulary == 0.0 {
+				// Every channel's run of the window moves in one strided copy each way.
+				next.write_window(begin, end, &tape.output_window_values(begin, end)?)?;
+			} else {
+				for (start, count) in runs {
+					next.write_samples(start, &tape.output(start, count)?)?;
+				}
 			}
 		}
-		last.predictions()
+		if last_only { last.last_column() } else { last.predictions() }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17562,7 +18078,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
-		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
+		Operation::Attention(attention) => lower_attention(graph, attention.clone(), block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
@@ -17658,6 +18174,17 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		if kept.is_none() {
 			requantize_bound(graph, index, storage, config)?;
 		}
+	}
+	// A float sum reads a file-bound weight in the file's own format: the bytes
+	// stay as stored and the dot decodes them, so VRAM holds the file, not values.
+	for index in first..graph.nodes.len() {
+		let Some(Some(weight)) = graph.stored.get(index) else { continue };
+		let node = &graph.nodes[index];
+		if node.packed || node.table() || !matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) || !weight.codebook.is_empty() || !weight.segments.iter().all(|(span, _)| span.spec().is_some()) { continue }
+		let format = weight.format.0;
+		let node = &mut graph.nodes[index];
+		node.packed = true;
+		node.storage = format;
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
@@ -18249,7 +18776,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, f64::from(u8::from(delta.tiled_keys)), if delta.scaled_query { 1.0 / (key_width as f64).sqrt() } else { 1.0 }, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
 	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
 	let normalized = graph.source;
@@ -18264,7 +18791,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled, .. } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
@@ -20653,6 +21180,14 @@ impl NativeTape {
 			self.samples.write_float_bytes(checked_mul(first, input_precision.bytes(), "sample offset")?, values, input_precision)
 		}
 	}
+	/// Positions `begin..end` of every input channel, channel by channel.
+	fn write_window(&self, begin: u32, end: u32, values: &[f64]) -> Result<()> {
+		let precision = self.program.artifact.layout.input_precision;
+		let bytes = precision.bytes();
+		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
+		let pitch = checked_mul(self.input.length, bytes, "window pitch")?;
+		self.samples.write_strided_bytes(checked_mul(begin as usize, bytes, "window offset")?, pitch, checked_mul((end - begin) as usize, bytes, "window width")?, &encoded)
+	}
 	fn write_tokens(&self, first: usize, values: &[f64]) -> Result<()> {
 		let mut tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
 		let end = checked_add(first, values.len(), "token write")?;
@@ -20721,6 +21256,25 @@ impl NativeTape {
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.rows as usize * self.output.elements())
 	}
+	/// Positions `begin..end` of every output channel, channel by channel.
+	fn output_window_values(&self, begin: u32, end: u32) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let arena = *layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let (precision, bytes) = (layout.output_precision, layout.output_precision.bytes());
+		let offset = checked_add(arena, checked_mul(begin as usize, bytes, "window offset")?, "window offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(self.output.length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
+		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
+		self.trace_values(&values)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	/// The output channels at the last position the latest forward reached.
+	fn last_column(&self) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let column = layout.last_column.ok_or_else(|| RecipeError::new("this tape keeps no last output column"))?;
+		let values = self.contexts.download_float_bytes(column, self.output.channels, layout.output_precision)?;
+		self.trace_values(&values)?;
+		Ok(values)
+	}
 	/// Select the last output position reached by an input window for
 	/// autoregressive sampling. Predictions stay channel-major (`channel,
 	/// position`) so a decode must sample one value from each channel while
@@ -20731,11 +21285,9 @@ impl NativeTape {
 		select_last_logits(predictions, self.output, reached as usize - 1)
 	}
 	/// A run of `count` output values from element `first` of the output arena.
-	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
-		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let output_precision = self.program.artifact.layout.output_precision;
-		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
-		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+	/// Under a trace, the head of every traced node's values, once and again
+	/// whenever the output the host just read went nonfinite.
+	fn trace_values(&self, values: &[f64]) -> Result<()> {
 		// A traced run shows the head of every node's values once, at the first
 		// output, and again if a later output went nonfinite.
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -20809,6 +21361,14 @@ impl NativeTape {
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
+		Ok(())
+	}
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let output_precision = self.program.artifact.layout.output_precision;
+		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
@@ -21973,6 +22533,19 @@ impl Buffer {
 		require(checked_add(offset, values.len(), "GPU byte write")? <= self.bytes, "GPU byte write exceeds buffer")?;
 		self.runtime.upload(self.pointer + offset as u64, values.as_ptr().cast(), values.len()).map(|_| ())
 	}
+	/// Runs of `width` bytes from `offset` on, `pitch` apart, one per value of `values.len() / width`.
+	fn write_strided_bytes(&self, offset: usize, pitch: usize, width: usize, values: &[u8]) -> Result<()> {
+		let rows = values.len() / width.max(1);
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided write")?, "GPU strided write")?, width, "GPU strided write")? <= self.bytes, "GPU strided write exceeds buffer")?;
+		self.runtime.upload_strided(self.pointer + offset as u64, values.as_ptr().cast(), pitch, width, rows)
+	}
+	fn download_strided_bytes(&self, offset: usize, pitch: usize, width: usize, rows: usize) -> Result<Vec<u8>> {
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided read")?, "GPU strided read")?, width, "GPU strided read")? <= self.bytes, "GPU strided read exceeds buffer")?;
+		let mut values = vec![0_u8; checked_mul(rows, width, "GPU strided read")?];
+		self.runtime.synchronize()?;
+		self.runtime.download_strided(values.as_mut_ptr().cast(), self.pointer + offset as u64, pitch, width, rows)?;
+		Ok(values)
+	}
 	fn clear(&self) -> Result<()> {
 		self.clear_range(0, self.bytes)
 	}
@@ -22207,6 +22780,27 @@ impl Kernel {
 		}
 	}
 }
+/// `CUDA_MEMCPY2D`: `height` rows of `width` bytes, each side with its own pitch.
+#[cfg(nvidia)]
+#[repr(C)]
+struct CudaCopy2d {
+	src_x: usize,
+	src_y: usize,
+	src_memory: u32,
+	src_host: *const c_void,
+	src_device: u64,
+	src_array: Ptr,
+	src_pitch: usize,
+	dst_x: usize,
+	dst_y: usize,
+	dst_memory: u32,
+	dst_host: Ptr,
+	dst_device: u64,
+	dst_array: Ptr,
+	dst_pitch: usize,
+	width: usize,
+	height: usize,
+}
 #[cfg(nvidia)]
 struct Cuda {
 	_runtime: std::sync::Arc<Library>,
@@ -22216,6 +22810,7 @@ struct Cuda {
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	copy_2d: unsafe extern "C" fn(*const CudaCopy2d) -> i32,
 	clear: unsafe extern "C" fn(u64, u8, usize) -> i32,
 	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
@@ -22812,6 +23407,33 @@ impl Gpu {
 			}
 		}
 	}
+	/// `rows` runs of `width` bytes, `pitch` apart on the device, packed together
+	/// in machine RAM: one copy where the driver has one, else one per run.
+	fn download_strided(&self, dst: Ptr, src: u64, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 2, src_host: ptr::null(), src_device: src, src_array: ptr::null_mut(), src_pitch: pitch, dst_x: 0, dst_y: 0, dst_memory: 1, dst_host: dst, dst_device: 0, dst_array: ptr::null_mut(), dst_pitch: width, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided download");
+			if result.is_ok() { record_transfer(&self.name, false, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.download(unsafe { dst.cast::<u8>().add(row * width).cast() }, src + (row * pitch) as u64, width))
+	}
+	/// `rows` runs of `width` bytes packed in machine RAM, written `pitch` apart on the device.
+	fn upload_strided(&self, dst: u64, src: *const c_void, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 1, src_host: src, src_device: 0, src_array: ptr::null_mut(), src_pitch: width, dst_x: 0, dst_y: 0, dst_memory: 2, dst_host: ptr::null_mut(), dst_device: dst, dst_array: ptr::null_mut(), dst_pitch: pitch, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided upload");
+			if result.is_ok() { record_transfer(&self.name, true, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.upload(dst + (row * pitch) as u64, unsafe { src.cast::<u8>().add(row * width).cast() }, width).map(|_| ()))
+	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		self.activate()?;
@@ -22852,7 +23474,9 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					Ok(free as u64)
+					// Memory above a configured bound is unusable, so it is never free.
+					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
@@ -23051,6 +23675,12 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
 /// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
+/// The bytes of this machine's device `name` that may hold data, when the
+/// manifest bounds them (`device-usable-bytes`): memory above it is faulty.
+fn device_usable_bytes(name: &str) -> Result<Option<u64>> {
+	let device = format!("{}:{name}", local_host()?);
+	env!("RECIPE_DEVICE_USABLE_BYTES").split(';').filter_map(|entry| entry.split_once('=')).find(|(entry, _)| *entry == device).map(|(_, bytes)| bytes.parse::<u64>().map_err(|error| RecipeError::new(format!("device-usable-bytes for {device} is invalid: {error}")))).transpose()
+}
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -23972,6 +24602,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_2d: runtime.function(b"cuMemcpy2D_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,

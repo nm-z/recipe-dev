@@ -32,6 +32,8 @@ attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 134217728
+# archy nv0 has bad VRAM from ~5.9 GB up
+device-usable-bytes = { "archy:nv0" = 6186598400 }
 cpu-worker-threads = 0
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
@@ -150,6 +152,27 @@ train = "fp32"
 tolerance = 0.05
 exact-cpu = true
 sum = "int8"
+embed = "fp32"
+attn = "fp32"
+rope = "fp32"
+kv = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp32"
+acc = "fp32"
+gelu-table = "fp16"
+norm-acc = "fp64"
+rope-angle = "chain"
+attn-softmax = "online"
+math = "libm"
+step = 256
+
+[precision.stored]
+fp8 = "e4m3"
+train = "fp32"
+tolerance = 0.05
+exact-cpu = true
+sum = "fp32"
 embed = "fp32"
 attn = "fp32"
 rope = "fp32"
