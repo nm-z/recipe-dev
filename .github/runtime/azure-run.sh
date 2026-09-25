@@ -595,10 +595,41 @@ JSON
 		cat evidence/blocker.json
 		exit 1
 	fi
-	# The extension finishes asynchronously and may reboot the guest later, which
-	# would kill a running guest script; restart once now so the driver is in
-	# place and no reboot is pending before Run Command starts.
-	az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors
+	# The extension reports success before its installer binds the driver, and that
+	# installer reboots the guest when it finishes, which kills a running guest
+	# script. Wait until the adapter has its driver, then restart once so no
+	# reboot is pending before Run Command starts.
+	driver_deadline=$(( $(date +%s) + 1200 ))
+	driver_bound=false
+	while [ "$(date +%s)" -lt "$driver_deadline" ]; do
+		az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors || true
+		if az vm run-command invoke \
+			--resource-group "$GROUP" --name "$WORKER" \
+			--command-id RunPowerShellScript \
+			--scripts "Get-CimInstance Win32_PnPEntity | Where-Object { \$_.PNPDeviceID -like 'PCI\\VEN_1002*' -and \$_.PNPClass -eq 'Display' } | ForEach-Object { 'amd-display error=' + \$_.ConfigManagerErrorCode + ' name=' + \$_.Name }" \
+			--only-show-errors -o json > evidence/azure-driver-probe.json 2>> evidence/azure-driver-probe.log; then
+			probe="$(jq -r '.value[0].message // ""' evidence/azure-driver-probe.json)"
+			printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$probe" | tr '\n' ' ')" >> evidence/azure-driver-probe.log
+			if printf '%s' "$probe" | grep -q 'amd-display error=0 '; then
+				driver_bound=true
+				break
+			fi
+		fi
+		sleep 30
+	done
+	if [ "$driver_bound" != true ]; then
+		detail="$(jq -Rs . < evidence/azure-driver-probe.log)"
+		cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-driver-unbound",
+  "detail": $detail,
+  "resolution": "$extension_name $extension_version reported success but no AMD display adapter bound its driver within 20 minutes."
+}
+JSON
+		cat evidence/blocker.json
+		exit 1
+	fi
+	tail -n 1 evidence/azure-driver-probe.log
 	az vm restart --resource-group "$GROUP" --name "$WORKER" --only-show-errors -o none
 	az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors
 	echo "$extension_name $extension_version installed"
