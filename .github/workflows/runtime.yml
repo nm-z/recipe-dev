@@ -976,3 +976,299 @@ jobs:
           path: candidate/evidence/
           retention-days: 14
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 6. recipe/linux-amd -- Ubuntu 24.04 AMD Radeon PRO V710 (gfx1101) VM in
+  # Azure, driven by the same controller as win/nv through AZURE_GPU_PROFILE.
+  # The AMD backend supports Linux, so this cell is strict like win/nv.
+  # ---------------------------------------------------------------------------
+  linux-amd:
+    name: linux/amd
+    needs: prepare
+    runs-on: ubuntu-24.04
+    # The Azure OIDC federation trusts this environment; every Azure GPU cell uses it.
+    environment: recipe-windows-gpu
+    timeout-minutes: 120
+    concurrency:
+      group: recipe-linux-amd-${{ github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      CELL: recipe/linux-amd
+      AZURE_GPU_PROFILE: linux-amd
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          echo "snapshot verified sha256=$actual"
+
+      - name: Require the Azure federation
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${AZURE_CLIENT_ID:-}" ] || [ -z "${AZURE_TENANT_ID:-}" ] || [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "azure-federation-absent",
+            "detail": "AZURE_GPU_CLIENT_ID, AZURE_TENANT_ID, or AZURE_SUBSCRIPTION_ID is unavailable to this run.",
+            "resolution": "Configure the GPU controller identity and subscription secrets for the minimal branch."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/linux-amd is blocked: the Azure federation is absent" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision, execute and collect the Linux AMD worker
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # The guest installs LLVM, ROCm and Rust before the build.
+          AZURE_DEADLINE_SECONDS: "3600"
+          AZURE_VM_SIZE: ${{ vars.AZURE_AMD_VM_SIZE }}
+          AZURE_VM_IMAGE: ${{ vars.AZURE_AMD_LINUX_IMAGE }}
+
+      - name: Deallocate and clean up the worker
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-cleanup.sh"
+          else
+            echo "no Azure resources to clean up"
+          fi
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-linux-amd
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 7. recipe/windows-amd -- Windows Server 2022 AMD Radeon PRO V710 VM in
+  # Azure. Recipe has no Windows AMD runtime; this cell spends the compute
+  # anyway to record why AMD execution is unavailable on Windows. The worker
+  # step's failure is the record, so it does not fail the check (a failed check
+  # would draft every open pull request).
+  # ---------------------------------------------------------------------------
+  windows-amd:
+    name: win/amd
+    needs: prepare
+    runs-on: ubuntu-24.04
+    # The Azure OIDC federation trusts this environment; every Azure GPU cell uses it.
+    environment: recipe-windows-gpu
+    timeout-minutes: 90
+    concurrency:
+      group: recipe-windows-amd-${{ github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      CELL: recipe/windows-amd
+      AZURE_GPU_PROFILE: windows-amd
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT || secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER || secrets.AZURE_STORAGE_CONTAINER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download the immutable snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: recipe-source-snapshot
+          path: snapshot
+
+      - name: Verify the snapshot checksum
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
+          [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
+          echo "snapshot verified sha256=$actual"
+
+      - name: Require the Azure federation
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ -z "${AZURE_CLIENT_ID:-}" ] || [ -z "${AZURE_TENANT_ID:-}" ] || [ -z "${AZURE_SUBSCRIPTION_ID:-}" ]; then
+            cat > evidence/blocker.json <<'JSON'
+          {
+            "blocker": "azure-federation-absent",
+            "detail": "AZURE_GPU_CLIENT_ID, AZURE_TENANT_ID, or AZURE_SUBSCRIPTION_ID is unavailable to this run.",
+            "resolution": "Configure the GPU controller identity and subscription secrets for the minimal branch."
+          }
+          JSON
+            cat evidence/blocker.json
+            echo "recipe/windows-amd is blocked: the Azure federation is absent" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_GPU_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision, execute and collect the Windows AMD worker
+        id: worker
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-run.sh"
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
+          SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
+          TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          AZURE_VM_SIZE: ${{ vars.AZURE_AMD_VM_SIZE }}
+          AZURE_VM_IMAGE: ${{ vars.AZURE_AMD_WINDOWS_IMAGE }}
+
+      - name: Deallocate and clean up the worker
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AZURE_CLIENT_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/azure-cleanup.sh"
+          else
+            echo "no Azure resources to clean up"
+          fi
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+
+      - name: Record why AMD execution is unavailable on Windows
+        if: always()
+        env:
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          # The first failure the guest or controller reported is the reason.
+          reason=""
+          for log in evidence/execute.log evidence/preflight.log; do
+            [ -n "$reason" ] || reason="$(grep -h -m1 'GUEST FAILURE:' "$log" 2>/dev/null | sed 's/^.*GUEST FAILURE: //' || true)"
+          done
+          if [ -z "$reason" ] && [ -f evidence/blocker.json ]; then
+            reason="$(jq -r '"\(.blocker): \(.detail)"' evidence/blocker.json)"
+          fi
+          if [ "$WORKER_OUTCOME" = success ]; then
+            reason="AMD execution completed on Windows"
+          fi
+          [ -n "$reason" ] || reason="the controller stopped before the guest reported; the worker step log has the cause"
+          jq -n \
+            --arg cell "$CELL" \
+            --arg commit "${{ needs.prepare.outputs.candidate_sha }}" \
+            --arg outcome "$WORKER_OUTCOME" \
+            --arg reason "$reason" \
+            '{cell:$cell, commit:$commit, supported:false, outcome:$outcome, reason:$reason}' > evidence/outcome.json
+          cat evidence/outcome.json
+          summary="$(printf '%s' "$reason" | head -n 1 | cut -c1-300)"
+          echo "::warning title=win/amd ($WORKER_OUTCOME)::$summary"
+          printf '### win/amd: %s\n\n%s\n' "$WORKER_OUTCOME" "$reason" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write the cell evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [ ! -f evidence/cell.json ]; then
+            cat > evidence/cell.json <<JSON
+          {
+            "cell": "$CELL",
+            "commit": "${{ needs.prepare.outputs.candidate_sha }}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "backend": "unavailable",
+            "device": "unavailable",
+            "gpu_execution": false,
+            "snapshot_sha256": "${{ needs.prepare.outputs.snapshot_sha256 }}"
+          }
+          JSON
+          fi
+          cat evidence/cell.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recipe-windows-amd
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error

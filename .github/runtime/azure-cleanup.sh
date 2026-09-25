@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Removes the per-run Windows GPU worker and every billable resource it
-# created, then sweeps anything an earlier controller left behind.
+# Removes the per-run GPU worker of one AZURE_GPU_PROFILE and every billable
+# resource it created, then sweeps anything an earlier controller of that
+# profile left behind.
 #
 # The caller runs this in an always() step, so cancellation and timeout also
 # release resources. Budget alerts are not a spending cap; this script and the
@@ -11,13 +12,20 @@ GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
 RUN="${RUN_ID:-${GITHUB_RUN_ID:-}}"
 ATTEMPT="${RUN_ATTEMPT:-${GITHUB_RUN_ATTEMPT:-}}"
 MAX_AGE_HOURS="${AZURE_MAX_AGE_HOURS:-3}"
+# The same profile names as azure-run.sh; each owns its worker and transfer prefixes.
+case "${AZURE_GPU_PROFILE:-windows-nvidia}" in
+	windows-nvidia) WORKER_PREFIX=recipe-wgpu; TRANSFER_PREFIX=runtime/windows ;;
+	windows-amd) WORKER_PREFIX=recipe-wamd; TRANSFER_PREFIX=runtime/windows-amd ;;
+	linux-amd) WORKER_PREFIX=recipe-lamd; TRANSFER_PREFIX=runtime/linux-amd ;;
+	*) echo "AZURE_GPU_PROFILE must be windows-nvidia, windows-amd or linux-amd" >&2; exit 2 ;;
+esac
 
 if [[ ! "$RUN" =~ ^[0-9]+$ ]] || [[ ! "$ATTEMPT" =~ ^[0-9]+$ ]]; then
 	echo "RUN_ID/RUN_ATTEMPT or GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT must identify the worker" >&2
 	exit 2
 fi
 
-WORKER="recipe-wgpu-${RUN}-${ATTEMPT}"
+WORKER="${WORKER_PREFIX}-${RUN}-${ATTEMPT}"
 cleanup_status=0
 
 if ! az account show -o none; then
@@ -145,8 +153,8 @@ fi
 
 echo "== expiry watchdog =="
 cutoff="$(date -u -d "${MAX_AGE_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
-echo "removing recipe-wgpu-* workers created before $cutoff"
-stale="$(az vm list --resource-group "$GROUP" --query "[?starts_with(name,'recipe-wgpu-')].name" -o tsv --only-show-errors)" || {
+echo "removing ${WORKER_PREFIX}-* workers created before $cutoff"
+stale="$(az vm list --resource-group "$GROUP" --query "[?starts_with(name,'${WORKER_PREFIX}-')].name" -o tsv --only-show-errors)" || {
 	echo "could not list workers for the expiry watchdog" >&2
 	stale=""
 	cleanup_status=1
@@ -167,13 +175,13 @@ done
 
 echo "== orphan resource watchdog =="
 for kind in nic disk public-ip nsg; do
-	resources="$(list_resources "$kind" "recipe-wgpu-")" || {
+	resources="$(list_resources "$kind" "${WORKER_PREFIX}-")" || {
 		echo "could not list runtime $kind resources" >&2
 		cleanup_status=1
 		continue
 	}
 	while IFS= read -r resource; do
-		if [[ ! "$resource" =~ ^(recipe-wgpu-[0-9]+-[0-9]+) ]]; then
+		if [[ ! "$resource" =~ ^(${WORKER_PREFIX}-[0-9]+-[0-9]+) ]]; then
 			continue
 		fi
 		worker="${BASH_REMATCH[1]}"
@@ -194,8 +202,8 @@ done
 echo "== deleting private transfer blobs =="
 if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ]; then
 	for blob in \
-		"runtime/windows/${RUN}-${ATTEMPT}/snapshot.tar.gz" \
-		"runtime/windows/${RUN}-${ATTEMPT}/runtime-suite.tar.gz"; do
+		"${TRANSFER_PREFIX}/${RUN}-${ATTEMPT}/snapshot.tar.gz" \
+		"${TRANSFER_PREFIX}/${RUN}-${ATTEMPT}/runtime-suite.tar.gz"; do
 		if ! blob_exists="$(az storage blob exists \
 			--auth-mode login \
 			--account-name "$AZURE_STORAGE_ACCOUNT" \
@@ -228,14 +236,14 @@ if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_CONTAINER:-}" ] 
 		--auth-mode login \
 		--account-name "$AZURE_STORAGE_ACCOUNT" \
 		--container-name "$AZURE_STORAGE_CONTAINER" \
-		--prefix "runtime/windows/" \
+		--prefix "${TRANSFER_PREFIX}/" \
 		--query "[].name" -o tsv --only-show-errors)" || {
 		echo "could not list prior runtime transfer blobs" >&2
 		blobs=""
 		cleanup_status=1
 	}
 	while IFS= read -r blob; do
-		if [[ ! "$blob" =~ ^runtime/windows/([0-9]+)-([0-9]+)/(snapshot\.tar\.gz|runtime-suite\.tar\.gz)$ ]]; then
+		if [[ ! "$blob" =~ ^${TRANSFER_PREFIX}/([0-9]+)-([0-9]+)/(snapshot\.tar\.gz|runtime-suite\.tar\.gz)$ ]]; then
 			continue
 		fi
 		prior_run="${BASH_REMATCH[1]}"

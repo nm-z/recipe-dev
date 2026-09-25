@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Provisions an isolated native Windows NVIDIA worker, transfers the exact
-# candidate snapshot, executes the Recipe GPU suite through managed Run
-# Command, and reads the guest process's actual result.
+# Provisions an isolated native GPU worker for one AZURE_GPU_PROFILE (Windows
+# NVIDIA T4, Windows AMD V710 or Linux AMD V710), transfers the exact candidate
+# snapshot, executes the Recipe GPU suite through managed Run Command, and reads
+# the guest process's actual result.
 #
 # A successful deployment is not a successful run. The only thing that decides
 # this cell is the guest command's exit code and the evidence it returns.
@@ -26,15 +27,64 @@ if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
 fi
 
 GROUP="${AZURE_RESOURCE_GROUP:-recipe-ci}"
-# Standard_NC4as_T4_v3 is the smallest T4 shape.
-SIZE="${AZURE_VM_SIZE:-Standard_NC4as_T4_v3}"
-IMAGE="${AZURE_VM_IMAGE:-microsoft-dsvm:dsvm-win-2022:winserver-2022:25.05.10}"
-FAMILY="Standard NCASv3_T4 Family"
+# The profile names one OS/GPU cell. Its worker and transfer prefixes keep each
+# cell's VMs, blobs and admission slots apart; azure-cleanup.sh reads the same profile.
+PROFILE="${AZURE_GPU_PROFILE:-windows-nvidia}"
+case "$PROFILE" in
+	windows-nvidia)
+		# Standard_NC4as_T4_v3 is the smallest T4 shape.
+		DEFAULT_SIZE=Standard_NC4as_T4_v3
+		DEFAULT_IMAGE=microsoft-dsvm:dsvm-win-2022:winserver-2022:25.05.10
+		FAMILY="Standard NCASv3_T4 Family"
+		GUEST_OS=windows
+		VENDOR=nvidia
+		CELL_NAME=recipe/windows-gpu
+		OS_LABEL="Windows Server 2022 Data Science Virtual Machine"
+		GPU_PATTERN='Tesla T4|NVIDIA T4|T4'
+		DRIVER_EXTENSION=""
+		DEVICE_TAG=t4
+		WORKER_PREFIX=recipe-wgpu
+		TRANSFER_PREFIX=runtime/windows
+		;;
+	windows-amd)
+		# Standard_NV4ads_V710_v5 is the smallest Radeon PRO V710 (gfx1101) shape: 1/6 GPU.
+		# The DSVM image carries the Visual C++ tools the Windows guest builds with.
+		DEFAULT_SIZE=Standard_NV4ads_V710_v5
+		DEFAULT_IMAGE=microsoft-dsvm:dsvm-win-2022:winserver-2022:25.05.10
+		FAMILY=""
+		GUEST_OS=windows
+		VENDOR=amd
+		CELL_NAME=recipe/windows-amd
+		OS_LABEL="Windows Server 2022 Data Science Virtual Machine"
+		GPU_PATTERN='Radeon[^,]*V710|V710'
+		DRIVER_EXTENSION="AmdGpuDriverWindows 1.1"
+		DEVICE_TAG=v710
+		WORKER_PREFIX=recipe-wamd
+		TRANSFER_PREFIX=runtime/windows-amd
+		;;
+	linux-amd)
+		DEFAULT_SIZE=Standard_NV4ads_V710_v5
+		DEFAULT_IMAGE=Canonical:ubuntu-24_04-lts:server:latest
+		FAMILY=""
+		GUEST_OS=linux
+		VENDOR=amd
+		CELL_NAME=recipe/linux-amd
+		OS_LABEL="Ubuntu 24.04 LTS"
+		GPU_PATTERN='gfx1101'
+		DRIVER_EXTENSION="AmdGpuDriverLinux 1.0"
+		DEVICE_TAG=v710
+		WORKER_PREFIX=recipe-lamd
+		TRANSFER_PREFIX=runtime/linux-amd
+		;;
+	*) echo "AZURE_GPU_PROFILE must be windows-nvidia, windows-amd or linux-amd" >&2; exit 2 ;;
+esac
+SIZE="${AZURE_VM_SIZE:-$DEFAULT_SIZE}"
+IMAGE="${AZURE_VM_IMAGE:-$DEFAULT_IMAGE}"
 REQUIRED_CORES=4
 # One worker per run: two candidates must never share a mutable working directory.
-WORKER="recipe-wgpu-${RUN_ID}-${RUN_ATTEMPT}"
+WORKER="${WORKER_PREFIX}-${RUN_ID}-${RUN_ATTEMPT}"
 COMPUTER_NAME="rgpu$(printf '%s' "$WORKER" | sha256sum | cut -c1-11)"
-TRANSFER_ROOT="runtime/windows/${RUN_ID}-${RUN_ATTEMPT}"
+TRANSFER_ROOT="${TRANSFER_PREFIX}/${RUN_ID}-${RUN_ATTEMPT}"
 SNAPSHOT_BLOB="$TRANSFER_ROOT/snapshot.tar.gz"
 RUNTIME_BLOB="$TRANSFER_ROOT/runtime-suite.tar.gz"
 # The guest runs one workload: the suite (default), or the composition harness over
@@ -62,7 +112,7 @@ PREFLIGHT_DEADLINE_SECONDS="${AZURE_PREFLIGHT_DEADLINE_SECONDS:-600}"
 DEADLINE_SECONDS="${AZURE_DEADLINE_SECONDS:-1200}"
 ADMISSION_WAIT_SECONDS="${AZURE_ADMISSION_WAIT_SECONDS:-1800}"
 ADMISSION_LEASE_SECONDS=60
-ADMISSION_BLOB="runtime/windows/admission.$((RUN_ID % 4)).lock"
+ADMISSION_BLOB="$TRANSFER_PREFIX/admission.$((RUN_ID % 4)).lock"
 admission_lease_id=""
 admission_renew_pid=""
 admission_started="$(date +%s)"
@@ -165,7 +215,7 @@ acquire_admission() {
 {
   "blocker": "azure-gpu-admission-storage-unavailable",
   "detail": "The Azure storage blob used for GPU admission could not be inspected or created.",
-  "resolution": "Restore the storage account/container permissions before retrying the Windows GPU check."
+  "resolution": "Restore the storage account/container permissions before retrying the $CELL_NAME check."
 }
 JSON
 		cat evidence/blocker.json
@@ -197,7 +247,7 @@ JSON
 {
   "blocker": "azure-gpu-admission-error",
   "detail": $detail,
-  "resolution": "Resolve the Azure storage authorization or network error before retrying the Windows GPU check."
+  "resolution": "Resolve the Azure storage authorization or network error before retrying the $CELL_NAME check."
 }
 JSON
 			cat evidence/blocker.json
@@ -211,7 +261,7 @@ JSON
 			cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-admission-timeout",
-  "detail": "This Windows GPU admission slot stayed occupied for ${ADMISSION_WAIT_SECONDS} seconds.",
+  "detail": "This $CELL_NAME admission slot stayed occupied for ${ADMISSION_WAIT_SECONDS} seconds.",
   "resolution": "Retry after its active worker releases the slot."
 }
 JSON
@@ -223,7 +273,7 @@ JSON
 	done
 }
 
-echo "== acquiring the Windows GPU admission lease =="
+echo "== acquiring the $CELL_NAME admission lease =="
 acquire_admission
 
 echo "== selecting available GPU capacity =="
@@ -237,7 +287,7 @@ printf '%s\n' "$inventory" | tee evidence/azure-gpu-inventory.json
 # prior per-run worker only after GitHub confirms that its owning run completed.
 if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
 	while IFS=$'\t' read -r prior_worker prior_group; do
-		if [[ ! "$prior_worker" =~ ^recipe-wgpu-([0-9]+)-([0-9]+)$ ]]; then
+		if [[ ! "$prior_worker" =~ ^${WORKER_PREFIX}-([0-9]+)-([0-9]+)$ ]]; then
 			continue
 		fi
 		prior_run="${BASH_REMATCH[1]}"
@@ -248,6 +298,7 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITO
 		fi
 		if [ "$prior_status" = "completed" ]; then
 			echo "== reclaiming terminal-run worker $prior_worker =="
+			AZURE_GPU_PROFILE="$PROFILE" \
 			AZURE_RESOURCE_GROUP="$prior_group" \
 			RUN_ID="$prior_run" \
 			RUN_ATTEMPT="$prior_attempt" \
@@ -260,19 +311,19 @@ fi
 inventory="$(az vm list --show-details \
 	--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
 	--only-show-errors -o json)"
-active_workers="$(jq -r --arg current "$WORKER" '
+active_workers="$(jq -r --arg current "$WORKER" --arg prefix "$WORKER_PREFIX-" '
 	.[]
 	| select(.name != $current)
-	| select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith("recipe-wgpu-")))
+	| select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith($prefix)))
 	| select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")
 	| .name
 ' <<< "$inventory")"
-active_count="$(jq -r --arg current "$WORKER" '[.[] | select(.name != $current) | select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith("recipe-wgpu-"))) | select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")] | length' <<< "$inventory")"
+active_count="$(jq -r --arg current "$WORKER" --arg prefix "$WORKER_PREFIX-" '[.[] | select(.name != $current) | select((.recipe_owner == "recipe-runtime-ci") or ((.name // "") | startswith($prefix))) | select((.power_state // "") != "VM deallocated" and (.power_state // "") != "VM stopped")] | length' <<< "$inventory")"
 if [ "$active_count" -ge 4 ]; then
 	cat > evidence/blocker.json <<JSON
 {
   "blocker": "azure-gpu-worker-active",
-  "detail": "Four Recipe Windows GPU workers are active: ${active_workers//$'\n'/, }.",
+  "detail": "Four Recipe $SIZE workers are active: ${active_workers//$'\n'/, }.",
   "resolution": "Wait for one worker's verified cleanup, then retry."
 }
 JSON
@@ -296,8 +347,21 @@ mapfile -t supported_locations < <(
 	' <<< "$sku" | sort -u
 )
 if [ "${#supported_locations[@]}" -eq 0 ]; then
+	cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-size-unavailable",
+  "detail": "$SIZE is not offered to this subscription in any unrestricted region.",
+  "resolution": "Request access to the size, or set AZURE_VM_SIZE to a size this subscription can allocate."
+}
+JSON
+	cat evidence/blocker.json
 	echo "$SIZE is unavailable to this subscription" >&2
 	exit 1
+fi
+# A profile without a fixed quota family uses the family the SKU catalog names.
+if [ -z "$FAMILY" ]; then
+	FAMILY="$(jq -r --arg size "$SIZE" '[.[] | select(.name == $size)][0].family // empty' <<< "$sku")"
+	[ -n "$FAMILY" ] || { echo "the SKU catalog names no quota family for $SIZE" >&2; exit 1; }
 fi
 
 declare -a candidate_locations=()
@@ -325,8 +389,8 @@ read_quota() {
 	if ! usage="$(az vm list-usage --location "$location" -o json --only-show-errors)"; then
 		return 1
 	fi
-	current="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].currentValue // 0' <<< "$usage")"
-	limit="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family)][0].limit // 0' <<< "$usage")"
+	current="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family or .name.localizedValue == $family)][0].currentValue // 0' <<< "$usage")"
+	limit="$(jq -r --arg family "$FAMILY" '[.[] | select(.name.value == $family or .name.localizedValue == $family)][0].limit // 0' <<< "$usage")"
 	regional_current="$(jq -r '[.[] | select(.name.value == "cores")][0].currentValue // 0' <<< "$usage")"
 	regional_limit="$(jq -r '[.[] | select(.name.value == "cores")][0].limit // 0' <<< "$usage")"
 	free=$((limit - current))
@@ -372,12 +436,12 @@ if [ -z "$LOCATION" ]; then
 }
 JSON
 	cat evidence/blocker.json
-	echo "recipe/windows-gpu is blocked: no unused GPU quota" >&2
+	echo "$CELL_NAME is blocked: no unused GPU quota" >&2
 	exit 1
 fi
 echo "selected $LOCATION for $SIZE"
 
-echo "== resolving the Windows image =="
+echo "== resolving the $GUEST_OS image =="
 az vm image show \
 	--location "$LOCATION" \
 	--urn "$IMAGE" \
@@ -447,7 +511,12 @@ trap cleanup_on_exit EXIT
 echo "== provisioning the isolated worker =="
 az group create --name "$GROUP" --location "$LOCATION" --only-show-errors -o none
 admin_password="Aa1!$(openssl rand -hex 18)"
-az vm create \
+declare -a os_options=()
+if [ "$GUEST_OS" = linux ]; then
+	# ROCm, LLVM and the release build do not fit the image's default 30 GiB disk.
+	os_options=(--authentication-type password --os-disk-size-gb 128)
+fi
+if ! az vm create \
 	--resource-group "$GROUP" \
 	--name "$WORKER" \
 	--computer-name "$COMPUTER_NAME" \
@@ -457,6 +526,7 @@ az vm create \
 	--security-type Standard \
 	--admin-username recipeci \
 	--admin-password "$admin_password" \
+	"${os_options[@]}" \
 	--public-ip-address "$WORKER-ip" \
 	--public-ip-address-allocation static \
 	--public-ip-sku Standard \
@@ -468,9 +538,47 @@ az vm create \
 		"recipe-worker=$WORKER" \
 		"recipe-run-id=$RUN_ID" \
 		"recipe-run-attempt=$RUN_ATTEMPT" \
-	--only-show-errors -o json > evidence/azure-vm.json
+	--only-show-errors -o json > evidence/azure-vm.json 2> evidence/azure-vm-create.log; then
+	unset admin_password
+	detail="$(jq -Rs . < evidence/azure-vm-create.log)"
+	cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-provisioning-failed",
+  "detail": $detail,
+  "resolution": "Azure refused $SIZE with $IMAGE in $LOCATION; the detail names the capacity, image generation or policy cause."
+}
+JSON
+	cat evidence/blocker.json
+	exit 1
+fi
 unset admin_password
 echo "provisioned $WORKER ($SIZE) in $GROUP/$LOCATION with explicit outbound access and no inbound rule"
+
+if [ -n "$DRIVER_EXTENSION" ]; then
+	read -r extension_name extension_version <<< "$DRIVER_EXTENSION"
+	echo "== installing the $extension_name driver extension =="
+	if ! az vm extension set \
+		--resource-group "$GROUP" \
+		--vm-name "$WORKER" \
+		--name "$extension_name" \
+		--publisher Microsoft.HpcCompute \
+		--version "$extension_version" \
+		--only-show-errors -o json > evidence/azure-driver-extension.json 2> evidence/azure-driver-extension.log; then
+		detail="$(jq -Rs . < evidence/azure-driver-extension.log)"
+		cat > evidence/blocker.json <<JSON
+{
+  "blocker": "azure-gpu-driver-extension-failed",
+  "detail": $detail,
+  "resolution": "$extension_name $extension_version did not install on $SIZE with $IMAGE."
+}
+JSON
+		cat evidence/blocker.json
+		exit 1
+	fi
+	# The extension may reboot the guest; Run Command needs it running again.
+	az vm wait --resource-group "$GROUP" --name "$WORKER" --custom "instanceView.statuses[?code=='PowerState/running']" --interval 10 --timeout 900 --only-show-errors
+	echo "$extension_name $extension_version installed"
+fi
 
 echo "== transferring the immutable snapshot =="
 # Upload each archive once to the existing private container. The guest gets
@@ -557,9 +665,17 @@ if [ "$RECIPE_WORKLOAD" = trial ]; then
 	trial_uri_encoded="$(printf '%s' "$TRIAL_URI" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
 fi
 
-echo "== executing the native Windows GPU suite in the guest =="
+echo "== executing the native $CELL_NAME suite in the guest =="
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cp "$script_dir/azure-guest.ps1" guest.ps1
+if [ "$GUEST_OS" = linux ]; then
+	cp "$script_dir/azure-guest.sh" guest.script
+	COMMAND_ID=RunShellScript
+	GUEST_OPTIONS=()
+else
+	cp "$script_dir/azure-guest.ps1" guest.script
+	COMMAND_ID=RunPowerShellScript
+	GUEST_OPTIONS=("vendor=$VENDOR")
+fi
 
 invoke_guest() {
 	local phase="$1"
@@ -573,9 +689,9 @@ invoke_guest() {
 	timeout --signal=TERM --kill-after=30s "${deadline}s" \
 		az vm run-command invoke \
 			--resource-group "$GROUP" --name "$WORKER" \
-			--command-id RunPowerShellScript \
-			--scripts "@guest.ps1" \
-			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" "progressUriEncoded=$progress_uri_encoded" "workload=$RECIPE_WORKLOAD" "trialCursor=${RECIPE_TRIAL_CURSOR:-0}" "trialCount=${RECIPE_TRIAL_COUNT:-0}" "trialUriEncoded=$trial_uri_encoded" \
+			--command-id "$COMMAND_ID" \
+			--scripts "@guest.script" \
+			--parameters "phase=$phase" "candidateSha=$CANDIDATE_SHA" "snapshotSha256=$SNAPSHOT_SHA256" "runtimeSuiteSha256=$runtime_sha256" "snapshotUriEncoded=$snapshot_uri_encoded" "runtimeSuiteUriEncoded=$runtime_uri_encoded" "progressUriEncoded=$progress_uri_encoded" "workload=$RECIPE_WORKLOAD" "trialCursor=${RECIPE_TRIAL_CURSOR:-0}" "trialCount=${RECIPE_TRIAL_COUNT:-0}" "trialUriEncoded=$trial_uri_encoded" "${GUEST_OPTIONS[@]}" \
 			--only-show-errors -o json > "$document"
 	status=$?
 	set -e
@@ -602,17 +718,17 @@ invoke_guest() {
 	fi
 }
 
-echo "== checking the DSVM before the build =="
+echo "== checking the worker before the build =="
 invoke_guest "preflight" "$PREFLIGHT_DEADLINE_SECONDS" "PREFLIGHT EXIT 0"
 
-echo "== building and executing Recipe on the DSVM =="
+echo "== building and executing Recipe on the worker =="
 invoke_guest "execute" "$DEADLINE_SECONDS" "GUEST EXIT 0"
 cp evidence/execute.log evidence/guest.log
 
 if [ "$RECIPE_WORKLOAD" = trial ]; then
 	# The trial's evidence is the harness stderr the guest uploaded, named the way the issue
 	# machine's inbox expects (device prefix before "-run", then the cursor span).
-	trial_file="evidence/azure-t4-run-${RECIPE_TRIAL_CURSOR}-$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1)).txt"
+	trial_file="evidence/azure-${DEVICE_TAG}-run-${RECIPE_TRIAL_CURSOR}-$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1)).txt"
 	az storage blob download \
 		--auth-mode login \
 		--account-name "$AZURE_STORAGE_ACCOUNT" \
@@ -625,7 +741,7 @@ if [ "$RECIPE_WORKLOAD" = trial ]; then
 	awk -v sha="$CANDIDATE_SHA" '{ sub(/^base=commit=[0-9a-f]*/, "base=commit=" sha); print }' "$trial_file" > "$trial_file.tmp" && mv "$trial_file.tmp" "$trial_file"
 	grep -E '^TRIAL EXIT' evidence/guest.log
 	echo "compositions: $(grep -c '^composition [0-9]*:' "$trial_file" || true), packets: $(grep -c '^RECIPE FAILURE BEGIN$' "$trial_file" || true), file: $trial_file"
-	echo "recipe/windows-gpu trial completed for cursors $RECIPE_TRIAL_CURSOR..$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1))"
+	echo "$CELL_NAME trial completed for cursors $RECIPE_TRIAL_CURSOR..$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1))"
 	exit 0
 fi
 
@@ -642,15 +758,17 @@ jq -e '.schema == "recipe-runtime-suite/1" and .executed == 8 and .failed == 0 a
 route="$(sed -n 's/^executed on //p' evidence/guest.log | head -n 1)"
 [ -n "$route" ] || { echo "the guest did not report its executed device" >&2; exit 1; }
 device="${route##*:}"
+device_prefix=nv
+[ "$VENDOR" = nvidia ] || device_prefix=amd
 case "$device" in
-	nv*) ;;
-	*) echo "expected an nv device, got '$device'; CPU fallback is a failure" >&2; exit 1 ;;
+	"$device_prefix"*) ;;
+	*) echo "expected an $device_prefix device, got '$device'; CPU fallback is a failure" >&2; exit 1 ;;
 esac
 
-gpu_model="$(grep -m1 -oE 'Tesla T4|NVIDIA T4|T4' evidence/preflight.log)"
+gpu_model="$(cat evidence/preflight.log evidence/guest.log | grep -m1 -oE "$GPU_PATTERN" || true)"
 cat > evidence/cell.json <<JSON
 {
-  "cell": "recipe/windows-gpu",
+  "cell": "$CELL_NAME",
   "commit": "$CANDIDATE_SHA",
   "run_id": "$RUN_ID",
   "run_attempt": "$RUN_ATTEMPT",
@@ -660,9 +778,9 @@ cat > evidence/cell.json <<JSON
   "vm_size": "$SIZE",
   "location": "$LOCATION",
   "image": "$IMAGE",
-  "os": "Windows Server 2022 Data Science Virtual Machine",
+  "os": "$OS_LABEL",
   "arch": "x86_64",
-  "backend": "nvidia",
+  "backend": "$VENDOR",
   "device": "$device",
   "gpu_model": "$gpu_model",
   "gpu_execution": true,
@@ -670,4 +788,4 @@ cat > evidence/cell.json <<JSON
 }
 JSON
 cat evidence/cell.json
-echo "recipe/windows-gpu completed on $route"
+echo "$CELL_NAME completed on $route"

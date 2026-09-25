@@ -9,16 +9,20 @@ param(
 	[string] $workload = "suite",
 	[string] $trialCursor = "0",
 	[string] $trialCount = "0",
-	[string] $trialUriEncoded = ""
+	[string] $trialUriEncoded = "",
+	[ValidateSet("nvidia", "amd")] [string] $vendor = "nvidia"
 )
 
-# Runs inside the Windows GPU worker, invoked through managed Run Command. It
+# Runs inside the Windows GPU worker, invoked through managed Run Command. The
+# vendor selects the NVIDIA T4 or AMD Radeon PRO V710 checks and device. It
 # holds no cloud-management credential. The archive URLs are short-lived and
 # read-only.
 #
 # Every native command's exit code is checked immediately, so a later
 # successful command can never mask an earlier failing executable.
 
+$script:Device = if ($vendor -eq "amd") { "amd0" } else { "nv0" }
+$script:Capability = if ($vendor -eq "amd") { "gfx1101" } else { "sm75" }
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $script:ProgressHistory = [Collections.Generic.List[string]]::new()
@@ -125,7 +129,21 @@ function Resolve-CudaRoot {
 	throw "the DSVM image has no complete CUDA root with nvcc and libdevice"
 }
 
+function Confirm-AmdGpu {
+	Write-Output "== guest: GPU and driver =="
+	# Recipe has no Windows AMD runtime; this cell records the adapter and lets the
+	# build and suite report why AMD execution is unavailable, so an absent adapter
+	# is recorded rather than thrown.
+	$script:Smi = $null
+	$adapters = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+	foreach ($adapter in $adapters) { Write-Output "adapter: $($adapter.Name) driver=$($adapter.DriverVersion) pnp=$($adapter.PNPDeviceID)" }
+	$radeon = @($adapters | Where-Object { $_.PNPDeviceID -match "VEN_1002" -or $_.Name -match "Radeon|AMD" }) | Select-Object -First 1
+	$script:Gpu = if ($radeon) { [string]$radeon.Name } else { "absent" }
+	Write-Output "amd adapter=$script:Gpu"
+}
+
 function Confirm-Gpu {
+	if ($vendor -eq "amd") { Confirm-AmdGpu; return }
 	Write-Output "== guest: GPU and driver =="
 	$smiCandidates = @(
 		"C:\Windows\System32\nvidia-smi.exe",
@@ -163,9 +181,12 @@ function Initialize-Toolchain {
 
 	$script:VsRoot = Resolve-VsRoot
 	Enter-VsDeveloperEnvironment -VsRoot $script:VsRoot
-	$script:CudaRoot = Resolve-CudaRoot
-	$env:CUDA_PATH = $script:CudaRoot
-	$env:Path = "$(Join-Path $script:CudaRoot 'bin');$env:Path"
+	$script:CudaRoot = "none"
+	if ($vendor -eq "nvidia") {
+		$script:CudaRoot = Resolve-CudaRoot
+		$env:CUDA_PATH = $script:CudaRoot
+		$env:Path = "$(Join-Path $script:CudaRoot 'bin');$env:Path"
+	}
 
 	$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 	if ([IO.Directory]::Exists($cargoBin)) { $env:Path = "$cargoBin;$env:Path" }
@@ -225,10 +246,12 @@ function Initialize-Toolchain {
 		Invoke-Native $script:Clang @("--version") "clang"
 		Invoke-Native $script:Linker @("--version") "lld-link"
 	}
-	$nvcc = Join-Path $script:CudaRoot "bin\nvcc.exe"
-	Invoke-Native $nvcc @("--version") "nvcc"
+	if ($vendor -eq "nvidia") {
+		$nvcc = Join-Path $script:CudaRoot "bin\nvcc.exe"
+		Invoke-Native $nvcc @("--version") "nvcc"
+	}
 	$state = if ($AllowInstall) { "toolchain ready" } else { "platform ready" }
-	Write-Output "$state cuda=$script:CudaRoot vs=$script:VsRoot"
+	Write-Output "$state vendor=$vendor cuda=$script:CudaRoot vs=$script:VsRoot"
 }
 
 try {
@@ -267,7 +290,7 @@ try {
 	Write-Output "trusted runtime verified sha256=$runtimeActual"
 	Report-Phase "snapshot-ready"
 
-	Write-Output "== guest: building with the NVIDIA backend =="
+	Write-Output "== guest: building with the $vendor backend =="
 	Report-Phase "build-start"
 	Push-Location $work
 	Invoke-Native "cargo" @("build", "--release", "--lib", "--bin", "recipe") "the native GPU build"
@@ -275,12 +298,12 @@ try {
 
 	if ($workload -eq "trial") {
 		Report-Phase "trial-start"
-		Write-Output "== guest: running the composition harness on nv0, cursor $trialCursor count $trialCount =="
+		Write-Output "== guest: running the composition harness on $script:Device, cursor $trialCursor count $trialCount =="
 		$trial = Join-Path $work "trial"
 		New-Item -ItemType Directory -Force -Path $trial | Out-Null
 		Copy-Item -LiteralPath (Join-Path $runtime "harness.rs") -Destination (Join-Path $work "harness.rs")
-		$env:RECIPE_DEVICE = "nv0"
-		$env:RECIPE_COMPOSITION_CAPABILITY = "sm75"
+		$env:RECIPE_DEVICE = $script:Device
+		$env:RECIPE_COMPOSITION_CAPABILITY = $script:Capability
 		$env:RECIPE_COMPOSITION_RUNNER = Join-Path $work "target\release\recipe.exe"
 		$env:RECIPE_COMPOSITION_CURSOR = $trialCursor
 		$env:RECIPE_COMPOSITION_COUNT = $trialCount
@@ -310,7 +333,7 @@ try {
 		return
 	}
 
-	Write-Output "== guest: executing the suite on nv0 =="
+	Write-Output "== guest: executing the suite on $script:Device =="
 	Report-Phase "suite-start"
 	New-Item -ItemType Directory -Force -Path (Join-Path $work "evidence"), (Join-Path $work "gpu-work") | Out-Null
 	$env:RECIPE_SUITE_ROOT = $runtime
@@ -318,13 +341,13 @@ try {
 	$env:RECIPE_EVIDENCE = Join-Path $work "evidence\suite.json"
 	$env:RECIPE_SUITE_PROGRESS = "1"
 	$env:RECIPE_TRACE_PATH = Join-Path $root "suite-trace-$candidateSha.log"
-	# --device nv0 hard-errors when the device is absent; a build carrying the
-	# nvidia cfg does not add a CPU device, so there is no silent fallback.
+	# --device nv0/amd0 hard-errors when the device is absent or its backend is
+	# not compiled in; a GPU device never adds a CPU device, so there is no silent fallback.
 	$runStdout = Join-Path $work "run.stdout.log"
 	$runStderr = Join-Path $work "run.stderr.log"
 	$runProcess = Start-Process `
 		-FilePath (Join-Path $work "target\release\recipe.exe") `
-		-ArgumentList @("--device", "nv0", (Join-Path $runtime "suite.rs")) `
+		-ArgumentList @("--device", $script:Device, (Join-Path $runtime "suite.rs")) `
 		-PassThru `
 		-RedirectStandardOutput $runStdout `
 		-RedirectStandardError $runStderr
@@ -341,7 +364,7 @@ try {
 		if ($last.Length -gt 180) { $last = $last.Substring(0, 180) }
 		if ($checks -ne $lastChecks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge 60) {
 			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($runProcess.Id)" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ","
-			$gpu = (& $script:Smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>$null) -join ","
+			$gpu = if ($script:Smi) { (& $script:Smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>$null) -join "," } else { "n/a" }
 			Report-Phase "suite-checks-$checks child=$children gpu=$gpu stderr=$last"
 			$lastChecks = $checks
 			$lastSample = [DateTime]::UtcNow
@@ -364,7 +387,8 @@ try {
 	$route = ([regex]::Match($log, '(?m)^suite device (\S+)')).Groups[1].Value
 	if (-not $route) { throw "no suite device: training did not report its device" }
 	$device = $route.Split(':')[-1]
-	if ($device -notlike "nv*") { throw "expected an nv device, got '$device'; CPU fallback is a failure" }
+	$prefix = $script:Device.TrimEnd("0")
+	if ($device -notlike "$prefix*") { throw "expected an $prefix device, got '$device'; CPU fallback is a failure" }
 	$evidence = Get-Content -Raw -LiteralPath (Join-Path $work "evidence\suite.json") | ConvertFrom-Json
 	if ($evidence.executed -ne 8 -or $evidence.failed -ne 0) { throw "the suite evidence does not contain eight passing checks" }
 	$exitLabel = if ($null -eq $exitCode) { "unavailable" } else { [string]$exitCode }
