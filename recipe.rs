@@ -14379,8 +14379,8 @@ impl Recipe {
 
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	let file = Gguf::open(&resolve_path(path)?)?;
-	for (key, _) in file.metadata() { println!("key {key}"); }
-	for tensor in file.tensors() { println!("tensor {} kind={} shape={:?}", tensor.name, tensor.kind, tensor.shape); }
+	for (key, _) in file.metadata() { println!("{key}"); }
+	for tensor in file.tensors() { println!("{}", tensor.name); }
 	Ok(())
 }
 /// Print row-wise distribution statistics without expanding a whole tensor in
