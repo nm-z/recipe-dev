@@ -95,22 +95,37 @@ confirm_gpu() {
 	[ -n "$gpu" ] || fail "no AMD PCI function is attached to this worker"
 	gpu="$(dirname "$gpu")"
 	echo "pci: ${gpu##*/} device=$(cat "$gpu/device") class=$(cat "$gpu/class")"
-	# The driver extension installs amdgpu but may leave it unloaded until a reboot.
-	[ -e /dev/kfd ] || modprobe amdgpu > "$LOGS/modprobe.log" 2>&1 || true
+	echo "kfd=$([ -e /dev/kfd ] && echo present || echo absent) module=$(find "/lib/modules/$(uname -r)" -name 'amdgpu.ko*' 2> /dev/null | head -n 1)"
+}
+
+# The Azure image ships no amdgpu module and blocklists it, and the AMD driver
+# extension finishes asynchronously, so the guest installs AMD's amdgpu-dkms for
+# the running kernel itself (Microsoft's manual V710 procedure) and loads it.
+install_driver() {
+	local attempt codename
+	if [ ! -e /dev/kfd ]; then
+		codename="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"
+		quiet "kernel headers" apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" dkms gnupg
+		install -d -m 0755 /etc/apt/keyrings
+		curl --silent --show-error --fail --retry 3 https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/rocm.gpg || fail "the AMD driver repository key download failed"
+		printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/%s/ubuntu %s main\n' "${AMDGPU_RELEASE:-31.50}" "$codename" > /etc/apt/sources.list.d/amdgpu.list
+		quiet "AMD driver repository refresh" apt-get update
+		quiet "amdgpu-dkms build for $(uname -r)" apt-get install -y amdgpu-dkms
+		# Explicit modprobe ignores a blocklist; removing it keeps the driver across reboots.
+		sed -i '/^blacklist amdgpu/d' /etc/modprobe.d/*.conf
+		modprobe amdgpu > "$LOGS/modprobe.log" 2>&1 || { tail -n 5 "$LOGS/modprobe.log"; fail "amdgpu did not load on kernel $(uname -r)"; }
+	fi
 	for attempt in $(seq 1 24); do
 		[ -e /dev/kfd ] && break
 		if [ "$attempt" -eq 24 ]; then
-			echo "modprobe: $(tail -n 2 "$LOGS/modprobe.log" 2> /dev/null | tr '\n' ' ')"
-			echo "module files: $(find "/lib/modules/$(uname -r)" -name 'amdgpu.ko*' 2> /dev/null | head -n 2 | tr '\n' ' ')"
 			echo "dkms: $(dkms status 2> /dev/null | grep -i amdgpu | head -n 2 | tr '\n' ' ')"
-			echo "blocklist: $(grep -rhs '^blacklist amdgpu' /etc/modprobe.d | head -n 1)"
-			echo "extension log: $(find /var/log/azure -iname '*.log' -path '*mdGpu*' -print0 2> /dev/null | xargs -0 -r tail -q -n 3 2> /dev/null | tail -n 3 | tr '\n' ' ')"
-			fail "/dev/kfd is absent: amdgpu is not loaded on kernel $(uname -r)"
+			echo "dmesg: $(dmesg 2> /dev/null | grep -i amdgpu | tail -n 3 | tr '\n' ' ')"
+			fail "/dev/kfd is absent after loading amdgpu on kernel $(uname -r)"
 		fi
 		sleep 5
 	done
 	renders=(/dev/dri/renderD*)
-	echo "kfd=present render nodes=${#renders[@]}"
+	echo "kfd=present render nodes=${#renders[@]} driver=$(modinfo -F version amdgpu 2> /dev/null)"
 }
 
 initialize_toolchain() {
@@ -250,6 +265,9 @@ if [ "$phase" = preflight ]; then
 fi
 quiet "package index refresh" apt-get update
 quiet "archive and JSON tools" apt-get install -y --no-install-recommends ca-certificates curl jq tar gzip
+report_phase "driver-start"
+install_driver
+report_phase "driver-ready"
 initialize_toolchain true
 report_phase "toolchain-ready"
 

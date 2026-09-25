@@ -49,14 +49,15 @@ case "$PROFILE" in
 		;;
 	windows-amd)
 		# Standard_NV4ads_V710_v5 is the smallest Radeon PRO V710 (gfx1101) shape: 1/6 GPU.
-		# The DSVM image carries the Visual C++ tools the Windows guest builds with.
+		# V710 boots only Generation 2 images, which the DSVM image is not; the Visual Studio
+		# image carries the Visual C++ tools the Windows guest builds with.
 		DEFAULT_SIZE=Standard_NV4ads_V710_v5
-		DEFAULT_IMAGE=microsoft-dsvm:dsvm-win-2022:winserver-2022:25.05.10
+		DEFAULT_IMAGE=MicrosoftVisualStudio:visualstudio2022:vs-2022-comm-latest-ws2022:latest
 		FAMILY=""
 		GUEST_OS=windows
 		VENDOR=amd
 		CELL_NAME=recipe/windows-amd
-		OS_LABEL="Windows Server 2022 Data Science Virtual Machine"
+		OS_LABEL="Windows Server 2022 with Visual Studio 2022"
 		GPU_PATTERN='Radeon[^,]*V710|V710'
 		DRIVER_EXTENSION="AmdGpuDriverWindows 1.1"
 		DEVICE_TAG=v710
@@ -76,7 +77,8 @@ case "$PROFILE" in
 		CELL_NAME=recipe/linux-amd
 		OS_LABEL="Ubuntu 22.04 LTS"
 		GPU_PATTERN='gfx1101'
-		DRIVER_EXTENSION="AmdGpuDriverLinux 1.0"
+		# The guest installs amdgpu-dkms itself; the extension finishes asynchronously.
+		DRIVER_EXTENSION=""
 		DEVICE_TAG=v710
 		WORKER_PREFIX=recipe-lamd
 		TRANSFER_PREFIX=runtime/linux-amd
