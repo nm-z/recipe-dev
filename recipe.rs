@@ -8232,8 +8232,7 @@ mod gguf {
 		}
 	}
 
-	/// One tensor descriptor: `kind` is the GGML type id and `offset` counts bytes
-	/// from the start of its shard's data section.
+	/// Tensor shape, GGML type and shard-data offset.
 	#[derive(Clone, Debug, PartialEq, Eq)]
 	pub struct GgufTensor {
 		pub name: String,
@@ -8421,7 +8420,7 @@ mod gguf {
 		data: usize,
 	}
 
-	/// One model: a single file or every shard of a split, opened by name.
+	/// One file or a split GGUF model.
 	#[derive(Clone)]
 	pub struct Gguf {
 		shards: Vec<Shard>,
@@ -8449,7 +8448,7 @@ mod gguf {
 			}
 			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
 		}
-		/// Parses one file: its metadata, its tensors, and where its data begins.
+		/// Parses one shard's header.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
 			let mapping = Mapping::open(path)?;
 			let bytes = mapping.bytes();
@@ -8489,14 +8488,14 @@ mod gguf {
 			}
 			Ok((Shard { mapping: Arc::new(mapping), data }, metadata, tensors))
 		}
-		/// Every key-value pair of the first shard, in file order.
+		/// First-shard metadata in file order.
 		pub fn metadata(&self) -> &[(String, GgufValue)] {
 			&self.metadata
 		}
 		pub fn value(&self, key: &str) -> Option<&GgufValue> {
 			self.metadata.iter().find(|(name, _)| name == key).map(|(_, value)| value)
 		}
-		/// Every tensor across every shard, in shard then file order.
+		/// Tensor descriptors in file order.
 		pub fn tensors(&self) -> &[GgufTensor] {
 			&self.tensors
 		}
@@ -14378,15 +14377,25 @@ impl Recipe {
 }
 
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
+	use GgufValue::*;
 	let file = Gguf::open(&resolve_path(path)?)?;
-	for (key, _) in file.metadata() { println!("{key}"); }
-	for tensor in file.tensors() { println!("{}", tensor.name); }
+	for (key, value) in file.metadata() {
+		if let Array(values) = value {
+			let kind = match values.first() {
+				Some(String(_)) => "strings", Some(Bool(_)) => "booleans", Some(F32(_) | F64(_)) => "floats",
+				Some(Array(_)) => "arrays", Some(_) => "integers", None => "values",
+			};
+			println!("{key}.[{} {kind}]", values.len());
+		} else {
+			let rendered = format!("{value:?}");
+			let scalar = rendered.split_once('(').and_then(|(_, value)| value.strip_suffix(')')).unwrap_or(&rendered);
+			println!("{key}.{scalar}");
+		}
+	}
+	for tensor in file.tensors() { println!("{}.{:?}", tensor.name, tensor.shape); }
 	Ok(())
 }
-/// Print row-wise distribution statistics without expanding a whole tensor in
-/// memory. Participation is `(mean |w|)^2 / mean(w^2)`; outlier rows have RMS
-/// above the tensor's mean row RMS plus three standard deviations. Histogram
-/// bins cover `w / tensor_rms` from -4 through 4, with the ends including tails.
+/// Prints row-wise GGUF statistics.
 pub fn stats(path: impl AsRef<Path>) -> Result<()> {
 	const BINS: usize = 17;
 	let path = resolve_path(path)?;
