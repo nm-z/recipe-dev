@@ -3932,6 +3932,9 @@ mod quantized {
 		pub(super) block: String,
 		pub(super) align: u64,
 		pub(super) words: &'a mut std::collections::HashMap<(String, u64), String>,
+		/// The bytes before the block's first byte from `block`, the aligned
+		/// address the words are read from.
+		pub(super) skew: u64,
 	}
 	impl RunQuantOps<'_> {
 		fn word_bytes(&self) -> u64 {
@@ -3956,7 +3959,7 @@ mod quantized {
 			let per = self.word_bytes();
 			let mut value = "0".to_owned();
 			for byte in 0..u64::from(bits / 8) {
-				let at = offset + byte;
+				let at = self.skew + offset + byte;
 				let word = self.word(at / per);
 				let shifted = self.inner.instruction(format!("lshr i64 {word}, {}", (at % per) * 8));
 				let masked = self.inner.instruction(format!("and i64 {shifted}, 255"));
@@ -4027,6 +4030,7 @@ mod quantized {
 			match offset {
 				RunInt::Known(offset) => RunInt::Ir(self.bytes(offset, bits)),
 				RunInt::Ir(offset) => {
+					let offset = if self.skew == 0 { offset } else { self.inner.int(QuantIntOp::Add, offset, self.skew.to_string()) };
 					let address = self.inner.instruction(format!("getelementptr inbounds i8, {} {}, i64 {offset}", pointer_type(self.inner.backend), self.block));
 					let loaded = self.inner.instruction(format!("load i{bits}, {} {address}, align 1, !invariant.load !{{}}", pointer_type(self.inner.backend)));
 					RunInt::Ir(if bits == 64 { loaded } else { self.inner.instruction(format!("zext i{bits} {loaded} to i64")) })
@@ -7242,19 +7246,37 @@ impl NativeModelIr {
 		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		let run = dot_run(block);
 		operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
-		{
+		// Blocks aligned to less than a four-byte word are read as aligned words:
+		// the run's place within its word selects one of a body per place, each
+		// with that place folded into its byte offsets.
+		let skews = if align >= 4 { vec![0] } else { (0..4).step_by(align as usize).collect::<Vec<u64>>() };
+		let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+		let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
+			let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
+			operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"))
+		}).collect::<Vec<_>>();
+		if skews.len() > 1 {
+			let arms = skews.iter().skip(1).map(|skew| format!("i64 {skew}, label %run.skew{skew}")).collect::<Vec<_>>().join(" ");
+			operations.ir.push_str(&format!("%run.address = ptrtoint {pointer} %run.base to i64\n%run.place = and i64 %run.address, 3\nswitch i64 %run.place, label %run.skew0 [ {arms} ]\n"));
+		}
+		for skew in skews.iter().copied() {
+			let (base, word_align) = if skews.len() > 1 {
+				operations.ir.push_str(&format!("run.skew{skew}:\n%run.aligned{skew} = getelementptr inbounds i8, {pointer} %run.base, i64 -{skew}\n"));
+				(format!("%run.aligned{skew}"), 4)
+			} else {
+				("%run.base".to_owned(), align)
+			};
 			let mut words = std::collections::HashMap::new();
-			let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
-			let mut sums = vec![zero; positions];
-			let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
-				let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
-				operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"))
-			}).collect::<Vec<_>>();
+			let mut sums = vec![zero.clone(); positions];
 			for j in 0..run {
 				let (relative, local) = if block >= run { (0, j) } else { (j / block, j % block) };
-				let base = if relative == 0 { "%run.base".to_owned() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} %run.base, i64 {}", relative * stride)) };
+				// A later block of the run starts `relative * stride` bytes on: its own
+				// place within a word follows from the run's.
+				let start = skew + (relative * stride) as u64;
+				let (whole, place) = if skews.len() > 1 { (start / 4 * 4, start % 4) } else { (start, 0) };
+				let block_base = if whole == 0 { base.clone() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} {base}, i64 {whole}")) };
 				let value = {
-					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: base, align, words: &mut words };
+					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place };
 					native.decode(&mut run)
 				};
 				// The weight rounds to the model type as the per-value decoder does.
@@ -23453,7 +23475,9 @@ impl Buffer {
 	/// every other node's parameters are encoded and written in place.
 	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
-		let bytes = bytes.max(1);
+		// A run decoder reads the last block of a weight as whole aligned words,
+		// up to three bytes past its end.
+		let bytes = bytes + 4;
 		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
