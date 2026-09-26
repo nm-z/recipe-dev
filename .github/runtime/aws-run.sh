@@ -46,19 +46,6 @@ if ! aws sts get-caller-identity --query Arn --output text > evidence/aws-identi
 fi
 echo "signed in as $(cat evidence/aws-identity.txt) in $AWS_DEFAULT_REGION"
 
-echo "== checking the G instance quota =="
-vcpus="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text)"
-# L-DB2E81BA is "Running On-Demand G and VT instances", counted in vCPUs.
-if quota="$(aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA --query 'Quota.Value' --output text 2> evidence/aws-quota.log)"; then
-	echo "quota=$quota vCPUs, $INSTANCE_TYPE needs $vcpus"
-	if awk -v quota="$quota" -v need="$vcpus" 'BEGIN { exit !(quota < need) }'; then
-		blocker "aws-gpu-quota" "Running On-Demand G and VT instances is $quota vCPUs in $AWS_DEFAULT_REGION; $INSTANCE_TYPE needs $vcpus." \
-			"Request at least $vcpus vCPUs for that quota in $AWS_DEFAULT_REGION (Service Quotas, EC2)."
-	fi
-else
-	echo "the quota is unreadable with this credential; the launch will report it"
-fi
-
 echo "== resolving the Arch Linux image =="
 ami="$(aws ec2 describe-images --owners "$ARCH_AMI_OWNER" \
 	--filters "Name=name,Values=$ARCH_AMI_NAME" Name=architecture,Values=x86_64 Name=state,Values=available \
@@ -71,6 +58,23 @@ if [ -z "$ami" ] || [ "${ami%%[[:space:]]*}" = None ]; then
 fi
 read -r ami_id root_device _ <<< "$ami"
 echo "image $ami"
+
+echo "== checking the G instance quota =="
+vcpus="$(aws ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text)"
+# L-DB2E81BA is "Running On-Demand G and VT instances", counted in vCPUs. An
+# approved increase can take a while to apply, so a short quota is waited on
+# for AWS_QUOTA_WAIT_SECONDS before it counts as the blocker.
+quota_deadline=$(( $(date +%s) + ${AWS_QUOTA_WAIT_SECONDS:-1200} ))
+while quota="$(aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA --query 'Quota.Value' --output text 2> evidence/aws-quota.log)"; do
+	echo "quota=$quota vCPUs, $INSTANCE_TYPE needs $vcpus"
+	awk -v quota="$quota" -v need="$vcpus" 'BEGIN { exit !(quota < need) }' || break
+	if [ "$(date +%s)" -ge "$quota_deadline" ]; then
+		blocker "aws-gpu-quota" "Running On-Demand G and VT instances is $quota vCPUs in $AWS_DEFAULT_REGION; $INSTANCE_TYPE needs $vcpus." \
+			"Request at least $vcpus vCPUs for that quota in $AWS_DEFAULT_REGION (Service Quotas, EC2), and wait until the applied value shows it."
+	fi
+	sleep 60
+done
+[ -n "${quota:-}" ] || echo "the quota is unreadable with this credential; the launch will report it"
 
 echo "== creating the per-run key and security group =="
 rm -f "$KEY" "$KEY.pub"
