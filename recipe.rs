@@ -1671,6 +1671,9 @@ pub(crate) struct NativeLayout {
 	/// The persistent K/V history region for an inference attention node, or
 	/// `None` for training and non-attention nodes.
 	pub attention_kv: Vec<Option<usize>>,
+	/// Every position of an indexed attention's indexer plane, for a layout
+	/// that holds its values one window at a time.
+	pub indexer_history: Vec<Option<usize>>,
 	pub adjoints: Vec<usize>,
 	/// Byte offset of each contraction or scan node's runtime schedule words in
 	/// the context arena. Nodes without a schedule use `usize::MAX`.
@@ -2271,6 +2274,7 @@ impl NativeLayout {
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
 		let mut contexts_in_values = Vec::with_capacity(graph.nodes.len());
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
+		let mut indexer_history = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
@@ -2342,6 +2346,16 @@ impl NativeLayout {
 				None
 			};
 			attention_kv.push(kv);
+			// The index and selection read keys from each block's first position,
+			// which can precede the window the indexer's values hold.
+			let indexer_plane = match usize::try_from(node.second) {
+				Ok(second) if inference && window_positions < graph.input.length && node.op == Primitive::Attention && attention_blocks(node) > 0 => {
+					let bytes = checked_mul(checked_mul(rows, graph.nodes[second].output.elements(), "indexer history")?, node.precision.bytes(), "indexer history bytes")?;
+					Some(context_plan.allocate(&[(bytes, BufferLifetime::Retained)], unit, step, false)?)
+				}
+				_ => None,
+			};
+			indexer_history.push(indexer_plane);
 			if inference {
 				adjoints.push(0);
 			} else {
@@ -2377,7 +2391,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
 	}
 }
 
@@ -2386,6 +2400,7 @@ struct NodePlan {
 	value: usize,
 	context: usize,
 	attention_kv: Option<usize>,
+	indexer_history: Option<usize>,
 	adjoint: usize,
 	stored: Option<StoredWeight>,
 	/// The file bytes the load kernel requantizes into `stored`'s format.
@@ -2684,6 +2699,7 @@ impl NativeModelIr {
 				value: layout.values[index],
 				context: layout.contexts[index],
 				attention_kv: layout.attention_kv[index],
+				indexer_history: layout.indexer_history[index],
 				adjoint: layout.adjoints[index],
 				stored,
 				requantize,
@@ -4763,7 +4779,29 @@ impl NativeModelIr {
 "));
 					if blocks != 0 {
 						// Keep running key sums in context and score only touched window blocks.
-						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
+						let (pointer, context) = (pointer_type(backend), &pointers.context);
+						// A layout that holds one window of the indexer first writes the
+						// window into the history plane, so the index and the selection
+						// read every position where the whole-sequence layout keeps it.
+						let source = match plan.indexer_history {
+							Some(offset) => {
+								let indexer = self.graph.nodes.get(usize::try_from(node.second).map_err(|_| RecipeError::new("indexed attention has no indexer"))?).ok_or_else(|| RecipeError::new("indexed attention has no indexer"))?;
+								let held = window_shape(indexer.output, self.graph.input.length, self.layout.window_positions);
+								let (ty, plane, prefix) = (self.node_precision(node).model_type, format!("n{index}.index.history"), format!("n{index}.index.mirror"));
+								ir.push_str(&ptr_gep(backend, "contexts", offset, &plane));
+								let (elements, length, second) = (indexer.output.elements(), indexer.output.length, &pointers.second);
+								emit_runtime_window_loop(&mut ir, index, "index.mirror", held, &window, |ir, _p, wide| {
+									ir.push_str(&format!(
+										"%{prefix}.from = getelementptr {ty}, {pointer} {second}, i64 {wide}\n%{prefix}.value = load {ty}, {pointer} %{prefix}.from, align {align}\n%{prefix}.row = mul i64 %{prefix}.at.row, {elements}\n%{prefix}.channel = mul i64 %{prefix}.at.channel, {length}\n%{prefix}.origin = zext i32 %begin to i64\n%{prefix}.position = add i64 %{prefix}.at.position, %{prefix}.origin\n%{prefix}.plane = add i64 %{prefix}.row, %{prefix}.channel\n%{prefix}.slot = add i64 %{prefix}.plane, %{prefix}.position\n%{prefix}.to = getelementptr {ty}, {pointer} %{plane}, i64 %{prefix}.slot\nstore {ty} %{prefix}.value, {pointer} %{prefix}.to, align {align}\n",
+										align = alignment(ty)
+									));
+								})?;
+								ir.push_str(barrier(backend));
+								format!("%{plane}")
+							}
+							None => pointers.second.clone(),
+						};
+						let source = &source;
 						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
@@ -4771,7 +4809,14 @@ impl NativeModelIr {
 						// accumulates; an inference layout holds none.
 						let block = integer_argument(node.argument[3], "indexer block")?;
 						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
-						let end = format!("%n{index}.end");
+						// A compact layout's node window counts from the window's first position.
+						let end = if compact {
+							ir.push_str(&format!("%n{index}.index.end = add i32 %begin, {span}\n"));
+							format!("%n{index}.index.end")
+						} else {
+							format!("%n{index}.end")
+						};
+						let queries = NodeWindow { begin: begin.to_owned(), span: span.to_string() };
 						ir.push_str(&format!(
 							"{first} = udiv i32 {begin}, {block}\n%n{index}.index.stop = add i32 {end}, {last}\n%n{index}.index.last = udiv i32 %n{index}.index.stop, {block}\n%n{index}.index.touched = sub i32 %n{index}.index.last, {first}\n%n{index}.index.empty = icmp eq i32 {span}, 0\n{count} = select i1 %n{index}.index.empty, i32 0, i32 %n{index}.index.touched\n",
 							last = block - 1
@@ -4790,7 +4835,7 @@ impl NativeModelIr {
 						// block ranks itself against the others, a grid barrier apart.
 						let length = node.output.length;
 						for phase in ["score", "rank"] {
-							emit_runtime_window_loop(&mut ir, index, &format!("select.{phase}"), Shape { channels: blocks, length }, &window, |ir, _p, wide| {
+							emit_runtime_window_loop(&mut ir, index, &format!("select.{phase}"), Shape { channels: blocks, length }, &queries, |ir, _p, wide| {
 								ir.push_str(&format!(
 									"%n{index}.select.{phase}.block.wide = udiv i64 {wide}, {length}\n%n{index}.select.{phase}.block = trunc i64 %n{index}.select.{phase}.block.wide to i32\n%n{index}.select.{phase}.query = urem i64 {wide}, {length}\ncall void @attention_select_{phase}_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 %n{index}.select.{phase}.query, i32 {keep}, {shared}, i32 %n{index}.select.{phase}.block )\n"
 								));
