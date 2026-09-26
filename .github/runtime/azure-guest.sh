@@ -12,7 +12,7 @@ set -euo pipefail
 
 for argument in "$@"; do
 	case "$argument" in
-		phase=* | candidateSha=* | snapshotSha256=* | runtimeSuiteSha256=* | snapshotUriEncoded=* | runtimeSuiteUriEncoded=* | progressUriEncoded=* | workload=* | trialCursor=* | trialCount=* | trialUriEncoded=*)
+		phase=* | candidateSha=* | snapshotSha256=* | runtimeSuiteSha256=* | snapshotUriEncoded=* | runtimeSuiteUriEncoded=* | progressUriEncoded=* | workload=* | suiteRepeats=* | trialCursor=* | trialCount=* | trialUriEncoded=*)
 			export "${argument%%=*}=${argument#*=}"
 			;;
 	esac
@@ -227,45 +227,60 @@ run_trial() {
 }
 
 run_suite() {
-	local work="$1" runtime="$2" exit_code route device
-	echo "== guest: executing the suite on amd0 =="
-	report_phase "suite-start"
-	mkdir -p "$work/evidence" "$work/gpu-work"
-	# --device amd0 hard-errors when the device is absent or AMD support is not
-	# compiled in; there is no silent CPU fallback.
-	set +e
-	(
-		cd "$work"
-		RECIPE_SUITE_ROOT="$runtime" \
-		RECIPE_SUITE_WORK="$work/gpu-work" \
-		RECIPE_EVIDENCE="$work/evidence/suite.json" \
-		RECIPE_SUITE_PROGRESS=1 \
-		RECIPE_TRACE_PATH="$ROOT/suite-trace-$candidateSha.log" \
-			timeout --signal=TERM --kill-after=30s 600s "$work/target/release/recipe" --device amd0 "$runtime/suite.rs"
-	) > "$work/run.log" 2>&1
-	exit_code=$?
-	set -e
-	if [ "$exit_code" -ne 0 ]; then
-		tail -n 30 "$work/run.log"
+	local work="$1" runtime="$2" exit_code route device iteration trace
+	# The suite runs several times in fresh processes on one worker: a fault that
+	# strikes one run in three shows up within one job, and the first hang stops
+	# the loop with the evidence of where it stopped.
+	local repeats="${suiteRepeats:-5}" fallbacks_before
+	fallbacks_before="$(dmesg 2> /dev/null | grep -c 'Fence fallback' || true)"
+	echo "== guest: executing the suite on amd0, $repeats runs (fence fallbacks before: $fallbacks_before) =="
+	report_phase "suite-start runs=$repeats fallbacks=$fallbacks_before"
+	for iteration in $(seq 1 "$repeats"); do
+		rm -rf "$work/evidence" "$work/gpu-work"
+		mkdir -p "$work/evidence" "$work/gpu-work"
+		trace="$ROOT/suite-trace-$candidateSha-$iteration.log"
+		# --device amd0 hard-errors when the device is absent or AMD support is not
+		# compiled in; there is no silent CPU fallback.
+		set +e
+		(
+			cd "$work"
+			RECIPE_SUITE_ROOT="$runtime" \
+			RECIPE_SUITE_WORK="$work/gpu-work" \
+			RECIPE_EVIDENCE="$work/evidence/suite.json" \
+			RECIPE_SUITE_PROGRESS=1 \
+			RECIPE_TRACE_PATH="$trace" \
+				timeout --signal=TERM --kill-after=30s 300s "$work/target/release/recipe" --device amd0 "$runtime/suite.rs"
+		) > "$work/run.log" 2>&1
+		exit_code=$?
+		set -e
 		if [ "$exit_code" -eq 124 ]; then
-			# A hang says nothing on its own: the trace shows the last dispatch, the kernel log any GPU reset.
+			# A hang says nothing on its own: where the trace stopped, whether the SDMA
+			# ring was already failing before the suite, and what the kernel logged
+			# just before its first fence timeout.
 			{
+				echo "--- run $iteration of $repeats hung; fence fallbacks before suite: $fallbacks_before, now: $(dmesg 2> /dev/null | grep -c 'Fence fallback' || true) ---"
 				echo "--- last suite trace lines ---"
-				tail -n 15 "$ROOT/suite-trace-$candidateSha.log" 2> /dev/null || echo "no suite trace"
-				echo "--- last amdgpu kernel messages ---"
-				dmesg 2> /dev/null | grep -i -E 'amdgpu|kfd' | tail -n 10 || true
+				tail -n 8 "$trace" 2> /dev/null || echo "no suite trace"
+				echo "--- kernel lines before the first fence timeout ---"
+				dmesg 2> /dev/null | grep -i -E 'amdgpu|kfd|drm' | grep -B6 -m1 'Fence fallback' || true
+				echo "--- amdgpu fence state ---"
+				cat /sys/kernel/debug/dri/*/amdgpu_fence_info 2> /dev/null | grep -A3 -E 'ring (gfx|comp|sdma)' | head -n 24 || echo "no debugfs fence info"
 			} >&2
-			fail "the runtime suite exceeded 600s after $(grep -c '^check ' "$work/run.log" || true) completed checks"
+			fail "the runtime suite hung in run $iteration of $repeats after $(grep -c '^check ' "$work/run.log" || true) completed checks"
 		fi
-		fail "the runtime suite failed with exit code $exit_code"
-	fi
-	grep -q 'SUITE PASS executed=8' "$work/run.log" || { tail -n 30 "$work/run.log"; fail "the suite did not report eight passing checks"; }
+		if [ "$exit_code" -ne 0 ]; then
+			tail -n 30 "$work/run.log"
+			fail "the runtime suite failed in run $iteration of $repeats with exit code $exit_code"
+		fi
+		grep -q 'SUITE PASS executed=8' "$work/run.log" || { tail -n 30 "$work/run.log"; fail "run $iteration of $repeats did not report eight passing checks"; }
+		echo "run $iteration of $repeats: SUITE PASS executed=8"
+	done
 	route="$(sed -n 's/^suite device \([^[:space:]]*\).*/\1/p' "$work/run.log" | head -n 1)"
 	[ -n "$route" ] || fail "no suite device: training did not report its device"
 	device="${route##*:}"
 	case "$device" in amd*) ;; *) fail "expected an amd device, got '$device'; CPU fallback is a failure" ;; esac
 	jq -e '.executed == 8 and .failed == 0' "$work/evidence/suite.json" > /dev/null 2>&1 || fail "the suite evidence does not contain eight passing checks"
-	report_phase "suite-ready checks=8 exit=$exit_code"
+	report_phase "suite-ready checks=8 runs=$repeats exit=$exit_code"
 	echo "executed on $route"
 	echo "SUITE-EVIDENCE-BEGIN"
 	cat "$work/evidence/suite.json"
