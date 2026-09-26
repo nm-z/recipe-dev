@@ -2118,16 +2118,20 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 	const POSITIONS: usize = 128;
 	let length = graph.input.length;
-	let bounded = inference && rows == 1 && graph.input.channels == 1 && graph.output.length == 1
-		&& graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather)
+	// Token ids stay whole and are read at the window's first position; a part
+	// that continues another part's stream holds one window of it.
+	let ids = graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather);
+	let bounded = inference && rows == 1 && (!ids || graph.input.channels == 1)
 		&& graph.nodes.iter().enumerate().all(|(index, node)| {
 			(node.input.length == length || node.input.length == 1) && (node.output.length == length || node.output.length == 1)
-				&& (index == 0 || node.source >= 0) && node.second != -1
+				&& (index == 0 || node.source >= 0 || !ids || (node.source == -2 && node.op == Primitive::Lookup)) && (node.second != -1 || !ids)
 				&& match node.op {
-					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last => true,
+					// Each position on its own, or a state carried from the window's
+					// first position that the op reads at the window's origin.
+					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last | Primitive::Expand | Primitive::Read | Primitive::Outer | Primitive::Fold | Primitive::TopK
+					| Primitive::ExpertIn | Primitive::ExpertOut | Primitive::Exchange | Primitive::Lookup | Primitive::Delta | Primitive::Dconv | Primitive::Attention => true,
 					Primitive::Contraction => node.argument[0] <= 1.0,
 					Primitive::Normalize => normalize_mode(node.argument[0]).is_ok_and(|mode| mode.per_row()),
-					Primitive::Attention => attention_blocks(node) == 0,
 					_ => false,
 				}
 		});
@@ -6786,9 +6790,11 @@ impl NativeModelIr {
 		} else { ("%begin".to_owned(), "%end".to_owned()) };
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
+		// Lengths as this tape holds them: a window of positions when it holds one.
+		let held = |length: usize| window_shape(Shape { channels: 1, length }, self.graph.input.length, self.layout.window_positions).length;
 		let source_length = match usize::try_from(node.source) {
-			Ok(source) => self.graph.nodes.get(source).map(|source| source.output.length),
-			Err(_) => Some(graph_positions(&self.graph)),
+			Ok(source) => self.graph.nodes.get(source).map(|source| held(source.output.length)),
+			Err(_) => Some(held(graph_positions(&self.graph))),
 		};
 		let reinterpreted = source_length.is_some_and(|source_length| source_length != node.input.length);
 		match node.op {
@@ -6926,7 +6932,7 @@ impl NativeModelIr {
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
 		let source = if plan.node.source >= 0 { format!("%{prefix}.source") }
-		else if self.layout.window_positions < self.graph.input.length {
+		else if self.layout.window_positions < self.graph.input.length && self.graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) {
 			ir.push_str(&format!("%{prefix}.input.begin = zext i32 %begin to i64\n%{prefix}.input = getelementptr i32, {} %samples, i64 %{prefix}.input.begin\n", pointer_type(backend)));
 			format!("%{prefix}.input")
 		} else { "%samples".to_owned() };
@@ -7259,7 +7265,8 @@ impl NativeModelIr {
 		let (Some(column), Some(last)) = (self.layout.last_column, self.graph.nodes.len().checked_sub(1)) else { return Ok(String::new()) };
 		let node = &self.graph.nodes[last];
 		let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
-		let (channels, length) = (node.output.channels, node.output.length);
+		// A buffer that holds one window has the window as its pitch.
+		let (channels, length) = (node.output.channels, window_shape(node.output, self.graph.input.length, self.layout.window_positions).length);
 		let mut ir = String::new();
 		ir.push_str(&ptr_gep(backend, "values", self.layout.values[last], "lc.values"));
 		ir.push_str(&ptr_gep(backend, "contexts", column, "lc.column"));
@@ -18878,8 +18885,16 @@ impl Placed {
 		if begin == 0 {
 			tape.reset_sequence()?;
 		}
-		tape.write_window(begin, end, &values)?;
-		tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |_, _| {})?;
+		// A head that holds one window of its input takes the settled positions a window at a time.
+		let capacity = tape.program.artifact.layout.window_positions.min(tape.input.length).max(1);
+		for first in (0..positions).step_by(capacity) {
+			let stop = (first + capacity).min(positions);
+			let window = (0..channels).flat_map(|channel| values[channel * positions + first..channel * positions + stop].iter().copied()).collect::<Vec<_>>();
+			let (from, to) = (begin + first as u32, begin + stop as u32);
+			tape.window_begin.store(from, Ordering::Relaxed);
+			tape.write_window(from, to, &window)?;
+			tape.forward_window_observed(tape.samples.pointer, from, to, ForwardMode::Inference, &mut |_, _| {})?;
+		}
 		draft.reached.store(end, Ordering::Relaxed);
 		tape.last_column().map(Some)
 	}
@@ -18952,6 +18967,18 @@ impl Placed {
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		let capacity = tapes.iter().map(|tape| tape.program.artifact.layout.window_positions.min(tape.input.length)).min().unwrap_or(1).max(1) as u32;
+		if end - begin > capacity {
+			let mut cursor = begin;
+			loop {
+				let stop = cursor.saturating_add(capacity).min(end);
+				let values = self.forward_window(tapes, samples, cursor, stop, progress, last_only)?;
+				if stop == end {
+					return Ok(values);
+				}
+				cursor = stop;
+			}
+		}
 		if self.exchange.is_some() {
 			return self.forward_dies(tapes, samples, begin, end, progress, last_only);
 		}
@@ -18972,6 +18999,7 @@ impl Placed {
 			})?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
+			next.window_begin.store(begin, Ordering::Relaxed);
 			let runs = window_runs(tape.output, begin, end);
 			if runs.len() > 1 && next.vocabulary == 0.0 {
 				// Every channel's run of the window moves in one strided copy each way.
@@ -22693,16 +22721,20 @@ impl NativeTape {
 			self.samples.write_bytes(checked_mul(first, size_of::<i32>(), "token offset")?, ids.as_flattened())
 		} else {
 			let input_precision = self.program.artifact.layout.input_precision;
-			self.samples.write_float_bytes(checked_mul(first, input_precision.bytes(), "sample offset")?, values, input_precision)
+			self.samples.write_float_bytes(checked_mul(first - self.input_origin(), input_precision.bytes(), "sample offset")?, values, input_precision)
 		}
+	}
+	/// The first position a windowed stream input holds.
+	fn input_origin(&self) -> usize {
+		if self.program.artifact.layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) as usize } else { 0 }
 	}
 	/// Positions `begin..end` of every input channel, channel by channel.
 	fn write_window(&self, begin: u32, end: u32, values: &[f64]) -> Result<()> {
 		let precision = self.program.artifact.layout.input_precision;
 		let bytes = precision.bytes();
 		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
-		let pitch = checked_mul(self.input.length, bytes, "window pitch")?;
-		self.samples.write_strided_bytes(checked_mul(begin as usize, bytes, "window offset")?, pitch, checked_mul((end - begin) as usize, bytes, "window width")?, &encoded)
+		let pitch = checked_mul(self.input.length.min(self.program.artifact.layout.window_positions), bytes, "window pitch")?;
+		self.samples.write_strided_bytes(checked_mul(begin as usize - self.input_origin(), bytes, "window offset")?, pitch, checked_mul((end - begin) as usize, bytes, "window width")?, &encoded)
 	}
 	fn write_tokens(&self, first: usize, values: &[f64]) -> Result<()> {
 		let mut tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
@@ -22829,8 +22861,11 @@ impl NativeTape {
 		let layout = &self.program.artifact.layout;
 		let arena = *layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
 		let (precision, bytes) = (layout.output_precision, layout.output_precision.bytes());
-		let offset = checked_add(arena, checked_mul(begin as usize, bytes, "window offset")?, "window offset")?;
-		let encoded = self.values.download_strided_bytes(offset, checked_mul(self.output.length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
+		// A buffer that holds one window keeps its first position at slot zero.
+		let length = window_shape(self.output, self.input.length, layout.window_positions).length;
+		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) } else { 0 };
+		let offset = checked_add(arena, checked_mul((begin - origin) as usize, bytes, "window offset")?, "window offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
 		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
 		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
