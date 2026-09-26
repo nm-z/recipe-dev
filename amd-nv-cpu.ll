@@ -2337,34 +2337,11 @@ store:
 store double %result, ptr addrspace(1) %out.ptr, align 8
 ret void
 }
-; One unit of a plain sum's row over four staged positions: the run decodes
-; each weight once and adds it into all four, the positions %x.pitch apart.
-define internal <4 x RECIPE_STATE> @packed_unit_dot4( ptr addrspace(1) %weights, i32 %node, i64 %terms.wide, i64 %weight.base, i32 %chunk.base, i32 %unit, i32 %row, i32 %unit.index, i1 %active, i32 %x.pitch, i32 %unit.pitch ) #1 { entry:
-%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
-%row.safe = select i1 %active, i32 %row, i32 0
-%unit.safe = select i1 %active, i32 %unit.index, i32 0
-%unit.start = mul i32 %unit.safe, %unit
-%k0 = add i32 %chunk.base, %unit.start
-%row.wide = zext i32 %row.safe to i64
-%row.index = mul i64 %row.wide, %terms.wide
-%row.base = add i64 %weight.base, %row.index
-%k0.wide = zext i32 %k0 to i64
-%run.index = add i64 %row.base, %k0.wide
-%x.at = mul i32 %unit.safe, %unit.pitch
-%x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %x.at
-%values = call <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1, i32 %x.pitch, i64 %terms.wide)
-%zeros.0 = insertelement <4 x RECIPE_STATE> poison, RECIPE_STATE %state.zero, i32 0
-%zeros.1 = insertelement <4 x RECIPE_STATE> %zeros.0, RECIPE_STATE %state.zero, i32 1
-%zeros.2 = insertelement <4 x RECIPE_STATE> %zeros.1, RECIPE_STATE %state.zero, i32 2
-%zeros = insertelement <4 x RECIPE_STATE> %zeros.2, RECIPE_STATE %state.zero, i32 3
-%result = select i1 %active, <4 x RECIPE_STATE> %values, <4 x RECIPE_STATE> %zeros
-ret <4 x RECIPE_STATE> %result
-}
-; Positions of a plain sum over stored weights four at a time: each weight
-; decodes once and adds into four positions' row sums. It takes whole tiles of
-; four and returns how many positions it took; the row body takes the rest,
-; every single-position step among them.
-define internal i32 @packed_tile_body(
+; Rows of a plain sum over stored weights at whole tiles of four positions from
+; %out.begin, one row per lane as in the lane body: each decoded weight adds
+; into the lane's four positions. It returns the positions it took: the whole
+; tiles, or none when the tile cannot hold a unit for four positions.
+define internal i32 @packed_lanes4_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %rows, i32 %terms, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span,
 i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, i32 %in.share ) RECIPE_CONTRACTION_BODY { entry:
 %lid = call i32 @recipe.local.id.x()
@@ -2382,36 +2359,53 @@ i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, 
 %in.share.zero = icmp eq i32 %in.share, 0
 %in.share.nonzero = select i1 %in.share.zero, i32 1, i32 %in.share
 %unit = call i32 @recipe.model.dot.run.length(i32 %node)
-%unit.pitch = add i32 %unit, 1
-%tiles = udiv i32 %out.span, 4
-; The tile holds four staged columns, each unit padded by one value, then per
-; wave four rows of 32 row sums. A chunk holds at most a wave of units.
+%unit.wide = zext i32 %unit to i64
+; The tile holds four staged columns, then four parts per lane of the workgroup.
 %tile.bytes = call i32 @recipe.tile.bytes()
-%scratch.values = mul i32 %waves, 128
-%scratch.room = mul i32 %scratch.values, RECIPE_STATE_ALIGN
-%tile.fits = icmp ugt i32 %tile.bytes, %scratch.room
-%tile.left = sub i32 %tile.bytes, %scratch.room
+%parts.lane = mul i32 %block, 4
+%parts.room = mul i32 %parts.lane, RECIPE_STATE_ALIGN
+%fixed.room = add i32 %parts.room, 32
+%tile.fits = icmp ugt i32 %tile.bytes, %fixed.room
+%tile.left = sub i32 %tile.bytes, %fixed.room
 %tile.spare = select i1 %tile.fits, i32 %tile.left, i32 0
 %tile.values = udiv i32 %tile.spare, RECIPE_MODEL_BYTES
-%unit.pitch4 = mul i32 %unit.pitch, 4
-%chunk.units.room = udiv i32 %tile.values, %unit.pitch4
-%chunk.units.over = icmp ugt i32 %chunk.units.room, %width
-%chunk.units = select i1 %chunk.units.over, i32 %width, i32 %chunk.units.room
+%unit.four = mul i32 %unit, 4
+%chunk.units.room = udiv i32 %tile.values, %unit.four
+%units = udiv i32 %terms, %unit
+%chunk.units.over = icmp ugt i32 %chunk.units.room, %units
+%chunk.units = select i1 %chunk.units.over, i32 %units, i32 %chunk.units.room
 %chunk.span = mul i32 %chunk.units, %unit
-%chunk.some = icmp ugt i32 %chunk.units, 0
-%tiled = select i1 %chunk.some, i32 %tiles, i32 0
-%x.pitch = mul i32 %chunk.units, %unit.pitch
-%x.values = mul i32 %x.pitch, 4
+%x.values = mul i32 %chunk.span, 4
 %x.bytes = mul i32 %x.values, RECIPE_MODEL_BYTES
 %x.over = add i32 %x.bytes, 15
 %x.aligned = and i32 %x.over, -16
-%scratch = getelementptr i8, ptr addrspace(3) @contraction_tile, i32 %x.aligned
-%wave.base = mul i32 %wave, 128
-%sums.base = getelementptr RECIPE_STATE, ptr addrspace(3) %scratch, i32 %wave.base
+%parts = getelementptr i8, ptr addrspace(3) @contraction_tile, i32 %x.aligned
+%row.groups.over = add i32 %rows, %width
+%row.groups.raised = sub i32 %row.groups.over, 1
+%row.groups = udiv i32 %row.groups.raised, %width
+%per.group.over = add i32 %row.groups, %groups
+%per.group.raised = sub i32 %per.group.over, 1
+%per.group.raw = udiv i32 %per.group.raised, %groups
+%per.group.some = icmp ugt i32 %per.group.raw, 0
+%per.group = select i1 %per.group.some, i32 %per.group.raw, i32 1
+%teams.over = icmp ugt i32 %per.group, %waves
+%teams = select i1 %teams.over, i32 %waves, i32 %per.group
+%team.size = udiv i32 %waves, %teams
+%team = udiv i32 %wave, %team.size
+%part = urem i32 %wave, %team.size
+%team.in = icmp ult i32 %team, %teams
+%rounds.over = add i32 %per.group, %teams
+%rounds.raised = sub i32 %rounds.over, 1
+%rounds = udiv i32 %rounds.raised, %teams
+%leads = icmp eq i32 %part, 0
+%chunk.some = icmp ugt i32 %chunk.units, 0
+%tiles.raw = udiv i32 %out.span, 4
+%tiles = select i1 %chunk.some, i32 %tiles.raw, i32 0
+%lane.parts = mul i32 %lid, 4
 br label %tile.loop
 tile.loop:
-%tile = phi i32 [ 0, %entry ], [ %tile.next, %tile.done ]
-%tile.more = icmp ult i32 %tile, %tiled
+%tile = phi i32 [ 0, %entry ], [ %tile.next, %chunk.done ]
+%tile.more = icmp ult i32 %tile, %tiles
 br i1 %tile.more, label %tile.step, label %exit
 tile.step:
 %tile.first = mul i32 %tile, 4
@@ -2419,14 +2413,15 @@ tile.step:
 %position0 = zext i32 %position0.index to i64
 br label %chunk.loop
 chunk.loop:
-%chunk.base = phi i32 [ 0, %tile.step ], [ %chunk.next, %chunk.done ]
+%chunk.base = phi i32 [ 0, %tile.step ], [ %chunk.next, %round.loop.end ]
 %chunk.remaining = sub i32 %terms, %chunk.base
 %chunk.over = icmp ugt i32 %chunk.remaining, %chunk.span
 %chunk.terms = select i1 %chunk.over, i32 %chunk.span, i32 %chunk.remaining
 %chunk.end = add i32 %chunk.base, %chunk.terms
 %chunk.first = icmp eq i32 %chunk.base, 0
 %chunk.last = icmp eq i32 %chunk.end, %terms
-%upr = udiv i32 %chunk.terms, %unit
+%chunk.units.here = udiv i32 %chunk.terms, %unit
+%chunk.base.wide = zext i32 %chunk.base to i64
 %stage.count = mul i32 %chunk.terms, 4
 br label %stage.loop
 stage.loop:
@@ -2451,122 +2446,122 @@ stage.step:
 %stage.at = add i64 %stage.index, %stage.position
 %stage.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.at
 %stage.value = load double, ptr addrspace(1) %stage.ptr, align 8
-%stage.unit = udiv i32 %stage.local, %unit
-%stage.within = urem i32 %stage.local, %unit
-%stage.row = mul i32 %stage.unit, %unit.pitch
-%stage.in = add i32 %stage.row, %stage.within
-%stage.column = mul i32 %stage.t, %x.pitch
-%stage.place = add i32 %stage.column, %stage.in
+%stage.column = mul i32 %stage.t, %chunk.span
+%stage.place = add i32 %stage.column, %stage.local
 %stage.slot = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %stage.place
 store double %stage.value, ptr addrspace(3) %stage.slot, align 8
 %stage.c.next = add i32 %stage.c, %block
 br label %stage.loop
 stage.done:
 call void @recipe.local.barrier()
-; Every chunk gives a wave the rows a whole chunk does, so one lane sums a
-; row in every chunk with no barrier across workgroups between chunks.
-%m.fill = udiv i32 %width, %chunk.units
-%m.some = icmp ugt i32 %m.fill, 0
-%m = select i1 %m.some, i32 %m.fill, i32 1
-%items = mul i32 %m, %upr
-%rowgroups.over = add i32 %rows, %m
-%rowgroups.raised = sub i32 %rowgroups.over, 1
-%rowgroups = udiv i32 %rowgroups.raised, %m
-%jobs.over = add i32 %rowgroups, %waves
-%jobs.raised = sub i32 %jobs.over, 1
-%jobs = udiv i32 %jobs.raised, %waves
-%lane.owns = icmp ult i32 %lane, %m
-%item.row = udiv i32 %lane, %upr
-%item.unit = urem i32 %lane, %upr
-%item.in = icmp ult i32 %lane, %items
-br label %job.loop
-job.loop:
-%job = phi i32 [ %group, %stage.done ], [ %job.next, %job.done ]
-%job.more = icmp ult i32 %job, %jobs
-br i1 %job.more, label %job.step, label %chunk.done
-job.step:
-%rowgroup.base = mul i32 %job, %waves
-%rowgroup = add i32 %rowgroup.base, %wave
-%row0 = mul i32 %rowgroup, %m
-br i1 %lane.owns, label %zero, label %sweep
-zero:
-%zero.slot0 = add i32 %lane, 0
-%zero.ptr0 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %zero.slot0
-store RECIPE_STATE %state.zero, ptr addrspace(3) %zero.ptr0, align RECIPE_STATE_ALIGN
-%zero.slot1 = add i32 %lane, 32
-%zero.ptr1 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %zero.slot1
-store RECIPE_STATE %state.zero, ptr addrspace(3) %zero.ptr1, align RECIPE_STATE_ALIGN
-%zero.slot2 = add i32 %lane, 64
-%zero.ptr2 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %zero.slot2
-store RECIPE_STATE %state.zero, ptr addrspace(3) %zero.ptr2, align RECIPE_STATE_ALIGN
-%zero.slot3 = add i32 %lane, 96
-%zero.ptr3 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %zero.slot3
-store RECIPE_STATE %state.zero, ptr addrspace(3) %zero.ptr3, align RECIPE_STATE_ALIGN
-br label %sweep
-sweep:
-%row = add i32 %row0, %item.row
+br label %round.loop
+round.loop:
+%round = phi i32 [ 0, %stage.done ], [ %round.next, %round.done ]
+%round.more = icmp ult i32 %round, %rounds
+br i1 %round.more, label %round.step, label %round.loop.end
+round.step:
+%slot.base = mul i32 %round, %teams
+%slot = add i32 %slot.base, %team
+%slot.stride = mul i32 %slot, %groups
+%row.group = add i32 %slot.stride, %group
+%row.group.in = icmp ult i32 %row.group, %row.groups
+%team.live = and i1 %team.in, %row.group.in
+%row.lane0 = mul i32 %row.group, %width
+%row = add i32 %row.lane0, %lane
 %row.in = icmp ult i32 %row, %rows
-%active = and i1 %item.in, %row.in
-%parts = call <4 x RECIPE_STATE> @packed_unit_dot4( ptr addrspace(1) %weights, i32 %node, i64 %terms.wide, i64 %weight.base, i32 %chunk.base, i32 %unit, i32 %row, i32 %item.unit, i1 %active, i32 %x.pitch, i32 %unit.pitch )
-br i1 %active, label %add, label %added
-add:
-%add.part0 = extractelement <4 x RECIPE_STATE> %parts, i32 0
-%add.slot0 = add i32 %item.row, 0
-%add.ptr0 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %add.slot0
-%add.prior0 = atomicrmw fadd ptr addrspace(3) %add.ptr0, RECIPE_STATE %add.part0 monotonic
-%add.part1 = extractelement <4 x RECIPE_STATE> %parts, i32 1
-%add.slot1 = add i32 %item.row, 32
-%add.ptr1 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %add.slot1
-%add.prior1 = atomicrmw fadd ptr addrspace(3) %add.ptr1, RECIPE_STATE %add.part1 monotonic
-%add.part2 = extractelement <4 x RECIPE_STATE> %parts, i32 2
-%add.slot2 = add i32 %item.row, 64
-%add.ptr2 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %add.slot2
-%add.prior2 = atomicrmw fadd ptr addrspace(3) %add.ptr2, RECIPE_STATE %add.part2 monotonic
-%add.part3 = extractelement <4 x RECIPE_STATE> %parts, i32 3
-%add.slot3 = add i32 %item.row, 96
-%add.ptr3 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %add.slot3
-%add.prior3 = atomicrmw fadd ptr addrspace(3) %add.ptr3, RECIPE_STATE %add.part3 monotonic
-br label %added
-added:
-%out.row = add i32 %row0, %lane
-%out.in = icmp ult i32 %out.row, %rows
-%out.write = and i1 %lane.owns, %out.in
-br i1 %out.write, label %write, label %job.done
-write:
-%write.slot0 = add i32 %lane, 0
-%write.ptr0 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %write.slot0
-%write.sum0 = load RECIPE_STATE, ptr addrspace(3) %write.ptr0, align RECIPE_STATE_ALIGN
-%write.position0 = add i64 %position0, 0
-call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %write.position0, i64 %weight.base, RECIPE_STATE %write.sum0, i32 %row.first, i32 %row.period, i32 %row.share )
-%write.slot1 = add i32 %lane, 32
-%write.ptr1 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %write.slot1
-%write.sum1 = load RECIPE_STATE, ptr addrspace(3) %write.ptr1, align RECIPE_STATE_ALIGN
-%write.position1 = add i64 %position0, 1
-call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %write.position1, i64 %weight.base, RECIPE_STATE %write.sum1, i32 %row.first, i32 %row.period, i32 %row.share )
-%write.slot2 = add i32 %lane, 64
-%write.ptr2 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %write.slot2
-%write.sum2 = load RECIPE_STATE, ptr addrspace(3) %write.ptr2, align RECIPE_STATE_ALIGN
-%write.position2 = add i64 %position0, 2
-call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %write.position2, i64 %weight.base, RECIPE_STATE %write.sum2, i32 %row.first, i32 %row.period, i32 %row.share )
-%write.slot3 = add i32 %lane, 96
-%write.ptr3 = getelementptr RECIPE_STATE, ptr addrspace(3) %sums.base, i32 %write.slot3
-%write.sum3 = load RECIPE_STATE, ptr addrspace(3) %write.ptr3, align RECIPE_STATE_ALIGN
-%write.position3 = add i64 %position0, 3
-call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %out.row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %write.position3, i64 %weight.base, RECIPE_STATE %write.sum3, i32 %row.first, i32 %row.period, i32 %row.share )
-br label %job.done
-job.done:
-%job.next = add i32 %job, %groups
-br label %job.loop
-chunk.done:
+%row.live = and i1 %team.live, %row.in
+%row.safe = select i1 %row.live, i32 %row, i32 0
+%row.wide = zext i32 %row.safe to i64
+%row.index = mul i64 %row.wide, %terms.wide
+%row.base = add i64 %weight.base, %row.index
+%row.chunk = add i64 %row.base, %chunk.base.wide
+br label %unit.loop
+unit.loop:
+%u = phi i32 [ %part, %round.step ], [ %u.next, %unit.step ]
+%sum0 = phi RECIPE_STATE [ %state.zero, %round.step ], [ %sum0.next, %unit.step ]
+%sum1 = phi RECIPE_STATE [ %state.zero, %round.step ], [ %sum1.next, %unit.step ]
+%sum2 = phi RECIPE_STATE [ %state.zero, %round.step ], [ %sum2.next, %unit.step ]
+%sum3 = phi RECIPE_STATE [ %state.zero, %round.step ], [ %sum3.next, %unit.step ]
+%u.more = icmp ult i32 %u, %chunk.units.here
+%u.go = and i1 %u.more, %team.live
+br i1 %u.go, label %unit.step, label %unit.done
+unit.step:
+%u.start = mul i32 %u, %unit
+%u.start.wide = zext i32 %u.start to i64
+%run.index = add i64 %row.chunk, %u.start.wide
+%x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %u.start
+%runs = call <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1, i32 %chunk.span, i64 %terms.wide)
+%run0 = extractelement <4 x RECIPE_STATE> %runs, i32 0
+%run1 = extractelement <4 x RECIPE_STATE> %runs, i32 1
+%run2 = extractelement <4 x RECIPE_STATE> %runs, i32 2
+%run3 = extractelement <4 x RECIPE_STATE> %runs, i32 3
+%sum0.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum0, RECIPE_STATE %run0)
+%sum1.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum1, RECIPE_STATE %run1)
+%sum2.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum2, RECIPE_STATE %run2)
+%sum3.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum3, RECIPE_STATE %run3)
+%u.next = add i32 %u, %team.size
+br label %unit.loop
+unit.done:
+%part0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %parts, i32 %lane.parts
+store RECIPE_STATE %sum0, ptr addrspace(3) %part0.ptr, align RECIPE_STATE_ALIGN
+%part1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %part0.ptr, i32 1
+store RECIPE_STATE %sum1, ptr addrspace(3) %part1.ptr, align RECIPE_STATE_ALIGN
+%part2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %part0.ptr, i32 2
+store RECIPE_STATE %sum2, ptr addrspace(3) %part2.ptr, align RECIPE_STATE_ALIGN
+%part3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %part0.ptr, i32 3
+store RECIPE_STATE %sum3, ptr addrspace(3) %part3.ptr, align RECIPE_STATE_ALIGN
 call void @recipe.local.barrier()
+%store.now = and i1 %leads, %row.live
+br i1 %store.now, label %gather.loop, label %round.done
+gather.loop:
+%g = phi i32 [ 1, %unit.done ], [ %g.next, %gather.step ]
+%total0 = phi RECIPE_STATE [ %sum0, %unit.done ], [ %total0.next, %gather.step ]
+%total1 = phi RECIPE_STATE [ %sum1, %unit.done ], [ %total1.next, %gather.step ]
+%total2 = phi RECIPE_STATE [ %sum2, %unit.done ], [ %total2.next, %gather.step ]
+%total3 = phi RECIPE_STATE [ %sum3, %unit.done ], [ %total3.next, %gather.step ]
+%g.more = icmp ult i32 %g, %team.size
+br i1 %g.more, label %gather.step, label %gather.store
+gather.step:
+%g.wave = add i32 %wave, %g
+%g.lane0 = mul i32 %g.wave, %width
+%g.lid = add i32 %g.lane0, %lane
+%g.slot = mul i32 %g.lid, 4
+%g0.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %parts, i32 %g.slot
+%g0 = load RECIPE_STATE, ptr addrspace(3) %g0.ptr, align RECIPE_STATE_ALIGN
+%g1.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %g0.ptr, i32 1
+%g1 = load RECIPE_STATE, ptr addrspace(3) %g1.ptr, align RECIPE_STATE_ALIGN
+%g2.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %g0.ptr, i32 2
+%g2 = load RECIPE_STATE, ptr addrspace(3) %g2.ptr, align RECIPE_STATE_ALIGN
+%g3.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %g0.ptr, i32 3
+%g3 = load RECIPE_STATE, ptr addrspace(3) %g3.ptr, align RECIPE_STATE_ALIGN
+%total0.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total0, RECIPE_STATE %g0)
+%total1.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total1, RECIPE_STATE %g1)
+%total2.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total2, RECIPE_STATE %g2)
+%total3.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total3, RECIPE_STATE %g3)
+%g.next = add i32 %g, 1
+br label %gather.loop
+gather.store:
+%position1 = add i64 %position0, 1
+%position2 = add i64 %position0, 2
+%position3 = add i64 %position0, 3
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position0, i64 %weight.base, RECIPE_STATE %total0, i32 %row.first, i32 %row.period, i32 %row.share )
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position1, i64 %weight.base, RECIPE_STATE %total1, i32 %row.first, i32 %row.period, i32 %row.share )
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position2, i64 %weight.base, RECIPE_STATE %total2, i32 %row.first, i32 %row.period, i32 %row.share )
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position3, i64 %weight.base, RECIPE_STATE %total3, i32 %row.first, i32 %row.period, i32 %row.share )
+br label %round.done
+round.done:
+call void @recipe.local.barrier()
+%round.next = add i32 %round, 1
+br label %round.loop
+round.loop.end:
 %chunk.next = add i32 %chunk.base, %chunk.terms
 %chunk.more = icmp ult i32 %chunk.next, %terms
-br i1 %chunk.more, label %chunk.loop, label %tile.done
-tile.done:
+br i1 %chunk.more, label %chunk.loop, label %chunk.done
+chunk.done:
 %tile.next = add i32 %tile, 1
 br label %tile.loop
 exit:
-%handled = mul i32 %tiled, 4
+%handled = mul i32 %tiles, 4
 ret i32 %handled
 }
 ; Rows of a sum over stored weights at the positions %out.begin to
