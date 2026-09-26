@@ -2024,7 +2024,7 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 		// read sixteen bytes at a time by the block dots.
 		let offset = align(bytes, element.max(16))?;
 		let span = match packed_weight(graph, index, inference) {
-			Some(weight) => weight.bytes.len(),
+			Some(weight) => interleaved_span(weight),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
 		};
 		offsets.push(offset);
@@ -2965,10 +2965,26 @@ fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequa
 /// the device's `lanes` for a weight only the run-decoder bodies read, and one
 /// (rows one after another) for every other weight.
 fn interleaved_lanes(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> u32 {
-	row_interleave(graph, index, inference, rows, lanes).map_or(1, |(lanes, _)| lanes)
+	row_interleave(graph, index, inference, rows, lanes).map_or(1, |(lanes, ..)| lanes)
 }
-/// The lanes and row bytes of stored weight `index` when its rows interleave.
-fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> Option<(u32, usize)> {
+/// The bytes one block takes in interleaved rows. A lane's run over a large
+/// block is one straight body per place of the block within a word, so such
+/// blocks start on a word and the run has one body; small blocks stay packed.
+fn interleaved_stride(block: usize, stride: usize) -> usize {
+	if block >= 256 { stride.next_multiple_of(4) } else { stride }
+}
+/// The bytes a packed weight takes in the weight arena: room for its blocks at
+/// their interleaved stride, which the rows take when they interleave.
+fn interleaved_span(weight: &StoredWeight) -> usize {
+	let bytes = weight.bytes.len();
+	match weight.format_segments()[..] {
+		[(segment, _)] => segment.spec().filter(|spec| spec.stride != 0 && bytes % spec.stride == 0).map_or(bytes, |spec| bytes / spec.stride * interleaved_stride(spec.block, spec.stride)),
+		_ => bytes,
+	}
+}
+/// The lanes, row bytes and interleaved row bytes of stored weight `index`
+/// when its rows interleave.
+fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> Option<(u32, usize, usize)> {
 	let node = &graph.nodes[index];
 	let stored = graph.stored.get(index).and_then(Option::as_ref)?;
 	if lanes <= 1 || !inference || rows != 1 || !node.packed || node.int_bits != 0 || graph.requantize.get(index).is_some_and(Option::is_some) || stored.bytes.absent_runs() {
@@ -2991,19 +3007,25 @@ fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lan
 	};
 	let row_bytes = row_values / spec.block * spec.stride;
 	let whole = row_values % spec.block == 0 && row_bytes % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
-	whole.then_some((lanes, row_bytes))
+	whole.then_some((lanes, row_bytes, row_values / spec.block * interleaved_stride(spec.block, spec.stride)))
 }
-/// `bytes` of `rows` rows of `row_bytes` each, with the rows of every group of
-/// `lanes` interleaved four bytes at a time: word `w` of the group's row `l`
-/// sits at word `w * lanes + l` of the group.
-fn interleave_rows(bytes: &[u8], rows: usize, row_bytes: usize, lanes: usize) -> Vec<u8> {
-	let (words, group_bytes) = (row_bytes / 4, row_bytes * lanes);
-	let mut interleaved = vec![0_u8; bytes.len()];
+/// `bytes` of `rows` rows of `row_bytes` each, every block of `stride` bytes
+/// widened to `padded` with zeros, and the rows of every group of `lanes`
+/// interleaved four bytes at a time: word `w` of the group's row `l` sits at
+/// word `w * lanes + l` of the group.
+fn interleave_rows(bytes: &[u8], rows: usize, row_bytes: usize, lanes: usize, stride: usize, padded: usize) -> Vec<u8> {
+	let padded_row = row_bytes / stride * padded;
+	let (words, group_bytes) = (padded_row / 4, padded_row * lanes);
+	let mut interleaved = vec![0_u8; rows * padded_row];
+	let mut row_padded = vec![0_u8; padded_row];
 	for row in 0..rows {
+		for (block, source) in bytes[row * row_bytes..(row + 1) * row_bytes].chunks_exact(stride).enumerate() {
+			row_padded[block * padded..block * padded + stride].copy_from_slice(source);
+		}
 		let (group, lane) = (row / lanes, row % lanes);
 		for word in 0..words {
-			let (from, to) = (row * row_bytes + word * 4, group * group_bytes + (word * lanes + lane) * 4);
-			interleaved[to..to + 4].copy_from_slice(&bytes[from..from + 4]);
+			let to = group * group_bytes + (word * lanes + lane) * 4;
+			interleaved[to..to + 4].copy_from_slice(&row_padded[word * 4..word * 4 + 4]);
 		}
 	}
 	interleaved
@@ -7385,8 +7407,9 @@ impl NativeModelIr {
 				}
 			}
 			for (name, native, block, stride, lanes) in &formats {
-				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, *stride, 1, *lanes));
-				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, *stride, 4, *lanes));
+				let stride = if *lanes > 1 { interleaved_stride(*block, *stride) } else { *stride };
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 1, *lanes));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 4, *lanes));
 			}
 			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
 			// The same formats over four positions at once.
@@ -24204,12 +24227,14 @@ impl Buffer {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
 				match row_interleave(graph, index, inference, rows, runtime.lanes()) {
-					Some((lanes, row_bytes)) => {
+					Some((lanes, row_bytes, padded_row)) => {
 						let mut bytes = Vec::with_capacity(weight.bytes.len());
 						for (_, run) in weight.bytes.runs() {
 							bytes.extend_from_slice(run);
 						}
-						buffer.write_bytes(offsets[index], &interleave_rows(&bytes, bytes.len() / row_bytes, row_bytes, lanes as usize))?;
+						let stride = weight.format_segments().first().and_then(|(segment, _)| segment.spec()).map_or(row_bytes, |spec| spec.stride);
+						let padded = stride * padded_row / row_bytes;
+						buffer.write_bytes(offsets[index], &interleave_rows(&bytes, bytes.len() / row_bytes, row_bytes, lanes as usize, stride, padded))?;
 					}
 					None => buffer.write_runs(offsets[index], &weight.bytes)?,
 				}
