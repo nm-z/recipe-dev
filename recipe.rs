@@ -18133,18 +18133,33 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 	let threshold = natural("tensor split region bytes", env!("RECIPE_TENSOR_SPLIT_REGION_BYTES"))?;
 	let mut candidates = split_regions(graph, devices.len())?.into_iter().filter(|region| region.read < threshold).collect::<Vec<_>>();
 	candidates.sort_by_key(|region| region.read);
+	let mut kept = Vec::new();
 	for region in candidates {
 		let grown = used.iter().zip(&shares).map(|(bytes, share)| bytes + (region.stored as f64 * (1.0 - share / total)) as u64).collect::<Vec<_>>();
 		if grown.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
 			whole.insert(region.end);
+			kept.push(region.end);
 			used = grown;
 		}
 	}
-	// The first shards go before the second are cut, so the machine holds one set.
-	let graphs = if whole.is_empty() { split } else {
-		drop(split);
-		(0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?
-	};
+	// The first shards go before the second are cut, so the machine holds one
+	// set. The estimate above can miss a die's real size: while a die does not
+	// fit, the region kept last is split again.
+	let mut graphs = split;
+	while !whole.is_empty() {
+		drop(graphs);
+		graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
+		let fits = graphs.iter().zip(&available).map(|(part, room)| part_bytes(part, precision).map(|bytes| bytes as u64 <= *room)).collect::<Result<Vec<_>>>()?;
+		if fits.iter().all(|fit| *fit) {
+			break;
+		}
+		let Some(last) = kept.pop() else { break };
+		whole.remove(&last);
+		if whole.is_empty() {
+			drop(graphs);
+			graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
+		}
+	}
 	if tracing() {
 		for (index, node) in graphs[0].nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
@@ -18543,23 +18558,23 @@ fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> 
 	Ok(StoredWeight { format, count, bytes: StoredBytes::joined(parts), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
 }
 /// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
-/// inputs repeated `repeats` times, gathered whole blocks at a time into bytes
-/// of their own: each row's share is not one run of the file.
+/// inputs repeated `repeats` times, whole blocks at a time: each row's share
+/// is its own view of the stored bytes, so a die's share copies nothing.
 fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize, run: Run, block: usize, stride: usize) -> Result<StoredWeight> {
 	require(run.first % block == 0 && run.count % block == 0 && (run.period == 0 || run.period % block == 0), "a split of a sum's inputs must fall on whole blocks")?;
 	let row_bytes = terms / block * stride;
 	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
 	let periods = if run.period == 0 { 1 } else { terms / run.period };
-	let mut gathered = Vec::with_capacity(repeats * rows * periods * run.count / block * stride);
+	let mut parts = Vec::with_capacity(repeats * rows * periods);
 	for row in 0..repeats * rows {
 		for period in 0..periods {
 			let at = row * row_bytes + (period * run.period + run.first) / block * stride;
-			gathered.extend_from_slice(&weight.bytes.slice(at, run.count / block * stride)?);
+			parts.push(weight.bytes.view(at, run.count / block * stride));
 		}
 	}
 	let count = repeats * rows * periods * run.count;
 	let format = weight.format_segments()[0].0;
-	Ok(StoredWeight { format, count, bytes: StoredBytes::from(gathered), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+	Ok(StoredWeight { format, count, bytes: StoredBytes::joined(parts), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
 }
 /// Die `die`'s graph of a tensor split over dies whose relative speeds are
 /// `shares`. Each split region runs apart: its first sums keep this die's share
@@ -24204,9 +24219,27 @@ impl Buffer {
 	}
 	/// Writes stored bytes run by run from where they are mapped or held, so a
 	/// weight reaches the device without a host copy of its own size.
+	/// Adjacent runs, such as the per-row views of a die's share, go up
+	/// together through one staging buffer of at most 64 MiB.
 	fn write_runs(&self, offset: usize, stored: &StoredBytes) -> Result<()> {
+		const STAGING: usize = 64 << 20;
+		let (mut staged, mut start) = (Vec::new(), 0);
 		for (at, run) in stored.runs() {
-			self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+			if !staged.is_empty() && (start + staged.len() != at || staged.len() + run.len() > STAGING) {
+				self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
+				staged.clear();
+			}
+			if run.len() >= STAGING {
+				self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+				continue;
+			}
+			if staged.is_empty() {
+				start = at;
+			}
+			staged.extend_from_slice(run);
+		}
+		if !staged.is_empty() {
+			self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
 		}
 		Ok(())
 	}
