@@ -114,6 +114,10 @@ install_driver() {
 		quiet "amdgpu-dkms build for $(uname -r)" apt-get install -y amdgpu-dkms
 		# Explicit modprobe ignores a blocklist; removing it keeps the driver across reboots.
 		sed -i '/^blacklist amdgpu/d' /etc/modprobe.d/*.conf
+		# The V710 virtual function has stalled its kernel SDMA ring mid-suite ("Fence
+		# fallback timer expired on ring sdma1", first dispatch never completes); page
+		# table updates by the CPU keep compute dispatch off that ring.
+		printf 'options amdgpu vm_update_mode=%s\n' "${AMDGPU_VM_UPDATE_MODE:-3}" > /etc/modprobe.d/recipe-amdgpu.conf
 		depmod -a
 		if ! modprobe amdgpu > "$LOGS/modprobe.log" 2>&1; then
 			tail -n 5 "$LOGS/modprobe.log"
@@ -131,7 +135,7 @@ install_driver() {
 		sleep 5
 	done
 	renders=(/dev/dri/renderD*)
-	echo "kfd=present render nodes=${#renders[@]} driver=$(modinfo -F version amdgpu 2> /dev/null)"
+	echo "kfd=present render nodes=${#renders[@]} driver=$(modinfo -F version amdgpu 2> /dev/null) vm_update_mode=$(cat /sys/module/amdgpu/parameters/vm_update_mode 2> /dev/null || echo unknown)"
 }
 
 initialize_toolchain() {
