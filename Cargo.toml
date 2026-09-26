@@ -32,6 +32,8 @@ contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
+# weight bytes a position must read of a split region to pay for its exchange
+tensor-split-region-bytes = 8388608
 # scattered lookup-table rows a window reads at once
 lookup-readers = 16
 placement-launch-reserve-bytes = 134217728

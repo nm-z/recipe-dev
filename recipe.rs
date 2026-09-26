@@ -5038,6 +5038,8 @@ impl NativeModelIr {
 						half = half.max(checked_mul(checked_mul(plan.node.output.elements(), planes, "exchange planes")?, self.node_precision(&plan.node).model.bytes(), "exchange bytes")?);
 					}
 					let prefix = format!("n{index}.exchange");
+					let exchanges = self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
+					let ordinal = self.plans[..index].iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
 					// Another die's values reach machine RAM past this device's caches: a
 					// read treats any cached line of it as stale and fetches it again.
 					let (fresh, constraint) = match ty {
@@ -5049,7 +5051,7 @@ impl NativeModelIr {
 					// exchanges alternate between: a die writes exchange e + 1 only
 					// after every die posted e, so nobody still reads that half.
 					ir.push_str(&format!(
-						"%{prefix}.host.bits = load volatile i64, ptr addrspace(1) @recipe_exchange_host, align 8\n%{prefix}.host = inttoptr i64 %{prefix}.host.bits to {pointer}\n%{prefix}.epoch = load volatile i32, ptr addrspace(1) @recipe_exchange_epoch, align 4\n%{prefix}.next = add i32 %{prefix}.epoch, 1\n%{prefix}.parity = and i32 %{prefix}.epoch, 1\n%{prefix}.parity.wide = zext i32 %{prefix}.parity to i64\n%{prefix}.half = mul i64 %{prefix}.parity.wide, {half}\n%{prefix}.offset = add i64 %{prefix}.half, {EXCHANGE_FLAG_BYTES}\n%{prefix}.data = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.offset\n"
+						"%{prefix}.host.bits = load volatile i64, ptr addrspace(1) @recipe_exchange_host, align 8\n%{prefix}.host = inttoptr i64 %{prefix}.host.bits to {pointer}\n%{prefix}.base = load volatile i32, ptr addrspace(1) @recipe_exchange_epoch, align 4\n%{prefix}.epoch = add i32 %{prefix}.base, {ordinal}\n%{prefix}.next = add i32 %{prefix}.epoch, 1\n%{prefix}.parity = and i32 %{prefix}.epoch, 1\n%{prefix}.parity.wide = zext i32 %{prefix}.parity to i64\n%{prefix}.half = mul i64 %{prefix}.parity.wide, {half}\n%{prefix}.offset = add i64 %{prefix}.half, {EXCHANGE_FLAG_BYTES}\n%{prefix}.data = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.offset\n"
 					));
 					emit_runtime_window_loop(&mut ir, index, "exchange.post", node.output, &window, |ir, _p, wide| {
 						let channel = format!("%n{index}.exchange.post.at.channel");
@@ -5081,9 +5083,9 @@ impl NativeModelIr {
 					// would at a thousand times the cost.
 					ir.push_str(barrier(backend));
 					ir.push_str(&format!(
-						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.signaled\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.wait\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.signal ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
+						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.posted\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.posted\n{prefix}.posted:\n%{prefix}.width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()\n%{prefix}.lane = urem i32 %tid, %{prefix}.width\n%{prefix}.waiter = icmp eq i32 %{prefix}.lane, 0\nbr i1 %{prefix}.waiter, label %{prefix}.wait, label %{prefix}.signaled\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.posted ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
 					));
-					ir.push_str(barrier(backend));
+					ir.push_str("call void @llvm.nvvm.barrier0()\n");
 					emit_runtime_window_loop(&mut ir, index, "exchange.take", node.output, &window, |ir, _p, wide| {
 						if sum {
 							let mut total = String::new();
@@ -5101,8 +5103,11 @@ impl NativeModelIr {
 						ir.push_str(&format!("%{prefix}.take.to = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.take.value, {pointer} %{prefix}.take.to, align {align}\n", value = pointers.value, align = alignment(ty)));
 					})?;
 					ir.push_str(barrier(backend));
-					ir.push_str(&format!("br i1 %{prefix}.leader, label %{prefix}.advance, label %{prefix}.advanced\n{prefix}.advance:\nstore volatile i32 %{prefix}.next, ptr addrspace(1) @recipe_exchange_epoch, align 4\nbr label %{prefix}.advanced\n{prefix}.advanced:\n"));
-					ir.push_str(barrier(backend));
+					// Every exchange of a launch reads the launch's base epoch and adds its
+					// place among them; the last one leaves the next launch its base.
+					if ordinal + 1 == exchanges {
+						ir.push_str(&format!("br i1 %{prefix}.leader, label %{prefix}.advance, label %{prefix}.advanced\n{prefix}.advance:\n%{prefix}.following = add i32 %{prefix}.base, {exchanges}\nstore volatile i32 %{prefix}.following, ptr addrspace(1) @recipe_exchange_epoch, align 4\nbr label %{prefix}.advanced\n{prefix}.advanced:\n"));
+					}
 				}
 				(true, Primitive::Last) => {
 					let pointer = pointer_type(backend);
@@ -18008,13 +18013,35 @@ impl Gpu {
 fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
 	// Each die takes a share of the split weights in proportion to its free memory.
 	let shares = devices.iter().map(|device| device.free_bytes().map(|bytes| bytes as f64)).collect::<Result<Vec<_>>>()?;
-	let graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares)).collect::<Result<Vec<_>>>()?;
+	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	// A region saves each die the weights it reads a share of and costs an
+	// exchange. One a position reads few bytes of stays whole on every die,
+	// the fewest first, while every die still holds its weights.
+	let mut whole = std::collections::BTreeSet::new();
+	let split = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
+	let mut used = split.iter().map(|part| part_bytes(part, precision).map(|bytes| bytes as u64)).collect::<Result<Vec<_>>>()?;
+	let available = devices.iter().map(|device| device.free_bytes().map(|bytes| bytes.saturating_sub(reserve))).collect::<Result<Vec<_>>>()?;
+	let total = shares.iter().sum::<f64>();
+	let threshold = natural("tensor split region bytes", env!("RECIPE_TENSOR_SPLIT_REGION_BYTES"))?;
+	let mut candidates = split_regions(graph, devices.len())?.into_iter().filter(|region| region.read < threshold).collect::<Vec<_>>();
+	candidates.sort_by_key(|region| region.read);
+	for region in candidates {
+		let grown = used.iter().zip(&shares).map(|(bytes, share)| bytes + (region.stored as f64 * (1.0 - share / total)) as u64).collect::<Vec<_>>();
+		if grown.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			whole.insert(region.end);
+			used = grown;
+		}
+	}
+	// The first shards go before the second are cut, so the machine holds one set.
+	let graphs = if whole.is_empty() { split } else {
+		drop(split);
+		(0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?
+	};
 	if tracing() {
 		for (index, node) in graphs[0].nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
 		}
 	}
-	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	for (part, device) in graphs.iter().zip(devices) {
 		let required = part_bytes(part, precision)? as u64;
 		let available = device.free_bytes()?.saturating_sub(reserve);
@@ -18280,6 +18307,9 @@ struct SplitRegion {
 	end: usize,
 	period: usize,
 	unit: usize,
+	/// The weight bytes one position reads of the region, and the bytes it stores.
+	read: usize,
+	stored: usize,
 }
 /// Every region of `graph` a split can keep apart: grown back from each sum that
 /// can split its inputs, through ops that keep channels apart, to the sums that
@@ -18368,13 +18398,24 @@ fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
 		if period == 0 || period % unit != 0 || period / unit < dies || !channels_fit {
 			continue;
 		}
+		let read = starts.iter().chain(std::iter::once(&end)).map(|at| position_weight_bytes(graph, *at)).sum::<usize>();
+		let stored = starts.iter().chain(std::iter::once(&end)).map(|at| graph.stored.get(*at).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len())).sum::<usize>();
 		for at in &inside {
 			claimed[*at] = true;
 		}
 		claimed[end] = true;
-		regions.push(SplitRegion { starts, end, period, unit });
+		regions.push(SplitRegion { starts, end, period, unit, read, stored });
 	}
 	Ok(regions)
+}
+/// The stored weight bytes one position reads of node `index`: all of a sum's,
+/// and of an expert table the share its routed experts hold.
+fn position_weight_bytes(graph: &Graph, index: usize) -> usize {
+	let (node, bytes) = (&graph.nodes[index], graph.stored.get(index).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len()));
+	match node.op {
+		Primitive::ExpertIn | Primitive::ExpertOut if node.argument[0] >= 1.0 => (bytes as f64 * node.argument[1] / node.argument[0]) as usize,
+		_ => bytes,
+	}
 }
 /// Rows `run` of a row-major weight of `rows` rows repeated `repeats` times
 /// (once per expert), as views of the stored bytes.
@@ -18418,7 +18459,7 @@ fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize
 /// this die's share of its inputs, which one exchange then sums over the dies.
 /// A large sum outside any region keeps a share of its rows, gathered after it;
 /// every other node runs whole on every die.
-fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
+fn shard_graph(graph: &Graph, die: usize, shares: &[f64], whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
 	require(die < shares.len() && shares.iter().all(|share| *share > 0.0), "a tensor split needs a positive share for every die")?;
 	let total = shares.iter().sum::<f64>();
 	let before = shares[..die].iter().sum::<f64>();
@@ -18427,7 +18468,7 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
 		let last = (count as f64 * (before + shares[die]) / total).round() as usize;
 		(first, last - first)
 	};
-	let regions = split_regions(graph, shares.len())?;
+	let regions = split_regions(graph, shares.len())?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
 	if tracing() && die == 0 {
 		for region in &regions {
 			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;

@@ -2055,6 +2055,7 @@ fn main() -> BuildResult<()> {
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("delta-chunk", "RECIPE_DELTA_CHUNK"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("tensor-split-region-bytes", "RECIPE_TENSOR_SPLIT_REGION_BYTES"),
 		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("nvidia-step-registers", "RECIPE_NVIDIA_STEP_REGISTERS"),
 		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
