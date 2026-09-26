@@ -2597,7 +2597,7 @@ ret i32 %handled
 define internal i32 @packed_lanes_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %routing, i32 %rows, i32 %terms, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span,
 i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %mode, i32 %hidden, i32 %experts, i32 %top,
-i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, i32 %in.share ) RECIPE_CONTRACTION_BODY { entry:
+ptr addrspace(1) %split.scratch, i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, i32 %in.share ) RECIPE_CONTRACTION_BODY { entry:
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -2673,6 +2673,34 @@ i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, 
 %fails.some = or i1 %top.fails, %down.fails
 %fails.none = xor i1 %fails.some, true
 %takes = and i1 %chunk.some, %fails.none
+; A plain sum with fewer groups of rows than workgroups, whose inputs fit one
+; chunk, splits each row's units across workgroups too: each takes a group of
+; rows and a slice of their units, leaves its parts in the split scratch, and
+; after a grid barrier every thread adds up rows.
+%split.fewer = icmp ult i32 %row.groups, %groups
+%split.able = icmp ne ptr addrspace(1) %split.scratch, null
+%split.whole = icmp eq i32 %chunk.units, %units
+%split.plain = icmp eq i32 %mode, 0
+%split.a = and i1 %split.fewer, %split.able
+%split.b = and i1 %split.whole, %split.plain
+%split = and i1 %split.a, %split.b
+%slices = udiv i32 %groups, %row.groups
+%split.row.group = urem i32 %group, %row.groups
+%split.slice = udiv i32 %group, %row.groups
+%split.live = icmp ult i32 %split.slice, %slices
+%split.step.waves = mul i32 %slices, %waves
+%split.slice.waves = mul i32 %split.slice, %waves
+%split.first.unit = add i32 %split.slice.waves, %wave
+%split.row.lane0 = mul i32 %split.row.group, %width
+%split.row = add i32 %split.row.lane0, %lane
+%split.row.in = icmp ult i32 %split.row, %rows
+%split.row.live = and i1 %split.live, %split.row.in
+%split.row.safe = select i1 %split.row.live, i32 %split.row, i32 0
+%split.row.wide = zext i32 %split.row.safe to i64
+%split.row.index = mul i64 %split.row.wide, %terms.wide
+%split.row.base = add i64 %weight.base, %split.row.index
+%split.threads.id.base = mul i32 %group, %block
+%split.thread = add i32 %split.threads.id.base, %lid
 %position.end = add i32 %out.begin, %out.span
 br i1 %takes, label %position.loop, label %exit
 position.loop:
@@ -2681,7 +2709,103 @@ position.loop:
 br i1 %position.more, label %position.step, label %exit
 position.step:
 %position = zext i32 %position.index to i64
+br i1 %split, label %split.stage, label %position.route
+position.route:
 br i1 %expert, label %route.entry, label %chunk.enter
+split.stage:
+%ss.c = phi i32 [ %lid, %position.step ], [ %ss.c.next, %split.stage.step ]
+%ss.more = icmp ult i32 %ss.c, %terms
+br i1 %ss.more, label %split.stage.step, label %split.staged
+split.stage.step:
+%ss.k.period = udiv i32 %ss.c, %in.share.nonzero
+%ss.k.within = urem i32 %ss.c, %in.share.nonzero
+%ss.k.base = mul i32 %ss.k.period, %in.period
+%ss.k.placed = add i32 %ss.k.base, %ss.k.within
+%ss.k.periodic = icmp ne i32 %in.period, 0
+%ss.k.share = select i1 %ss.k.periodic, i32 %ss.k.placed, i32 %ss.c
+%ss.k.global = add i32 %ss.k.share, %in.first
+%ss.channel = zext i32 %ss.k.global to i64
+%ss.index = mul i64 %ss.channel, %in.length.wide
+%ss.at = add i64 %ss.index, %position
+%ss.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %ss.at
+%ss.value = load double, ptr addrspace(1) %ss.ptr, align 8
+%ss.slot = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %ss.c
+store double %ss.value, ptr addrspace(3) %ss.slot, align 8
+%ss.c.next = add i32 %ss.c, %block
+br label %split.stage
+split.staged:
+call void @recipe.local.barrier()
+br label %split.unit
+split.unit:
+%su = phi i32 [ %split.first.unit, %split.staged ], [ %su.next, %split.unit.step ]
+%su.sum = phi RECIPE_STATE [ %state.zero, %split.staged ], [ %su.sum.next, %split.unit.step ]
+%su.more = icmp ult i32 %su, %units
+%su.go = and i1 %su.more, %split.live
+br i1 %su.go, label %split.unit.step, label %split.unit.done
+split.unit.step:
+%su.start = mul i32 %su, %unit
+%su.start.wide = zext i32 %su.start to i64
+%su.index = add i64 %split.row.base, %su.start.wide
+%su.x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %su.start
+%su.run = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %su.index, i32 %node, ptr addrspace(3) %su.x, i32 1, i64 %terms.wide)
+%su.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %su.sum, RECIPE_STATE %su.run)
+%su.next = add i32 %su, %split.step.waves
+br label %split.unit
+split.unit.done:
+%sp.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %parts, i32 %lid
+store RECIPE_STATE %su.sum, ptr addrspace(3) %sp.ptr, align RECIPE_STATE_ALIGN
+call void @recipe.local.barrier()
+%sp.lead = icmp eq i32 %wave, 0
+%sp.write = and i1 %sp.lead, %split.row.live
+br i1 %sp.write, label %split.parts, label %split.written
+split.parts:
+%sw = phi i32 [ 1, %split.unit.done ], [ %sw.next, %split.parts.step ]
+%sw.total = phi RECIPE_STATE [ %su.sum, %split.unit.done ], [ %sw.total.next, %split.parts.step ]
+%sw.more = icmp ult i32 %sw, %waves
+br i1 %sw.more, label %split.parts.step, label %split.parts.store
+split.parts.step:
+%sw.lane0 = mul i32 %sw, %width
+%sw.slot = add i32 %sw.lane0, %lane
+%sw.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) %parts, i32 %sw.slot
+%sw.value = load RECIPE_STATE, ptr addrspace(3) %sw.ptr, align RECIPE_STATE_ALIGN
+%sw.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sw.total, RECIPE_STATE %sw.value)
+%sw.next = add i32 %sw, 1
+br label %split.parts
+split.parts.store:
+%sg.slice = mul i32 %split.slice, %rows
+%sg.at = add i32 %sg.slice, %split.row
+%sg.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %split.scratch, i32 %sg.at
+store RECIPE_STATE %sw.total, ptr addrspace(1) %sg.ptr, align RECIPE_STATE_ALIGN
+br label %split.written
+split.written:
+call void @grid_barrier(i32 %threads)
+br label %split.gather
+split.gather:
+%sr = phi i32 [ %split.thread, %split.written ], [ %sr.next, %split.gathered ]
+%sr.more = icmp ult i32 %sr, %rows
+br i1 %sr.more, label %split.gather.row, label %split.done
+split.gather.row:
+%sa = phi i32 [ 0, %split.gather ], [ %sa.next, %split.gather.add ]
+%sa.total = phi RECIPE_STATE [ %state.zero, %split.gather ], [ %sa.total.next, %split.gather.add ]
+%sa.more = icmp ult i32 %sa, %slices
+br i1 %sa.more, label %split.gather.add, label %split.gathered.store
+split.gather.add:
+%sa.slice = mul i32 %sa, %rows
+%sa.at = add i32 %sa.slice, %sr
+%sa.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %split.scratch, i32 %sa.at
+%sa.value = load volatile RECIPE_STATE, ptr addrspace(1) %sa.ptr, align RECIPE_STATE_ALIGN
+%sa.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sa.total, RECIPE_STATE %sa.value)
+%sa.next = add i32 %sa, 1
+br label %split.gather.row
+split.gathered.store:
+call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 true, i1 true, i32 %sr, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position, i64 %weight.base, RECIPE_STATE %sa.total, i32 %row.first, i32 %row.period, i32 %row.share )
+br label %split.gathered
+split.gathered:
+%sr.next = add i32 %sr, %threads
+br label %split.gather
+split.done:
+call void @grid_barrier(i32 %threads)
+br label %chunk.done
 ; The first wave lists the experts the position routed to in ascending order,
 ; as the row body does; a slot no expert fills reads expert 0 and adds nothing.
 route.entry:

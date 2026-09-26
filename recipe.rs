@@ -4242,6 +4242,8 @@ impl NativeModelIr {
 			}
 			let node = &plan.node;
 			let v = self.variant(node);
+			// The run decoder a packed sum over stored weights calls, when it has one.
+			let key = self.run_key(index).unwrap_or_default();
 			let matrix = matrix && matrix_capable(self.node_precision(node));
 			let gradient_base = self.gradient_base(plan)?;
 			// The reverse pass differentiates the whole sequence at once.
@@ -4258,7 +4260,7 @@ impl NativeModelIr {
 					// the lane bodies cannot.
 					ir.push_str(&format!("br label %n{index}.pre\nn{index}.pre:\n"));
 					ir.push_str(&format!(
-						"%n{index}.tiling = icmp uge i32 {span}, 2\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_lanes4_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
+						"%n{index}.tiling = icmp uge i32 {span}, 2\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_lanes4_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n{scratch_gep}%n{index}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
 						pointer = pointer_type(backend),
 						source = pointers.source,
 						weights = pointers.weights,
@@ -4277,10 +4279,13 @@ impl NativeModelIr {
 						in_first = node.shard.terms.first,
 						in_period = node.shard.terms.period,
 						in_share = node.shard.terms.count,
+						scratch_gep = self.split_scratch_gep(backend, index),
+						scratch = self.split_scratch_name(backend, index),
 					));
 					let (begin, span) = (format!("%n{index}.last.begin"), format!("%n{index}.last.span"));
+					ir.push_str(&format!("%n{index}.rows.some = icmp ne i32 {span}, 0\nbr i1 %n{index}.rows.some, label %n{index}.rows, label %n{index}.rows.done\nn{index}.rows:\n"));
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+						"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
 						row_first = node.shard.rows.first,
 						row_period = node.shard.rows.period,
 						row_share = node.shard.rows.count,
@@ -4288,7 +4293,6 @@ impl NativeModelIr {
 						in_period = node.shard.terms.period,
 						in_share = node.shard.terms.count,
 						node = index + 1,
-						scratch_gep = self.split_scratch_gep(backend, index),
 						scratch = self.split_scratch_name(backend, index),
 						pointer = pointer_type(backend),
 						decode = plan.decode(index),
@@ -4302,6 +4306,7 @@ impl NativeModelIr {
 						bias = node.argument[2] == 0.0,
 						relu = node.argument[1] == 1.0,
 					));
+					ir.push_str(&format!("br label %n{index}.rows.done\nn{index}.rows.done:\n"));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Contraction) => {
@@ -4445,7 +4450,7 @@ impl NativeModelIr {
 					// The lane body takes the window, a row per lane; the row body takes
 					// what the lane body cannot.
 					ir.push_str(&format!(
-						"%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 {begin}, %n{index}.laned\n%n{index}.last.span = sub i32 {span}, %n{index}.laned\n{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.last.begin, i32 %n{index}.last.span, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+						"{scratch_gep}%n{index}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 {begin}, %n{index}.laned\n%n{index}.last.span = sub i32 {span}, %n{index}.laned\n%n{index}.rows.some = icmp ne i32 %n{index}.last.span, 0\nbr i1 %n{index}.rows.some, label %n{index}.rows, label %n{index}.rows.done\nn{index}.rows:\ncall void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.last.begin, i32 %n{index}.last.span, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.rows.done\nn{index}.rows.done:\n",
 						// A split expert table holds a share of every expert: the gate and
 						// up tables its hidden rows (placed within each expert's period),
 						// the down table its output rows.
@@ -7280,11 +7285,11 @@ impl NativeModelIr {
 				if self.variant(&plan.node) != suffix {
 					continue;
 				}
-				let Some((format, native, block, stride)) = eligible(plan) else { continue };
+				let Some((_, native, block, stride)) = eligible(plan) else { continue };
 				// Nodes of one format and row layout share one call, so its decoder is
 				// inlined once.
 				let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
-				let name = if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() };
+				let name = self.run_key(index).ok_or_else(|| RecipeError::new("a run decoder's node has no run format"))?;
 				arms.push_str(&format!("i32 {}, label %{name}\n", index + 1));
 				if !formats.iter().any(|(known, ..)| *known == name) {
 					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
@@ -7300,6 +7305,47 @@ impl NativeModelIr {
 			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
 			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
 			let _ = ty;
+		}
+		Ok(ir)
+	}
+	/// The name of node `index`'s run decoder: its stored format, and the lanes
+	/// its rows interleave when they do.
+	fn run_key(&self, index: usize) -> Option<String> {
+		let (format, ..) = dot_run_format(&self.plans[index])?;
+		let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+		Some(if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() })
+	}
+	/// Copies of the lane bodies that call one run decoder directly. The shared
+	/// bodies reach every format's decoder through one switch and so hold every
+	/// decoder's registers, spilling them at each call; a copy holds one.
+	fn specialize_lane_bodies(&self, mut ir: String) -> Result<String> {
+		let mut done = std::collections::BTreeSet::new();
+		for index in 0..self.plans.len() {
+			let Some(key) = self.run_key(index) else { continue };
+			let v = self.variant(&self.plans[index].node);
+			if !done.insert((v, key.clone())) {
+				continue;
+			}
+			for (body, generic, direct) in [("packed_lanes_body", "recipe.model.dot.run", "recipe_model_run_"), ("packed_lanes4_body", "recipe.model.dot.run4", "recipe_model_run4_")] {
+				let name = format!("{body}{v}");
+				let Some((start, end)) = definition_span(&ir, &name) else { continue };
+				let mut copy = ir[start..end].replacen(&format!("@{name}("), &format!("@{name}.{key}("), 1);
+				// Each call through the switch drops the node it switched on.
+				let call = format!("@{generic}{v}(");
+				let mut direct_calls = String::with_capacity(copy.len());
+				while let Some(at) = copy.find(&call) {
+					let after = at + call.len();
+					let node = copy[after..].find(" i32 %node,").ok_or_else(|| RecipeError::new(format!("{name} calls the run switch without a node")))?;
+					direct_calls.push_str(&copy[..at]);
+					direct_calls.push_str(&format!("@{direct}{key}{v}("));
+					direct_calls.push_str(&copy[after..after + node]);
+					copy = copy[after + node + " i32 %node,".len()..].to_owned();
+				}
+				direct_calls.push_str(&copy);
+				ir.push('\n');
+				ir.push_str(&direct_calls);
+				ir.push('\n');
+			}
 		}
 		Ok(ir)
 	}
@@ -7790,6 +7836,7 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		ir.push_str(&body);
+		let ir = self.specialize_lane_bodies(ir)?;
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
