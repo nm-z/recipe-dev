@@ -355,16 +355,27 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
+  # 2. recipe/linux-gpu -- NVIDIA on an Arch Linux EC2 worker, driven by this
+  #    controller over a per-run SSH key.
   # ---------------------------------------------------------------------------
   linux-gpu:
     name: linux/nv
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
+    environment: recipe-windows-gpu
+    # One worker at a time fits the smallest G-instance quota.
+    concurrency:
+      group: recipe-aws-linux-nv
+      cancel-in-progress: false
     env:
       CELL: recipe/linux-gpu
-      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_NV_INSTANCE_TYPE: ${{ vars.AWS_NV_INSTANCE_TYPE || 'g4dn.xlarge' }}
+      AWS_ARCH_AMI_OWNER: ${{ vars.AWS_ARCH_AMI_OWNER }}
+      AWS_ARCH_SSH_USER: ${{ vars.AWS_ARCH_SSH_USER }}
     steps:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
@@ -384,46 +395,43 @@ jobs:
           set -euo pipefail
           actual="$(sha256sum snapshot/recipe-source.tar.gz | cut -d' ' -f1)"
           [ "$actual" = "${{ needs.prepare.outputs.snapshot_sha256 }}" ] || { echo "snapshot checksum mismatch" >&2; exit 1; }
-          mkdir -p "$GITHUB_WORKSPACE/candidate"
-          tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
-          echo "snapshot verified and extracted to candidate sha256=$actual"
+          echo "snapshot verified sha256=$actual"
 
-      - name: Require the Camber control credential
+      - name: Require the AWS credential
         run: |
           set -euo pipefail
           mkdir -p evidence
-          if [ -z "${CAMBER_API_KEY:-}" ]; then
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
             cat > evidence/blocker.json <<'JSON'
           {
-            "blocker": "camber-credential-absent",
-            "detail": "CAMBER_API_KEY is not available to this run. A fork pull request never receives it, and it has not been configured for this repository. The Camber student GPU allowance must be redeemed and the control credential stored as a repository secret before this cell can execute.",
-            "resolution": "Redeem the Camber Student Pack offer, confirm the workspace has the student GPU allowance, then store the API key as the CAMBER_API_KEY repository secret."
+            "blocker": "aws-credential-absent",
+            "detail": "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not available to this run. A fork pull request never receives them.",
+            "resolution": "Store an access key as the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets of the recipe-windows-gpu environment."
           }
           JSON
             cat evidence/blocker.json
-            echo "recipe/linux-gpu is blocked: the Camber control credential is absent" >&2
+            echo "recipe/linux-gpu is blocked: the AWS credential is absent" >&2
             exit 1
           fi
 
-      - name: Submit, poll and collect the Camber GPU job
-        id: camber
+      - name: Provision, execute and collect the Arch Linux NVIDIA worker
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-run.sh"
         env:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
 
-      - name: Terminate the Camber job
+      - name: Terminate and clean up the worker
         if: always()
         run: |
           set -euo pipefail
-          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
-            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
+          if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-cleanup.sh"
           else
-            echo "no Camber job to terminate"
+            echo "no AWS resources to clean up"
           fi
 
       - name: Write the cell evidence
