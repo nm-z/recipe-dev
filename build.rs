@@ -2050,6 +2050,7 @@ fn main() -> BuildResult<()> {
 		("contraction-matrix-split-span", "RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"),
 		("contraction-chunk-k", "RECIPE_CONTRACTION_CHUNK_K"),
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
+		("lookup-readers", "RECIPE_LOOKUP_READERS"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("delta-chunk", "RECIPE_DELTA_CHUNK"),

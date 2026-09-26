@@ -14362,17 +14362,11 @@ impl StoredBytes {
 	fn joined(parts: Vec<Self>) -> Self {
 		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
 	}
-	/// Asks the kernel to read the mapped runs into memory ahead of use, so later
-	/// reads of scattered rows find their pages resident instead of on the disk.
-	fn prefetch(&self) {
+	/// Tells the kernel the mapped runs are read at scattered places, so a read
+	/// brings in its own page and not the pages around it.
+	fn scattered(&self) {
 		#[cfg(unix)]
-		self.advise(3);
-	}
-	/// Gives the mapped runs' pages back to the machine once their bytes are on
-	/// the device, so the memory holds what the machine still reads.
-	fn release(&self) {
-		#[cfg(target_os = "linux")]
-		self.advise(21);
+		self.advise(1);
 	}
 	#[cfg(unix)]
 	fn advise(&self, advice: i32) {
@@ -21901,21 +21895,13 @@ impl NativeTape {
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
-				// Every position reads scattered rows of the table from the machine's
-				// memory: its pages come in now, while the model loads.
-				table.bytes.prefetch();
+				// A position reads a few scattered rows of a table far larger than the
+				// machine's memory: each read takes only its own page from the disk.
+				table.bytes.scattered();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
-			}
-		}
-		// Every weight but the machine's lookup tables is on the device now.
-		for (index, node) in graph.nodes.iter().enumerate() {
-			if node.op != Primitive::Lookup {
-				for stored in [graph.stored.get(index), graph.requantize.get(index)].into_iter().flatten().flatten() {
-					stored.bytes.release();
-				}
 			}
 		}
 		let context_resets = layout.context_resets.clone();
@@ -22075,10 +22061,18 @@ impl NativeTape {
 			let channels = lookup.hash.heads() * lookup.width;
 			for row in 0..self.rows as usize {
 				let ids = tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
+				// The rows of a window are scattered reads of the machine's disk or
+				// memory: they are read at once, each waiting on its own page.
+				let indices = (begin..end).flat_map(|position| lookup.hash.rows_at(&ids, position)).collect::<Vec<_>>();
+				let readers = indices.len().clamp(1, natural("lookup readers", env!("RECIPE_LOOKUP_READERS"))?);
+				let parts = std::thread::scope(|scope| {
+					let handles = indices.chunks(indices.len().div_ceil(readers).max(1)).map(|part| scope.spawn(move || part.iter().map(|index| ngram::table_row(&lookup.table, lookup.width, *index)).collect::<Result<Vec<_>>>())).collect::<Vec<_>>();
+					handles.into_iter().map(|handle| handle.join().map_err(|_| RecipeError::new("a lookup reader panicked"))?).collect::<Result<Vec<_>>>()
+				})?;
 				let mut staged = Vec::with_capacity((end - begin) * channels);
-				for position in begin..end {
-					for index in lookup.hash.rows_at(&ids, position) {
-						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
+				for rows in parts {
+					for row in rows {
+						staged.extend(row);
 					}
 				}
 				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin - origin, "lookup slot")?, channels, "lookup staging offset")?;

@@ -32,6 +32,8 @@ contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
+# scattered lookup-table rows a window reads at once
+lookup-readers = 16
 placement-launch-reserve-bytes = 134217728
 nvidia-step-registers = 128
 # relocatable ptxas held ~60 bytes of RAM per byte of Flash Next IR (2026-09-26)
