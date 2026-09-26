@@ -2337,10 +2337,11 @@ store:
 store double %result, ptr addrspace(1) %out.ptr, align 8
 ret void
 }
-; Rows of a plain sum over stored weights at whole tiles of four positions from
+; Rows of a plain sum over stored weights at tiles of four positions from
 ; %out.begin, one row per lane as in the lane body: each decoded weight adds
-; into the lane's four positions. It returns the positions it took: the whole
-; tiles, or none when the tile cannot hold a unit for four positions.
+; into the lane's four positions, the last tile's past the window left unused.
+; It takes a window of two positions or more whole, and none when the window
+; is one position or the tile cannot hold a unit for four positions.
 define internal i32 @packed_lanes4_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %rows, i32 %terms, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span,
 i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, i32 %in.share ) RECIPE_CONTRACTION_BODY { entry:
@@ -2399,8 +2400,12 @@ i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, 
 %rounds = udiv i32 %rounds.raised, %teams
 %leads = icmp eq i32 %part, 0
 %chunk.some = icmp ugt i32 %chunk.units, 0
-%tiles.raw = udiv i32 %out.span, 4
-%tiles = select i1 %chunk.some, i32 %tiles.raw, i32 0
+; A window of two or more positions takes tiles of four, the last one partial.
+%tiles.over = add i32 %out.span, 3
+%tiles.raw = udiv i32 %tiles.over, 4
+%tiles.span = icmp uge i32 %out.span, 2
+%tiles.take = and i1 %chunk.some, %tiles.span
+%tiles = select i1 %tiles.take, i32 %tiles.raw, i32 0
 %lane.parts = mul i32 %lid, 4
 br label %tile.loop
 tile.loop:
@@ -2409,6 +2414,9 @@ tile.loop:
 br i1 %tile.more, label %tile.step, label %exit
 tile.step:
 %tile.first = mul i32 %tile, 4
+%tile.remaining = sub i32 %out.span, %tile.first
+%tile.whole = icmp ugt i32 %tile.remaining, 4
+%tile.count = select i1 %tile.whole, i32 4, i32 %tile.remaining
 %position0.index = add i32 %out.begin, %tile.first
 %position0 = zext i32 %position0.index to i64
 br label %chunk.loop
@@ -2444,8 +2452,11 @@ stage.step:
 %stage.t.wide = zext i32 %stage.t to i64
 %stage.position = add i64 %position0, %stage.t.wide
 %stage.at = add i64 %stage.index, %stage.position
-%stage.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.at
-%stage.value = load double, ptr addrspace(1) %stage.ptr, align 8
+%stage.in = icmp ult i32 %stage.t, %tile.count
+%stage.at.safe = select i1 %stage.in, i64 %stage.at, i64 %stage.index
+%stage.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.at.safe
+%stage.loaded = load double, ptr addrspace(1) %stage.ptr, align 8
+%stage.value = select i1 %stage.in, double %stage.loaded, double 0.0
 %stage.column = mul i32 %stage.t, %chunk.span
 %stage.place = add i32 %stage.column, %stage.local
 %stage.slot = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %stage.place
@@ -2545,8 +2556,17 @@ gather.store:
 %position2 = add i64 %position0, 2
 %position3 = add i64 %position0, 3
 call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position0, i64 %weight.base, RECIPE_STATE %total0, i32 %row.first, i32 %row.period, i32 %row.share )
+%store1 = icmp ugt i32 %tile.count, 1
+br i1 %store1, label %gather.store1, label %round.done
+gather.store1:
 call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position1, i64 %weight.base, RECIPE_STATE %total1, i32 %row.first, i32 %row.period, i32 %row.share )
+%store2 = icmp ugt i32 %tile.count, 2
+br i1 %store2, label %gather.store2, label %round.done
+gather.store2:
 call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position2, i64 %weight.base, RECIPE_STATE %total2, i32 %row.first, i32 %row.period, i32 %row.share )
+%store3 = icmp ugt i32 %tile.count, 3
+br i1 %store3, label %gather.store3, label %round.done
+gather.store3:
 call void @packed_row_store( ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %decode, i1 %has.bias, i1 %relu, i1 %chunk.first, i1 %chunk.last, i32 %row, i32 %rows, i32 %terms, i64 %out.length.wide, i64 %position3, i64 %weight.base, RECIPE_STATE %total3, i32 %row.first, i32 %row.period, i32 %row.share )
 br label %round.done
 round.done:
@@ -2561,7 +2581,8 @@ chunk.done:
 %tile.next = add i32 %tile, 1
 br label %tile.loop
 exit:
-%handled = mul i32 %tiles, 4
+%tiles.none = icmp eq i32 %tiles, 0
+%handled = select i1 %tiles.none, i32 0, i32 %out.span
 ret i32 %handled
 }
 ; Rows of a sum over stored weights at the positions %out.begin to
@@ -3680,12 +3701,19 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narro
 %adjoint.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %adjoint, i64 %p %prior = load RECIPE_STATE, ptr addrspace(1) %adjoint.ptr, align RECIPE_STATE_ALIGN
 %total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %prior, RECIPE_STATE %sum) store RECIPE_STATE %total, ptr addrspace(1) %adjoint.ptr, align RECIPE_STATE_ALIGN ret void }
 ; Output element %p of the narrow batch is the gate-weighted mean of its lanes: the sum in lane order times 1 / lanes; without a gate every lane weighs one.
-define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+; A pick of lane l + 1 reads lane l alone; pick 0 is the gated mean of the lanes.
+define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated, i32 %pick ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %narrow %within = urem i64 %p, %narrow
 %lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value)
-%row.base = mul i64 %row, %per.row %base = add i64 %row.base, %within br label %loop loop:
-%lane = phi i64 [ 0, %entry ], [ %lane.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ] %more = icmp ult i64 %lane, %lanes.wide
+%row.base = mul i64 %row, %per.row %base = add i64 %row.base, %within
+%picked = icmp ne i32 %pick, 0 br i1 %picked, label %take, label %base.ready
+base.ready: br label %loop
+take: %pick.lane = sub i32 %pick, 1 %pick.wide = zext i32 %pick.lane to i64 %pick.offset = mul i64 %pick.wide, %narrow %pick.index = add i64 %base, %pick.offset
+%pick.ptr = getelementptr inbounds double, ptr addrspace(1) %stream, i64 %pick.index %pick.value = load double, ptr addrspace(1) %pick.ptr, align 8
+%pick.output = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %pick.value, ptr addrspace(1) %pick.output, align 8 ret void
+loop:
+%lane = phi i64 [ 0, %base.ready ], [ %lane.next, %step ] %sum = phi double [ 0.0, %base.ready ], [ %sum.next, %step ] %more = icmp ult i64 %lane, %lanes.wide
 br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narrow %index = add i64 %base, %lane.offset
 %stream.ptr = getelementptr inbounds double, ptr addrspace(1) %stream, i64 %index %value = load double, ptr addrspace(1) %stream.ptr, align 8
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %index %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
@@ -3712,7 +3740,8 @@ br i1 %gated, label %gate.pass, label %exit gate.pass:
 %gate.adjoint.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %gate.adjoint, i64 %p %gate.prior = load RECIPE_STATE, ptr addrspace(1) %gate.adjoint.ptr, align RECIPE_STATE_ALIGN
 %gate.sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %gate.prior, RECIPE_STATE %gate.term) store RECIPE_STATE %gate.sum, ptr addrspace(1) %gate.adjoint.ptr, align RECIPE_STATE_ALIGN br label %exit exit: ret void }
 ; Output element %p of the widened batch is its lane's write gate times the branch output channel.
-define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+; A pick of lane l + 1 writes the branch into lane l and zeros every other lane.
+define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated, i32 %pick ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %per.row %within = urem i64 %p, %per.row
 %lane.channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide %channel = urem i64 %lane.channel, %channels.wide %lane = udiv i64 %lane.channel, %channels.wide
@@ -3720,7 +3749,9 @@ define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspac
 %gate.row = mul i64 %row, %lanes.wide %gate.lane = add i64 %gate.row, %lane %gate.lane.base = mul i64 %gate.lane, %length.wide %g = add i64 %gate.lane.base, %position
 %branch.ptr = getelementptr inbounds double, ptr addrspace(1) %branch, i64 %y %value = load double, ptr addrspace(1) %branch.ptr, align 8
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %g %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
-%weight = select i1 %gated, double %gate.loaded, double 1.0 %product = call double @recipe.mul(double %weight, double %value)
+%weight.gated = select i1 %gated, double %gate.loaded, double 1.0 %pick.lane = sub i32 %pick, 1 %pick.wide = zext i32 %pick.lane to i64 %pick.here = icmp eq i64 %lane, %pick.wide
+%pick.weight = select i1 %pick.here, double 1.0, double 0.0 %pick.zero = call double @recipe.from.u1(i1 false) %pick.value = select i1 %pick.here, double %value, double %pick.zero %picked = icmp ne i32 %pick, 0 %weight = select i1 %picked, double %pick.weight, double %weight.gated
+%product.raw = call double @recipe.mul(double %weight, double %value) %product = select i1 %picked, double %pick.value, double %product.raw
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %product, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; Branch element %p sums gate * adjoint over its lanes in lane order.
 define internal void @outer_reverse_branch_body( ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:

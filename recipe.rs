@@ -2079,6 +2079,9 @@ fn retained_outputs(graph: &Graph) -> Vec<bool> {
 	if let Some(last) = retained.last_mut() {
 		*last = true;
 	}
+	if let Some(stream) = graph.stream.and_then(|stream| retained.get_mut(stream)) {
+		*stream = true;
+	}
 	for (index, node) in graph.nodes.iter().enumerate() {
 		if node.op == Primitive::Scan {
 			retained[index] = true;
@@ -4250,12 +4253,12 @@ impl NativeModelIr {
 				(false, Primitive::Contraction)
 					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
 				{
-					// Whole tiles of four positions take the four-position lane body; the
-					// rest of the window, a one-position step among them, takes the lane
-					// body, and the row body takes what the lane bodies cannot.
+					// A window of two positions or more takes the four-position lane body;
+					// a one-position step takes the lane body, and the row body takes what
+					// the lane bodies cannot.
 					ir.push_str(&format!("br label %n{index}.pre\nn{index}.pre:\n"));
 					ir.push_str(&format!(
-						"%n{index}.tiling = icmp uge i32 {span}, 4\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_lanes4_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
+						"%n{index}.tiling = icmp uge i32 {span}, 2\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_lanes4_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
 						pointer = pointer_type(backend),
 						source = pointers.source,
 						weights = pointers.weights,
@@ -4500,7 +4503,8 @@ impl NativeModelIr {
 				(false, Primitive::Read) => {
 					emit_runtime_window_loop(&mut ir, index, "read", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4616,7 +4620,8 @@ impl NativeModelIr {
 				(false, Primitive::Outer) => {
 					emit_runtime_window_loop(&mut ir, index, "outer", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -5147,12 +5152,14 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Read) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!("call void @read_reverse_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Outer) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_reverse_branch_body{v}( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
@@ -9377,6 +9384,30 @@ mod gguf {
 			}
 			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
 		}
+		/// This file with `other` beside it: its tensors join this file's, and its
+		/// metadata fills the keys this file does not set.
+		pub(super) fn joined(&self, other: Gguf) -> Gguf {
+			let base = self.shards.len();
+			let mut joined = self.clone();
+			joined.shards.extend(other.shards);
+			joined.tensors.extend(other.tensors.into_iter().map(|mut tensor| {
+				tensor.shard += base;
+				tensor
+			}));
+			// A per-layer array that covers more layers, the draft head's among
+			// them, replaces the shorter one.
+			for (key, value) in other.metadata {
+				match joined.metadata.iter_mut().find(|(known, _)| *known == key) {
+					Some((_, known)) => {
+						if let (GgufValue::Array(longer), GgufValue::Array(shorter)) = (&value, &*known) && longer.len() > shorter.len() {
+							*known = value;
+						}
+					}
+					None => joined.metadata.push((key, value)),
+				}
+			}
+			joined
+		}
 		/// Parses one shard's header.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
 			let mapping = Mapping::open(path)?;
@@ -11361,6 +11392,7 @@ mod bundle {
 					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Join(lanes) => format!("join,{lanes}"),
 			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
@@ -11535,6 +11567,7 @@ mod bundle {
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
+			"join" => Ok(Operation::Join(value_at(fields.next(), "joined lanes")?)),
 			"norm" => Ok(Operation::Norm),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -12750,6 +12783,8 @@ enum Operation {
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
+	/// A stream of that many lanes from an input of one more: see `Model::join`.
+	Join(usize),
 	/// A normalization that leads a model: the block's own normalization is the
 	/// only thing it does, so the model input is normalized before its first block.
 	Norm,
@@ -13437,6 +13472,14 @@ impl Model {
 	/// whatever width the stream has there.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
 		self.push(Operation::Ple(table.block()))
+	}
+	/// A stream of `lanes` lanes from an input of `lanes + 1` lanes of one width,
+	/// whose last lane is a vector every lane joins: the vector and each lane are
+	/// normalized, each lane follows the vector into one projection shared by
+	/// every lane, and the projected lanes are the stream the hyper-connections
+	/// after it carry.
+	pub fn join(&self, lanes: usize) -> Self {
+		self.push(Operation::Join(lanes))
 	}
 	/// Normalizes the preceding block's output. Leading a model, it normalizes
 	/// the model input before the first block, which is the pre-normalization
@@ -15002,6 +15045,7 @@ impl Operation {
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
+			Self::Join(_) => "join",
 			Self::Norm => "norm",
 			Self::Glu(..) => "glu",
 		}
@@ -15573,7 +15617,7 @@ impl Gguf {
 	pub fn place(&self, blocks: &Model, positions: usize, split: &[usize]) -> Placed {
 		let model = with_last_projection(blocks);
 		let plan = conventional_plan(self, &model).unwrap_or_else(|error| panic!("{error}"));
-		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		let bound = Bound { file: self.clone(), draft: None, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
 		selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
@@ -15761,6 +15805,8 @@ pub struct Bound {
 	blocks: usize,
 	tensors: usize,
 	vocabulary: usize,
+	/// The draft head the file holds beside the model: its blocks and plan.
+	draft: Option<(Model, Binding)>,
 }
 impl Gguf {
 	/// The model this file describes: `general.architecture` selects the row of
@@ -15770,6 +15816,12 @@ impl Gguf {
 	/// tensor the file lacks is an error here, before any device is touched.
 	pub fn model(&self) -> Bound {
 		Builder::build(self).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// This file with the GGUF at `path` beside it, such as a draft head's file
+	/// that holds its own layer and reads the rest of the model from this one.
+	pub fn with(&self, path: impl AsRef<Path>) -> Gguf {
+		let other = resolve_path(path.as_ref()).and_then(|path| Gguf::open(&path)).unwrap_or_else(|error| panic!("{error}"));
+		self.joined(other)
 	}
 }
 impl Bound {
@@ -15954,10 +16006,67 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
+		// The draft head's layers follow the model's: a builder of its own binds
+		// them, reading the model's output where the head names none.
+		let draft = match builder.integer_or("nextn_predict_layers", 0)? {
+			0 => None,
+			1 => {
+				let mut drafter = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+				let draft = drafter.draft(builder.integer("block_count")?, vocabulary, &dimensions, file)?;
+				builder.consumed.extend(drafter.consumed);
+				Some((draft, drafter.plan))
+			}
+			layers => return Err(RecipeError::new(format!("the file names {layers} draft head layers; a draft head of one layer chains itself"))),
+		};
 		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.consumed.len();
-		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
+		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary, draft })
+	}
+	/// The draft head of layer `layer`: the model's stream joined with the next
+	/// id's embedding, the layer's attention and feed-forward on that stream, and
+	/// the head's own mixer before the model's output.
+	fn draft(&mut self, layer: usize, vocabulary: usize, dimensions: &Dimensions, file: &Gguf) -> Result<Model> {
+		let (lanes, _) = dimensions.hyper.ok_or_else(|| RecipeError::new("a draft head joins a hyper-connection stream, and this model has none"))?;
+		let width = dimensions.width;
+		let name = |suffix: &str| format!("blk.{layer}.nextn.{suffix}");
+		let role = format!("block {layer} draft head");
+		let mut model = recipe.model();
+		if self.present("attention.layer_norm_rms_epsilon") {
+			model = model.e(file.float_at(&self.key("attention.layer_norm_rms_epsilon"))?);
+		}
+		// The join's normalizations and its projection shared by every lane.
+		self.whole(&name("enorm.weight"), &role)?;
+		let hnorm = self.tensor(&name("hnorm.weight"), &role)?;
+		let scales = file.values(&hnorm)?;
+		require(scales.len() == lanes * width, format!("{} holds {} values; {role} normalizes {lanes} lanes of {width}", hnorm.name, scales.len()))?;
+		let projection = self.projection(&name("eh_proj.weight"), &role, 2 * width, width)?;
+		for lane in 0..lanes {
+			self.slot(vec![Plane::Owned { name: format!("{} (lane {lane})", hnorm.name), values: scales[lane * width..(lane + 1) * width].to_vec() }]);
+			self.mapped(vec![projection.clone()]);
+		}
+		model = model.join(lanes);
+		let branch = self.open(layer, "attn", dimensions)?;
+		let branch = self.attention(branch, layer, dimensions)?;
+		let branch = self.post(layer, "attn", branch, dimensions)?;
+		model = self.close(model, branch, dimensions);
+		let branch = self.open(layer, "ffn", dimensions)?;
+		let branch = match &dimensions.experts {
+			Some(experts) => self.experts(branch, layer, experts, dimensions)?,
+			None => self.feed_forward(branch, layer, dimensions)?,
+		};
+		let branch = self.post(layer, "ffn", branch, dimensions)?;
+		model = self.close(model, branch, dimensions);
+		self.whole(&name("hc_head_norm.weight"), "the draft head mixer normalization")?;
+		self.whole(&name("hc_head_down.weight"), "the draft head mixer read gate")?;
+		self.whole(&name("hc_head_up.weight"), "the draft head mixer read gate")?;
+		model = model.layer(vocabulary);
+		let output = match self.optional("output.weight") {
+			Some(output) => output,
+			None => self.tensor("token_embd.weight", "the draft head output")?,
+		};
+		self.mapped(vec![output]);
+		Ok(model)
 	}
 	fn key(&self, suffix: &str) -> String {
 		format!("{}.{suffix}", self.architecture)
@@ -15999,7 +16108,8 @@ impl<'a> Builder<'a> {
 		}
 	}
 	fn dimensions(&self) -> Result<Dimensions> {
-		let layers = self.integer("block_count")?;
+		// A draft head's layers follow the model's own.
+		let layers = self.integer("block_count")? + self.integer_or("nextn_predict_layers", 0)?;
 		let width = self.integer("embedding_length")?;
 		let heads = self.integer("attention.head_count")?;
 		let kv = self.layer_integers("attention.head_count_kv", heads, layers)?;
@@ -16701,7 +16811,7 @@ impl Infer {
 			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
 			None => ceiling,
 		};
-		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		let bound = Bound { file, draft: None, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
 		let placed = place_bound(&bound, sequence, &[], devices)?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
@@ -17146,6 +17256,9 @@ pub struct Generation {
 	pub cached: usize,
 	pub prefill_seconds: f64,
 	pub generation_seconds: f64,
+	/// Ids the decode drafted, and those its greedy choice kept.
+	pub drafted: usize,
+	pub accepted: usize,
 }
 /// Only evaluated tokens belong here. The final sampled token has no KV state
 /// until the next forward evaluates it. Logits stay in machine RAM.
@@ -17611,7 +17724,7 @@ fn decode_sequence(
 	// A shorter prompt needs its own terminal logits. Earlier KV positions are
 	// still valid, but the last position must produce that output again.
 	if cached == prompt.len() && cached != state.ids.len() { cached = cached.saturating_sub(1); }
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0 };
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), cached, prefill_seconds: 0.0, generation_seconds: 0.0, drafted: 0, accepted: 0 };
 	let prefill_started = Instant::now();
 	let mut generation_started = None;
 	let mut ended = None;
@@ -17627,7 +17740,7 @@ fn decode_sequence(
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
 		// A step past the prefill checks its drafts with the id it extends.
 		let limit = sampler.draft.min(budget.saturating_sub(step + 1));
-		if step > 0 && settled + 1 == reached && limit > 0 && let Some(drafts) = drafting.as_deref_mut().map(|drafting| drafting.draft(&generation.ids, limit)).transpose()?.filter(|drafts| !drafts.is_empty()) {
+		if step > 0 && settled + 2 >= reached && settled < reached && limit > 0 && let Some(drafts) = drafting.as_deref_mut().map(|drafting| drafting.draft(&generation.ids, limit)).transpose()?.filter(|drafts| !drafts.is_empty()) {
 			let drafting = drafting.as_deref_mut().ok_or_else(|| RecipeError::new("drafting is absent"))?;
 			drafting.keep()?;
 			for (offset, id) in drafts.iter().enumerate() {
@@ -17635,6 +17748,7 @@ fn decode_sequence(
 			}
 			let end = reached + drafts.len() as u32;
 			let columns = drafting.verify(samples, settled, end, drafts.len() + 1)?;
+			generation.drafted += drafts.len();
 			let mut stopped = false;
 			for (offset, column) in columns.iter().enumerate() {
 				let id = sampler.sample(column, &generation.ids);
@@ -17652,17 +17766,22 @@ fn decode_sequence(
 				if stopped || drafts.get(offset) != Some(&id) {
 					break;
 				}
+				generation.accepted += 1;
 			}
-			// The tapes ran every draft; the positions after the last id kept are
-			// taken back and the kept ones run again from the state before them.
+			// The tapes ran every draft. When one is rejected they go back to the
+			// state before the window, and the kept positions run again: all but
+			// the last in a window of their own, and the last in the next step's
+			// window beside its drafts.
 			let kept = narrow(generation.ids.len() - 1, "decode position")? as u32;
 			if kept < end {
 				drafting.restore()?;
-				if kept > settled {
-					logits(samples, settled, kept)?;
+				if kept > settled + 1 {
+					logits(samples, settled, kept - 1)?;
+					settled = kept - 1;
 				}
+			} else {
+				settled = kept;
 			}
-			settled = kept;
 			state.ids.clear();
 			state.ids.extend_from_slice(&generation.ids[..settled as usize]);
 			if stopped { break; }
@@ -17722,7 +17841,17 @@ struct PlacedDrafting<'a> {
 }
 impl Drafting for PlacedDrafting<'_> {
 	fn draft(&mut self, ids: &[u32], limit: usize) -> Result<Vec<u32>> {
-		Ok(ngram_draft(ids, limit))
+		let Some(draft) = &self.placed.draft else { return Ok(ngram_draft(ids, limit)) };
+		let Some(mut logits) = self.placed.run_draft(draft, ids)? else { return Ok(Vec::new()) };
+		if let PlacedSource::Bound(_, suppressed) = &self.placed.source {
+			for id in suppressed {
+				if let Some(logit) = logits.get_mut(*id as usize) {
+					*logit = -f64::MAX;
+				}
+			}
+		}
+		let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(id, _)| id as u32);
+		Ok(best.into_iter().take(limit).collect())
 	}
 	fn keep(&mut self) -> Result<()> {
 		self.placed.tapes.iter().flatten().try_for_each(NativeTape::keep_carried)
@@ -17770,6 +17899,24 @@ pub struct Placed {
 	/// A tensor split's shared machine RAM: its tapes are dies that each run
 	/// every layer at once rather than ranges run one after another.
 	exchange: Option<ExchangeBuffer>,
+	/// The draft head placed beside the model, when the file holds one.
+	draft: Option<PlacedDraft>,
+}
+/// A draft head on one device: it runs over every position the decode has
+/// settled, each position's input the model's stream there joined with the
+/// embedding of the id after it, and its output at the last such position
+/// drafts the id after the next.
+struct PlacedDraft {
+	tapes: Vec<NativeTape>,
+	/// The lanes and width of the stream it joins.
+	lanes: usize,
+	width: usize,
+	/// The model's embedding, whose row of the next id each position joins.
+	embedding: StoredWeight,
+	/// The model's stream at the positions the head has not yet run.
+	streams: Mutex<std::collections::BTreeMap<u32, Vec<f64>>>,
+	/// The positions the head has run.
+	reached: std::sync::atomic::AtomicU32,
 }
 /// Pinned machine RAM mapped into every die of a tensor split, which their
 /// exchanges write and read.
@@ -18067,6 +18214,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		bound_values: Vec::new(),
 		bias: graph.bias,
 		epsilon: graph.epsilon,
+		stream: graph.stream.filter(|stream| (start..end).contains(stream)).map(|stream| stream - start),
 	})
 }
 /// A stored weight a split can slice: packed, one format, every byte on the
@@ -18319,7 +18467,7 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
 		}
 		remap.push(nodes.len() as i32 - 1);
 	}
-	Ok(Graph { source: map(graph.source, &remap), nodes, stored, requantize, state: TrainingState::default(), bound: None, bound_values: Vec::new(), ..graph.clone() })
+	Ok(Graph { source: map(graph.source, &remap), stream: graph.stream.and_then(|stream| usize::try_from(remap[stream]).ok()), nodes, stored, requantize, state: TrainingState::default(), bound: None, bound_values: Vec::new(), ..graph.clone() })
 }
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
@@ -18401,7 +18549,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved, exchange: None })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved, exchange: None , draft: None })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -18418,10 +18566,27 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	if env!("RECIPE_DEVICE_SPLIT") == "tensor" && devices.len() > 1 && split.is_empty() {
 		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 		let (dies, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
-		return Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![dies], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange) });
+		let draft = place_draft(model, positions, devices)?;
+		return Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![dies], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange), draft });
 	}
 	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
+	let draft = place_draft(model, positions, devices)?;
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None, draft })
+}
+/// The model's draft head, when it has one, placed whole on the device with the
+/// most memory left after the model.
+fn place_draft(model: &Bound, positions: usize, devices: &'static [&'static Gpu]) -> Result<Option<PlacedDraft>> {
+	let Some((blocks, plan)) = &model.draft else { return Ok(None) };
+	let Some(Operation::Join(lanes)) = blocks.blocks.first().map(|block| &block.operation) else { return Err(RecipeError::new("a draft head starts with the join of its stream")) };
+	let embedding = model.file.tensor("token_embd.weight").ok_or_else(|| RecipeError::new("the draft head reads the model's embedding, which the file lacks"))?;
+	let width = embedding.shape.first().copied().ok_or_else(|| RecipeError::new("the embedding has no width"))? as usize;
+	let channels = checked_mul(lanes + 1, width, "draft head input")?;
+	let free = devices.iter().map(|gpu| gpu.free_bytes()).collect::<Result<Vec<_>>>()?;
+	let device = (0..devices.len()).max_by_key(|index| free[*index]).ok_or_else(|| RecipeError::new("the draft head has no device"))?;
+	let one = std::slice::from_ref(&devices[device]);
+	let graph = bound_graph_on(&model.file, blocks, plan, &vec![0.0; checked_mul(positions, channels, "draft head input")?], channels, devices[device])?;
+	let (_, tapes, ..) = place_ranges(&graph, &[], one, Config::load()?.precision, &[])?;
+	Ok(Some(PlacedDraft { tapes, lanes: *lanes, width, embedding: model.file.stored(&embedding)?, streams: Mutex::new(std::collections::BTreeMap::new()), reached: std::sync::atomic::AtomicU32::new(0) }))
 }
 impl Placed {
 	fn llvm_report(&self) -> LlvmReport {
@@ -18583,6 +18748,53 @@ impl Placed {
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
+	/// Keeps the model's stream at the window's positions for the draft head,
+	/// which starts over with a window from the first position.
+	fn keep_stream(&self, tapes: &[NativeTape], begin: u32, end: u32) -> Result<()> {
+		let Some(draft) = &self.draft else { return Ok(()) };
+		let mut streams = draft.streams.lock().map_err(|_| RecipeError::new("draft streams are poisoned"))?;
+		if begin == 0 {
+			streams.clear();
+			draft.reached.store(0, Ordering::Relaxed);
+		}
+		let tape = tapes.iter().rev().find(|tape| tape.stream.is_some()).ok_or_else(|| RecipeError::new("the model keeps no stream for its draft head"))?;
+		for (offset, column) in tape.stream_columns(begin, end)?.into_iter().enumerate() {
+			streams.insert(begin + offset as u32, column);
+		}
+		Ok(())
+	}
+	/// Runs the draft head over the positions settled since its last run and
+	/// returns its logits for the id after the next.
+	fn run_draft(&self, draft: &PlacedDraft, ids: &[u32]) -> Result<Option<Vec<f64>>> {
+		let (begin, end) = (draft.reached.load(Ordering::Relaxed), narrow(ids.len() - 1, "draft position")? as u32);
+		if end <= begin {
+			return Ok(None);
+		}
+		let (positions, stream) = ((end - begin) as usize, draft.lanes * draft.width);
+		let channels = stream + draft.width;
+		let mut values = vec![0.0; channels * positions];
+		{
+			let mut streams = draft.streams.lock().map_err(|_| RecipeError::new("draft streams are poisoned"))?;
+			for offset in 0..positions {
+				let position = begin + offset as u32;
+				let kept = streams.get(&position).ok_or_else(|| RecipeError::new(format!("the model's stream at position {position} was not kept for the draft head")))?;
+				require(kept.len() == stream, format!("the model's stream holds {} values, the draft head joins {stream}", kept.len()))?;
+				let embedded = ngram::table_row(&draft.embedding, draft.width, ids[position as usize + 1] as usize)?;
+				for (channel, value) in kept.iter().chain(&embedded).enumerate() {
+					values[channel * positions + offset] = *value;
+				}
+			}
+			streams.retain(|position, _| *position >= end);
+		}
+		let tape = draft.tapes.first().ok_or_else(|| RecipeError::new("the draft head has no tape"))?;
+		if begin == 0 {
+			tape.reset_sequence()?;
+		}
+		tape.write_window(begin, end, &values)?;
+		tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |_, _| {})?;
+		draft.reached.store(end, Ordering::Relaxed);
+		tape.last_column().map(Some)
+	}
 	/// A window through every die of a tensor split at once: each takes the
 	/// whole input and launches its step, and the dies meet at their exchanges.
 	fn forward_dies(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
@@ -18614,6 +18826,7 @@ impl Placed {
 				.collect::<Vec<_>>();
 			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
 		})?;
+		self.keep_stream(tapes, begin, end)?;
 		if last_only { last.last_column() } else { last.predictions() }
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
@@ -18662,6 +18875,7 @@ impl Placed {
 		for (start, count) in first.input_runs(begin, end) {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
 		}
+		let window = (begin, end);
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
 			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
@@ -18680,6 +18894,7 @@ impl Placed {
 				}
 			}
 		}
+		self.keep_stream(tapes, window.0, window.1)?;
 		if last_only { last.last_column() } else { last.predictions() }
 	}
 }
@@ -18913,6 +19128,9 @@ struct Graph {
 	bias: bool,
 	/// The model's normalization epsilon, which every lowered normalization reads.
 	epsilon: f64,
+	/// The hyper-connection stream the head collapses: the machine reads it at
+	/// every window's positions, as a draft head's input.
+	stream: Option<usize>,
 }
 impl Graph {
 	fn new(shape: Shape, epsilon: f64) -> Self {
@@ -18944,6 +19162,7 @@ impl Graph {
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
+			stream: None,
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -19228,6 +19447,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
+		Operation::Join(lanes) => lower_join(graph, *lanes)?,
 		Operation::Attention(attention) => lower_attention(graph, attention.clone(), block.qk, config)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -19789,6 +20009,41 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
+/// Lowers `Model::join`: lane picks, normalizations, a shared projection of
+/// each lane joined after the common vector, and lane writes summed into the
+/// stream.
+fn lower_join(graph: &mut Graph, lanes: usize) -> Result<()> {
+	let (input, shape) = (graph.source, graph.output);
+	require(graph.lanes == 0, "a join starts the stream, so it follows no open hyper-connection")?;
+	require(lanes != 0 && shape.channels % (lanes + 1) == 0, format!("a join of {lanes} lanes reads {} channels, not a multiple of {}", shape.channels, lanes + 1))?;
+	let width = shape.channels / (lanes + 1);
+	let (lane, pair) = (Shape { channels: width, length: shape.length }, Shape { channels: 2 * width, length: shape.length });
+	let stream = Shape { channels: lanes * width, length: shape.length };
+	push_node(graph, Primitive::Read, lane, 0, arguments((lanes + 1) as f64, (lanes + 1) as f64), -2)?;
+	lower_normalize(graph, BlockNormalization::Rms, width, width)?;
+	let common = graph.source;
+	let mut total = -1;
+	for index in 0..lanes {
+		reset(graph, input, shape);
+		push_node(graph, Primitive::Read, lane, 0, arguments((lanes + 1) as f64, (index + 1) as f64), -2)?;
+		lower_normalize(graph, BlockNormalization::Rms, width, width)?;
+		let own = graph.source;
+		reset(graph, common, lane);
+		push_node(graph, Primitive::Outer, pair, 0, arguments(2.0, 1.0), -2)?;
+		let first = graph.source;
+		reset(graph, own, lane);
+		push_node(graph, Primitive::Outer, pair, 0, arguments(2.0, 2.0), -2)?;
+		let second = graph.source;
+		binary(graph, first, second, pair, ScalarOpcode::Add)?;
+		lower_contraction(graph, width, false)?;
+		push_node(graph, Primitive::Outer, stream, 0, arguments(lanes as f64, (index + 1) as f64), -2)?;
+		let written = graph.source;
+		total = if total < 0 { written } else { binary(graph, total, written, stream, ScalarOpcode::Add)? };
+	}
+	reset(graph, total, stream);
+	graph.lanes = lanes;
+	Ok(())
+}
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let (stream, shape) = (graph.source, graph.output);
 	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
@@ -20594,6 +20849,7 @@ fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 /// read gate.
 fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
 	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
+	graph.stream = usize::try_from(graph.source).ok();
 	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
@@ -21711,6 +21967,8 @@ struct NativeTape {
 	/// The carried contexts as they were before a window that may be taken
 	/// back, and the positions they had reached.
 	kept: Mutex<Option<(Buffer, u32, u32)>>,
+	/// The node whose stream the head collapses, when this tape holds it.
+	stream: Option<usize>,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -22090,6 +22348,7 @@ impl NativeTape {
 			reached: std::sync::atomic::AtomicU32::new(0),
 			window_begin: std::sync::atomic::AtomicU32::new(0),
 			kept: Mutex::new(None),
+			stream: graph.stream,
 		};
 		tape.stage_lookups(0, tape.positions)?;
 		Ok(tape)
@@ -22420,6 +22679,21 @@ impl NativeTape {
 		self.reached.store(*reached, Ordering::Relaxed);
 		self.window_begin.store(*begin, Ordering::Relaxed);
 		Ok(())
+	}
+	/// The stream the head collapses at each position `begin..end` of the last
+	/// window, one vector per position.
+	fn stream_columns(&self, begin: u32, end: u32) -> Result<Vec<Vec<f64>>> {
+		let index = self.stream.ok_or_else(|| RecipeError::new("this tape holds no stream a head collapses"))?;
+		let layout = &self.program.artifact.layout;
+		let shape = window_shape(self.nodes[index].output, self.input.length, layout.window_positions);
+		// A buffer that holds one window keeps its first position at slot zero.
+		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) } else { 0 };
+		let (precision, bytes) = (layout.precisions[index], layout.precisions[index].bytes());
+		let positions = (end - begin) as usize;
+		let offset = checked_add(layout.values[index], checked_mul((begin - origin) as usize, bytes, "stream offset")?, "stream offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(shape.length, bytes, "stream pitch")?, checked_mul(positions, bytes, "stream width")?, shape.channels)?;
+		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
+		Ok((0..positions).map(|position| (0..shape.channels).map(|channel| values[channel * positions + position]).collect()).collect())
 	}
 	/// The output channels at each position `begin..end` of the last window,
 	/// one vector per position.
