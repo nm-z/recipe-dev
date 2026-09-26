@@ -2922,6 +2922,54 @@ fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequa
 	}
 	Some((format, format.native, spec.block, spec.stride))
 }
+/// The rows of stored weight `index` that interleave four bytes at a time, so
+/// the lanes of a wave, each on its own row, read one run of memory per word:
+/// the device's `lanes` for a weight only the run-decoder bodies read, and one
+/// (rows one after another) for every other weight.
+fn interleaved_lanes(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> u32 {
+	row_interleave(graph, index, inference, rows, lanes).map_or(1, |(lanes, _)| lanes)
+}
+/// The lanes and row bytes of stored weight `index` when its rows interleave.
+fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> Option<(u32, usize)> {
+	let node = &graph.nodes[index];
+	let stored = graph.stored.get(index).and_then(Option::as_ref)?;
+	if lanes <= 1 || !inference || rows != 1 || !node.packed || node.int_bits != 0 || graph.requantize.get(index).is_some_and(Option::is_some) || stored.bytes.absent_runs() {
+		return None;
+	}
+	let [(segment, _)] = stored.format_segments()[..] else { return None };
+	let spec = segment.spec()?;
+	if matches!(spec.codec.quantization().native, NativeDequant::Nf4) || spec.stride == 0 || spec.block < 32 || spec.block % 32 != 0 {
+		return None;
+	}
+	let unit = dot_run(spec.block);
+	let (rows_local, terms_local) = (node.shard.rows.local(node.output.channels), node.shard.terms.local(node.input.channels));
+	let expert_width = |count: usize| if count != 0 { count } else { node.argument[2] as usize };
+	// The rows of the stored table, and the values in each row.
+	let (table_rows, row_values) = match node.op {
+		Primitive::Contraction if node.argument[0] <= 1.0 && node.argument[2] != 0.0 && node.input.channels % unit == 0 => (rows_local, terms_local),
+		Primitive::ExpertIn if node.input.channels % unit == 0 => (node.argument[0] as usize * expert_width(node.shard.rows.count), terms_local),
+		Primitive::ExpertOut if node.input.channels % unit == 0 && (node.argument[2] as usize) % unit == 0 => (node.argument[0] as usize * rows_local, expert_width(node.shard.terms.count)),
+		_ => return None,
+	};
+	let row_bytes = row_values / spec.block * spec.stride;
+	let whole = row_values % spec.block == 0 && row_bytes % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
+	whole.then_some((lanes, row_bytes))
+}
+/// `bytes` of `rows` rows of `row_bytes` each, with the rows of every group of
+/// `lanes` interleaved four bytes at a time: word `w` of the group's row `l`
+/// sits at word `w * lanes + l` of the group.
+fn interleave_rows(bytes: &[u8], rows: usize, row_bytes: usize, lanes: usize) -> Vec<u8> {
+	let (words, group_bytes) = (row_bytes / 4, row_bytes * lanes);
+	let mut interleaved = vec![0_u8; bytes.len()];
+	for row in 0..rows {
+		let (group, lane) = (row / lanes, row % lanes);
+		for word in 0..words {
+			let (from, to) = (row * row_bytes + word * 4, group * group_bytes + (word * lanes + lane) * 4);
+			interleaved[to..to + 4].copy_from_slice(&bytes[from..from + 4]);
+		}
+	}
+	interleaved
+}
 /// The adjacent stored weights one lane decodes and dots at a time in a packed
 /// matrix-vector product: a whole block, so the lane reads each block once with
 /// wide loads, or 32 values of smaller blocks.
@@ -3935,6 +3983,9 @@ mod quantized {
 		/// The bytes before the block's first byte from `block`, the aligned
 		/// address the words are read from.
 		pub(super) skew: u64,
+		/// The bytes from one word of the block to the next: the word itself, or
+		/// a word of every lane's row where rows interleave.
+		pub(super) pitch: u64,
 	}
 	impl RunQuantOps<'_> {
 		fn word_bytes(&self) -> u64 {
@@ -3946,7 +3997,7 @@ mod quantized {
 				return name.clone();
 			}
 			let (bytes, pointer) = (self.word_bytes(), pointer_type(self.inner.backend));
-			let offset = word * bytes;
+			let offset = word * self.pitch;
 			let align = if offset == 0 { self.align } else { self.align.min(1 << offset.trailing_zeros()) };
 			let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {offset}", self.block));
 			let loaded = self.inner.instruction(format!("load i{}, {pointer} {address}, align {align}, !invariant.load !{{}}", bytes * 8));
@@ -4029,6 +4080,26 @@ mod quantized {
 		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
 			match offset {
 				RunInt::Known(offset) => RunInt::Ir(self.bytes(offset, bits)),
+				// A byte at a runtime offset of interleaved rows lies in its word's
+				// place of the lane's row: the value assembles a byte at a time.
+				RunInt::Ir(offset) if self.pitch != self.word_bytes() => {
+					let offset = self.inner.int(QuantIntOp::Add, offset, self.skew.to_string());
+					let pointer = pointer_type(self.inner.backend);
+					let mut value = "0".to_owned();
+					for byte in 0..u64::from(bits / 8) {
+						let at = self.inner.int(QuantIntOp::Add, offset.clone(), byte.to_string());
+						let word = self.inner.int(QuantIntOp::Divide, at.clone(), "4".to_owned());
+						let within = self.inner.int(QuantIntOp::Remainder, at, "4".to_owned());
+						let spaced = self.inner.int(QuantIntOp::Multiply, word, self.pitch.to_string());
+						let place = self.inner.int(QuantIntOp::Add, spaced, within);
+						let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {place}", self.block));
+						let loaded = self.inner.instruction(format!("load i8, {pointer} {address}, align 1, !invariant.load !{{}}"));
+						let wide = self.inner.instruction(format!("zext i8 {loaded} to i64"));
+						let placed = self.inner.instruction(format!("shl i64 {wide}, {}", byte * 8));
+						value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+					}
+					RunInt::Ir(value)
+				}
 				RunInt::Ir(offset) => {
 					let offset = if self.skew == 0 { offset } else { self.inner.int(QuantIntOp::Add, offset, self.skew.to_string()) };
 					let address = self.inner.instruction(format!("getelementptr inbounds i8, {} {}, i64 {offset}", pointer_type(self.inner.backend), self.block));
@@ -7197,30 +7268,30 @@ impl NativeModelIr {
 		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.length(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 32\n}}\n"));
 		for (precision, suffix) in self.precisions() {
 			let (ty, state) = (precision.model_type, precision.state_type);
-			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(&str, NativeDequant, usize, usize)>::new());
+			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(String, NativeDequant, usize, usize, u32)>::new());
 			for (index, plan) in self.plans.iter().enumerate() {
 				if self.variant(&plan.node) != suffix {
 					continue;
 				}
 				let Some((format, native, block, stride)) = eligible(plan) else { continue };
-				// Nodes of one format share one call, so its decoder is inlined once.
-				arms.push_str(&format!("i32 {}, label %{}\n", index + 1, format.name));
-				if !formats.iter().any(|(name, ..)| *name == format.name) {
-					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride)\nret {state} %{name}.sum\n", name = format.name));
-					formats.push((format.name, native, block, stride));
+				// Nodes of one format and row layout share one call, so its decoder is
+				// inlined once.
+				let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+				let name = if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() };
+				arms.push_str(&format!("i32 {}, label %{name}\n", index + 1));
+				if !formats.iter().any(|(known, ..)| *known == name) {
+					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+					formats.push((name, native, block, stride, lanes));
 				}
 			}
-			for (name, native, block, stride) in formats {
-				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride, 1));
-				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride, 4));
+			for (name, native, block, stride, lanes) in &formats {
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, *stride, 1, *lanes));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, *stride, 4, *lanes));
 			}
-			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
 			// The same formats over four positions at once.
-			let bodies4 = bodies.lines().collect::<Vec<_>>().chunks(3).map(|lines| {
-				let name = lines[0].trim_end_matches(':');
-				format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch)\nret <4 x {state}> %{name}.sums\n")
-			}).collect::<String>();
-			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i32 %pitch) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
+			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
+			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
 			let _ = ty;
 		}
 		Ok(ir)
@@ -7233,7 +7304,7 @@ impl NativeModelIr {
 	/// With `positions` of 4 the run adds each weight into four staged positions
 	/// `%pitch` apart and returns the four sums; its format's tables come with the
 	/// one-position run.
-	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize, positions: usize) -> String {
+	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize, positions: usize, lanes: u32) -> String {
 		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
 		let (ty, state) = (precision.model_type, precision.state_type);
 		let align = {
@@ -7245,11 +7316,21 @@ impl NativeModelIr {
 		};
 		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
 		let run = dot_run(block);
-		operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
 		// Blocks aligned to less than a four-byte word are read as aligned words:
 		// the run's place within its word selects one of a body per place, each
 		// with that place folded into its byte offsets.
 		let skews = if align >= 4 { vec![0] } else { (0..4).step_by(align as usize).collect::<Vec<u64>>() };
+		let interleaved = lanes > 1;
+		if interleaved {
+			// Rows of `%length` values interleave in groups of `lanes` a word at a
+			// time: word w of the group's row l is word `w * lanes + l` of the group.
+			operations.ir.push_str(&format!(
+				"%run.row = udiv i64 %index, %length\n%run.k = urem i64 %index, %length\n%run.blocks = udiv i64 %length, {block}\n%run.row.bytes = mul i64 %run.blocks, {stride}\n%run.group = udiv i64 %run.row, {lanes}\n%run.lane = urem i64 %run.row, {lanes}\n%run.group.bytes = mul i64 %run.row.bytes, {lanes}\n%run.group.at = mul i64 %run.group, %run.group.bytes\n%run.lane.at = mul i64 %run.lane, 4\n%run.k.block = udiv i64 %run.k, {block}\n%run.k.bytes = mul i64 %run.k.block, {stride}\n%run.word = udiv i64 %run.k.bytes, 4\n%run.word.at = mul i64 %run.word, {pitch}\n%run.lane.base = add i64 %run.group.at, %run.lane.at\n%run.at = add i64 %run.lane.base, %run.word.at\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.at\n%run.place = and i64 %run.k.bytes, 3\n",
+				pitch = 4 * lanes
+			));
+		} else {
+			operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
+		}
 		let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
 		let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
 			let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
@@ -7257,15 +7338,24 @@ impl NativeModelIr {
 		}).collect::<Vec<_>>();
 		if skews.len() > 1 {
 			let arms = skews.iter().skip(1).map(|skew| format!("i64 {skew}, label %run.skew{skew}")).collect::<Vec<_>>().join(" ");
-			operations.ir.push_str(&format!("%run.address = ptrtoint {pointer} %run.base to i64\n%run.place = and i64 %run.address, 3\nswitch i64 %run.place, label %run.skew0 [ {arms} ]\n"));
+			if !interleaved {
+				operations.ir.push_str(&format!("%run.address = ptrtoint {pointer} %run.base to i64\n%run.place = and i64 %run.address, 3\n"));
+			}
+			operations.ir.push_str(&format!("switch i64 %run.place, label %run.skew0 [ {arms} ]\n"));
 		}
 		for skew in skews.iter().copied() {
-			let (base, word_align) = if skews.len() > 1 {
+			let (base, word_align) = if interleaved {
+				if skews.len() > 1 {
+					operations.ir.push_str(&format!("run.skew{skew}:\n"));
+				}
+				("%run.base".to_owned(), 4)
+			} else if skews.len() > 1 {
 				operations.ir.push_str(&format!("run.skew{skew}:\n%run.aligned{skew} = getelementptr inbounds i8, {pointer} %run.base, i64 -{skew}\n"));
 				(format!("%run.aligned{skew}"), 4)
 			} else {
 				("%run.base".to_owned(), align)
 			};
+			let pitch = if interleaved { 4 * u64::from(lanes) } else { word_align.min(4) };
 			let mut words = std::collections::HashMap::new();
 			let mut sums = vec![zero.clone(); positions];
 			for j in 0..run {
@@ -7276,7 +7366,7 @@ impl NativeModelIr {
 				let (whole, place) = if skews.len() > 1 { (start / 4 * 4, start % 4) } else { (start, 0) };
 				let block_base = if whole == 0 { base.clone() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} {base}, i64 {whole}")) };
 				let value = {
-					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place };
+					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place, pitch };
 					native.decode(&mut run)
 				};
 				// The weight rounds to the model type as the per-value decoder does.
@@ -7301,9 +7391,9 @@ impl NativeModelIr {
 			}
 		}
 		if positions == 1 {
-			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
 		} else {
-			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch) #1 {{\nentry:\n{}}}\n", operations.ir)
+			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\n{}}}\n", operations.ir)
 		}
 	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
@@ -20611,6 +20701,8 @@ struct NativeSchedule {
 	shared_values: u32,
 	contractions: Vec<Option<NativeContractionTiles>>,
 	attention: Vec<Option<Tile>>,
+	/// The lanes of the device's wave: the rows a stored weight interleaves.
+	lanes: u32,
 }
 #[derive(Clone, Copy, Debug)]
 struct NativeContractionTiles {
@@ -21745,7 +21837,7 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
+		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference, rows)?;
 		if program.model_load.is_some() {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
@@ -23473,7 +23565,7 @@ impl Buffer {
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
-	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
+	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize) -> Result<Self> {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
 		// A run decoder reads the last block of a weight as whole aligned words,
 		// up to three bytes past its end.
@@ -23481,7 +23573,16 @@ impl Buffer {
 		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
-				buffer.write_runs(offsets[index], &weight.bytes)?;
+				match row_interleave(graph, index, inference, rows, runtime.lanes()) {
+					Some((lanes, row_bytes)) => {
+						let mut bytes = Vec::with_capacity(weight.bytes.len());
+						for (_, run) in weight.bytes.runs() {
+							bytes.extend_from_slice(run);
+						}
+						buffer.write_bytes(offsets[index], &interleave_rows(&bytes, bytes.len() / row_bytes, row_bytes, lanes as usize))?;
+					}
+					None => buffer.write_runs(offsets[index], &weight.bytes)?,
+				}
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
 				continue;
@@ -24053,6 +24154,17 @@ fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
 }
 impl Gpu {
+	/// The lanes of one wave on this device: a CPU runs one lane at a time.
+	fn lanes(&self) -> u32 {
+		match &self.driver {
+			Driver::Cpu => 1,
+			#[cfg(amd)]
+			Driver::Hsa(hsa) => hsa.wave,
+			#[cfg(nvidia)]
+			Driver::Cuda(cuda) => cuda.wave,
+			Driver::Remote(remote) => remote.wave,
+		}
+	}
 	#[cfg(any(amd, nvidia))]
 	fn status(&self, status: i32, action: &str) -> Result<()> {
 		driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend)))
@@ -24273,6 +24385,7 @@ impl Gpu {
 			shared_values,
 			contractions,
 			attention,
+			lanes: self.lanes(),
 		};
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		Ok((artifact, schedule, shapes, register_values, waves, element, shared_values))
