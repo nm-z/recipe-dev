@@ -2821,6 +2821,7 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 	}
 	names.push("recipe.model.decode".to_owned());
 	names.push("recipe.model.dot.run".to_owned());
+	names.push("recipe.model.dot.run4".to_owned());
 	names.sort();
 	names.dedup();
 	// Backend plumbing has no arithmetic in it and, on the CPU, owns the
@@ -3163,6 +3164,9 @@ mod quantized {
 		pub(super) packing: IqPacking,
 		pub(super) table_name: &'static str,
 		pub(super) table: &'static [u16],
+		/// The value of each grid level: ggml's grid bytes, which are not evenly spaced.
+		pub(super) levels_name: &'static str,
+		pub(super) levels: &'static [u16],
 	}
 
 	#[derive(Clone, Copy)]
@@ -3296,9 +3300,8 @@ mod quantized {
 		let table_word = quant.table(layout.table_name, layout.table, grid);
 		let man_shift = quant_int(quant, QuantIntOp::Multiply, table_lane, layout.man as u64);
 		let man_code = quant_bits(quant, table_word, man_shift, layout.man);
-		let man_code = quant_int(quant, QuantIntOp::Multiply, man_code, 2);
-		let man_code = quant_int(quant, QuantIntOp::Add, man_code, 1);
-		let mantissa = quant.number(man_code, false);
+		let level = quant.table(layout.levels_name, layout.levels, man_code);
+		let mantissa = quant.number(level, false);
 		let exponent = if odd_factor {
 			let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
 			let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
@@ -4156,6 +4159,31 @@ impl NativeModelIr {
 				(false, Primitive::Contraction)
 					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
 				{
+					// Whole tiles of four positions take the tile body; the rest of the
+					// window, a one-position step among them, takes the row body.
+					ir.push_str(&format!("br label %n{index}.pre\nn{index}.pre:\n"));
+					ir.push_str(&format!(
+						"%n{index}.tiling = icmp uge i32 {span}, 4\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_tile_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n",
+						pointer = pointer_type(backend),
+						source = pointers.source,
+						weights = pointers.weights,
+						value = pointers.value,
+						rows = node.shard.rows.local(node.output.channels),
+						terms = node.shard.terms.local(node.input.channels),
+						in_length = node.input.length,
+						out_length = node.output.length,
+						bias = node.argument[2] == 0.0,
+						relu = node.argument[1] == 1.0,
+						decode = plan.decode(index),
+						node = index + 1,
+						row_first = node.shard.rows.first,
+						row_period = node.shard.rows.period,
+						row_share = node.shard.rows.count,
+						in_first = node.shard.terms.first,
+						in_period = node.shard.terms.period,
+						in_share = node.shard.terms.count,
+					));
+					let (begin, span) = (format!("%n{index}.rest.begin"), format!("%n{index}.rest.span"));
 					ir.push_str(&format!(
 						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
 						row_first = node.shard.rows.first,
@@ -6907,7 +6935,7 @@ impl NativeModelIr {
 				if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) {
 					continue;
 				}
-				if let Some(table) = native.table() {
+				for table in native.tables() {
 					if !tables.contains(&table.name()) {
 						emitted.push_str(&table.definition());
 						tables.push(table.name());
@@ -7160,9 +7188,16 @@ impl NativeModelIr {
 				}
 			}
 			for (name, native, block, stride) in formats {
-				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride, 1));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, native, block, stride, 4));
 			}
 			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			// The same formats over four positions at once.
+			let bodies4 = bodies.lines().collect::<Vec<_>>().chunks(3).map(|lines| {
+				let name = lines[0].trim_end_matches(':');
+				format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch)\nret <4 x {state}> %{name}.sums\n")
+			}).collect::<String>();
+			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i32 %pitch) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
 			let _ = ty;
 		}
 		Ok(ir)
@@ -7172,7 +7207,10 @@ impl NativeModelIr {
 	/// block, or several smaller blocks, so the
 	/// place of every value is known here and its block fields fold into
 	/// constant offsets; a run over several smaller blocks steps block by block.
-	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize) -> String {
+	/// With `positions` of 4 the run adds each weight into four staged positions
+	/// `%pitch` apart and returns the four sums; its format's tables come with the
+	/// one-position run.
+	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize, positions: usize) -> String {
 		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
 		let (ty, state) = (precision.model_type, precision.state_type);
 		let align = {
@@ -7187,7 +7225,12 @@ impl NativeModelIr {
 		operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
 		{
 			let mut words = std::collections::HashMap::new();
-			let mut sum = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+			let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+			let mut sums = vec![zero; positions];
+			let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
+				let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
+				operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"))
+			}).collect::<Vec<_>>();
 			for j in 0..run {
 				let (relative, local) = if block >= run { (0, j) } else { (j / block, j % block) };
 				let base = if relative == 0 { "%run.base".to_owned() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} %run.base, i64 {}", relative * stride)) };
@@ -7199,14 +7242,28 @@ impl NativeModelIr {
 				let model = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({state} {value})"));
 				let weight = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {model})"));
 				let offset = operations.instruction(format!("mul i32 %stride, {j}"));
-				let address = operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"));
-				let input = operations.instruction(format!("load {ty}, {shared} {address}"));
-				let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
-				sum = operations.instruction(format!("call {state} @recipe.state.madd{suffix}({state} {sum}, {state} {weight}, {state} {input})"));
+				for (column, sum) in columns.iter().zip(sums.iter_mut()) {
+					let address = operations.instruction(format!("getelementptr {ty}, {shared} {column}, i32 {offset}"));
+					let input = operations.instruction(format!("load {ty}, {shared} {address}"));
+					let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
+					*sum = operations.instruction(format!("call {state} @recipe.state.madd{suffix}({state} {sum}, {state} {weight}, {state} {input})"));
+				}
 			}
-			operations.ir.push_str(&format!("ret {state} {sum}\n"));
+			if positions == 1 {
+				operations.ir.push_str(&format!("ret {state} {}\n", sums[0]));
+			} else {
+				let mut vector = "poison".to_owned();
+				for (position, sum) in sums.iter().enumerate() {
+					vector = operations.instruction(format!("insertelement <{positions} x {state}> {vector}, {state} {sum}, i32 {position}"));
+				}
+				operations.ir.push_str(&format!("ret <{positions} x {state}> {vector}\n"));
+			}
 		}
-		format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+		if positions == 1 {
+			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+		} else {
+			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch) #1 {{\nentry:\n{}}}\n", operations.ir)
+		}
 	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
 	/// requantized node's file bytes, or the stored weight an unpacked node
@@ -7345,7 +7402,7 @@ impl NativeModelIr {
 		};
 		match quantizer {
 			DeviceQuantizer::Iq4Nl => {
-				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).table().map(NativeQuantTable::name).unwrap_or("iq4");
+				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).tables().first().map(|table| table.name()).unwrap_or("iq4");
 				ir.push_str(&format!("%{p}.tiny = fcmp olt float %{p}.ext, {tiny}\n%{p}.inv.raw = fdiv float {first}, %{p}.e32\n%{p}.inv = select i1 %{p}.tiny, float {zero}, float %{p}.inv.raw\n%{p}.num0 = fadd float {zero}, {zero}\n%{p}.den0 = fadd float {zero}, {zero}\n", tiny = lit(1.0e-15), first = lit(f32::from(IQ4[0])), zero = lit(0.0)));
 				for i in 0..32 {
 					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n%{p}.c{i}.0 = add i32 0, 0\n"));
@@ -7474,12 +7531,14 @@ impl NativeModelIr {
 		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.state.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
 		ir = strip_definition(ir, "recipe.model.dot.run");
+		ir = strip_definition(ir, "recipe.model.dot.run4");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
 			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
 			let template = strip_definition(template, "recipe.model.dot.run");
+			let template = strip_definition(template, "recipe.model.dot.run4");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
 		}
@@ -7556,8 +7615,10 @@ impl NativeModelIr {
 		if loss.is_some() {
 			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
+			// An inference window runs as wide as the step, so it takes the step's register budget.
+			let attributes = if matches!(backend, Backend::Amd | Backend::Nvidia) { "#4" } else { "#0" };
 			body.push_str(&format!(
-				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) {attributes} {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss {
@@ -13499,6 +13560,10 @@ const IQ3_S: [u16; 512] = [
 	3159, 3188, 3210, 3228, 3234, 3245, 3250, 3256, 3264, 3276, 3281, 3296, 3349, 3363, 3378, 3392, 3395, 3420, 3440, 3461, 3488, 3529, 3531, 3584, 3588, 3591, 3600, 3602, 3614, 3616, 3628, 3634,
 	3650, 3657, 3668, 3683, 3685, 3713, 3716, 3720, 3726, 3729, 3736, 3753, 3778, 3802, 3805, 3819, 3841, 3845, 3851, 3856, 3880, 3922, 3938, 3970, 3993, 4032,
 ];
+/// ggml's IQ2 grid bytes for levels 0 to 2, IQ3_XXS's for levels 0 to 7, and IQ3_S's.
+const IQ2_LEVELS: [u16; 3] = [8, 25, 43];
+const IQ3_XXS_LEVELS: [u16; 8] = [4, 12, 20, 28, 36, 44, 52, 62];
+const IQ3_S_LEVELS: [u16; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 const IQ2_XXS: [u16; 256] = [
 	0, 2, 5, 8, 10, 17, 20, 32, 34, 40, 42, 65, 68, 80, 88, 97, 100, 128, 130, 138, 162, 257, 260, 272, 277, 320, 388, 408, 512, 514, 546, 642, 1025, 1028, 1040, 1057, 1060, 1088, 1090, 1096, 1120,
 	1153, 1156, 1168, 1188, 1280, 1282, 1288, 1312, 1350, 1385, 1408, 1425, 1545, 1552, 1600, 1668, 1700, 2048, 2053, 2056, 2068, 2088, 2113, 2116, 2128, 2130, 2184, 2308, 2368, 2562, 2580, 4097,
@@ -13987,12 +14052,13 @@ impl NativeDequant {
 		}
 	}
 
-	fn table(self) -> Option<NativeQuantTable> {
+	/// The constant tables the decoder reads: a grid, and for grids of levels, each level's value.
+	fn tables(self) -> Vec<NativeQuantTable> {
 		match self {
-			Self::Iq4(layout) => Some(NativeQuantTable::Signed(layout.table_name, layout.table)),
-			Self::Iq1(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			Self::Iq(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			_ => None,
+			Self::Iq4(layout) => vec![NativeQuantTable::Signed(layout.table_name, layout.table)],
+			Self::Iq1(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table)],
+			Self::Iq(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table), NativeQuantTable::Unsigned(layout.levels_name, layout.levels)],
+			_ => Vec::new(),
 		}
 	}
 }
@@ -14082,13 +14148,13 @@ quantizations! {
 	Q8K { code: (0, 8, [3]), block: 256, stride: 292, name: "q8k", quant: Quantizer::Q8K, native: Some(NativeDequant::Q8K) }
 	IQ4NL { code: (1, 4, [5]), block: 32, stride: 18, name: "iq4nl", quant: Quantizer::Iq4Nl, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 })) }
 	IQ4XS { code: (1, 4, [2]), block: 256, stride: 136, name: "iq4xs", quant: Quantizer::Iq4Xs, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 6, man: 4, xs: true, table_name: "iq4", table: &IQ4 })) }
-	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS })) }
-	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS })) }
-	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS })) }
-	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S })) }
+	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS, levels_name: "iq3_xxs_levels", levels: &IQ3_XXS_LEVELS })) }
+	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
+	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
+	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
 	IQ1S { code: (1, 1, [3]), block: 256, stride: 50, name: "iq1s", quant: Quantizer::Iq1 { medium: false }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: false, table_name: "iq1", table: &IQ1 })) }
 	IQ1M { code: (1, 1, [4]), block: 256, stride: 56, name: "iq1m", quant: Quantizer::Iq1 { medium: true }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: true, table_name: "iq1", table: &IQ1 })) }
-	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S })) }
+	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S, levels_name: "iq3_s_levels", levels: &IQ3_S_LEVELS })) }
 }
 
 fn nf4_codebook(codebook: &[f64], count: usize, bytes: usize) -> Result<(usize, &[f64], &[f64])> {
@@ -20844,48 +20910,6 @@ mod precision_contract_checks {
 			}
 		}
 	}
-	#[test]
-	fn narrow_delta_rule_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for chunk in [1, 2] {
-				let config = Config::load().unwrap();
-				let shape = Shape { channels: 3, length: 2 };
-				let mut graph = Graph::new(shape, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				graph.profile.atvn = format;
-				let gates = constant(&mut graph, -1, Shape { channels: 2, length: 2 }, 0.0).unwrap();
-				reset(&mut graph, -1, shape);
-				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 1, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
-				graph.parameters.fill(0.0);
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				// The existing forward predicts from the prior state before decay:
-				// S_next = a*S + b*k*(v-k*S). With a=b=k=0.5, carry is 0.375.
-				let inputs = [1.0, 1.0, 0.5, 0.5, 0.25, 0.5];
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&inputs), &inputs, &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let predictions = tape.predictions().unwrap();
-				assert!((predictions[0] - 0.0625 * scale).abs() < 1e-12);
-				assert!((predictions[1] - 0.1484375 * scale).abs() < 1e-12);
-				let d0 = (predictions[0] - 0.25) * scale;
-				let d1 = (predictions[1] - 0.25) * scale;
-				let s0 = d0 + 0.375 * d1;
-				let expected = [0.0625 * d0, 0.1484375 * d1, 0.125 * s0, 0.21875 * d1, 0.25 * s0, 0.25 * d1];
-				let adjoints = tape.input_adjoint.download_float(6, Compute::FP32).unwrap();
-				for (i, (got, want)) in adjoints.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} delta input {i}: {got} vs {want}", format.label()); }
-				let gate_values = tape.adjoints.download_float_bytes(tape.program.artifact.layout.adjoints[gates as usize], 4, Compute::FP32).unwrap();
-				for (i, (got, want)) in gate_values.iter().zip([0.0, -0.015625 * d1, 0.03125 * s0, 0.05859375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
-				let softplus = format.unpack(format.pack(2.0_f64.ln()));
-				let expected_decay = -0.03125 * softplus * d1;
-				let decay = tape.download_gradient().unwrap()[0];
-				assert!((decay - expected_decay).abs() < 1e-12, "{} chunk {chunk} decay {decay} vs {expected_decay}", format.label());
-			}
-		}
-	}
 	fn table(name: &str) -> &'static str {
 		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
 	}
@@ -24049,15 +24073,20 @@ impl Gpu {
 		let matrix_waves =
 			narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")?
 				as u32;
-		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
+		// An inference pass over a window runs as wide as the one-position step:
+		// its packed sums spread their rows over every wave the SM holds.
+		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else if loss.is_none() && !cpu { (512 / wave.max(1)).max(1) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
-		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
+		// A widened inference window keeps the general body's register tile small
+		// enough that its reduction buffer fits beside the packed column.
+		let widened = loss.is_none() && !cpu && !matrix;
+		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m).min(if widened { 2 } else { u32::MAX });
 		let waves = if cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
-		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
+		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min(if widened { 2 } else { u32::MAX }).min((self.shared_limit
 			/ element.bytes() as u32
 			/ block / register_m
 			.checked_add(1)
@@ -24070,7 +24099,9 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		// The margin is the configured width's: widening an inference pass to the
+		// step's width keeps the tiles its schedule sized for that width.
+		let shared_budget = shared_values / if matrix || cpu { waves } else { vector_waves };
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
