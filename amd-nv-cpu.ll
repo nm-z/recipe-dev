@@ -2345,8 +2345,10 @@ ret void
 ; a time, and each adds its row's part into the wave's row sums.
 define internal void @packed_rows_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %routing, i32 %rows, i32 %terms, i32 %in.length, i32 %out.length, i32 %out.begin, i32 %out.span,
-i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %mode, i32 %hidden, i32 %experts, i32 %top, ptr addrspace(1) %split.scratch, i32 %row.first, i32 %row.period, i32 %row.share ) RECIPE_CONTRACTION_BODY { entry:
+i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, i32 %mode, i32 %hidden, i32 %experts, i32 %top, ptr addrspace(1) %split.scratch, i32 %row.first, i32 %row.period, i32 %row.share, i32 %in.first, i32 %in.period, i32 %in.share ) RECIPE_CONTRACTION_BODY { entry:
 %lid = call i32 @recipe.local.id.x()
+%in.share.zero = icmp eq i32 %in.share, 0
+%in.share.nonzero = select i1 %in.share.zero, i32 1, i32 %in.share
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
 %groups = udiv i32 %threads, %block
@@ -2515,8 +2517,17 @@ stage.loop:
 %stage.more = icmp ult i32 %stage.c, %chunk.terms
 br i1 %stage.more, label %stage.step, label %stage.done
 stage.step:
-%stage.c.local = zext i32 %stage.c to i64
-%stage.c.wide = add i64 %stage.c.local, %chunk.base.wide
+; A die summing a share of the inputs reads input k at its place: channels
+; %in.first on, %in.share of every %in.period (or from %in.first on).
+%stage.k = add i32 %stage.c, %chunk.base
+%stage.k.period = udiv i32 %stage.k, %in.share.nonzero
+%stage.k.within = urem i32 %stage.k, %in.share.nonzero
+%stage.k.base = mul i32 %stage.k.period, %in.period
+%stage.k.placed = add i32 %stage.k.base, %stage.k.within
+%stage.k.periodic = icmp ne i32 %in.period, 0
+%stage.k.share = select i1 %stage.k.periodic, i32 %stage.k.placed, i32 %stage.k
+%stage.k.global = add i32 %stage.k.share, %in.first
+%stage.c.wide = zext i32 %stage.k.global to i64
 %stage.index = mul i64 %stage.c.wide, %in.length.wide
 %stage.at = add i64 %stage.index, %position
 %stage.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %stage.at

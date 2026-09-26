@@ -4157,8 +4157,13 @@ impl NativeModelIr {
 					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
 				{
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 0, i32 0 )\n",
-						row_first = node.shard.first,
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+						row_first = node.shard.rows.first,
+						row_period = node.shard.rows.period,
+						row_share = node.shard.rows.count,
+						in_first = node.shard.terms.first,
+						in_period = node.shard.terms.period,
+						in_share = node.shard.terms.count,
 						node = index + 1,
 						scratch_gep = self.split_scratch_gep(backend, index),
 						scratch = self.split_scratch_name(backend, index),
@@ -4167,8 +4172,8 @@ impl NativeModelIr {
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
-						rows = if node.shard.count != 0 { node.shard.count } else { node.output.channels },
-						terms = node.input.channels,
+						rows = node.shard.rows.local(node.output.channels),
+						terms = node.shard.terms.local(node.input.channels),
 						in_length = node.input.length,
 						out_length = node.output.length,
 						bias = node.argument[2] == 0.0,
@@ -4315,13 +4320,16 @@ impl NativeModelIr {
 					}) =>
 				{
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local} )\n",
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
 						// A split expert table holds a share of every expert: the gate and
 						// up tables its hidden rows (placed within each expert's period),
 						// the down table its output rows.
-						row_first = node.shard.first,
-						row_period = if node.op == Primitive::ExpertIn && node.shard.count != 0 { node.argument[2] as usize } else { 0 },
-						row_local = node.shard.count,
+						row_first = node.shard.rows.first,
+						row_period = node.shard.rows.period,
+						row_local = node.shard.rows.count,
+						in_first = node.shard.terms.first,
+						in_period = node.shard.terms.period,
+						in_share = node.shard.terms.count,
 						node = index + 1,
 						scratch_gep = self.split_scratch_gep(backend, index),
 						scratch = self.split_scratch_name(backend, index),
@@ -4331,16 +4339,18 @@ impl NativeModelIr {
 						routing = pointers.second,
 						weights = pointers.weights,
 						value = pointers.value,
-						rows = match (node.op, node.shard.count) {
-							(_, 0) => node.output.channels,
-							(Primitive::ExpertIn, count) => node.argument[1] as usize * count,
-							(_, count) => count,
-						},
-						terms = node.input.channels,
+						rows = node.shard.rows.local(node.output.channels),
+						terms = node.shard.terms.local(node.input.channels),
 						in_length = node.input.length,
 						out_length = node.output.length,
 						mode = if node.op == Primitive::ExpertIn { 1 } else { 2 },
-						hidden = if node.op == Primitive::ExpertIn && node.shard.count != 0 { node.shard.count as f64 } else { node.argument[2] },
+						// A die holding a share of every expert's hidden rows or inputs
+						// sees that share as the expert's hidden width.
+						hidden = match (node.op, node.shard.rows.count, node.shard.terms.count) {
+							(Primitive::ExpertIn, count, _) if count != 0 => count as f64,
+							(Primitive::ExpertOut, _, count) if count != 0 => count as f64,
+							_ => node.argument[2],
+						},
 						experts = node.argument[0],
 						top = node.argument[1]
 					));
@@ -4886,7 +4896,7 @@ impl NativeModelIr {
 					let sum = node.argument[0] != 0.0;
 					let die = integer_argument(node.argument[1], "exchange die")?;
 					let dies = integer_argument(node.argument[2], "exchange dies")?;
-					let (first, last) = (node.shard.first, node.shard.first + node.shard.count);
+					let (first, last) = (node.shard.rows.first, node.shard.rows.first + node.shard.rows.count);
 					let plane = node.output.elements();
 					// Every exchange alternates between the same two halves, each as large
 					// as the largest exchange, so consecutive exchanges never overlap.
@@ -4914,9 +4924,10 @@ impl NativeModelIr {
 						let own = if sum { "true".to_owned() } else { format!("%{prefix}.post.own") };
 						if !sum {
 							// With a period, the share recurs: the channel's place within its period decides.
-							let place = if node.argument[3] > 0.0 { format!("%{prefix}.post.place") } else { channel.clone() };
-							if node.argument[3] > 0.0 {
-								ir.push_str(&format!("%{prefix}.post.place = urem i64 {channel}, {}\n", node.argument[3] as usize));
+							let period = node.shard.rows.period;
+							let place = if period != 0 { format!("%{prefix}.post.place") } else { channel.clone() };
+							if period != 0 {
+								ir.push_str(&format!("%{prefix}.post.place = urem i64 {channel}, {period}\n"));
 							}
 							ir.push_str(&format!("%{prefix}.post.low = icmp uge i64 {place}, {first}\n%{prefix}.post.high = icmp ult i64 {place}, {last}\n%{prefix}.post.own = and i1 %{prefix}.post.low, %{prefix}.post.high\n"));
 						}
@@ -17725,11 +17736,160 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		epsilon: graph.epsilon,
 	})
 }
+/// A stored weight a split can slice: packed, one format, every byte on the
+/// machine, with its block of values and the bytes the block takes.
+fn sliceable(graph: &Graph, index: usize) -> Option<(&StoredWeight, usize, usize)> {
+	let weight = graph.stored[index].as_ref().filter(|weight| graph.nodes[index].packed && weight.format_segments().len() == 1 && !weight.bytes.absent_runs())?;
+	let spec = weight.format.spec()?;
+	Some((weight, spec.block, spec.stride))
+}
+/// Nodes that keep a split region together: a sum whose outputs a die can take
+/// a share of, ops that read and write only their own channels, and the sum over
+/// a share of its inputs that ends the region. `period` channels repeat the same
+/// pattern of shares and `unit` channels are the least a die takes.
+struct SplitRegion {
+	starts: Vec<usize>,
+	end: usize,
+	period: usize,
+	unit: usize,
+}
+/// Every region of `graph` a split can keep apart: grown back from each sum that
+/// can split its inputs, through ops that keep channels apart, to the sums that
+/// split their outputs. A region whose nodes feed anything outside it, or that
+/// reaches any other op, is not split.
+fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
+	let mut consumers = vec![Vec::new(); graph.nodes.len()];
+	for (index, node) in graph.nodes.iter().enumerate() {
+		for operand in [node.source, node.second] {
+			if let Ok(operand) = usize::try_from(operand) && operand < index {
+				consumers[operand].push(index);
+			}
+		}
+	}
+	let gcd = |mut a: usize, mut b: usize| {
+		while b != 0 {
+			(a, b) = (b, a % b);
+		}
+		a
+	};
+	let (mut regions, mut claimed) = (Vec::new(), vec![false; graph.nodes.len()]);
+	for (end, node) in graph.nodes.iter().enumerate() {
+		let sums = matches!(node.op, Primitive::Contraction if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels) || node.op == Primitive::ExpertOut;
+		let Some((_, block, _)) = sliceable(graph, end).filter(|_| sums) else { continue };
+		let (mut inside, mut starts, mut stack, mut whole) = (Vec::new(), Vec::new(), vec![node.source], true);
+		let (mut head, mut widths) = (None, vec![block]);
+		while let Some(operand) = stack.pop() {
+			let Ok(at) = usize::try_from(operand) else {
+				whole = false;
+				break;
+			};
+			if inside.contains(&at) || claimed[at] {
+				whole &= !claimed[at];
+				continue;
+			}
+			let producer = &graph.nodes[at];
+			let row_split = match producer.op {
+				Primitive::Contraction => producer.argument[0] <= 1.0 && producer.parameters == producer.input.channels * producer.output.channels,
+				Primitive::ExpertIn => true,
+				_ => false,
+			} && sliceable(graph, at).is_some();
+			inside.push(at);
+			if row_split {
+				starts.push(at);
+				continue;
+			}
+			match producer.op {
+				Primitive::Elementwise | Primitive::Dconv => {}
+				Primitive::Normalize if normalize_mode(producer.argument[0]).is_ok_and(|mode| mode.per_row()) && normalize_width(producer) < producer.output.channels => widths.push(normalize_width(producer)),
+				Primitive::Delta if producer.argument[5] == 1.0 => {
+					let (key_heads, key_width, _, width) = delta_extent(producer)?;
+					if key_width != width {
+						whole = false;
+						break;
+					}
+					head = Some((key_heads * key_width) as usize);
+					widths.push(width as usize);
+				}
+				_ => {
+					whole = false;
+					break;
+				}
+			}
+			// An elementwise op carries the channels of its operands of its own
+			// shape (others are whole on every die); the rest carry their source's.
+			if producer.op == Primitive::Elementwise {
+				for operand in [producer.source, producer.second] {
+					if usize::try_from(operand).is_ok_and(|operand| graph.nodes[operand].output == producer.output) {
+						stack.push(operand);
+					}
+				}
+			} else {
+				stack.push(producer.source);
+			}
+		}
+		if !whole || starts.is_empty() || inside.iter().any(|at| consumers[*at].iter().any(|consumer| *consumer != end && !inside.contains(consumer))) {
+			continue;
+		}
+		let period = match (head, node.op) {
+			(Some(period), _) => period,
+			(None, Primitive::ExpertOut) => node.argument[2] as usize,
+			(None, _) => node.input.channels,
+		};
+		let unit = widths.iter().fold(1, |unit, width| unit / gcd(unit, *width) * width);
+		let channels_fit = inside.iter().all(|at| graph.nodes[*at].output.channels % period == 0);
+		if period == 0 || period % unit != 0 || period / unit < dies || !channels_fit {
+			continue;
+		}
+		for at in &inside {
+			claimed[*at] = true;
+		}
+		claimed[end] = true;
+		regions.push(SplitRegion { starts, end, period, unit });
+	}
+	Ok(regions)
+}
+/// Rows `run` of a row-major weight of `rows` rows repeated `repeats` times
+/// (once per expert), as views of the stored bytes.
+fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> Result<StoredWeight> {
+	let row_bytes = weight.bytes.len() / (repeats * rows);
+	let row_count = weight.count / (repeats * rows);
+	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { rows / run.period };
+	let mut parts = Vec::new();
+	for repeat in 0..repeats {
+		for period in 0..periods {
+			parts.push(weight.bytes.view((repeat * rows + period * run.period + run.first) * row_bytes, run.count * row_bytes));
+		}
+	}
+	let count = row_count * run.count * periods * repeats;
+	let format = weight.format_segments()[0].0;
+	Ok(StoredWeight { format, count, bytes: StoredBytes::joined(parts), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+}
+/// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
+/// inputs repeated `repeats` times, gathered whole blocks at a time into bytes
+/// of their own: each row's share is not one run of the file.
+fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize, run: Run, block: usize, stride: usize) -> Result<StoredWeight> {
+	require(run.first % block == 0 && run.count % block == 0 && (run.period == 0 || run.period % block == 0), "a split of a sum's inputs must fall on whole blocks")?;
+	let row_bytes = terms / block * stride;
+	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { terms / run.period };
+	let mut gathered = Vec::with_capacity(repeats * rows * periods * run.count / block * stride);
+	for row in 0..repeats * rows {
+		for period in 0..periods {
+			let at = row * row_bytes + (period * run.period + run.first) / block * stride;
+			gathered.extend_from_slice(&weight.bytes.slice(at, run.count / block * stride)?);
+		}
+	}
+	let count = repeats * rows * periods * run.count;
+	let format = weight.format_segments()[0].0;
+	Ok(StoredWeight { format, count, bytes: StoredBytes::from(gathered), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+}
 /// Die `die`'s graph of a tensor split over dies whose relative speeds are
-/// `shares`. Every large stored contraction keeps a contiguous share of its
-/// rows, and every table of several experts a share of its experts. An exchange
-/// after each restores the whole value on every die (rows gathered, expert
-/// partial sums added), so every other node runs unchanged on every die.
+/// `shares`. Each split region runs apart: its first sums keep this die's share
+/// of their rows, the ops after them keep channels apart, and the last sum adds
+/// this die's share of its inputs, which one exchange then sums over the dies.
+/// A large sum outside any region keeps a share of its rows, gathered after it;
+/// every other node runs whole on every die.
 fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
 	require(die < shares.len() && shares.iter().all(|share| *share > 0.0), "a tensor split needs a positive share for every die")?;
 	let total = shares.iter().sum::<f64>();
@@ -17737,59 +17897,75 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
 	let part = |count: usize| {
 		let first = (count as f64 * before / total).round() as usize;
 		let last = (count as f64 * (before + shares[die]) / total).round() as usize;
-		Shard { first, count: last - first }
+		(first, last - first)
 	};
+	let regions = split_regions(graph, shares.len())?;
+	if tracing() && die == 0 {
+		for region in &regions {
+			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
+		}
+	}
+	// The rows and inputs each region node splits, and whether a sum follows.
+	let mut plans: Vec<Option<(Shard, Option<f64>)>> = vec![None; graph.nodes.len()];
+	for region in &regions {
+		let (first, count) = part(region.period / region.unit);
+		require(count != 0, "a split region gives a die no channels")?;
+		let run = Run { first: first * region.unit, count: count * region.unit, period: region.period };
+		for start in &region.starts {
+			plans[*start] = Some((Shard { rows: run, terms: Run::default() }, None));
+		}
+		plans[region.end] = Some((Shard { rows: Run::default(), terms: run }, Some(1.0)));
+	}
 	let (mut nodes, mut stored, mut requantize, mut remap) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(graph.nodes.len()));
 	let map = |index: i32, remap: &[i32]| if index >= 0 { remap[index as usize] } else { index };
 	for (index, original) in graph.nodes.iter().enumerate() {
 		let mut node = original.clone();
 		node.source = map(node.source, &remap);
 		node.second = map(node.second, &remap);
-		let weight = graph.stored[index].as_ref().filter(|weight| node.packed && weight.format_segments().len() == 1 && !weight.bytes.absent_runs());
-		// Rows of a contraction, experts of an expert table: the unit a die owns.
-		let units = match (node.op, weight) {
-			(Primitive::Contraction, Some(weight))
-				if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 1 << 20 && node.output.channels >= shares.len() =>
+		let weight = sliceable(graph, index);
+		// Outside a region, a large sum or expert table keeps a share of its rows
+		// and gathers them after itself; a small one runs whole.
+		let alone = match (node.op, weight) {
+			_ if plans[index].is_some() => None,
+			(Primitive::Contraction, Some((weight, _, _)))
+				if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 16 << 20 && node.output.channels >= shares.len() =>
 			{
-				Some(node.output.channels)
+				let (first, count) = part(node.output.channels);
+				Some(Run { first, count, period: 0 })
 			}
-			// Every die takes a share of every expert: the gate and up tables' hidden
-			// rows, the down table's output rows. The work is the same whichever
-			// experts a position routes to.
-			(Primitive::ExpertIn, Some(_)) if node.argument[0] as usize > 1 && node.argument[2] as usize >= shares.len() => Some(node.argument[2] as usize),
-			(Primitive::ExpertOut, Some(_)) if node.argument[0] as usize > 1 && node.output.channels >= shares.len() => Some(node.output.channels),
+			(Primitive::ExpertIn, Some(_)) if node.argument[0] as usize > 1 && node.argument[2] as usize >= shares.len() => {
+				let (first, count) = part(node.argument[2] as usize);
+				Some(Run { first, count, period: node.argument[2] as usize })
+			}
+			(Primitive::ExpertOut, Some(_)) if node.argument[0] as usize > 1 && node.output.channels >= shares.len() => {
+				let (first, count) = part(node.output.channels);
+				Some(Run { first, count, period: 0 })
+			}
 			_ => None,
 		};
-		if tracing() && die == 0 && matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) && units.is_none() {
-			let stored = graph.stored[index].as_ref();
-			trace(&format!("shard {} kept whole: packed {} stored {} segments {} parameters {} bytes {}", original.identity(index), node.packed, stored.is_some(), stored.map_or(0, |weight| weight.format_segments().len()), node.parameters, stored.map_or(0, |weight| weight.bytes.len())))?;
-		}
-		let Some(units) = units else {
+		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
+		let Some((shard, exchange)) = plan else {
 			nodes.push(node);
 			stored.push(graph.stored[index].clone());
 			requantize.push(graph.requantize[index].clone());
 			remap.push(nodes.len() as i32 - 1);
 			continue;
 		};
-		let weight = weight.ok_or_else(|| RecipeError::new("a split node has no stored weight"))?;
-		// An expert table repeats its rows once per expert; a contraction is one period.
-		let periods = if node.op == Primitive::Contraction { 1 } else { node.argument[0] as usize };
-		require(weight.bytes.len() % (units * periods) == 0 && weight.count % (units * periods) == 0, format!("{} does not divide into {units} equal parts per expert", original.identity(index)))?;
-		let shard = part(units);
-		let (unit_bytes, unit_count) = (weight.bytes.len() / (units * periods), weight.count / (units * periods));
-		let count = unit_count * shard.count * periods;
-		let format = weight.format_segments()[0].0;
-		let bytes = StoredBytes::joined((0..periods).map(|period| weight.bytes.view((period * units + shard.first) * unit_bytes, shard.count * unit_bytes)).collect());
-		stored.push(Some(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] }));
-		requantize.push(None);
-		node.parameters = count;
+		let (weight, block, stride) = weight.ok_or_else(|| RecipeError::new("a split node has no stored weight"))?;
+		// An expert table repeats its rows once per expert; a sum is one repeat.
+		let (repeats, rows, terms) = match node.op {
+			Primitive::ExpertIn => (node.argument[0] as usize, node.argument[2] as usize, node.input.channels),
+			Primitive::ExpertOut => (node.argument[0] as usize, node.output.channels, node.argument[2] as usize),
+			_ => (1, node.output.channels, node.input.channels),
+		};
+		let sliced = if shard.terms.count != 0 { weight_terms(weight, repeats, rows, terms, shard.terms, block, stride)? } else { weight_rows(weight, repeats, rows, shard.rows)? };
+		node.parameters = sliced.count;
 		node.shard = shard;
-		// Each die's rows gather into every die; a gate or up table's share
-		// recurs once per routed slot, every `hidden` rows.
-		let period = if node.op == Primitive::ExpertIn { node.argument[2] } else { 0.0 };
+		stored.push(Some(sliced));
+		requantize.push(None);
 		let (output, template) = (node.output, node.clone());
 		nodes.push(node);
-		{
+		if let Some(mode) = exchange {
 			let source = nodes.len() as i32 - 1;
 			nodes.push(Node {
 				op: Primitive::Exchange,
@@ -17798,7 +17974,7 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
 				input: output,
 				output,
 				parameters: 0,
-				argument: [0.0, die as f64, shares.len() as f64, period, 0.0, 0.0, 0.0, 0.0, 0.0],
+				argument: [mode, die as f64, shares.len() as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
 				program_offset: 0,
 				program_count: 0,
 				storage: 0,
@@ -18325,15 +18501,32 @@ struct Node {
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
-	/// The part of a tensor-split node this die computes: output rows of a
-	/// contraction, or experts of an expert table. Zero parts is the whole node.
+	/// The part of a tensor-split node this die computes: its output rows and the
+	/// inputs it sums over. A whole run is the whole axis.
 	shard: Shard,
 }
-/// A contiguous part of a node's rows or experts.
+/// Channels `first` to `first + count` of every `period` channels, or from
+/// `first` on when `period` is zero; no channels named is the whole axis.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Shard {
+struct Run {
 	first: usize,
 	count: usize,
+	period: usize,
+}
+impl Run {
+	/// How many of `channels` the run holds.
+	fn local(self, channels: usize) -> usize {
+		match (self.count, self.period) {
+			(0, _) => channels,
+			(count, 0) => count,
+			(count, period) => channels / period * count,
+		}
+	}
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Shard {
+	rows: Run,
+	terms: Run,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
