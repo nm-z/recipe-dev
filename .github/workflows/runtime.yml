@@ -1226,8 +1226,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p evidence
-          # The first failure the guest or controller reported is the reason.
+          # Recipe's own panic is the reason when the suite ran; otherwise the first
+          # failure the guest or controller reported.
           reason=""
+          if [ -f evidence/execute.log ]; then
+            reason="$(tr -d '\r' < evidence/execute.log | awk '/panicked at/ { site = $NF; sub(/:$/, "", site); getline; print "recipe: " $0 " (" site ")"; exit }')"
+          fi
           for log in evidence/execute.log evidence/preflight.log; do
             [ -n "$reason" ] || reason="$(grep -h -m1 'GUEST FAILURE:' "$log" 2>/dev/null | sed 's/^.*GUEST FAILURE: //' || true)"
           done
