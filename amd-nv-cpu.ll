@@ -1087,8 +1087,8 @@ define internal double @recipe.model.decode(ptr addrspace(1) %matrix, i64 %index
 ; The dot of one run of consecutive stored weights of a node (a whole block,
 ; or 32 values of smaller blocks), from %index on, with as many staged
 ; activations %stride apart: the node's format decodes each value where it lies.
-define internal RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %matrix, i64 %index, i32 %node, ptr addrspace(3) %x, i32 %stride, i64 %length) #1 { entry: unreachable }
-define internal <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %matrix, i64 %index, i32 %node, ptr addrspace(3) %x, i32 %stride, i32 %pitch, i64 %length) #1 { entry: unreachable }
+define internal RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %matrix, i64 %row, i64 %k, i32 %node, ptr addrspace(3) %x, i32 %stride, i64 %length) #1 { entry: unreachable }
+define internal <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %matrix, i64 %row, i64 %k, i32 %node, ptr addrspace(3) %x, i32 %stride, i32 %pitch, i64 %length) #1 { entry: unreachable }
 ; One weight of a node-relative span: a dense node loads it, a packed node decodes it.
 define internal double @recipe.model.weight(ptr addrspace(1) %weights, i64 %index, i32 %decode) #1 { entry:
 %packed = icmp ne i32 %decode, 0 br i1 %packed, label %decoded, label %direct
@@ -2278,7 +2278,9 @@ case.step:
 %x.row = mul i32 %unit.safe, %x.pitch
 %x.at = add i32 %x.row, %case.values
 %x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %x.at
-%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1, i64 %row.length)
+%run.row = udiv i64 %run.index, %row.length
+%run.k = urem i64 %run.index, %row.length
+%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.row, i64 %run.k, i32 %node, ptr addrspace(3) %x, i32 1, i64 %row.length)
 %part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %part, RECIPE_STATE %value)
 %case.next = add i32 %case, 1
 br label %case.loop
@@ -2501,7 +2503,8 @@ unit.step:
 %u.start.wide = zext i32 %u.start to i64
 %run.index = add i64 %row.chunk, %u.start.wide
 %x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %u.start
-%runs = call <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1, i32 %chunk.span, i64 %terms.wide)
+%run.k = sub i64 %run.index, %row.index
+%runs = call <4 x RECIPE_STATE> @recipe.model.dot.run4(ptr addrspace(1) %weights, i64 %row.wide, i64 %run.k, i32 %node, ptr addrspace(3) %x, i32 1, i32 %chunk.span, i64 %terms.wide)
 %run0 = extractelement <4 x RECIPE_STATE> %runs, i32 0
 %run1 = extractelement <4 x RECIPE_STATE> %runs, i32 1
 %run2 = extractelement <4 x RECIPE_STATE> %runs, i32 2
@@ -2747,7 +2750,8 @@ split.unit.step:
 %su.start.wide = zext i32 %su.start to i64
 %su.index = add i64 %split.row.base, %su.start.wide
 %su.x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %su.start
-%su.run = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %su.index, i32 %node, ptr addrspace(3) %su.x, i32 1, i64 %terms.wide)
+%su.k = sub i64 %su.index, %split.row.index
+%su.run = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %split.row.wide, i64 %su.k, i32 %node, ptr addrspace(3) %su.x, i32 1, i64 %terms.wide)
 %su.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %su.sum, RECIPE_STATE %su.run)
 %su.next = add i32 %su, %split.step.waves
 br label %split.unit
@@ -2961,8 +2965,6 @@ round.step:
 %in.erow.base = mul i64 %in.id.wide, %hidden.wide
 %in.erow = add i64 %in.erow.base, %in.f.wide
 %weight.row = select i1 %expert, i64 %in.erow, i64 %row.wide
-%weight.row.index = mul i64 %weight.row, %terms.wide
-%row.base = add i64 %weight.base, %weight.row.index
 br label %unit.loop
 unit.loop:
 %u = phi i32 [ %part, %round.step ], [ %u.next, %unit.step ]
@@ -2985,17 +2987,16 @@ unit.step:
 %down.id.wide = zext i32 %down.id to i64
 %down.erow.base = mul i64 %down.id.wide, %rows.wide
 %down.erow = add i64 %down.erow.base, %row.wide
-%down.row.index = mul i64 %down.erow, %hidden.wide
 %down.slot.wide = zext i32 %down.slot.safe to i64
 %down.slot.start = mul i64 %down.slot.wide, %hidden.wide
 %down.within = sub i64 %k0.wide, %down.slot.start
-%down.index.local = add i64 %down.row.index, %down.within
-%down.index = add i64 %weight.base, %down.index.local
-%plain.index = add i64 %row.base, %k0.wide
-%run.index = select i1 %down, i64 %down.index, i64 %plain.index
+%plain.within = add i64 %weight.base, %k0.wide
+%down.k = add i64 %weight.base, %down.within
+%run.row = select i1 %down, i64 %down.erow, i64 %weight.row
+%run.k = select i1 %down, i64 %down.k, i64 %plain.within
 %x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %u.start
 %run.length = select i1 %down, i64 %hidden.wide, i64 %terms.wide
-%run = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1, i64 %run.length)
+%run = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.row, i64 %run.k, i32 %node, ptr addrspace(3) %x, i32 1, i64 %run.length)
 %run.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %run, RECIPE_STATE %down.scale)
 %run.part = select i1 %down, RECIPE_STATE %run.scaled, RECIPE_STATE %run
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %run.part)

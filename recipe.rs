@@ -7402,7 +7402,7 @@ impl NativeModelIr {
 				let name = self.run_key(index).ok_or_else(|| RecipeError::new("a run decoder's node has no run format"))?;
 				arms.push_str(&format!("i32 {}, label %{name}\n", index + 1));
 				if !formats.iter().any(|(known, ..)| *known == name) {
-					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
 					formats.push((name, native, block, stride, lanes));
 				}
 			}
@@ -7411,10 +7411,10 @@ impl NativeModelIr {
 				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 1, *lanes));
 				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 4, *lanes));
 			}
-			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
 			// The same formats over four positions at once.
-			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
-			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %index, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
+			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
+			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
 			let _ = ty;
 		}
 		Ok(ir)
@@ -7489,11 +7489,11 @@ impl NativeModelIr {
 			// Rows of `%length` values interleave in groups of `lanes` a word at a
 			// time: word w of the group's row l is word `w * lanes + l` of the group.
 			operations.ir.push_str(&format!(
-				"%run.row = udiv i64 %index, %length\n%run.k = urem i64 %index, %length\n%run.blocks = udiv i64 %length, {block}\n%run.row.bytes = mul i64 %run.blocks, {stride}\n%run.group = udiv i64 %run.row, {lanes}\n%run.lane = urem i64 %run.row, {lanes}\n%run.group.bytes = mul i64 %run.row.bytes, {lanes}\n%run.group.at = mul i64 %run.group, %run.group.bytes\n%run.lane.at = mul i64 %run.lane, 4\n%run.k.block = udiv i64 %run.k, {block}\n%run.k.bytes = mul i64 %run.k.block, {stride}\n%run.word = udiv i64 %run.k.bytes, 4\n%run.word.at = mul i64 %run.word, {pitch}\n%run.lane.base = add i64 %run.group.at, %run.lane.at\n%run.at = add i64 %run.lane.base, %run.word.at\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.at\n%run.place = and i64 %run.k.bytes, 3\n",
+				"%run.row = add i64 %row, 0\n%run.k = add i64 %k, 0\n%run.blocks = udiv i64 %length, {block}\n%run.row.bytes = mul i64 %run.blocks, {stride}\n%run.group = udiv i64 %run.row, {lanes}\n%run.lane = urem i64 %run.row, {lanes}\n%run.group.bytes = mul i64 %run.row.bytes, {lanes}\n%run.group.at = mul i64 %run.group, %run.group.bytes\n%run.lane.at = mul i64 %run.lane, 4\n%run.k.block = udiv i64 %run.k, {block}\n%run.k.bytes = mul i64 %run.k.block, {stride}\n%run.word = udiv i64 %run.k.bytes, 4\n%run.word.at = mul i64 %run.word, {pitch}\n%run.lane.base = add i64 %run.group.at, %run.lane.at\n%run.at = add i64 %run.lane.base, %run.word.at\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.at\n%run.place = and i64 %run.k.bytes, 3\n",
 				pitch = 4 * lanes
 			));
 		} else {
-			operations.ir.push_str(&format!("%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
+			operations.ir.push_str(&format!("%run.row.start = mul i64 %row, %length\n%index = add i64 %run.row.start, %k\n%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
 		}
 		let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
 		let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
@@ -7555,9 +7555,9 @@ impl NativeModelIr {
 			}
 		}
 		if positions == 1 {
-			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
 		} else {
-			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\n{}}}\n", operations.ir)
+			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\n{}}}\n", operations.ir)
 		}
 	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
