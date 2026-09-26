@@ -243,7 +243,16 @@ run_suite() {
 	set -e
 	if [ "$exit_code" -ne 0 ]; then
 		tail -n 30 "$work/run.log"
-		[ "$exit_code" -ne 124 ] || fail "the runtime suite exceeded 600s after $(grep -c '^check ' "$work/run.log" || true) completed checks"
+		if [ "$exit_code" -eq 124 ]; then
+			# A hang says nothing on its own: the trace shows the last dispatch, the kernel log any GPU reset.
+			{
+				echo "--- last suite trace lines ---"
+				tail -n 15 "$ROOT/suite-trace-$candidateSha.log" 2> /dev/null || echo "no suite trace"
+				echo "--- last amdgpu kernel messages ---"
+				dmesg 2> /dev/null | grep -i -E 'amdgpu|kfd' | tail -n 10 || true
+			} >&2
+			fail "the runtime suite exceeded 600s after $(grep -c '^check ' "$work/run.log" || true) completed checks"
+		fi
 		fail "the runtime suite failed with exit code $exit_code"
 	fi
 	grep -q 'SUITE PASS executed=8' "$work/run.log" || { tail -n 30 "$work/run.log"; fail "the suite did not report eight passing checks"; }
