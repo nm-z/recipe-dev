@@ -3846,13 +3846,20 @@ mod quantized {
 			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {half})", self.suffix))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i16, ptr {address}, align 2"));
+			// Up to eight byte entries fit one constant: the entry is a shift away.
+			if values.len() <= 8 && values.iter().all(|value| *value < 256) {
+				let packed = values.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value) << (8 * at));
+				let shift = self.instruction(format!("shl i64 {index}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {packed}, {shift}"));
+				return self.instruction(format!("and i64 {shifted}, 255"));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i16, ptr addrspace(1) {address}, align 2, !invariant.load !{{}}"));
 			self.instruction(format!("zext i16 {loaded} to i64"))
 		}
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i8, ptr {address}, align 1"));
+			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i8, ptr addrspace(1) {address}, align 1, !invariant.load !{{}}"));
 			self.instruction(format!("sext i8 {loaded} to i64"))
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
@@ -4043,7 +4050,16 @@ mod quantized {
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
 			match index {
 				RunInt::Known(index) => RunInt::Known(u64::from(values[index as usize])),
-				RunInt::Ir(index) => RunInt::Ir(self.inner.table(name, values, index)),
+				// Values of one grid point share its entry: the run reads it once.
+				RunInt::Ir(index) => {
+					let key = (format!("table {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
 			}
 		}
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
@@ -4160,10 +4176,11 @@ impl NativeModelIr {
 					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
 				{
 					// Whole tiles of four positions take the tile body; the rest of the
-					// window, a one-position step among them, takes the row body.
+					// window, a one-position step among them, takes the lane body, a row
+					// per lane, and the row body takes what the lane body cannot.
 					ir.push_str(&format!("br label %n{index}.pre\nn{index}.pre:\n"));
 					ir.push_str(&format!(
-						"%n{index}.tiling = icmp uge i32 {span}, 4\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_tile_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n",
+						"%n{index}.tiling = icmp uge i32 {span}, 4\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_tile_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
 						pointer = pointer_type(backend),
 						source = pointers.source,
 						weights = pointers.weights,
@@ -4183,7 +4200,7 @@ impl NativeModelIr {
 						in_period = node.shard.terms.period,
 						in_share = node.shard.terms.count,
 					));
-					let (begin, span) = (format!("%n{index}.rest.begin"), format!("%n{index}.rest.span"));
+					let (begin, span) = (format!("%n{index}.last.begin"), format!("%n{index}.last.span"));
 					ir.push_str(&format!(
 						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
 						row_first = node.shard.rows.first,
@@ -4347,8 +4364,10 @@ impl NativeModelIr {
 						node.input.channels % unit == 0 && (node.op == Primitive::ExpertIn || (node.argument[2] as usize) % unit == 0)
 					}) =>
 				{
+					// The lane body takes the window, a row per lane; the row body takes
+					// what the lane body cannot.
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+						"%n{index}.laned = call i32 @packed_lanes_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 {begin}, %n{index}.laned\n%n{index}.last.span = sub i32 {span}, %n{index}.laned\n{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.last.begin, i32 %n{index}.last.span, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
 						// A split expert table holds a share of every expert: the gate and
 						// up tables its hidden rows (placed within each expert's period),
 						// the down table its output rows.
@@ -7409,7 +7428,7 @@ impl NativeModelIr {
 					for (k, mid) in IQ4_MID.iter().enumerate() {
 						ir.push_str(&format!("%{p}.c{i}.k{k} = fcmp ogt float %{p}.q{i}, {mid}\n%{p}.c{i}.z{k} = zext i1 %{p}.c{i}.k{k} to i32\n%{p}.c{i}.{next} = add i32 %{p}.c{i}.{k}, %{p}.c{i}.z{k}\n", mid = lit(*mid), next = k + 1));
 					}
-					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr %{p}.l{i}.ptr, align 1\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
+					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr addrspace(1) @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr addrspace(1) %{p}.l{i}.ptr, align 1, !invariant.load !{{}}\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
 				}
 				ir.push_str(&format!("%{p}.den.pos = fcmp ogt float %{p}.den32, {zero}\n%{p}.scale.raw = fdiv float %{p}.num32, %{p}.den32\n%{p}.scale.fit = select i1 %{p}.den.pos, float %{p}.scale.raw, float {zero}\n%{p}.scale = select i1 %{p}.tiny, float {zero}, float %{p}.scale.fit\n", zero = lit(0.0)));
 				for i in 0..32 {
@@ -14079,12 +14098,12 @@ impl NativeQuantTable {
 	fn definition(self) -> String {
 		match self {
 			Self::Unsigned(name, values) => format!(
-				"@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n",
+				"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i16] [{}]\n",
 				values.len(),
 				values.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")
 			),
 			Self::Signed(name, values) => {
-				format!("@recipe_model_{name} = private unnamed_addr constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
+				format!("@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
 			}
 		}
 	}
@@ -14230,6 +14249,29 @@ impl StoredBytes {
 	/// shared with the weight it came from, so joining copies no bytes.
 	fn joined(parts: Vec<Self>) -> Self {
 		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
+	}
+	/// Asks the kernel to read the mapped runs into memory ahead of use, so later
+	/// reads of scattered rows find their pages resident instead of on the disk.
+	fn prefetch(&self) {
+		#[cfg(unix)]
+		self.advise(3);
+	}
+	/// Gives the mapped runs' pages back to the machine once their bytes are on
+	/// the device, so the memory holds what the machine still reads.
+	fn release(&self) {
+		#[cfg(target_os = "linux")]
+		self.advise(21);
+	}
+	#[cfg(unix)]
+	fn advise(&self, advice: i32) {
+		for segment in self.0.iter() {
+			if let StoredSegment::Mapped(mapping, at, length) = segment {
+				let page = usize::try_from(unsafe { getpagesize() }).unwrap_or(4096).max(1);
+				let start = mapping.bytes().as_ptr() as usize + at;
+				let aligned = start / page * page;
+				unsafe { madvise(aligned as Ptr, length + (start - aligned), advice) };
+			}
+		}
 	}
 	/// A run of `length` bytes the load kernel writes on the device.
 	fn absent(length: usize) -> Self {
@@ -21745,10 +21787,21 @@ impl NativeTape {
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				// Every position reads scattered rows of the table from the machine's
+				// memory: its pages come in now, while the model loads.
+				table.bytes.prefetch();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
 				lookups.push(HostLookup { context: layout.contexts[index], precision: node.precision, hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
+			}
+		}
+		// Every weight but the machine's lookup tables is on the device now.
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if node.op != Primitive::Lookup {
+				for stored in [graph.stored.get(index), graph.requantize.get(index)].into_iter().flatten().flatten() {
+					stored.bytes.release();
+				}
 			}
 		}
 		let context_resets = layout.context_resets.clone();
@@ -25761,6 +25814,8 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn madvise(address: Ptr, length: usize, advice: i32) -> i32;
+	fn getpagesize() -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
