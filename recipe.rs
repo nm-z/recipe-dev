@@ -23375,7 +23375,17 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// A packed row stages its whole column at once when the tile holds it: the
+		// column, one padding value per 32, and 96 values of row sums, expert ids
+		// and routing weights per wave of the widest (512-lane) workgroup.
+		let packed_shared_values = if inference && !cpu {
+			let scratch = 96 * (512 / wave.max(1)) + 8;
+			let widest = graph.nodes.iter().filter(|node| node.packed).map(|node| node.input.channels as u32).max().unwrap_or(0);
+			(widest + widest / 32 + 1 + scratch).min(shared_values.saturating_sub(256))
+		} else {
+			0
+		};
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(packed_shared_values);
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;

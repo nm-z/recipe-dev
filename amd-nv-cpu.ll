@@ -2271,10 +2271,11 @@ case.step:
 %case.values = mul i32 %case, %unit
 %case.wide = zext i32 %case.values to i64
 %run.index = add i64 %run.first, %case.wide
-%x.row = mul i32 %case.values, %upr
-%x.at = add i32 %x.row, %unit.safe
+%x.pitch = add i32 %unit, 1
+%x.row = mul i32 %unit.safe, %x.pitch
+%x.at = add i32 %x.row, %case.values
 %x = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %x.at
-%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 %upr)
+%value = call RECIPE_STATE @recipe.model.dot.run(ptr addrspace(1) %weights, i64 %run.index, i32 %node, ptr addrspace(3) %x, i32 1)
 %part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %part, RECIPE_STATE %value)
 %case.next = add i32 %case, 1
 br label %case.loop
@@ -2366,11 +2367,17 @@ i1 %has.bias, i1 %relu, i32 %threads, i64 %weight.base, i32 %decode, i32 %node, 
 %tile.clear = sub i32 %tile.room, 16
 %tile.usable = select i1 %tile.some, i32 %tile.clear, i32 0
 %tile.values = udiv i32 %tile.usable, RECIPE_MODEL_BYTES
-%tile.blocks = udiv i32 %tile.values, 256
+; Each unit of at least 32 values is staged with one value of padding.
+%tile.padding.part = udiv i32 %tile.values, 32
+%tile.padding = add i32 %tile.padding.part, 1
+%tile.budget = sub i32 %tile.values, %tile.padding
+%tile.blocks = udiv i32 %tile.budget, 256
 %tile.chunk = mul i32 %tile.blocks, 256
 %tile.chunk.some = icmp ugt i32 %tile.chunk, 256
 %chunk.span = select i1 %tile.chunk.some, i32 %tile.chunk, i32 256
-%x.bytes = mul i32 %chunk.span, RECIPE_MODEL_BYTES
+%x.pad = udiv i32 %chunk.span, 32
+%x.values = add i32 %chunk.span, %x.pad
+%x.bytes = mul i32 %x.values, RECIPE_MODEL_BYTES
 %x.over = add i32 %x.bytes, 15
 %x.aligned = and i32 %x.over, -16
 %scratch = getelementptr i8, ptr addrspace(3) @contraction_tile, i32 %x.aligned
@@ -2387,31 +2394,72 @@ position.loop:
 br i1 %position.more, label %position.step, label %exit
 position.step:
 %position = zext i32 %position.index to i64
-%route.leader = icmp eq i32 %lane, 0
-%route.now = and i1 %expert, %route.leader
-br i1 %route.now, label %route.clear, label %chunk.entry
+br i1 %expert, label %route.clear, label %chunk.entry
 ; A slot no expert fills reads expert 0 and adds nothing, as the serial bodies do.
+; Each lane scans an equal, contiguous share of the experts, so the experts a
+; position routed to are listed in ascending order: a lane counts its routed
+; experts, publishes the count, and writes its experts after the counts of the
+; lanes before it.
 route.clear:
-%route.c = phi i32 [ 0, %position.step ], [ %route.c.next, %route.clear.step ]
-%route.c.more = icmp ult i32 %route.c, %top
-br i1 %route.c.more, label %route.clear.step, label %route.start
-route.clear.step:
-%route.c.id = getelementptr i32, ptr addrspace(3) %ids.base, i32 %route.c
+%route.clear.in = icmp ult i32 %lane, %top
+br i1 %route.clear.in, label %route.clear.store, label %route.count.entry
+route.clear.store:
+%route.c.id = getelementptr i32, ptr addrspace(3) %ids.base, i32 %lane
 store i32 0, ptr addrspace(3) %route.c.id, align 4
-%route.c.scale = getelementptr RECIPE_STATE, ptr addrspace(3) %scales.base, i32 %route.c
+%route.c.scale = getelementptr RECIPE_STATE, ptr addrspace(3) %scales.base, i32 %lane
 store RECIPE_STATE %state.zero, ptr addrspace(3) %route.c.scale, align RECIPE_STATE_ALIGN
-%route.c.next = add i32 %route.c, 1
-br label %route.clear
-route.start:
+br label %route.count.entry
+route.count.entry:
+%route.share.over = add i32 %experts, %width
+%route.share.raised = sub i32 %route.share.over, 1
+%route.share = udiv i32 %route.share.raised, %width
+%route.first = mul i32 %lane, %route.share
+%route.first.end = add i32 %route.first, %route.share
+%route.end.over = icmp ugt i32 %route.first.end, %experts
+%route.end = select i1 %route.end.over, i32 %experts, i32 %route.first.end
+br label %route.count
+route.count:
+%route.ce = phi i32 [ %route.first, %route.count.entry ], [ %route.ce.next, %route.count.step ]
+%route.count.value = phi i32 [ 0, %route.count.entry ], [ %route.count.next, %route.count.step ]
+%route.count.more = icmp ult i32 %route.ce, %route.end
+br i1 %route.count.more, label %route.count.step, label %route.count.done
+route.count.step:
+%route.ce.wide = zext i32 %route.ce to i64
+%route.ce.row = mul i64 %route.ce.wide, %out.length.wide
+%route.ce.index = add i64 %route.ce.row, %position
+%route.ce.ptr = getelementptr inbounds double, ptr addrspace(1) %routing, i64 %route.ce.index
+%route.ce.weight = load double, ptr addrspace(1) %route.ce.ptr, align 8
+%route.ce.zero = call i1 @recipe.oeq(double %route.ce.weight, double 0.0)
+%route.ce.taken = xor i1 %route.ce.zero, true
+%route.ce.add = zext i1 %route.ce.taken to i32
+%route.count.next = add i32 %route.count.value, %route.ce.add
+%route.ce.next = add i32 %route.ce, 1
+br label %route.count
+route.count.done:
+%route.count.slot = getelementptr i32, ptr addrspace(3) %sums.base, i32 %lane
+store i32 %route.count.value, ptr addrspace(3) %route.count.slot, align 4
+call void @recipe.local.barrier()
+br label %route.prefix
+route.prefix:
+%route.pl = phi i32 [ 0, %route.count.done ], [ %route.pl.next, %route.prefix.step ]
+%route.offset = phi i32 [ 0, %route.count.done ], [ %route.offset.next, %route.prefix.step ]
+%route.prefix.more = icmp ult i32 %route.pl, %lane
+br i1 %route.prefix.more, label %route.prefix.step, label %route.write.entry
+route.prefix.step:
+%route.pl.slot = getelementptr i32, ptr addrspace(3) %sums.base, i32 %route.pl
+%route.pl.count = load i32, ptr addrspace(3) %route.pl.slot, align 4
+%route.offset.next = add i32 %route.offset, %route.pl.count
+%route.pl.next = add i32 %route.pl, 1
+br label %route.prefix
+route.write.entry:
 br label %route.loop
-; Lane 0 lists the experts the position routed to, in ascending order.
 route.loop:
-%route.e = phi i32 [ 0, %route.start ], [ %route.e.next, %route.advance ]
-%route.slot = phi i32 [ 0, %route.start ], [ %route.slot.next, %route.advance ]
-%route.more.e = icmp ult i32 %route.e, %experts
+%route.e = phi i32 [ %route.first, %route.write.entry ], [ %route.e.next, %route.advance ]
+%route.slot = phi i32 [ %route.offset, %route.write.entry ], [ %route.slot.next, %route.advance ]
+%route.more.e = icmp ult i32 %route.e, %route.end
 %route.more.slot = icmp ult i32 %route.slot, %top
 %route.more = and i1 %route.more.e, %route.more.slot
-br i1 %route.more, label %route.step, label %chunk.entry
+br i1 %route.more, label %route.step, label %route.written
 route.step:
 %route.e.wide = zext i32 %route.e to i64
 %route.row = mul i64 %route.e.wide, %out.length.wide
@@ -2433,6 +2481,8 @@ route.advance:
 %route.slot.next = add i32 %route.slot, %route.step.slot
 %route.e.next = add i32 %route.e, 1
 br label %route.loop
+route.written:
+br label %chunk.entry
 chunk.entry:
 br label %chunk.loop
 chunk.loop:
@@ -2446,8 +2496,8 @@ chunk.loop:
 %chunk.base.wide = zext i32 %chunk.base to i64
 %upr = udiv i32 %chunk.terms, %unit
 br label %stage.loop
-; Value v of unit u sits at v * units + u, so lanes on adjacent units at one
-; place in the unit read adjacent slots.
+; Value v of unit u sits at u * (unit + 1) + v: a lane reads its unit at
+; constant offsets, and lanes on adjacent units land in adjacent banks.
 stage.loop:
 %stage.c = phi i32 [ %lid, %chunk.loop ], [ %stage.c.next, %stage.step ]
 %stage.more = icmp ult i32 %stage.c, %chunk.terms
@@ -2461,8 +2511,9 @@ stage.step:
 %stage.value = load double, ptr addrspace(1) %stage.ptr, align 8
 %stage.unit = udiv i32 %stage.c, %unit
 %stage.within = urem i32 %stage.c, %unit
-%stage.row = mul i32 %stage.within, %upr
-%stage.place = add i32 %stage.row, %stage.unit
+%stage.pitch = add i32 %unit, 1
+%stage.row = mul i32 %stage.unit, %stage.pitch
+%stage.place = add i32 %stage.row, %stage.within
 %stage.slot = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %stage.place
 store double %stage.value, ptr addrspace(3) %stage.slot, align 8
 %stage.c.next = add i32 %stage.c, %block
