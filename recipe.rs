@@ -3251,7 +3251,6 @@ mod quantized {
 		pub(super) table_name: &'static str,
 		pub(super) table: &'static [u16],
 		/// The value of each grid level: ggml's grid bytes, which are not evenly spaced.
-		pub(super) levels_name: &'static str,
 		pub(super) levels: &'static [u16],
 	}
 
@@ -3383,11 +3382,13 @@ mod quantized {
 			}
 			_ => unreachable!(),
 		};
-		let table_word = quant.table(layout.table_name, layout.table, grid);
-		let man_shift = quant_int(quant, QuantIntOp::Multiply, table_lane, layout.man as u64);
-		let man_code = quant_bits(quant, table_word, man_shift, layout.man);
-		let level = quant.table(layout.levels_name, layout.levels, man_code);
-		let mantissa = quant.number(level, false);
+		// Every grid word expanded to its levels' values: one load per weight
+		// instead of the word, its code, the level, and a conversion.
+		let lanes = if layout.man == 2 { 8 } else { 4 };
+		let expanded = layout.table.iter().flat_map(|word| (0..lanes).map(move |lane| f64::from(layout.levels[(word >> (lane * layout.man as usize)) as usize & ((1 << layout.man) - 1)]))).collect::<Vec<_>>();
+		let entry = quant_int(quant, QuantIntOp::Multiply, grid, lanes as u64);
+		let entry = quant.int(QuantIntOp::Add, entry, table_lane);
+		let mantissa = quant.value_table(&format!("{}_values", layout.table_name), &expanded, entry);
 		let exponent = if odd_factor {
 			let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
 			let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
@@ -3950,15 +3951,15 @@ mod quantized {
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
-			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+			if !self.globals.contains(&format!("@recipe_model_{name}_{ty} =")) {
 				self.globals.push_str(&format!(
-					"@recipe_model_{name} = private unnamed_addr constant [{} x {ty}] [{}]\n",
+					"@recipe_model_{name}_{ty} = private unnamed_addr addrspace(1) constant [{} x {ty}] [{}]\n",
 					values.len(),
 					values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.state, ty, *value))).collect::<Vec<_>>().join(", ")
 				));
 			}
-			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			self.instruction(format!("load {ty}, ptr {address}, align {}", super::alignment(ty)))
+			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr addrspace(1) @recipe_model_{name}_{ty}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load {ty}, ptr addrspace(1) {address}, align {}, !invariant.load !{{}}", super::alignment(ty)))
 		}
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -7924,6 +7925,9 @@ impl NativeModelIr {
 		}
 		ir.push_str(&body);
 		let ir = self.specialize_lane_bodies(ir)?;
+		// A value table several decoders read is defined once.
+		let mut defined = BTreeSet::new();
+		let ir = ir.split_inclusive('\n').filter(|line| !(line.starts_with("@recipe_model_") && line.contains(" constant [") && !defined.insert(line.to_owned()))).collect::<String>();
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -14365,7 +14369,6 @@ impl NativeDequant {
 		match self {
 			Self::Iq4(layout) => vec![NativeQuantTable::Signed(layout.table_name, layout.table)],
 			Self::Iq1(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table)],
-			Self::Iq(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table), NativeQuantTable::Unsigned(layout.levels_name, layout.levels)],
 			_ => Vec::new(),
 		}
 	}
@@ -14456,13 +14459,13 @@ quantizations! {
 	Q8K { code: (0, 8, [3]), block: 256, stride: 292, name: "q8k", quant: Quantizer::Q8K, native: Some(NativeDequant::Q8K) }
 	IQ4NL { code: (1, 4, [5]), block: 32, stride: 18, name: "iq4nl", quant: Quantizer::Iq4Nl, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 })) }
 	IQ4XS { code: (1, 4, [2]), block: 256, stride: 136, name: "iq4xs", quant: Quantizer::Iq4Xs, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 6, man: 4, xs: true, table_name: "iq4", table: &IQ4 })) }
-	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS, levels_name: "iq3_xxs_levels", levels: &IQ3_XXS_LEVELS })) }
-	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
-	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
-	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S, levels_name: "iq2_levels", levels: &IQ2_LEVELS })) }
+	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS, levels: &IQ3_XXS_LEVELS })) }
+	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS, levels: &IQ2_LEVELS })) }
+	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS, levels: &IQ2_LEVELS })) }
+	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S, levels: &IQ2_LEVELS })) }
 	IQ1S { code: (1, 1, [3]), block: 256, stride: 50, name: "iq1s", quant: Quantizer::Iq1 { medium: false }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: false, table_name: "iq1", table: &IQ1 })) }
 	IQ1M { code: (1, 1, [4]), block: 256, stride: 56, name: "iq1m", quant: Quantizer::Iq1 { medium: true }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: true, table_name: "iq1", table: &IQ1 })) }
-	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S, levels_name: "iq3_s_levels", levels: &IQ3_S_LEVELS })) }
+	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S, levels: &IQ3_S_LEVELS })) }
 }
 
 fn nf4_codebook(codebook: &[f64], count: usize, bytes: usize) -> Result<(usize, &[f64], &[f64])> {
