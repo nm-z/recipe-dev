@@ -155,6 +155,10 @@ impl Reference {
 
 	/// Records or compares one step. The winner to feed forward comes back: the
 	/// reference's in a comparison, this step's own in a record; `None` when off.
+	/// Whether a run records or compares its logits.
+	pub fn active(&self) -> bool {
+		!matches!(self.mode, Mode::Off)
+	}
 	pub fn step(&mut self, step: usize, logits: &[f64]) -> Result<Option<usize>, String> {
 		if logits.is_empty() {
 			return Err(format!("step {step} has no logits"));

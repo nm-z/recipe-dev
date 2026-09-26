@@ -17055,8 +17055,18 @@ pub struct Sampler {
 	window: usize,
 	state: u64,
 	suppressed: Vec<u32>,
+	draft: usize,
 }
 impl Sampler {
+	/// Draft up to `count` ids a step for a greedy decode to check in one
+	/// window: the model's draft head where it has one, else the ids that
+	/// followed the sequence's latest earlier occurrence of its last ids. The
+	/// decode keeps the ids its greedy choice agrees with, so the ids are the
+	/// same as without drafts.
+	pub fn draft(mut self, count: usize) -> Self {
+		self.draft = count;
+		self
+	}
 	pub fn temperature(mut self, value: f64) -> Self {
 		self.temperature = value;
 		self
@@ -17451,7 +17461,7 @@ impl Drop for InferenceLive {
 }
 impl Recipe {
 	pub fn sampler(&self) -> Sampler {
-		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15, suppressed: Vec::new() }
+		Sampler { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, penalty: 1.0, window: 64, state: 0x9E37_79B9_7F4A_7C15, suppressed: Vec::new(), draft: 0 }
 	}
 	/// Autoregressive decode over a saved model on the primary device: the
 	/// model placed as one range, decoded by [`Placed::decode`] over one tape.
@@ -17561,12 +17571,40 @@ fn decode_steps(
 	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
 	let exact = tape.profile.exact_cpu && tape.program.gpu.backend == Backend::Cpu;
-	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, &mut DecodeState::default(), emit, |samples, begin, end| logits(tape, samples, begin, end))
+	decode_sequence(samples, prompt, sampler, stop, budget, tape.profile, exact, None, &mut DecodeState::default(), emit, |samples, begin, end| logits(tape, samples, begin, end), None)
 }
 /// Both a single tape and a placed model measure and report through this loop.
+/// What a decode needs to check drafted ids in one window and take back the
+/// positions its greedy choice rejects.
+trait Drafting {
+	/// Up to `limit` ids that may follow `ids`.
+	fn draft(&mut self, ids: &[u32], limit: usize) -> Result<Vec<u32>>;
+	/// Copies the carried state aside before a window that may be taken back.
+	fn keep(&mut self) -> Result<()>;
+	/// Puts back the state `keep` copied.
+	fn restore(&mut self) -> Result<()>;
+	/// Runs the window `begin..end` and returns the logits at its last
+	/// `count` positions.
+	fn verify(&mut self, samples: &[f64], begin: u32, end: u32, count: usize) -> Result<Vec<Vec<f64>>>;
+}
+/// Up to `limit` ids that followed the latest earlier occurrence of the last
+/// ids of `ids`, trying the longest tail of three ids down to one.
+fn ngram_draft(ids: &[u32], limit: usize) -> Vec<u32> {
+	for length in (1..=3).rev() {
+		if ids.len() <= length {
+			continue;
+		}
+		let tail = &ids[ids.len() - length..];
+		if let Some(start) = (0..ids.len() - length).rev().find(|start| &ids[*start..start + length] == tail) {
+			let from = start + length;
+			return ids[from..ids.len().min(from + limit)].to_vec();
+		}
+	}
+	Vec::new()
+}
 fn decode_sequence(
 	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>, state: &mut DecodeState,
-	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
+	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>, mut drafting: Option<&mut dyn Drafting>,
 ) -> Result<Generation> {
 	let mut reference = reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)?;
 	let mut cached = prompt.iter().zip(&state.ids).take_while(|(left, right)| left == right).count();
@@ -17579,9 +17617,57 @@ fn decode_sequence(
 	let mut ended = None;
 	if let Some(progress) = progress { progress.cached(cached); progress.phase("prefill", prefill_started); }
 	let mut settled = narrow(cached, "cached positions")? as u32;
-	for step in 0..budget.max(1) {
+	// Drafts are checked by a greedy choice the reference comparison does not replace.
+	if sampler.draft == 0 || sampler.temperature != 0.0 || reference.active() {
+		drafting = None;
+	}
+	let mut step = 0;
+	while step < budget.max(1) {
 		if INTERRUPTED.load(Ordering::Acquire) { break; }
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
+		// A step past the prefill checks its drafts with the id it extends.
+		let limit = sampler.draft.min(budget.saturating_sub(step + 1));
+		if step > 0 && settled + 1 == reached && limit > 0 && let Some(drafts) = drafting.as_deref_mut().map(|drafting| drafting.draft(&generation.ids, limit)).transpose()?.filter(|drafts| !drafts.is_empty()) {
+			let drafting = drafting.as_deref_mut().ok_or_else(|| RecipeError::new("drafting is absent"))?;
+			drafting.keep()?;
+			for (offset, id) in drafts.iter().enumerate() {
+				samples[reached as usize + offset] = f64::from(*id);
+			}
+			let end = reached + drafts.len() as u32;
+			let columns = drafting.verify(samples, settled, end, drafts.len() + 1)?;
+			let mut stopped = false;
+			for (offset, column) in columns.iter().enumerate() {
+				let id = sampler.sample(column, &generation.ids);
+				stopped = stop.contains(&id);
+				if stopped {
+					let now = Instant::now();
+					ended = Some(now);
+					if let Some(progress) = progress { progress.phase("done", now); }
+				} else if let Some(progress) = progress { progress.generated(true); }
+				emit(id)?;
+				samples[generation.ids.len()] = f64::from(id);
+				generation.ids.push(id);
+				generation.logits.clone_from(column);
+				step += 1;
+				if stopped || drafts.get(offset) != Some(&id) {
+					break;
+				}
+			}
+			// The tapes ran every draft; the positions after the last id kept are
+			// taken back and the kept ones run again from the state before them.
+			let kept = narrow(generation.ids.len() - 1, "decode position")? as u32;
+			if kept < end {
+				drafting.restore()?;
+				if kept > settled {
+					logits(samples, settled, kept)?;
+				}
+			}
+			settled = kept;
+			state.ids.clear();
+			state.ids.extend_from_slice(&generation.ids[..settled as usize]);
+			if stopped { break; }
+			continue;
+		}
 		let (predictions, sample_logits) = if settled == reached {
 			(state.predictions.clone(), state.logits.clone())
 		} else {
@@ -17609,6 +17695,7 @@ fn decode_sequence(
 			break;
 		}
 		let id = reference_id.map(|id| id as u32).unwrap_or_else(|| sampler.sample(&sample_logits, &generation.ids));
+		step += 1;
 		let stopped = stop.contains(&id);
 		if stopped {
 			let now = Instant::now();
@@ -17627,6 +17714,38 @@ fn decode_sequence(
 	if let Some(progress) = progress { progress.phase("done", ended); }
 	require(reference.finish().map_err(RecipeError::new)?.ok(), "reference logits comparison failed")?;
 	Ok(generation)
+}
+/// A placement's drafting: the sequence's own n-grams, every tape's carried
+/// state, and windows whose last positions' logits come back.
+struct PlacedDrafting<'a> {
+	placed: &'a Placed,
+}
+impl Drafting for PlacedDrafting<'_> {
+	fn draft(&mut self, ids: &[u32], limit: usize) -> Result<Vec<u32>> {
+		Ok(ngram_draft(ids, limit))
+	}
+	fn keep(&mut self) -> Result<()> {
+		self.placed.tapes.iter().flatten().try_for_each(NativeTape::keep_carried)
+	}
+	fn restore(&mut self) -> Result<()> {
+		self.placed.tapes.iter().flatten().try_for_each(NativeTape::restore_carried)
+	}
+	fn verify(&mut self, samples: &[f64], begin: u32, end: u32, count: usize) -> Result<Vec<Vec<f64>>> {
+		let ranges = self.placed.tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?;
+		self.placed.forward_window(ranges, samples, begin, end, None, true)?;
+		let last = ranges.last().ok_or_else(|| RecipeError::new("placement has no range"))?;
+		let mut columns = last.window_columns(end - count as u32, end)?;
+		if let PlacedSource::Bound(_, suppressed) = &self.placed.source {
+			for column in &mut columns {
+				for id in suppressed {
+					if let Some(logit) = column.get_mut(*id as usize) {
+						*logit = -f64::MAX;
+					}
+				}
+			}
+		}
+		Ok(columns)
+	}
 }
 /// The interface in front of placed tapes: a saved semantic pipeline applies
 /// its named-input transforms, while a bound graph reads its input directly.
@@ -18447,6 +18566,7 @@ impl Placed {
 		if !prompt.starts_with(&state.ids) && self.tapes.iter().flatten().any(|tape| tape.nodes.iter().any(|node| node.op == Primitive::Delta || node.op == Primitive::Attention && attention_blocks(node) > 0)) {
 			*state = DecodeState::default();
 		}
+		let mut drafting = PlacedDrafting { placed: self };
 		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
 			let bound = matches!(self.source, PlacedSource::Bound(..));
 			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None }, bound)?;
@@ -18459,7 +18579,7 @@ impl Placed {
 				}
 			}
 			Ok((predictions, sample_logits))
-		});
+		}, Some(&mut drafting));
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
@@ -21588,6 +21708,9 @@ struct NativeTape {
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
 	window_begin: std::sync::atomic::AtomicU32,
+	/// The carried contexts as they were before a window that may be taken
+	/// back, and the positions they had reached.
+	kept: Mutex<Option<(Buffer, u32, u32)>>,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -21966,6 +22089,7 @@ impl NativeTape {
 			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
 			reached: std::sync::atomic::AtomicU32::new(0),
 			window_begin: std::sync::atomic::AtomicU32::new(0),
+			kept: Mutex::new(None),
 		};
 		tape.stage_lookups(0, tape.positions)?;
 		Ok(tape)
@@ -22267,6 +22391,43 @@ impl NativeTape {
 	}
 	/// Restore the token, input, and mutable arenas before a new sequence, while
 	/// retaining packed tables and saved evaluation statistics.
+	/// Copies every carried context aside on the device: the state a window
+	/// that may be taken back starts from.
+	fn keep_carried(&self) -> Result<()> {
+		let mut kept = self.kept.lock().map_err(|_| RecipeError::new("kept state is poisoned"))?;
+		let bytes = self.context_resets.iter().map(|(start, end)| end - start).sum::<usize>().max(1);
+		if kept.as_ref().is_none_or(|(buffer, ..)| buffer.bytes < bytes) {
+			*kept = Some((Buffer::reserve(self.program.gpu, bytes)?, 0, 0));
+		}
+		let (buffer, reached, begin) = kept.as_mut().ok_or_else(|| RecipeError::new("kept state is absent"))?;
+		let mut at = 0;
+		for &(start, end) in &self.context_resets {
+			self.program.gpu.copy_device(buffer.pointer + at as u64, self.contexts.pointer + start as u64, end - start)?;
+			at += end - start;
+		}
+		(*reached, *begin) = (self.reached.load(Ordering::Relaxed), self.window_begin.load(Ordering::Relaxed));
+		Ok(())
+	}
+	/// Puts back the carried contexts `keep_carried` copied aside.
+	fn restore_carried(&self) -> Result<()> {
+		let kept = self.kept.lock().map_err(|_| RecipeError::new("kept state is poisoned"))?;
+		let (buffer, reached, begin) = kept.as_ref().ok_or_else(|| RecipeError::new("no state was kept to restore"))?;
+		let mut at = 0;
+		for &(start, end) in &self.context_resets {
+			self.program.gpu.copy_device(self.contexts.pointer + start as u64, buffer.pointer + at as u64, end - start)?;
+			at += end - start;
+		}
+		self.reached.store(*reached, Ordering::Relaxed);
+		self.window_begin.store(*begin, Ordering::Relaxed);
+		Ok(())
+	}
+	/// The output channels at each position `begin..end` of the last window,
+	/// one vector per position.
+	fn window_columns(&self, begin: u32, end: u32) -> Result<Vec<Vec<f64>>> {
+		let values = self.output_window_values(begin, end)?;
+		let positions = (end - begin) as usize;
+		Ok((0..positions).map(|position| (0..self.output.channels).map(|channel| values[channel * positions + position]).collect()).collect())
+	}
 	fn reset_sequence(&self) -> Result<()> {
 		self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.fill(0.0);
 		self.samples.clear()?;
@@ -24517,6 +24678,27 @@ impl Gpu {
 					channel.flush()?;
 					channel.read_status("clear")
 				}
+			}
+		}
+	}
+	/// `bytes` from device address `src` to device address `dst` on this device.
+	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
+	fn copy_device(&self, dst: u64, src: u64, bytes: usize) -> Result<()> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => {
+					ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
+					Ok(())
+				}
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => {
+					let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 2, src_host: ptr::null(), src_device: src, src_array: ptr::null_mut(), src_pitch: bytes, dst_x: 0, dst_y: 0, dst_memory: 2, dst_host: ptr::null_mut(), dst_device: dst, dst_array: ptr::null_mut(), dst_pitch: bytes, width: bytes, height: 1 };
+					self.status((driver.copy_2d)(&copy), "device copy")
+				}
+				#[cfg(amd)]
+				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src as *const c_void, bytes), "device copy"),
+				Driver::Remote(_) => Err(RecipeError::new(format!("device {} is on another machine: its state is copied only where it runs", self.name))),
 			}
 		}
 	}
