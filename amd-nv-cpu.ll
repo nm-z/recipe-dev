@@ -5926,10 +5926,13 @@ ret double %result
 ; The running sum of indexer keys of one key block, extended by the keys of the
 ; block that lie in the forward window `begin..end`. A block whose first key
 ; lies in the window starts from zero; one that began earlier keeps the sum an
-; earlier window left, so a decode step adds one key to one block.
+; earlier window left, so a decode step adds one key to one block. When
+; %block.cached, a block whose last key the window reaches also stores its
+; representative, which no later query changes, in %block.cache.
 define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) %context,
 i64 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width,
-i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
+i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base,
+ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %block.cache, i1 %block.cached ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64 %begin.wide = zext i32 %begin to i64 %end.wide = zext i32 %end to i64
 %length = udiv i64 %from.wide, %channels.wide
 %index.query.channels = mul i64 %index.heads.wide, %index.width.wide
@@ -5977,7 +5980,28 @@ br label %clear.loop
 key.loop:
 %key = phi i64 [ %first, %entry ], [ %first, %clear.loop ], [ %key.advance, %key.step ]
 %key.more = icmp ult i64 %key, %stop
-br i1 %key.more, label %key.prepare, label %exit
+br i1 %key.more, label %key.prepare, label %finish
+finish:
+%complete = icmp eq i64 %stop, %stop.full
+%finished = and i1 %complete, %extends
+%cache.now = and i1 %finished, %block.cached
+%cache.query.wide = add i64 %start, %select.block.wide
+%cache.query = trunc i64 %cache.query.wide to i32 %cache.block = trunc i64 %block.index to i32 %cache.length = trunc i64 %length to i32
+br i1 %cache.now, label %cache.loop, label %exit
+cache.loop:
+%cd = phi i32 [ 0, %finish ], [ %cd.next, %cache.step ]
+%cd.more = icmp ult i32 %cd, %index.width
+br i1 %cd.more, label %cache.step, label %exit
+cache.step:
+%cache.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
+i64 %key.origin, i64 %representative.start.row, i32 %cache.query, i32 %cache.block, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %cache.length, i32 %index.mode, i32 %index.dims, RECIPE_STATE %index.base, double %epsilon, i1 %index.pooled, i32 %cd)
+%cd.wide = zext i32 %cd to i64
+%cache.row = sub i64 %representative.start, %representative.base
+%cache.index = add i64 %cache.row, %cd.wide
+%cache.ptr = getelementptr inbounds double, ptr addrspace(1) %block.cache, i64 %cache.index
+store double %cache.value, ptr addrspace(1) %cache.ptr, align 8
+%cd.next = add i32 %cd, 1
+br label %cache.loop
 key.prepare:
 %key.position = add i64 %key.origin, %key
 br label %dim.loop
@@ -6003,6 +6027,51 @@ br label %key.loop
 exit:
 ret void
 }
+; The representative of query %p's own block in dimension %d, pooled over the
+; block's keys up to the query and stored in the query's slot after the
+; complete blocks' representatives.
+define internal void @attention_own_representative_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
+i64 %p, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads,
+i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base,
+ptr addrspace(1) %block.cache, i32 %own.slots ) #1 { entry:
+%from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
+%length = udiv i64 %from.wide, %channels.wide
+%index.query.channels = mul i64 %index.heads.wide, %index.width.wide
+%index.channels = add i64 %index.query.channels, %index.width.wide
+%row.stride = mul i64 %index.channels, %length
+%index.key.base = mul i64 %index.query.channels, %length
+%blocks.numerator = add i64 %length, %select.block.wide
+%blocks.less = sub i64 %blocks.numerator, 1
+%blocks = udiv i64 %blocks.less, %select.block.wide
+%statistics.rows = mul i64 %rows.wide, %heads.wide
+%statistics.plane = mul i64 %statistics.rows, %length
+%representative.base = mul i64 %statistics.plane, 2
+%representative.stride = mul i64 %blocks, %index.width.wide
+%row.plane = mul i64 %index.width.wide, %length
+%row = udiv i64 %p, %row.plane
+%within = urem i64 %p, %row.plane
+%d.wide = udiv i64 %within, %length
+%query = urem i64 %within, %length
+%row.base = mul i64 %row, %row.stride
+%key.origin = add i64 %row.base, %index.key.base
+%representative.row = mul i64 %row, %representative.stride
+%representative.start = add i64 %representative.base, %representative.row
+%query.i32 = trunc i64 %query to i32 %length.i32 = trunc i64 %length to i32 %d = trunc i64 %d.wide to i32
+%block = udiv i32 %query.i32, %select.block
+%value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
+i64 %key.origin, i64 %representative.start, i32 %query.i32, i32 %block, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length.i32, i32 %index.mode, i32 %index.dims, RECIPE_STATE %index.base, double %epsilon, i1 %index.pooled, i32 %d)
+%own.base = mul i64 %representative.stride, %rows.wide
+%own.slots.wide = zext i32 %own.slots to i64
+%own.row.slots = mul i64 %row, %own.slots.wide
+%own.slot.local = urem i64 %query, %own.slots.wide
+%own.slot = add i64 %own.row.slots, %own.slot.local
+%own.slot.offset = mul i64 %own.slot, %index.width.wide
+%own.start = add i64 %own.base, %own.slot.offset
+%own.index = add i64 %own.start, %d.wide
+%own.ptr = getelementptr inbounds double, ptr addrspace(1) %block.cache, i64 %own.index
+store double %value, ptr addrspace(1) %own.ptr, align 8
+ret void
+}
 ; Block scores and the selection threshold of one query. Every indexer query
 ; head scores every causal block representative, the heads' scores add, and
 ; the threshold is the score of the keep-th best, so a query keeps every block
@@ -6012,7 +6081,8 @@ ret void
 ; type after each head as the whole-row body stores it.
 define internal void @attention_select_score_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
 i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads,
-i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %block ) #1 { entry:
+i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %block,
+ptr addrspace(1) nocapture readonly %block.cache, i1 %block.cached, i32 %own.slots ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
 %length = udiv i64 %from.wide, %channels.wide
 %index.query.channels = mul i64 %index.heads.wide, %index.width.wide
@@ -6045,6 +6115,25 @@ i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode,
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
 %in.range = icmp ult i32 %block, %count
+; A block before the query's own is complete: its representative is cached.
+%query.block = udiv i32 %query.i32, %select.block
+%earlier.block = icmp ult i32 %block, %query.block
+%use.cache = and i1 %earlier.block, %block.cached
+%cache.block.wide = zext i32 %block to i64
+%cache.block.offset = mul i64 %cache.block.wide, %index.width.wide
+%cache.start = add i64 %representative.row, %cache.block.offset
+; The query's own block was pooled once for the query, one dimension per thread.
+%own.block = icmp eq i32 %block, %query.block
+%use.own = and i1 %own.block, %block.cached
+%own.base = mul i64 %representative.stride, %rows.wide
+%own.slots.wide = zext i32 %own.slots to i64
+%own.row.slots = mul i64 %row, %own.slots.wide
+%own.slot.local = urem i64 %query, %own.slots.wide
+%own.slot = add i64 %own.row.slots, %own.slot.local
+%own.slot.offset = mul i64 %own.slot, %index.width.wide
+%own.start = add i64 %own.base, %own.slot.offset
+%use.stored = or i1 %use.cache, %use.own
+%stored.start = select i1 %use.own, i64 %own.start, i64 %cache.start
 br i1 %in.range, label %head.loop, label %exit
 head.loop:
 %head = phi i32 [ 0, %entry ], [ %head.advance, %head.done ]
@@ -6057,8 +6146,8 @@ head.prepare:
 %head.base = add i64 %query.position, %head.plane
 br label %dim.loop
 dim.loop:
-%d = phi i32 [ 0, %head.prepare ], [ %d.advance, %dim.step ]
-%sum = phi RECIPE_STATE [ %state.zero, %head.prepare ], [ %sum.next, %dim.step ]
+%d = phi i32 [ 0, %head.prepare ], [ %d.advance, %representative.done ]
+%sum = phi RECIPE_STATE [ %state.zero, %head.prepare ], [ %sum.next, %representative.done ]
 %dim.more = icmp ult i32 %d, %index.width
 br i1 %dim.more, label %dim.step, label %head.done
 dim.step:
@@ -6066,8 +6155,18 @@ dim.step:
 %query.index = add i64 %head.base, %dim.offset
 %query.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %query.index
 %query.value = load double, ptr addrspace(1) %query.ptr, align 8
-%representative.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
+br i1 %use.stored, label %representative.cached, label %representative.compute
+representative.cached:
+%cached.index = add i64 %stored.start, %d.wide
+%cached.ptr = getelementptr inbounds double, ptr addrspace(1) %block.cache, i64 %cached.index
+%cached.value = load double, ptr addrspace(1) %cached.ptr, align 8
+br label %representative.done
+representative.compute:
+%computed.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
 i64 %key.origin, i64 %representative.start, i32 %query.i32, i32 %block, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length.i32, i32 %index.mode, i32 %index.dims, RECIPE_STATE %index.base, double %epsilon, i1 %index.pooled, i32 %d)
+br label %representative.done
+representative.done:
+%representative.value = phi double [ %cached.value, %representative.cached ], [ %computed.value, %representative.compute ]
 %query.wide = call RECIPE_STATE @recipe.decode(double %query.value)
 %representative.wide = call RECIPE_STATE @recipe.decode(double %representative.value)
 %term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.wide, RECIPE_STATE %representative.wide)
@@ -6096,7 +6195,8 @@ ret void
 ; an equal score ranking the earlier block first.
 define internal void @attention_select_rank_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
 i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %value.heads, i32 %index.heads,
-i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %block ) #1 { entry:
+i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i32 %block,
+ptr addrspace(1) nocapture readonly %block.cache, i1 %block.cached, i32 %own.slots ) #1 { entry:
 %from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
 %length = udiv i64 %from.wide, %channels.wide
 %index.query.channels = mul i64 %index.heads.wide, %index.width.wide

@@ -1674,6 +1674,9 @@ pub(crate) struct NativeLayout {
 	/// Every position of an indexed attention's indexer plane, for a layout
 	/// that holds its values one window at a time.
 	pub indexer_history: Vec<Option<usize>>,
+	/// The representative of every complete key block of an indexed attention,
+	/// kept once its last key arrives so later queries only read it.
+	pub indexer_blocks: Vec<Option<usize>>,
 	pub adjoints: Vec<usize>,
 	/// Byte offset of each contraction or scan node's runtime schedule words in
 	/// the context arena. Nodes without a schedule use `usize::MAX`.
@@ -2275,6 +2278,7 @@ impl NativeLayout {
 		let mut contexts_in_values = Vec::with_capacity(graph.nodes.len());
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut indexer_history = Vec::with_capacity(graph.nodes.len());
+		let mut indexer_blocks = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
@@ -2356,6 +2360,15 @@ impl NativeLayout {
 				_ => None,
 			};
 			indexer_history.push(indexer_plane);
+			let blocks_plane = if inference && node.op == Primitive::Attention && attention_blocks(node) > 0 {
+				// Then one slot per query of the window for the query's own block.
+				let slots = checked_add(attention_blocks(node), window_shape(node.output, graph.input.length, window_positions).length, "indexer block cache")?;
+				let elements = checked_mul(checked_mul(rows, slots, "indexer block cache")?, node.argument[6] as usize, "indexer block cache")?;
+				Some(context_plan.allocate(&[(checked_mul(elements, node.precision.bytes(), "indexer block cache bytes")?, BufferLifetime::Retained)], unit, step, false)?)
+			} else {
+				None
+			};
+			indexer_blocks.push(blocks_plane);
 			if inference {
 				adjoints.push(0);
 			} else {
@@ -2391,7 +2404,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, indexer_blocks, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
 	}
 }
 
@@ -2401,6 +2414,7 @@ struct NodePlan {
 	context: usize,
 	attention_kv: Option<usize>,
 	indexer_history: Option<usize>,
+	indexer_blocks: Option<usize>,
 	adjoint: usize,
 	stored: Option<StoredWeight>,
 	/// The file bytes the load kernel requantizes into `stored`'s format.
@@ -2700,6 +2714,7 @@ impl NativeModelIr {
 				context: layout.contexts[index],
 				attention_kv: layout.attention_kv[index],
 				indexer_history: layout.indexer_history[index],
+				indexer_blocks: layout.indexer_blocks[index],
 				adjoint: layout.adjoints[index],
 				stored,
 				requantize,
@@ -4802,6 +4817,14 @@ impl NativeModelIr {
 							None => pointers.second.clone(),
 						};
 						let source = &source;
+						let cache = match plan.indexer_blocks {
+							Some(offset) => {
+								ir.push_str(&ptr_gep(backend, "contexts", offset, &format!("n{index}.index.blocks")));
+								format!("{pointer} %n{index}.index.blocks, i1 true")
+							}
+							None => format!("{pointer} {context}, i1 false"),
+						};
+						let slots = window_shape(node.output, self.graph.input.length, self.layout.window_positions).length;
 						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
@@ -4825,19 +4848,26 @@ impl NativeModelIr {
 						// Every block up to the window's end is kept while their count is at most the kept count.
 						ir.push_str(&format!("%n{index}.index.all = icmp ule i32 %n{index}.index.last, {keep}\n{fast} = and i1 %n{index}.attention.single, %n{index}.index.all\n%n{index}.attention.step.block = select i1 %n{index}.index.all, i32 0, i32 {block}\n"));
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
-							ir.push_str(&format!("call void @attention_index_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
+							ir.push_str(&format!("call void @attention_index_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared}, {pointer} {key_weights}, {cache} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
 						// A step that keeps every block needs no selection.
 						let skip = if fast_attention { fast.clone() } else { "false".to_owned() };
 						ir.push_str(&format!("br i1 {skip}, label %n{index}.select.skip, label %n{index}.select.run\nn{index}.select.run:\n"));
+						if plan.indexer_blocks.is_some() {
+							let width = integer_argument(node.argument[6], "indexer width")? as usize;
+							emit_runtime_window_loop(&mut ir, index, "index.own", Shape { channels: width, length: node.output.length }, &queries, |ir, _p, wide| {
+								ir.push_str(&format!("call void @attention_own_representative_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, {shared}, {pointer} %n{index}.index.blocks, i32 {slots} )\n"));
+							})?;
+							ir.push_str(barrier(backend));
+						}
 						// One element per block and query: every block scores, then every
 						// block ranks itself against the others, a grid barrier apart.
 						let length = node.output.length;
 						for phase in ["score", "rank"] {
 							emit_runtime_window_loop(&mut ir, index, &format!("select.{phase}"), Shape { channels: blocks, length }, &queries, |ir, _p, wide| {
 								ir.push_str(&format!(
-									"%n{index}.select.{phase}.block.wide = udiv i64 {wide}, {length}\n%n{index}.select.{phase}.block = trunc i64 %n{index}.select.{phase}.block.wide to i32\n%n{index}.select.{phase}.query = urem i64 {wide}, {length}\ncall void @attention_select_{phase}_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 %n{index}.select.{phase}.query, i32 {keep}, {shared}, i32 %n{index}.select.{phase}.block )\n"
+									"%n{index}.select.{phase}.block.wide = udiv i64 {wide}, {length}\n%n{index}.select.{phase}.block = trunc i64 %n{index}.select.{phase}.block.wide to i32\n%n{index}.select.{phase}.query = urem i64 {wide}, {length}\ncall void @attention_select_{phase}_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 %n{index}.select.{phase}.query, i32 {keep}, {shared}, i32 %n{index}.select.{phase}.block, {cache}, i32 {slots} )\n"
 								));
 							})?;
 							ir.push_str(barrier(backend));
