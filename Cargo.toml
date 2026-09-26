@@ -16,6 +16,7 @@ path = "cli.rs"
 [package.metadata.recipe] # backend trash, and perf tuners
 dependency-allowlist = []
 multi-device = "auto"
+device-split = "layer"
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
 contraction-register-n = 8

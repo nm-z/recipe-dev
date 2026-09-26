@@ -4148,7 +4148,8 @@ impl NativeModelIr {
 					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
 				{
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch} )\n",
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 0, i32 0 )\n",
+						row_first = node.shard.first,
 						node = index + 1,
 						scratch_gep = self.split_scratch_gep(backend, index),
 						scratch = self.split_scratch_name(backend, index),
@@ -4157,7 +4158,7 @@ impl NativeModelIr {
 						source = pointers.source,
 						weights = pointers.weights,
 						value = pointers.value,
-						rows = node.output.channels,
+						rows = if node.shard.count != 0 { node.shard.count } else { node.output.channels },
 						terms = node.input.channels,
 						in_length = node.input.length,
 						out_length = node.output.length,
@@ -4305,7 +4306,13 @@ impl NativeModelIr {
 					}) =>
 				{
 					ir.push_str(&format!(
-						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch} )\n",
+						"{scratch_gep}call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local} )\n",
+						// A split expert table holds a share of every expert: the gate and
+						// up tables its hidden rows (placed within each expert's period),
+						// the down table its output rows.
+						row_first = node.shard.first,
+						row_period = if node.op == Primitive::ExpertIn && node.shard.count != 0 { node.argument[2] as usize } else { 0 },
+						row_local = node.shard.count,
 						node = index + 1,
 						scratch_gep = self.split_scratch_gep(backend, index),
 						scratch = self.split_scratch_name(backend, index),
@@ -4315,12 +4322,16 @@ impl NativeModelIr {
 						routing = pointers.second,
 						weights = pointers.weights,
 						value = pointers.value,
-						rows = node.output.channels,
+						rows = match (node.op, node.shard.count) {
+							(_, 0) => node.output.channels,
+							(Primitive::ExpertIn, count) => node.argument[1] as usize * count,
+							(_, count) => count,
+						},
 						terms = node.input.channels,
 						in_length = node.input.length,
 						out_length = node.output.length,
 						mode = if node.op == Primitive::ExpertIn { 1 } else { 2 },
-						hidden = node.argument[2],
+						hidden = if node.op == Primitive::ExpertIn && node.shard.count != 0 { node.shard.count as f64 } else { node.argument[2] },
 						experts = node.argument[0],
 						top = node.argument[1]
 					));
@@ -4357,6 +4368,30 @@ impl NativeModelIr {
 							length = node.output.length,
 							lanes = node.argument[0],
 							gated = node.second >= 0
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Dconv) if self.inference && self.rows == 1 && self.layout.window_positions < self.graph.input.length => {
+					// The window's buffer holds its positions alone; the taps behind it
+					// read the channel history this node keeps in its context.
+					let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")?, integer_argument(node.argument[1], "depthwise dilation")?.max(1));
+					let tail = (kernel - 1) * dilation;
+					ir.push_str(&format!("%n{index}.dconv.fresh = icmp eq i32 %begin, 0\n"));
+					emit_runtime_window_loop(&mut ir, index, "dconv", node.output, &window, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"call void @dconv_window_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), decode = plan.decode(index), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context,
+							channels = node.output.channels, length = node.output.length
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					let channels = Shape { channels: node.output.channels, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					emit_runtime_window_loop(&mut ir, index, "dconv.history", channels, &whole, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"call void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {length}, i32 {span}, i32 {tail}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -4463,7 +4498,8 @@ impl NativeModelIr {
 					let length = narrow(node.output.length, "delta length")?;
 					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale} )\n",
+							"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin} )\n",
+							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
 							tiled = node.argument[5] == 1.0,
 							ty = self.node_precision(node).model_type,
 							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
@@ -4587,7 +4623,7 @@ impl NativeModelIr {
 						));
 						let touched = NodeWindow { begin: first, span: count };
 						// Every block up to the window's end is kept while their count is at most the kept count.
-						ir.push_str(&format!("%n{index}.index.all = icmp ule i32 %n{index}.index.last, {keep}\n{fast} = and i1 %n{index}.attention.single, %n{index}.index.all\n"));
+						ir.push_str(&format!("%n{index}.index.all = icmp ule i32 %n{index}.index.last, {keep}\n{fast} = and i1 %n{index}.attention.single, %n{index}.index.all\n%n{index}.attention.step.block = select i1 %n{index}.index.all, i32 0, i32 {block}\n"));
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!("call void @attention_index_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
@@ -4595,15 +4631,20 @@ impl NativeModelIr {
 						// A step that keeps every block needs no selection.
 						let skip = if fast_attention { fast.clone() } else { "false".to_owned() };
 						ir.push_str(&format!("br i1 {skip}, label %n{index}.select.skip, label %n{index}.select.run\nn{index}.select.run:\n"));
-						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
-							ir.push_str(&format!(
-								"call void @attention_select_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
-							));
-						})?;
-						ir.push_str(barrier(backend));
+						// One element per block and query: every block scores, then every
+						// block ranks itself against the others, a grid barrier apart.
+						let length = node.output.length;
+						for phase in ["score", "rank"] {
+							emit_runtime_window_loop(&mut ir, index, &format!("select.{phase}"), Shape { channels: blocks, length }, &window, |ir, _p, wide| {
+								ir.push_str(&format!(
+									"%n{index}.select.{phase}.block.wide = udiv i64 {wide}, {length}\n%n{index}.select.{phase}.block = trunc i64 %n{index}.select.{phase}.block.wide to i32\n%n{index}.select.{phase}.query = urem i64 {wide}, {length}\ncall void @attention_select_{phase}_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 %n{index}.select.{phase}.query, i32 {keep}, {shared}, i32 %n{index}.select.{phase}.block )\n"
+								));
+							})?;
+							ir.push_str(barrier(backend));
+						}
 						ir.push_str(&format!("br label %n{index}.select.skip\nn{index}.select.skip:\n"));
 					} else {
-						ir.push_str(&format!("{fast} = and i1 %n{index}.attention.single, true\n"));
+						ir.push_str(&format!("{fast} = and i1 %n{index}.attention.single, true\n%n{index}.attention.step.block = add i32 0, 0\n"));
 					}
 					// The matrix body scores the whole sequence at once. Its keys past
 					// the window are zero and the causal mask drops them, so it stays
@@ -4629,8 +4670,9 @@ impl NativeModelIr {
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
-						ir.push_str(&format!("br i1 {fast}, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin}, i32 %n{index}.attention.step.block, i32 {index_width} )\n", index_width = node.argument[6], pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						// A single query takes the step body; a selection masks its keys there.
+						ir.push_str(&format!("br i1 %n{index}.attention.single, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
 					}
@@ -4823,6 +4865,91 @@ impl NativeModelIr {
 							length = node.output.length
 						));
 					})?;
+					ir.push_str(barrier(backend));
+				}
+				(true, Primitive::Exchange) => return Err(RecipeError::new("a tensor-split exchange has no reverse pass")),
+				(false, Primitive::Exchange) => {
+					require(backend == Backend::Nvidia, "a tensor-split exchange runs on NVIDIA devices")?;
+					require(self.rows == 1, "a tensor-split exchange moves one row")?;
+					let pointer = pointer_type(backend);
+					let precision = self.node_precision(node);
+					let (ty, state) = (precision.model_type, precision.state_type);
+					let sum = node.argument[0] != 0.0;
+					let die = integer_argument(node.argument[1], "exchange die")?;
+					let dies = integer_argument(node.argument[2], "exchange dies")?;
+					let (first, last) = (node.shard.first, node.shard.first + node.shard.count);
+					let plane = node.output.elements();
+					// Every exchange alternates between the same two halves, each as large
+					// as the largest exchange, so consecutive exchanges never overlap.
+					let mut half = 0;
+					for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange) {
+						let planes = if plan.node.argument[0] != 0.0 { dies as usize } else { 1 };
+						half = half.max(checked_mul(checked_mul(plan.node.output.elements(), planes, "exchange planes")?, self.node_precision(&plan.node).model.bytes(), "exchange bytes")?);
+					}
+					let prefix = format!("n{index}.exchange");
+					// Another die's values reach machine RAM past this device's caches: a
+					// read treats any cached line of it as stale and fetches it again.
+					let (fresh, constraint) = match ty {
+						"float" => ("ld.global.cv.f32 $0, [$1];", "=f"),
+						"double" => ("ld.global.cv.f64 $0, [$1];", "=d"),
+						_ => return Err(RecipeError::new(format!("a tensor-split exchange moves float or double values, not {ty}"))),
+					};
+					// The buffer holds a flag per die, then two halves of planes the
+					// exchanges alternate between: a die writes exchange e + 1 only
+					// after every die posted e, so nobody still reads that half.
+					ir.push_str(&format!(
+						"%{prefix}.host.bits = load volatile i64, ptr addrspace(1) @recipe_exchange_host, align 8\n%{prefix}.host = inttoptr i64 %{prefix}.host.bits to {pointer}\n%{prefix}.epoch = load volatile i32, ptr addrspace(1) @recipe_exchange_epoch, align 4\n%{prefix}.next = add i32 %{prefix}.epoch, 1\n%{prefix}.parity = and i32 %{prefix}.epoch, 1\n%{prefix}.parity.wide = zext i32 %{prefix}.parity to i64\n%{prefix}.half = mul i64 %{prefix}.parity.wide, {half}\n%{prefix}.offset = add i64 %{prefix}.half, {EXCHANGE_FLAG_BYTES}\n%{prefix}.data = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.offset\n"
+					));
+					emit_runtime_window_loop(&mut ir, index, "exchange.post", node.output, &window, |ir, _p, wide| {
+						let channel = format!("%n{index}.exchange.post.at.channel");
+						let own = if sum { "true".to_owned() } else { format!("%{prefix}.post.own") };
+						if !sum {
+							// With a period, the share recurs: the channel's place within its period decides.
+							let place = if node.argument[3] > 0.0 { format!("%{prefix}.post.place") } else { channel.clone() };
+							if node.argument[3] > 0.0 {
+								ir.push_str(&format!("%{prefix}.post.place = urem i64 {channel}, {}\n", node.argument[3] as usize));
+							}
+							ir.push_str(&format!("%{prefix}.post.low = icmp uge i64 {place}, {first}\n%{prefix}.post.high = icmp ult i64 {place}, {last}\n%{prefix}.post.own = and i1 %{prefix}.post.low, %{prefix}.post.high\n"));
+						}
+						// Machine RAM holds the window alone, packed: a step's values are
+						// contiguous, so a warp's reads and writes cross the bus together.
+						let packed = format!("%n{index}.exchange.post.at.q");
+						let slot = if sum { format!("%{prefix}.post.slot") } else { packed.clone() };
+						if sum {
+							ir.push_str(&format!("%{prefix}.post.slot = add i64 {packed}, {}\n", die as usize * plane));
+						}
+						ir.push_str(&format!(
+							"br i1 {own}, label %{prefix}.post.write, label %{prefix}.post.skip\n{prefix}.post.write:\n%{prefix}.post.from = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n%{prefix}.post.value = load {ty}, {pointer} %{prefix}.post.from, align {align}\n%{prefix}.post.to = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 {slot}\nstore volatile {ty} %{prefix}.post.value, {pointer} %{prefix}.post.to, align {align}\nbr label %{prefix}.post.skip\n{prefix}.post.skip:\n",
+							source = pointers.source,
+							align = alignment(ty)
+						));
+					})?;
+					// The grid barrier gathers every thread's writes; the leader's system
+					// fence then orders them all before its flag, as one fence per thread
+					// would at a thousand times the cost.
+					ir.push_str(barrier(backend));
+					ir.push_str(&format!(
+						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.signaled\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.wait\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.signal ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
+					));
+					ir.push_str(barrier(backend));
+					emit_runtime_window_loop(&mut ir, index, "exchange.take", node.output, &window, |ir, _p, wide| {
+						if sum {
+							let mut total = String::new();
+							for other in 0..dies as usize {
+								ir.push_str(&format!("%{prefix}.take.slot{other} = add i64 %n{index}.exchange.take.at.q, {}\n%{prefix}.take.at{other} = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %{prefix}.take.slot{other}\n%{prefix}.take.raw{other} = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at{other})\n%{prefix}.take.part{other} = call {state} @recipe.decode{v}({ty} %{prefix}.take.raw{other})\n", other * plane, fresh = fresh, constraint = constraint));
+								total = if other == 0 { format!("%{prefix}.take.part0") } else {
+									ir.push_str(&format!("%{prefix}.take.sum{other} = call {state} @recipe.state.add{v}({state} {total}, {state} %{prefix}.take.part{other})\n"));
+									format!("%{prefix}.take.sum{other}")
+								};
+							}
+							ir.push_str(&format!("%{prefix}.take.value = call {ty} @recipe.encode{v}({state} {total})\n"));
+						} else {
+							ir.push_str(&format!("%{prefix}.take.at = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %n{index}.exchange.take.at.q\n%{prefix}.take.value = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at)\n", fresh = fresh, constraint = constraint));
+						}
+						ir.push_str(&format!("%{prefix}.take.to = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.take.value, {pointer} %{prefix}.take.to, align {align}\n", value = pointers.value, align = alignment(ty)));
+					})?;
+					ir.push_str(barrier(backend));
+					ir.push_str(&format!("br i1 %{prefix}.leader, label %{prefix}.advance, label %{prefix}.advanced\n{prefix}.advance:\nstore volatile i32 %{prefix}.next, ptr addrspace(1) @recipe_exchange_epoch, align 4\nbr label %{prefix}.advanced\n{prefix}.advanced:\n"));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Last) => {
@@ -7055,8 +7182,7 @@ impl NativeModelIr {
 				let address = operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"));
 				let input = operations.instruction(format!("load {ty}, {shared} {address}"));
 				let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
-				let product = operations.instruction(format!("call {state} @recipe.state.mul{suffix}({state} {weight}, {state} {input})"));
-				sum = operations.instruction(format!("call {state} @recipe.state.add{suffix}({state} {sum}, {state} {product})"));
+				sum = operations.instruction(format!("call {state} @recipe.state.madd{suffix}({state} {sum}, {state} {weight}, {state} {input})"));
 			}
 			operations.ir.push_str(&format!("ret {state} {sum}\n"));
 		}
@@ -7359,6 +7485,11 @@ impl NativeModelIr {
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
 		ir.push_str(&self.emit_tile_bytes());
+		if self.graph.nodes.iter().any(|node| node.op == Primitive::Exchange) {
+			// The mapped machine RAM the dies of a tensor split exchange through,
+			// and how many exchanges this die has finished.
+			ir.push_str("@recipe_exchange_host = addrspace(1) externally_initialized global i64 0, align 8\n@recipe_exchange_epoch = addrspace(1) externally_initialized global i32 0, align 4\n");
+		}
 		ir.push_str(&self.emit_plane_support(backend));
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
@@ -7993,6 +8124,10 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 /// launch, while the position window remains a runtime value for autoregressive
 /// decode. This is used by rotary and indexed-attention helpers, whose compiled
 /// artifacts are shared by training and holdout launches.
+/// The bytes before a tensor split's exchange planes: one flag per die, each
+/// on its own line.
+const EXCHANGE_FLAG_STRIDE: usize = 128;
+const EXCHANGE_FLAG_BYTES: usize = 8192;
 fn emit_runtime_window_loop(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let elements = i64::try_from(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?)
@@ -13907,6 +14042,25 @@ impl StoredBytes {
 	fn absent(length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Absent(length)]))
 	}
+	/// Bytes `from` to `from + length` of the runs, sharing every mapped run.
+	fn view(&self, from: usize, length: usize) -> Self {
+		let (mut at, mut parts) = (0, Vec::new());
+		for run in self.0.iter() {
+			let (start, end) = (at, at + run.length());
+			at = end;
+			let (low, high) = (from.max(start), (from + length).min(end));
+			if low >= high {
+				continue;
+			}
+			let (offset, count) = (low - start, high - low);
+			parts.push(match run {
+				StoredSegment::Owned(bytes) => StoredSegment::Owned(bytes[offset..offset + count].to_vec()),
+				StoredSegment::Mapped(mapping, base, _) => StoredSegment::Mapped(mapping.clone(), base + offset, count),
+				StoredSegment::Absent(_) => StoredSegment::Absent(count),
+			});
+		}
+		Self(Arc::new(parts))
+	}
 	/// Whether any run is written on the device rather than held on the host.
 	fn absent_runs(&self) -> bool {
 		self.0.iter().any(|run| matches!(run, StoredSegment::Absent(_)))
@@ -17153,6 +17307,86 @@ pub struct Placed {
 	resident: Vec<usize>,
 	movement: Vec<usize>,
 	moved: usize,
+	/// A tensor split's shared machine RAM: its tapes are dies that each run
+	/// every layer at once rather than ranges run one after another.
+	exchange: Option<ExchangeBuffer>,
+}
+/// Pinned machine RAM mapped into every die of a tensor split, which their
+/// exchanges write and read.
+struct ExchangeBuffer {
+	pointer: Ptr,
+	gpu: &'static Gpu,
+}
+// The buffer is plain pinned memory; each die reaches it through its own mapping.
+unsafe impl Send for ExchangeBuffer {}
+unsafe impl Sync for ExchangeBuffer {}
+impl Drop for ExchangeBuffer {
+	fn drop(&mut self) {
+		match &self.gpu.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				(driver.host_free)(self.pointer);
+			},
+			_ => {}
+		}
+	}
+}
+impl Gpu {
+	/// Zeroed pinned machine RAM of `bytes` that every device's context maps.
+	fn exchange_buffer(&'static self, bytes: usize) -> Result<ExchangeBuffer> {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				let mut pointer = ptr::null_mut();
+				// Portable to every context, and mapped into each device's addresses.
+				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
+				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
+				Ok(ExchangeBuffer { pointer, gpu: self })
+			},
+			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
+		}
+	}
+}
+/// Every die of a tensor split over `devices` with its tape, and the machine
+/// RAM their exchanges go through. Each die holds its share of the split
+/// nodes' weights and the whole of every other node's.
+fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
+	let shares = vec![1.0; devices.len()];
+	let graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares)).collect::<Result<Vec<_>>>()?;
+	if tracing() {
+		for (index, node) in graphs[0].nodes.iter().enumerate() {
+			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
+		}
+	}
+	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	for (part, device) in graphs.iter().zip(devices) {
+		let required = part_bytes(part, precision)? as u64;
+		let available = device.free_bytes()?.saturating_sub(reserve);
+		if required > available {
+			return Err(placement_memory_error(part, precision, available)?);
+		}
+	}
+	std::thread::scope(|scope| {
+		let compiles = graphs.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a die compile panicked"))?)
+	})?;
+	let tokens = vec![0.0; graph_positions(graph)];
+	let mut statistics = 0;
+	let tapes = graphs.iter().zip(devices).map(|(part, device)| range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, &[], &mut statistics)).collect::<Result<Vec<_>>>()?;
+	// The largest exchange: its planes in the model type, over the window a tape holds.
+	let mut largest = 0;
+	for (part, tape) in graphs.iter().zip(&tapes) {
+		for node in part.nodes.iter().filter(|node| node.op == Primitive::Exchange) {
+			let plane = window_shape(node.output, part.input.length, tape.program.artifact.layout.window_positions).elements();
+			let planes = if node.argument[0] != 0.0 { devices.len() } else { 1 };
+			largest = largest.max(plane * planes * NativePrecision::new(node.precision, node.acc)?.model.bytes());
+		}
+	}
+	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest)?;
+	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
+	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
+	Ok((tapes, buffer, resident))
 }
 /// The saved statistics a batch normalization carries into inference, as the
 /// node index and the values it holds, out of what every node declares.
@@ -17368,6 +17602,93 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		epsilon: graph.epsilon,
 	})
 }
+/// Die `die`'s graph of a tensor split over dies whose relative speeds are
+/// `shares`. Every large stored contraction keeps a contiguous share of its
+/// rows, and every table of several experts a share of its experts. An exchange
+/// after each restores the whole value on every die (rows gathered, expert
+/// partial sums added), so every other node runs unchanged on every die.
+fn shard_graph(graph: &Graph, die: usize, shares: &[f64]) -> Result<Graph> {
+	require(die < shares.len() && shares.iter().all(|share| *share > 0.0), "a tensor split needs a positive share for every die")?;
+	let total = shares.iter().sum::<f64>();
+	let before = shares[..die].iter().sum::<f64>();
+	let part = |count: usize| {
+		let first = (count as f64 * before / total).round() as usize;
+		let last = (count as f64 * (before + shares[die]) / total).round() as usize;
+		Shard { first, count: last - first }
+	};
+	let (mut nodes, mut stored, mut requantize, mut remap) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(graph.nodes.len()));
+	let map = |index: i32, remap: &[i32]| if index >= 0 { remap[index as usize] } else { index };
+	for (index, original) in graph.nodes.iter().enumerate() {
+		let mut node = original.clone();
+		node.source = map(node.source, &remap);
+		node.second = map(node.second, &remap);
+		let weight = graph.stored[index].as_ref().filter(|weight| node.packed && weight.format_segments().len() == 1 && !weight.bytes.absent_runs());
+		// Rows of a contraction, experts of an expert table: the unit a die owns.
+		let units = match (node.op, weight) {
+			(Primitive::Contraction, Some(weight))
+				if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 1 << 20 && node.output.channels >= shares.len() =>
+			{
+				Some(node.output.channels)
+			}
+			// Every die takes a share of every expert: the gate and up tables' hidden
+			// rows, the down table's output rows. The work is the same whichever
+			// experts a position routes to.
+			(Primitive::ExpertIn, Some(_)) if node.argument[0] as usize > 1 && node.argument[2] as usize >= shares.len() => Some(node.argument[2] as usize),
+			(Primitive::ExpertOut, Some(_)) if node.argument[0] as usize > 1 && node.output.channels >= shares.len() => Some(node.output.channels),
+			_ => None,
+		};
+		if tracing() && die == 0 && matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) && units.is_none() {
+			let stored = graph.stored[index].as_ref();
+			trace(&format!("shard {} kept whole: packed {} stored {} segments {} parameters {} bytes {}", original.identity(index), node.packed, stored.is_some(), stored.map_or(0, |weight| weight.format_segments().len()), node.parameters, stored.map_or(0, |weight| weight.bytes.len())))?;
+		}
+		let Some(units) = units else {
+			nodes.push(node);
+			stored.push(graph.stored[index].clone());
+			requantize.push(graph.requantize[index].clone());
+			remap.push(nodes.len() as i32 - 1);
+			continue;
+		};
+		let weight = weight.ok_or_else(|| RecipeError::new("a split node has no stored weight"))?;
+		// An expert table repeats its rows once per expert; a contraction is one period.
+		let periods = if node.op == Primitive::Contraction { 1 } else { node.argument[0] as usize };
+		require(weight.bytes.len() % (units * periods) == 0 && weight.count % (units * periods) == 0, format!("{} does not divide into {units} equal parts per expert", original.identity(index)))?;
+		let shard = part(units);
+		let (unit_bytes, unit_count) = (weight.bytes.len() / (units * periods), weight.count / (units * periods));
+		let count = unit_count * shard.count * periods;
+		let format = weight.format_segments()[0].0;
+		let bytes = StoredBytes::joined((0..periods).map(|period| weight.bytes.view((period * units + shard.first) * unit_bytes, shard.count * unit_bytes)).collect());
+		stored.push(Some(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] }));
+		requantize.push(None);
+		node.parameters = count;
+		node.shard = shard;
+		// Each die's rows gather into every die; a gate or up table's share
+		// recurs once per routed slot, every `hidden` rows.
+		let period = if node.op == Primitive::ExpertIn { node.argument[2] } else { 0.0 };
+		let (output, template) = (node.output, node.clone());
+		nodes.push(node);
+		{
+			let source = nodes.len() as i32 - 1;
+			nodes.push(Node {
+				op: Primitive::Exchange,
+				source,
+				second: source,
+				input: output,
+				output,
+				parameters: 0,
+				argument: [0.0, die as f64, shares.len() as f64, period, 0.0, 0.0, 0.0, 0.0, 0.0],
+				program_offset: 0,
+				program_count: 0,
+				storage: 0,
+				packed: false,
+				..template
+			});
+			stored.push(None);
+			requantize.push(None);
+		}
+		remap.push(nodes.len() as i32 - 1);
+	}
+	Ok(Graph { source: map(graph.source, &remap), nodes, stored, requantize, state: TrainingState::default(), bound: None, bound_values: Vec::new(), ..graph.clone() })
+}
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
 fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
@@ -17448,7 +17769,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved, exchange: None })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -17462,8 +17783,13 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
 		None => Vec::new(),
 	};
+	if env!("RECIPE_DEVICE_SPLIT") == "tensor" && devices.len() > 1 && split.is_empty() {
+		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+		let (dies, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
+		return Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![dies], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange) });
+	}
 	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
 }
 impl Placed {
 	fn llvm_report(&self) -> LlvmReport {
@@ -17624,6 +17950,39 @@ impl Placed {
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
+	/// A window through every die of a tensor split at once: each takes the
+	/// whole input and launches its step, and the dies meet at their exchanges.
+	fn forward_dies(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
+		let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
+		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		for tape in tapes {
+			if begin == 0 {
+				tape.reset_sequence()?;
+			}
+			tape.write_tokens(begin as usize, token_window)?;
+			for (start, count) in tape.input_runs(begin, end) {
+				tape.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
+			}
+		}
+		let count = tapes.len();
+		let gate = std::sync::Barrier::new(count);
+		std::thread::scope(|scope| {
+			let runs = tapes
+				.iter()
+				.enumerate()
+				.map(|(index, tape)| {
+					let gate = &gate;
+					scope.spawn(move || {
+						tape.forward_window_gated(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+							if index + 1 == count && let Some(progress) = progress { progress.prefilled(reached as usize); }
+						}, Some(gate))
+					})
+				})
+				.collect::<Vec<_>>();
+			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
+		})?;
+		if last_only { last.last_column() } else { last.predictions() }
+	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
@@ -17659,6 +18018,9 @@ impl Placed {
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		if self.exchange.is_some() {
+			return self.forward_dies(tapes, samples, begin, end, progress, last_only);
+		}
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
@@ -17730,6 +18092,9 @@ enum Primitive {
 	Fold = 21,
 	/// The final position reached by a forward window, collapsed to length one.
 	Last = 22,
+	/// Values the dies of a tensor split share: each die's rows gathered into
+	/// every die (argument 0 = 0), or every die's partial sums added (= 1).
+	Exchange = 23,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -17794,6 +18159,7 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
+			Primitive::Exchange => "Exchange",
 		}
 	}
 	fn identity(&self, index: usize) -> String {
@@ -17836,6 +18202,15 @@ struct Node {
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
+	/// The part of a tensor-split node this die computes: output rows of a
+	/// contraction, or experts of an expert table. Zero parts is the whole node.
+	shard: Shard,
+}
+/// A contiguous part of a node's rows or experts.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Shard {
+	first: usize,
+	count: usize,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
@@ -18173,6 +18548,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	Ok(graph.source)
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	// The nodes this block adds, the stream collapse before it included, are the
+	// ones its stored weights pack in.
+	let packed_from = graph.nodes.len();
 	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
 	// the stream open as a hyper-connection block does.
 	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
@@ -18299,7 +18677,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	// A float sum reads a file-bound weight in the file's own format: the bytes
 	// stay as stored and the dot decodes them, so VRAM holds the file, not values.
-	for index in first..graph.nodes.len() {
+	for index in packed_from..graph.nodes.len() {
 		let Some(Some(weight)) = graph.stored.get(index) else { continue };
 		let node = &graph.nodes[index];
 		if node.packed || node.table() || !matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) || !weight.codebook.is_empty() || !weight.segments.iter().all(|(span, _)| span.spec().is_some()) { continue }
@@ -18408,6 +18786,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		precision,
 		acc,
 		kv_precision,
+		shard: Shard::default(),
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
 	// the next plan entry. Block bytes stay packed and the node reserves no
@@ -19030,10 +19409,13 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	}
 	let epsilon = if unscaled { -graph.epsilon } else { graph.epsilon };
 	graph.block_precision = ordinary_precision;
-	let block_or_window = if window == 0 { indexer.block as f64 } else { -(window as f64) };
+	// A sequence of at most `keep` blocks keeps every block, so the selection
+	// is the whole sequence and the attention is dense over it.
+	let selects = indexer.block != 0 && input.length.div_ceil(indexer.block) > indexer.keep;
+	let block_or_window = if window == 0 { if selects { indexer.block as f64 } else { 0.0 } } else { -(window as f64) };
 	let argument = [heads as f64, keys as f64, 0.0, block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	let attended = Shape { channels: inner, length: input.length };
-	push_node(graph, Primitive::Attention, attended, 0, argument, side)?;
+	push_node(graph, Primitive::Attention, attended, 0, argument, if selects { side } else { -2 })?;
 	if gate {
 		// The output gate is its own projection of the block input, a sigmoid of
 		// it multiplying the attention output: two plain branches, not an attention mode.
@@ -21178,6 +21560,8 @@ impl NativeTape {
 	/// the host and write them into the staging context the device reads.
 	fn stage_lookups(&self, begin: u32, end: u32) -> Result<()> {
 		let (begin, end) = (begin as usize, end as usize);
+		// A buffer that holds one window keeps its first position at slot zero.
+		let origin = if self.program.artifact.layout.window_positions < self.input.length { begin } else { 0 };
 		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
 		for lookup in &self.lookups {
 			let bytes = lookup.precision.bytes();
@@ -21190,7 +21574,7 @@ impl NativeTape {
 						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
 					}
 				}
-				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin, "lookup slot")?, channels, "lookup staging offset")?;
+				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin - origin, "lookup slot")?, channels, "lookup staging offset")?;
 				self.contexts.write_float_bytes(checked_add(lookup.context, checked_mul(slot, bytes, "lookup staging bytes")?, "lookup staging")?, &staged, lookup.precision)?;
 			}
 		}
@@ -21207,13 +21591,19 @@ impl NativeTape {
 		self.forward_window_observed(samples, begin, end, mode, &mut |_, _| {})
 	}
 	fn forward_window_observed(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64)) -> Result<()> {
+		self.forward_window_gated(samples, begin, end, mode, observed, None)
+	}
+	/// A window whose launch waits at `gate` for the other dies of a tensor
+	/// split, so every die starts its step together and none waits at its
+	/// first exchange for another's host work.
+	fn forward_window_gated(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64), gate: Option<&std::sync::Barrier>) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
 		let capacity = self.program.artifact.layout.window_positions as u32;
 		if end - begin > capacity {
 			let (mut cursor, mut seconds) = (begin, 0.0);
 			while cursor < end {
 				let stop = cursor.saturating_add(capacity).min(end);
-				self.forward_window_observed(samples, cursor, stop, mode, observed)?;
+				self.forward_window_gated(samples, cursor, stop, mode, observed, gate)?;
 				seconds += f64::from_bits(self.last_device_seconds.load(Ordering::Acquire));
 				cursor = stop;
 			}
@@ -21233,6 +21623,9 @@ impl NativeTape {
 		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
+		if let Some(gate) = gate {
+			gate.wait();
+		}
 		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.program.gpu.synchronize()?;
@@ -21251,6 +21644,26 @@ impl NativeTape {
 			trace(&line)?;
 		}
 		Ok(())
+	}
+	/// Points this tape's program at a tensor split's machine RAM and starts
+	/// its exchange count at zero.
+	fn bind_exchange(&self, buffer: &ExchangeBuffer) -> Result<()> {
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				// The address this device's context maps the machine RAM at.
+				let mut mapped = 0_u64;
+				driver_status(Backend::Nvidia, (driver.host_device_pointer)(&mut mapped, buffer.pointer, 0), "exchange mapping")?;
+				for (name, value, size) in [(&b"recipe_exchange_host\0"[..], mapped, 8), (&b"recipe_exchange_epoch\0"[..], 0, 4)] {
+					let (mut address, mut bytes) = (0_u64, 0_usize);
+					driver_status(Backend::Nvidia, (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, name.as_ptr()), "exchange symbol")?;
+					driver_status(Backend::Nvidia, (driver.upload)(address, (&value as *const u64).cast(), size), "exchange symbol write")?;
+				}
+				Ok(())
+			},
+			_ => Err(RecipeError::new(format!("{} cannot take part in a tensor split", self.program.gpu.name))),
+		}
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
@@ -22497,6 +22910,12 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 	}
 	let state = carried(node, rows)?.values;
 	let regions = match node.op {
+		// The inputs before a window that its taps still reach, per channel.
+		Primitive::Dconv if inference => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
+			let tail = checked_mul(checked_mul(rows, node.output.channels, "depthwise history channels")?, checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?, "depthwise history")?;
+			vec![(checked_mul(tail.max(1), precision.bytes(), "depthwise history bytes")?, Retained)]
+		}
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
@@ -22951,6 +23370,10 @@ struct Cuda {
 	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
 	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
 	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
+	host_alloc: unsafe extern "C" fn(*mut Ptr, usize, u32) -> i32,
+	host_free: unsafe extern "C" fn(Ptr) -> i32,
+	host_device_pointer: unsafe extern "C" fn(*mut u64, Ptr, u32) -> i32,
+	module_global: unsafe extern "C" fn(*mut u64, *mut usize, Ptr, *const u8) -> i32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
@@ -24782,6 +25205,10 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				function,
 				function_attribute,
 				occupancy,
+				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
+				host_free: runtime.function(b"cuMemFreeHost\0")?,
+				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
+				module_global: runtime.function(b"cuModuleGetGlobal_v2\0")?,
 				cus: cus as u32,
 				wave: wave as u32,
 				workgroup: workgroup as u32,
