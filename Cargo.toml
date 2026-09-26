@@ -34,6 +34,8 @@ delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 134217728
 nvidia-step-registers = 128
+# relocatable ptxas held ~60 bytes of RAM per byte of Flash Next IR (2026-09-26)
+compile-memory-per-ir-byte = 100
 # archy nv0 has bad VRAM from ~5.9 GB up
 device-usable-bytes = { "archy:nv0" = 6186598400 }
 cpu-worker-threads = 0

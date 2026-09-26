@@ -3069,8 +3069,8 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "call void @recipe.cpu.barrier()",
-		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
+		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
+		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)\n",
 	}
 }
 
@@ -4110,6 +4110,11 @@ impl NativeModelIr {
 
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
+		// An inference pass computes every node's window first, then marks where
+		// each block's nodes begin, so the caller can give each block a function.
+		let blocked = !reverse && !training;
+		let mut windows = String::new();
+		let mut block = None;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
@@ -4122,6 +4127,10 @@ impl NativeModelIr {
 			// outside the recurrence and race the position-local tape.
 			if plan.node.block_kind == "recur_body" {
 				continue;
+			}
+			if blocked && block != Some(plan.node.block_index) {
+				block = Some(plan.node.block_index);
+				ir.push_str(&format!("{BLOCK_MARK}{}\n", plan.node.block_index));
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
@@ -4139,7 +4148,7 @@ impl NativeModelIr {
 			let matrix = matrix && matrix_capable(self.node_precision(node));
 			let gradient_base = self.gradient_base(plan)?;
 			// The reverse pass differentiates the whole sequence at once.
-			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, &mut ir)? };
+			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, if blocked { &mut windows } else { &mut ir })? };
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
@@ -5515,7 +5524,7 @@ impl NativeModelIr {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
 			}
 		}
-		Ok(ir)
+		Ok(if blocked { windows + &ir } else { ir })
 	}
 
 	// Group statistics are reductions over the batch, like the loss, so they
@@ -7502,9 +7511,12 @@ impl NativeModelIr {
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
+		let (prelude, blocks) = block_functions(&inference_forward, &forward_args)?;
+		body.push_str(&blocks.definitions);
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
-		body.push_str(&inference_forward);
+		body.push_str(&prelude);
+		body.push_str(&blocks.calls);
 		body.push_str(&self.emit_last_column(backend)?);
 		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
@@ -8124,6 +8136,56 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 /// launch, while the position window remains a runtime value for autoregressive
 /// decode. This is used by rotary and indexed-attention helpers, whose compiled
 /// artifacts are shared by training and holdout launches.
+/// The line an inference pass puts before each block's nodes.
+const BLOCK_MARK: &str = "; recipe.block ";
+struct BlockFunctions {
+	definitions: String,
+	calls: String,
+}
+/// Every block of an inference pass as its own function, so a deep model
+/// compiles in time linear in its blocks rather than as one function whose
+/// optimization grows faster than its length. The windows before the first
+/// block stay in the caller; each block takes the ones it reads.
+fn block_functions(pass: &str, forward_args: &str) -> Result<(String, BlockFunctions)> {
+	let mut parts = pass.split(BLOCK_MARK);
+	let prelude = parts.next().unwrap_or_default().to_owned();
+	// The type each prelude value is defined with.
+	let mut types = HashMap::new();
+	for line in prelude.lines() {
+		let Some((name, rest)) = line.split_once(" = ") else { continue };
+		let words = rest.split_whitespace().collect::<Vec<_>>();
+		let ty = match words.first().copied() {
+			Some("icmp") => "i1",
+			Some("select") => words.get(3).copied().unwrap_or("i32"),
+			Some("zext" | "sext" | "trunc") => words.iter().position(|word| *word == "to").and_then(|at| words.get(at + 1)).copied().unwrap_or("i32"),
+			Some(_) => words.get(1).copied().unwrap_or("i32"),
+			None => continue,
+		};
+		types.insert(name.trim().to_owned(), ty.trim_end_matches(',').to_owned());
+	}
+	let base = ["%samples", "%weights", "%values", "%contexts", "%rows", "%threads", "%begin", "%end", "%tid"];
+	let (mut definitions, mut calls) = (String::new(), String::new());
+	for part in parts {
+		let (block, code) = part.split_once('\n').unwrap_or((part, ""));
+		// Values the block defines, and its labels, which branches name with a %.
+		let mut defined = code.lines().filter_map(|line| line.split_once(" = ").map(|(name, _)| name.trim().to_owned())).collect::<std::collections::HashSet<_>>();
+		defined.extend(code.lines().filter_map(|line| line.strip_suffix(':').filter(|label| !label.contains(' ')).map(|label| format!("%{label}"))));
+		let mut taken = Vec::new();
+		for word in code.split(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '%' | '.' | '_'))) {
+			let name = word.trim_end_matches('.');
+			if !name.starts_with('%') || base.contains(&name) || defined.contains(name) || taken.iter().any(|(taken, _): &(String, String)| taken == name) {
+				continue;
+			}
+			let ty = types.get(name).ok_or_else(|| RecipeError::new(format!("block {block} reads {name} from another block")))?;
+			taken.push((name.to_owned(), ty.clone()));
+		}
+		let parameters = taken.iter().map(|(name, ty)| format!(", {ty} {name}")).collect::<String>();
+		definitions.push_str(&format!("define internal void @recipe_model_block{block}({forward_args}, i32 %tid{parameters}) #3 {{\nentry:\n{code}ret void\n}}\n"));
+		// The caller holds the same typed names, so its arguments read as the parameters.
+		calls.push_str(&format!("call void @recipe_model_block{block}({forward_args}, i32 %tid{parameters})\n"));
+	}
+	Ok((prelude, BlockFunctions { definitions, calls }))
+}
 /// The bytes before a tensor split's exchange planes: one flag per die, each
 /// on its own line.
 const EXCHANGE_FLAG_STRIDE: usize = 128;
@@ -8488,7 +8550,41 @@ fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
 		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
 }
 
+/// Machine RAM the compiles running at once may claim: each claims its IR's
+/// size times the configured factor, so parallel compiles of a deep model
+/// queue instead of exhausting memory. One compile always runs.
+struct CompileBudget {
+	claimed: Mutex<(u64, usize)>,
+	freed: std::sync::Condvar,
+}
+static COMPILE_BUDGET: CompileBudget = CompileBudget { claimed: Mutex::new((0, 0)), freed: std::sync::Condvar::new() };
+/// The machine's available RAM as the kernel reports it; unbounded where it cannot be read.
+fn machine_available_bytes() -> u64 {
+	fs::read_to_string("/proc/meminfo")
+		.ok()
+		.and_then(|text| text.lines().find(|line| line.starts_with("MemAvailable:")).and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok()))
+		.map_or(u64::MAX, |kilobytes| kilobytes.saturating_mul(1024))
+}
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
+	let factor = natural("compile memory per IR byte", env!("RECIPE_COMPILE_MEMORY_PER_IR_BYTE"))? as u64;
+	let claim = fs::metadata(source).map_or(0, |metadata| metadata.len()).saturating_mul(factor);
+	{
+		let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		// A running compile grows into its claim, so every claim counts against what is available now.
+		while claimed.1 != 0 && claimed.0.saturating_add(claim) > machine_available_bytes() {
+			claimed = COMPILE_BUDGET.freed.wait(claimed).map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		}
+		claimed.0 += claim;
+		claimed.1 += 1;
+	}
+	let result = compile_native_artifact_within(target, source, output, key);
+	let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+	claimed.0 -= claim;
+	claimed.1 -= 1;
+	COMPILE_BUDGET.freed.notify_all();
+	result
+}
+fn compile_native_artifact_within(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -8572,11 +8668,31 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
-				let mut command = Command::new(assembler);
-				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
-				let assembled = native_command(command, "NVIDIA PTX assembler", key);
+				// Whole-program assembly specializes every shared body for each call
+				// site, which on a deep model runs for many minutes in tens of GB.
+				// Each function assembles once as relocatable code instead, and the
+				// linker beside the assembler joins them into the loadable object.
+				let object = output.with_extension("o.cubin");
+				let linker = Path::new(assembler).with_file_name("nvlink");
+				require(linker.is_file(), format!("the NVIDIA assembler {assembler} has no nvlink beside it"))?;
+				// A kernel whose optimizer constants overflow their bank links only when
+				// the assembler leaves them in the code; every other kernel keeps them.
+				let mut linked = Err(RecipeError::new("NVIDIA link did not run"));
+				for flags in [&["-O3", "-c"][..], &["-O3", "-c", "--disable-optimizer-constants"][..]] {
+					let mut command = Command::new(assembler);
+					command.arg(format!("-arch={architecture}")).args(flags).arg("-o").arg(&object).arg(&ptx);
+					native_command(command, "NVIDIA PTX assembler", key)?;
+					let mut command = Command::new(&linker);
+					command.arg(format!("-arch={architecture}")).arg(&object).arg("-o").arg(output);
+					linked = native_command(command, "NVIDIA linker", key);
+					match &linked {
+						Err(error) if error.to_string().contains("compiler-generated constants") => continue,
+						_ => break,
+					}
+				}
 				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
-				assembled?;
+				fs::remove_file(&object).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA object: {error}")))?;
+				linked?;
 				return Ok(Vec::new());
 			}
 			fs::read(output)
@@ -17352,7 +17468,8 @@ impl Gpu {
 /// RAM their exchanges go through. Each die holds its share of the split
 /// nodes' weights and the whole of every other node's.
 fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
-	let shares = vec![1.0; devices.len()];
+	// Each die takes a share of the split weights in proportion to its free memory.
+	let shares = devices.iter().map(|device| device.free_bytes().map(|bytes| bytes as f64)).collect::<Result<Vec<_>>>()?;
 	let graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares)).collect::<Result<Vec<_>>>()?;
 	if tracing() {
 		for (index, node) in graphs[0].nodes.iter().enumerate() {
@@ -17371,9 +17488,15 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 		let compiles = graphs.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None))).collect::<Vec<_>>();
 		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a die compile panicked"))?)
 	})?;
+	// Every die uploads its weights at once, each from its own thread.
 	let tokens = vec![0.0; graph_positions(graph)];
-	let mut statistics = 0;
-	let tapes = graphs.iter().zip(devices).map(|(part, device)| range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, &[], &mut statistics)).collect::<Result<Vec<_>>>()?;
+	let tapes = std::thread::scope(|scope| {
+		let builds = graphs.iter().zip(devices).map(|(part, device)| {
+			let tokens = &tokens;
+			scope.spawn(move || range_tape(part, &vec![0.0; part.input.elements()], tokens, device, precision, &[], &mut 0))
+		}).collect::<Vec<_>>();
+		builds.into_iter().map(|build| build.join().map_err(|_| RecipeError::new("a die's tape build panicked"))?).collect::<Result<Vec<_>>>()
+	})?;
 	// The largest exchange: its planes in the model type, over the window a tape holds.
 	let mut largest = 0;
 	for (part, tape) in graphs.iter().zip(&tapes) {

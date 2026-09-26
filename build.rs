@@ -2056,6 +2056,7 @@ fn main() -> BuildResult<()> {
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
 		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("nvidia-step-registers", "RECIPE_NVIDIA_STEP_REGISTERS"),
+		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
