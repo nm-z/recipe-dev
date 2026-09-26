@@ -7005,9 +7005,10 @@ impl NativeModelIr {
 					continue;
 				}
 				let Some((format, native, block, stride)) = eligible(plan) else { continue };
-				arms.push_str(&format!("i32 {}, label %n{index}\n", index + 1));
-				bodies.push_str(&format!("n{index}:\n%n{index}.sum = call {state} @recipe_model_run_{}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride)\nret {state} %n{index}.sum\n", format.name));
+				// Nodes of one format share one call, so its decoder is inlined once.
+				arms.push_str(&format!("i32 {}, label %{}\n", index + 1, format.name));
 				if !formats.iter().any(|(name, ..)| *name == format.name) {
+					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %index, {shared} %x, i32 %stride)\nret {state} %{name}.sum\n", name = format.name));
 					formats.push((format.name, native, block, stride));
 				}
 			}
@@ -8296,13 +8297,13 @@ fn native_nvidia_codegen() -> Result<&'static str> {
 /// reports it (11040 for 11.4); zero until a device is opened in this process.
 static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The toolkit assembler that turns the PTX into the device object at
-/// compile time, so a run never waits on the driver to assemble it. A driver
-/// loads only objects from an assembler no newer than itself, so an assembler
-/// past the driver is left alone and the PTX goes to the driver as before.
+/// compile time, so ranges assemble in parallel instead of waiting on the
+/// driver, which assembles one module at a time. A driver loads only objects
+/// from an assembler no newer than itself, so this is the newest configured
+/// assembler at or below the driver; without one the PTX goes to the driver.
 fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
-	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-	static TARGETS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
+	static RELEASES: OnceLock<Vec<(u32, &'static str)>> = OnceLock::new();
+	static TARGETS: OnceLock<Mutex<HashMap<String, Option<&'static str>>>> = OnceLock::new();
 	fn release_of(path: &str) -> Option<u32> {
 		let output = Command::new(path).arg("--version").output().ok()?;
 		let text = String::from_utf8_lossy(&output.stdout);
@@ -8311,12 +8312,18 @@ fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
 		let (major, minor) = (parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?);
 		Some(major * 1000 + minor * 10)
 	}
-	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
 	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
-	if driver == 0 || release > driver { return None; }
+	if driver == 0 { return None; }
+	let releases = RELEASES.get_or_init(|| {
+		let paths = option_env!("RECIPE_NV_ASSEMBLER").unwrap_or("").split('\x3b').filter(|path| Path::new(path).is_file());
+		let mut releases = paths.filter_map(|path| Some((release_of(path)?, path))).collect::<Vec<_>>();
+		releases.sort_by(|left, right| right.0.cmp(&left.0));
+		releases
+	});
 	let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
-	let supported = *targets.entry(architecture.to_owned()).or_insert_with(|| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()));
-	supported.then_some(path)
+	*targets.entry(architecture.to_owned()).or_insert_with(|| {
+		releases.iter().filter(|(release, _)| *release <= driver).map(|(_, path)| *path).find(|path| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()))
+	})
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
@@ -17400,6 +17407,12 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 			return Err(placement_memory_error(graph, precision, available)?);
 		}
 	}
+	// Every range compiles at once, one thread each, through LLVM and the
+	// driver's own compile; the tapes below then load the cached objects.
+	std::thread::scope(|scope| {
+		let compiles = parts.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a range compile panicked"))?)
+	})?;
 	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
@@ -23214,6 +23227,30 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+		let (artifact, schedule, shapes, register_values, waves, element, shared_values) = self.native_compile(graph, rows, precision, loss)?;
+		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
+		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
+		let required = fixed
+			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
+			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
+		Ok(program)
+	}
+	/// Compiles a graph for this device and runs the driver's own compile of the
+	/// artifact into its cache, without keeping anything loaded.
+	fn native_prepare(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<()> {
+		let (artifact, ..) = self.native_compile(graph, rows, precision, loss)?;
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe { driver.warm_native(&artifact.artifact) },
+			_ => Ok(()),
+		}
+	}
+	/// The schedule and compiled artifact of a graph on this device, without
+	/// loading it: the artifact lands in the native cache, so ranges compile in
+	/// parallel before each loads on its own device.
+	#[allow(clippy::type_complexity)]
+	fn native_compile(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<(NativeArtifact, NativeSchedule, Vec<Option<NativeContractionShapes>>, u32, u32, Compute, u32)> {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
@@ -23381,13 +23418,7 @@ impl Gpu {
 			attention,
 		};
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
-		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
-		let required = fixed
-			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
-			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
-		Ok(program)
+		Ok((artifact, schedule, shapes, register_values, waves, element, shared_values))
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
 		let pointer = self.allocate_bytes(bytes)?;
@@ -24148,6 +24179,17 @@ impl Cuda {
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
 			// One workgroup per SM leaves every block room to reach the grid barrier.
 			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+		}
+	}
+
+	/// Runs the driver's PTX compile for this device into its compute cache, so
+	/// the later load of the same bytes reads the cached object.
+	unsafe fn warm_native(&self, bytes: &[u8]) -> Result<()> {
+		unsafe {
+			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
+			let mut module = ptr::null_mut();
+			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
+			driver_status(Backend::Nvidia, (self.unload)(module), "native module unload")
 		}
 	}
 

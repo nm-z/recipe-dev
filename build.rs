@@ -1674,13 +1674,13 @@ fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
 }
 struct NvidiaToolkit {
 	device_library: PathBuf,
-	assembler: PathBuf,
+	assemblers: Vec<PathBuf>,
 	required: bool,
 }
 fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
 	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
 	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
-	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(text(manifest, "nvidia-assembler")?), required: entry.starts_with('$') }))
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assemblers: text(manifest, "nvidia-assembler")?.split(';').map(|path| root.join(path)).collect(), required: entry.starts_with('$') }))
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
@@ -1931,7 +1931,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	let toolkit = nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?;
 	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", toolkit.device_library.display());
-	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assembler.display());
+	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assemblers.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
 	Ok(())
 }

@@ -58,7 +58,7 @@ nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
-nvidia-assembler = "bin/ptxas"
+nvidia-assembler = "bin/ptxas;/opt/cuda-11.4/bin/ptxas"
 
 [package.metadata.train] # a bunch of constants in one place for refs
 epochs = 210

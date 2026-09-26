@@ -4555,10 +4555,25 @@ store RECIPE_KV %cache.value.kv, ptr addrspace(1) %cache.value.ptr, align RECIPE
 br label %cache.loop
 cache.done:
 call void @grid_barrier(i32 %threads)
+; Each workgroup scores one head per round; every workgroup runs the same
+; number of rounds, so a grid with fewer workgroups than heads reaches every
+; head and the grid barriers between phases stay uniform.
+%groups = udiv i32 %threads, %block
+%rounds.span = add i32 %heads, %groups
+%rounds.full = sub i32 %rounds.span, 1
+%rounds = udiv i32 %rounds.full, %groups
+br label %head.loop
+head.loop:
+%round = phi i32 [ 0, %cache.done ], [ %round.next, %probability.done ]
+%head.more = icmp ult i32 %round, %rounds
+br i1 %head.more, label %head.start, label %head.done
+head.start:
+%round.offset = mul i32 %round, %groups
+%head = add i32 %group, %round.offset
 br label %score.tile.loop
 score.tile.loop:
-%score.tile.base = phi i32 [ 0, %cache.done ], [ %score.tile.next, %score.tile.advance ]
-%score.group.active = icmp ult i32 %group, %heads
+%score.tile.base = phi i32 [ 0, %head.start ], [ %score.tile.next, %score.tile.advance ]
+%score.group.active = icmp ult i32 %head, %heads
 %score.tile.limit = icmp ult i32 %score.tile.base, %reached
 %score.tile.more = and i1 %score.group.active, %score.tile.limit
 br i1 %score.tile.more, label %score.query.copy.loop, label %score.done
@@ -4567,7 +4582,7 @@ score.query.copy.loop:
 %score.query.channel.more = icmp ult i32 %score.query.channel, %width
 br i1 %score.query.channel.more, label %score.query.copy.step, label %score.query.copy.done
 score.query.copy.step:
-%score.head.channel = mul i32 %group, %width
+%score.head.channel = mul i32 %head, %width
 %score.query.global.channel = add i32 %score.head.channel, %score.query.channel
 %score.query.channel.base = mul i32 %score.query.global.channel, %length
 %score.query.index = add i32 %score.query.channel.base, %position
@@ -4586,10 +4601,10 @@ call void @recipe.local.barrier()
 %score.key.more = icmp ult i32 %score.key, %reached
 br i1 %score.key.more, label %score.key.compute, label %score.key.done
 score.key.compute:
-%score.kv.head = udiv i32 %group, %kv.group
+%score.kv.head = udiv i32 %head, %kv.group
 %score.scaled.raw = call RECIPE_STATE @attention_step_key_dot(ptr addrspace(3) %tile.RECIPE_STATE, ptr addrspace(1) %kv.context, i32 %score.key, i32 %score.kv.head, i32 %width, i32 %length)
 %score.scaled = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %score.scaled.raw, RECIPE_STATE %scale)
-%score.row = mul i32 %group, %length
+%score.row = mul i32 %head, %length
 %score.slot = add i32 %score.row, %score.key
 %score.slot.wide = zext i32 %score.slot to i64
 call void @attention_step_score_store(ptr addrspace(1) %context, i64 %score.slot.wide, RECIPE_STATE %score.scaled)
@@ -4602,7 +4617,7 @@ score.tile.advance:
 br label %score.tile.loop
 score.done:
 call void @grid_barrier(i32 %threads)
-%active = icmp ult i32 %group, %heads
+%active = icmp ult i32 %head, %heads
 %active.limit = select i1 %active, i32 %reached, i32 0
 br label %maximum.loop
 maximum.loop:
@@ -4611,7 +4626,7 @@ maximum.loop:
 %maximum.more = icmp ult i32 %maximum.key, %active.limit
 br i1 %maximum.more, label %maximum.step, label %maximum.wave.loop
 maximum.step:
-%maximum.row = mul i32 %group, %length
+%maximum.row = mul i32 %head, %length
 %maximum.slot = add i32 %maximum.row, %maximum.key
 %maximum.slot.wide = zext i32 %maximum.slot to i64
 %maximum.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %maximum.slot.wide)
@@ -4668,7 +4683,7 @@ denominator.loop:
 %denominator.more = icmp ult i32 %denominator.key, %active.limit
 br i1 %denominator.more, label %denominator.step, label %denominator.wave.loop
 denominator.step:
-%denominator.row = mul i32 %group, %length
+%denominator.row = mul i32 %head, %length
 %denominator.slot = add i32 %denominator.row, %denominator.key
 %denominator.slot.wide = zext i32 %denominator.slot to i64
 %denominator.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %denominator.slot.wide)
@@ -4723,7 +4738,7 @@ probability.loop:
 %probability.more = icmp ult i32 %probability.key, %active.limit
 br i1 %probability.more, label %probability.step, label %probability.done
 probability.step:
-%probability.row = mul i32 %group, %length
+%probability.row = mul i32 %head, %length
 %probability.slot = add i32 %probability.row, %probability.key
 %probability.slot.wide = zext i32 %probability.slot to i64
 %probability.score = call RECIPE_STATE @attention_step_score_load(ptr addrspace(1) %context, i64 %probability.slot.wide)
@@ -4735,9 +4750,12 @@ call void @attention_step_score_store(ptr addrspace(1) %context, i64 %probabilit
 br label %probability.loop
 probability.done:
 call void @grid_barrier(i32 %threads)
+%round.next = add i32 %round, 1
+br label %head.loop
+head.done:
 br label %output.channel.loop
 output.channel.loop:
-%output.channel = phi i32 [ %global.wave, %probability.done ], [ %output.channel.next, %output.channel.done ]
+%output.channel = phi i32 [ %global.wave, %head.done ], [ %output.channel.next, %output.channel.done ]
 %output.channel.more = icmp ult i32 %output.channel, %channels
 br i1 %output.channel.more, label %output.key.loop, label %output.stats.owner
 output.key.loop:
