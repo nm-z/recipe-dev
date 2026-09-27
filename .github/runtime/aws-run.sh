@@ -305,7 +305,13 @@ USERDATA
 echo "== resolving the AMI and subnets =="
 ami_id="$(aws ssm get-parameter --region "$AWS_REGION" --name "$AMI_PARAMETER" --query Parameter.Value --output text)"
 root_device="$(aws ec2 describe-images --region "$AWS_REGION" --image-ids "$ami_id" --query 'Images[0].RootDeviceName' --output text)"
-echo "AMI $ami_id root $root_device"
+image_volume_gb="$(aws ec2 describe-images --region "$AWS_REGION" --image-ids "$ami_id" --query "Images[0].BlockDeviceMappings[?DeviceName=='$root_device'].Ebs.VolumeSize | [0]" --output text)"
+# The root volume cannot be smaller than the image snapshot.
+case "$image_volume_gb" in
+	''|*[!0-9]*) ;;
+	*) [ "$image_volume_gb" -le "$ROOT_VOLUME_GB" ] || ROOT_VOLUME_GB="$image_volume_gb" ;;
+esac
+echo "AMI $ami_id root $root_device image ${image_volume_gb}GB volume ${ROOT_VOLUME_GB}GB"
 if [ -n "${AWS_SUBNET_ID:-}" ]; then
 	subnets="$AWS_SUBNET_ID"
 else
