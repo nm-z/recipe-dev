@@ -253,6 +253,14 @@ let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model,
 let prediction = recipe.predict("model.ogdl", &input);
 ```
 
+GGUF chat renders `tokenizer.chat_template`. Stop tokens come from `tokenizer.ggml.eos_token_id` and `tokenizer.ggml.eot_token_id`.
+Suppressed tokens come from `tokenizer.ggml.suppress_tokens`. Set either list in the model script:
+
+```rust
+let coder = recipe.gguf("model.gguf").tokenizer().stop([eos_id, turn_id]).suppress([blocked_id]);
+let report = recipe.infer().tokenizer(coder).chat([time, pp, tg, input, out, cached]).run(&model, &data);
+```
+
 ```rust
 infer()
 	.tokens(count)

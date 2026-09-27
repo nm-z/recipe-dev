@@ -55,5 +55,7 @@ fn main() {
 		.tanh().fp(16)
 		.scale(arch.final_logit_softcapping).fp(16);
 
-	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+	let coder = recipe.gguf(GGUF).tokenizer();
+	let stop = [coder.eos().expect("RNJ EOS token"), coder.id("<|eot_id|>").expect("RNJ end-of-turn token")];
+	recipe.infer().tokenizer(coder.stop(stop)).chat([time, pp, tg, input, out, cached]).run(&model, &data);
 }

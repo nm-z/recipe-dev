@@ -9987,7 +9987,8 @@ mod tokenizer {
 		Gpt2,
 		Llama3,
 		Qwen2,
-		Gemma4,
+		CommandR,
+		SentencePiece,
 	}
 
 	fn letter(value: char) -> bool {
@@ -10035,6 +10036,7 @@ mod tokenizer {
 				"gpt-2" | "phi-2" | "jina-v1-en" | "jina-v2-es" | "jina-v2-de" | "jina-v2-code" | "roberta-bpe" | "gigachat" | "olmo" => Self::Gpt2,
 				"llama3" | "llama-v3" | "llama-bpe" | "smaug-bpe" | "dbrx" | "lfm2" => Self::Llama3,
 				"qwen2" | "qwen35" | "deepseek-r1-qwen" | "stablelm2" => Self::Qwen2,
+				"command-r" => Self::CommandR,
 				other => return Err(RecipeError::new(format!("pre-tokenizer family {other:?} is not supported"))),
 			})
 		}
@@ -10045,7 +10047,8 @@ mod tokenizer {
 				let count = run(chars, at + space_prefix, class);
 				if count == 0 { 0 } else { space_prefix + count }
 			};
-			if self == Self::Gpt2 {
+			if self == Self::Gpt2 || self == Self::CommandR {
+				if self == Self::CommandR && number(chars[at]) { return 1; }
 				let count = contraction(chars, at, false);
 				if count != 0 {
 					return count;
@@ -10090,7 +10093,7 @@ mod tokenizer {
 			run(chars, at, space).max(1)
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
-			if self == Self::Gemma4 {
+			if self == Self::SentencePiece {
 				let mut pieces = Vec::new();
 				let mut start = 0;
 				while start < text.len() {
@@ -10131,6 +10134,7 @@ mod tokenizer {
 
 	/// Where the vocabulary ranks its pieces: the merge list names each pair and
 	/// its rank, while scores rank every piece on their own, best first.
+	#[derive(Clone)]
 	enum Ranks {
 		Merges(HashMap<(u32, u32), (u32, u32)>),
 		Scores(Vec<u32>),
@@ -10156,6 +10160,7 @@ mod tokenizer {
 		Ok(ranks)
 	}
 
+	#[derive(Clone)]
 	pub struct Tokenizer {
 		tokens: Vec<String>,
 		ids: HashMap<String, u32>,
@@ -10166,20 +10171,37 @@ mod tokenizer {
 		byte_of: HashMap<char, u8>,
 		family: Family,
 		template: Option<String>,
+		add_space_prefix: bool,
 		add_bos: bool,
 		add_eos: bool,
 		bos: Option<u32>,
 		eos: Option<u32>,
 		pad: Option<u32>,
+		stop: Vec<u32>,
+		suppress: Vec<u32>,
+	}
+
+	pub(super) fn token_ids(model: &Gguf, key: &str) -> Result<Vec<u32>> {
+		let values = match model.value(key) {
+			None => return Ok(Vec::new()),
+			Some(GgufValue::Array(values)) => values.as_slice(),
+			Some(value) => std::slice::from_ref(value),
+		};
+		values.iter().map(|value| value.integer().and_then(|id| u32::try_from(id).ok()).ok_or_else(|| RecipeError::new(format!("{key} contains an invalid token id")))).collect()
 	}
 
 	impl Tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			let family = if kind == "gemma4" { Family::Gemma4 } else {
+			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
+			};
+			let add_space_prefix = match model.value("tokenizer.ggml.add_space_prefix") {
+				Some(GgufValue::Bool(value)) => *value,
+				None => kind == "llama",
+				Some(_) => return Err(RecipeError::new("tokenizer.ggml.add_space_prefix is not a boolean")),
 			};
 			let array = |key: &str| match model.value(key) {
 				Some(GgufValue::Array(items)) => Ok(items.as_slice()),
@@ -10207,7 +10229,7 @@ mod tokenizer {
 			let map = byte_map();
 			let mut bytes = [*ids.get("<unk>").unwrap_or(&0); 256];
 			let mut byte_of = HashMap::new();
-			if family != Family::Gemma4 {
+			if family != Family::SentencePiece {
 				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = id(&symbol.to_string())?; }
 				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
@@ -10223,6 +10245,11 @@ mod tokenizer {
 			}
 			let special_id = |key: &str| model.value(key).and_then(GgufValue::integer).map(|value| value as u32);
 			let flag = |key: &str| matches!(model.value(key), Some(GgufValue::Bool(true)));
+			let mut stop = token_ids(model, "tokenizer.ggml.eos_token_id")?;
+			stop.extend(token_ids(model, "tokenizer.ggml.eot_token_id")?);
+			stop.sort_unstable();
+			stop.dedup();
+			let suppress = token_ids(model, "tokenizer.ggml.suppress_tokens")?;
 			Ok(Self {
 				byte_of,
 				ids,
@@ -10232,19 +10259,42 @@ mod tokenizer {
 				bytes,
 				family,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
+				add_space_prefix,
 				add_bos: flag("tokenizer.ggml.add_bos_token"),
 				add_eos: flag("tokenizer.ggml.add_eos_token"),
 				bos: special_id("tokenizer.ggml.bos_token_id"),
 				eos: special_id("tokenizer.ggml.eos_token_id"),
 				pad: special_id("tokenizer.ggml.padding_token_id"),
+				stop,
+				suppress,
 				tokens,
 			})
 		}
+		/// Replace the file's EOS and end-of-turn ids for this tokenizer.
+		pub fn stop(mut self, ids: impl IntoIterator<Item = u32>) -> Self {
+			self.stop = ids.into_iter().collect();
+			self.stop.sort_unstable();
+			self.stop.dedup();
+			self
+		}
+		/// Replace the file's suppressed token ids for this tokenizer.
+		pub fn suppress(mut self, ids: impl IntoIterator<Item = u32>) -> Self {
+			self.suppress = ids.into_iter().collect();
+			self.suppress.sort_unstable();
+			self.suppress.dedup();
+			self
+		}
+		pub fn stop_ids(&self) -> Vec<u32> { self.stop.clone() }
+		pub fn suppress_ids(&self) -> &[u32] { &self.suppress }
 		pub fn bos(&self) -> Option<u32> {
 			self.bos
 		}
 		pub fn eos(&self) -> Option<u32> {
 			self.eos
+		}
+		/// The vocabulary id of a token written in the model's chat template.
+		pub fn id(&self, token: &str) -> Option<u32> {
+			self.ids.get(token).copied()
 		}
 		pub fn pad(&self) -> Option<u32> {
 			self.pad
@@ -10289,10 +10339,14 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
-			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
+			let normalized = (self.family == Family::SentencePiece).then(|| {
+				let mut normalized = text.replace(' ', "▁");
+				if self.add_space_prefix && !normalized.is_empty() { normalized.insert(0, '▁'); }
+				normalized
+			});
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
-				let mut symbols = if self.family == Family::Gemma4 {
+				let mut symbols = if self.family == Family::SentencePiece {
 					if word.chars().all(|value| value == '\n') && let Some(id) = self.ids.get(word) {
 						vec![*id]
 					} else {
@@ -10336,7 +10390,7 @@ mod tokenizer {
 				}
 			}
 			let text = String::from_utf8_lossy(&bytes).into_owned();
-			if self.family == Family::Gemma4 { text.replace('▁', " ") } else { text }
+			if self.family == Family::SentencePiece { text.replace('▁', " ") } else { text }
 		}
 		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
 		/// content. `generation` sets `add_generation_prompt`, which the template
@@ -10345,17 +10399,6 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
-			if self.family == Family::Gemma4 {
-				let mut prompt = String::new();
-				for (role, content) in messages {
-					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
-					prompt.push_str(&format!("<|turn>{role}\n{}<turn|>\n", content.trim()));
-				}
-				if generation {
-					prompt.push_str("<|turn>model\n<|channel>thought\n<channel|>");
-				}
-				return Ok(prompt);
-			}
 			let template = self.template.as_deref().ok_or_else(|| RecipeError::new("tokenizer.chat_template is absent"))?;
 			let token = |id: Option<u32>| id.map_or(String::new(), |id| self.decode(&[id]));
 			let conversation = messages
@@ -10365,7 +10408,8 @@ mod tokenizer {
 			let globals = vec![
 				("messages".to_owned(), Value::List(conversation)),
 				("add_generation_prompt".to_owned(), Value::Bool(generation)),
-				("bos_token".to_owned(), Value::Text(token(self.bos))),
+				("enable_thinking".to_owned(), Value::Bool(true)),
+				("bos_token".to_owned(), Value::Text(if self.add_bos { String::new() } else { token(self.bos) })),
 				("eos_token".to_owned(), Value::Text(token(self.eos))),
 			];
 			let mut scope = Scope { frames: vec![globals] };
@@ -10381,6 +10425,7 @@ mod tokenizer {
 
 	/// One piece of a chat template: literal text, a `{{ ... }}` substitution, or
 	/// a `{% ... %}` statement. A `{# ... #}` comment leaves no piece.
+	#[derive(Clone)]
 	enum Piece {
 		Text(String),
 		Write(String),
@@ -10449,6 +10494,11 @@ mod tokenizer {
 		List(Vec<Value>),
 		Map(Vec<(String, Value)>),
 		Namespace(std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>),
+		Macro(std::rc::Rc<TemplateMacro>),
+	}
+	struct TemplateMacro {
+		parameters: Vec<(String, Option<String>)>,
+		pieces: Vec<Piece>,
 	}
 	impl Value {
 		fn truth(&self) -> bool {
@@ -10459,7 +10509,7 @@ mod tokenizer {
 				Self::Text(text) => !text.is_empty(),
 				Self::List(items) => !items.is_empty(),
 				Self::Map(fields) => !fields.is_empty(),
-				Self::Namespace(_) => true,
+				Self::Namespace(_) | Self::Macro(_) => true,
 			}
 		}
 		/// The text a `{{ }}` writes or a `~` joins.
@@ -10470,6 +10520,7 @@ mod tokenizer {
 				Self::Int(value) => value.to_string(),
 				Self::Text(text) => text.clone(),
 				Self::List(_) | Self::Map(_) | Self::Namespace(_) => self.json(),
+				Self::Macro(_) => String::new(),
 			}
 		}
 		fn json(&self) -> String {
@@ -10496,6 +10547,7 @@ mod tokenizer {
 				Self::List(items) => format!("[{}]", items.iter().map(Self::json).collect::<Vec<_>>().join(", ")),
 				Self::Map(fields) => format!("{{{}}}", fields.iter().map(|(key, value)| format!("{}: {}", Self::Text(key.clone()).json(), value.json())).collect::<Vec<_>>().join(", ")),
 				Self::Namespace(fields) => Self::Map(fields.borrow().clone()).json(),
+				Self::Macro(_) => "null".to_owned(),
 			}
 		}
 		fn integer(&self) -> Result<i64> {
@@ -10602,8 +10654,27 @@ mod tokenizer {
 
 	/// The names a chat template resolves, innermost frame first: the globals,
 	/// then one frame per `for` body.
+	#[derive(Clone)]
 	struct Scope {
 		frames: Vec<Vec<(String, Value)>>,
+	}
+	impl TemplateMacro {
+		fn call(&self, arguments: &[Value], outer: &Scope) -> Result<Value> {
+			require(arguments.len() <= self.parameters.len(), "chat template macro receives too many arguments")?;
+			let mut scope = outer.clone();
+			scope.frames.push(Vec::new());
+			for (index, (name, default)) in self.parameters.iter().enumerate() {
+				let value = match (arguments.get(index), default) {
+					(Some(value), _) => value.clone(),
+					(None, Some(expression)) => evaluate(expression, &scope, true)?,
+					(None, None) => Value::Undefined,
+				};
+				scope.assign(name, value)?;
+			}
+			let (mut at, mut output) = (0, String::new());
+			render(&self.pieces, &mut at, &mut output, &mut scope, true, &[])?;
+			Ok(Value::Text(output))
+		}
 	}
 	impl Scope {
 		fn get(&self, name: &str) -> Value {
@@ -10985,6 +11056,14 @@ mod tokenizer {
 						if live { return Err(RecipeError::new(arguments.first().map(Value::text).unwrap_or_else(|| "chat template raise_exception needs a message".to_owned()))); }
 						Ok(Value::Undefined)
 					}
+					_ if self.eat_op("(") => {
+						let arguments = self.arguments(live)?;
+						if !live { return Ok(Value::Undefined); }
+						match self.scope.get(&name) {
+							Value::Macro(body) => body.call(&arguments, self.scope),
+							_ => Err(RecipeError::new(format!("chat template function {name:?} is not defined"))),
+						}
+					}
 					_ => Ok(self.scope.get(&name)),
 				},
 				other => Err(RecipeError::new(format!("chat template expression holds {other:?} where a value belongs"))),
@@ -11096,6 +11175,17 @@ mod tokenizer {
 						return Ok(source.clone());
 					}
 					match head {
+						"macro" => {
+							let (name, parameters) = rest.split_once('(').ok_or_else(|| RecipeError::new(format!("chat template macro {rest:?} has no parameters")))?;
+							let parameters = parameters.strip_suffix(')').ok_or_else(|| RecipeError::new(format!("chat template macro {rest:?} has no closing parenthesis")))?;
+							let parameters = parameters.split(',').filter(|parameter| !parameter.trim().is_empty()).map(|parameter| {
+								let (name, default) = parameter.split_once('=').map_or((parameter, None), |(name, value)| (name, Some(value.trim().to_owned())));
+								(name.trim().to_owned(), default)
+							}).collect();
+							let body = *at;
+							render(pieces, at, &mut String::new(), scope, false, &["endmacro"])?;
+							if emit { scope.assign(name.trim(), Value::Macro(std::rc::Rc::new(TemplateMacro { parameters, pieces: pieces[body..*at - 1].to_vec() })))?; }
+						}
 						"if" => {
 							// Each branch renders in turn; only the first whose condition
 							// holds writes, and the others parse with `emit` off.
@@ -17497,6 +17587,7 @@ pub struct Infer {
 	log: Vec<Metric>,
 	tokens: Option<usize>,
 	chat: Option<Vec<ChatMetric>>,
+	tokenizer: Option<Tokenizer>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -17525,13 +17616,15 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, tokenizer: None }
 	}
 }
 impl Infer {
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
+	/// Use a tokenizer with explicit stop or suppressed ids for this inference run.
+	pub fn tokenizer(mut self, coder: Tokenizer) -> Self { self.tokenizer = Some(coder); self }
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log = metrics.into_metrics();
 		arm_trace(&self.log);
@@ -17560,18 +17653,19 @@ impl Infer {
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
 		let requested = std::env::var("RECIPE_CONTEXT").ok().map(|value| value.parse::<usize>().map_err(|_| RecipeError::new("RECIPE_CONTEXT must be a positive integer"))).transpose()?;
 		if let Some(context) = requested { require(context > 0 && context <= ceiling, format!("requested context {context} is outside this model's 1..={ceiling} positions"))?; }
-		let coder = file.tokenizer();
+		let loaded_coder = self.tokenizer.is_none().then(|| file.tokenizer());
+		let coder = self.tokenizer.as_ref().or(loaded_coder.as_ref()).unwrap();
 		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
 		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
 		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
-		let stop = stop_ids(&coder)?;
+		let stop = coder.stop_ids();
 		let sequence = match requested {
 			Some(context) => context,
 			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
 			None => ceiling,
 		};
 		let bound = Bound { file, draft: None, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
-		let placed = place_bound(&bound, sequence, &[], devices)?;
+		let placed = place_bound_with_suppressed(&bound, sequence, &[], devices, Some(coder.suppress_ids()))?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
 		let input = ChatInput::new(interactive)?;
@@ -17669,31 +17763,6 @@ impl Infer {
 			last: request_history.last().cloned().unwrap_or_default(),
 			history: request_history,
 		})
-	}
-}
-/// The ids a reply ends with: the end-of-sequence id, and the token the chat
-/// template closes an assistant turn with.
-fn stop_ids(coder: &Tokenizer) -> Result<Vec<u32>> {
-	let mut stop = coder.eos().into_iter().collect::<Vec<_>>();
-	let sentinel = "\u{1}reply\u{1}";
-	if let Ok(rendered) = coder.prompt(&[("user", "."), ("assistant", sentinel)], false)
-		&& let Some((_, tail)) = rendered.split_once(sentinel)
-	{
-		let ids = coder.encode(tail.trim()).into_iter().filter(|id| Some(*id) != coder.bos()).collect::<Vec<_>>();
-		if let Some(first) = ids.first()
-			&& !stop.contains(first)
-		{
-			stop.push(*first);
-		}
-	}
-	Ok(stop)
-}
-impl Tokenizer {
-	/// End-of-turn ids rendered by this tokenizer's own chat template, including
-	/// its declared EOS id. A resident chat process can use the same stop set as
-	/// `recipe.infer()` without restating model-specific tokens.
-	pub fn stop_ids(&self) -> Vec<u32> {
-		stop_ids(self).unwrap_or_else(|error| panic!("{error}"))
 	}
 }
 /// The model with its output projection evaluated at the newest position
@@ -19489,14 +19558,16 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
 fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
+	place_bound_with_suppressed(model, positions, split, devices, None)
+}
+fn place_bound_with_suppressed(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], override_suppressed: Option<&[u32]>) -> Result<Placed> {
 	require(positions != 0, "a placed bound model has no positions")?;
 	let samples = vec![0.0; positions];
 	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
 	let input = graph.input;
-	let suppressed = match model.file.value("tokenizer.ggml.suppress_tokens") {
-		Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| RecipeError::new("tokenizer suppress_tokens contains an invalid id"))).collect::<Result<Vec<_>>>()?,
-		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
-		None => Vec::new(),
+	let suppressed = match override_suppressed {
+		Some(ids) => ids.to_vec(),
+		None => tokenizer::token_ids(&model.file, "tokenizer.ggml.suppress_tokens")?,
 	};
 	if env!("RECIPE_DEVICE_SPLIT") == "tensor" && devices.len() > 1 && split.is_empty() {
 		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
