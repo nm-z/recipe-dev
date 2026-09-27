@@ -3058,8 +3058,10 @@ fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lan
 		_ => return None,
 	};
 	let row_bytes = row_values / spec.block * spec.stride;
-	let whole = row_values % spec.block == 0 && row_bytes % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
-	whole.then_some((lanes, row_bytes, row_values / spec.block * interleaved_stride(spec.block, spec.stride)))
+	// Interleaved rows take whole words at the interleaved stride.
+	let padded_row = row_values / spec.block * interleaved_stride(spec.block, spec.stride);
+	let whole = row_values % spec.block == 0 && padded_row % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
+	whole.then_some((lanes, row_bytes, padded_row))
 }
 /// `bytes` of `rows` rows of `row_bytes` each, every block of `stride` bytes
 /// widened to `padded` with zeros, and the rows of every group of `lanes`
