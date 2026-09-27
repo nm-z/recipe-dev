@@ -18910,10 +18910,14 @@ struct PlacedDraft {
 	/// The positions the head has run.
 	reached: std::sync::atomic::AtomicU32,
 }
-/// Pinned machine RAM mapped into every die of a tensor split, which their
-/// exchanges write and read.
+/// The memory a tensor split's exchanges write and read: the first die's own
+/// memory when every other die reaches it peer to peer, else pinned machine
+/// RAM mapped into every die.
 struct ExchangeBuffer {
+	/// The pinned machine RAM, when the dies share that.
 	pointer: Ptr,
+	/// The first die's buffer the others reach directly, or zero.
+	device: u64,
 	gpu: &'static Gpu,
 }
 // The buffer is plain pinned memory; each die reaches it through its own mapping.
@@ -18924,24 +18928,45 @@ impl Drop for ExchangeBuffer {
 		match &self.gpu.driver {
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => unsafe {
-				(driver.host_free)(self.pointer);
+				if self.device != 0 {
+					(driver.set)(driver.context);
+					(driver.free)(self.device);
+				} else {
+					(driver.host_free)(self.pointer);
+				}
 			},
 			_ => {}
 		}
 	}
 }
 impl Gpu {
-	/// Zeroed pinned machine RAM of `bytes` that every device's context maps.
-	fn exchange_buffer(&'static self, bytes: usize) -> Result<ExchangeBuffer> {
+	/// `bytes` of zeroed exchange memory for this die and `peers`: this die's
+	/// own memory when every peer reaches it directly, so exchanges never wait on
+	/// the machine's memory controller; else pinned machine RAM every context maps.
+	fn exchange_buffer(&'static self, bytes: usize, peers: &[&'static Gpu]) -> Result<ExchangeBuffer> {
 		match &self.driver {
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => unsafe {
+				let reach = peers.iter().filter(|peer| !std::ptr::eq(**peer, self)).all(|peer| match &peer.driver {
+					Driver::Cuda(other) => {
+						(other.set)(other.context);
+						// 704: peer access is already on.
+						matches!((other.enable_peer)(driver.context, 0), 0 | 704)
+					}
+					_ => false,
+				});
 				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				if reach {
+					let mut device = 0_u64;
+					driver_status(Backend::Nvidia, (driver.allocate)(&mut device, bytes), "exchange allocation")?;
+					driver_status(Backend::Nvidia, (driver.clear)(device, 0, bytes), "exchange clear")?;
+					return Ok(ExchangeBuffer { pointer: ptr::null_mut(), device, gpu: self });
+				}
 				let mut pointer = ptr::null_mut();
 				// Portable to every context, and mapped into each device's addresses.
 				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
 				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
-				Ok(ExchangeBuffer { pointer, gpu: self })
+				Ok(ExchangeBuffer { pointer, device: 0, gpu: self })
 			},
 			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
 		}
@@ -19051,7 +19076,7 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 			largest = largest.max(plane * planes * NativePrecision::new(node.precision, node.acc)?.model.bytes());
 		}
 	}
-	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest)?;
+	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest, devices)?;
 	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
 	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
 	Ok((tapes, buffer, resident))
@@ -23760,9 +23785,12 @@ impl NativeTape {
 			#[cfg(nvidia)]
 			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
 				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
-				// The address this device's context maps the machine RAM at.
-				let mut mapped = 0_u64;
-				driver_status(Backend::Nvidia, (driver.host_device_pointer)(&mut mapped, buffer.pointer, 0), "exchange mapping")?;
+				// The first die's buffer at its unified address, or the address this
+				// device's context maps the machine RAM at.
+				let mut mapped = buffer.device;
+				if mapped == 0 {
+					driver_status(Backend::Nvidia, (driver.host_device_pointer)(&mut mapped, buffer.pointer, 0), "exchange mapping")?;
+				}
 				for (name, value, size) in [(&b"recipe_exchange_host\0"[..], mapped, 8), (&b"recipe_exchange_epoch\0"[..], 0, 4)] {
 					let (mut address, mut bytes) = (0_u64, 0_usize);
 					driver_status(Backend::Nvidia, (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, name.as_ptr()), "exchange symbol")?;
@@ -25571,6 +25599,7 @@ struct Cuda {
 	host_alloc: unsafe extern "C" fn(*mut Ptr, usize, u32) -> i32,
 	host_free: unsafe extern "C" fn(Ptr) -> i32,
 	host_device_pointer: unsafe extern "C" fn(*mut u64, Ptr, u32) -> i32,
+	enable_peer: unsafe extern "C" fn(Ptr, u32) -> i32,
 	module_global: unsafe extern "C" fn(*mut u64, *mut usize, Ptr, *const u8) -> i32,
 	cus: u32,
 	wave: u32,
@@ -27446,6 +27475,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
 				host_free: runtime.function(b"cuMemFreeHost\0")?,
 				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
+				enable_peer: runtime.function(b"cuCtxEnablePeerAccess\0")?,
 				module_global: runtime.function(b"cuModuleGetGlobal_v2\0")?,
 				cus: cus as u32,
 				wave: wave as u32,
