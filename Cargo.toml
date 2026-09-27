@@ -131,6 +131,62 @@ tf32-storage = [1, 8, 23]
 fp8-e4m3-special = [126, 127, 126]
 fp8-e5m2-special = [123, 126, 124]
 
+[architecture.llama]
+rope = "pairs"
+
+[architecture.gemma3]
+rope = "neox"
+
+[architecture.gemma4]
+rope = "neox"
+
+[architecture.lfm2]
+rope = "neox"
+
+[architecture.qwen2]
+rope = "neox"
+
+[architecture.qwen3]
+rope = "neox"
+
+[architecture.qwen2moe]
+rope = "neox"
+
+[architecture.qwen3moe]
+rope = "neox"
+
+[architecture.qwen35]
+rope = "neox"
+conv = "silu"
+qk = "l2"
+norm = "rms"
+decay = "softplus"
+output = "silu"
+
+[architecture.qwen35moe]
+rope = "neox"
+conv = "silu"
+qk = "l2"
+norm = "rms"
+decay = "softplus"
+output = "silu"
+
+[architecture.qwen3next]
+rope = "neox"
+conv = "silu"
+qk = "l2"
+norm = "rms"
+decay = "softplus"
+output = "silu"
+
+[architecture.qwen4exp]
+rope = "neox"
+conv = "silu"
+qk = "l2"
+norm = "rms"
+decay = "softplus"
+output = "sigmoid"
+
 [precision] # --config <name>
 default-config = "recipe"
 

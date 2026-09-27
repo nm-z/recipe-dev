@@ -4576,14 +4576,33 @@ impl NativeModelIr {
 					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
 					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
 					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
-					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
+					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8].abs());
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							concat!(
+								"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, ",
+								"i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, ",
+								"{ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, ",
+								"i1 {has_factors}, i1 {reverse}, i1 {pairs}{position_origin} )\n"
+							),
 							position_origin = if reverse { "" } else if self.layout.window_positions < self.graph.input.length { ", i32 %begin" } else { ", i32 0" },
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							has_factors = node.parameters != 0,
+							pairs = node.argument[8].is_sign_negative(),
+							body = body,
+							v = v,
+							input = input,
+							output = output,
+							wide = wide,
+							ty = ty,
+							base = base,
+							mscale = mscale,
+							factor = factor,
+							chain = chain,
+							fast = fast,
+							slow = slow,
+							reverse = reverse,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -4808,9 +4827,22 @@ impl NativeModelIr {
 					let length = narrow(node.output.length, "delta length")?;
 					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin} )\n",
+							concat!(
+								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
+								"i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, ",
+								"i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin}, i1 {sigmoid_decay} )\n"
+							),
 							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
 							tiled = node.argument[5] == 1.0,
+							sigmoid_decay = node.argument[7] == 1.0,
+							v = v,
+							wide = wide,
+							pairs = pairs,
+							key_heads = key_heads,
+							key_width = key_width,
+							heads = heads,
+							width = width,
+							length = length,
 							ty = self.node_precision(node).model_type,
 							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
 							pointer = pointer_type(backend),
@@ -4836,7 +4868,15 @@ impl NativeModelIr {
 					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries}, i32 {decode} )\n",
+							concat!(
+								"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
+								"{pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, ",
+								"i32 {entries}, i32 {decode}, i1 {sigmoid_decay} )\n"
+							),
+							sigmoid_decay = node.argument[7] == 1.0,
+							v = v,
+							wide = wide,
+							entries = entries,
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -5414,7 +5454,14 @@ impl NativeModelIr {
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
+							concat!(
+								"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
+								"{pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, ",
+								"{pointer} {gate}, i64 {wide}, {arguments}, i1 {sigmoid_decay} )\n"
+							),
+							sigmoid_decay = node.argument[7] == 1.0,
+							v = v,
+							wide = wide,
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
@@ -11634,8 +11681,13 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,{},{},{},{},{},{},{},{}",
-					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
+				"delta,{},{},{},{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
+				delta.conv_activation.expect("delta convolution activation is absent").code(),
+				match delta.qk.expect("delta query and key normalization is absent") { BlockNormalization::L2 => 1, _ => unreachable!() },
+				match delta.norm.expect("delta value normalization is absent") { BlockNormalization::Rms => 1, _ => unreachable!() },
+				match delta.decay.expect("delta decay activation is absent") { DeltaDecay::Softplus => 1, DeltaDecay::Sigmoid => 2 },
+				delta.output_activation.expect("delta output activation is absent").code()
 			),
 			Operation::Ple(ple) => {
 				let blocks = |parts: &[Block]| text(&parts.iter().map(block_text).collect::<Vec<_>>().join("\n"));
@@ -11690,8 +11742,10 @@ mod bundle {
 				let score_normalization = normalization(fields.next(), "indexer scoring normalization")?;
 				let score_dims = value_at(fields.next(), "indexer rotary dimensions")?;
 				index.score = score_normalization.map(|normalization| (normalization, score_dims));
-				let layout = match fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(1) {
-					0 | 1 => RopeLayout::Neox,
+				let layout = match value_at::<u8>(fields.next(), "rotary layout")? {
+					0 if dims == 0 => None,
+					1 if dims != 0 => Some(RopeLayout::Neox),
+					2 if dims != 0 => Some(RopeLayout::Pairs),
 					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
 				};
 				// The four yarn values follow the head width, all four or none. A
@@ -11731,7 +11785,7 @@ mod bundle {
 					width,
 					keys,
 					values,
-					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
+					rope: layout.map(|layout| (layout, dims, base.to_bits())),
 					yarn,
 					index: (index.block != 0).then_some(index),
 					window,
@@ -11797,16 +11851,18 @@ mod bundle {
 			)),
 			"delta" => {
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
-				// A bundle written before the extents were separable names neither, so
-				// an absent field takes the extent from the stream, as the builder does.
-				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
-				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
-				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				// Older bundles always used a linear convolution and sigmoid output gate.
-				// Keep those defaults when the optional activation selectors are absent.
-				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
-				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, tiled_keys: false, scaled_query: false }))
+				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
+				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
+				let conv_activation = activation(fields.next().ok_or_else(|| RecipeError::new("delta convolution activation is absent"))?)?;
+				let qk = match value_at(fields.next(), "delta query and key normalization")? { 1u8 => BlockNormalization::L2, _ => return Err(RecipeError::new("invalid delta query and key normalization")) };
+				let norm = match value_at(fields.next(), "delta value normalization")? { 1u8 => BlockNormalization::Rms, _ => return Err(RecipeError::new("invalid delta value normalization")) };
+				let decay = match value_at(fields.next(), "delta decay activation")? { 1u8 => DeltaDecay::Softplus, 2 => DeltaDecay::Sigmoid, _ => return Err(RecipeError::new("invalid delta decay activation")) };
+				let output_activation = activation(fields.next().ok_or_else(|| RecipeError::new("delta output activation is absent"))?)?;
+				require(fields.next().is_none(), "delta has trailing fields")?;
+				Ok(Operation::Delta(DeltaBlock {
+					heads, kernel, key_heads, key_width, value_width, output,
+					conv_activation: Some(conv_activation), qk: Some(qk), norm: Some(norm), decay: Some(decay), output_activation: Some(output_activation),
+				}))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -12784,11 +12840,13 @@ const CHAR_IDS: [char; 100] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeLayout {
 	Neox,
+	Pairs,
 }
 impl RopeLayout {
 	const fn code(self) -> u8 {
 		match self {
 			Self::Neox => 1,
+			Self::Pairs => 2,
 		}
 	}
 }
@@ -12801,6 +12859,14 @@ impl RopeSelector for Neox {
 	fn layout(self) -> RopeLayout {
 		RopeLayout::Neox
 	}
+}
+pub struct Pairs;
+pub fn pairs() -> Pairs { Pairs }
+impl<F: Fn() -> Pairs> RopeSelector for F {
+	fn layout(self) -> RopeLayout { RopeLayout::Pairs }
+}
+impl RopeSelector for RopeLayout {
+	fn layout(self) -> RopeLayout { self }
 }
 /// A step of a model, and equally a step of a fragment inside one. `res`,
 /// `ensemble`, `moe`, and the model builder all take the same thing, because a branch step
@@ -12959,6 +13025,30 @@ impl AttentionBlock {
 		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, window: 0, factors: false, unscaled: false, query: None, key: None, value: None }
 	}
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaDecay {
+	Softplus,
+	Sigmoid,
+}
+pub const softplus: DeltaDecay = DeltaDecay::Softplus;
+pub trait DeltaDecaySelector {
+	fn decay(self) -> DeltaDecay;
+}
+impl DeltaDecaySelector for DeltaDecay {
+	fn decay(self) -> DeltaDecay { self }
+}
+impl<F: Fn() -> Block> DeltaDecaySelector for F {
+	fn decay(self) -> DeltaDecay {
+		assert!(matches!(delta_activation(self), Activation::Sigmoid), "delta decay must be softplus or sigmoid");
+		DeltaDecay::Sigmoid
+	}
+}
+fn delta_activation(selector: impl Fn() -> Block) -> Activation {
+	let block = selector();
+	assert!(matches!(block.operation, Operation::Identity) && block.maps.len() == 1, "delta activation must name one activation");
+	let MapKind::Activation(activation) = block.maps[0].kind else { panic!("delta activation must name one activation") };
+	activation
+}
 /// One gated delta rule block: value heads, the convolution kernel, and the key
 /// and value extents. A zero extent takes it from the stream, so the value heads
 /// exactly partition the block input and the keys match the values.
@@ -12970,23 +13060,15 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
-	/// Activation applied after the causal convolution. Existing hand-built
-	/// models default to linear for compatibility; GGUF Qwen delta blocks set
-	/// this to SiLU from their architecture row.
-	conv_activation: Activation,
-	/// Activation applied to the output gate. Existing hand-built models
-	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
-	output_activation: Activation,
-	/// Which key head a value head reads: grouped (head / group), or tiled
-	/// (head modulo the key heads), the layout ggml's broadcast gives a file.
-	tiled_keys: bool,
-	/// Whether the recurrence output takes 1 / sqrt(key width): the scaled query
-	/// of the standard gated delta rule.
-	scaled_query: bool,
+	conv_activation: Option<Activation>,
+	qk: Option<BlockNormalization>,
+	norm: Option<BlockNormalization>,
+	decay: Option<DeltaDecay>,
+	output_activation: Option<Activation>,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid, tiled_keys: false, scaled_query: false }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, qk: None, norm: None, decay: None, output_activation: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -13500,7 +13582,7 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn lstm(&self, width: usize) -> Model { self.model().lstm(width) }
 	pub fn perc(&self, width: usize) -> Model { self.model().perc(width) }
 	pub fn dconv(&self, kernel: usize) -> Model { self.model().dconv(kernel) }
-	pub fn delta(&self, heads: usize, kernel: usize) -> Model { self.model().delta(heads, kernel) }
+	pub fn delta(&self, heads: usize, kernel: usize) -> DeltaModel { self.model().delta(heads, kernel) }
 	pub fn attn(&self, heads: usize) -> Model { self.model().attn(heads) }
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Model { self.model().glu(hidden, activation) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().res(parts) }
@@ -13549,6 +13631,53 @@ impl Exclusion for Bias {
 	}
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
+/// A delta block being configured. `.output(...)` completes its required math
+/// and returns the ordinary model chain.
+pub struct DeltaModel(Model);
+impl std::ops::Deref for DeltaModel {
+	type Target = Model;
+	fn deref(&self) -> &Model { &self.0 }
+}
+impl DeltaModel {
+	fn edit(self, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
+		Self(self.0.suffix().edit(|model| {
+			let Operation::Delta(delta) = &mut model.blocks.last_mut().expect("delta block is absent").operation else { panic!("delta selector requires a delta block") };
+			apply(delta);
+		}))
+	}
+	pub fn keys(self, count: usize, width: usize) -> Self {
+		self.edit(|delta| (delta.key_heads, delta.key_width) = (count, width))
+	}
+	pub fn values(self, width: usize) -> Self { self.edit(|delta| delta.value_width = width) }
+	pub fn out(self, width: usize) -> Self { self.edit(|delta| delta.output = width) }
+	pub fn conv(self, selector: impl Fn() -> Block) -> Self {
+		let value = delta_activation(selector);
+		assert!(matches!(value, Activation::Linear | Activation::Silu), "delta convolution activation must be linear or silu");
+		self.edit(|delta| delta.conv_activation = Some(value))
+	}
+	pub fn qk(self, selector: impl NormalizationSelector) -> Self {
+		let value = selector.normalization();
+		assert!(value == BlockNormalization::L2, "delta query and key normalization must be l2");
+		self.edit(|delta| delta.qk = Some(value))
+	}
+	pub fn norm(self, selector: impl NormalizationSelector) -> Self {
+		let value = selector.normalization();
+		assert!(value == BlockNormalization::Rms, "delta value normalization must be rms");
+		self.edit(|delta| delta.norm = Some(value))
+	}
+	pub fn decay(self, selector: impl DeltaDecaySelector) -> Self {
+		let value = selector.decay();
+		self.edit(|delta| delta.decay = Some(value))
+	}
+	pub fn output(self, selector: impl Fn() -> Block) -> Model {
+		let value = delta_activation(selector);
+		assert!(matches!(value, Activation::Sigmoid | Activation::Silu), "delta output activation must be sigmoid or silu");
+		let model = self.edit(|delta| delta.output_activation = Some(value)).0;
+		let Operation::Delta(delta) = &model.blocks.last().expect("delta block is absent").operation else { unreachable!() };
+		assert!(delta.conv_activation.is_some() && delta.qk.is_some() && delta.norm.is_some() && delta.decay.is_some(), "delta requires conv, qk, norm, and decay choices");
+		model
+	}
+}
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		assert!(operation.weighted() || !self.pending_frozen, "{} owns no weights to qualify", operation.name());
@@ -13618,7 +13747,10 @@ impl Model {
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn last() = Operation::Last;
 	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
-	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
+	}
+	pub fn delta(&self, heads: usize, kernel: usize) -> DeltaModel {
+		DeltaModel(self.push(Operation::Delta(DeltaBlock::new(heads, kernel))))
+	}
 	/// Attention over query heads. The scalar form gives keys and values the
 	/// same count; the array form states query, key, and value counts separately.
 	pub fn attn(&self, heads: usize) -> Self {
@@ -13646,7 +13778,7 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
-	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
@@ -13657,15 +13789,6 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.pop().unwrap();
 			model.blocks.push(apply(block));
-		})
-	}
-	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
-		self.suffix().edit(|model| {
-			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding delta block"));
-			match &mut block.operation {
-				Operation::Delta(delta) => apply(delta),
-				_ => panic!("{selector} requires a preceding delta block"),
-			}
 		})
 	}
 	/// Tap spacing of the preceding `dconv` block: tap `j` of a `kernel`-wide
@@ -13694,20 +13817,6 @@ impl Model {
 	/// Compatibility spelling for the public attention head-width selector.
 	pub fn width(&self, width: usize) -> Self {
 		self.head(width)
-	}
-	/// Key and query heads of the preceding `delta` block, at `width` each. Every
-	/// key head serves `heads / count` value heads.
-	pub fn keys(&self, count: usize, width: usize) -> Self {
-		self.delta_block("keys", |delta| (delta.key_heads, delta.key_width) = (count, width))
-	}
-	/// Value width per head of the preceding `delta` block, so its value heads
-	/// need not partition the stream.
-	pub fn values(&self, width: usize) -> Self {
-		self.delta_block("values", |delta| delta.value_width = width)
-	}
-	/// Output width of the preceding `delta` block's closing projection.
-	pub fn out(&self, width: usize) -> Self {
-		self.delta_block("out", |delta| delta.output = width)
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -15796,6 +15905,8 @@ impl LossFunction {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF file for metadata and tensor-shape decisions in a model script.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf { open_script_file(path.as_ref()) }
 	/// The data a model reads: table, image and text sources, or one GGUF model
 	/// file, whose metadata the `gemma3.*` and `tokenizer.*` identifiers then
 	/// read and whose weights `recipe.infer` binds.
@@ -16124,43 +16235,64 @@ fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], c
 	};
 	compile(&blocks.for_file(model), &data, &data.targets, 1, device, config, false)
 }
-/// How an architecture pairs the channels its rotary embedding rotates. Recipe's
-/// rope pairs each channel with the one half the rotated span away; an
-/// architecture that pairs neighbouring channels binds its query and key rows in
-/// the order that makes the two rotations agree.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RopePairs {
-	Halves,
-	Neighbours,
+#[derive(Clone, Copy)]
+struct ManifestArchitecture {
+	rope: RopeLayout,
+	conv: Option<Activation>,
+	qk: Option<BlockNormalization>,
+	norm: Option<BlockNormalization>,
+	decay: Option<DeltaDecay>,
+	output: Option<Activation>,
 }
-// GGUF tensors using adjacent rotary pairs are permuted by `head_order` before
-// they are bound. The native kernel therefore always receives NeoX-ordered
-// rows, while this adapter retains the source convention for the permutation.
-impl RopeSelector for RopePairs {
-	fn layout(self) -> RopeLayout {
-		RopeLayout::Neox
+impl ManifestArchitecture {
+	fn read(name: &str) -> Result<Self> {
+		let body = env!("RECIPE_ARCHITECTURE_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(known, _)| *known == name).map(|(_, body)| body))
+			.ok_or_else(|| RecipeError::new(format!("Cargo.toml [architecture.{name}] is absent; required rope, and conv, qk, norm, decay, output for delta blocks")))?;
+		let field = |key: &str| body.split(',').find_map(|entry| entry.split_once('=').filter(|(known, _)| *known == key).map(|(_, value)| value));
+		let required = |key: &str| field(key).ok_or_else(|| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key}")));
+		let rope = match required("rope")? {
+			"neox" => RopeLayout::Neox,
+			"pairs" => RopeLayout::Pairs,
+			value => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] rope={value} must be neox or pairs"))),
+		};
+		let conv = match field("conv") {
+			None => None,
+			Some("linear") => Some(Activation::Linear),
+			Some("silu") => Some(Activation::Silu),
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] conv={value} must be linear or silu"))),
+		};
+		let qk = match field("qk") {
+			None => None,
+			Some("l2") => Some(BlockNormalization::L2),
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] qk={value} must be l2"))),
+		};
+		let norm = match field("norm") {
+			None => None,
+			Some("rms") => Some(BlockNormalization::Rms),
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] norm={value} must be rms"))),
+		};
+		let decay = match field("decay") {
+			None => None,
+			Some("softplus") => Some(DeltaDecay::Softplus),
+			Some("sigmoid") => Some(DeltaDecay::Sigmoid),
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] decay={value} must be softplus or sigmoid"))),
+		};
+		let output = match field("output") {
+			None => None,
+			Some("sigmoid") => Some(Activation::Sigmoid),
+			Some("silu") => Some(Activation::Silu),
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] output={value} must be sigmoid or silu"))),
+		};
+		Ok(Self { rope, conv, qk, norm, decay, output })
+	}
+	fn delta(self, name: &str) -> Result<(Activation, BlockNormalization, BlockNormalization, DeltaDecay, Activation)> {
+		let missing = |key: &str| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key} for a delta block"));
+		Ok((
+			self.conv.ok_or_else(|| missing("conv"))?, self.qk.ok_or_else(|| missing("qk"))?, self.norm.ok_or_else(|| missing("norm"))?,
+			self.decay.ok_or_else(|| missing("decay"))?, self.output.ok_or_else(|| missing("output"))?,
+		))
 	}
 }
-/// One row of the architecture table: the `general.architecture` names whose
-/// standard metadata keys and tensor names map onto the same blocks, and the
-/// convention those names leave implicit. Every dimension comes from the
-/// `<architecture>.*` namespace and every weight from the `blk.<n>.*`,
-/// `token_embd`, `output_norm` and `output` names, so a row adds no path of
-/// its own.
-struct Architecture {
-	names: &'static [&'static str],
-	rope: RopePairs,
-	delta_activation: Option<(Activation, Activation)>,
-}
-const ARCHITECTURES: &[Architecture] = &[
-	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
-	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
-	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
-];
 /// A model built from a GGUF file: the blocks its architecture metadata declares
 /// and the plan that binds every weighted node to the file's tensors by name.
 pub struct Bound {
@@ -16174,8 +16306,8 @@ pub struct Bound {
 	draft: Option<(Model, Binding)>,
 }
 impl Gguf {
-	/// The model this file describes: `general.architecture` selects the row of
-	/// the architecture table, the `<architecture>.*` namespace sizes every block,
+	/// The model this file describes: `general.architecture` selects its
+	/// `[architecture.<name>]` manifest choices; its metadata sizes every block,
 	/// and each weighted node binds to the tensor of the standard name that
 	/// holds its weight. A tensor no node reads, a node no tensor fills, or a
 	/// tensor the file lacks is an error here, before any device is touched.
@@ -16245,8 +16377,7 @@ impl Bound {
 struct Builder<'a> {
 	file: &'a Gguf,
 	architecture: &'a str,
-	rope: RopePairs,
-	delta_activation: Option<(Activation, Activation)>,
+	choices: Option<ManifestArchitecture>,
 	plan: Binding,
 	consumed: std::collections::BTreeSet<String>,
 }
@@ -16288,11 +16419,8 @@ struct ExpertDims {
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
-		let row = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).ok_or_else(|| {
-			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
-			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
-		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+		let choices = ManifestArchitecture::read(architecture)?;
+		let mut builder = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -16388,7 +16516,7 @@ impl<'a> Builder<'a> {
 		let draft = match builder.integer_or("nextn_predict_layers", 0)? {
 			0 => None,
 			1 => {
-				let mut drafter = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+				let mut drafter = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
 				let draft = drafter.draft(builder.integer("block_count")?, vocabulary, &dimensions, file)?;
 				builder.consumed.extend(drafter.consumed);
 				Some((draft, drafter.plan))
@@ -16605,33 +16733,11 @@ impl<'a> Builder<'a> {
 			None => self.projection(name, role, inputs, outputs),
 		}
 	}
-	/// A normalization scale of `width` values, repeated over `groups` groups of
-	/// the span it normalizes, in the order `order` reads each group's channels.
-	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
+	/// A normalization scale of `width` values, repeated over `groups` groups.
+	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize) -> Result<Vec<Plane>> {
 		let tensor = self.tensor(name, role)?;
 		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
-		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![Plane::Mapped(tensor); groups]);
-		}
-		let values = self.file.values(&tensor)?;
-		let permuted = order.iter().map(|channel| values[*channel]).collect::<Vec<_>>();
-		Ok(vec![Plane::Owned { name: format!("{name} (paired)"), values: permuted }; groups])
-	}
-	/// The order Recipe reads one head's rows in: the channels the rotation pairs
-	/// as neighbours moved into halves, the rest in place.
-	fn head_order(&self, width: usize, dims: usize) -> Vec<usize> {
-		match self.rope {
-			RopePairs::Halves => (0..width).collect(),
-			RopePairs::Neighbours => (0..dims).step_by(2).chain((1..dims).step_by(2)).chain(dims..width).collect(),
-		}
-	}
-	/// The rows of one head at `base`, as one view when they are read in place
-	/// and as one view per row otherwise.
-	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
-		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?]);
-		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)).collect()
+		Ok(vec![Plane::Mapped(tensor); groups])
 	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
@@ -16656,14 +16762,13 @@ impl<'a> Builder<'a> {
 			}
 			None => key.clone(),
 		};
-		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.push(query.rows(index * stride, head)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.push(key.rows(index * head, head)?);
 		}
 		planes.push(value);
 		let mut block = branch.attn(heads).kv(kv).head(head);
@@ -16678,7 +16783,7 @@ impl<'a> Builder<'a> {
 		if normalized {
 			block = block.qk(rms);
 		}
-		block = block.rope(self.rope, rope_dims, rope_base);
+		block = block.rope(self.choices.expect("architecture choices are absent").rope, rope_dims, rope_base);
 		let factors = !sliding && self.file.tensor("rope_freqs.weight").is_some();
 		block = block.edit(|model| {
 			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
@@ -16687,8 +16792,8 @@ impl<'a> Builder<'a> {
 		});
 		self.mapped(planes);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
+			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv)?);
 			self.slot(scales);
 		}
 		if factors {
@@ -16700,23 +16805,19 @@ impl<'a> Builder<'a> {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
 			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
 			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
-			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
-			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
-			// reaches the adjacent-pair Rope with the matching columns.
-			let index_order = self.head_order(index_width, rope_dims);
 			let mut index_planes = Vec::new();
 			for index in 0..index_heads {
-				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
+				index_planes.push(query.rows(index * index_width, index_width)?);
 			}
-			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
+			index_planes.push(key.rows(0, index_width)?);
 			self.mapped(index_planes);
 			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size));
 			let query_norm = name("indexer.q_norm.weight");
 			let key_norm = name("indexer.k_norm.weight");
 			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
 				block = block.score(rms, rope_dims);
-				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
-				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
+				let mut scales = self.scale(&query_norm, &role, index_width, index_heads)?;
+				scales.extend(self.scale(&key_norm, &role, index_width, 1)?);
 				self.slot(scales);
 			}
 		}
@@ -16797,25 +16898,23 @@ impl<'a> Builder<'a> {
 		let values = self.file.values(&decay)?;
 		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
 		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
-		let order = (0..state).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, state, heads, &order)?;
+		let scales = self.scale(&name("ssm_norm.weight"), &role, state, heads)?;
 		self.slot(scales);
 		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
 		self.mapped(vec![gate]);
 		let output = self.projection(&name("ssm_out.weight"), &role, inner, width)?;
 		self.mapped(vec![output]);
-		// A missing row selector keeps the historical hand-built defaults;
-		// architecture rows that use this block provide their trained pair.
-		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
+		let (conv, qk, norm, decay, output_activation) = self.choices.ok_or_else(|| RecipeError::new("architecture choices are absent"))?.delta(self.architecture)?;
 		let block = branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width);
-		// A GGUF delta block follows ggml's gated delta net: value heads tile the
-		// key heads, and the output takes the query scale 1 / sqrt(key width).
-		Ok(block.delta_block("activations", |delta| {
-			delta.conv_activation = conv_activation;
-			delta.output_activation = output_activation;
-			delta.tiled_keys = true;
-			delta.scaled_query = true;
-		}))
+		let block = match conv { Activation::Linear => block.conv(linear), Activation::Silu => block.conv(silu), _ => unreachable!() };
+		let block = match qk { BlockNormalization::L2 => block.qk(l2), _ => unreachable!() };
+		let block = match norm { BlockNormalization::Rms => block.norm(rms), _ => unreachable!() };
+		let block = match decay { DeltaDecay::Softplus => block.decay(softplus), DeltaDecay::Sigmoid => block.decay(sigmoid) };
+		Ok(match output_activation {
+			Activation::Silu => block.output(silu),
+			Activation::Sigmoid => block.output(sigmoid),
+			_ => return Err(RecipeError::new("delta output activation must be silu or sigmoid")),
+		})
 	}
 	/// One gated feed-forward and the plan of its gate, up and down projections.
 	fn feed_forward(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -17417,8 +17516,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 		return Ok(bound.plan);
 	}
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
+	let mut builder = Builder { file, architecture, choices: None, plan: Binding::default(), consumed: BTreeSet::new() };
 	let embedding = builder.tensor("token_embd.weight", "the embedding")?;
 	require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 	let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
@@ -17560,7 +17658,6 @@ impl Builder<'_> {
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
-		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
 		let query = if let Some(path) = &attention.query { self.keyed_tensor(path, &role)? } else { self.tensor(&name("attn_q.weight"), &role)? };
@@ -17573,20 +17670,19 @@ impl Builder<'_> {
 		require(query_gated == gated || gated && gate_path.is_some(), format!("{} gate rows do not match block {layer} attention product", query.name))?;
 		let key = if let Some(path) = &attention.key { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
 		let value = if let Some(path) = &attention.value { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_v.weight"), &role, width, kv * head)? };
-		let order = self.head_order(head, rope_dims);
 		let stride = if query_gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.push(query.rows(index * stride, head)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.push(key.rows(index * head, head)?);
 		}
 		planes.push(value);
 		self.mapped(planes);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
+			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv)?);
 			self.slot(scales);
 		}
 		if gated {
@@ -20776,6 +20872,11 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 /// length, the output a per-head root mean square and the gate built from a third
 /// projection, and the output projection closes the block.
 fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
+	let conv_activation = delta.conv_activation.ok_or_else(|| RecipeError::new("delta convolution activation is absent"))?;
+	let qk = delta.qk.ok_or_else(|| RecipeError::new("delta query and key normalization is absent"))?;
+	let norm = delta.norm.ok_or_else(|| RecipeError::new("delta value normalization is absent"))?;
+	let decay = delta.decay.ok_or_else(|| RecipeError::new("delta decay activation is absent"))?;
+	let output_activation = delta.output_activation.ok_or_else(|| RecipeError::new("delta output activation is absent"))?;
 	let (source, input) = (graph.source, graph.output);
 	let (heads, kernel) = (delta.heads, delta.kernel);
 	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
@@ -20790,21 +20891,24 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
-	if delta.conv_activation != Activation::Linear {
+	if conv_activation != Activation::Linear {
 		// Qwen's gated delta recurrence applies SiLU to the causal convolution
 		// before splitting the query, key, and value planes.
-		lower_activation(graph, delta.conv_activation, config)?;
+		lower_activation(graph, conv_activation, config)?;
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, f64::from(u8::from(delta.tiled_keys)), if delta.scaled_query { 1.0 / (key_width as f64).sqrt() } else { 1.0 }, 0.0, 0.0];
+	lower_normalize(graph, qk, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	let argument = [
+		heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, f64::from(u8::from(key_heads != heads)),
+		1.0 / (key_width as f64).sqrt(), if decay == DeltaDecay::Sigmoid { 1.0 } else { 0.0 }, 0.0,
+	];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
-	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
+	lower_normalize(graph, norm, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
@@ -20852,9 +20956,6 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
-		match layout {
-			RopeLayout::Neox => {}
-		}
 		let rotated = checked_mul(width, checked_add(heads, keys, "rotary head partition")?, "rotary width")?;
 		let (mscale, factor, context, low, high) = match yarn {
 			None => (1.0, 1.0, 0.0, 0.0, 1.0),
@@ -20872,6 +20973,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let chain = f64::from(u8::from(graph.profile.chain_angle));
 		let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
 		let parameters = if factors { dims / 2 } else { 0 };
+		let high = if layout == RopeLayout::Pairs { -high } else { high };
 		push_node(graph, Primitive::Rope, graph.output, parameters, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
 		if factors {
 			let precision = graph.nodes.last().unwrap().precision;
@@ -20906,7 +21008,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		graph.block_precision = ordinary_precision;
 		if dims != 0 {
 			graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
-			let (_, _, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
+			let (layout, _, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
 			let (mscale, factor, context, low, high) = match yarn {
 				None => (1.0, 1.0, 0.0, 0.0, 1.0),
@@ -20919,6 +21021,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			let _ = context;
 			let chain = f64::from(u8::from(graph.profile.chain_angle));
 			let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
+			let high = if layout == RopeLayout::Pairs { -high } else { high };
 			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, base_argument, index.width as f64, query_channels as f64, mscale, factor, chain, low, high], -2)?;
 			graph.block_precision = ordinary_precision;
 		}

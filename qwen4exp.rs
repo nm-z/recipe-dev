@@ -18,7 +18,7 @@ fn main() {
 		GgufValue::Array(values) => values.iter().map(|value| value.integer().unwrap() as usize).collect::<Vec<_>>(),
 		_ => panic!("qwen4exp.attention.compress_ratios must be an array"),
 	};
-	let mut model = recipe.model().epsilon(0.000001).embed(248320, 2560);
+	let mut model = recipe.model().e(0.000001).embed(248320, 2560);
 
 	for block in 0..48 {
 		if block == ngram.layer() {
@@ -42,10 +42,7 @@ fn main() {
 			}
 		} else {
 			recipe.model().delta(48, 4).keys(16, 128).values(128).out(2560)
-				.delta_block("activations", |delta| {
-					delta.conv_activation = Activation::Silu;
-					delta.output_activation = Activation::Sigmoid;
-				})
+				.conv(silu).qk(l2).norm(rms).decay(softplus).output(sigmoid)
 		};
 		if file.tensor(&format!("blk.{block}.post_attention_norm.weight")).is_some() {
 			attention = attention.norm(rms);

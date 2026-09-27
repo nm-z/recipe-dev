@@ -1639,6 +1639,32 @@ fn precision_profiles(manifest: &str) -> BuildResult<(String, String)> {
 	}
 	Ok((default, profiles.iter().map(|(name, entries)| format!("{name}:{}", entries.join(","))).collect::<Vec<_>>().join(";")))
 }
+fn architecture_profiles(manifest: &str) -> BuildResult<String> {
+	let (mut section, mut profiles) = (false, Vec::<(String, Vec<String>)>::new());
+	for line in manifest.lines() {
+		let line = line.split('#').next().unwrap_or_default().trim();
+		if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+			section = false;
+			if let Some(name) = name.trim().strip_prefix("architecture.") {
+				if name.is_empty() || profiles.iter().any(|(known, _)| known == name) {
+					return Err(io::Error::other(format!("invalid or duplicate [architecture.{name}] table")).into());
+				}
+				profiles.push((name.to_owned(), Vec::new()));
+				section = true;
+			}
+			continue;
+		}
+		if !section || line.is_empty() { continue }
+		let (key, value) = line.split_once('=').ok_or_else(|| io::Error::other(format!("invalid architecture entry {line}")))?;
+		let (key, value) = (key.trim(), value.trim());
+		let value = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("architecture {key} must be quoted")))?;
+		if !["rope", "conv", "qk", "norm", "decay", "output"].contains(&key) || profiles.last().is_some_and(|(_, fields)| fields.iter().any(|field| field.starts_with(&format!("{key}=")))) {
+			return Err(io::Error::other(format!("invalid or duplicate architecture key {key}")).into());
+		}
+		profiles.last_mut().expect("architecture table is open").1.push(format!("{key}={value}"));
+	}
+	Ok(profiles.iter().map(|(name, fields)| format!("{name}:{}", fields.join(","))).collect::<Vec<_>>().join(";"))
+}
 fn native_configuration(manifest: &str, os: &str) -> u64 {
 	let mut hash = 14695981039346656037_u64;
 	let mut update = |value: &str| {
@@ -2075,6 +2101,7 @@ fn main() -> BuildResult<()> {
 	let (default_config, profiles) = precision_profiles(&manifest)?;
 	println!("cargo:rustc-env=RECIPE_DEFAULT_CONFIG={default_config}");
 	println!("cargo:rustc-env=RECIPE_PRECISION_PROFILES={profiles}");
+	println!("cargo:rustc-env=RECIPE_ARCHITECTURE_PROFILES={}", architecture_profiles(&manifest)?);
 	let placement = setting(&manifest, "multi-device")?;
 	println!(
 		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",
