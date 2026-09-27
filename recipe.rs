@@ -11520,52 +11520,14 @@ mod bundle {
 		format!("{}:{blocks}", value.exclusions)
 	}
 	fn product_branch(value: &str) -> Result<ProductBranch> {
-		// Product records that carried a run-level quantization prefix are adapted
-		// at load into block-local legacy storage. New records carry only exclusions.
-		let mut fields = value.splitn(3, ':');
-		let first = fields.next().unwrap_or("");
-		if let (Some(exclusions), Some(blocks)) = (fields.next(), fields.next())
-			&& let Ok(quantization) = first.parse::<u16>()
-			&& let Ok(exclusions) = exclusions.parse::<u8>()
-		{
-			let mut blocks = split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?;
-			if quantization != 0 {
-				for block in &mut blocks {
-					if block.quantization == 0 {
-						block.quantization = quantization;
-						block.profile = StorageFormat(quantization).selection().is_some();
-					}
-				}
-			}
-			return Ok(ProductBranch { blocks, exclusions });
-		}
-		if let Some((exclusions, blocks)) = value.split_once(':')
-			&& let Ok(exclusions) = exclusions.parse::<u8>()
-		{
-			return Ok(ProductBranch {
-				blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-				exclusions,
-			});
-		}
+		let (exclusions, blocks) = value.split_once(':').ok_or_else(|| RecipeError::new("product branch has no exclusions"))?;
 		Ok(ProductBranch {
-			blocks: split_escaped(value, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
-			exclusions: 0,
+			blocks: split_escaped(blocks, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+			exclusions: value_at(Some(exclusions), "product branch exclusions")?,
 		})
 	}
 	fn residual(value: &str) -> Result<Block> {
 		let text = unescape(value)?;
-		// A fragment step used to be one of three fixed shapes carrying no
-		// fields of its own, written without a block's six. Those records still
-		// read: only the newer form holds the block separator.
-		if !text.contains('|') {
-			let mut fields = text.split(',');
-			return match fields.next().unwrap_or("") {
-				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
-				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
-				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
-			};
-		}
 		block(&text)
 	}
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
@@ -11669,7 +11631,6 @@ mod bundle {
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Join(lanes) => format!("join,{lanes}"),
-			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
@@ -11844,7 +11805,6 @@ mod bundle {
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
 			"join" => Ok(Operation::Join(value_at(fields.next(), "joined lanes")?)),
-			"norm" => Ok(Operation::Norm),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -11862,45 +11822,57 @@ mod bundle {
 			_ => return Err(RecipeError::new("invalid block normalization")),
 		})
 	}
+	fn map_text(map: &OutputMap) -> String {
+		let (kind, value) = match map.kind {
+			MapKind::Activation(activation) => ('a', activation_text(activation)),
+			MapKind::Normalization(normalization) => ('n', normalization_text(Some(normalization)).to_string()),
+		};
+		format!("{kind}:{value}:{}", precision_token(map.precision))
+	}
+	fn map(value: &str) -> Result<OutputMap> {
+		let mut fields = value.split(':');
+		let kind = fields.next().ok_or_else(|| RecipeError::new("block map kind is absent"))?;
+		let value = fields.next().ok_or_else(|| RecipeError::new("block map value is absent"))?;
+		let precision = precision_from_token(fields.next().ok_or_else(|| RecipeError::new("block map precision is absent"))?)?;
+		require(fields.next().is_none(), "block map has trailing fields")?;
+		let kind = match kind {
+			"a" => MapKind::Activation(activation(value)?),
+			"n" => MapKind::Normalization(normalization(Some(value), "block map normalization")?.ok_or_else(|| RecipeError::new("block map normalization is absent"))?),
+			_ => return Err(RecipeError::new(format!("invalid block map kind {kind}"))),
+		};
+		Ok(OutputMap { kind, precision })
+	}
 	fn block_text(block: &Block) -> String {
 		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}||-|{}|{}|{}|{}",
+			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
 			operation_text(&block.operation),
-			activation_text(block.activation),
-			normalization_text(block.normalization),
+			block.maps.iter().map(map_text).collect::<Vec<_>>().join("~"),
 			block.quantization,
 			u8::from(block.profile),
 			normalization_text(block.qk),
 			u8::from(block.frozen),
-			0,
 			precision_token(block.precision),
 			precision_token(block.kv_precision),
 			precision_token(block.blck_precision),
 			precision_token(block.qk_precision),
-			precision_token(block.rope_precision),
-			precision_token(block.activation_precision),
-			precision_token(block.norm_precision)
+			precision_token(block.rope_precision)
 		)
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17), "semantic model block has the wrong width")?;
-		require(fields.get(11).is_none_or(|field| field.is_empty()), "saved block accumulator overrides are no longer supported; configure acc in the precision table")?;
+		require(fields.len() == 11, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
-			activation: activation(&fields[1])?,
-			normalization: normalization(Some(&fields[2]), "block normalization")?,
-			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(&fields[3]), "block quantization")?,
-			profile: bool_value(&fields[4], "block quantization profile")?,
-			frozen: fields.get(6).map_or(Ok(false), |field| bool_value(field, "block frozen qualifier"))?,
-			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
-			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
-			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
-			qk_precision: fields.get(13).map_or(Ok(None), |field| precision_from_token(field))?,
-			rope_precision: fields.get(14).map_or(Ok(None), |field| precision_from_token(field))?,
-			activation_precision: fields.get(15).map_or(Ok(None), |field| precision_from_token(field))?,
-			norm_precision: fields.get(16).map_or(Ok(None), |field| precision_from_token(field))?,
+			maps: if fields[1].is_empty() { Vec::new() } else { fields[1].split('~').map(map).collect::<Result<Vec<_>>>()? },
+			qk: normalization(Some(&fields[4]), "block query and key normalization")?,
+			quantization: value_at(Some(&fields[2]), "block quantization")?,
+			profile: bool_value(&fields[3], "block quantization profile")?,
+			frozen: bool_value(&fields[5], "block frozen qualifier")?,
+			precision: precision_from_token(&fields[6])?,
+			kv_precision: precision_from_token(&fields[7])?,
+			blck_precision: precision_from_token(&fields[8])?,
+			qk_precision: precision_from_token(&fields[9])?,
+			rope_precision: precision_from_token(&fields[10])?,
 			suffix: Suffix::End,
 		})
 	}
@@ -12164,9 +12136,9 @@ mod bundle {
 			}
 			let builder = current.as_mut().ok_or_else(|| RecipeError::new("semantic model value precedes graph"))?;
 			match kind {
-				"model2" => {
+				"model3" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(fields.len() == 3, "semantic model2 header has the wrong width")?;
+					require(fields.len() == 3, "semantic model3 header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
@@ -12255,7 +12227,7 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model2", &format!("{} {} {}", semantic.model.loss.0, semantic.model.epsilon, semantic.model.exclusions));
+			field(&mut document, "model3", &format!("{} {} {}", semantic.model.loss.0, semantic.model.epsilon, semantic.model.exclusions));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -12456,15 +12428,12 @@ mod bundle {
 		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
 			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
 			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 17);
+			assert_eq!(split_escaped(&text, '|').len(), 11);
 			assert_eq!(block(&text).unwrap(), original);
-			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
-			let legacy = block(legacy).unwrap();
-			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
-			assert_eq!(legacy.qk_precision, None);
-			assert_eq!(legacy.rope_precision, None);
-			assert_eq!(legacy.activation_precision, None);
-			assert_eq!(legacy.norm_precision, None);
+			assert_eq!(original.maps.len(), 2);
+			assert_eq!(original.maps[0].precision, Some(Compute::FP16));
+			assert_eq!(original.maps[1].precision, Some(Compute::FP32));
+			assert!(block("layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-").is_err());
 		}
 	}
 }
@@ -12835,7 +12804,7 @@ pub const fn conv(filters: usize, kernel: usize) -> Block {
 }
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
-	Block { normalization: Some(normalization.normalization()), suffix: Suffix::Norm, ..Block::of(Operation::Identity) }
+	Block::of(Operation::Identity).norm(normalization)
 }
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
@@ -13061,13 +13030,9 @@ enum Operation {
 	Ple(PleBlock),
 	/// A stream of that many lanes from an input of one more: see `Model::join`.
 	Join(usize),
-	/// A normalization that leads a model: the block's own normalization is the
-	/// only thing it does, so the model input is normalized before its first block.
-	Norm,
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
-	/// Computes nothing. It carries a step that is only an activation or only
-	/// a normalization, so those need no operation of their own.
+	/// Computes nothing before its maps.
 	Identity,
 	/// Keeps the last position reached by each forward window and collapses the
 	/// sequence axis to one position for a following projection.
@@ -13176,10 +13141,10 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Activation } })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub fn $name() -> Block {
+	Block::of(Operation::Identity).with_activation(Activation::$value) })+}; }
 pub mod atv {
-	use super::{Activation, Block, Operation, Suffix};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -13227,15 +13192,13 @@ macro_rules! precision_methods {
 #[derive(Clone, Debug)]
 pub struct Block {
 	operation: Operation,
-	activation: Activation,
-	normalization: Option<BlockNormalization>,
+	maps: Vec<OutputMap>,
 	/// The per-head normalization of the attention queries and keys.
 	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
 	frozen: bool,
-	/// The precision of an activation, output normalization, composition, or
-	/// residual add named by a suffix immediately after that operation.
+	/// The precision of a composition or residual add named by a suffix immediately after it.
 	precision: Option<Compute>,
 	/// The precision of the op that holds the block's numbers (a layer's sum,
 	/// attention, an embedding's lookup), named by a precision right after it.
@@ -13247,11 +13210,19 @@ pub struct Block {
 	qk_precision: Option<Compute>,
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
-	activation_precision: Option<Compute>,
-	norm_precision: Option<Compute>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputMap {
+	kind: MapKind,
+	precision: Option<Compute>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapKind {
+	Activation(Activation),
+	Normalization(BlockNormalization),
 }
 /// What a precision suffix names inside one block. Each operation has its own
 /// slot so a later suffix cannot rewrite an earlier operation's arithmetic.
@@ -13264,8 +13235,7 @@ enum Suffix {
 	Kv,
 	Qk,
 	Rope,
-	Activation,
-	Norm,
+	Map,
 	End,
 }
 impl Suffix {
@@ -13285,8 +13255,7 @@ impl Suffix {
 impl PartialEq for Block {
 	fn eq(&self, other: &Self) -> bool {
 		self.operation == other.operation
-			&& self.activation == other.activation
-			&& self.normalization == other.normalization
+			&& self.maps == other.maps
 			&& self.qk == other.qk
 			&& self.quantization == other.quantization
 			&& self.profile == other.profile
@@ -13296,8 +13265,6 @@ impl PartialEq for Block {
 			&& self.kv_precision == other.kv_precision
 			&& self.qk_precision == other.qk_precision
 			&& self.rope_precision == other.rope_precision
-			&& self.activation_precision == other.activation_precision
-			&& self.norm_precision == other.norm_precision
 	}
 }
 impl Eq for Block {}
@@ -13317,17 +13284,19 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 })+}; }
 impl Block {
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Fresh }
+		Self {
+			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
+			kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
-		self.suffix = Suffix::Activation;
-		assert!(self.normalization.is_none(), "activation must precede normalization");
-		self.activation = activation;
+		self.maps.push(OutputMap { kind: MapKind::Activation(activation), precision: None });
+		self.suffix = Suffix::Map;
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::Norm;
-		self.normalization = Some(normalization.normalization());
+		self.maps.push(OutputMap { kind: MapKind::Normalization(normalization.normalization()), precision: None });
+		self.suffix = Suffix::Map;
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -13415,8 +13384,7 @@ impl Block {
 			Suffix::Kv => block.kv_precision = Some(format),
 			Suffix::Qk => block.qk_precision = Some(format),
 			Suffix::Rope => block.rope_precision = Some(format),
-			Suffix::Activation => block.activation_precision = Some(format),
-			Suffix::Norm => block.norm_precision = Some(format),
+			Suffix::Map => block.maps.last_mut().expect("map precision requires a preceding map").precision = Some(format),
 			Suffix::End => block.precision = Some(format),
 		}
 		block
@@ -13542,8 +13510,7 @@ impl Model {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
 				operation,
-				activation: Activation::Linear,
-				normalization: None,
+				maps: Vec::new(),
 				qk: None,
 				quantization: 0,
 				profile: false,
@@ -13553,8 +13520,6 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
-				activation_precision: None,
-				norm_precision: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -13572,15 +13537,12 @@ impl Model {
 		self.edit(|model| model.exclusions |= mask)
 	}
 	fn with_activation(&self, activation: Activation) -> Self {
-		if self.blocks.last().is_some_and(|block| block.activation != Activation::Linear || block.normalization.is_some()) {
-			return self.push(Operation::Identity).with_activation(activation);
-		}
 		let model = self.suffix();
 		assert!(!model.blocks.is_empty(), "activation requires a preceding block");
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap();
-			block.activation = activation;
-			block.suffix = Suffix::Activation;
+			block.maps.push(OutputMap { kind: MapKind::Activation(activation), precision: None });
+			block.suffix = Suffix::Map;
 		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
@@ -13757,16 +13719,14 @@ impl Model {
 	pub fn join(&self, lanes: usize) -> Self {
 		self.push(Operation::Join(lanes))
 	}
-	/// Normalizes the preceding block's output. Leading a model, it normalizes
-	/// the model input before the first block, which is the pre-normalization
-	/// of a residual branch when the model is one.
+	/// Appends a map to the preceding block. Leading a model, the map takes its input.
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
-		let model = if self.blocks.is_empty() { self.push(Operation::Norm) } else { self.suffix() };
+		let model = if self.blocks.is_empty() { self.push(Operation::Identity) } else { self.suffix() };
 		let normalization = normalization.normalization();
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
-			block.normalization = Some(normalization);
-			block.suffix = Suffix::Norm;
+			block.maps.push(OutputMap { kind: MapKind::Normalization(normalization), precision: None });
+			block.suffix = Suffix::Map;
 		})
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
@@ -13817,7 +13777,7 @@ impl Model {
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
 		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
-		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
+		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), maps, .. }) if maps.is_empty()));
 		self.blocks
 			.iter()
 			.take(self.blocks.len() - output)
@@ -13825,14 +13785,15 @@ impl Model {
 				let mut names = Vec::new();
 				if selected {
 					names.push(block.operation.name().to_owned());
-					if block.activation != Activation::Linear {
-						names.push(block.activation.name().to_owned())
-					}
 					if let Some(name) = block.qk.map(BlockNormalization::name) {
 						names.push(format!("qk-{name}"))
 					}
-					if let Some(name) = block.normalization.map(BlockNormalization::name) {
-						names.push(name.to_owned())
+					for map in &block.maps {
+						match map.kind {
+							MapKind::Activation(Activation::Linear) => {}
+							MapKind::Activation(activation) => names.push(activation.name().to_owned()),
+							MapKind::Normalization(normalization) => names.push(normalization.name().to_owned()),
+						}
 					}
 					if block.quantization != 0 {
 						names.push(quantization(block.quantization))
@@ -15347,7 +15308,6 @@ impl Operation {
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Join(_) => "join",
-			Self::Norm => "norm",
 			Self::Glu(..) => "glu",
 		}
 	}
@@ -17347,7 +17307,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 						}
 						Operation::Product(left, right) => {
 							// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
-							let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.activation != Activation::Linear);
+							let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.maps.iter().any(|map| matches!(map.kind, MapKind::Activation(activation) if activation != Activation::Linear)));
 							let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
 							for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
 								let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
@@ -17372,23 +17332,27 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 						}
 						other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 					}
-					if step.normalization.is_some() {
-						let suffix = match (part, weighted) {
-							("attn", false) => "attn_norm.weight",
-							("attn", true) => "post_attention_norm.weight",
-							(_, false) => "ffn_norm.weight",
-							(_, true) => "post_ffw_norm.weight",
-						};
-						builder.norm_scale(&name(suffix), width)?;
+					for map in &step.maps {
+						if matches!(map.kind, MapKind::Normalization(_)) {
+							let suffix = match (part, weighted) {
+								("attn", false) => "attn_norm.weight",
+								("attn", true) => "post_attention_norm.weight",
+								(_, false) => "ffn_norm.weight",
+								(_, true) => "post_ffw_norm.weight",
+							};
+							builder.norm_scale(&name(suffix), width)?;
+						}
 					}
 				}
-				if block.normalization.is_some() {
-					builder.norm_scale("output_norm.weight", width)?;
+				for map in &block.maps {
+					if matches!(map.kind, MapKind::Normalization(_)) {
+						builder.norm_scale("output_norm.weight", width)?;
+					}
 				}
 			}
 			Operation::Layer(outputs) => {
 				require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
-				require(block.normalization.is_none(), "a normalization after the vocabulary projection has no tensor name")?;
+				require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after the vocabulary projection has no tensor name")?;
 				let output = match builder.optional("output.weight") {
 					Some(output) => output,
 					None => embedding.clone(),
@@ -17396,7 +17360,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				require(output.shape.len() == 2 && output.shape[0] as usize == width && output.shape[1] as usize == vocabulary, format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
 				builder.mapped(vec![output]);
 			}
-			Operation::Identity | Operation::Last => require(block.normalization.is_none(), "a normalization outside the blocks has no tensor name")?,
+			Operation::Identity | Operation::Last => require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization outside the blocks has no tensor name")?,
 			other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 		}
 	}
@@ -18574,8 +18538,6 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_kv_precision: None,
 		block_qk_precision: None,
 		block_rope_precision: None,
-		block_activation_precision: None,
-		block_norm_precision: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -19561,8 +19523,6 @@ struct Graph {
 	block_kv_precision: Option<Compute>,
 	block_qk_precision: Option<Compute>,
 	block_rope_precision: Option<Compute>,
-	block_activation_precision: Option<Compute>,
-	block_norm_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
 	/// The weights still to bind while a graph compiles over mapped tensors:
@@ -19604,8 +19564,6 @@ impl Graph {
 			block_kv_precision: None,
 			block_qk_precision: None,
 			block_rope_precision: None,
-			block_activation_precision: None,
-			block_norm_precision: None,
 			profile: Precisions::default(),
 			bound: None,
 			bound_values: Vec::new(),
@@ -19703,8 +19661,6 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_kv_precision = None;
 	graph.block_qk_precision = None;
 	graph.block_rope_precision = None;
-	graph.block_activation_precision = None;
-	graph.block_norm_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
@@ -19876,15 +19832,13 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
 	graph.block_qk_precision = block.qk_precision;
 	graph.block_rope_precision = block.rope_precision;
-	graph.block_activation_precision = block.activation_precision;
-	graph.block_norm_precision = block.norm_precision;
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -19907,7 +19861,6 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
-		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -19917,17 +19870,17 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
-	if block.activation != Activation::Linear {
+	for map in &block.maps {
 		let precision = graph.block_precision;
-		graph.block_precision = graph.block_activation_precision.or(precision);
-		lower_activation(graph, block.activation, config)?;
-		graph.block_precision = precision;
-	}
-	if let Some(normalization) = block.normalization {
-		let precision = graph.block_precision;
-		graph.block_precision = graph.block_norm_precision.or(precision);
-		let channels = graph.output.channels;
-		lower_normalize(graph, normalization, channels, channels)?;
+		graph.block_precision = map.precision.or(precision);
+		match map.kind {
+			MapKind::Activation(Activation::Linear) => {}
+			MapKind::Activation(activation) => lower_activation(graph, activation, config)?,
+			MapKind::Normalization(normalization) => {
+				let channels = graph.output.channels;
+				lower_normalize(graph, normalization, channels, channels)?;
+			}
+		}
 		graph.block_precision = precision;
 	}
 	// Only a legacy block record can name storage. New models take storage from
@@ -20006,7 +19959,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -21066,12 +21019,26 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		ref other => return Err(RecipeError::new(format!("a recurrent body must open with a layer, not {}", other.name()))),
 	};
 	require(width != 0, "recurrent width must be positive")?;
-	let mut cell_activation = recur_activation(first.activation)?;
-	let mut body_start = 1;
-	if let Some(block) = parts.get(1) && matches!(block.operation, Operation::Identity) {
-		require(cell_activation == 0, "a recurrent cell stage declares one activation")?;
-		cell_activation = recur_activation(block.activation)?;
-		body_start = 2;
+	let mut cell_activation = 0;
+	let mut first_maps = first.maps.clone();
+	if let Some(OutputMap { kind: MapKind::Activation(activation), precision: None }) = first_maps.first()
+		&& matches!(activation, Activation::Linear | Activation::Relu | Activation::Tanh | Activation::Sigmoid)
+	{
+		cell_activation = recur_activation(*activation)?;
+		first_maps.remove(0);
+	}
+	let mut body_blocks = Vec::new();
+	if !first_maps.is_empty() {
+		body_blocks.push(Block { maps: first_maps, ..Block::of(Operation::Identity) });
+	}
+	body_blocks.extend_from_slice(&parts[1..]);
+	if first.maps.is_empty() && let Some(block) = body_blocks.first_mut() && matches!(block.operation, Operation::Identity)
+		&& let Some(OutputMap { kind: MapKind::Activation(activation), precision: None }) = block.maps.first()
+		&& matches!(activation, Activation::Linear | Activation::Relu | Activation::Tanh | Activation::Sigmoid)
+	{
+		cell_activation = recur_activation(*activation)?;
+		block.maps.remove(0);
+		if block.maps.is_empty() { body_blocks.remove(0); }
 	}
 	// The program record carries the cell width and activation. Body operations
 	// are lowered as ordinary graph nodes below the scan and run once per
@@ -21087,13 +21054,13 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		node.program_offset = program_offset;
 		node.program_count = 1;
 	}
-	if body_start < parts.len() {
+	if !body_blocks.is_empty() {
 		let mut body = Graph::new(Shape { channels: width, length: 1 }, graph.epsilon);
 		body.bias = graph.bias;
 		// The body's blocks name their own precisions or take the run's table,
 		// as the outer blocks do.
 		body.profile = graph.profile;
-		for (index, block) in parts[body_start..].iter().enumerate() {
+		for (index, block) in body_blocks.iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
 			lower_block(&mut body, block, parts.len(), data, targets, rows, gpu, config)?;
@@ -21990,8 +21957,8 @@ mod precision_contract_checks {
 	fn precision_suffix_scope_is_local_and_explicit() {
 		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
 		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.activation_precision, Some(Compute::FP16));
-		assert_eq!(projection.norm_precision, Some(Compute::FP32));
+		assert_eq!(projection.maps[0].precision, Some(Compute::FP16));
+		assert_eq!(projection.maps[1].precision, Some(Compute::FP32));
 		assert_eq!(projection.precision, None);
 		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
 		assert_eq!(attention.blck_precision, Some(Compute::INT8));
