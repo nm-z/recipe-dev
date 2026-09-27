@@ -12,12 +12,7 @@ fn hyper(model: Model, branch: &Model) -> Model {
 
 fn main() {
 	let data = recipe.data(GGUF);
-	let file = recipe.gguf(GGUF);
-	let ngram = file.ngram();
-	let compression = match file.value("qwen4exp.attention.compress_ratios").unwrap() {
-		GgufValue::Array(values) => values.iter().map(|value| value.integer().unwrap() as usize).collect::<Vec<_>>(),
-		_ => panic!("qwen4exp.attention.compress_ratios must be an array"),
-	};
+	let ngram = data.ngram();
 	let mut model = recipe.model().e(0.000001).embed(248320, 2560);
 
 	for block in 0..48 {
@@ -30,12 +25,15 @@ fn main() {
 		}
 
 		let mut attention = if (block + 1) % 4 == 0 {
-			let mut attention = attn(24).kv(2).width(256);
-			if file.tensor(&format!("blk.{block}.attn_q_norm.weight")).is_some() {
+			let mut attention = attn(24).kv(2).width(256)
+				.q(key!(blk[block].attn_q.weight))
+				.k(key!(blk[block].attn_k.weight))
+				.v(key!(blk[block].attn_v.weight));
+			if data.has_tensor(key!(blk[block].attn_q_norm.weight)) {
 				attention = attention.qk(rms);
 			}
-			let attention = attention.rope(neox, 64, 10000000.0).index(4, 128, compression[block].max(1), 1);
-			if file.tensor(&format!("blk.{block}.attn_q.weight")).unwrap().shape[1] == 12288 {
+			let attention = attention.rope(neox, 64, 10000000.0).index(4, 128, data.integer(key!(qwen4exp.attention.compress_ratios[block])).max(1), 1);
+			if data.tensor(key!(blk[block].attn_q.weight)).shape[1] == 12288 {
 				(attention * layer(6144).sigmoid()).layer(2560)
 			} else {
 				attention.layer(2560)
@@ -44,28 +42,28 @@ fn main() {
 			recipe.model().delta(48, 4).keys(16, 128).values(128).out(2560)
 				.conv(silu).qk(l2).norm(rms).decay(softplus).output(sigmoid)
 		};
-		if file.tensor(&format!("blk.{block}.post_attention_norm.weight")).is_some() {
+		if data.has_tensor(key!(blk[block].post_attention_norm.weight)) {
 			attention = attention.norm(rms);
 		}
 		model = hyper(model, &attention);
 
 		let expert = (layer(640).silu() * layer(640)).layer(2560);
 		let mut experts = recipe.model().moe(10, vec![expert.clone(); 512]).route(softmax).renorm();
-		if file.tensor(&format!("blk.{block}.ffn_gate_shexp.weight")).is_some() {
+		if data.has_tensor(key!(blk[block].ffn_gate_shexp.weight)) {
 			experts = experts.shared(expert, [layer(1).sigmoid()]);
 		}
-		if file.tensor(&format!("blk.{block}.post_ffw_norm.weight")).is_some() {
+		if data.has_tensor(key!(blk[block].post_ffw_norm.weight)) {
 			experts = experts.norm(rms);
 		}
 		model = hyper(model, &experts);
 	}
 
-	if file.tensor("output_hc_norm.weight").is_some() {
+	if data.has_tensor(key!(output_hc_norm.weight)) {
 		model = model.collapse([norm(rms), layer(320), scale(0.25), silu(), layer(4 * 2560), sigmoid()]);
 	} else {
 		model = model.collapse([]);
 	}
-	if file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight")).is_some() {
+	if data.has_tensor(key!(output_norm.weight)) || data.has_tensor(key!(token_embd_norm.weight)) {
 		model = model.norm(rms);
 	}
 	model = model.layer(248320);

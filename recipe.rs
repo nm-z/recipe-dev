@@ -9493,6 +9493,21 @@ mod gguf {
 				_ => None,
 			}
 		}
+		pub fn number(&self) -> Option<f64> {
+			match *self {
+				Self::U8(value) => Some(f64::from(value)),
+				Self::I8(value) => Some(f64::from(value)),
+				Self::U16(value) => Some(f64::from(value)),
+				Self::I16(value) => Some(f64::from(value)),
+				Self::U32(value) => Some(f64::from(value)),
+				Self::I32(value) => Some(f64::from(value)),
+				Self::F32(value) => Some(f64::from(value)),
+				Self::U64(value) => Some(value as f64),
+				Self::I64(value) => Some(value as f64),
+				Self::F64(value) => Some(value),
+				_ => None,
+			}
+		}
 	}
 
 	/// Tensor shape, GGML type and shard-data offset.
@@ -9681,6 +9696,7 @@ mod gguf {
 	/// One file or a split GGUF model.
 	#[derive(Clone)]
 	pub struct Gguf {
+		pub(super) path: PathBuf,
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
@@ -9704,7 +9720,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+			Ok(Self { path: path.to_owned(), shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
 		}
 		/// This file with `other` beside it: its tensors join this file's, and its
 		/// metadata fills the keys this file does not set.
@@ -12807,27 +12823,39 @@ impl KeyPath {
 		let found = file.metadata().iter().filter(|(name, _)| self.matches(name, false)).collect::<Vec<_>>();
 		match found.as_slice() {
 			[(_, value)] => Ok(value),
-			[] => Err(RecipeError::new(format!("GGUF metadata key {} is absent", self.text()))),
-			_ => Err(RecipeError::new(format!("GGUF metadata path {} matches more than one key", self.text()))),
+			[] => {
+				if let Some((KeyPart::Value(index), prefix)) = self.0.split_last() {
+					let index = index.parse::<usize>().map_err(|_| RecipeError::new(format!("GGUF metadata path {} has an invalid array index in {}", self.text(), file.path.display())))?;
+					let prefix = KeyPath(prefix.to_vec());
+					if let GgufValue::Array(values) = prefix.metadata(file)? {
+						return values.get(index).ok_or_else(|| RecipeError::new(format!("GGUF metadata path {} is absent in {}", self.text(), file.path.display())));
+					}
+					return Err(RecipeError::new(format!("GGUF metadata path {} is not an array in {}", prefix.text(), file.path.display())));
+				}
+				Err(RecipeError::new(format!("GGUF metadata path {} is absent in {}", self.text(), file.path.display())))
+			}
+			_ => Err(RecipeError::new(format!("GGUF metadata path {} matches more than one key in {}", self.text(), file.path.display()))),
 		}
 	}
 	fn tensor(&self, file: &Gguf) -> Result<GgufTensor> {
 		let found = file.tensors().iter().filter(|tensor| self.matches(&tensor.name, true)).collect::<Vec<_>>();
 		match found.as_slice() {
 			[tensor] => Ok((*tensor).clone()),
-			[] => Err(RecipeError::new(format!("GGUF tensor path {} does not identify a tensor", self.text()))),
-			_ => Err(RecipeError::new(format!("GGUF tensor path {} matches more than one tensor", self.text()))),
+			[] => Err(RecipeError::new(format!("GGUF tensor path {} is absent in {}", self.text(), file.path.display()))),
+			_ => Err(RecipeError::new(format!("GGUF tensor path {} matches more than one tensor in {}", self.text(), file.path.display()))),
 		}
 	}
 }
-pub fn metadata_f64(path: KeyPath) -> f64 {
-	path.metadata(script_file()).unwrap_or_else(|error| panic!("{error}"))
-		.float().unwrap_or_else(|| panic!("GGUF metadata path {} is not numeric", path.text()))
-}
-pub fn metadata_usize(path: KeyPath) -> usize {
-	let value = path.metadata(script_file()).unwrap_or_else(|error| panic!("{error}"))
-		.integer().unwrap_or_else(|| panic!("GGUF metadata path {} is not an integer", path.text()));
-	usize::try_from(value).unwrap_or_else(|_| panic!("GGUF metadata path {} exceeds usize", path.text()))
+/// A dotted GGUF key or tensor path, with bracketed indices from Rust values.
+#[macro_export]
+macro_rules! key {
+	($head:ident $([$head_index:expr])? $(.$part:ident $([$index:expr])? )*) => {
+		$crate::KeyPath::new(vec![
+			$crate::KeyPart::from_static(stringify!($head)),
+			$($crate::KeyPart::from_value($head_index),)?
+			$($crate::KeyPart::from_static(stringify!($part)), $($crate::KeyPart::from_value($index),)?)*
+		])
+	};
 }
 #[derive(Clone)]
 enum FeatureSelection {
@@ -13793,12 +13821,12 @@ impl Model {
 		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
-	/// `layer(tokenizer.ggml.tokens)`.
+	/// `layer(data.array(key!(tokenizer.ggml.tokens)).len())`.
 	pub fn layer(&self, width: impl Width) -> Self {
 		self.push(Operation::Layer(width.extent()))
 	}
 	/// A token embedding: `vocabulary` rows of `width`, as counts or as
-	/// `embed(tokenizer.ggml.tokens, width)`.
+	/// `embed(data.array(key!(tokenizer.ggml.tokens)).len(), width)`.
 	pub fn embed(&self, vocabulary: impl Width, width: impl Width) -> Self {
 		self.push(Operation::Embed(vocabulary.extent(), width.extent()))
 	}
@@ -16017,8 +16045,8 @@ impl Recipe {
 	/// Opens a GGUF file for metadata and tensor-shape decisions in a model script.
 	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf { open_script_file(path.as_ref()) }
 	/// The data a model reads: table, image and text sources, or one GGUF model
-	/// file, whose metadata the `gemma3.*` and `tokenizer.*` identifiers then
-	/// read and whose weights `recipe.infer` binds.
+	/// file, whose metadata and tensors named paths then read and whose weights
+	/// `recipe.infer` binds.
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
 		let sources = sources.into_data_sources();
 		let models = sources.iter().filter(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))).collect::<Vec<_>>();
@@ -17191,13 +17219,9 @@ impl<'a> Builder<'a> {
 		}
 	}
 }
-/// The GGUF a model file opens through `recipe.data`, whose metadata the
-/// identifiers below and `recipe.model()` read. One process describes one
-/// model, so the file opens once.
+/// The GGUF a model file opens through `recipe.data`. One process describes
+/// one model, so the file opens once.
 static SCRIPT_FILE: OnceLock<(PathBuf, Gguf)> = OnceLock::new();
-fn script_file() -> &'static Gguf {
-	&SCRIPT_FILE.get().unwrap_or_else(|| panic!("recipe.data(\"<model>.gguf\") opens the file whose metadata an identifier reads")).1
-}
 fn open_script_file(path: &Path) -> Gguf {
 	let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 	let (opened, file) = SCRIPT_FILE.get_or_init(|| (path.clone(), Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))));
@@ -17211,129 +17235,8 @@ impl Gguf {
 		self.value(&format!("{architecture}.attention.layer_norm_rms_epsilon")).and_then(GgufValue::float)
 	}
 }
-/// The standard `<architecture>.*` keys a GGUF file sizes its blocks with, as
-/// the fields a model file spells: `gemma3.embedding_length`,
-/// `gemma3.attention.head_count`, `gemma3.rope.scaling.factor`. A count the
-/// file lacks reads as the convention its readers apply, or zero.
-pub struct ArchitectureKeys {
-	pub embedding_length: usize,
-	pub block_count: usize,
-	pub feed_forward_length: usize,
-	pub context_length: usize,
-	pub vocab_size: usize,
-	pub final_logit_softcapping: f64,
-	pub attention: AttentionKeys,
-	pub rope: RopeKeys,
-}
-pub struct AttentionKeys {
-	pub head_count: usize,
-	pub head_count_kv: usize,
-	pub key_length: usize,
-	pub value_length: usize,
-	pub layer_norm_rms_epsilon: f64,
-}
-pub struct RopeKeys {
-	pub freq_base: f64,
-	pub dimension_count: usize,
-	pub scaling: RopeScalingKeys,
-}
-pub struct RopeScalingKeys {
-	pub factor: f64,
-	pub original_context_length: usize,
-	pub yarn_beta_fast: f64,
-	pub yarn_beta_slow: f64,
-}
-impl ArchitectureKeys {
-	fn load(file: &Gguf, prefix: &str) -> Self {
-		let count = |key: &str| file.value(&format!("{prefix}.{key}")).and_then(GgufValue::integer).map_or(0, |value| value as usize);
-		let real = |key: &str, default: f64| file.value(&format!("{prefix}.{key}")).and_then(GgufValue::float).unwrap_or(default);
-		let or = |value: usize, default: usize| if value == 0 { default } else { value };
-		let (embedding_length, head_count) = (count("embedding_length"), count("attention.head_count"));
-		let key_length = or(count("attention.key_length"), embedding_length / head_count.max(1));
-		Self {
-			embedding_length,
-			block_count: count("block_count"),
-			feed_forward_length: count("feed_forward_length"),
-			context_length: count("context_length"),
-			vocab_size: count("vocab_size"),
-			final_logit_softcapping: real("final_logit_softcapping", 0.0),
-			attention: AttentionKeys {
-				head_count,
-				head_count_kv: or(count("attention.head_count_kv"), head_count),
-				key_length,
-				value_length: or(count("attention.value_length"), key_length),
-				layer_norm_rms_epsilon: real("attention.layer_norm_rms_epsilon", 0.0),
-			},
-			rope: RopeKeys {
-				freq_base: real("rope.freq_base", 10000.0),
-				dimension_count: or(count("rope.dimension_count"), key_length),
-				scaling: RopeScalingKeys {
-					factor: real("rope.scaling.factor", 1.0),
-					original_context_length: count("rope.scaling.original_context_length"),
-					yarn_beta_fast: real("rope.scaling.yarn_beta_fast", 0.0),
-					yarn_beta_slow: real("rope.scaling.yarn_beta_slow", 0.0),
-				},
-			},
-		}
-	}
-}
-/// One `<architecture>.*` namespace, `gemma3` or `llama`, whose keys load
-/// from the opened file the first time an identifier reads them.
-pub struct Namespace {
-	prefix: &'static str,
-	keys: OnceLock<ArchitectureKeys>,
-}
-impl std::ops::Deref for Namespace {
-	type Target = ArchitectureKeys;
-	fn deref(&self) -> &ArchitectureKeys {
-		self.keys.get_or_init(|| ArchitectureKeys::load(script_file(), self.prefix))
-	}
-}
-macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 phi3 deepseek2 glm4 granite }
-/// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
-/// ids and the chat template sit beside it.
-pub struct TokenizerKeys {
-	pub ggml: GgmlKeys,
-	pub chat_template: &'static str,
-}
-pub struct GgmlKeys {
-	pub tokens: &'static [String],
-	pub model: &'static str,
-	pub pre: &'static str,
-	pub bos_token_id: u32,
-	pub eos_token_id: u32,
-	pub add_bos_token: bool,
-}
-pub struct TokenizerNamespace(OnceLock<TokenizerKeys>);
-impl std::ops::Deref for TokenizerNamespace {
-	type Target = TokenizerKeys;
-	fn deref(&self) -> &TokenizerKeys {
-		self.0.get_or_init(|| {
-			let file = script_file();
-			let text = |key: &str| -> &'static str { Box::leak(file.value(key).and_then(GgufValue::text).unwrap_or("").to_owned().into_boxed_str()) };
-			let id = |key: &str| file.value(key).and_then(GgufValue::integer).map_or(u32::MAX, |value| value as u32);
-			let tokens = match file.value("tokenizer.ggml.tokens") {
-				Some(GgufValue::Array(items)) => items.iter().map(|item| item.text().unwrap_or("").to_owned()).collect::<Vec<_>>(),
-				_ => Vec::new(),
-			};
-			TokenizerKeys {
-				ggml: GgmlKeys {
-					tokens: Box::leak(tokens.into_boxed_slice()),
-					model: text("tokenizer.ggml.model"),
-					pre: text("tokenizer.ggml.pre"),
-					bos_token_id: id("tokenizer.ggml.bos_token_id"),
-					eos_token_id: id("tokenizer.ggml.eos_token_id"),
-					add_bos_token: matches!(file.value("tokenizer.ggml.add_bos_token"), Some(GgufValue::Bool(true))),
-				},
-				chat_template: text("tokenizer.chat_template"),
-			}
-		})
-	}
-}
-pub static tokenizer: TokenizerNamespace = TokenizerNamespace(OnceLock::new());
 /// A width a model file gives as a count or as the vocabulary itself:
-/// `layer(4096)`, `embed(tokenizer.ggml.tokens, width)`.
+/// `layer(4096)`, `embed(data.array(key!(tokenizer.ggml.tokens)).len(), width)`.
 pub trait Width {
 	fn extent(self) -> usize;
 }
@@ -28968,6 +28871,40 @@ impl Data {
 	/// The GGUF opened by `recipe.data(path)`.
 	pub fn gguf(&self) -> &Gguf {
 		self.file.as_ref().expect("GGUF access requires recipe.data(\"<model>.gguf\")")
+	}
+	/// The metadata value at a dotted path in this data file.
+	pub fn value(&self, path: KeyPath) -> &GgufValue {
+		path.metadata(self.gguf()).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// A numeric metadata value, including an integer or an array element.
+	pub fn number(&self, path: KeyPath) -> f64 {
+		self.value(path.clone()).number()
+			.unwrap_or_else(|| panic!("GGUF metadata path {} is not numeric in {}", path.text(), self.gguf().path.display()))
+	}
+	pub fn integer(&self, path: KeyPath) -> usize {
+		let value = self.value(path.clone()).integer()
+			.unwrap_or_else(|| panic!("GGUF metadata path {} is not a nonnegative integer in {}", path.text(), self.gguf().path.display()));
+		usize::try_from(value).unwrap_or_else(|_| panic!("GGUF metadata path {} exceeds usize in {}", path.text(), self.gguf().path.display()))
+	}
+	pub fn text(&self, path: KeyPath) -> &str {
+		self.value(path.clone()).text()
+			.unwrap_or_else(|| panic!("GGUF metadata path {} is not a string in {}", path.text(), self.gguf().path.display()))
+	}
+	pub fn array(&self, path: KeyPath) -> &[GgufValue] {
+		match self.value(path.clone()) {
+			GgufValue::Array(values) => values,
+			_ => panic!("GGUF metadata path {} is not an array in {}", path.text(), self.gguf().path.display()),
+		}
+	}
+	/// The tensor descriptor at a dotted path in this data file.
+	pub fn tensor(&self, path: KeyPath) -> GgufTensor {
+		path.tensor(self.gguf()).unwrap_or_else(|error| panic!("{error}"))
+	}
+	pub fn has_tensor(&self, path: KeyPath) -> bool {
+		self.gguf().tensors().iter().any(|tensor| path.matches(&tensor.name, true))
+	}
+	pub fn ngram(&self) -> Ngram<'_> {
+		self.gguf().ngram()
 	}
 	fn report_path(&self) -> Result<String> {
 		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
