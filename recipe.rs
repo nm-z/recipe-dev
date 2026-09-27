@@ -5100,8 +5100,20 @@ impl NativeModelIr {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
 						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin}, i32 %n{index}.attention.step.block, i32 {index_width} )\n", index_width = node.argument[6], pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
-						// A single query takes the step body; a selection masks its keys there.
-						ir.push_str(&format!("br i1 %n{index}.attention.single, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
+						if blocks == 0 {
+							// A window of a few queries takes the step body a position at a time,
+							// each seeing the keys the one before it wrote.
+							let each = fast_call.replace(&format!("i32 {channels}, i32 {begin}, i32 {kv_heads}"), &format!("i32 {channels}, i32 %{prefix}.position, i32 {kv_heads}"));
+							require(each != fast_call, "attention step call has no position")?;
+							ir.push_str(&format!(
+								"%{prefix}.few = icmp ule i32 {span}, {few}\n%{prefix}.end = add i32 {begin}, {span}\nbr i1 %{prefix}.few, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.position = phi i32 [ {begin}, %{prefix}.fast ], [ %{prefix}.next, %{prefix}.each ]\n%{prefix}.more = icmp ult i32 %{prefix}.position, %{prefix}.end\nbr i1 %{prefix}.more, label %{prefix}.each, label %{prefix}.done\n{prefix}.each:\n{each}{sync}%{prefix}.next = add i32 %{prefix}.position, 1\nbr label %{prefix}.loop\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n",
+								few = draft_positions()?,
+								sync = barrier(backend)
+							));
+						} else {
+							// A single query takes the step body; a selection masks its keys there.
+							ir.push_str(&format!("br i1 %n{index}.attention.single, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
+						}
 					} else {
 						ir.push_str(&normal_call);
 					}
