@@ -12812,7 +12812,8 @@ impl Drop for ChatInput {
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
 static TRACE: AtomicBool = AtomicBool::new(false);
 fn tracing() -> bool {
-	TRACE.load(Ordering::Relaxed)
+	static ENV_TRACE: OnceLock<bool> = OnceLock::new();
+	TRACE.load(Ordering::Relaxed) || *ENV_TRACE.get_or_init(|| std::env::var("RECIPE_TRACE").is_ok_and(|value| value == "1"))
 }
 fn trace(message: &str) -> Result<()> {
 	if !tracing() {
@@ -16609,6 +16610,20 @@ impl Bound {
 	pub fn model(&self) -> &Model {
 		&self.model
 	}
+	/// Inspect the file model's graph on the selected device without compiling kernels.
+	pub fn memory(&self, positions: impl Count) -> Result<DeviceMemory> {
+		self.memory_for(&self.model, positions)
+	}
+	/// Inspect another model against this file's tensor plan without compiling kernels.
+	pub fn memory_for(&self, model: &Model, positions: impl Count) -> Result<DeviceMemory> {
+		let positions = positions.count();
+		require(positions > 0, "memory inspection requires context positions")?;
+		let device = selected_gpu()?;
+		let graph = bound_graph_on(&self.file, &with_last_projection(model), &self.plan, &vec![0.0; positions], 1, device)?;
+		let mut memory = part_memory(&graph, Config::load()?.precision)?;
+		memory.device = device.name.clone();
+		Ok(memory)
+	}
 	/// The plan that fills the model's weighted nodes.
 	pub fn plan(&self) -> &Binding {
 		&self.plan
@@ -17205,7 +17220,8 @@ impl<'a> Builder<'a> {
 			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
-		Ok(branch.glu(hidden, Activation::Silu))
+		let feed_forward = (crate::layer(hidden).silu() * crate::layer(hidden)).layer(width);
+		Ok(branch.edit(|model| model.blocks.extend(feed_forward.blocks.iter().cloned())))
 	}
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
@@ -17637,9 +17653,14 @@ impl Infer {
 	}
 	pub fn run(&self, model: &Model, data: &Data) -> InferenceReport {
 		let _transfers = TransferScope::new();
-		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
+		self.try_run(model, data, None).unwrap_or_else(|error| panic!("{error}"))
 	}
-	fn try_run(&self, model: &Model, data: &Data) -> Result<InferenceReport> {
+	/// Run an explicit model with the tensor plan supplied by a GGUF file.
+	pub fn run_bound(&self, model: &Model, data: &Data, bound: &Bound) -> InferenceReport {
+		let _transfers = TransferScope::new();
+		self.try_run(model, data, Some(bound)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn try_run(&self, model: &Model, data: &Data, bound: Option<&Bound>) -> Result<InferenceReport> {
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPTED.store(false, Ordering::Release);
 		let load_started = Instant::now();
@@ -17647,7 +17668,13 @@ impl Infer {
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
 		let model = with_last_projection(model);
-		let plan = conventional_plan(&file, &model)?;
+		let plan = match bound {
+			Some(bound) => {
+				require(bound.file.path == file.path, "the tensor plan and inference data must name the same GGUF file")?;
+				bound.plan.clone()
+			}
+			None => conventional_plan(&file, &model)?,
+		};
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
