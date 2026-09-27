@@ -4028,6 +4028,19 @@ mod quantized {
 			self.instruction(format!("zext i16 {loaded} to i64"))
 		}
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
+			// Up to sixteen byte entries fit two constants: the entry is a select and a
+			// shift away, with no load.
+			if values.len() <= 16 {
+				let pack = |part: &[i8]| part.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value as u8) << (8 * at)) as i64;
+				let (low, high) = (pack(&values[..values.len().min(8)]), pack(values.get(8..).unwrap_or(&[])));
+				let upper = self.instruction(format!("icmp uge i64 {index}, 8"));
+				let word = self.instruction(format!("select i1 {upper}, i64 {high}, i64 {low}"));
+				let lane = self.instruction(format!("and i64 {index}, 7"));
+				let shift = self.instruction(format!("shl i64 {lane}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {word}, {shift}"));
+				let byte = self.instruction(format!("trunc i64 {shifted} to i8"));
+				return self.instruction(format!("sext i8 {byte} to i64"));
+			}
 			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
 			let loaded = self.instruction(format!("load i8, ptr addrspace(1) {address}, align 1, !invariant.load !{{}}"));
 			self.instruction(format!("sext i8 {loaded} to i64"))
