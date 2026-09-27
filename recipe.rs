@@ -16694,9 +16694,13 @@ impl<'a> Builder<'a> {
 	}
 	/// Applies an architecture's post-attention or post-FFN normalization inside
 	/// the branch, before the residual add. Architectures without that tensor keep
-	/// the branch unchanged.
+	/// the branch unchanged. A layer without `ffn_norm` names its feed-forward's
+	/// input normalization `post_attention_norm`, so there it is no post-norm.
 	fn post(&mut self, layer: usize, part: &str, branch: Model, dimensions: &Dimensions) -> Result<Model> {
 		let suffix = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
+		if part == "attn" && self.optional(&format!("blk.{layer}.ffn_norm.weight")).is_none() {
+			return Ok(branch);
+		}
 		let name = format!("blk.{layer}.{suffix}");
 		let Some(scale) = self.optional(&name) else { return Ok(branch) };
 		require(scale.elements() == dimensions.width, format!("{} holds {} values; block {layer} {part} post-normalization scales {} channels", scale.name, scale.elements(), dimensions.width))?;
