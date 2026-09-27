@@ -249,7 +249,7 @@ mkdir -p "$root/evidence"
 cp -r "$work/evidence/." "$root/evidence/"
 cp "$work/run.log" "$root/evidence/worker-run.log"
 
-route="$(awk '/^selected route / { print $3; exit }' "$root/evidence/worker-run.log")"
+route="$(awk '/^suite device / { print $3; exit }' "$root/evidence/worker-run.log")"
 device="${route##*:}"
 case "$device" in
 	nv*) echo "executed on $route" ;;
@@ -413,7 +413,7 @@ awk '/^RECIPE_SUITE_JSON_BEGIN$/{capture=1; next} /^RECIPE_SUITE_JSON_END$/{capt
 	exit 1
 }
 [ -s evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
-route="$(awk '/^selected route / { print $3; exit }' evidence/worker-run.log)"
+route="$(awk '/^suite device / { print $3; exit }' evidence/worker-run.log)"
 device="${route##*:}"
 case "$device" in
 	nv*) ;;
