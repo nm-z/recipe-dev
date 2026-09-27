@@ -17759,9 +17759,19 @@ impl Builder<'_> {
 						Some(layer) => format!("blk.{layer}.nextn.hc_head_{suffix}.weight"),
 						None => format!("output_hc_{suffix}.weight"),
 					};
-					self.whole(&name("norm"), "the head mixer normalization")?;
-					self.whole(&name("down"), "the head mixer read gate")?;
-					self.whole(&name("up"), "the head mixer read gate")?;
+					// Each of the read gate's weights takes its bound path, else the convention.
+					let bound = |block: &Block| block.weight.clone().filter(|_| matches!(block.operation, Operation::Identity | Operation::Layer(_)));
+					let norm = read.first().and_then(bound);
+					let projections = read.iter().filter(|block| matches!(block.operation, Operation::Layer(_))).map(bound).collect::<Vec<_>>();
+					for (path, suffix, role) in [(norm, "norm", "the head mixer normalization"), (projections.first().cloned().flatten(), "down", "the head mixer read gate"), (projections.get(1).cloned().flatten(), "up", "the head mixer read gate")] {
+						match path {
+							Some(path) => {
+								let tensor = self.keyed_tensor(&path, role)?;
+								self.mapped(vec![tensor]);
+							}
+							None => self.whole(&name(suffix), role)?,
+						}
+					}
 				}
 				Operation::Layer(outputs) => {
 					require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after a layer has no tensor name")?;
