@@ -44,10 +44,10 @@ frozen.blck.atvn.prec = block
 
 ```rust
 let model = recipe.model()
-	.embed(data.array(key!(tokenizer.ggml.tokens)).len(), data.integer(key!(gemma3.embedding_length))).fp(16)
-	.layer(data.integer(key!(gemma3.feed_forward_length))).int(4).gelu().fp(16)
-	.layer(data.integer(key!(gemma3.embedding_length))).int(8)
-	.layer(data.array(key!(tokenizer.ggml.tokens)).len()).int(8);
+	.embed(tokenizer.ggml.tokens, arch.embedding_length).fp(16)
+	.layer(arch.feed_forward_length).int(4).gelu().fp(16)
+	.layer(arch.embedding_length).int(8)
+	.layer(tokenizer.ggml.tokens).int(8);
 
 recipe.train().run(&model, &data);
 recipe.infer().run(&model, &data);
@@ -55,11 +55,12 @@ recipe.infer().run(&model, &data);
 
 ```rust
 let data = recipe.data("model.gguf");
-let temperature = data.number(key!(general.sampling.temp));
-let ratio = data.integer(key!(qwen4exp.attention.compress_ratios[3]));
-let architecture = data.text(key!(general.architecture));
-let shape = data.tensor(key!(blk[3].attn_q.weight)).shape;
-let attention = attn(24).q(key!(blk[3].attn_q.weight));
+let sampler = recipe.sampler().temperature(general.sampling.temp);
+let ratio = arch.attention.compress_ratios[3];
+let vocabulary = tokenizer.ggml.tokens.len();
+let architecture = general.architecture.get();
+let shape = data.tensor(blk[3].attn_q.weight).shape;
+let attention = attn(24).q(blk[3].attn_q.weight);
 ```
 
 ```rb
@@ -73,14 +74,14 @@ layer(d).int(8)
 
 ```rust
 let attention = recipe.model()
-	.delta(48, 4).keys(16, 128).values(128).out(data.integer(key!(qwen35.embedding_length)))
+	.delta(48, 4).keys(16, 128).values(128).out(arch.embedding_length)
 	.conv(silu).qk(l2).norm(rms).decay(softplus).output(silu)
 	.norm(rms);
 let model = recipe.model()
-	.e(data.number(key!(qwen35.attention.layer_norm_rms_epsilon)))
-	.embed(data.array(key!(tokenizer.ggml.tokens)).len(), data.integer(key!(qwen35.embedding_length)))
+	.e(arch.attention.layer_norm_rms_epsilon)
+	.embed(tokenizer.ggml.tokens, arch.embedding_length)
 	.hyper(4, &attention)
-	.read([norm(rms), layer(320), scale(0.25), silu(), layer(4 * data.integer(key!(qwen35.embedding_length))), sigmoid()])
+	.read([norm(rms), layer(320), scale(0.25), silu(), layer(4 * arch.embedding_length), sigmoid()])
 	.write([norm(rms), layer(4), scale(0.25), sigmoid(), scale(2.0)]);
 ```
 
@@ -249,8 +250,8 @@ infer()
 	.run(&model, &data)
 predict(path, &input)
 data(path)
-	.value(key!(path))|.number(key!(path))|.integer(key!(path))|.text(key!(path))|.array(key!(path))
-	.tensor(key!(path)).shape|.has_tensor(key!(path))
+	.value(key!(other.path))|.number(key!(other.path))|.integer(key!(other.path))
+	.tensor(blk[index].attn_q.weight).shape|.has_tensor(blk[index].attn_q.weight)
 sampler()
 	.temperature(value)|.top_k(count)|.top_p(mass)|.min_p(ratio)|.repeat(penalty, window)|.seed(value)
 	.sample(&logits, &previous)

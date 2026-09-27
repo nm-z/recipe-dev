@@ -12797,8 +12797,20 @@ impl KeyPath {
 	fn from_name(name: &str) -> Self {
 		Self(name.split('.').map(|part| KeyPart::Static(part.to_owned())).collect())
 	}
+	fn dotted(path: &'static str) -> Self {
+		Self::from_name(path)
+	}
 	fn text(&self) -> String {
 		self.0.iter().map(KeyPart::text).collect::<Vec<_>>().join(".")
+	}
+	fn resolved(&self, file: &Gguf) -> Result<Self> {
+		let mut path = self.clone();
+		if path.0.first().is_some_and(|part| part.text() == "arch") {
+			let architecture = file.value("general.architecture").and_then(GgufValue::text)
+				.ok_or_else(|| RecipeError::new(format!("GGUF metadata path general.architecture is absent in {}", file.path.display())))?;
+			path.0[0] = KeyPart::Value(architecture.to_owned());
+		}
+		Ok(path)
 	}
 	fn matches(&self, name: &str, implicit_weight: bool) -> bool {
 		fn match_parts(path: &[String], path_at: usize, key: &[&str], key_at: usize) -> bool {
@@ -12820,7 +12832,8 @@ impl KeyPath {
 		match_parts(&path, 0, &key, 0) || implicit_weight && key.last() == Some(&"weight") && match_parts(&path, 0, &key[..key.len() - 1], 0)
 	}
 	fn metadata<'a>(&self, file: &'a Gguf) -> Result<&'a GgufValue> {
-		let found = file.metadata().iter().filter(|(name, _)| self.matches(name, false)).collect::<Vec<_>>();
+		let resolved = self.resolved(file)?;
+		let found = file.metadata().iter().filter(|(name, _)| resolved.matches(name, false)).collect::<Vec<_>>();
 		match found.as_slice() {
 			[(_, value)] => Ok(value),
 			[] => {
@@ -12838,7 +12851,8 @@ impl KeyPath {
 		}
 	}
 	fn tensor(&self, file: &Gguf) -> Result<GgufTensor> {
-		let found = file.tensors().iter().filter(|tensor| self.matches(&tensor.name, true)).collect::<Vec<_>>();
+		let resolved = self.resolved(file)?;
+		let found = file.tensors().iter().filter(|tensor| resolved.matches(&tensor.name, true)).collect::<Vec<_>>();
 		match found.as_slice() {
 			[tensor] => Ok((*tensor).clone()),
 			[] => Err(RecipeError::new(format!("GGUF tensor path {} is absent in {}", self.text(), file.path.display()))),
@@ -12911,52 +12925,54 @@ impl RopeSelector for RopeLayout {
 pub fn layer(width: impl Width) -> Block {
 	Block::of(Operation::Layer(width.extent()))
 }
-pub const fn conv(filters: usize, kernel: usize) -> Block {
-	Block::of(Operation::Conv(filters, kernel))
+pub fn conv(filters: impl Count, kernel: impl Count) -> Block {
+	Block::of(Operation::Conv(filters.count(), kernel.count()))
 }
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
 	Block::of(Operation::Identity).norm(normalization)
 }
-pub fn group(normalization: impl NormalizationSelector, width: usize) -> Block {
+pub fn group(normalization: impl NormalizationSelector, width: impl Count) -> Block {
+	let width = width.count();
 	assert!(width != 0, "grouped normalization width must be positive");
 	Block::of(Operation::Group(normalization.normalization(), width))
 }
-pub fn fold(lanes: usize) -> Block {
+pub fn fold(lanes: impl Count) -> Block {
+	let lanes = lanes.count();
 	assert!(lanes != 0, "fold lane count must be positive");
 	Block::of(Operation::Fold(lanes))
 }
-pub fn dconv(kernel: usize) -> Block {
-	Block::of(Operation::Dconv(kernel, 1))
+pub fn dconv(kernel: impl Count) -> Block {
+	Block::of(Operation::Dconv(kernel.count(), 1))
 }
-pub fn scale(factor: f64) -> Block {
+pub fn scale(factor: impl Real) -> Block {
 	Block::of(Operation::Identity).scale(factor)
 }
-pub fn pool(size: usize) -> Block {
-	Block::of(Operation::Pool(size))
+pub fn pool(size: impl Count) -> Block {
+	Block::of(Operation::Pool(size.count()))
 }
 /// An attention step of `heads` query heads, `attn(heads)` inside a
 /// fragment, taking the same selectors as the model's `.attn`; `.kv(heads)`
 /// names its key and value heads.
-pub fn attn(heads: usize) -> Block {
-	Block::of(Operation::Attention(AttentionBlock::new(heads)))
+pub fn attn(heads: impl Count) -> Block {
+	Block::of(Operation::Attention(AttentionBlock::new(heads.count())))
 }
-pub fn rnn(width: usize) -> Block {
-	Block::of(Operation::Rnn(width))
+pub fn rnn(width: impl Count) -> Block {
+	Block::of(Operation::Rnn(width.count()))
 }
-pub fn gru(width: usize) -> Block {
-	Block::of(Operation::Gru(width))
+pub fn gru(width: impl Count) -> Block {
+	Block::of(Operation::Gru(width.count()))
 }
-pub fn lstm(width: usize) -> Block {
-	Block::of(Operation::Lstm(width))
+pub fn lstm(width: impl Count) -> Block {
+	Block::of(Operation::Lstm(width.count()))
 }
 /// A recurrent body applied at every sequence position with one shared
 /// parameter set. The body reads the current input and the previous output.
 pub fn recur<const N: usize>(parts: [Block; N]) -> Block {
 	Block::of(Operation::Recur(parts.into()))
 }
-pub fn perc(width: usize) -> Block {
-	Block::of(Operation::Perceptron(width))
+pub fn perc(width: impl Count) -> Block {
+	Block::of(Operation::Perceptron(width.count()))
 }
 pub fn kmeans(clusters: usize) -> Block {
 	Block::of(Operation::Estimator(Estimator { fit: fit_kmeans, validate: cluster_estimator, param: clusters, name: "kmeans" }))
@@ -13001,10 +13017,10 @@ impl IntoExpert for Block {
 impl IntoExpert for Model {
 	fn into_expert(self) -> Block { Block::of(Operation::Sequence(self.blocks.clone())) }
 }
-pub fn moe<E: IntoExpert>(top_k: usize, experts: impl IntoIterator<Item = E>) -> Block {
+pub fn moe<E: IntoExpert>(top_k: impl Count, experts: impl IntoIterator<Item = E>) -> Block {
 	let experts = experts.into_iter().map(IntoExpert::into_expert).collect::<Vec<_>>();
 	assert!(!experts.is_empty(), "moe requires an expert");
-	Block::of(Operation::Moe(MoeBlock { top_k, experts, scoring: None, renormalize: false, shared: None }))
+	Block::of(Operation::Moe(MoeBlock { top_k: top_k.count(), experts, scoring: None, renormalize: false, shared: None }))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -13529,13 +13545,13 @@ impl Block {
 		}
 		self
 	}
-	pub fn q(self, path: KeyPath) -> Self { self.attention("q", |attention| attention.query = Some(path)) }
-	pub fn k(self, path: KeyPath) -> Self { self.attention("k", |attention| attention.key = Some(path)) }
-	pub fn v(self, path: KeyPath) -> Self { self.attention("v", |attention| attention.value = Some(path)) }
+	pub fn q(self, path: impl Into<KeyPath>) -> Self { self.attention("q", |attention| attention.query = Some(path.into())) }
+	pub fn k(self, path: impl Into<KeyPath>) -> Self { self.attention("k", |attention| attention.key = Some(path.into())) }
+	pub fn v(self, path: impl Into<KeyPath>) -> Self { self.attention("v", |attention| attention.value = Some(path.into())) }
 	/// Bind this layer or depthwise convolution to one GGUF tensor path.
-	pub fn bind(mut self, path: KeyPath) -> Self {
+	pub fn bind(mut self, path: impl Into<KeyPath>) -> Self {
 		assert!(matches!(self.operation, Operation::Layer(_) | Operation::Dconv(..)), "weight binding requires a layer or depthwise convolution");
-		self.weight = Some(path);
+		self.weight = Some(path.into());
 		self.weight_rows = None;
 		self
 	}
@@ -13548,18 +13564,20 @@ impl Block {
 	}
 	/// Head width of this `attn` block. Without it, the width comes from the
 	/// residual stream and the heads partition the input.
-	pub fn width(self, width: usize) -> Self {
-		self.attention("width", |attention| attention.width = width)
+	pub fn width(self, width: impl Count) -> Self {
+		self.attention("width", |attention| attention.width = width.count())
 	}
 	/// Equal key and value heads of this `attn` block. Each head serves
 	/// `heads / kv` query heads.
-	pub fn kv(self, heads: usize) -> Self {
+	pub fn kv(self, heads: impl Count) -> Self {
+		let heads = heads.count();
 		let mut block = self.attention("kv", |attention| { attention.keys = heads; attention.values = heads; });
 		block.suffix = Suffix::Kv;
 		block
 	}
 	/// Rotary position embedding on this `attn` block.
-	pub fn rope(self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+	pub fn rope(self, layout: impl RopeSelector, dims: impl Count, base: impl Real) -> Self {
+		let (dims, base) = (dims.count(), base.real());
 		let layout = layout.layout();
 		assert!(dims != 0 && dims % 2 == 0, "rotary dimensions must be positive and even");
 		assert!(base.is_finite() && base > 1.0, "rotary base must be finite and greater than one");
@@ -13568,7 +13586,8 @@ impl Block {
 		block
 	}
 	/// YaRN frequency scaling for this `rope`.
-	pub fn yarn(self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
+	pub fn yarn(self, factor: impl Real, context: impl Count, fast: f64, slow: impl Real) -> Self {
+		let (factor, context, slow) = (factor.real(), context.count(), slow.real());
 		let mut block = self.attention("yarn", |attention| {
 			assert!(attention.rope.is_some(), "yarn requires a preceding rope");
 			assert!(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one");
@@ -13580,7 +13599,8 @@ impl Block {
 		block
 	}
 	/// Sparse key selection on this `attn` block.
-	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+	pub fn index(self, heads: impl Count, width: impl Count, block: impl Count, keep: impl Count) -> Self {
+		let (heads, width, block, keep) = (heads.count(), width.count(), block.count(), keep.count());
 		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
 	}
 	block_activations! {
@@ -13603,15 +13623,18 @@ impl Block {
 		}
 		block
 	}
-	pub fn scale(self, factor: f64) -> Self {
+	pub fn scale(self, factor: impl Real) -> Self {
+		let factor = factor.real();
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.with_activation(Activation::Scale(factor.to_bits()))
 	}
-	pub fn signed_sqrt(self, floor: f64) -> Self {
+	pub fn signed_sqrt(self, floor: impl Real) -> Self {
+		let floor = floor.real();
 		assert!(floor.is_finite() && floor > 0.0, "signed square root floor must be finite and positive");
 		self.with_activation(Activation::SignedSqrt(floor.to_bits()))
 	}
-	pub fn dilate(mut self, steps: usize) -> Self {
+	pub fn dilate(mut self, steps: impl Count) -> Self {
+		let steps = steps.count();
 		assert!(steps != 0, "a depthwise convolution dilation must be positive");
 		match &mut self.operation {
 			Operation::Dconv(_, dilation) => *dilation = steps,
@@ -13674,20 +13697,20 @@ impl Frozen {
 }
 macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn layer(&self, width: impl Width) -> Model { self.model().layer(width) }
-	pub fn conv(&self, filters: usize, kernel: usize) -> Model { self.model().conv(filters, kernel) }
-	pub fn rnn(&self, width: usize) -> Model { self.model().rnn(width) }
-	pub fn gru(&self, width: usize) -> Model { self.model().gru(width) }
-	pub fn lstm(&self, width: usize) -> Model { self.model().lstm(width) }
-	pub fn perc(&self, width: usize) -> Model { self.model().perc(width) }
-	pub fn dconv(&self, kernel: usize) -> Model { self.model().dconv(kernel) }
-	pub fn delta(&self, heads: usize, kernel: usize) -> DeltaModel { self.model().delta(heads, kernel) }
-	pub fn attn(&self, heads: usize) -> Model { self.model().attn(heads) }
-	pub fn glu(&self, hidden: usize, activation: Activation) -> Model { self.model().glu(hidden, activation) }
+	pub fn conv(&self, filters: impl Count, kernel: impl Count) -> Model { self.model().conv(filters, kernel) }
+	pub fn rnn(&self, width: impl Count) -> Model { self.model().rnn(width) }
+	pub fn gru(&self, width: impl Count) -> Model { self.model().gru(width) }
+	pub fn lstm(&self, width: impl Count) -> Model { self.model().lstm(width) }
+	pub fn perc(&self, width: impl Count) -> Model { self.model().perc(width) }
+	pub fn dconv(&self, kernel: impl Count) -> Model { self.model().dconv(kernel) }
+	pub fn delta(&self, heads: impl Count, kernel: impl Count) -> DeltaModel { self.model().delta(heads, kernel) }
+	pub fn attn(&self, heads: impl Count) -> Model { self.model().attn(heads) }
+	pub fn glu(&self, hidden: impl Count, activation: Activation) -> Model { self.model().glu(hidden, activation) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().res(parts) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Model { self.model().ensemble(members) }
-	pub fn moe<E: IntoExpert>(&self, top_k: usize, experts: impl IntoIterator<Item = E>) -> Model { self.model().moe(top_k, experts) }
-	pub fn hyper(&self, lanes: usize, branch: &Model) -> Model { self.model().hyper(lanes, branch) }
+	pub fn moe<E: IntoExpert>(&self, top_k: impl Count, experts: impl IntoIterator<Item = E>) -> Model { self.model().moe(top_k, experts) }
+	pub fn hyper(&self, lanes: impl Count, branch: &Model) -> Model { self.model().hyper(lanes, branch) }
 })+ }; }
 qualified_blocks! { Frozen }
 /// `frozen` before a part inside a composition: `frozen.layer(n)`.
@@ -13695,12 +13718,12 @@ pub struct FrozenBlock;
 pub static frozen: FrozenBlock = FrozenBlock;
 macro_rules! qualified_parts { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn layer(&self, width: impl Width) -> Block { self.qualify(layer(width)) }
-	pub fn conv(&self, filters: usize, kernel: usize) -> Block { self.qualify(conv(filters, kernel)) }
-	pub fn rnn(&self, width: usize) -> Block { self.qualify(rnn(width)) }
-	pub fn gru(&self, width: usize) -> Block { self.qualify(gru(width)) }
-	pub fn lstm(&self, width: usize) -> Block { self.qualify(lstm(width)) }
-	pub fn perc(&self, width: usize) -> Block { self.qualify(perc(width)) }
-	pub fn attn(&self, heads: usize) -> Block { self.qualify(Block::from(attn(heads))) }
+	pub fn conv(&self, filters: impl Count, kernel: impl Count) -> Block { self.qualify(conv(filters, kernel)) }
+	pub fn rnn(&self, width: impl Count) -> Block { self.qualify(rnn(width)) }
+	pub fn gru(&self, width: impl Count) -> Block { self.qualify(gru(width)) }
+	pub fn lstm(&self, width: impl Count) -> Block { self.qualify(lstm(width)) }
+	pub fn perc(&self, width: impl Count) -> Block { self.qualify(perc(width)) }
+	pub fn attn(&self, heads: impl Count) -> Block { self.qualify(Block::from(attn(heads))) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Block { self.qualify(res(parts)) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Block { self.qualify(recur(parts)) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Block { self.qualify(ensemble(members)) }
@@ -13728,7 +13751,7 @@ impl Exclusion for Bias {
 	}
 	}
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
-$(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
+$(pub fn $method(&self, $($argument: impl Count),*) -> Self { $(let $argument = $argument.count();)* self.push($operation) })+ }; }
 /// A delta block being configured. `.output(...)` completes its required math
 /// and returns the ordinary model chain.
 pub struct DeltaModel(Model);
@@ -13743,11 +13766,12 @@ impl DeltaModel {
 			apply(delta);
 		}))
 	}
-	pub fn keys(self, count: usize, width: usize) -> Self {
+	pub fn keys(self, count: impl Count, width: impl Count) -> Self {
+		let (count, width) = (count.count(), width.count());
 		self.edit(|delta| (delta.key_heads, delta.key_width) = (count, width))
 	}
-	pub fn values(self, width: usize) -> Self { self.edit(|delta| delta.value_width = width) }
-	pub fn out(self, width: usize) -> Self { self.edit(|delta| delta.output = width) }
+	pub fn values(self, width: impl Count) -> Self { self.edit(|delta| delta.value_width = width.count()) }
+	pub fn out(self, width: impl Count) -> Self { self.edit(|delta| delta.output = width.count()) }
 	pub fn conv(self, selector: impl Fn() -> Block) -> Self {
 		let value = delta_activation(selector);
 		assert!(matches!(value, Activation::Linear | Activation::Silu), "delta convolution activation must be linear or silu");
@@ -13847,19 +13871,19 @@ impl Model {
 	fn last() = Operation::Last;
 	fn dconv(kernel: usize) = Operation::Dconv(kernel, 1);
 	}
-	pub fn delta(&self, heads: usize, kernel: usize) -> DeltaModel {
-		DeltaModel(self.push(Operation::Delta(DeltaBlock::new(heads, kernel))))
+	pub fn delta(&self, heads: impl Count, kernel: impl Count) -> DeltaModel {
+		DeltaModel(self.push(Operation::Delta(DeltaBlock::new(heads.count(), kernel.count()))))
 	}
 	/// Attention over query heads. The scalar form gives keys and values the
 	/// same count; the array form states query, key, and value counts separately.
-	pub fn attn(&self, heads: usize) -> Self {
-		self.push(Operation::Attention(AttentionBlock::new(heads)))
+	pub fn attn(&self, heads: impl Count) -> Self {
+		self.push(Operation::Attention(AttentionBlock::new(heads.count())))
 	}
-	pub fn q(&self, path: KeyPath) -> Self { self.attention("q", |block| block.q(path)) }
-	pub fn k(&self, path: KeyPath) -> Self { self.attention("k", |block| block.k(path)) }
-	pub fn v(&self, path: KeyPath) -> Self { self.attention("v", |block| block.v(path)) }
+	pub fn q(&self, path: impl Into<KeyPath>) -> Self { self.attention("q", |block| block.q(path)) }
+	pub fn k(&self, path: impl Into<KeyPath>) -> Self { self.attention("k", |block| block.k(path)) }
+	pub fn v(&self, path: impl Into<KeyPath>) -> Self { self.attention("v", |block| block.v(path)) }
 	/// Bind the preceding layer or depthwise convolution to one GGUF tensor path.
-	pub fn bind(&self, path: KeyPath) -> Self {
+	pub fn bind(&self, path: impl Into<KeyPath>) -> Self {
 		self.suffix().edit(|model| {
 			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding weighted block"));
 			model.blocks.push(block.bind(path));
@@ -13881,7 +13905,7 @@ impl Model {
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
 		self.push(Operation::Ensemble(branch(members)))
 	}
-	pub fn moe<E: IntoExpert>(&self, top_k: usize, experts: impl IntoIterator<Item = E>) -> Self {
+	pub fn moe<E: IntoExpert>(&self, top_k: impl Count, experts: impl IntoIterator<Item = E>) -> Self {
 		self.push(moe(top_k, experts).operation)
 	}
 	fn moesuffix(&self, selector: &str, apply: impl FnOnce(Block) -> Block) -> Self {
@@ -13914,7 +13938,8 @@ impl Model {
 	/// Tap spacing of the preceding `dconv` block: tap `j` of a `kernel`-wide
 	/// convolution reads position `t - (kernel - 1 - j) * steps`, so the block
 	/// carries `(kernel - 1) * steps` positions of history. One is the plain form.
-	pub fn dilate(&self, steps: usize) -> Self {
+	pub fn dilate(&self, steps: impl Count) -> Self {
+		let steps = steps.count();
 		assert!(steps != 0, "a depthwise convolution dilation must be positive");
 		self.suffix().edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("dilate requires a preceding dconv block"));
@@ -13926,39 +13951,40 @@ impl Model {
 	}
 	/// Equal key and value heads of the preceding `attn` block. Each head serves
 	/// `heads / kv` query heads.
-	pub fn kv(&self, heads: usize) -> Self {
+	pub fn kv(&self, heads: impl Count) -> Self {
 		self.attention("kv", |block| block.kv(heads))
 	}
 	/// Head width of the preceding `attn` block, so the heads need not partition
 	/// the stream. The block outputs `heads * width` channels.
-	pub fn head(&self, width: usize) -> Self {
+	pub fn head(&self, width: impl Count) -> Self {
 		self.attention("head", |block| block.width(width))
 	}
 	/// Compatibility spelling for the public attention head-width selector.
-	pub fn width(&self, width: usize) -> Self {
+	pub fn width(&self, width: impl Count) -> Self {
 		self.head(width)
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
 	/// frequencies `base^(-2i/dims)`.
-	pub fn rope(&self, layout: impl RopeSelector, dims: usize, base: f64) -> Self {
+	pub fn rope(&self, layout: impl RopeSelector, dims: impl Count, base: impl Real) -> Self {
 		self.attention("rope", |block| block.rope(layout, dims, base))
 	}
 	/// YaRN frequency scaling for the preceding rotary attention block.
-	pub fn yarn(&self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
+	pub fn yarn(&self, factor: impl Real, context: impl Count, fast: f64, slow: impl Real) -> Self {
 		self.attention("yarn", |block| block.yarn(factor, context, fast, slow))
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
 	/// of `block` keys, and each query attends to its best `keep` blocks.
-	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
+	pub fn index(&self, heads: impl Count, width: impl Count, block: impl Count, keep: impl Count) -> Self {
 		self.attention("index", |value| value.index(heads, width, block, keep))
 	}
 	/// Trained scoring geometry of the preceding `index`: every indexer query and
 	/// key head normalizes under `normalization` with its own trained scale, and
 	/// its leading `dims` channels rotate at the block's `rope` base before the
 	/// indexer scores. Zero `dims` leaves the planes unrotated.
-	pub fn score(&self, normalization: impl NormalizationSelector, dims: usize) -> Self {
+	pub fn score(&self, normalization: impl NormalizationSelector, dims: impl Count) -> Self {
+		let dims = dims.count();
 		let normalization = normalization.normalization();
 		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
 			panic!("indexer scoring normalization must be rms or l2");
@@ -13976,7 +14002,8 @@ impl Model {
 	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
 	/// through a gated read and takes its output back through gated writes.
 	/// Empty gate lists use a gate of one.
-	pub fn hyper(&self, lanes: usize, branch: &Model) -> Self {
+	pub fn hyper(&self, lanes: impl Count, branch: &Model) -> Self {
+		let lanes = lanes.count();
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
 		self.push(Operation::Hyper(Hyper { lanes, branch: branch.blocks.clone(), read: Vec::new(), write: Vec::new() }))
 	}
@@ -14033,8 +14060,8 @@ impl Model {
 	/// normalized, each lane follows the vector into one projection shared by
 	/// every lane, and the projected lanes are the stream the hyper-connections
 	/// after it carry.
-	pub fn join(&self, lanes: usize) -> Self {
-		self.push(Operation::Join(lanes))
+	pub fn join(&self, lanes: impl Count) -> Self {
+		self.push(Operation::Join(lanes.count()))
 	}
 	/// Appends a map to the preceding block. Leading a model, the map takes its input.
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
@@ -14048,8 +14075,8 @@ impl Model {
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
 	/// returning to the block input width.
-	pub fn glu(&self, hidden: usize, activation: Activation) -> Self {
-		self.push(Operation::Glu(hidden, activation))
+	pub fn glu(&self, hidden: impl Count, activation: Activation) -> Self {
+		self.push(Operation::Glu(hidden.count(), activation))
 	}
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
@@ -14076,7 +14103,8 @@ impl Model {
 	/// L2 norm and the shift under a batch, layer, or RMS variance, in every block,
 	/// query and key normalization, delta rule, and hyper-connection gate. It is
 	/// saved with the model, so a bundle reloads with the value it was trained with.
-	pub fn e(&self, value: f64) -> Self {
+	pub fn e(&self, value: impl Real) -> Self {
+		let value = value.real();
 		assert!(value.is_finite() && value > 0.0, "normalization epsilon must be finite and positive");
 		self.edit(|model| { model.epsilon = value; model.epsilon_explicit = true; })
 	}
@@ -14123,7 +14151,8 @@ impl Model {
 	}
 	/// Inspect the planned inference arenas before compiling or allocating GPU
 	/// kernels. This uses the same graph and arena layout as a real run.
-	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
+	pub fn memory(&self, data: &Data, positions: impl Count) -> Result<DeviceMemory> {
+		let positions = positions.count();
 		require(positions > 0, "memory inspection requires context positions")?;
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
 		let model = with_last_projection(self);
@@ -15703,11 +15732,13 @@ fn prelu = Prelu; }
 impl Model {
 	/// Multiplies every value the preceding block produces by `factor`. Owns no
 	/// weights, preserves shape, and stores the factor with the model.
-	pub fn scale(&self, factor: f64) -> Self {
+	pub fn scale(&self, factor: impl Real) -> Self {
+		let factor = factor.real();
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.with_activation(Activation::Scale(factor.to_bits()))
 	}
-	pub fn signed_sqrt(&self, floor: f64) -> Self {
+	pub fn signed_sqrt(&self, floor: impl Real) -> Self {
+		let floor = floor.real();
 		assert!(floor.is_finite() && floor > 0.0, "signed square root floor must be finite and positive");
 		self.with_activation(Activation::SignedSqrt(floor.to_bits()))
 	}
@@ -17222,6 +17253,9 @@ impl<'a> Builder<'a> {
 /// The GGUF a model file opens through `recipe.data`. One process describes
 /// one model, so the file opens once.
 static SCRIPT_FILE: OnceLock<(PathBuf, Gguf)> = OnceLock::new();
+fn script_file() -> &'static Gguf {
+	&SCRIPT_FILE.get().unwrap_or_else(|| panic!("recipe.data(\"<model>.gguf\") must open the file before a key is read")).1
+}
 fn open_script_file(path: &Path) -> Gguf {
 	let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 	let (opened, file) = SCRIPT_FILE.get_or_init(|| (path.clone(), Gguf::open(&path).unwrap_or_else(|error| panic!("{error}"))));
@@ -17235,6 +17269,162 @@ impl Gguf {
 		self.value(&format!("{architecture}.attention.layer_norm_rms_epsilon")).and_then(GgufValue::float)
 	}
 }
+/// One numeric key resolved from the GGUF opened by `recipe.data`.
+#[derive(Clone, Copy)]
+pub struct MetaCount(&'static str);
+impl MetaCount {
+	pub fn get(self) -> usize {
+		let path = KeyPath::dotted(self.0);
+		let file = script_file();
+		let value = path.metadata(file).unwrap_or_else(|error| panic!("{error}"));
+		let value = value.integer().unwrap_or_else(|| panic!("GGUF metadata path {} is not a nonnegative integer in {}", self.0, file.path.display()));
+		usize::try_from(value).unwrap_or_else(|_| panic!("GGUF metadata path {} exceeds usize in {}", self.0, file.path.display()))
+	}
+}
+#[derive(Clone, Copy)]
+pub struct MetaReal(&'static str);
+impl MetaReal {
+	pub fn get(self) -> f64 {
+		let path = KeyPath::dotted(self.0);
+		let file = script_file();
+		path.metadata(file).unwrap_or_else(|error| panic!("{error}"))
+			.number().unwrap_or_else(|| panic!("GGUF metadata path {} is not numeric in {}", self.0, file.path.display()))
+	}
+}
+impl std::ops::Div<MetaReal> for f64 {
+	type Output = f64;
+	fn div(self, right: MetaReal) -> f64 { self / right.get() }
+}
+impl std::ops::Mul<MetaCount> for usize {
+	type Output = usize;
+	fn mul(self, right: MetaCount) -> usize { self * right.get() }
+}
+pub trait Count {
+	fn count(self) -> usize;
+}
+impl Count for usize {
+	fn count(self) -> usize { self }
+}
+impl Count for MetaCount {
+	fn count(self) -> usize { self.get() }
+}
+pub trait Real {
+	fn real(self) -> f64;
+}
+impl Real for f64 {
+	fn real(self) -> f64 { self }
+}
+impl Real for MetaReal {
+	fn real(self) -> f64 { self.get() }
+}
+pub struct MetaIntArray {
+	path: &'static str,
+	values: OnceLock<Vec<usize>>,
+}
+impl MetaIntArray {
+	fn values(&self) -> &[usize] {
+		self.values.get_or_init(|| {
+			let path = KeyPath::dotted(self.path);
+			let file = script_file();
+			let GgufValue::Array(values) = path.metadata(file).unwrap_or_else(|error| panic!("{error}")) else {
+				panic!("GGUF metadata path {} is not an array in {}", self.path, file.path.display());
+			};
+			values.iter().enumerate().map(|(index, value)| {
+				let value = value.integer().unwrap_or_else(|| panic!("GGUF metadata path {}[{index}] is not a nonnegative integer in {}", self.path, file.path.display()));
+				usize::try_from(value).unwrap_or_else(|_| panic!("GGUF metadata path {}[{index}] exceeds usize in {}", self.path, file.path.display()))
+			}).collect()
+		})
+	}
+	pub fn len(&self) -> usize { self.values().len() }
+	pub fn is_empty(&self) -> bool { self.values().is_empty() }
+}
+impl std::ops::Index<usize> for MetaIntArray {
+	type Output = usize;
+	fn index(&self, index: usize) -> &usize {
+		self.values().get(index).unwrap_or_else(|| panic!("GGUF metadata path {}[{index}] is absent in {}", self.path, script_file().path.display()))
+	}
+}
+#[derive(Clone, Copy)]
+pub struct MetaTokens(&'static str);
+impl MetaTokens {
+	fn values(self) -> &'static [GgufValue] {
+		let file = script_file();
+		let path = KeyPath::dotted(self.0);
+		match path.metadata(file).unwrap_or_else(|error| panic!("{error}")) {
+			GgufValue::Array(values) => values,
+			_ => panic!("GGUF metadata path {} is not an array in {}", self.0, file.path.display()),
+		}
+	}
+	pub fn len(self) -> usize { self.values().len() }
+	pub fn is_empty(self) -> bool { self.values().is_empty() }
+}
+impl std::ops::Index<usize> for MetaTokens {
+	type Output = GgufValue;
+	fn index(&self, index: usize) -> &GgufValue {
+		self.values().get(index).unwrap_or_else(|| panic!("GGUF metadata path {}[{index}] is absent in {}", self.0, script_file().path.display()))
+	}
+}
+#[derive(Clone, Copy)]
+pub struct MetaText(&'static str);
+impl MetaText {
+	pub fn get(self) -> &'static str {
+		let file = script_file();
+		let path = KeyPath::dotted(self.0);
+		path.metadata(file).unwrap_or_else(|error| panic!("{error}"))
+			.text().unwrap_or_else(|| panic!("GGUF metadata path {} is not a string in {}", self.0, file.path.display()))
+	}
+}
+impl fmt::Display for MetaText {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.get()) }
+}
+pub struct GeneralSamplingKeys { pub temp: MetaReal }
+pub struct GeneralKeys { pub architecture: MetaText, pub sampling: GeneralSamplingKeys }
+pub static general: GeneralKeys = GeneralKeys { architecture: MetaText("general.architecture"), sampling: GeneralSamplingKeys { temp: MetaReal("general.sampling.temp") } };
+pub struct TokenizerGgmlKeys { pub tokens: MetaTokens, pub token_type: MetaIntArray }
+pub struct TokenizerKeys { pub ggml: TokenizerGgmlKeys }
+pub static tokenizer: TokenizerKeys = TokenizerKeys { ggml: TokenizerGgmlKeys { tokens: MetaTokens("tokenizer.ggml.tokens"),
+	token_type: MetaIntArray { path: "tokenizer.ggml.token_type", values: OnceLock::new() } } };
+pub struct ArchScalingKeys { pub factor: MetaReal, pub original_context_length: MetaCount, pub yarn_beta_fast: MetaReal, pub yarn_beta_slow: MetaReal }
+pub struct ArchRopeKeys { pub freq_base: MetaReal, pub dimension_count: MetaCount, pub scaling: ArchScalingKeys }
+pub struct ArchAttentionKeys { pub head_count: MetaCount, pub head_count_kv: MetaCount, pub key_length: MetaCount, pub value_length: MetaCount,
+	pub layer_norm_rms_epsilon: MetaReal, pub compress_ratios: MetaIntArray }
+pub struct ArchKeys { pub embedding_length: MetaCount, pub block_count: MetaCount, pub feed_forward_length: MetaCount, pub context_length: MetaCount,
+	pub vocab_size: MetaCount, pub final_logit_softcapping: MetaReal, pub attention: ArchAttentionKeys, pub rope: ArchRopeKeys }
+pub static arch: ArchKeys = ArchKeys {
+	embedding_length: MetaCount("arch.embedding_length"), block_count: MetaCount("arch.block_count"),
+	feed_forward_length: MetaCount("arch.feed_forward_length"), context_length: MetaCount("arch.context_length"),
+	vocab_size: MetaCount("arch.vocab_size"), final_logit_softcapping: MetaReal("arch.final_logit_softcapping"),
+	attention: ArchAttentionKeys { head_count: MetaCount("arch.attention.head_count"), head_count_kv: MetaCount("arch.attention.head_count_kv"),
+		key_length: MetaCount("arch.attention.key_length"), value_length: MetaCount("arch.attention.value_length"),
+		layer_norm_rms_epsilon: MetaReal("arch.attention.layer_norm_rms_epsilon"),
+		compress_ratios: MetaIntArray { path: "arch.attention.compress_ratios", values: OnceLock::new() } },
+	rope: ArchRopeKeys { freq_base: MetaReal("arch.rope.freq_base"), dimension_count: MetaCount("arch.rope.dimension_count"),
+		scaling: ArchScalingKeys { factor: MetaReal("arch.rope.scaling.factor"), original_context_length: MetaCount("arch.rope.scaling.original_context_length"),
+			yarn_beta_fast: MetaReal("arch.rope.scaling.yarn_beta_fast"), yarn_beta_slow: MetaReal("arch.rope.scaling.yarn_beta_slow") } },
+};
+#[derive(Clone, Copy)]
+pub struct TensorPath { layer: usize, suffix: &'static str }
+impl From<TensorPath> for KeyPath {
+	fn from(path: TensorPath) -> Self { KeyPath::new(vec![KeyPart::from_static("blk"), KeyPart::from_value(path.layer), KeyPart::from_static(path.suffix), KeyPart::from_static("weight")]) }
+}
+pub struct TensorName { pub weight: TensorPath }
+pub struct BlockKeys { pub attn_q: TensorName, pub attn_k: TensorName, pub attn_v: TensorName, pub attn_q_norm: TensorName, pub attn_k_norm: TensorName,
+	pub attn_output: TensorName, pub post_attention_norm: TensorName, pub post_ffw_norm: TensorName, pub ffn_gate_shexp: TensorName,
+	pub ffn_gate: TensorName, pub ffn_up: TensorName, pub ffn_down: TensorName }
+pub struct BlockNamespace(OnceLock<Vec<BlockKeys>>);
+impl std::ops::Index<usize> for BlockNamespace {
+	type Output = BlockKeys;
+	fn index(&self, index: usize) -> &BlockKeys {
+		self.0.get_or_init(|| (0..arch.block_count.get()).map(|layer| {
+			let named = |suffix| TensorName { weight: TensorPath { layer, suffix } };
+			BlockKeys { attn_q: named("attn_q"), attn_k: named("attn_k"), attn_v: named("attn_v"), attn_q_norm: named("attn_q_norm"),
+				attn_k_norm: named("attn_k_norm"), attn_output: named("attn_output"), post_attention_norm: named("post_attention_norm"),
+				post_ffw_norm: named("post_ffw_norm"), ffn_gate_shexp: named("ffn_gate_shexp"), ffn_gate: named("ffn_gate"),
+				ffn_up: named("ffn_up"), ffn_down: named("ffn_down") }
+		}).collect::<Vec<_>>()).get(index).unwrap_or_else(|| panic!("GGUF block {index} is outside arch.block_count in {}", script_file().path.display()))
+	}
+}
+pub static blk: BlockNamespace = BlockNamespace(OnceLock::new());
 /// A width a model file gives as a count or as the vocabulary itself:
 /// `layer(4096)`, `embed(data.array(key!(tokenizer.ggml.tokens)).len(), width)`.
 pub trait Width {
@@ -17244,6 +17434,12 @@ impl Width for usize {
 	fn extent(self) -> usize {
 		self
 	}
+}
+impl Width for MetaCount {
+	fn extent(self) -> usize { self.get() }
+}
+impl Width for MetaTokens {
+	fn extent(self) -> usize { self.len() }
 }
 impl Width for &[String] {
 	fn extent(self) -> usize {
@@ -17258,6 +17454,12 @@ impl Root for usize {
 	fn sqrt(self) -> f64 {
 		(self as f64).sqrt()
 	}
+}
+impl Root for MetaCount {
+	fn sqrt(self) -> f64 { (self.get() as f64).sqrt() }
+}
+impl Root for MetaReal {
+	fn sqrt(self) -> f64 { self.get().sqrt() }
 }
 /// The reply streamed to standard output as it decodes, with the prompt size
 /// and the decode timing on standard error.
@@ -17788,29 +17990,29 @@ impl Sampler {
 		self.draft = count;
 		self
 	}
-	pub fn temperature(mut self, value: f64) -> Self {
-		self.temperature = value;
+	pub fn temperature(mut self, value: impl Real) -> Self {
+		self.temperature = value.real();
 		self
 	}
 	/// Keep the `count` highest logits; zero keeps every id.
-	pub fn top_k(mut self, count: usize) -> Self {
-		self.top_k = count;
+	pub fn top_k(mut self, count: impl Count) -> Self {
+		self.top_k = count.count();
 		self
 	}
 	/// Keep the smallest set of ids whose probability sums to at least `mass`.
-	pub fn top_p(mut self, mass: f64) -> Self {
-		self.top_p = mass;
+	pub fn top_p(mut self, mass: impl Real) -> Self {
+		self.top_p = mass.real();
 		self
 	}
 	/// Drop ids whose probability is below `ratio` times the highest.
-	pub fn min_p(mut self, ratio: f64) -> Self {
-		self.min_p = ratio;
+	pub fn min_p(mut self, ratio: impl Real) -> Self {
+		self.min_p = ratio.real();
 		self
 	}
 	/// Divide positive logits of the last `window` ids by `penalty`, and
 	/// multiply negative ones.
-	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
-		(self.penalty, self.window) = (penalty, window);
+	pub fn repeat(mut self, penalty: impl Real, window: impl Count) -> Self {
+		(self.penalty, self.window) = (penalty.real(), window.count());
 		self
 	}
 	pub fn seed(mut self, seed: u64) -> Self {
@@ -18249,20 +18451,20 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 	let budget = request_number(query, "budget")?.unwrap_or(16);
 	// An absent field keeps the sampler's own default rather than restating it.
 	let mut sampler = recipe.sampler();
-	if let Some(value) = request_number(query, "temperature")? {
+	if let Some(value) = request_number::<f64>(query, "temperature")? {
 		sampler = sampler.temperature(value);
 	}
-	if let Some(value) = request_number(query, "top_k")? {
+	if let Some(value) = request_number::<usize>(query, "top_k")? {
 		sampler = sampler.top_k(value);
 	}
-	if let Some(value) = request_number(query, "top_p")? {
+	if let Some(value) = request_number::<f64>(query, "top_p")? {
 		sampler = sampler.top_p(value);
 	}
-	if let Some(value) = request_number(query, "min_p")? {
+	if let Some(value) = request_number::<f64>(query, "min_p")? {
 		sampler = sampler.min_p(value);
 	}
-	if let Some(value) = request_number(query, "penalty")? {
-		sampler = sampler.repeat(value, request_number(query, "penalty_window")?.unwrap_or(64));
+	if let Some(value) = request_number::<f64>(query, "penalty")? {
+		sampler = sampler.repeat(value, request_number::<usize>(query, "penalty_window")?.unwrap_or(64));
 	}
 	if let Some(value) = request_number(query, "seed")? {
 		sampler = sampler.seed(value);
@@ -28897,10 +29099,11 @@ impl Data {
 		}
 	}
 	/// The tensor descriptor at a dotted path in this data file.
-	pub fn tensor(&self, path: KeyPath) -> GgufTensor {
-		path.tensor(self.gguf()).unwrap_or_else(|error| panic!("{error}"))
+	pub fn tensor(&self, path: impl Into<KeyPath>) -> GgufTensor {
+		path.into().tensor(self.gguf()).unwrap_or_else(|error| panic!("{error}"))
 	}
-	pub fn has_tensor(&self, path: KeyPath) -> bool {
+	pub fn has_tensor(&self, path: impl Into<KeyPath>) -> bool {
+		let path = path.into().resolved(self.gguf()).unwrap_or_else(|error| panic!("{error}"));
 		self.gguf().tensors().iter().any(|tensor| path.matches(&tensor.name, true))
 	}
 	pub fn ngram(&self) -> Ngram<'_> {
