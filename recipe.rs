@@ -9835,6 +9835,12 @@ mod gguf {
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
 			decode(tensor, self.data(tensor), tensor.elements())
 		}
+		pub(super) fn scalar(&self, tensor: &GgufTensor) -> Result<f64> {
+			require(tensor.elements() == 1, format!("{} holds {} values, not one scalar", tensor.name, tensor.elements()))?;
+			let value = self.values(tensor)?[0];
+			require(value.is_finite(), format!("{} is nonfinite", tensor.name))?;
+			Ok(value)
+		}
 		/// Row `index` of a tensor whose rows are its first dimension, decoded from
 		/// that row's own bytes so a table larger than memory reads only the rows it
 		/// addresses.
@@ -16646,10 +16652,7 @@ impl<'a> Builder<'a> {
 			let branch = builder.post(layer, "ffn", branch, &dimensions)?;
 			model = builder.close(model, branch, &dimensions);
 			if let Some(scale) = builder.optional(&format!("blk.{layer}.layer_output_scale.weight")) {
-				require(scale.elements() == 1, format!("{} holds {} values; block {layer} output scale is one value", scale.name, scale.elements()))?;
-				let value = file.values(&scale)?[0];
-				require(value.is_finite(), format!("{} is nonfinite", scale.name))?;
-				model = model.scale(value);
+				model = model.scale(file.scalar(&scale)?);
 			}
 		}
 		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
@@ -16667,13 +16670,10 @@ impl<'a> Builder<'a> {
 			model = model.norm(rms);
 			builder.mapped(vec![scale]);
 		}
-		model = model.layer(vocabulary);
-		// A file without an output tensor ties the output to the embedding.
-		let output = match builder.optional("output.weight") {
-			Some(output) => output,
-			None => embedding,
-		};
-	builder.mapped(vec![output]);
+		let head = if builder.file.tensor("output.weight").is_some() { tensor::output.weight } else { tensor::token_embd.weight };
+		model = model.layer(vocabulary).bind(head);
+		let output = builder.layer_projection(model.blocks.last().unwrap(), "", "the output", dimensions.width, vocabulary)?;
+		builder.mapped(vec![output]);
 		if builder.present("final_logit_softcapping") {
 			let cap = file.float_at(&builder.key("final_logit_softcapping"))?;
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
@@ -17407,10 +17407,25 @@ pub struct TensorPath { layer: usize, suffix: &'static str }
 impl From<TensorPath> for KeyPath {
 	fn from(path: TensorPath) -> Self { KeyPath::new(vec![KeyPart::from_static("blk"), KeyPart::from_value(path.layer), KeyPart::from_static(path.suffix), KeyPart::from_static("weight")]) }
 }
+#[derive(Clone, Copy)]
+pub struct RootTensorPath(&'static str);
+impl From<RootTensorPath> for KeyPath {
+	fn from(path: RootTensorPath) -> Self {
+		KeyPath::new(vec![KeyPart::from_static(path.0), KeyPart::from_static("weight")])
+	}
+}
+pub struct RootTensorName {
+	pub weight: RootTensorPath,
+}
+pub mod tensor {
+	use super::{RootTensorName, RootTensorPath};
+	pub const token_embd: RootTensorName = RootTensorName { weight: RootTensorPath("token_embd") };
+	pub const output: RootTensorName = RootTensorName { weight: RootTensorPath("output") };
+}
 pub struct TensorName { pub weight: TensorPath }
 pub struct BlockKeys { pub attn_q: TensorName, pub attn_k: TensorName, pub attn_v: TensorName, pub attn_q_norm: TensorName, pub attn_k_norm: TensorName,
 	pub attn_output: TensorName, pub post_attention_norm: TensorName, pub post_ffw_norm: TensorName, pub ffn_gate_shexp: TensorName,
-	pub ffn_gate: TensorName, pub ffn_up: TensorName, pub ffn_down: TensorName }
+	pub ffn_gate: TensorName, pub ffn_up: TensorName, pub ffn_down: TensorName, pub layer_output_scale: TensorName }
 pub struct BlockNamespace(OnceLock<Vec<BlockKeys>>);
 impl std::ops::Index<usize> for BlockNamespace {
 	type Output = BlockKeys;
@@ -17420,7 +17435,7 @@ impl std::ops::Index<usize> for BlockNamespace {
 			BlockKeys { attn_q: named("attn_q"), attn_k: named("attn_k"), attn_v: named("attn_v"), attn_q_norm: named("attn_q_norm"),
 				attn_k_norm: named("attn_k_norm"), attn_output: named("attn_output"), post_attention_norm: named("post_attention_norm"),
 				post_ffw_norm: named("post_ffw_norm"), ffn_gate_shexp: named("ffn_gate_shexp"), ffn_gate: named("ffn_gate"),
-				ffn_up: named("ffn_up"), ffn_down: named("ffn_down") }
+				ffn_up: named("ffn_up"), ffn_down: named("ffn_down"), layer_output_scale: named("layer_output_scale") }
 		}).collect::<Vec<_>>()).get(index).unwrap_or_else(|| panic!("GGUF block {index} is outside arch.block_count in {}", script_file().path.display()))
 	}
 }
@@ -17743,8 +17758,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// names: `token_embd`, then per block `attn_norm`, `attn_q`, `attn_k`,
 /// `attn_v`, `attn_q_norm`, `attn_k_norm`, `attn_output`,
 /// `post_attention_norm`, `ffn_norm`, `ffn_gate`, `ffn_up`, `ffn_down` and
-/// `post_ffw_norm`, then `output_norm` and `output`, the last tied to the
-/// embedding when the file has none. The walk follows the order the lowering
+/// `post_ffw_norm`, then the explicitly bound output layer. The walk follows the order the lowering
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	fn explicitly_bound(block: &Block) -> bool {
@@ -17886,21 +17900,9 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 			}
 			Operation::Layer(outputs) => {
 				require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after a layer has no tensor name")?;
-				if block.weight.is_some() {
-					let tensor = builder.layer_projection(block, "", "a layer", channels, *outputs)?;
-					builder.mapped(vec![tensor]);
-				} else {
-					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
-					let output = match builder.optional("output.weight") {
-						Some(output) => output,
-						None => embedding.clone(),
-					};
-					require(
-						output.shape.len() == 2 && output.shape[0] as usize == channels && output.shape[1] as usize == vocabulary,
-						format!("{} has shape {:?}; the vocabulary projection contracts {channels} inputs into {vocabulary} outputs", output.name, output.shape),
-					)?;
-					builder.mapped(vec![output]);
-				}
+				require(block.weight.is_some(), format!("layer({outputs}) needs .bind(output.weight) or .bind(token_embd.weight) to name its GGUF tensor"))?;
+				let tensor = builder.layer_projection(block, "", "a layer", channels, *outputs)?;
+				builder.mapped(vec![tensor]);
 				channels = *outputs;
 			}
 			Operation::Identity | Operation::Last => require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization outside the blocks has no tensor name")?,
@@ -29101,6 +29103,11 @@ impl Data {
 	/// The tensor descriptor at a dotted path in this data file.
 	pub fn tensor(&self, path: impl Into<KeyPath>) -> GgufTensor {
 		path.into().tensor(self.gguf()).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// A one-element GGUF tensor used as a scalar in the model definition.
+	pub fn scalar(&self, path: impl Into<KeyPath>) -> f64 {
+		let tensor = self.tensor(path);
+		self.gguf().scalar(&tensor).unwrap_or_else(|error| panic!("{error}"))
 	}
 	pub fn has_tensor(&self, path: impl Into<KeyPath>) -> bool {
 		let path = path.into().resolved(self.gguf()).unwrap_or_else(|error| panic!("{error}"));

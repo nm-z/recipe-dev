@@ -1,5 +1,6 @@
 use recipe::*;
 use recipe::infer::{cached, input, out, pp, tg, time};
+use recipe::tensor::token_embd;
 
 const GGUF: &str = "/home/nate/.lmstudio/models/lmstudio-community/rnj-1-instruct-GGUF/rnj-1-instruct-Q4_K_M.gguf";
 // llama.cpp's Gemma3 loader uses this architecture default and ignores the
@@ -49,7 +50,7 @@ fn main() {
 
 	model = model
 		.norm(rms).fp(16)
-		.layer(tokenizer.ggml.tokens).int(8)
+		.layer(tokenizer.ggml.tokens).bind(token_embd.weight).int(8)
 		.scale(1.0 / arch.final_logit_softcapping).fp(16)
 		.tanh().fp(16)
 		.scale(arch.final_logit_softcapping).fp(16);

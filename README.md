@@ -63,6 +63,18 @@ let shape = data.tensor(blk[3].attn_q.weight).shape;
 let attention = attn(24).q(blk[3].attn_q.weight);
 ```
 
+```rust
+use recipe::tensor::{output, token_embd};
+let input = recipe.model()
+	.embed(tokenizer.ggml.tokens, arch.embedding_length)
+	.scale(arch.embedding_length.sqrt());
+let tied = input.layer(tokenizer.ggml.tokens).bind(token_embd.weight)
+	.scale(1.0 / arch.final_logit_softcapping).tanh()
+	.scale(arch.final_logit_softcapping);
+let separate = input.layer(tokenizer.ggml.tokens).bind(output.weight);
+model = model.scale(data.scalar(blk[layer].layer_output_scale.weight));
+```
+
 ```rb
 attn(heads).int(8)
 	.kv(kv_heads).fp(16)
