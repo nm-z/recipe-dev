@@ -3229,6 +3229,9 @@ mod quantized {
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int;
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value;
+		/// One 64-bit word of a table built at emission, such as a grid entry's
+		/// levels packed a byte each: the values that share an entry share its load.
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int;
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value;
 		fn literal(&self, value: f64) -> Self::Value;
 		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value;
@@ -3404,13 +3407,14 @@ mod quantized {
 			}
 			_ => unreachable!(),
 		};
-		// Every grid word expanded to its levels' values: one load per weight
-		// instead of the word, its code, the level, and a conversion.
+		// Every grid entry's levels, a byte each in one word: the values of one
+		// entry share one load, and each takes its byte.
 		let lanes = if layout.man == 2 { 8 } else { 4 };
-		let expanded = layout.table.iter().flat_map(|word| (0..lanes).map(move |lane| f64::from(layout.levels[(word >> (lane * layout.man as usize)) as usize & ((1 << layout.man) - 1)]))).collect::<Vec<_>>();
-		let entry = quant_int(quant, QuantIntOp::Multiply, grid, lanes as u64);
-		let entry = quant.int(QuantIntOp::Add, entry, table_lane);
-		let mantissa = quant.value_table(&format!("{}_values", layout.table_name), &expanded, entry);
+		let packed = layout.table.iter().map(|word| (0..lanes).fold(0_u64, |packed, lane| packed | u64::from(layout.levels[(word >> (lane * layout.man as usize)) as usize & ((1 << layout.man) - 1)]) << (8 * lane))).collect::<Vec<_>>();
+		let entry = quant.word_table(&format!("{}_levels", layout.table_name), &packed, grid);
+		let shift = quant_int(quant, QuantIntOp::Multiply, table_lane, 8);
+		let level = quant_bits(quant, entry, shift, 8);
+		let mantissa = quant.number(level, false);
 		let exponent = if odd_factor {
 			let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
 			let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
@@ -3840,6 +3844,9 @@ mod quantized {
 		fn signed_table(&mut self, _name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
 			values[index as usize] as i64 as u64
 		}
+		fn word_table(&mut self, _name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			values[index as usize]
+		}
 		fn value_table(&mut self, _name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			values[index as usize]
 		}
@@ -3970,6 +3977,17 @@ mod quantized {
 			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
 			let loaded = self.instruction(format!("load i8, ptr addrspace(1) {address}, align 1, !invariant.load !{{}}"));
 			self.instruction(format!("sext i8 {loaded} to i64"))
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+				self.globals.push_str(&format!(
+					"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i64] [{}]\n",
+					values.len(),
+					values.iter().map(|value| format!("i64 {}", *value as i64)).collect::<Vec<_>>().join(", ")
+				));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i64], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load i64, ptr addrspace(1) {address}, align 8, !invariant.load !{{}}"))
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -4202,6 +4220,20 @@ mod quantized {
 			match index {
 				RunInt::Known(index) => RunInt::Known(i64::from(values[index as usize]) as u64),
 				RunInt::Ir(index) => RunInt::Ir(self.inner.signed_table(name, values, index)),
+			}
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(values[index as usize]),
+				RunInt::Ir(index) => {
+					let key = (format!("words {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.word_table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
 			}
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
