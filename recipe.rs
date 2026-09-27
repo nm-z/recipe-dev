@@ -4742,11 +4742,11 @@ impl NativeModelIr {
 					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
 					let kept_bytes = self.layout.kept.iter().find(|(live, ..)| *live == self.layout.contexts[index]).map_or(0, |(.., bytes)| *bytes);
 					emit_runtime_window_loop(&mut ir, index, "dconv.history", channels, &whole, |ir, _p, wide| {
-						// In a window of several positions, the history after each of its
-						// first positions is kept before the live history moves past them.
+						// The history after each of the window's first positions but its
+						// last is kept before the live history moves past them.
 						let p = format!("n{index}.dconv.keep");
 						ir.push_str(&format!(
-							"br label %{p}.entry\n{p}.entry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.next, %{p}.step ]\n%{p}.more = icmp ult i32 %{p}.j, {slots}\n%{p}.reached = icmp ult i32 %{p}.j, {span}\n%{p}.several = icmp ugt i32 {span}, 1\n%{p}.early = and i1 %{p}.more, %{p}.reached\n%{p}.go = and i1 %{p}.early, %{p}.several\nbr i1 %{p}.go, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.span = add i32 %{p}.j, 1\n%{p}.j.wide = zext i32 %{p}.j to i64\n%{p}.at = mul i64 %{p}.j.wide, {kept_bytes}\n%{p}.target = getelementptr i8, {pointer} {kept}, i64 %{p}.at\ncall void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} %{p}.target, i64 {wide}, i32 {length}, i32 %{p}.span, i32 {tail}, i1 %n{index}.dconv.fresh )\n%{p}.next = add i32 %{p}.j, 1\nbr label %{p}.loop\n{p}.done:\n",
+							"br label %{p}.entry\n{p}.entry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.next, %{p}.step ]\n%{p}.more = icmp ult i32 %{p}.j, {slots}\n%{p}.last = sub i32 {span}, 1\n%{p}.inner = icmp ult i32 %{p}.j, %{p}.last\n%{p}.go = and i1 %{p}.more, %{p}.inner\nbr i1 %{p}.go, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.span = add i32 %{p}.j, 1\n%{p}.j.wide = zext i32 %{p}.j to i64\n%{p}.at = mul i64 %{p}.j.wide, {kept_bytes}\n%{p}.target = getelementptr i8, {pointer} {kept}, i64 %{p}.at\ncall void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} %{p}.target, i64 {wide}, i32 {length}, i32 %{p}.span, i32 {tail}, i1 %n{index}.dconv.fresh )\n%{p}.next = add i32 %{p}.j, 1\nbr label %{p}.loop\n{p}.done:\n",
 							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
 						));
 						ir.push_str(&format!(

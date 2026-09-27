@@ -4155,10 +4155,10 @@ time.step:
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
 call void @delta_column( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i64 %k.base, i64 %v.base, i64 %q.base, i64 %o.base, i64 %work.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %time.local, i32 %column, double %decay, double %write, i1 true, double %scale )
-; In a window of several positions, the first %slots each leave a copy of the
-; column's state to take back to.
+; Each of a window's first %slots positions but its last leaves a copy of the
+; column's state to take back to; the last one's state is the live one.
 %kept.slot = sub i32 %time, %begin %kept.early = icmp ult i32 %kept.slot, %slots
-%kept.span = sub i32 %end, %begin %kept.several = icmp ugt i32 %kept.span, 1 %kept.now = and i1 %kept.early, %kept.several
+%kept.span = sub i32 %end, %begin %kept.last = sub i32 %kept.span, 1 %kept.inner = icmp ult i32 %kept.slot, %kept.last %kept.now = and i1 %kept.early, %kept.inner
 br i1 %kept.now, label %keep, label %kept.done
 keep: %kept.slot.wide = zext i32 %kept.slot to i64 %kept.pairs = zext i32 %pairs to i64 %kept.stride = mul i64 %kept.pairs, %state %kept.at = mul i64 %kept.slot.wide, %kept.stride
 call void @delta_keep( ptr addrspace(1) %context, ptr addrspace(1) %kept, i64 %work.base, i64 %kept.at, i32 %kwidth, i64 %vwidth.wide, i64 %column.wide )
