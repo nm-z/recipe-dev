@@ -11940,6 +11940,7 @@ mod bundle {
 		Ok(Block {
 			operation: operation(&fields[0])?,
 			weight: None,
+			weight_rows: None,
 			maps: if fields[1].is_empty() { Vec::new() } else { fields[1].split('~').map(map).collect::<Result<Vec<_>>>()? },
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?,
 			quantization: value_at(Some(&fields[2]), "block quantization")?,
@@ -12771,6 +12772,9 @@ impl KeyPath {
 	pub fn new(parts: Vec<KeyPart>) -> Self {
 		Self(parts)
 	}
+	fn from_name(name: &str) -> Self {
+		Self(name.split('.').map(|part| KeyPart::Static(part.to_owned())).collect())
+	}
 	fn text(&self) -> String {
 		self.0.iter().map(KeyPart::text).collect::<Vec<_>>().join(".")
 	}
@@ -12790,11 +12794,8 @@ impl KeyPath {
 			false
 		}
 		let path = self.0.iter().map(|part| part.text().to_owned()).collect::<Vec<_>>();
-		let mut key = name.split('.').collect::<Vec<_>>();
-		if implicit_weight && key.last() == Some(&"weight") {
-			key.pop();
-		}
-		match_parts(&path, 0, &key, 0)
+		let key = name.split('.').collect::<Vec<_>>();
+		match_parts(&path, 0, &key, 0) || implicit_weight && key.last() == Some(&"weight") && match_parts(&path, 0, &key[..key.len() - 1], 0)
 	}
 	fn metadata<'a>(&self, file: &'a Gguf) -> Result<&'a GgufValue> {
 		let found = file.metadata().iter().filter(|(name, _)| self.matches(name, false)).collect::<Vec<_>>();
@@ -13314,8 +13315,10 @@ macro_rules! precision_methods {
 #[derive(Clone, Debug)]
 pub struct Block {
 	operation: Operation,
-	/// The GGUF tensor whose rows supply a layer's weight.
+	/// The GGUF tensor that supplies this weighted operation.
 	weight: Option<KeyPath>,
+	/// A view of consecutive output rows in the bound tensor.
+	weight_rows: Option<(usize, usize)>,
 	maps: Vec<OutputMap>,
 	/// The per-head normalization of the attention queries and keys.
 	qk: Option<BlockNormalization>,
@@ -13380,6 +13383,7 @@ impl PartialEq for Block {
 	fn eq(&self, other: &Self) -> bool {
 		self.operation == other.operation
 			&& self.weight == other.weight
+			&& self.weight_rows == other.weight_rows
 			&& self.maps == other.maps
 			&& self.qk == other.qk
 			&& self.quantization == other.quantization
@@ -13410,7 +13414,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
-			operation, weight: None, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
+			operation, weight: None, weight_rows: None, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
 			kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
 		}
 	}
@@ -13442,10 +13446,18 @@ impl Block {
 	pub fn q(self, path: KeyPath) -> Self { self.attention("q", |attention| attention.query = Some(path)) }
 	pub fn k(self, path: KeyPath) -> Self { self.attention("k", |attention| attention.key = Some(path)) }
 	pub fn v(self, path: KeyPath) -> Self { self.attention("v", |attention| attention.value = Some(path)) }
-	/// Bind this layer's weight to one GGUF tensor path.
+	/// Bind this layer or depthwise convolution to one GGUF tensor path.
 	pub fn bind(mut self, path: KeyPath) -> Self {
-		assert!(matches!(self.operation, Operation::Layer(_)), "weight binding requires a layer");
+		assert!(matches!(self.operation, Operation::Layer(_) | Operation::Dconv(..)), "weight binding requires a layer or depthwise convolution");
 		self.weight = Some(path);
+		self.weight_rows = None;
+		self
+	}
+	/// Select `count` output rows starting at `start` from a bound layer tensor.
+	pub fn rows(mut self, start: usize, count: usize) -> Self {
+		assert!(matches!(self.operation, Operation::Layer(_)) && self.weight.is_some(), "row selection requires a bound layer");
+		assert!(count != 0, "row selection requires a positive count");
+		self.weight_rows = Some((start, count));
 		self
 	}
 	/// Head width of this `attn` block. Without it, the width comes from the
@@ -13686,6 +13698,7 @@ impl Model {
 			model.blocks.push(Block {
 				operation,
 				weight: None,
+				weight_rows: None,
 				maps: Vec::new(),
 				qk: None,
 				quantization: 0,
@@ -13759,11 +13772,18 @@ impl Model {
 	pub fn q(&self, path: KeyPath) -> Self { self.attention("q", |block| block.q(path)) }
 	pub fn k(&self, path: KeyPath) -> Self { self.attention("k", |block| block.k(path)) }
 	pub fn v(&self, path: KeyPath) -> Self { self.attention("v", |block| block.v(path)) }
-	/// Bind the preceding layer's weight to one GGUF tensor path.
+	/// Bind the preceding layer or depthwise convolution to one GGUF tensor path.
 	pub fn bind(&self, path: KeyPath) -> Self {
 		self.suffix().edit(|model| {
-			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding layer"));
+			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding weighted block"));
 			model.blocks.push(block.bind(path));
+		})
+	}
+	/// Select a consecutive output-row view of the preceding bound layer.
+	pub fn rows(&self, start: usize, count: usize) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.pop().unwrap_or_else(|| panic!("row selection requires a preceding bound layer"));
+			model.blocks.push(block.rows(start, count));
 		})
 	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
@@ -15625,10 +15645,26 @@ impl std::ops::Mul for Block {
 		))
 	}
 }
+impl std::ops::Mul<Block> for Model {
+	type Output = Block;
+	fn mul(self, right: Block) -> Block {
+		let left = (*self.inner).clone();
+		assert!(!left.blocks.is_empty(), "the left product branch has no blocks");
+		assert!(!left.pending_frozen, "product branch qualifier requires a following block");
+		Block::of(Operation::Product(
+			ProductBranch { blocks: left.blocks, exclusions: left.exclusions },
+			ProductBranch { blocks: vec![right], exclusions: 0 },
+		))
+	}
+}
 impl Block {
 	/// Continues a standalone block with an output projection.
 	pub fn layer(self, width: impl Width) -> Model {
 		recipe.model().edit(|model| model.blocks.push(self)).layer(width)
+	}
+	/// Continues a standalone block with a depthwise convolution.
+	pub fn dconv(self, kernel: usize) -> Model {
+		recipe.model().edit(|model| model.blocks.push(self)).dconv(kernel)
 	}
 }
 pub struct Recipe;
@@ -16729,9 +16765,49 @@ impl<'a> Builder<'a> {
 	}
 	fn layer_projection(&mut self, block: &Block, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
 		match &block.weight {
-			Some(path) => self.projection_path(path, role, inputs, outputs),
+			Some(path) => {
+				let mut tensor = self.keyed_tensor(path, role)?;
+				if let Some((start, count)) = block.weight_rows {
+					require(
+						tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && count == outputs,
+						format!("{} has shape {:?}; {role} selects {count} rows for a {inputs} by {outputs} projection", tensor.name, tensor.shape),
+					)?;
+					tensor = tensor.rows(start, count)?;
+				}
+				require(
+					tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
+					format!("{} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.name, tensor.shape),
+				)?;
+				Ok(tensor)
+			}
 			None => self.projection(name, role, inputs, outputs),
 		}
+	}
+	/// Bind ordinary, explicitly named blocks in the order lowering visits them.
+	fn bound_fragment(&mut self, blocks: &[Block], mut channels: usize) -> Result<usize> {
+		for block in blocks {
+			match &block.operation {
+				Operation::Layer(outputs) => {
+					let tensor = self.layer_projection(block, "", "a bound layer", channels, *outputs)?;
+					self.mapped(vec![tensor]);
+					channels = *outputs;
+				}
+				Operation::Dconv(kernel, _) => {
+					let path = block.weight.as_ref().ok_or_else(|| RecipeError::new("a bound depthwise convolution needs a tensor path"))?;
+					let tensor = self.keyed_tensor(path, "a bound depthwise convolution")?;
+					require(tensor.shape == [*kernel as u64, channels as u64], format!("{} has shape {:?}; a depthwise convolution needs [{kernel}, {channels}]", tensor.name, tensor.shape))?;
+					self.mapped(vec![tensor]);
+				}
+				Operation::Product(left, right) => {
+					let left_channels = self.bound_fragment(&left.blocks, channels)?;
+					let right_channels = self.bound_fragment(&right.blocks, channels)?;
+					require(left_channels == right_channels, format!("product branches produce {left_channels} and {right_channels} channels"))?;
+					channels = left_channels;
+				}
+				other => return Err(RecipeError::new(format!("{} has no ordinary tensor binding", other.name()))),
+			}
+		}
+		Ok(channels)
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize) -> Result<Vec<Plane>> {
@@ -16832,37 +16908,18 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![output]);
 		Ok(block.layer(width))
 	}
-	/// LFM2 short convolution: project B, C and X in one stored tensor, run
-	/// `C * depthwise_conv(B * X)`, then project back to the residual width.
 	fn shortconv(&mut self, branch: Model, layer_index: usize, dimensions: &Dimensions) -> Result<Model> {
 		let width = dimensions.width;
 		let kernel = dimensions.shortconv.ok_or_else(|| RecipeError::new("the architecture names no short-convolution cache"))?;
 		require(kernel > 1, "short-convolution cache must cover the current position and at least one prior position")?;
 		let name = |suffix: &str| format!("blk.{layer_index}.{suffix}");
-		let role = format!("block {layer_index} short convolution");
-		let input = self.tensor(&name("shortconv.in_proj.weight"), &role)?;
-		require(input.shape == [width as u64, (3 * width) as u64], format!("{} has shape {:?}; {role} projects three {width}-wide planes", input.name, input.shape))?;
-		let b = input.rows(0, width)?;
-		let c = input.rows(width, width)?;
-		let x = input.rows(2 * width, width)?;
-		let taps = self.tensor(&name("shortconv.conv.weight"), &role)?;
-		require(taps.shape == [kernel as u64, width as u64], format!("{} has shape {:?}; {role} holds {kernel} taps for {width} channels", taps.name, taps.shape))?;
-		let output = self.projection(&name("shortconv.out_proj.weight"), &role, width, width)?;
-		// Lowering walks the nested product's left branch first: B, X, taps,
-		// then the right C branch, followed by the output projection.
-		self.mapped(vec![b]);
-		self.mapped(vec![x]);
-		self.mapped(vec![taps]);
-		self.mapped(vec![c]);
-		self.mapped(vec![output]);
-		let bx = layer(width) * layer(width);
-		let dconv = Block::of(Operation::Dconv(kernel, 1));
-		let short = Block::of(Operation::Product(
-			ProductBranch { blocks: vec![bx, dconv], exclusions: 0 },
-			ProductBranch { blocks: vec![layer(width)], exclusions: 0 },
-		));
-		let branch = branch.edit(|model| model.blocks.push(short));
-		Ok(branch.layer(width))
+		let input = KeyPath::from_name(&name("shortconv.in_proj.weight"));
+		let short = ((layer(width).bind(input.clone()).rows(0, width) * layer(width).bind(input.clone()).rows(2 * width, width))
+			.dconv(kernel).bind(KeyPath::from_name(&name("shortconv.conv.weight")))
+			* layer(width).bind(input).rows(width, width))
+			.layer(width).bind(KeyPath::from_name(&name("shortconv.out_proj.weight")));
+		require(self.bound_fragment(&short.blocks, width)? == width, "short convolution changes the residual width")?;
+		Ok(branch.edit(|model| model.blocks.extend(short.blocks.iter().cloned())))
 	}
 	/// One gated delta rule block and the plan of its gate projection, its
 	/// query-key-value projection, its convolution taps, its decay, its output
@@ -17508,6 +17565,14 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// embedding when the file has none. The walk follows the order the lowering
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
+	fn explicitly_bound(block: &Block) -> bool {
+		match &block.operation {
+			Operation::Identity => true,
+			Operation::Layer(_) | Operation::Dconv(..) => block.weight.is_some(),
+			Operation::Product(left, right) => left.blocks.iter().all(explicitly_bound) && right.blocks.iter().all(explicitly_bound),
+			_ => false,
+		}
+	}
 	// Architecture-built models carry tensor arrangements beyond the flat
 	// residual convention, including hyper-connections and per-layer embeddings.
 	if model.blocks.iter().any(|block| matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..))) {
@@ -17535,7 +17600,8 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 			}
 			Operation::Residual(parts) => {
 				require(channels == width, format!("a residual receives {channels} channels, but this GGUF declares {width}"))?;
-				let attends = parts.iter().any(|part| match &part.operation {
+				let explicit = parts.iter().all(explicitly_bound) && parts.iter().any(|part| !matches!(part.operation, Operation::Identity));
+				let attends = explicit || parts.iter().any(|part| match &part.operation {
 					Operation::Attention(_) => true,
 					Operation::Product(left, _) => left.blocks.iter().any(|block| matches!(block.operation, Operation::Attention(_))),
 					_ => false,
@@ -17547,6 +17613,24 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
 				let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 				let role = format!("block {layer} feed-forward");
+				if explicit {
+					let mut bound = false;
+					for step in parts {
+						if !matches!(step.operation, Operation::Identity) {
+							require(builder.bound_fragment(std::slice::from_ref(step), width)? == width, format!("block {layer} bound fragment changes the residual width"))?;
+							bound = true;
+						}
+						for map in &step.maps {
+							if matches!(map.kind, MapKind::Normalization(_)) {
+								builder.norm_scale(&name(if bound { "post_attention_norm.weight" } else { "attn_norm.weight" }), width)?;
+							}
+						}
+					}
+					for map in &block.maps {
+						if matches!(map.kind, MapKind::Normalization(_)) { builder.norm_scale("output_norm.weight", width)?; }
+					}
+					continue;
+				}
 				let (mut weighted, mut hidden, mut attention_inner) = (false, 0, None);
 				for step in parts {
 					match &step.operation {
@@ -17620,8 +17704,8 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 			}
 			Operation::Layer(outputs) => {
 				require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after a layer has no tensor name")?;
-				if let Some(path) = &block.weight {
-					let tensor = builder.projection_path(path, "a layer", channels, *outputs)?;
+				if block.weight.is_some() {
+					let tensor = builder.layer_projection(block, "", "a layer", channels, *outputs)?;
 					builder.mapped(vec![tensor]);
 				} else {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
@@ -28762,6 +28846,10 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	}
 }
 impl Data {
+	/// The GGUF opened by `recipe.data(path)`.
+	pub fn gguf(&self) -> &Gguf {
+		self.file.as_ref().expect("GGUF access requires recipe.data(\"<model>.gguf\")")
+	}
 	fn report_path(&self) -> Result<String> {
 		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
 		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;

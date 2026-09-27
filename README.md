@@ -168,6 +168,15 @@ prec:
 ```
 
 ```rust
+let w = blk[layer].shortconv.in_proj.weight;
+let short = ((layer(width).bind(w.clone()).rows(0, width)
+	* layer(width).bind(w.clone()).rows(2 * width, width))
+	.dconv(kernel).bind(blk[layer].shortconv.conv.weight)
+	* layer(width).bind(w).rows(width, width))
+	.layer(width).bind(blk[layer].shortconv.out_proj.weight);
+```
+
+```rust
 let expert = [
 	layer(640).silu() * layer(640),
 	layer(2560),
