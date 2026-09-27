@@ -361,7 +361,11 @@ jobs:
     name: linux/nv
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 120
+    concurrency:
+      # Every AWS GPU job shares the account's G/VT vCPU quota; one runs at a time.
+      group: recipe-aws-gpu
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write

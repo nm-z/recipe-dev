@@ -321,32 +321,62 @@ else
 fi
 
 echo "== launching the $INSTANCE_TYPE instance =="
+# The account's on-demand G/VT vCPU quota is shared with every other GPU instance in the
+# region, including ones still shutting down. A launch it refuses waits for that capacity
+# to be released, up to CAPACITY_WAIT_SECONDS, and reports what holds it if it never is.
+CAPACITY_WAIT_SECONDS="${CAPACITY_WAIT_SECONDS:-1200}"
+gpu_holders() {
+	aws ec2 describe-instances --region "$AWS_REGION" \
+		--filters Name=instance-state-name,Values=pending,running,shutting-down,stopping Name=instance-type,Values='g*,vt*' \
+		--query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore,LaunchTime,Tags[?Key==`Name`]|[0].Value]' \
+		--output text 2>&1 || true
+}
+gpu_quota="$(aws service-quotas get-service-quota --region "$AWS_REGION" --service-code ec2 --quota-code L-DB2E81BA --query Quota.Value --output text 2>/dev/null || echo unknown)"
+capacity_started="$(date +%s)"
 instance_id=""
-for subnet in $subnets; do
-	if launch_output="$(aws ec2 run-instances --region "$AWS_REGION" \
-		--image-id "$ami_id" \
-		--instance-type "$INSTANCE_TYPE" \
-		--count 1 \
-		--network-interfaces "DeviceIndex=0,SubnetId=$subnet,AssociatePublicIpAddress=true,DeleteOnTermination=true" \
-		--block-device-mappings "DeviceName=$root_device,Ebs={VolumeSize=$ROOT_VOLUME_GB,VolumeType=gp3,DeleteOnTermination=true}" \
-		--instance-initiated-shutdown-behavior terminate \
-		--metadata-options HttpTokens=required \
-		--user-data file://user-data.sh \
-		--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$s3_prefix},{Key=recipe-run,Value=$request_key}]" \
-		--query 'Instances[0].InstanceId' --output text 2>&1)"; then
-		instance_id="$launch_output"
-		break
+while [ -z "$instance_id" ]; do
+	quota_refused=false
+	for subnet in $subnets; do
+		if launch_output="$(aws ec2 run-instances --region "$AWS_REGION" \
+			--image-id "$ami_id" \
+			--instance-type "$INSTANCE_TYPE" \
+			--count 1 \
+			--network-interfaces "DeviceIndex=0,SubnetId=$subnet,AssociatePublicIpAddress=true,DeleteOnTermination=true" \
+			--block-device-mappings "DeviceName=$root_device,Ebs={VolumeSize=$ROOT_VOLUME_GB,VolumeType=gp3,DeleteOnTermination=true}" \
+			--instance-initiated-shutdown-behavior terminate \
+			--metadata-options HttpTokens=required \
+			--user-data file://user-data.sh \
+			--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$s3_prefix},{Key=recipe-run,Value=$request_key}]" \
+			--query 'Instances[0].InstanceId' --output text 2>&1)"; then
+			instance_id="$launch_output"
+			break
+		fi
+		printf '%s\n' "$launch_output" >&2
+		case "$launch_output" in
+			*InsufficientInstanceCapacity*|*Unsupported*) echo "no $INSTANCE_TYPE capacity in $subnet; trying the next subnet" >&2 ;;
+			*VcpuLimitExceeded*) quota_refused=true; break ;;
+			*PendingVerification*|*OptInRequired*) blocker aws-account-pending "AWS has not finished verifying the account for EC2 in $AWS_REGION." "Wait for AWS to complete account verification, then rerun." ;;
+			*UnauthorizedOperation*|*AccessDenied*) blocker aws-permission "The AWS role may not launch EC2 instances." "Allow ec2:RunInstances, ec2:CreateTags, ec2:Describe*, ec2:TerminateInstances, ec2:GetConsoleOutput, ssm:GetParameter and S3 access to the bucket for the AWS_ROLE_ARN role." ;;
+			*) exit 1 ;;
+		esac
+	done
+	[ -z "$instance_id" ] || break
+	waited=$(($(date +%s) - capacity_started))
+	holders="$(gpu_holders)"
+	if [ "$quota_refused" = true ]; then
+		echo "  t=${waited}s the G/VT vCPU quota ($gpu_quota) is occupied by:" >&2
+	else
+		echo "  t=${waited}s no subnet in $AWS_REGION had $INSTANCE_TYPE capacity; GPU instances in the account:" >&2
 	fi
-	printf '%s\n' "$launch_output" >&2
-	case "$launch_output" in
-		*InsufficientInstanceCapacity*|*Unsupported*) echo "no $INSTANCE_TYPE capacity in $subnet; trying the next subnet" >&2 ;;
-		*VcpuLimitExceeded*) blocker aws-gpu-quota "AWS refused $INSTANCE_TYPE: the account's vCPU quota for on-demand G instances in $AWS_REGION is too low." "Request at least 4 vCPUs for 'Running On-Demand G and VT instances' in Service Quotas for $AWS_REGION, then rerun." ;;
-		*PendingVerification*|*OptInRequired*) blocker aws-account-pending "AWS has not finished verifying the account for EC2 in $AWS_REGION." "Wait for AWS to complete account verification, then rerun." ;;
-		*UnauthorizedOperation*|*AccessDenied*) blocker aws-permission "The AWS role may not launch EC2 instances." "Allow ec2:RunInstances, ec2:CreateTags, ec2:Describe*, ec2:TerminateInstances, ec2:GetConsoleOutput, ssm:GetParameter and S3 access to the bucket for the AWS_ROLE_ARN role." ;;
-		*) exit 1 ;;
-	esac
+	printf '%s\n' "${holders:-    none listed}" | sed 's/^/    /' >&2
+	if [ "$waited" -ge "$CAPACITY_WAIT_SECONDS" ]; then
+		if [ "$quota_refused" = true ]; then
+			blocker aws-gpu-quota-occupied "AWS refused $INSTANCE_TYPE for ${CAPACITY_WAIT_SECONDS}s: other GPU instances hold the on-demand G/VT vCPU quota ($gpu_quota) in $AWS_REGION. Holders: $(printf '%s' "$holders" | tr '\t\n' ' ;')" "Terminate the listed instances that no run owns, or raise the quota if they are all in use, then rerun."
+		fi
+		blocker aws-no-capacity "No subnet in $AWS_REGION had $INSTANCE_TYPE capacity for ${CAPACITY_WAIT_SECONDS}s." "Rerun later, or set AWS_REGION to a region with L4 capacity."
+	fi
+	sleep 30
 done
-[ -n "$instance_id" ] || { echo "no subnet in $AWS_REGION had $INSTANCE_TYPE capacity" >&2; exit 1; }
 case "$instance_id" in
 	i-*) ;;
 	*) echo "AWS did not return an instance ID" >&2; exit 1 ;;

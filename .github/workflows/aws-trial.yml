@@ -27,7 +27,10 @@ jobs:
   trial:
     name: aws/l4 trial
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 120
+    concurrency:
+      group: recipe-aws-gpu
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
