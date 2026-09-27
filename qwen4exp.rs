@@ -20,14 +20,16 @@ fn main() {
 		}
 
 		let mut attention = if (block + 1) % 4 == 0 {
-			let mut attention = recipe.model().attn(24).kv(2).head(256);
-			if file.tensor(&format!("blk.{block}.attn_q.weight")).unwrap().shape[1] == 12288 {
-				attention = attention.gate();
-			}
+			let mut attention = attn(24).kv(2).width(256);
 			if file.tensor(&format!("blk.{block}.attn_q_norm.weight")).is_some() {
 				attention = attention.qk(rms);
 			}
-			attention.rope(neox, 64, 10000000.0).index(4, 128, compression[block].max(1), 1).budget(2048)
+			let attention = attention.rope(neox, 64, 10000000.0).index(4, 128, compression[block].max(1), 1);
+			if file.tensor(&format!("blk.{block}.attn_q.weight")).unwrap().shape[1] == 12288 {
+				(attention * layer(6144).sigmoid()).layer(2560)
+			} else {
+				attention.layer(2560)
+			}
 		} else {
 			recipe.model().delta(48, 4).keys(16, 128).values(128).out(2560)
 				.delta_block("activations", |delta| {

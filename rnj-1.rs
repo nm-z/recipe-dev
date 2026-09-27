@@ -32,6 +32,7 @@ fn main() {
 						YARN_FAST,
 						gemma3.rope.scaling.yarn_beta_slow
 					).fp(32),
+				layer(gemma3.embedding_length).int(8),
 				norm(rms).fp(16),
 			]).fp(16)
 			.res([

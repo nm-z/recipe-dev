@@ -8295,13 +8295,12 @@ fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { no
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
 	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
-		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
+		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
 		block = block,
-		gate = node.argument[2] != 0.0,
 		model_ty = precision.model_type,
 		state_ty = precision.state_type,
 		epsilon = native_literal(precision.model, precision.model_type, node.argument[7]),
@@ -11599,14 +11598,13 @@ mod bundle {
 				let unscaled = if attention.unscaled { ",s=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,v2,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
+					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
 					attention.heads,
 					attention.keys,
 					index.heads,
 					index.width,
 					index.block,
 					index.keep,
-					u8::from(attention.gate),
 					attention.width,
 					normalization_text(score_normalization)
 				)
@@ -11661,7 +11659,7 @@ mod bundle {
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")?)?)),
 			"attn" => {
 				let mut fields = rest.split(',');
-				require(fields.next() == Some("v2"), "saved attention record is not current format")?;
+				require(fields.next() == Some("v3"), "saved attention record is not current format")?;
 				let heads = value_at(fields.next(), "attention heads")?;
 				let keys = value_at(fields.next(), "attention key-value heads")?;
 				let dims = value_at::<usize>(fields.next(), "rotary dimensions")?;
@@ -11673,7 +11671,6 @@ mod bundle {
 					keep: value_at(fields.next(), "indexer blocks kept")?,
 					..Indexer::NONE
 				};
-				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
 				let width = value_at(fields.next(), "attention head width")?;
 				let score_normalization = normalization(fields.next(), "indexer scoring normalization")?;
 				let score_dims = value_at(fields.next(), "indexer rotary dimensions")?;
@@ -11722,14 +11719,12 @@ mod bundle {
 					rope: (dims != 0).then_some((layout, dims, base.to_bits())),
 					yarn,
 					index: (index.block != 0).then_some(index),
-					gate,
 					window,
 					factors,
 					unscaled,
 					query: None,
 					key: None,
 					value: None,
-					output: None,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -12904,15 +12899,12 @@ impl Indexer {
 /// The attention head counts: one count for all three, or explicit query, key,
 /// and value counts. The array form is the typed Rust spelling of the three
 /// count API; the scalar form remains the equal-head shorthand.
-/// One attention block: query, key, and value heads, plus the rotary, indexer,
-/// and output-gate selectors.
+/// One attention block: query, key, and value heads, plus the rotary and indexer selectors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AttentionBlock {
 	heads: usize,
-	/// The width of one query, key and value head. `None` derives it from the
-	/// residual width, which is what `attn(heads)` alone has always meant. The
-	/// inferred width rounds up when the residual width is not divisible by the
-	/// query count.
+	/// The width of one query, key, and value head. Zero derives it from the
+	/// input width, rounded up when the query count does not divide it.
 	width: usize,
 	/// The key and value head counts, equal, set by `.kv(heads)`; they divide
 	/// the query count so grouped-query attention has an unambiguous map.
@@ -12922,7 +12914,6 @@ struct AttentionBlock {
 	rope: Option<(RopeLayout, usize, u64)>,
 	yarn: Option<(u64, usize, u64, u64)>,
 	index: Option<Indexer>,
-	gate: bool,
 	/// A sliding layer attends fully only up to this many positions. Longer
 	/// contexts are rejected until the attention kernel carries the mask.
 	window: usize,
@@ -12933,11 +12924,10 @@ struct AttentionBlock {
 	query: Option<KeyPath>,
 	key: Option<KeyPath>,
 	value: Option<KeyPath>,
-	output: Option<KeyPath>,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, gate: false, window: 0, factors: false, unscaled: false, query: None, key: None, value: None, output: None }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, window: 0, factors: false, unscaled: false, query: None, key: None, value: None }
 	}
 }
 /// One gated delta rule block: value heads, the convolution kernel, and the key
@@ -13325,9 +13315,6 @@ impl Block {
 	pub fn q(self, path: KeyPath) -> Self { self.bind_projection(Projection::Q, path) }
 	pub fn k(self, path: KeyPath) -> Self { self.bind_projection(Projection::K, path) }
 	pub fn v(self, path: KeyPath) -> Self { self.bind_projection(Projection::V, path) }
-	pub fn o(self, path: KeyPath) -> Self {
-		self.attention("output projection binding", |attention| attention.output = Some(path))
-	}
 	pub fn bind(self, role: Projection, path: KeyPath) -> Self { self.bind_projection(role, path) }
 	/// Head width of this `attn` block. Without it, the width comes from the
 	/// residual stream and the heads partition the input.
@@ -13365,10 +13352,6 @@ impl Block {
 	/// Sparse key selection on this `attn` block.
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
 		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
-	}
-	/// Sigmoid gate on the output of this `attn` block.
-	pub fn gate(self) -> Self {
-		self.attention("gate", |attention| attention.gate = true)
 	}
 	block_activations! {
 		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
@@ -13581,7 +13564,6 @@ impl Model {
 	pub fn q(&self, path: KeyPath) -> Self { self.attention("q", |block| block.q(path)) }
 	pub fn k(&self, path: KeyPath) -> Self { self.attention("k", |block| block.k(path)) }
 	pub fn v(&self, path: KeyPath) -> Self { self.attention("v", |block| block.v(path)) }
-	pub fn o(&self, path: KeyPath) -> Self { self.attention("o", |block| block.o(path)) }
 	pub fn bind(&self, role: Projection, path: KeyPath) -> Self { self.attention("projection binding", |block| block.bind(role, path)) }
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(branch(parts)))
@@ -13636,8 +13618,7 @@ impl Model {
 		self.attention("kv", |block| block.kv(heads))
 	}
 	/// Head width of the preceding `attn` block, so the heads need not partition
-	/// the stream. The block attends over `heads * width` and its gate spans the
-	/// same width before the output projection returns to the stream.
+	/// the stream. The block outputs `heads * width` channels.
 	pub fn head(&self, width: usize) -> Self {
 		self.attention("head", |block| block.width(width))
 	}
@@ -13693,11 +13674,6 @@ impl Model {
 				None => panic!("{selector} requires a preceding index"),
 			})
 		})
-	}
-	/// Sigmoid gate on the output of the preceding `attn` block, from its own
-	/// projection of the block input.
-	pub fn gate(&self) -> Self {
-		self.attention("gate", |block| block.gate())
 	}
 	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
 	/// through a gated read and takes its output back through gated writes.
@@ -15419,6 +15395,12 @@ impl std::ops::Mul for Block {
 		))
 	}
 }
+impl Block {
+	/// Continues a standalone block with an output projection.
+	pub fn layer(self, width: impl Width) -> Model {
+		recipe.model().edit(|model| model.blocks.push(self)).layer(width)
+	}
+}
 pub struct Recipe;
 pub struct Adamw;
 #[derive(Clone, Copy)]
@@ -16541,14 +16523,12 @@ impl<'a> Builder<'a> {
 		}
 		planes.push(value);
 		let mut block = branch.attn(heads).kv(kv).head(head);
-		// The gate rows of the query tensor bind the gate projection, which lowers
-		// after the attention and its indexer.
+		// The gate rows bind the product's right-branch projection.
 		let mut gate_planes = Vec::new();
 		if gated {
 			for index in 0..heads {
 				gate_planes.push(query.rows(index * stride + head, head)?);
 			}
-			block = block.gate();
 		}
 		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
 		if normalized {
@@ -16598,10 +16578,14 @@ impl<'a> Builder<'a> {
 		}
 		if !gate_planes.is_empty() {
 			self.mapped(gate_planes);
+			block = block.edit(|model| {
+				let attention = model.blocks.pop().unwrap();
+				model.blocks.push(attention * crate::layer(heads * head).sigmoid());
+			});
 		}
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
-		Ok(block)
+		Ok(block.layer(width))
 	}
 	/// LFM2 short convolution: project B, C and X in one stored tensor, run
 	/// `C * depthwise_conv(B * X)`, then project back to the residual width.
@@ -17290,7 +17274,11 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				builder.mapped(vec![embedding.clone()]);
 			}
 			Operation::Residual(parts) => {
-				let attends = parts.iter().any(|part| matches!(part.operation, Operation::Attention(_)));
+				let attends = parts.iter().any(|part| match &part.operation {
+					Operation::Attention(_) => true,
+					Operation::Product(left, _) => left.blocks.iter().any(|block| matches!(block.operation, Operation::Attention(_))),
+					_ => false,
+				});
 				if attends {
 					layers += 1;
 				}
@@ -17298,26 +17286,37 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
 				let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 				let role = format!("block {layer} feed-forward");
-				let (mut weighted, mut hidden) = (false, 0);
+				let (mut weighted, mut hidden, mut attention_inner) = (false, 0, None);
 				for step in parts {
 					match &step.operation {
 						Operation::Identity => {}
 						Operation::Attention(attention) => {
-							builder.attention_planes(layer, attention, step.qk.is_some(), width)?;
+							attention_inner = Some(builder.attention_planes(layer, attention, step.qk.is_some(), width, false)?);
 							weighted = true;
 						}
 						Operation::Product(left, right) => {
-							// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
-							let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.maps.iter().any(|map| matches!(map.kind, MapKind::Activation(activation) if activation != Activation::Linear)));
-							let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
-							for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
-								let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
-								require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
-								hidden = widths[0];
-								let tensor = builder.projection(&name(suffix), &role, width, hidden)?;
-								builder.mapped(vec![tensor]);
+							if let Some(attention) = left.blocks.first().and_then(|block| match &block.operation { Operation::Attention(attention) => Some(attention), _ => None }) {
+								require(part == "attn" && left.blocks.len() == 1 && right.blocks.len() == 1, format!("block {layer} attention product has invalid branches"))?;
+								let inner = builder.attention_planes(layer, attention, left.blocks[0].qk.is_some(), width, true)?;
+								require(
+									matches!(right.blocks[0].operation, Operation::Layer(outputs) if outputs == inner) && right.blocks[0].maps.len() == 1 && matches!(right.blocks[0].maps[0].kind, MapKind::Activation(Activation::Sigmoid)),
+									format!("block {layer} attention gate must be layer({inner}).sigmoid()"),
+								)?;
+								attention_inner = Some(inner);
+								weighted = true;
+							} else {
+								// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
+								let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.maps.iter().any(|map| matches!(map.kind, MapKind::Activation(activation) if activation != Activation::Linear)));
+								let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
+								for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
+									let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
+									require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
+									hidden = widths[0];
+									let tensor = builder.projection(&name(suffix), &role, width, hidden)?;
+									builder.mapped(vec![tensor]);
+								}
+								weighted = true;
 							}
-							weighted = true;
 						}
 						Operation::Glu(inner, _) => {
 							for (suffix, inputs, outputs) in [("ffn_gate.weight", width, *inner), ("ffn_up.weight", width, *inner), ("ffn_down.weight", *inner, width)] {
@@ -17327,8 +17326,14 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 							weighted = true;
 						}
 						Operation::Layer(outputs) => {
-							require(part == "ffn" && hidden != 0 && *outputs == width, format!("layer({outputs}) in block {layer} follows no feed-forward product, so no tensor name is its convention"))?;
-							let tensor = builder.projection(&name("ffn_down.weight"), &role, hidden, width)?;
+							let (suffix, inputs) = if part == "attn" {
+								("attn_output.weight", attention_inner.take().ok_or_else(|| RecipeError::new(format!("layer({outputs}) in block {layer} follows no attention")))?)
+							} else {
+								require(hidden != 0, format!("layer({outputs}) in block {layer} follows no feed-forward product"))?;
+								("ffn_down.weight", hidden)
+							};
+							require(*outputs == width, format!("layer({outputs}) in block {layer} does not restore {width} channels"))?;
+							let tensor = builder.projection(&name(suffix), &role, inputs, width)?;
 							builder.mapped(vec![tensor]);
 						}
 						other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
@@ -17345,6 +17350,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 						}
 					}
 				}
+				require(attention_inner.is_none(), format!("block {layer} attention has no output projection"))?;
 				for map in &block.maps {
 					if matches!(map.kind, MapKind::Normalization(_)) {
 						builder.norm_scale("output_norm.weight", width)?;
@@ -17376,9 +17382,9 @@ impl Builder<'_> {
 		Ok(())
 	}
 	/// The planes of a composed attention block: its query, key and value
-	/// projection, its query and key scales when it normalizes them, and its
-	/// output projection, as `attention` lays them out for a built one.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize) -> Result<()> {
+	/// projection, its query and key scales when it normalizes them, and the
+	/// product's gate projection when present.
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, gated: bool) -> Result<usize> {
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
@@ -17387,12 +17393,12 @@ impl Builder<'_> {
 		let role = format!("block {layer} attention");
 		let query = if let Some(path) = &attention.query { self.keyed_tensor(path, &role)? } else { self.tensor(&name("attn_q.weight"), &role)? };
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
-		let gated = match query.shape[1] as usize {
+		let query_gated = match query.shape[1] as usize {
 			outputs if outputs == heads * head => false,
 			outputs if outputs == 2 * heads * head => true,
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
-		require(gated == attention.gate, format!("{} {} an output gate, and the attention block {}", query.name, if gated { "holds" } else { "holds no" }, if attention.gate { "declares one" } else { "declares none" }))?;
+		require(query_gated == gated, format!("{} gate rows do not match block {layer} attention product", query.name))?;
 		let key = if let Some(path) = &attention.key { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
 		let value = if let Some(path) = &attention.value { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_v.weight"), &role, width, kv * head)? };
 		let order = self.head_order(head, rope_dims);
@@ -17418,9 +17424,7 @@ impl Builder<'_> {
 			}
 			self.mapped(gate_planes);
 		}
-		let output = if let Some(path) = &attention.output { self.projection_path(path, &role, heads * head, width)? } else { self.projection(&name("attn_output.weight"), &role, heads * head, width)? };
-		self.mapped(vec![output]);
-		Ok(())
+		Ok(heads * head)
 	}
 }
 /// One id at a time from a model's logits: a repetition penalty over the
@@ -19634,15 +19638,22 @@ fn sequential_operation(operation: &Operation) -> bool {
 		_ => false,
 	}
 }
+fn begins_with_attention(operation: &Operation) -> bool {
+	match operation {
+		Operation::Attention(_) => true,
+		Operation::Product(left, _) => left.blocks.first().is_some_and(|block| begins_with_attention(&block.operation)),
+		_ => false,
+	}
+}
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some((index, format)) = model.blocks.iter().enumerate().map(|(index, block)| (index, StorageFormat(block.quantization))).find(|(_, format)| format.0 != 0 && !format.valid()) {
 		return Err(RecipeError::new(format!("block {index} {}: {}", model.blocks[index].operation.name(), format.unavailable())));
 	}
-	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
+	let first_attention = begins_with_attention(&model.blocks[0].operation);
+	let sequence = data.sequence.map(|(sequence, attention)| if first_attention { attention } else { sequence });
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
 	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
-	let sequential = sequential || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.profile = config.profile;
@@ -20596,11 +20607,9 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	lower_project(graph, output)
 }
 /// Lowers one attention block into its projection, the optional query and key
-/// normalization and rotary nodes, the attention node and the output
-/// projection. The projection carries the query, key and value planes, then
-/// the indexer planes, then the gate plane.
-fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>, config: Config) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, gate, window, factors, unscaled, .. } = attention;
+/// normalization and rotary nodes, and the attention node.
+fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>, _config: Config) -> Result<()> {
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, window, factors, unscaled, .. } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
@@ -20626,8 +20635,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let width = if width == 0 { input.channels.div_ceil(heads) } else { width };
 	// The query plane the attention writes. With a divisible residual width this
 	// remains exactly `input.channels`; otherwise the rounded-up Q/K/V projection
-	// creates a wider internal plane and the closing projection restores the input
-	// width.
+	// creates a wider output plane.
 	let inner = checked_mul(heads, width, "attention query plane")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_add(keys, values, "attention key and value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	lower_project(graph, pairs)?;
@@ -20723,17 +20731,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let block_or_window = if window == 0 { if selects { indexer.block as f64 } else { 0.0 } } else { -(window as f64) };
 	let argument = [heads as f64, keys as f64, 0.0, block_or_window, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, values as f64];
 	let attended = Shape { channels: inner, length: input.length };
-	push_node(graph, Primitive::Attention, attended, 0, argument, if selects { side } else { -2 })?;
-	if gate {
-		// The output gate is its own projection of the block input, a sigmoid of
-		// it multiplying the attention output: two plain branches, not an attention mode.
-		let attention = graph.source;
-		reset(graph, source, input);
-		lower_project(graph, inner)?;
-		let (factor, shape) = activation(graph, graph.source, attended, Activation::Sigmoid, config)?;
-		binary(graph, attention, factor, shape, ScalarOpcode::Multiply)?;
-	}
-	lower_project(graph, input.channels)
+	push_node(graph, Primitive::Attention, attended, 0, argument, if selects { side } else { -2 })
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
@@ -21740,15 +21738,15 @@ mod precision_contract_checks {
 			Box::leak(Box::new(cpu_device().unwrap()))
 		}
 	}
-	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize, gated: bool) -> (Vec<f64>, Vec<f64>) {
+	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize) -> (Vec<f64>, Vec<f64>) {
 		let config = Config::load().unwrap();
-		let channels = width * (heads + 2 + if gated { heads } else { 0 });
+		let channels = width * (heads + 2);
 		assert_eq!(inputs.len(), channels * length);
 		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
 		graph.profile = config.profile;
 		graph.profile.attn = format;
 		graph.profile.atvn = Compute::FP32;
-		let args = [heads as f64, 1.0, f64::from(gated), 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
+		let args = [heads as f64, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
 		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
 		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
 		let targets = vec![0.25; width * heads * length];
@@ -21795,25 +21793,19 @@ mod precision_contract_checks {
 		let scale = 2.0_f64.powi(-24);
 		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
 			for heads in [1, 2] {
-				for gated in [false, true] {
-					let mut inputs = vec![0.5; (heads + 2) * 4];
-					inputs[(heads + 1) * 4..].fill(0.0625);
-					if gated { inputs.extend(vec![0.0; heads * 4]); }
-					let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1, gated);
-					let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
-					for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
-					for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
-						let expected = delta * heads as f64 * if gated { 0.5 } else { 1.0 };
-						assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
-					}
-					if gated {
-						for value in &derivative[(heads + 2) * 4..] { assert!((value - delta * 0.0625 * 0.25).abs() < 1e-12, "{} gate gradient {value}", format.label()); }
-					}
+				let mut inputs = vec![0.5; (heads + 2) * 4];
+				inputs[(heads + 1) * 4..].fill(0.0625);
+				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1);
+				let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
+				for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
+				for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
+					let expected = delta * heads as f64;
+					assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
 				}
 			}
 			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
 				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2, false);
+				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2);
 				let d0 = (output[0] - 0.25) * scale;
 				let d1 = (output[1] - 0.25) * scale;
 				let score0 = d1 * 0.5 * (0.25 - 0.375);

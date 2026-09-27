@@ -59,6 +59,7 @@ attn(heads).int(8)
 	.qk(rms).fp(16)
 	.rope(neox, head_width, rope_base)
 	.yarn(factor, original_context, fast, slow).fp(32)
+layer(d).int(8)
 ```
 
 ```rust
@@ -104,7 +105,7 @@ let model = recipe.model()
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
-			.gate()
+		layer(d)
 atvn:
 	relu()
 	leak()
@@ -344,6 +345,7 @@ model.memory(&data, positions).*|place().memory()[].*
 
 ```rust
 .rope(neox|pairs, dims, base)
+(attn(heads) * layer(heads * width).sigmoid()).layer(d)
 ```
 
 ## Proposed
@@ -355,9 +357,6 @@ delta(heads, kernel)
 	.keys(count, width, tiled)                                  // .keys(count, width)
 	.qk(l2|rms)
 	.decay(softplus|sigmoid)
-
-attn(heads)
-	.gate(sigmoid|silu|tanh)                                    // .gate()
 
 hyper(lanes, [blocks])                                          // hyper(lanes, rank, &branch)
 hyper(lanes, [blocks], [blocks])
