@@ -26,10 +26,5 @@ fn main() {
 		model = model.res([norm(rms), feed_forward, layer(5120).bind(key!(blk[a].ffn_down.weight))]);
 	}
 	model = model.norm(rms).layer(248320).bind(key!(output.weight));
-	let bound = data.gguf().model();
-	if std::env::var_os("RECIPE_TRACE").is_some() {
-		bound.memory_for(&model, 1).unwrap();
-		return;
-	}
-	recipe.infer().chat([time, pp, tg, input, out, cached]).run_bound(&model, &data, &bound);
+	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
 }
