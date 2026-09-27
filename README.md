@@ -74,6 +74,14 @@ let model = recipe.model()
 ```
 
 ```rust
+let model = model.ple(&ngram)
+	.key([layer(lanes * width), group(rms, width), group(rms, width)])
+	.factor([fold(lanes).scale(1.0 / (width as f64).sqrt()).signed_sqrt(1e-6).sigmoid()])
+	.value([layer(width), group(rms, width)])
+	.tail([dconv(ngram.kernel()).dilate(ngram.dilation()).silu()]);
+```
+
+```rust
 	conv(filters, kernel)
 	dconv(kernel)
 		.dilate(steps)
@@ -87,7 +95,7 @@ let model = recipe.model()
 		.delta_activations(convolution, output)
 	perc(width)
 	glu(hidden, activation)
-	ple(&ngram)
+	ple(&ngram).key([blocks]).factor([blocks]).value([blocks]).tail([blocks])
 	estimators:
 		svm()
 		bayes()
@@ -110,6 +118,7 @@ atvn:
 	relu()
 	leak()
 	sigmoid()
+	signed_sqrt(floor)
 	tanh()
 	selu()
 	gelu()
@@ -364,11 +373,6 @@ hyper(lanes, [blocks], [blocks])
 moe(topk, [experts])                                            // moe(topk, [blocks])
 	.route(softmax|sigmoid)
 	.renorm()
-
-ple(&ngram)                                                     // ple(&ngram)
-	.norm(rms)
-	.gate(sigmoid|silu)
-	.silu()
 
 mtp([blocks])                                                   // .mtp(path)
 	.file(path)

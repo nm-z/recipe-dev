@@ -11335,6 +11335,10 @@ mod ngram {
 		pub fn kernel(&self) -> usize {
 			self.kernel
 		}
+		/// Tap spacing for a per-layer embedding's depthwise convolution.
+		pub fn dilation(&self) -> usize {
+			self.hash.ngram
+		}
 		/// How the rows are addressed.
 		pub fn hash(&self) -> &RowHash {
 			&self.hash
@@ -11372,11 +11376,10 @@ mod ngram {
 		pub fn rows(&self, ids: &[u32], position: usize) -> Vec<usize> {
 			self.hash.rows_at(ids, position)
 		}
-		/// The per-layer embedding block this table feeds: `heads` rows of `width`
-		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
-		/// size, and the table's row count.
+		/// The lookup this table feeds: `heads` rows of `width` per token and the
+		/// table's row count. The caller supplies the maps after the lookup.
 		pub(super) fn block(&self) -> PleBlock {
-			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
+			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, hash: self.hash.clone(), key: Vec::new(), factor: Vec::new(), value: Vec::new(), tail: Vec::new() }
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -11547,17 +11550,17 @@ mod bundle {
 	/// values ride inside this one rather than widening the record.
 	fn activation_text(activation: Activation) -> String {
 		match activation {
-			Activation::Scale(factor) => format!("{},{factor}", activation.code()),
+			Activation::Scale(factor) | Activation::SignedSqrt(factor) => format!("{},{factor}", activation.code()),
 			_ => activation.code().to_string(),
 		}
 	}
 	fn activation(text: &str) -> Result<Activation> {
 		let mut fields = text.split(',');
 		let value: u8 = value_at(fields.next(), "activation code")?;
-		let activation = if value == 16 {
+		let activation = if value == 16 || value == 17 {
 			let factor = value_at::<u64>(fields.next(), "scale factor")?;
-			require(f64::from_bits(factor).is_finite(), "scale factor must be finite")?;
-			Activation::Scale(factor)
+			require(f64::from_bits(factor).is_finite() && (value == 16 || f64::from_bits(factor) > 0.0), "activation factor must be finite and a signed square root floor must be positive")?;
+			if value == 16 { Activation::Scale(factor) } else { Activation::SignedSqrt(factor) }
 		} else {
 			match value {
 			0 => Ok(Activation::Linear),
@@ -11627,7 +11630,12 @@ mod bundle {
 				"delta,{},{},{},{},{},{},{},{}",
 					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
 			),
-			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Ple(ple) => {
+				let blocks = |parts: &[Block]| text(&parts.iter().map(block_text).collect::<Vec<_>>().join("\n"));
+				format!("ple,{},{},{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.hash.text(), blocks(&ple.key), blocks(&ple.factor), blocks(&ple.value), blocks(&ple.tail))
+			}
+			Operation::Group(normalization, width) => format!("group,{},{}", normalization_text(Some(*normalization)), width),
+			Operation::Fold(lanes) => format!("fold,{lanes}"),
 			Operation::Join(lanes) => format!("join,{lanes}"),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
@@ -11793,12 +11801,20 @@ mod bundle {
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
-				let (rows, kernel) = (value_at(fields.next(), "per-layer embedding rows")?, value_at(fields.next(), "per-layer embedding kernel")?);
-				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
+				let rows = value_at(fields.next(), "per-layer embedding rows")?;
 				let hash = RowHash::parse(&mut fields)?;
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
-				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
+				let mut parts = || -> Result<Vec<Block>> {
+					let encoded = fields.next().ok_or_else(|| RecipeError::new("per-layer embedding blocks are absent"))?;
+					let decoded = untext(encoded, "per-layer embedding blocks")?;
+					decoded.lines().map(block).collect()
+				};
+				let (key, factor, value, tail) = (parts()?, parts()?, parts()?, parts()?);
+				require(fields.next().is_none(), "per-layer embedding has trailing fields")?;
+				Ok(Operation::Ple(PleBlock { heads, width, rows, hash, key, factor, value, tail }))
 			}
+			"group" => Ok(Operation::Group(normalization(fields.next(), "grouped normalization")?.ok_or_else(|| RecipeError::new("grouped normalization is absent"))?, value_at(fields.next(), "group width")?)),
+			"fold" => Ok(Operation::Fold(value_at(fields.next(), "fold lanes")?)),
 			"join" => Ok(Operation::Join(value_at(fields.next(), "joined lanes")?)),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -12792,6 +12808,17 @@ pub const fn conv(filters: usize, kernel: usize) -> Block {
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
 	Block::of(Operation::Identity).norm(normalization)
 }
+pub fn group(normalization: impl NormalizationSelector, width: usize) -> Block {
+	assert!(width != 0, "grouped normalization width must be positive");
+	Block::of(Operation::Group(normalization.normalization(), width))
+}
+pub fn fold(lanes: usize) -> Block {
+	assert!(lanes != 0, "fold lane count must be positive");
+	Block::of(Operation::Fold(lanes))
+}
+pub fn dconv(kernel: usize) -> Block {
+	Block::of(Operation::Dconv(kernel, 1))
+}
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
 }
@@ -12967,17 +12994,18 @@ impl DeltaBlock {
 	}
 }
 /// One per-layer embedding block: every token gathers `heads` rows of `width`
-/// from a host-resident table of `rows` rows, addressed by `hash`, and the block
-/// projects, gates, convolves and adds them into the stream it sits on. The
-/// depthwise convolution is `kernel` wide and dilated by `dilation` positions.
+/// from a table of `rows` rows in machine RAM, addressed by `hash`, and the block
+/// combines the script's key, factor, value, and tail blocks with the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PleBlock {
 	heads: usize,
 	width: usize,
 	rows: usize,
-	kernel: usize,
-	dilation: usize,
 	hash: RowHash,
+	key: Vec<Block>,
+	factor: Vec<Block>,
+	value: Vec<Block>,
+	tail: Vec<Block>,
 }
 impl PleBlock {
 	/// Values the table holds: its rows of the head width.
@@ -13007,6 +13035,8 @@ enum Operation {
 	Embed(usize, usize),
 	Hyper(usize, usize, Vec<Block>),
 	Dconv(usize, usize),
+	Group(BlockNormalization, usize),
+	Fold(usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
 	/// A stream of that many lanes from an input of one more: see `Model::join`.
@@ -13038,6 +13068,8 @@ pub enum Activation {
 	Silu,
 	Elu,
 	Prelu,
+	/// Sign-preserving square root with a positive floor under the magnitude.
+	SignedSqrt(u64),
 	/// Multiplies every value by one constant, held as its bit pattern so the
 	/// activation stays comparable. Owns no weights and preserves shape.
 	Scale(u64),
@@ -13064,6 +13096,7 @@ impl Activation {
 			Self::Elu => 14,
 			Self::Prelu => 15,
 			Self::Scale(_) => 16,
+			Self::SignedSqrt(_) => 17,
 		}
 	}
 }
@@ -13367,6 +13400,18 @@ impl Block {
 	pub fn scale(self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.with_activation(Activation::Scale(factor.to_bits()))
+	}
+	pub fn signed_sqrt(self, floor: f64) -> Self {
+		assert!(floor.is_finite() && floor > 0.0, "signed square root floor must be finite and positive");
+		self.with_activation(Activation::SignedSqrt(floor.to_bits()))
+	}
+	pub fn dilate(mut self, steps: usize) -> Self {
+		assert!(steps != 0, "a depthwise convolution dilation must be positive");
+		match &mut self.operation {
+			Operation::Dconv(_, dilation) => *dilation = steps,
+			_ => panic!("dilate requires a dconv block"),
+		}
+		self
 	}
 }
 precision_methods!(Block => Block);
@@ -13680,11 +13725,35 @@ impl Model {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
 		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone()))
 	}
-	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
-	/// block projects, gates and convolves them into the stream it sits on, at
-	/// whatever width the stream has there.
+	/// Gather `table`'s n-gram rows in machine RAM. The four following selectors
+	/// supply every map that turns the rows into a stream update.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
 		self.push(Operation::Ple(table.block()))
+	}
+	fn ple_parts(&self, name: &str, parts: Vec<Block>, set: impl FnOnce(&mut PleBlock, Vec<Block>)) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{name} requires a preceding ple block"));
+			match &mut block.operation {
+				Operation::Ple(ple) => set(ple, parts),
+				_ => panic!("{name} requires a preceding ple block"),
+			}
+		})
+	}
+	/// The gathered-row projection and normalization, then the stream normalization.
+	pub fn key<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.ple_parts("key", parts.into(), |ple, parts| ple.key = parts)
+	}
+	/// The lane reduction and activations that turn key and stream products into gates.
+	pub fn factor<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.ple_parts("factor", parts.into(), |ple, parts| ple.factor = parts)
+	}
+	/// The gathered-row projection, then the gated stream normalization.
+	pub fn value<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.ple_parts("value", parts.into(), |ple, parts| ple.value = parts)
+	}
+	/// The maps applied to the gated value before it is added to the stream.
+	pub fn tail<const N: usize>(&self, parts: [Block; N]) -> Self {
+		self.ple_parts("tail", parts.into(), |ple, parts| ple.tail = parts)
 	}
 	/// A stream of `lanes` lanes from an input of `lanes + 1` lanes of one width,
 	/// whose last lane is a vector every lane joins: the vector and each lane are
@@ -15280,6 +15349,8 @@ impl Operation {
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
 			Self::Dconv(..) => "dconv",
+			Self::Group(..) => "group",
+			Self::Fold(..) => "fold",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Join(_) => "join",
@@ -15320,6 +15391,7 @@ impl Activation {
 			Self::Elu => "elu",
 			Self::Prelu => "prelu",
 			Self::Scale(_) => "scale",
+			Self::SignedSqrt(_) => "signed_sqrt",
 		}
 	}
 }
@@ -15357,6 +15429,10 @@ impl Model {
 	pub fn scale(&self, factor: f64) -> Self {
 		assert!(factor.is_finite(), "scale factor must be finite, received {factor}");
 		self.with_activation(Activation::Scale(factor.to_bits()))
+	}
+	pub fn signed_sqrt(&self, floor: f64) -> Self {
+		assert!(floor.is_finite() && floor > 0.0, "signed square root floor must be finite and positive");
+		self.with_activation(Activation::SignedSqrt(floor.to_bits()))
 	}
 }
 /// Rust multiplication composes two model fragments from the same incoming
@@ -16198,8 +16274,15 @@ impl<'a> Builder<'a> {
 		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
 		for layer in 0..blocks {
 			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
-				model = model.ple(ple);
-				builder.ple(layer, ple, &dimensions)?;
+				let lanes = dimensions.hyper.map_or(1, |(lanes, _)| lanes);
+				let stream = checked_mul(lanes, dimensions.width, "per-layer embedding stream")?;
+				model = model.ple(ple)
+					.key([self::layer(stream), group(rms, dimensions.width), group(rms, dimensions.width)])
+					.factor([fold(lanes).scale(1.0 / (dimensions.width as f64).sqrt()).signed_sqrt(1e-6).sigmoid()])
+					.value([self::layer(dimensions.width), group(rms, dimensions.width)])
+					.tail([dconv(ple.kernel()).dilate(ple.dilation()).silu()]);
+				let Operation::Ple(formula) = &model.blocks.last().unwrap().operation else { unreachable!() };
+				builder.ple(layer, ple, formula)?;
 			}
 			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
 			let branch = builder.open(layer, "attn", &dimensions)?;
@@ -16720,28 +16803,39 @@ impl<'a> Builder<'a> {
 		}
 		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
 	}
-	/// One per-layer embedding and the plan of its host table, key and value
+	/// One per-layer embedding and the plan of its machine RAM table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
-	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
+	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, formula: &PleBlock) -> Result<()> {
 		let role = format!("block {layer} per-layer embedding");
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let (table_name, _, _) = ple.table();
 		let table = self.tensor(table_name, &role)?;
 		self.mapped(vec![table]);
-		let lanes = dimensions.hyper.map_or(1, |(lanes, _)| lanes);
-		let stream = checked_mul(lanes, dimensions.width, "per-layer embedding stream")?;
+		let stream = match formula.key.first().map(|block| &block.operation) {
+			Some(Operation::Layer(width)) => *width,
+			_ => return Err(RecipeError::new("per-layer embedding key begins with a projection")),
+		};
+		let width = match formula.value.first().map(|block| &block.operation) {
+			Some(Operation::Layer(width)) => *width,
+			_ => return Err(RecipeError::new("per-layer embedding value begins with a projection")),
+		};
+		require(formula.key.len() == 3 && formula.value.len() == 2 && width != 0 && stream % width == 0, "per-layer embedding key and value blocks do not describe whole lanes")?;
 		let gathered = ple.width();
 		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
 		self.mapped(vec![key]);
 		self.whole(&name("ple_norm_key.weight"), &role)?;
 		self.whole(&name("ple_norm_query.weight"), &role)?;
-		let value = self.projection(&name("ple_value.weight"), &role, gathered, dimensions.width)?;
+		let value = self.projection(&name("ple_value.weight"), &role, gathered, width)?;
 		self.mapped(vec![value]);
 		self.whole(&name("ple_norm_conv.weight"), &role)?;
+		let kernel = match formula.tail.first().map(|block| &block.operation) {
+			Some(Operation::Dconv(kernel, _)) => *kernel,
+			_ => return Err(RecipeError::new("per-layer embedding tail begins with a depthwise convolution")),
+		};
 		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
 		require(
-			taps.shape.len() == 2 && taps.shape[0] as usize == ple.kernel() && taps.shape[1] as usize == stream,
-			format!("{} has shape {:?}; {role} convolves {stream} channels with {} taps", taps.name, taps.shape, ple.kernel()),
+			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == stream,
+			format!("{} has shape {:?}; {role} convolves {stream} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
 		Ok(())
@@ -17277,6 +17371,11 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
 				builder.mapped(vec![embedding.clone()]);
 				channels = *columns;
+			}
+			Operation::Ple(formula) => {
+				let ngram = Ngram::new(file)?;
+				require(formula.hash == *ngram.hash(), "per-layer embedding hash differs from the GGUF table metadata")?;
+				builder.ple(ngram.layer(), &ngram, formula)?;
 			}
 			Operation::Residual(parts) => {
 				require(channels == width, format!("a residual receives {channels} channels, but this GGUF declares {width}"))?;
@@ -19879,8 +19978,14 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
+		Operation::Group(normalization, width) => lower_normalize(graph, *normalization, *width, graph.output.channels)?,
+		Operation::Fold(lanes) => {
+			require(*lanes != 0 && graph.output.channels % lanes == 0, "fold lanes must partition the input channels")?;
+			let width = graph.output.channels / lanes;
+			push_node(graph, Primitive::Fold, Shape { channels: *lanes, length: graph.output.length }, 0, arguments(width as f64, 0.0), -2)?;
+		}
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
-		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
+		Operation::Ple(ple) => lower_ple(graph, ple, total, data, targets, rows, gpu, config)?,
 		Operation::Join(lanes) => lower_join(graph, *lanes)?,
 		Operation::Attention(attention) => lower_attention(graph, attention.clone(), block.qk, config)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
@@ -20243,13 +20348,34 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 				selected
 			}
 		}
-		Activation::Sigmoid | Activation::Silu => {
+		Activation::Sigmoid => {
+			let negated = program.op(ScalarOpcode::Subtract, zero, x);
+			let exponential = program.unary(ScalarOpcode::Exp, negated);
+			let denominator = program.op(ScalarOpcode::Add, one, exponential);
+			program.op(ScalarOpcode::Divide, one, denominator)
+		}
+		Activation::Silu => {
 			let half = constant(&mut program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			let curved = program.unary(ScalarOpcode::Tanh, half_x);
 			let shifted = program.op(ScalarOpcode::Add, curved, one);
 			let sigmoid = program.op(ScalarOpcode::Multiply, half, shifted);
-			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
+			program.op(ScalarOpcode::Multiply, x, sigmoid)
+		}
+		Activation::SignedSqrt(floor) => {
+			let floor = f64::from_bits(floor);
+			require(floor.is_finite() && floor > 0.0, "signed square root floor must be finite and positive")?;
+			let magnitude = program.unary(ScalarOpcode::Absolute, x);
+			let floor = program.constant(floor);
+			let above = program.op(ScalarOpcode::Greater, magnitude, floor);
+			let clamped = program.choose(above, magnitude, floor);
+			let log = program.unary(ScalarOpcode::Log, clamped);
+			let half = program.constant(0.5);
+			let half_log = program.op(ScalarOpcode::Multiply, half, log);
+			let root = program.unary(ScalarOpcode::Exp, half_log);
+			let negative = program.op(ScalarOpcode::Greater, zero, x);
+			let sign = program.op(ScalarOpcode::Subtract, positive, negative);
+			program.op(ScalarOpcode::Multiply, sign, root)
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
 		Activation::Gelu if graph.profile.gelu_table => {
@@ -20435,14 +20561,6 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 	require(kernel != 0 && dilation != 0, "depthwise convolution kernel and dilation must be positive")?;
 	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, dilation as f64), -2)
 }
-/// A per-layer embedding. The rows one token addresses are gathered on the host
-/// and staged for the device, which projects them to a key and a value without
-/// a bias. The key and the stream take grouped root-mean-square norms over one
-/// lane with a scale over every lane; their per-lane dot product over the root of
-/// the lane width, through a signed square root and a sigmoid, gates the value
-/// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
-/// dilated by the n-gram size and a SiLU form the second term, and both add into
-/// the stream, which keeps its width.
 /// Lowers `Model::join`: lane picks, normalizations, a shared projection of
 /// each lane joined after the common vector, and lane writes summed into the
 /// stream.
@@ -20478,10 +20596,15 @@ fn lower_join(graph: &mut Graph, lanes: usize) -> Result<()> {
 	graph.lanes = lanes;
 	Ok(())
 }
-fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
+/// Gather the n-gram rows in machine RAM, then apply the script's key, factor,
+/// value, and tail blocks. The key and stream meet at an elementwise product;
+/// the factor gates the value across lanes, and the value and tail add to the
+/// incoming stream.
+fn lower_ple(graph: &mut Graph, ple: &PleBlock, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (stream, shape) = (graph.source, graph.output);
 	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
-	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
+	require(ple.heads != 0 && ple.width != 0, "per-layer embedding dimensions must be positive")?;
+	require(ple.key.len() >= 2 && !ple.factor.is_empty() && ple.value.len() >= 2 && !ple.tail.is_empty(), "per-layer embedding requires key, factor, value, and tail blocks")?;
 	ple.hash.validate()?;
 	require(ple.hash.heads() == ple.heads, format!("per-layer embedding names {} heads, its hash addresses {}", ple.heads, ple.hash.heads()))?;
 	require(ple.hash.rows() <= ple.rows, format!("per-layer embedding table holds {} rows, its hash reaches row {}", ple.rows, ple.hash.rows()))?;
@@ -20489,56 +20612,51 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	require(shape.channels != 0 && shape.channels % lanes == 0, format!("per-layer embedding stream of {} does not split into {lanes} lanes", shape.channels))?;
 	let channels = shape.channels / lanes;
 	let gathered = Shape { channels: checked_mul(ple.heads, ple.width, "per-layer embedding width")?, length: shape.length };
-	// The lookup reads the ids on the host, so it names no device source; the
-	// hash rides beside the node as program words.
 	let (program_offset, words) = (graph.programs.len(), ple.hash.words());
 	let program_count = words.len().div_ceil(3);
 	graph.programs.extend(words);
 	graph.programs.resize(program_offset + program_count * 3, 0.0);
 	reset(graph, -2, Shape { channels: 1, length: shape.length });
-	let argument = [ple.heads as f64, ple.width as f64, ple.rows as f64, ple.kernel as f64, ple.dilation as f64, 0.0, 0.0, 0.0, 0.0];
+	let argument = [ple.heads as f64, ple.width as f64, ple.rows as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 	push_node(graph, Primitive::Lookup, gathered, 0, argument, -2)?;
 	if let Some(node) = graph.nodes.last_mut() {
 		(node.program_offset, node.program_count) = (program_offset, program_count);
 	}
-	let rows = graph.source;
-	lower_project(graph, shape.channels)?;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	let gathered_rows = graph.source;
+	let lower = |graph: &mut Graph, part: &Block| -> Result<()> {
+		let open_lanes = std::mem::replace(&mut graph.lanes, 0);
+		let result = lower_block(graph, part, total, data, targets, rows, gpu, config);
+		graph.lanes = open_lanes;
+		result
+	};
+	for part in &ple.key[..ple.key.len() - 1] {
+		lower(graph, part)?;
+	}
+	require(graph.output == shape, "per-layer embedding key blocks must produce the stream shape")?;
 	let key = graph.source;
 	reset(graph, stream, shape);
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower(graph, ple.key.last().unwrap())?;
+	require(graph.output == shape, "per-layer embedding stream key must preserve the stream shape")?;
 	let query = graph.source;
 	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
-	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
-	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
-	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
-	let scale = program.constant(1.0 / (channels as f64).sqrt());
-	let s = program.op(ScalarOpcode::Multiply, x, scale);
-	let (zero, one, half) = (program.constant(0.0), program.constant(1.0), program.constant(0.5));
-	let magnitude = program.unary(ScalarOpcode::Absolute, s);
-	let floor = program.constant(1e-6);
-	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
-	let clamped = program.choose(above, magnitude, floor);
-	let log = program.unary(ScalarOpcode::Log, clamped);
-	let half_log = program.op(ScalarOpcode::Multiply, half, log);
-	let root = program.unary(ScalarOpcode::Exp, half_log);
-	let positive = program.op(ScalarOpcode::Greater, s, zero);
-	let negative = program.op(ScalarOpcode::Greater, zero, s);
-	let sign = program.op(ScalarOpcode::Subtract, positive, negative);
-	let signed = program.op(ScalarOpcode::Multiply, sign, root);
-	let negated = program.op(ScalarOpcode::Subtract, zero, signed);
-	let exponential = program.unary(ScalarOpcode::Exp, negated);
-	let denominator = program.op(ScalarOpcode::Add, one, exponential);
-	program.op(ScalarOpcode::Divide, one, denominator);
-	push_program(graph, -2, &[], program)?;
+	for part in &ple.factor {
+		lower(graph, part)?;
+	}
+	require(graph.output == (Shape { channels: lanes, length: shape.length }), "per-layer embedding factor must produce one gate per lane")?;
 	let gate = graph.source;
-	reset(graph, rows, gathered);
-	lower_project(graph, channels)?;
+	reset(graph, gathered_rows, gathered);
+	for part in &ple.value[..ple.value.len() - 1] {
+		lower(graph, part)?;
+	}
+	require(graph.output == (Shape { channels, length: shape.length }), "per-layer embedding value must produce one lane")?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
 	let gated = graph.source;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
-	lower_dconv(graph, ple.kernel, ple.dilation)?;
-	lower_activation(graph, Activation::Silu, config)?;
+	lower(graph, ple.value.last().unwrap())?;
+	require(graph.output == shape, "per-layer embedding gated value must preserve the stream shape")?;
+	for part in &ple.tail {
+		lower(graph, part)?;
+	}
+	require(graph.output == shape, "per-layer embedding tail must preserve the stream shape")?;
 	let convolved = graph.source;
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)

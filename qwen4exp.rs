@@ -16,7 +16,11 @@ fn main() {
 
 	for block in 0..48 {
 		if block == ngram.layer() {
-			model = model.ple(&ngram);
+			model = model.ple(&ngram)
+				.key([layer(10240), group(rms, 2560), group(rms, 2560)])
+				.factor([fold(4).scale(1.0 / (2560.0_f64).sqrt()).signed_sqrt(1e-6).sigmoid()])
+				.value([layer(2560), group(rms, 2560)])
+				.tail([dconv(ngram.kernel()).dilate(ngram.dilation()).silu()]);
 		}
 
 		let mut attention = if (block + 1) % 4 == 0 {
