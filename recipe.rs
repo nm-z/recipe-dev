@@ -12428,12 +12428,13 @@ mod bundle {
 		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
 			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
 			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
+			assert_eq!(split_escaped(&text, '|').len(), 17);
 			assert_eq!(block(&text).unwrap(), original);
-			assert_eq!(original.maps.len(), 2);
-			assert_eq!(original.maps[0].precision, Some(Compute::FP16));
-			assert_eq!(original.maps[1].precision, Some(Compute::FP32));
-			assert!(block("layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-").is_err());
+			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
+			let legacy = block(legacy).unwrap();
+			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
+			assert_eq!(legacy.qk_precision, None);
+			assert_eq!(legacy.rope_precision, None);
 		}
 	}
 }

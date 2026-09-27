@@ -35,12 +35,11 @@ let model = recipe.model()
 ```
 
 ```rust
-frozen.packed.blck.atvn.quant = block
-	│      │      │    │    └─ quantization
-	│      │      │    └────── activation
-	│      │      └─────────── ""
-	│      └────────────────── packed qualifier
-	└───────────────────────── frozen qualifier
+frozen.blck.atvn.prec = block
+	│      │    │    └─ precision it computes in
+	│      │    └────── activation
+	│      └─────────── ""
+	└────────────────── frozen qualifier
 ```
 
 ```rust
