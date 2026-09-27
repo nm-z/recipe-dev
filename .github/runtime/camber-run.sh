@@ -285,6 +285,19 @@ for provider_attempt in 1 2; do
 		--path "$stash_root/" \
 		--cmd "$job_command" 2>&1)" || {
 		printf '%s\n' "$create_output" >&2
+		# Camber answers code 1005 when the workspace's plan cannot create jobs. Stash
+		# uploads still succeed on that plan, so this is the first call that shows it.
+		if printf '%s\n' "$create_output" | grep -q -E 'code=1005|not available on the free tier'; then
+			cat > evidence/blocker.json <<'JSON'
+{
+	"blocker": "camber-plan-without-jobs",
+	"detail": "Camber refused job creation with code 1005: the workspace that owns CAMBER_API_KEY is on the free tier, which cannot create jobs. Stash uploads succeed on that tier.",
+	"resolution": "Redeem the Camber Student Pack GPU allowance or upgrade the workspace plan, then rerun. If the allowance was redeemed on another workspace, store that workspace's API key as the CAMBER_API_KEY repository secret."
+}
+JSON
+			cat evidence/blocker.json
+			echo "the Camber workspace plan cannot create jobs (code 1005)" >&2
+		fi
 		exit 1
 	}
 	printf '%s\n' "$create_output"
