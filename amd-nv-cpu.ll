@@ -3976,10 +3976,11 @@ step: %back = sub i64 %reach, %tap %back.scaled = mul i64 %back, %dilation.wide 
 %tap.index = add i64 %tap.base, %tap %weight = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %tap.index, i32 %decode)
 %product = call double @recipe.mul(double %weight, double %value) %sum.next = call double @recipe.add(double %sum, double %product) %tap.next = add i64 %tap, 1 br label %loop
 done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
-; After a window, channel %channel's history takes the last %tail inputs: from the
+; After the first %span positions of a window, %target takes channel %channel's
+; history, the last %tail inputs, in place when it is %history itself: from the
 ; window as far back as it reaches, then from the older history (zero when %fresh).
 ; One thread walks a channel in order, so each slot reads an older slot first.
-define internal void @dconv_history_body( ptr addrspace(1) %input, ptr addrspace(1) %history, i64 %channel, i32 %length, i32 %span, i32 %tail, i1 %fresh ) #1 { entry:
+define internal void @dconv_history_body( ptr addrspace(1) %input, ptr addrspace(1) %history, ptr addrspace(1) %target, i64 %channel, i32 %length, i32 %span, i32 %tail, i1 %fresh ) #1 { entry:
 %length.wide = zext i32 %length to i64 %tail.wide = zext i32 %tail to i64 %span.wide = zext i32 %span to i64
 %base = mul i64 %channel, %length.wide %past.base = mul i64 %channel, %tail.wide %start = sub i64 %span.wide, %tail.wide
 br label %loop
@@ -3989,7 +3990,7 @@ step: %source = add i64 %start, %h %inside = icmp sge i64 %source, 0 %source.cla
 %older = add i64 %h, %span.wide %older.inside = icmp ult i64 %older, %tail.wide %older.clamped = select i1 %older.inside, i64 %older, i64 0
 %older.index = add i64 %past.base, %older.clamped %older.ptr = getelementptr inbounds double, ptr addrspace(1) %history, i64 %older.index %older.loaded = load double, ptr addrspace(1) %older.ptr, align 8
 %older.kept = select i1 %fresh, double 0.0, double %older.loaded %value = select i1 %inside, double %loaded, double %older.kept
-%slot = add i64 %past.base, %h %slot.ptr = getelementptr inbounds double, ptr addrspace(1) %history, i64 %slot store double %value, ptr addrspace(1) %slot.ptr, align 8
+%slot = add i64 %past.base, %h %slot.ptr = getelementptr inbounds double, ptr addrspace(1) %target, i64 %slot store double %value, ptr addrspace(1) %slot.ptr, align 8
 %h.next = add i64 %h, 1 br label %loop
 done: ret void }
 ; Input element %p receives tap j times the adjoint at position t + (kernel - 1 - j) * dilation while that position exists.
@@ -4099,11 +4100,21 @@ i64 %k.base, i64 %v.base, i64 %q.base, i64 %o.base, i64 %work.base, i32 %kwidth,
 br label %column.done
 column.done: %column.next = add nuw i32 %column, 1 br label %column.loop
 exit: ret void }
+; Copies one value column of a pair's live state to the kept copy at %at.
+define internal void @delta_keep( ptr addrspace(1) %context, ptr addrspace(1) %kept, i64 %work.base, i64 %at, i32 %kwidth, i64 %vwidth, i64 %column ) #1 { entry:
+br label %loop
+loop: %i = phi i32 [ 0, %entry ], [ %i.next, %step ] %more = icmp ult i32 %i, %kwidth br i1 %more, label %step, label %done
+step: %i.wide = zext i32 %i to i64 %row = mul i64 %i.wide, %vwidth %cell.row = add i64 %row, %column %cell = add i64 %work.base, %cell.row
+%from = getelementptr inbounds double, ptr addrspace(1) %context, i64 %cell %value = load double, ptr addrspace(1) %from, align 8
+%slot = add i64 %at, %cell %to = getelementptr inbounds double, ptr addrspace(1) %kept, i64 %slot store double %value, ptr addrspace(1) %to, align 8
+%i.next = add nuw i32 %i, 1 br label %loop
+done: ret void }
 ; One row, head and value column of the gated delta rule at inference: the
 ; live state carries across windows, starts at zero at position 0, and walks
 ; only the window's positions.
 define internal void @delta_live_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %pairs, i32 %begin, i32 %end, i32 %decode, i1 %tiled, double %scale, i32 %origin, i1 %sigmoid.decay ) #3 { entry:
+i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %pairs, i32 %begin, i32 %end, i32 %decode, i1 %tiled, double %scale, i32 %origin, i1 %sigmoid.decay,
+ptr addrspace(1) %kept, i32 %slots ) #3 { entry:
 %kheads.wide = zext i32 %kheads to i64 %kwidth.wide = zext i32 %kwidth to i64 %vheads.wide = zext i32 %vheads to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64
 %pair = udiv i64 %p, %vwidth.wide %column.wide = urem i64 %p, %vwidth.wide %column = trunc i64 %column.wide to i32
 %row = udiv i64 %pair, %vheads.wide %head = urem i64 %pair, %vheads.wide %state = mul i64 %kwidth.wide, %vwidth.wide
@@ -4129,7 +4140,7 @@ br i1 %zero.more, label %zero.step, label %time.loop
 zero.step: %zero.i.wide = zext i32 %zero.i to i64 %zero.row = mul i64 %zero.i.wide, %vwidth.wide %zero.cell = add i64 %zero.row, %column.wide %zero.index = add i64 %work.base, %zero.cell
 %zero.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %zero.index
 store double 0.0, ptr addrspace(1) %zero.pointer, align 8 %zero.next = add nuw i32 %zero.i, 1 br label %zero.loop
-time.loop: %time = phi i32 [ %begin, %entry ], [ %begin, %zero.loop ], [ %time.next, %time.step ] %time.more = icmp ult i32 %time, %end
+time.loop: %time = phi i32 [ %begin, %entry ], [ %begin, %zero.loop ], [ %time.next, %kept.done ] %time.more = icmp ult i32 %time, %end
 br i1 %time.more, label %time.step, label %exit
 time.step:
 ; Positions %begin to %end sit at %origin less in a buffer that holds the window alone.
@@ -4144,7 +4155,15 @@ time.step:
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
 call void @delta_column( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i64 %k.base, i64 %v.base, i64 %q.base, i64 %o.base, i64 %work.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %time.local, i32 %column, double %decay, double %write, i1 true, double %scale )
-%time.next = add nuw i32 %time, 1 br label %time.loop
+; In a window of several positions, the first %slots each leave a copy of the
+; column's state to take back to.
+%kept.slot = sub i32 %time, %begin %kept.early = icmp ult i32 %kept.slot, %slots
+%kept.span = sub i32 %end, %begin %kept.several = icmp ugt i32 %kept.span, 1 %kept.now = and i1 %kept.early, %kept.several
+br i1 %kept.now, label %keep, label %kept.done
+keep: %kept.slot.wide = zext i32 %kept.slot to i64 %kept.pairs = zext i32 %pairs to i64 %kept.stride = mul i64 %kept.pairs, %state %kept.at = mul i64 %kept.slot.wide, %kept.stride
+call void @delta_keep( ptr addrspace(1) %context, ptr addrspace(1) %kept, i64 %work.base, i64 %kept.at, i32 %kwidth, i64 %vwidth.wide, i64 %column.wide )
+br label %kept.done
+kept.done: %time.next = add nuw i32 %time, 1 br label %time.loop
 exit: ret void }
 ; One row and head of the gated delta rule. The sequence walks in chunks of
 ; %chunk positions and the carried state is committed at every chunk start, so a

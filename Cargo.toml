@@ -31,6 +31,8 @@ contraction-resident-waves-per-workgroup = 2
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 delta-chunk = 8
+# window positions whose carried state a decode keeps, so it takes back rejected drafts without running again
+draft-positions = 4
 topology-probe-bytes = 4194304
 # weight bytes a position must read of a split region to pay for its exchange
 tensor-split-region-bytes = 8388608

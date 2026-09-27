@@ -1722,6 +1722,10 @@ pub(crate) struct NativeLayout {
 	/// The adjoint slot each such operand's contribution is written to in this
 	/// state type before it is converted and added to the operand's adjoint.
 	pub cast_adjoints: Vec<[Option<usize>; 2]>,
+	/// Each node whose carried state a window changes in place: the context
+	/// offset of that state, of the copies of it after each of the window's first
+	/// positions, and its bytes.
+	pub kept: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2281,6 +2285,7 @@ impl NativeLayout {
 		let mut indexer_blocks = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
+		let mut kept = Vec::new();
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
@@ -2341,7 +2346,12 @@ impl NativeLayout {
 			let regions = node_context(graph, &context_node, rows, node.precision, inference, step)?;
 			let temporary = inference && regions.iter().all(|(_, lifetime)| matches!(lifetime, BufferLifetime::Until(_) | BufferLifetime::Unused));
 			let plan = if temporary { &mut value_plan } else { &mut context_plan };
-			contexts.push(plan.allocate(&regions, unit, step, inference)?);
+			let offset = plan.allocate(&regions, unit, step, inference)?;
+			if inference && matches!(node.op, Primitive::Delta | Primitive::Dconv) && let [(live, _), .., _] = regions[..] {
+				let before = regions[..regions.len() - 1].iter().map(|(bytes, _)| bytes).sum::<usize>();
+				kept.push((offset, checked_add(offset, before, "kept state offset")?, live));
+			}
+			contexts.push(offset);
 			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
 				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
@@ -2404,7 +2414,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, indexer_blocks, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, indexer_blocks, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, kept })
 	}
 }
 
@@ -4729,9 +4739,18 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 					let channels = Shape { channels: node.output.channels, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
+					let kept_bytes = self.layout.kept.iter().find(|(live, ..)| *live == self.layout.contexts[index]).map_or(0, |(.., bytes)| *bytes);
 					emit_runtime_window_loop(&mut ir, index, "dconv.history", channels, &whole, |ir, _p, wide| {
+						// In a window of several positions, the history after each of its
+						// first positions is kept before the live history moves past them.
+						let p = format!("n{index}.dconv.keep");
 						ir.push_str(&format!(
-							"call void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {length}, i32 {span}, i32 {tail}, i1 %n{index}.dconv.fresh )\n",
+							"br label %{p}.entry\n{p}.entry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.next, %{p}.step ]\n%{p}.more = icmp ult i32 %{p}.j, {slots}\n%{p}.reached = icmp ult i32 %{p}.j, {span}\n%{p}.several = icmp ugt i32 {span}, 1\n%{p}.early = and i1 %{p}.more, %{p}.reached\n%{p}.go = and i1 %{p}.early, %{p}.several\nbr i1 %{p}.go, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.span = add i32 %{p}.j, 1\n%{p}.j.wide = zext i32 %{p}.j to i64\n%{p}.at = mul i64 %{p}.j.wide, {kept_bytes}\n%{p}.target = getelementptr i8, {pointer} {kept}, i64 %{p}.at\ncall void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} %{p}.target, i64 {wide}, i32 {length}, i32 %{p}.span, i32 {tail}, i1 %n{index}.dconv.fresh )\n%{p}.next = add i32 %{p}.j, 1\nbr label %{p}.loop\n{p}.done:\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
+						));
+						ir.push_str(&format!(
+							"call void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} {context}, i64 {wide}, i32 {length}, i32 {span}, i32 {tail}, i1 %n{index}.dconv.fresh )\n",
 							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
 						));
 					})?;
@@ -4838,16 +4857,19 @@ impl NativeModelIr {
 					let columns = Shape { channels: checked_mul(pairs, width as usize, "delta columns")?, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					let length = narrow(node.output.length, "delta length")?;
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
 					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							concat!(
 								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
 								"i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, ",
-								"i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin}, i1 {sigmoid_decay} )\n"
+								"i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin}, i1 {sigmoid_decay}, {pointer} {kept}, i32 {slots} )\n"
 							),
 							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
 							tiled = node.argument[5] == 1.0,
 							sigmoid_decay = node.argument[7] == 1.0,
+							kept = kept,
+							slots = slots,
 							v = v,
 							wide = wide,
 							pairs = pairs,
@@ -7511,6 +7533,15 @@ impl NativeModelIr {
 	/// through the node's own decoder with constant offsets, so the inliner shares
 	/// the block fields every value of a run reads.
 	/// The pointer to the split scratch a packed sum hands its body, defined before its call.
+	/// The pointer to node `index`'s kept states and how many window positions
+	/// they hold.
+	fn kept_states(&self, backend: Backend, index: usize, context: &str, ir: &mut String) -> Result<(String, usize)> {
+		let live = self.layout.contexts[index];
+		let &(_, kept, _) = self.layout.kept.iter().find(|(offset, ..)| *offset == live).ok_or_else(|| RecipeError::new(format!("node {index} keeps no carried state")))?;
+		let name = format!("%n{index}.kept");
+		ir.push_str(&format!("{name} = getelementptr i8, {} {context}, i64 {}\n", pointer_type(backend), kept - live));
+		Ok((name, draft_positions()?))
+	}
 	fn split_scratch_gep(&self, backend: Backend, index: usize) -> String {
 		self.layout.split_scratch.map_or(String::new(), |offset| ptr_gep(backend, "contexts", offset, &format!("n{index}.split")))
 	}
@@ -18701,9 +18732,18 @@ trait Drafting {
 	fn keep(&mut self) -> Result<()>;
 	/// Puts back the state `keep` copied.
 	fn restore(&mut self) -> Result<()>;
+	/// Whether a window can stop after one of its first positions without
+	/// `keep` and `restore`.
+	fn takes_back(&self) -> bool;
+	/// Stops the last window after position `position - 1`.
+	fn take_back(&mut self, position: u32) -> Result<()>;
 	/// Runs the window `begin..end` and returns the logits at its last
 	/// `count` positions.
 	fn verify(&mut self, samples: &[f64], begin: u32, end: u32, count: usize) -> Result<Vec<Vec<f64>>>;
+}
+/// The positions a draft window from `settled` runs: the unsettled ids and the drafts.
+fn end_positions(settled: u32, reached: u32, drafts: usize) -> usize {
+	(reached - settled) as usize + drafts
 }
 /// Up to `limit` ids that followed the latest earlier occurrence of the last
 /// ids of `ids`, trying the longest tail of three ids down to one.
@@ -18747,7 +18787,12 @@ fn decode_sequence(
 		let limit = sampler.draft.min(budget.saturating_sub(step + 1));
 		if step > 0 && settled + 2 >= reached && settled < reached && limit > 0 && let Some(drafts) = drafting.as_deref_mut().map(|drafting| drafting.draft(&generation.ids, limit)).transpose()?.filter(|drafts| !drafts.is_empty()) {
 			let drafting = drafting.as_deref_mut().ok_or_else(|| RecipeError::new("drafting is absent"))?;
-			drafting.keep()?;
+			// A window whose positions each leave their state can stop at any of
+			// them; otherwise the state before it is copied aside.
+			let takes_back = drafting.takes_back() && end_positions(settled, reached, drafts.len()) <= draft_positions()?;
+			if !takes_back {
+				drafting.keep()?;
+			}
 			for (offset, id) in drafts.iter().enumerate() {
 				samples[reached as usize + offset] = f64::from(*id);
 			}
@@ -18778,7 +18823,10 @@ fn decode_sequence(
 			// the last in a window of their own, and the last in the next step's
 			// window beside its drafts.
 			let kept = narrow(generation.ids.len() - 1, "decode position")? as u32;
-			if kept < end {
+			if kept < end && takes_back {
+				drafting.take_back(kept)?;
+				settled = kept;
+			} else if kept < end {
 				drafting.restore()?;
 				if kept > settled + 1 {
 					logits(samples, settled, kept - 1)?;
@@ -18863,6 +18911,12 @@ impl Drafting for PlacedDrafting<'_> {
 	}
 	fn restore(&mut self) -> Result<()> {
 		self.placed.tapes.iter().flatten().try_for_each(NativeTape::restore_carried)
+	}
+	fn takes_back(&self) -> bool {
+		self.placed.tapes.iter().flatten().all(NativeTape::takes_back)
+	}
+	fn take_back(&mut self, position: u32) -> Result<()> {
+		self.placed.tapes.iter().flatten().try_for_each(|tape| tape.take_back(position))
 	}
 	fn verify(&mut self, samples: &[f64], begin: u32, end: u32, count: usize) -> Result<Vec<Vec<f64>>> {
 		let ranges = self.placed.tapes.first().ok_or_else(|| RecipeError::new("placement has no range"))?;
@@ -23936,6 +23990,24 @@ impl NativeTape {
 		(*reached, *begin) = (self.reached.load(Ordering::Relaxed), self.window_begin.load(Ordering::Relaxed));
 		Ok(())
 	}
+	/// Whether every state a window changes in place leaves a copy after each of
+	/// its first positions, so the tape can stop at one of them without running
+	/// the window again.
+	fn takes_back(&self) -> bool {
+		self.nodes.iter().all(|node| !matches!(node.op, Primitive::Scan) && !(node.op == Primitive::Contraction && node.argument[0] > 1.0))
+	}
+	/// Takes the tape back to the state after position `position - 1` of its last
+	/// window: every in-place state returns to the copy that position left.
+	fn take_back(&self, position: u32) -> Result<()> {
+		let begin = self.window_begin.load(Ordering::Relaxed);
+		let slot = position.checked_sub(begin + 1).ok_or_else(|| RecipeError::new(format!("position {position} is not past window start {begin}")))? as usize;
+		require(slot < draft_positions()?, format!("position {position} is past the {} kept positions of the window", draft_positions()?))?;
+		for &(live, kept, bytes) in &self.program.artifact.layout.kept {
+			self.program.gpu.copy_device(self.contexts.pointer + live as u64, self.contexts.pointer + (kept + slot * bytes) as u64, bytes)?;
+		}
+		self.reached.store(position, Ordering::Relaxed);
+		Ok(())
+	}
 	/// Puts back the carried contexts `keep_carried` copied aside.
 	fn restore_carried(&self) -> Result<()> {
 		let kept = self.kept.lock().map_err(|_| RecipeError::new("kept state is poisoned"))?;
@@ -25106,6 +25178,11 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 }
 /// Context sizing and lifetimes are one declaration consumed by allocation.
 /// Regions remain contiguous and in the order the kernel reads them.
+/// The first positions of a decode window whose carried state is kept, so a
+/// rejected draft takes the state back instead of running the window again.
+fn draft_positions() -> Result<usize> {
+	natural("draft positions", env!("RECIPE_DRAFT_POSITIONS"))
+}
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool, step: usize) -> Result<Vec<(usize, BufferLifetime)>> {
 	use BufferLifetime::{ReadOnly, Retained, Unused};
 	let local = if inference { BufferLifetime::Until(step) } else { Retained };
@@ -25122,7 +25199,9 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		Primitive::Dconv if inference => {
 			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
 			let tail = checked_mul(checked_mul(rows, node.output.channels, "depthwise history channels")?, checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?, "depthwise history")?;
-			vec![(checked_mul(tail.max(1), precision.bytes(), "depthwise history bytes")?, Retained)]
+			let tail_bytes = checked_mul(tail.max(1), precision.bytes(), "depthwise history bytes")?;
+			// The history after each of a window's first positions, to take back to.
+			vec![(tail_bytes, Retained), (checked_mul(tail_bytes, draft_positions()?, "depthwise kept histories")?, Retained)]
 		}
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -25172,9 +25251,12 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta state")?;
 			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
+			let live = checked_mul(pair_bytes, state, "delta carried state bytes")?;
 			vec![
-				(checked_mul(pair_bytes, state, "delta carried state bytes")?, Retained),
+				(live, Retained),
 				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+				// The live state after each of a window's first positions, to take back to.
+				(checked_mul(live, draft_positions()?, "delta kept states")?, Retained),
 			]
 		}
 		Primitive::Pool if inference => Vec::new(),
