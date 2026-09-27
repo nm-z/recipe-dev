@@ -14646,23 +14646,27 @@ enum StoredSegment {
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
 	Absent(usize),
+	/// `count` pieces of `length` mapped bytes, `pitch` apart from `at`: one
+	/// die's rows or inputs of every row of a split weight.
+	Strided { mapping: Arc<gguf::Mapping>, at: usize, length: usize, pitch: usize, count: usize },
 }
 impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
+			Self::Strided { length, count, .. } => length * count,
 		}
 	}
-}
-impl std::ops::Deref for StoredSegment {
-	type Target = [u8];
-	fn deref(&self) -> &[u8] {
-		match self {
-			Self::Owned(bytes) => bytes,
-			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
-			Self::Absent(_) => &[],
-		}
+	/// The contiguous host pieces of the run, in order.
+	fn pieces(&self) -> impl Iterator<Item = &[u8]> {
+		let (bytes, at, length, pitch, count): (&[u8], usize, usize, usize, usize) = match self {
+			Self::Owned(bytes) => (bytes, 0, bytes.len(), 0, 1),
+			Self::Mapped(mapping, at, length) => (mapping.bytes(), *at, *length, 0, 1),
+			Self::Absent(_) => (&[], 0, 0, 0, 0),
+			Self::Strided { mapping, at, length, pitch, count } => (mapping.bytes(), *at, *length, *pitch, *count),
+		};
+		(0..count).map(move |piece| &bytes[at + piece * pitch..at + piece * pitch + length])
 	}
 }
 /// One node's stored bytes as the ordered runs they are assembled from, each
@@ -14689,7 +14693,12 @@ impl StoredBytes {
 	#[cfg(unix)]
 	fn advise(&self, advice: i32) {
 		for segment in self.0.iter() {
-			if let StoredSegment::Mapped(mapping, at, length) = segment {
+			let (mapping, at, length) = match segment {
+				StoredSegment::Mapped(mapping, at, length) => (mapping, at, *length),
+				StoredSegment::Strided { mapping, at, length, pitch, count } => (mapping, at, (count - 1) * pitch + length),
+				_ => continue,
+			};
+			{
 				let page = usize::try_from(unsafe { getpagesize() }).unwrap_or(4096).max(1);
 				let start = mapping.bytes().as_ptr() as usize + at;
 				let aligned = start / page * page;
@@ -14700,6 +14709,18 @@ impl StoredBytes {
 	/// A run of `length` bytes the load kernel writes on the device.
 	fn absent(length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Absent(length)]))
+	}
+	/// `count` views of `length` bytes, `pitch` apart from `first`: one
+	/// strided run when the bytes are one mapped run, so splitting a table of
+	/// many rows costs one segment, not one per row.
+	fn strided(&self, first: usize, length: usize, pitch: usize, count: usize) -> Self {
+		match self.0.as_slice() {
+			[StoredSegment::Mapped(mapping, at, total)] if count > 1 && first + (count - 1) * pitch + length <= *total => {
+				Self(Arc::new(vec![StoredSegment::Strided { mapping: mapping.clone(), at: at + first, length, pitch, count }]))
+			}
+			[StoredSegment::Absent(_)] => Self::absent(length * count),
+			_ => Self::joined((0..count).map(|piece| self.view(first + piece * pitch, length)).collect()),
+		}
 	}
 	/// Bytes `from` to `from + length` of the runs, sharing every mapped run.
 	fn view(&self, from: usize, length: usize) -> Self {
@@ -14716,6 +14737,14 @@ impl StoredBytes {
 				StoredSegment::Owned(bytes) => StoredSegment::Owned(bytes[offset..offset + count].to_vec()),
 				StoredSegment::Mapped(mapping, base, _) => StoredSegment::Mapped(mapping.clone(), base + offset, count),
 				StoredSegment::Absent(_) => StoredSegment::Absent(count),
+				StoredSegment::Strided { mapping, at, length, pitch, .. } => {
+					// Each piece the range touches becomes its own mapped run.
+					for piece in offset / length..(offset + count).div_ceil(*length) {
+						let (low, high) = (offset.max(piece * length), (offset + count).min((piece + 1) * length));
+						parts.push(StoredSegment::Mapped(mapping.clone(), at + piece * pitch + low - piece * length, high - low));
+					}
+					continue;
+				}
 			});
 		}
 		Self(Arc::new(parts))
@@ -14731,13 +14760,10 @@ impl StoredBytes {
 	/// device writes is skipped.
 	fn runs(&self) -> impl Iterator<Item = (usize, &[u8])> {
 		let mut at = 0;
-		self.0.iter().filter_map(move |run| {
+		self.0.iter().flat_map(|run| run.pieces()).filter_map(move |piece| {
 			let offset = at;
-			at += run.length();
-			match run {
-				StoredSegment::Absent(_) => None,
-				_ => Some((offset, &**run)),
-			}
+			at += piece.len();
+			(!piece.is_empty()).then_some((offset, piece))
 		})
 	}
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
@@ -18238,23 +18264,48 @@ impl Gpu {
 /// RAM their exchanges go through. Each die holds its share of the split
 /// nodes' weights and the whole of every other node's.
 fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
-	// Each die takes a share of the split weights in proportion to its free memory.
-	let shares = devices.iter().map(|device| device.free_bytes().map(|bytes| bytes as f64)).collect::<Result<Vec<_>>>()?;
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	// A region saves each die the weights it reads a share of and costs an
 	// exchange. One a position reads few bytes of stays whole on every die,
 	// the fewest first, while every die still holds its weights.
 	let mut whole = std::collections::BTreeSet::new();
-	let split = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
-	let mut used = split.iter().map(|part| part_bytes(part, precision).map(|bytes| bytes as u64)).collect::<Result<Vec<_>>>()?;
-	let available = devices.iter().map(|device| device.free_bytes().map(|bytes| bytes.saturating_sub(reserve))).collect::<Result<Vec<_>>>()?;
-	let total = shares.iter().sum::<f64>();
+	// The plan keeps 1/64 of each die free: setting up the dies takes some of
+	// it before the weights go up.
+	let available = devices.iter().map(|device| device.free_bytes().map(|bytes| { let room = bytes.saturating_sub(reserve); room - room / 64 })).collect::<Result<Vec<_>>>()?;
+	let dies = devices.len();
+	let items = split_items(graph, dies, &whole)?;
+	let shard = |plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>| (0..dies).map(|die| shard_graph(graph, die, dies, plan, whole)).collect::<Result<Vec<_>>>();
+	let sizes = |parts: &[Graph]| parts.iter().map(|part| part_bytes(part, precision).map(|bytes| bytes as u64)).collect::<Result<Vec<_>>>();
+	// The first plan fills each die's free memory; every later one fills the
+	// room past what the die measured holding whole.
+	let mut plan = plan_split(&items, &available.iter().map(|room| *room as f64).collect::<Vec<_>>());
+	let mut split = shard(&plan, &whole)?;
+	let mut used = sizes(&split)?;
+	for _ in 0..8 {
+		if used.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			break;
+		}
+		let rooms = (0..dies).map(|die| {
+			let held = items.iter().map(|(key, units, bytes)| plan[key][die] as f64 * *bytes as f64 / *units as f64).sum::<f64>();
+			available[die] as f64 - (used[die] as f64 - held)
+		}).collect::<Vec<_>>();
+		plan = plan_split(&items, &rooms);
+		drop(split);
+		split = shard(&plan, &whole)?;
+		used = sizes(&split)?;
+	}
+	if used.iter().zip(&available).any(|(bytes, room)| bytes > room) {
+		let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+		let dies = devices.iter().zip(used.iter().zip(&available)).map(|(device, (bytes, room))| format!("{} {:.3} of {:.3} GiB", device.name, gib(*bytes), gib(*room))).collect::<Vec<_>>();
+		return Err(RecipeError::new(format!("no tensor split fits every die: {}", dies.join(", "))));
+	}
 	let threshold = natural("tensor split region bytes", env!("RECIPE_TENSOR_SPLIT_REGION_BYTES"))?;
 	let mut candidates = split_regions(graph, devices.len())?.into_iter().filter(|region| region.read < threshold).collect::<Vec<_>>();
 	candidates.sort_by_key(|region| region.read);
 	let mut kept = Vec::new();
 	for region in candidates {
-		let grown = used.iter().zip(&shares).map(|(bytes, share)| bytes + (region.stored as f64 * (1.0 - share / total)) as u64).collect::<Vec<_>>();
+		let counts = &plan[&region.end];
+		let grown = used.iter().zip(counts).map(|(bytes, count)| bytes + (region.stored as f64 * (1.0 - *count as f64 * region.unit as f64 / region.period as f64)) as u64).collect::<Vec<_>>();
 		if grown.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
 			whole.insert(region.end);
 			kept.push(region.end);
@@ -18267,7 +18318,7 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 	let mut graphs = split;
 	while !whole.is_empty() {
 		drop(graphs);
-		graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
+		graphs = shard(&plan, &whole)?;
 		let fits = graphs.iter().zip(&available).map(|(part, room)| part_bytes(part, precision).map(|bytes| bytes as u64 <= *room)).collect::<Result<Vec<_>>>()?;
 		if fits.iter().all(|fit| *fit) {
 			break;
@@ -18276,7 +18327,7 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 		whole.remove(&last);
 		if whole.is_empty() {
 			drop(graphs);
-			graphs = (0..devices.len()).map(|die| shard_graph(graph, die, &shares, &whole)).collect::<Result<Vec<_>>>()?;
+			graphs = shard(&plan, &whole)?;
 		}
 	}
 	if tracing() {
@@ -18288,7 +18339,7 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 		let required = part_bytes(part, precision)? as u64;
 		let available = device.free_bytes()?.saturating_sub(reserve);
 		if required > available {
-			return Err(placement_memory_error(part, precision, available)?);
+			return Err(RecipeError::new(format!("{}: {}", device.name, placement_memory_error(part, precision, available)?)));
 		}
 	}
 	std::thread::scope(|scope| {
@@ -18666,15 +18717,12 @@ fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> 
 	let row_count = weight.count / (repeats * rows);
 	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
 	let periods = if run.period == 0 { 1 } else { rows / run.period };
-	let mut parts = Vec::new();
-	for repeat in 0..repeats {
-		for period in 0..periods {
-			parts.push(weight.bytes.view((repeat * rows + period * run.period + run.first) * row_bytes, run.count * row_bytes));
-		}
-	}
+	// Every repeat's periods are the same rows apart, so the share is one strided view.
+	let pitch = if run.period == 0 { rows } else { run.period } * row_bytes;
+	let bytes = weight.bytes.strided(run.first * row_bytes, run.count * row_bytes, pitch, repeats * periods);
 	let count = row_count * run.count * periods * repeats;
 	let format = weight.format_segments()[0].0;
-	Ok(StoredWeight { format, count, bytes: StoredBytes::joined(parts), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+	Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
 }
 /// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
 /// inputs repeated `repeats` times, whole blocks at a time: each row's share
@@ -18684,33 +18732,92 @@ fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize
 	let row_bytes = terms / block * stride;
 	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
 	let periods = if run.period == 0 { 1 } else { terms / run.period };
-	let mut parts = Vec::with_capacity(repeats * rows * periods);
-	for row in 0..repeats * rows {
-		for period in 0..periods {
-			let at = row * row_bytes + (period * run.period + run.first) / block * stride;
-			parts.push(weight.bytes.view(at, run.count / block * stride));
-		}
-	}
+	// Every row's periods are the same bytes apart, so the share is one strided view.
+	let bytes = weight.bytes.strided(run.first / block * stride, run.count / block * stride, row_bytes / periods, repeats * rows * periods);
 	let count = repeats * rows * periods * run.count;
 	let format = weight.format_segments()[0].0;
-	Ok(StoredWeight { format, count, bytes: StoredBytes::joined(parts), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+	Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
 }
-/// Die `die`'s graph of a tensor split over dies whose relative speeds are
-/// `shares`. Each split region runs apart: its first sums keep this die's share
+/// How many units of each split item every die takes, keyed by the item's
+/// node: a region by its end, a sum or expert table split alone by itself.
+type SplitPlan = BTreeMap<usize, Vec<usize>>;
+/// The units node `index` outside every region splits into and the period its
+/// rows repeat with, when it is large enough to split alone.
+fn lone_split(graph: &Graph, index: usize, dies: usize) -> Option<(usize, usize)> {
+	let node = &graph.nodes[index];
+	let (weight, _, _) = sliceable(graph, index)?;
+	match node.op {
+		Primitive::Contraction if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 16 << 20 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		Primitive::ExpertIn if node.argument[0] as usize > 1 && node.argument[2] as usize >= dies => Some((node.argument[2] as usize, node.argument[2] as usize)),
+		Primitive::ExpertOut if node.argument[0] as usize > 1 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		_ => None,
+	}
+}
+/// Every item a split over `dies` cuts, as its key, its units and its stored
+/// bytes: each region not kept `whole`, then each large node outside them.
+fn split_items(graph: &Graph, dies: usize, whole: &std::collections::BTreeSet<usize>) -> Result<Vec<(usize, usize, usize)>> {
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	let inside = regions.iter().flat_map(|region| region.starts.iter().copied().chain([region.end])).collect::<std::collections::BTreeSet<_>>();
+	let mut items = regions.iter().map(|region| (region.end, region.period / region.unit, region.stored)).collect::<Vec<_>>();
+	for index in (0..graph.nodes.len()).filter(|index| !inside.contains(index)) {
+		if let Some((units, _)) = lone_split(graph, index, dies) {
+			items.push((index, units, graph.stored[index].as_ref().map_or(0, |weight| weight.bytes.len())));
+		}
+	}
+	Ok(items)
+}
+/// Each item's units over the dies, largest unit first, in proportion to the
+/// room each die has left: the coarse items go first and the fine ones even
+/// out what their whole units left over.
+fn plan_split(items: &[(usize, usize, usize)], rooms: &[f64]) -> SplitPlan {
+	let mut order = (0..items.len()).collect::<Vec<_>>();
+	let unit = |index: usize| items[index].2 as f64 / items[index].1 as f64;
+	order.sort_by(|a, b| unit(*b).total_cmp(&unit(*a)).then(a.cmp(b)));
+	let mut left = rooms.to_vec();
+	let mut plan = SplitPlan::new();
+	for index in order {
+		let (key, units, _) = items[index];
+		let weights = left.iter().map(|room| room.max(0.0)).collect::<Vec<_>>();
+		let total = weights.iter().sum::<f64>();
+		let exact = weights.iter().map(|weight| if total > 0.0 { units as f64 * weight / total } else { units as f64 / weights.len() as f64 }).collect::<Vec<_>>();
+		let counts = apportion(units, &exact);
+		for (room, count) in left.iter_mut().zip(&counts) {
+			*room -= *count as f64 * unit(index);
+		}
+		plan.insert(key, counts);
+	}
+	plan
+}
+/// Whole units summing to `count` near `exact`: each takes its whole part, at
+/// least one while there are enough to go round, and the units left go to the
+/// largest remainders.
+fn apportion(count: usize, exact: &[f64]) -> Vec<usize> {
+	let floor = usize::from(count >= exact.len());
+	let mut counts = exact.iter().map(|units| (*units as usize).max(floor)).collect::<Vec<_>>();
+	let mut order = (0..exact.len()).collect::<Vec<_>>();
+	order.sort_by(|a, b| (exact[*b] - counts[*b] as f64).total_cmp(&(exact[*a] - counts[*a] as f64)).then(a.cmp(b)));
+	for index in order.iter().cycle().take(count.saturating_sub(counts.iter().sum())) {
+		counts[*index] += 1;
+	}
+	// Units over the count leave the ones furthest past their exact share.
+	while counts.iter().sum::<usize>() > count {
+		let index = (0..exact.len()).filter(|index| counts[*index] > floor).max_by(|a, b| (counts[*a] as f64 - exact[*a]).total_cmp(&(counts[*b] as f64 - exact[*b])).then(b.cmp(a))).unwrap_or(0);
+		counts[index] -= 1;
+	}
+	counts
+}
+/// Die `die`'s graph of a tensor split over `dies` dies, each taking the units
+/// `plan` gives it of every split item. Each split region runs apart: its first sums keep this die's share
 /// of their rows, the ops after them keep channels apart, and the last sum adds
 /// this die's share of its inputs, which one exchange then sums over the dies.
 /// A large sum outside any region keeps a share of its rows, gathered after it;
 /// every other node runs whole on every die.
-fn shard_graph(graph: &Graph, die: usize, shares: &[f64], whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
-	require(die < shares.len() && shares.iter().all(|share| *share > 0.0), "a tensor split needs a positive share for every die")?;
-	let total = shares.iter().sum::<f64>();
-	let before = shares[..die].iter().sum::<f64>();
-	let part = |count: usize| {
-		let first = (count as f64 * before / total).round() as usize;
-		let last = (count as f64 * (before + shares[die]) / total).round() as usize;
-		(first, last - first)
+fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
+	// Die `die`'s first unit and unit count of the item keyed `key`.
+	let part = |key: usize| {
+		plan.get(&key).map(|counts| (counts[..die].iter().sum::<usize>(), counts[die])).ok_or_else(|| RecipeError::new("a split item has no plan"))
 	};
-	let regions = split_regions(graph, shares.len())?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
 	if tracing() && die == 0 {
 		for region in &regions {
 			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
@@ -18719,7 +18826,7 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64], whole: &std::collectio
 	// The rows and inputs each region node splits, and whether a sum follows.
 	let mut plans: Vec<Option<(Shard, Option<f64>)>> = vec![None; graph.nodes.len()];
 	for region in &regions {
-		let (first, count) = part(region.period / region.unit);
+		let (first, count) = part(region.end)?;
 		require(count != 0, "a split region gives a die no channels")?;
 		let run = Run { first: first * region.unit, count: count * region.unit, period: region.period };
 		for start in &region.starts {
@@ -18736,23 +18843,13 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64], whole: &std::collectio
 		let weight = sliceable(graph, index);
 		// Outside a region, a large sum or expert table keeps a share of its rows
 		// and gathers them after itself; a small one runs whole.
-		let alone = match (node.op, weight) {
-			_ if plans[index].is_some() => None,
-			(Primitive::Contraction, Some((weight, _, _)))
-				if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 16 << 20 && node.output.channels >= shares.len() =>
-			{
-				let (first, count) = part(node.output.channels);
-				Some(Run { first, count, period: 0 })
+		let alone = match lone_split(graph, index, dies) {
+			_ if plans[index].is_some() || !plan.contains_key(&index) => None,
+			Some((_, period)) => {
+				let (first, count) = part(index)?;
+				Some(Run { first, count, period })
 			}
-			(Primitive::ExpertIn, Some(_)) if node.argument[0] as usize > 1 && node.argument[2] as usize >= shares.len() => {
-				let (first, count) = part(node.argument[2] as usize);
-				Some(Run { first, count, period: node.argument[2] as usize })
-			}
-			(Primitive::ExpertOut, Some(_)) if node.argument[0] as usize > 1 && node.output.channels >= shares.len() => {
-				let (first, count) = part(node.output.channels);
-				Some(Run { first, count, period: 0 })
-			}
-			_ => None,
+			None => None,
 		};
 		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
 		let Some((shard, exchange)) = plan else {
@@ -18785,7 +18882,7 @@ fn shard_graph(graph: &Graph, die: usize, shares: &[f64], whole: &std::collectio
 				input: output,
 				output,
 				parameters: 0,
-				argument: [mode, die as f64, shares.len() as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+				argument: [mode, die as f64, dies as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
 				program_offset: 0,
 				program_count: 0,
 				storage: 0,
@@ -19940,9 +20037,10 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	// first), so a host requantize is kept and handed back to every later compile
 	// of the same file bytes into the same format.
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
-		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
-		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
-		StoredSegment::Absent(length) => (0, 0, *length),
+		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length, 0, 1),
+		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len(), 0, 1),
+		StoredSegment::Absent(length) => (0, 0, *length, 0, 1),
+		StoredSegment::Strided { mapping, at, length, pitch, count } => (Arc::as_ptr(mapping) as usize, *at, *length, *pitch, *count),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
@@ -19976,7 +20074,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 /// Host requantize results by source runs and target format, kept for the
 /// later compiles of one run.
 #[allow(clippy::type_complexity)]
-static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
+static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
 	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
 	// The block's own suffix for this kind of op, else the run's table.
