@@ -52,10 +52,13 @@ fn main() {
 		}
 		model = hyper(model, &attention);
 
-		let expert = (layer(640).silu() * layer(640)).layer(2560);
-		let mut experts = recipe.model().moe(10, vec![expert.clone(); 512]).route(softmax).renorm();
+		let expert = (layer(640).bind(key!(blk[a].ffn_gate_exps.weight)).silu() * layer(640).bind(key!(blk[a].ffn_up_exps.weight)))
+			.layer(2560).bind(key!(blk[a].ffn_down_exps.weight));
+		let mut experts = recipe.model().moe(10, vec![expert; 512]).route(softmax).renorm();
 		if data.has_tensor(key!(blk[a].ffn_gate_shexp.weight)) {
-			experts = experts.shared(expert, [layer(1).sigmoid()]);
+			let shared = (layer(640).bind(key!(blk[a].ffn_gate_shexp.weight)).silu() * layer(640).bind(key!(blk[a].ffn_up_shexp.weight)))
+				.layer(2560).bind(key!(blk[a].ffn_down_shexp.weight));
+			experts = experts.shared(shared, [layer(1).bind(key!(blk[a].ffn_gate_inp_shexp.weight)).sigmoid()]);
 		}
 		if data.has_tensor(key!(blk[a].post_ffw_norm.weight)) {
 			experts = experts.norm(rms);

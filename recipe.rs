@@ -17697,6 +17697,15 @@ fn mixes(parts: &[Block]) -> bool {
 		_ => false,
 	})
 }
+/// The projections inside `block` in the order lowering visits them.
+fn layers_of(block: &Block) -> Vec<&Block> {
+	match &block.operation {
+		Operation::Layer(_) => vec![block],
+		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).flat_map(layers_of).collect(),
+		Operation::Residual(parts) | Operation::Sequence(parts) => parts.iter().flat_map(layers_of).collect(),
+		_ => Vec::new(),
+	}
+}
 /// The width of the first projection inside `block`: an expert's hidden width.
 fn first_layer(block: &Block) -> Option<usize> {
 	match &block.operation {
@@ -17959,23 +17968,36 @@ impl Builder<'_> {
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
 		self.mapped(vec![router]);
-		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
-			let table = self.tensor(&name(suffix), &role)?;
+		// An expert's projections bind the tables that stack every expert's rows,
+		// by path where the expert names one.
+		let expert_layers = moe.experts.first().map(layers_of).unwrap_or_default();
+		for (position, (suffix, inputs, outputs)) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)].into_iter().enumerate() {
+			let table = match expert_layers.get(position).and_then(|block| block.weight.as_ref()) {
+				Some(path) => self.keyed_tensor(path, &role)?,
+				None => self.tensor(&name(suffix), &role)?,
+			};
 			require(
 				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
 				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
 			)?;
 			self.mapped(vec![table]);
 		}
-		if let Some((expert, _)) = &moe.shared {
+		if let Some((expert, gate_blocks)) = &moe.shared {
 			let shared_role = format!("block {layer} shared expert");
 			let shared_hidden = first_layer(expert).ok_or_else(|| RecipeError::new(format!("{shared_role} begins with no projection")))?;
 			// The per-position gate is the first weighted node in the shared path.
-			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+			let gate = match gate_blocks.iter().flat_map(layers_of).next().and_then(|block| block.weight.as_ref()) {
+				Some(path) => self.keyed_tensor(path, &shared_role)?,
+				None => self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?,
+			};
 			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
 			self.mapped(vec![gate]);
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)] {
-				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+			let shared_layers = layers_of(expert);
+			for (position, (suffix, inputs, outputs)) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)].into_iter().enumerate() {
+				let tensor = match shared_layers.get(position) {
+					Some(block) if block.weight.is_some() => self.layer_projection(block, "", &shared_role, inputs, outputs)?,
+					_ => self.projection(&name(suffix), &shared_role, inputs, outputs)?,
+				};
 				self.mapped(vec![tensor]);
 			}
 		}
