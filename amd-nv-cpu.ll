@@ -4508,7 +4508,7 @@ own.step:
 %own.none = icmp slt i32 %own.best, 0 %own.higher = call i1 @recipe.state.ogt(RECIPE_STATE %own.value, RECIPE_STATE %own.score) %own.better = or i1 %own.none, %own.higher %own.take = and i1 %own.open, %own.better
 %own.best.next = select i1 %own.take, i32 %own.e, i32 %own.best %own.score.next = select i1 %own.take, RECIPE_STATE %own.value, RECIPE_STATE %own.score
 %own.j.next = add i32 %own.j, 1
-br label %own.loop
+br label %own.loop, !llvm.loop !2
 reduce.entry:
 br label %reduce.loop
 reduce.loop:
@@ -4559,7 +4559,7 @@ max.step:
 %m.higher = call i1 @recipe.state.ogt(RECIPE_STATE %m.score, RECIPE_STATE %m.value) %m.better = or i1 %m.first, %m.higher %m.take = and i1 %m.member, %m.better
 %m.value.next = select i1 %m.take, RECIPE_STATE %m.score, RECIPE_STATE %m.value %m.first.next = select i1 %m.take, i1 false, i1 %m.first
 %m.j.next = add i32 %m.j, 1
-br label %max.loop
+br label %max.loop, !llvm.loop !3
 max.reduce.entry:
 br label %max.reduce.loop
 max.reduce.loop:
@@ -4601,7 +4601,7 @@ sum.step:
 %s.term = select i1 %s.member, RECIPE_STATE %s.raw.state, RECIPE_STATE %state.zero
 %s.total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %s.total, RECIPE_STATE %s.term)
 %s.j.next = add i32 %s.j, 1
-br label %sum.loop
+br label %sum.loop, !llvm.loop !4
 sum.reduce.entry:
 br label %sum.reduce.loop
 sum.reduce.loop:
@@ -4637,7 +4637,7 @@ store double %w.value, ptr addrspace(1) %w.ptr, align 8
 br label %write.next
 write.next:
 %w.j.next = add i32 %w.j, 1
-br label %write.loop
+br label %write.loop, !llvm.loop !5
 exit: ret void }
 ; The routing weights of one position. The top scores are kept by rank, scored
 ; by softmax over every expert or by sigmoid, and divided by the kept total when
@@ -9160,3 +9160,9 @@ invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = 
 ; and the accumulator vector remains in registers.
 !0 = distinct !{!0, !1}
 !1 = !{!"llvm.loop.unroll.full"}
+; A router wave scans its experts with every load issued at once, so each
+; pick waits on one load latency rather than one per expert slot.
+!2 = distinct !{!2, !1}
+!3 = distinct !{!3, !1}
+!4 = distinct !{!4, !1}
+!5 = distinct !{!5, !1}
