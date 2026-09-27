@@ -11007,10 +11007,25 @@ mod tokenizer {
 			match token {
 				Token::Str(text) => Ok(Value::Text(text)),
 				Token::Int(value) => Ok(Value::Int(value)),
+				// A parenthesized expression, or a tuple when a comma follows its first item.
 				Token::Op("(") => {
+					if self.eat_op(")") {
+						return Ok(Value::List(Vec::new()));
+					}
 					let value = self.expression(live)?;
-					self.expect_op(")")?;
-					Ok(value)
+					if !self.eat_op(",") {
+						self.expect_op(")")?;
+						return Ok(value);
+					}
+					let mut items = vec![value];
+					while !self.eat_op(")") {
+						items.push(self.expression(live)?);
+						if !self.eat_op(",") {
+							self.expect_op(")")?;
+							break;
+						}
+					}
+					Ok(Value::List(items))
 				}
 				Token::Op("[") => {
 					let mut items = Vec::new();
