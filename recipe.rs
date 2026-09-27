@@ -11858,6 +11858,7 @@ mod bundle {
 		require(fields.len() == 11, "semantic model block has the wrong width")?;
 		Ok(Block {
 			operation: operation(&fields[0])?,
+			weight: None,
 			maps: if fields[1].is_empty() { Vec::new() } else { fields[1].split('~').map(map).collect::<Result<Vec<_>>>()? },
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?,
 			quantization: value_at(Some(&fields[2]), "block quantization")?,
@@ -12731,17 +12732,6 @@ impl KeyPath {
 		}
 	}
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Projection {
-	Q,
-	K,
-	V,
-}
-impl fmt::Display for Projection {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self { Self::Q => "q", Self::K => "k", Self::V => "v" })
-	}
-}
 pub fn metadata_f64(path: KeyPath) -> f64 {
 	path.metadata(script_file()).unwrap_or_else(|error| panic!("{error}"))
 		.float().unwrap_or_else(|| panic!("GGUF metadata path {} is not numeric", path.text()))
@@ -13183,6 +13173,8 @@ macro_rules! precision_methods {
 #[derive(Clone, Debug)]
 pub struct Block {
 	operation: Operation,
+	/// The GGUF tensor whose rows supply a layer's weight.
+	weight: Option<KeyPath>,
 	maps: Vec<OutputMap>,
 	/// The per-head normalization of the attention queries and keys.
 	qk: Option<BlockNormalization>,
@@ -13246,6 +13238,7 @@ impl Suffix {
 impl PartialEq for Block {
 	fn eq(&self, other: &Self) -> bool {
 		self.operation == other.operation
+			&& self.weight == other.weight
 			&& self.maps == other.maps
 			&& self.qk == other.qk
 			&& self.quantization == other.quantization
@@ -13276,7 +13269,7 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
-			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
+			operation, weight: None, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
 			kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
 		}
 	}
@@ -13305,17 +13298,15 @@ impl Block {
 		}
 		self
 	}
-	fn bind_projection(self, role: Projection, path: KeyPath) -> Self {
-		self.attention("projection binding", |attention| match role {
-			Projection::Q => attention.query = Some(path),
-			Projection::K => attention.key = Some(path),
-			Projection::V => attention.value = Some(path),
-		})
+	pub fn q(self, path: KeyPath) -> Self { self.attention("q", |attention| attention.query = Some(path)) }
+	pub fn k(self, path: KeyPath) -> Self { self.attention("k", |attention| attention.key = Some(path)) }
+	pub fn v(self, path: KeyPath) -> Self { self.attention("v", |attention| attention.value = Some(path)) }
+	/// Bind this layer's weight to one GGUF tensor path.
+	pub fn bind(mut self, path: KeyPath) -> Self {
+		assert!(matches!(self.operation, Operation::Layer(_)), "weight binding requires a layer");
+		self.weight = Some(path);
+		self
 	}
-	pub fn q(self, path: KeyPath) -> Self { self.bind_projection(Projection::Q, path) }
-	pub fn k(self, path: KeyPath) -> Self { self.bind_projection(Projection::K, path) }
-	pub fn v(self, path: KeyPath) -> Self { self.bind_projection(Projection::V, path) }
-	pub fn bind(self, role: Projection, path: KeyPath) -> Self { self.bind_projection(role, path) }
 	/// Head width of this `attn` block. Without it, the width comes from the
 	/// residual stream and the heads partition the input.
 	pub fn width(self, width: usize) -> Self {
@@ -13494,6 +13485,7 @@ impl Model {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
 				operation,
+				weight: None,
 				maps: Vec::new(),
 				qk: None,
 				quantization: 0,
@@ -13564,7 +13556,13 @@ impl Model {
 	pub fn q(&self, path: KeyPath) -> Self { self.attention("q", |block| block.q(path)) }
 	pub fn k(&self, path: KeyPath) -> Self { self.attention("k", |block| block.k(path)) }
 	pub fn v(&self, path: KeyPath) -> Self { self.attention("v", |block| block.v(path)) }
-	pub fn bind(&self, role: Projection, path: KeyPath) -> Self { self.attention("projection binding", |block| block.bind(role, path)) }
+	/// Bind the preceding layer's weight to one GGUF tensor path.
+	pub fn bind(&self, path: KeyPath) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding layer"));
+			model.blocks.push(block.bind(path));
+		})
+	}
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Self {
 		self.push(Operation::Residual(branch(parts)))
 	}
@@ -16461,6 +16459,12 @@ impl<'a> Builder<'a> {
 		)?;
 		Ok(tensor)
 	}
+	fn layer_projection(&mut self, block: &Block, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
+		match &block.weight {
+			Some(path) => self.projection_path(path, role, inputs, outputs),
+			None => self.projection(name, role, inputs, outputs),
+		}
+	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
@@ -17266,14 +17270,16 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let embedding = builder.tensor("token_embd.weight", "the embedding")?;
 	require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 	let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-	let mut layers = 0;
+	let (mut layers, mut channels) = (0, width);
 	for block in &model.blocks {
 		match &block.operation {
 			Operation::Embed(rows, columns) => {
 				require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
 				builder.mapped(vec![embedding.clone()]);
+				channels = *columns;
 			}
 			Operation::Residual(parts) => {
+				require(channels == width, format!("a residual receives {channels} channels, but this GGUF declares {width}"))?;
 				let attends = parts.iter().any(|part| match &part.operation {
 					Operation::Attention(_) => true,
 					Operation::Product(left, _) => left.blocks.iter().any(|block| matches!(block.operation, Operation::Attention(_))),
@@ -17291,13 +17297,13 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 					match &step.operation {
 						Operation::Identity => {}
 						Operation::Attention(attention) => {
-							attention_inner = Some(builder.attention_planes(layer, attention, step.qk.is_some(), width, false)?);
+							attention_inner = Some(builder.attention_planes(layer, attention, step.qk.is_some(), width, false, None)?);
 							weighted = true;
 						}
 						Operation::Product(left, right) => {
 							if let Some(attention) = left.blocks.first().and_then(|block| match &block.operation { Operation::Attention(attention) => Some(attention), _ => None }) {
 								require(part == "attn" && left.blocks.len() == 1 && right.blocks.len() == 1, format!("block {layer} attention product has invalid branches"))?;
-								let inner = builder.attention_planes(layer, attention, left.blocks[0].qk.is_some(), width, true)?;
+								let inner = builder.attention_planes(layer, attention, left.blocks[0].qk.is_some(), width, true, right.blocks[0].weight.as_ref())?;
 								require(
 									matches!(right.blocks[0].operation, Operation::Layer(outputs) if outputs == inner) && right.blocks[0].maps.len() == 1 && matches!(right.blocks[0].maps[0].kind, MapKind::Activation(Activation::Sigmoid)),
 									format!("block {layer} attention gate must be layer({inner}).sigmoid()"),
@@ -17312,7 +17318,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 									let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
 									require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 									hidden = widths[0];
-									let tensor = builder.projection(&name(suffix), &role, width, hidden)?;
+									let tensor = builder.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?;
 									builder.mapped(vec![tensor]);
 								}
 								weighted = true;
@@ -17333,7 +17339,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 								("ffn_down.weight", hidden)
 							};
 							require(*outputs == width, format!("layer({outputs}) in block {layer} does not restore {width} channels"))?;
-							let tensor = builder.projection(&name(suffix), &role, inputs, width)?;
+							let tensor = builder.layer_projection(step, &name(suffix), &role, inputs, width)?;
 							builder.mapped(vec![tensor]);
 						}
 						other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
@@ -17358,14 +17364,23 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 				}
 			}
 			Operation::Layer(outputs) => {
-				require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
-				require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after the vocabulary projection has no tensor name")?;
-				let output = match builder.optional("output.weight") {
-					Some(output) => output,
-					None => embedding.clone(),
-				};
-				require(output.shape.len() == 2 && output.shape[0] as usize == width && output.shape[1] as usize == vocabulary, format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
-				builder.mapped(vec![output]);
+				require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization after a layer has no tensor name")?;
+				if let Some(path) = &block.weight {
+					let tensor = builder.projection_path(path, "a layer", channels, *outputs)?;
+					builder.mapped(vec![tensor]);
+				} else {
+					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
+					let output = match builder.optional("output.weight") {
+						Some(output) => output,
+						None => embedding.clone(),
+					};
+					require(
+						output.shape.len() == 2 && output.shape[0] as usize == channels && output.shape[1] as usize == vocabulary,
+						format!("{} has shape {:?}; the vocabulary projection contracts {channels} inputs into {vocabulary} outputs", output.name, output.shape),
+					)?;
+					builder.mapped(vec![output]);
+				}
+				channels = *outputs;
 			}
 			Operation::Identity | Operation::Last => require(!block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))), "a normalization outside the blocks has no tensor name")?,
 			other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
@@ -17384,7 +17399,7 @@ impl Builder<'_> {
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and the
 	/// product's gate projection when present.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, gated: bool) -> Result<usize> {
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, gated: bool, gate_path: Option<&KeyPath>) -> Result<usize> {
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
@@ -17398,11 +17413,11 @@ impl Builder<'_> {
 			outputs if outputs == 2 * heads * head => true,
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
-		require(query_gated == gated, format!("{} gate rows do not match block {layer} attention product", query.name))?;
+		require(query_gated == gated || gated && gate_path.is_some(), format!("{} gate rows do not match block {layer} attention product", query.name))?;
 		let key = if let Some(path) = &attention.key { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
 		let value = if let Some(path) = &attention.value { self.projection_path(path, &role, width, kv * head)? } else { self.projection(&name("attn_v.weight"), &role, width, kv * head)? };
 		let order = self.head_order(head, rope_dims);
-		let stride = if gated { 2 * head } else { head };
+		let stride = if query_gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
 			planes.extend(Self::head_rows(&query, index * stride, &order)?);
@@ -17418,11 +17433,16 @@ impl Builder<'_> {
 			self.slot(scales);
 		}
 		if gated {
-			let mut gate_planes = Vec::new();
-			for index in 0..heads {
-				gate_planes.push(query.rows(index * stride + head, head)?);
+			if let Some(path) = gate_path {
+				let gate = self.projection_path(path, &role, width, heads * head)?;
+				self.mapped(vec![gate]);
+			} else {
+				let mut gate_planes = Vec::new();
+				for index in 0..heads {
+					gate_planes.push(query.rows(index * stride + head, head)?);
+				}
+				self.mapped(gate_planes);
 			}
-			self.mapped(gate_planes);
 		}
 		Ok(heads * head)
 	}
