@@ -13660,9 +13660,11 @@ impl Block {
 	pub fn q(self, path: impl Into<KeyPath>) -> Self { self.attention("q", |attention| attention.query = Some(path.into())) }
 	pub fn k(self, path: impl Into<KeyPath>) -> Self { self.attention("k", |attention| attention.key = Some(path.into())) }
 	pub fn v(self, path: impl Into<KeyPath>) -> Self { self.attention("v", |attention| attention.value = Some(path.into())) }
-	/// Bind this layer or depthwise convolution to one GGUF tensor path.
+	/// Bind this layer, depthwise convolution, or normalization's scale to one
+	/// GGUF tensor path.
 	pub fn bind(mut self, path: impl Into<KeyPath>) -> Self {
-		assert!(matches!(self.operation, Operation::Layer(_) | Operation::Dconv(..)), "weight binding requires a layer or depthwise convolution");
+		let normalization = matches!(self.operation, Operation::Identity) && self.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_)));
+		assert!(matches!(self.operation, Operation::Layer(_) | Operation::Dconv(..)) || normalization, "weight binding requires a layer, a depthwise convolution or a normalization");
 		self.weight = Some(path.into());
 		self.weight_rows = None;
 		self
@@ -13994,7 +13996,8 @@ impl Model {
 	pub fn q(&self, path: impl Into<KeyPath>) -> Self { self.attention("q", |block| block.q(path)) }
 	pub fn k(&self, path: impl Into<KeyPath>) -> Self { self.attention("k", |block| block.k(path)) }
 	pub fn v(&self, path: impl Into<KeyPath>) -> Self { self.attention("v", |block| block.v(path)) }
-	/// Bind the preceding layer or depthwise convolution to one GGUF tensor path.
+	/// Bind the preceding layer, depthwise convolution or normalization's scale to
+	/// one GGUF tensor path.
 	pub fn bind(&self, path: impl Into<KeyPath>) -> Self {
 		self.suffix().edit(|model| {
 			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding weighted block"));
@@ -17764,7 +17767,7 @@ impl Builder<'_> {
 			// A normalization on a block of the model itself scales its output.
 			if !matches!(block.operation, Operation::Layer(_)) && block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))) {
 				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
-				self.norm_scale(name, width)?;
+				self.norm_scale_of(block, name, width)?;
 			}
 		}
 		Ok(())
@@ -17794,7 +17797,13 @@ impl Builder<'_> {
 		}
 		let role = format!("block {layer} {part} mixer");
 		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
-		self.whole(&name("norm"), &role)?;
+		match read.first().and_then(|block| block.weight.as_ref().filter(|_| matches!(block.operation, Operation::Identity))) {
+			Some(path) => {
+				let tensor = self.keyed_tensor(path, &role)?;
+				self.mapped(vec![tensor]);
+			}
+			None => self.whole(&name("norm"), &role)?,
+		}
 		let mut channels = lanes * width;
 		for (gate, suffixes) in [(read, &["down", "up"][..]), (write, &["inject"][..])] {
 			let projections = gate.iter().filter(|block| matches!(block.operation, Operation::Layer(_))).collect::<Vec<_>>();
@@ -17891,7 +17900,7 @@ impl Builder<'_> {
 						(_, false) => "ffn_norm.weight",
 						(_, true) => "post_ffw_norm.weight",
 					};
-					self.norm_scale(&name(suffix), width)?;
+					self.norm_scale_of(step, &name(suffix), width)?;
 				}
 			}
 		}
@@ -17975,6 +17984,15 @@ impl Builder<'_> {
 }
 impl Builder<'_> {
 	/// One normalization scale of `width` values.
+	/// The scale of `block`'s normalization: the tensor it binds by path, or
+	/// the one named `name` by convention.
+	fn norm_scale_of(&mut self, block: &Block, name: &str, width: usize) -> Result<()> {
+		let Some(path) = block.weight.as_ref().filter(|_| matches!(block.operation, Operation::Identity)) else { return self.norm_scale(name, width) };
+		let tensor = self.keyed_tensor(path, "a normalization")?;
+		require(tensor.elements() == width, format!("{} holds {} values; the normalization scales {width} channels", tensor.name, tensor.elements()))?;
+		self.mapped(vec![tensor]);
+		Ok(())
+	}
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let tensor = self.tensor(name, "a normalization")?;
 		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;

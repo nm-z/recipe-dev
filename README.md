@@ -199,6 +199,10 @@ let short = ((layer(width).bind(w.clone()).rows(0, width)
 ```
 
 ```rust
+model.res([norm(rms).bind(blk[a].attn_norm.weight), attention, layer(width).bind(blk[a].attn_output.weight)])
+```
+
+```rust
 let expert = (layer(640).silu() * layer(640)).layer(2560);
 let mixture = moe(10, vec![expert.clone(); 512])
 	.route(softmax).renorm()

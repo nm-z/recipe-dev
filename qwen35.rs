@@ -15,15 +15,15 @@ fn main() {
 				.v(key!(blk[a].attn.v.weight))
 				.qk(rms).rope(neox, 64, 10000000.0);
 			let gated = attention * layer(6144).sigmoid();
-			model = model.res([norm(rms), gated, layer(5120).bind(key!(blk[a].attn.output.weight))]);
+			model = model.res([norm(rms).bind(key!(blk[a].attn_norm.weight)), gated, layer(5120).bind(key!(blk[a].attn.output.weight))]);
 		} else {
 			let delta = recipe.model().delta(48, 4).keys(16, 128).values(128).out(5120)
 				.conv(silu).qk(l2).norm(rms).decay(softplus).output(silu);
-			model = model.res([norm(rms), delta.into()]);
+			model = model.res([norm(rms).bind(key!(blk[a].attn_norm.weight)), delta.into()]);
 		}
 		let feed_forward = layer(17408).bind(key!(blk[a].ffn_gate.weight)).silu()
 			* layer(17408).bind(key!(blk[a].ffn_up.weight));
-		model = model.res([norm(rms), feed_forward, layer(5120).bind(key!(blk[a].ffn_down.weight))]);
+		model = model.res([norm(rms).bind(key!(blk[a].post_attention_norm.weight)), feed_forward, layer(5120).bind(key!(blk[a].ffn_down.weight))]);
 	}
 	model = model.norm(rms).layer(248320).bind(key!(output.weight));
 	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
