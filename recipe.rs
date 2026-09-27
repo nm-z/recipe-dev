@@ -2953,12 +2953,64 @@ fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequa
 	}
 	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
 	let [(segment, _)] = stored.format_segments()[..] else { return None };
-	let spec = segment.spec()?;
-	let format = spec.codec.quantization();
-	if matches!(format.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % 32 == 0 || 32 % spec.block == 0) {
+	run_segment_format(segment)
+}
+/// A run format a packed weight's segment can take: its quantization, decoder,
+/// block and stride.
+fn run_segment_format(format: StorageFormat) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	let spec = format.spec()?;
+	let quantization = spec.codec.quantization();
+	if matches!(quantization.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % 32 == 0 || 32 % spec.block == 0) {
 		return None;
 	}
-	Some((format, format.native, spec.block, spec.stride))
+	Some((quantization, quantization.native, spec.block, spec.stride))
+}
+/// One format's rows of a packed sum whose weight joins several formats, such
+/// as a query, key and value projection quantized apart: its decoder, its first
+/// row and row count, where its bytes start, and the id its runs dispatch on.
+#[derive(Clone)]
+struct RowSegment {
+	format: &'static Quantization,
+	native: NativeDequant,
+	block: usize,
+	stride: usize,
+	row: usize,
+	rows: usize,
+	bytes: usize,
+	id: usize,
+}
+/// The row segments of every packed sum whose weight joins formats a row at a
+/// time, by node; each segment's id follows the nodes' own ids.
+fn row_segments(plans: &[NodePlan], inference: bool, rows: usize) -> Vec<Option<Vec<RowSegment>>> {
+	let mut next = plans.len() + 1;
+	plans
+		.iter()
+		.map(|plan| {
+			let node = &plan.node;
+			let stored = plan.stored.as_ref().filter(|_| plan.packed && inference && rows == 1)?;
+			let segments = stored.format_segments();
+			let whole = node.shard.rows.count == 0 && node.shard.terms.count == 0 && node.parameters == node.input.channels * node.output.channels;
+			if segments.len() < 2 || !whole || node.op != Primitive::Contraction || node.int_bits != 0 || node.argument[0] > 1.0 || node.argument[2] == 0.0 {
+				return None;
+			}
+			let terms = node.input.channels;
+			let (mut row, mut bytes, mut parts) = (0, 0, Vec::new());
+			for (format, count) in segments {
+				let (format, native, block, stride) = run_segment_format(format)?;
+				if count % terms != 0 || terms % dot_run(block) != 0 || count % block != 0 {
+					return None;
+				}
+				parts.push(RowSegment { format, native, block, stride, row, rows: count / terms, bytes, id: 0 });
+				row += count / terms;
+				bytes += count / block * stride;
+			}
+			for part in &mut parts {
+				part.id = next;
+				next += 1;
+			}
+			Some(parts)
+		})
+		.collect()
 }
 /// The rows of stored weight `index` that interleave four bytes at a time, so
 /// the lanes of a wave, each on its own row, read one run of memory per word:
@@ -4297,6 +4349,7 @@ impl NativeModelIr {
 
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
+		let segments = row_segments(&self.plans, self.inference, self.rows);
 		// An inference pass computes every node's window first, then marks where
 		// each block's nodes begin, so the caller can give each block a function.
 		let blocked = !reverse && !training;
@@ -4342,61 +4395,75 @@ impl NativeModelIr {
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				// A float sum over a stored format, one row at a time: the packed body.
+				// A weight that joins formats a row at a time takes it once per format.
 				(false, Primitive::Contraction)
-					if self.inference && self.rows == 1 && node.int_bits == 0 && node.argument[0] <= 1.0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) =>
+					if self.inference
+						&& self.rows == 1 && node.int_bits == 0
+						&& node.argument[0] <= 1.0
+						&& (dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) || segments[index].is_some()) =>
 				{
-					// A window of two positions or more takes the four-position lane body;
-					// a one-position step takes the lane body, and the row body takes what
-					// the lane bodies cannot.
-					ir.push_str(&format!("br label %n{index}.pre\nn{index}.pre:\n"));
-					ir.push_str(&format!(
-						"%n{index}.tiling = icmp uge i32 {span}, 2\nbr i1 %n{index}.tiling, label %n{index}.tile, label %n{index}.untiled\nn{index}.tile:\n%n{index}.tiled.count = call i32 @packed_lanes4_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.untiled\nn{index}.untiled:\n%n{index}.tiled = phi i32 [ 0, %n{index}.pre ], [ %n{index}.tiled.count, %n{index}.tile ]\n%n{index}.rest.begin = add i32 {begin}, %n{index}.tiled\n%n{index}.rest.span = sub i32 {span}, %n{index}.tiled\n{scratch_gep}%n{index}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.rest.begin, i32 %n{index}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 %n{index}.rest.begin, %n{index}.laned\n%n{index}.last.span = sub i32 %n{index}.rest.span, %n{index}.laned\n",
-						pointer = pointer_type(backend),
-						source = pointers.source,
-						weights = pointers.weights,
-						value = pointers.value,
-						rows = node.shard.rows.local(node.output.channels),
-						terms = node.shard.terms.local(node.input.channels),
-						in_length = node.input.length,
-						out_length = node.output.length,
-						bias = node.argument[2] == 0.0,
-						relu = node.argument[1] == 1.0,
-						decode = plan.decode(index),
-						node = index + 1,
-						row_first = node.shard.rows.first,
-						row_period = node.shard.rows.period,
-						row_share = node.shard.rows.count,
-						in_first = node.shard.terms.first,
-						in_period = node.shard.terms.period,
-						in_share = node.shard.terms.count,
-						scratch_gep = self.split_scratch_gep(backend, index),
-						scratch = self.split_scratch_name(backend, index),
-					));
-					let (begin, span) = (format!("%n{index}.last.begin"), format!("%n{index}.last.span"));
-					ir.push_str(&format!("%n{index}.rows.some = icmp ne i32 {span}, 0\nbr i1 %n{index}.rows.some, label %n{index}.rows, label %n{index}.rows.done\nn{index}.rows:\n"));
-					ir.push_str(&format!(
-						"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
-						row_first = node.shard.rows.first,
-						row_period = node.shard.rows.period,
-						row_share = node.shard.rows.count,
-						in_first = node.shard.terms.first,
-						in_period = node.shard.terms.period,
-						in_share = node.shard.terms.count,
-						node = index + 1,
-						scratch = self.split_scratch_name(backend, index),
-						pointer = pointer_type(backend),
-						decode = plan.decode(index),
-						source = pointers.source,
-						weights = pointers.weights,
-						value = pointers.value,
-						rows = node.shard.rows.local(node.output.channels),
-						terms = node.shard.terms.local(node.input.channels),
-						in_length = node.input.length,
-						out_length = node.output.length,
-						bias = node.argument[2] == 0.0,
-						relu = node.argument[1] == 1.0,
-					));
-					ir.push_str(&format!("br label %n{index}.rows.done\nn{index}.rows.done:\n"));
+					let rows = node.shard.rows.local(node.output.channels);
+					// Each part: its decoder key, dispatch id, first row, rows, and first byte.
+					let parts = match &segments[index] {
+						Some(segments) => segments.iter().map(|segment| (segment.format.name.to_owned(), segment.id, segment.row, segment.rows, segment.bytes)).collect::<Vec<_>>(),
+						None => vec![(key.clone(), index + 1, 0, rows, 0)],
+					};
+					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+					let scratch = self.split_scratch_name(backend, index);
+					ir.push_str(&self.split_scratch_gep(backend, index));
+					for (part, (key, id, first_row, rows, bytes)) in parts.iter().enumerate() {
+						let p = format!("n{index}.p{part}");
+						// A later part's split scratch is free only once the part before is summed.
+						if part > 0 {
+							ir.push_str(barrier(backend));
+						}
+						let weights = if *bytes == 0 { pointers.weights.clone() } else {
+							ir.push_str(&format!("%{p}.weights = getelementptr inbounds i8, {pointer} {}, i64 {bytes}\n", pointers.weights));
+							format!("%{p}.weights")
+						};
+						let value = if *first_row == 0 { pointers.value.clone() } else {
+							ir.push_str(&format!("%{p}.value = getelementptr inbounds {ty}, {pointer} {}, i64 {}\n", pointers.value, first_row * node.output.length));
+							format!("%{p}.value")
+						};
+						// A window of two positions or more takes the four-position lane body;
+						// a one-position step takes the lane body, and the row body takes what
+						// the lane bodies cannot.
+						ir.push_str(&format!("br label %{p}.pre\n{p}.pre:\n"));
+						ir.push_str(&format!(
+							"%{p}.tiling = icmp uge i32 {span}, 2\nbr i1 %{p}.tiling, label %{p}.tile, label %{p}.untiled\n{p}.tile:\n%{p}.tiled.count = call i32 @packed_lanes4_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %{p}.untiled\n{p}.untiled:\n%{p}.tiled = phi i32 [ 0, %{p}.pre ], [ %{p}.tiled.count, %{p}.tile ]\n%{p}.rest.begin = add i32 {begin}, %{p}.tiled\n%{p}.rest.span = sub i32 {span}, %{p}.tiled\n%{p}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.rest.begin, i32 %{p}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%{p}.last.begin = add i32 %{p}.rest.begin, %{p}.laned\n%{p}.last.span = sub i32 %{p}.rest.span, %{p}.laned\n",
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+							decode = plan.decode(index),
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+						));
+						ir.push_str(&format!("%{p}.rows.some = icmp ne i32 %{p}.last.span, 0\nbr i1 %{p}.rows.some, label %{p}.rows, label %{p}.rows.done\n{p}.rows:\n"));
+						ir.push_str(&format!(
+							"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.last.begin, i32 %{p}.last.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+							decode = plan.decode(index),
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+						));
+						ir.push_str(&format!("br label %{p}.rows.done\n{p}.rows.done:\n"));
+					}
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Contraction) => {
@@ -7410,10 +7477,15 @@ impl NativeModelIr {
 		let eligible = dot_run_format;
 		let mut ir = String::new();
 		let (mut available, mut cases) = (String::new(), String::new());
+		let segments = row_segments(&self.plans, self.inference, self.rows);
 		for (index, plan) in self.plans.iter().enumerate() {
 			if let Some((_, _, block, _)) = eligible(plan) {
 				available.push_str(&format!("i32 {}, label %yes\n", index + 1));
 				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, dot_run(block)));
+			}
+			for segment in segments[index].iter().flatten() {
+				available.push_str(&format!("i32 {}, label %yes\n", segment.id));
+				cases.push_str(&format!("i32 {}, label %c{}\n", segment.id, dot_run(segment.block)));
 			}
 		}
 		ir.push_str(&format!("define internal i1 @recipe.model.dot.run.available(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %no [\n{available}]\nyes:\nret i1 true\nno:\nret i1 false\n}}\n"));
@@ -7426,6 +7498,14 @@ impl NativeModelIr {
 			for (index, plan) in self.plans.iter().enumerate() {
 				if self.variant(&plan.node) != suffix {
 					continue;
+				}
+				for segment in segments[index].iter().flatten() {
+					let name = segment.format.name.to_owned();
+					arms.push_str(&format!("i32 {}, label %{name}\n", segment.id));
+					if !formats.iter().any(|(known, ..)| *known == name) {
+						bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+						formats.push((name, segment.native, segment.block, segment.stride, 1));
+					}
 				}
 				let Some((_, native, block, stride)) = eligible(plan) else { continue };
 				// Nodes of one format and row layout share one call, so its decoder is
@@ -7463,8 +7543,9 @@ impl NativeModelIr {
 	/// decoder's registers, spilling them at each call; a copy holds one.
 	fn specialize_lane_bodies(&self, mut ir: String) -> Result<String> {
 		let mut done = std::collections::BTreeSet::new();
-		for index in 0..self.plans.len() {
-			let Some(key) = self.run_key(index) else { continue };
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		let keys = (0..self.plans.len()).flat_map(|index| self.run_key(index).into_iter().chain(segments[index].iter().flatten().map(|segment| segment.format.name.to_owned())).map(move |key| (index, key))).collect::<Vec<_>>();
+		for (index, key) in keys {
 			let v = self.variant(&self.plans[index].node);
 			if !done.insert((v, key.clone())) {
 				continue;
