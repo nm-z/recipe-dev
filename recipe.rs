@@ -3054,7 +3054,10 @@ fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lan
 	}
 	let [(segment, _)] = stored.format_segments()[..] else { return None };
 	let spec = segment.spec()?;
-	if matches!(spec.codec.quantization().native, NativeDequant::Nf4) || spec.stride == 0 || spec.block < 32 || spec.block % 32 != 0 {
+	// Blocks of a whole run, or small word-sized blocks a run holds whole (a float a value).
+	let whole_blocks = spec.block >= 32 && spec.block % 32 == 0;
+	let word_blocks = spec.block < 32 && 32 % spec.block == 0 && spec.stride % 4 == 0;
+	if matches!(spec.codec.quantization().native, NativeDequant::Nf4) || spec.stride == 0 || !(whole_blocks || word_blocks) {
 		return None;
 	}
 	let unit = dot_run(spec.block);
@@ -7746,6 +7749,8 @@ impl NativeModelIr {
 				// place within a word follows from the run's.
 				let start = skew + (relative * stride) as u64;
 				let (whole, place) = if skews.len() > 1 { (start / 4 * 4, start % 4) } else { (start, 0) };
+				// Interleaved rows put word w of a lane's row w pitches on.
+				let whole = if interleaved { whole / 4 * pitch } else { whole };
 				let block_base = if whole == 0 { base.clone() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} {base}, i64 {whole}")) };
 				let value = {
 					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place, pitch };
