@@ -12074,6 +12074,7 @@ mod bundle {
 			operation: operation(&fields[0])?,
 			weight: None,
 			weight_rows: None,
+			aliases: Vec::new(),
 			maps: if fields[1].is_empty() { Vec::new() } else { fields[1].split('~').map(map).collect::<Result<Vec<_>>>()? },
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?,
 			quantization: value_at(Some(&fields[2]), "block quantization")?,
@@ -13515,6 +13516,9 @@ pub struct Block {
 	weight: Option<KeyPath>,
 	/// A view of consecutive output rows in the bound tensor.
 	weight_rows: Option<(usize, usize)>,
+	/// Tensors this block reads under another path than the GGUF naming
+	/// convention's: the convention's name within its block, and the path.
+	aliases: Vec<(String, KeyPath)>,
 	maps: Vec<OutputMap>,
 	/// The per-head normalization of the attention queries and keys.
 	qk: Option<BlockNormalization>,
@@ -13610,7 +13614,8 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
-			operation, weight: None, weight_rows: None, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
+			operation, weight: None, weight_rows: None,
+			aliases: Vec::new(), maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None,
 			kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
 		}
 	}
@@ -13667,6 +13672,13 @@ impl Block {
 		assert!(matches!(self.operation, Operation::Layer(_) | Operation::Dconv(..)) || normalization, "weight binding requires a layer, a depthwise convolution or a normalization");
 		self.weight = Some(path.into());
 		self.weight_rows = None;
+		self
+	}
+	/// Read the tensor the GGUF convention names `name` within this block's
+	/// layer (`ssm_a`, `indexer.q_proj.weight`, `attn_q_norm.weight`, ...)
+	/// from `path` instead: any weight of a composite operation binds this way.
+	pub fn bind_as(mut self, name: &str, path: impl Into<KeyPath>) -> Self {
+		self.aliases.push((name.to_owned(), path.into()));
 		self
 	}
 	/// Select `count` output rows starting at `start` from a bound layer tensor.
@@ -13923,6 +13935,7 @@ impl Model {
 				operation,
 				weight: None,
 				weight_rows: None,
+			aliases: Vec::new(),
 				maps: Vec::new(),
 				qk: None,
 				quantization: 0,
@@ -14002,6 +14015,14 @@ impl Model {
 		self.suffix().edit(|model| {
 			let block = model.blocks.pop().unwrap_or_else(|| panic!("weight binding requires a preceding weighted block"));
 			model.blocks.push(block.bind(path));
+		})
+	}
+	/// Read the preceding block's tensor the GGUF convention names `name` from
+	/// `path` instead.
+	pub fn bind_as(&self, name: &str, path: impl Into<KeyPath>) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.pop().unwrap_or_else(|| panic!("an alias requires a preceding block"));
+			model.blocks.push(block.bind_as(name, path));
 		})
 	}
 	/// Select a consecutive output-row view of the preceding bound layer.
@@ -16673,6 +16694,8 @@ struct Builder<'a> {
 	choices: Option<ManifestArchitecture>,
 	plan: Binding,
 	consumed: std::collections::BTreeSet<String>,
+	/// The paths the block being planned reads in place of conventional names.
+	aliases: Vec<(String, KeyPath)>,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
 struct Dimensions {
@@ -16713,7 +16736,7 @@ impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
 		let choices = ManifestArchitecture::read(architecture)?;
-		let mut builder = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+		let mut builder = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new(), aliases: Vec::new() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -16795,7 +16818,7 @@ impl<'a> Builder<'a> {
 		let draft = match builder.integer_or("nextn_predict_layers", 0)? {
 			0 => None,
 			1 => {
-				let mut drafter = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+				let mut drafter = Self { file, architecture, choices: Some(choices), plan: Binding::default(), consumed: std::collections::BTreeSet::new(), aliases: Vec::new() };
 				let draft = drafter.draft(blocks, vocabulary, &dimensions, file)?;
 				drafter.plan_model(&draft, Some(blocks))?;
 				builder.consumed.extend(drafter.consumed);
@@ -16935,7 +16958,15 @@ impl<'a> Builder<'a> {
 		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
+	/// The path a block being planned reads in place of the conventional `name`.
+	fn alias(&self, name: &str) -> Option<KeyPath> {
+		let within = name.strip_prefix("blk.")?.split_once('.')?.1;
+		self.aliases.iter().rev().find(|(alias, _)| alias == within).map(|(_, path)| path.clone())
+	}
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
+		if let Some(path) = self.alias(name) {
+			return self.keyed_tensor(&path, role);
+		}
 		let tensor = self.file.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent; {role} reads it")))?.clone();
 		self.consumed.insert(name.to_owned());
 		Ok(tensor)
@@ -16946,6 +16977,9 @@ impl<'a> Builder<'a> {
 		Ok(tensor)
 	}
 	fn optional(&mut self, name: &str) -> Option<GgufTensor> {
+		if let Some(path) = self.alias(name) {
+			return self.keyed_tensor(&path, "an optional tensor").ok();
+		}
 		let tensor = self.file.tensor(name)?.clone();
 		self.consumed.insert(name.to_owned());
 		Some(tensor)
@@ -17671,7 +17705,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let mut builder = Builder { file, architecture, choices: None, plan: Binding::default(), consumed: BTreeSet::new() };
+	let mut builder = Builder { file, architecture, choices: None, plan: Binding::default(), consumed: BTreeSet::new(), aliases: Vec::new() };
 	builder.plan_model(model, None)?;
 	Ok(builder.plan)
 }
@@ -17727,6 +17761,7 @@ impl Builder<'_> {
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
 		let (mut layers, mut channels) = (draft.unwrap_or(0), width);
 		for block in &model.blocks {
+			self.aliases.clone_from(&block.aliases);
 			match &block.operation {
 				Operation::Embed(rows, columns) => {
 					require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
@@ -17846,7 +17881,13 @@ impl Builder<'_> {
 		// A branch whose every weight names its tensor carries its own widths.
 		let (explicit, mut channels) = (bound_branch(parts), width);
 		let (mut weighted, mut hidden, mut attention_inner) = (false, 0, None);
+		let outer = self.aliases.clone();
 		for step in parts {
+			// A step reads its own aliases, and an attention product its attention's.
+			self.aliases = outer.iter().chain(&step.aliases).cloned().collect();
+			if let Operation::Product(left, _) = &step.operation {
+				self.aliases.extend(left.blocks.iter().flat_map(|block| block.aliases.iter().cloned()));
+			}
 			match &step.operation {
 				Operation::Identity => {}
 				_ if explicit => {
@@ -17923,6 +17964,7 @@ impl Builder<'_> {
 				}
 			}
 		}
+		self.aliases = outer;
 		require(attention_inner.is_none(), format!("block {layer} attention has no output projection"))?;
 		require(channels == width, format!("block {layer} bound branch returns {channels} channels to a residual of {width}"))?;
 		Ok(())

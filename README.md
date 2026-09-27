@@ -203,6 +203,10 @@ model.res([norm(rms).bind(blk[a].attn_norm.weight), attention, layer(width).bind
 ```
 
 ```rust
+delta(heads, kernel).bind_as("ssm_a", blk[a].ssm_a).bind_as("attn_qkv.weight", blk[a].attn_qkv.weight)
+```
+
+```rust
 let expert = (layer(640).silu() * layer(640)).layer(2560);
 let mixture = moe(10, vec![expert.clone(); 512])
 	.route(softmax).renorm()
