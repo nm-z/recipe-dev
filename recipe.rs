@@ -11672,9 +11672,16 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
-			}
+			Operation::Moe(moe) => format!(
+				"moe,{},{},{},{},{},{}",
+				moe.top_k,
+				moe.scoring.map_or(2, |scoring| scoring as u8),
+				u8::from(moe.renormalize),
+				text(&moe.experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+				moe.shared.as_ref().map_or_else(String::new, |(expert, _)| text(&block_text(expert))),
+				moe.shared.as_ref().map_or_else(String::new, |(_, gate)| text(&gate.iter().map(residual_text).collect::<Vec<_>>().join(";")))
+			),
+			Operation::Sequence(parts) => format!("sequence,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Hyper(hyper) => format!("hyper,{},{},{},{}", hyper.lanes, block_list_text(&hyper.branch), block_list_text(&hyper.read), block_list_text(&hyper.write)),
 			Operation::Collapse(read) => format!("collapse,{}", block_list_text(read)),
 			Operation::Perceptron(width) => format!("perc,{width}"),
@@ -11699,7 +11706,6 @@ mod bundle {
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
-			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -11809,27 +11815,27 @@ mod bundle {
 				require(branches.len() == 2, "product must contain two branches")?;
 				Ok(Operation::Product(product_branch(&branches[0])?, product_branch(&branches[1])?))
 			}
-			"moe_blocks" => {
-				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
-			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				if fields.len() >= 7 {
-					Ok(Operation::Moe(
-						value_at(fields.first().copied(), "MoE experts")?,
-						value_at(fields.get(1).copied(), "MoE top-k")?,
-						value_at(fields.get(2).copied(), "MoE expert width")?,
-						activation(fields.get(3).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
-						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
-						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
-						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
-					))
+				require(fields.len() == 6, "saved MoE record has the wrong width")?;
+				let experts = untext(fields[3], "MoE experts")?;
+				let shared = if fields[4].is_empty() {
+					require(fields[5].is_empty(), "MoE gate has no shared expert")?;
+					None
 				} else {
-					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
-					Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
-				}
+					let expert = block(&untext(fields[4], "MoE shared expert")?)?;
+					let gate = untext(fields[5], "MoE shared gate")?;
+					Some((Box::new(expert), split_escaped(&gate, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+				};
+				Ok(Operation::Moe(MoeBlock {
+					top_k: value_at(fields.first().copied(), "MoE top-k")?,
+					scoring: match value_at::<u8>(fields.get(1).copied(), "MoE scoring")? { 2 => None, value => Some(scoring(value)?) },
+					renormalize: bool_value(fields[2], "MoE renormalization")?,
+					experts: split_escaped(&experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+					shared,
+				}))
 			}
+			"sequence" => Ok(Operation::Sequence(split_escaped(rest, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?)),
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
@@ -12958,8 +12964,19 @@ pub fn res<const N: usize>(parts: [Block; N]) -> Block {
 pub fn ensemble<const N: usize>(members: [Block; N]) -> Block {
 	Block::of(Operation::Ensemble(branch(members)))
 }
-pub fn moe<const N: usize>(top_k: usize, experts: [Block; N]) -> Block {
-	Block::of(Operation::MoeBlocks(top_k, branch(experts)))
+pub trait IntoExpert {
+	fn into_expert(self) -> Block;
+}
+impl IntoExpert for Block {
+	fn into_expert(self) -> Block { self }
+}
+impl IntoExpert for Model {
+	fn into_expert(self) -> Block { Block::of(Operation::Sequence(self.blocks.clone())) }
+}
+pub fn moe<E: IntoExpert>(top_k: usize, experts: impl IntoIterator<Item = E>) -> Block {
+	let experts = experts.into_iter().map(IntoExpert::into_expert).collect::<Vec<_>>();
+	assert!(!experts.is_empty(), "moe requires an expert");
+	Block::of(Operation::Moe(MoeBlock { top_k, experts, scoring: None, renormalize: false, shared: None }))
 }
 type FitFn = fn(usize, &Prepared, usize, Config) -> Result<Predictor>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
@@ -13102,6 +13119,14 @@ struct PleBlock {
 	value: Vec<Block>,
 	tail: Vec<Block>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MoeBlock {
+	top_k: usize,
+	experts: Vec<Block>,
+	scoring: Option<Scoring>,
+	renormalize: bool,
+	shared: Option<(Box<Block>, Vec<Block>)>,
+}
 impl PleBlock {
 	/// Values the table holds: its rows of the head width.
 	fn table(&self) -> usize {
@@ -13124,8 +13149,8 @@ enum Operation {
 	Residual(Vec<Block>),
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
-	MoeBlocks(usize, Vec<Block>),
+	Moe(MoeBlock),
+	Sequence(Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
 	Hyper(Hyper),
@@ -13215,6 +13240,21 @@ impl Activation {
 pub enum Scoring {
 	Softmax,
 	Sigmoid,
+}
+pub const softmax: Scoring = Scoring::Softmax;
+pub trait RoutingSelector {
+	fn scoring(self) -> Scoring;
+}
+impl RoutingSelector for Scoring {
+	fn scoring(self) -> Scoring { self }
+}
+impl<F: Fn() -> Block> RoutingSelector for F {
+	fn scoring(self) -> Scoring {
+		let block = self();
+		let sigmoid = matches!(block.maps.as_slice(), [OutputMap { kind: MapKind::Activation(Activation::Sigmoid), .. }]);
+		assert!(matches!(block.operation, Operation::Identity) && sigmoid, "MoE routing selector must be softmax or sigmoid");
+		Scoring::Sigmoid
+	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -13418,6 +13458,24 @@ impl Block {
 			kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
 		}
 	}
+	fn moe_block(&mut self, selector: &str) -> &mut MoeBlock {
+		match &mut self.operation {
+			Operation::Moe(moe) => moe,
+			_ => panic!("{selector} requires a preceding moe block"),
+		}
+	}
+	pub fn route(mut self, selector: impl RoutingSelector) -> Self {
+		self.moe_block("route").scoring = Some(selector.scoring());
+		self
+	}
+	pub fn renorm(mut self) -> Self {
+		self.moe_block("renorm").renormalize = true;
+		self
+	}
+	pub fn shared<const N: usize>(mut self, expert: impl IntoExpert, gate: [Block; N]) -> Self {
+		self.moe_block("shared").shared = Some((Box::new(expert.into_expert()), branch(gate)));
+		self
+	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.maps.push(OutputMap { kind: MapKind::Activation(activation), precision: None });
 		self.suffix = Suffix::Map;
@@ -13600,7 +13658,7 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn res<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().res(parts) }
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Model { self.model().ensemble(members) }
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Model { self.model().moe(top_k, experts) }
+	pub fn moe<E: IntoExpert>(&self, top_k: usize, experts: impl IntoIterator<Item = E>) -> Model { self.model().moe(top_k, experts) }
 	pub fn hyper(&self, lanes: usize, branch: &Model) -> Model { self.model().hyper(lanes, branch) }
 })+ }; }
 qualified_blocks! { Frozen }
@@ -13795,11 +13853,25 @@ impl Model {
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Self {
 		self.push(Operation::Ensemble(branch(members)))
 	}
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
-		self.push(Operation::MoeBlocks(top_k, branch(experts)))
+	pub fn moe<E: IntoExpert>(&self, top_k: usize, experts: impl IntoIterator<Item = E>) -> Self {
+		self.push(moe(top_k, experts).operation)
 	}
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
-		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
+	fn moesuffix(&self, selector: &str, apply: impl FnOnce(Block) -> Block) -> Self {
+		let model = self.suffix();
+		assert!(!model.blocks.is_empty(), "{selector} requires a preceding moe block");
+		model.edit(|model| {
+			let block = model.blocks.pop().unwrap();
+			model.blocks.push(apply(block));
+		})
+	}
+	pub fn route(&self, selector: impl RoutingSelector) -> Self {
+		self.moesuffix("route", |block| block.route(selector))
+	}
+	pub fn renorm(&self) -> Self {
+		self.moesuffix("renorm", Block::renorm)
+	}
+	pub fn shared<const N: usize>(&self, expert: impl IntoExpert, gate: [Block; N]) -> Self {
+		self.moesuffix("shared", |block| block.shared(expert, gate))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
 	/// and a standalone `attn(...)` block share one configuration path.
@@ -15517,7 +15589,7 @@ impl Operation {
 			Self::Identity => "identity",
 			Self::Last => "last",
 			Self::Moe(..) => "moe",
-			Self::MoeBlocks(..) => "moe",
+			Self::Sequence(..) => "sequence",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
@@ -15538,7 +15610,8 @@ impl Operation {
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
-			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
+			Self::Residual(parts) | Self::Sequence(parts) => weighted_parts(parts),
+			Self::Moe(moe) => weighted_parts(&moe.experts) || moe.shared.as_ref().is_some_and(|(expert, gate)| weighted_gate(expert) || gate.iter().any(weighted_gate)),
 			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
 			Self::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(weighted_gate),
@@ -17014,7 +17087,11 @@ impl<'a> Builder<'a> {
 				self.mapped(vec![tensor]);
 			}
 		}
-		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		let expert = (crate::layer(hidden).silu() * crate::layer(hidden)).layer(width);
+		let mut branch = branch.moe(used, vec![expert.clone(); count]).route(scoring);
+		if renormalize { branch = branch.renorm(); }
+		if shared { branch = branch.shared(expert, [crate::layer(1).sigmoid()]); }
+		Ok(branch)
 	}
 	/// One per-layer embedding and the plan of its machine RAM table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
@@ -19989,7 +20066,11 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Sequence(parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
+		Operation::Moe(moe) => {
+			moe.experts.iter().any(|part| sequential_operation(&part.operation))
+				|| moe.shared.as_ref().is_some_and(|(expert, gate)| sequential_operation(&expert.operation) || gate.iter().any(|part| sequential_operation(&part.operation)))
+		}
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(|block| sequential_operation(&block.operation)),
 		Operation::Collapse(read) => read.iter().any(|block| sequential_operation(&block.operation)),
@@ -20234,8 +20315,12 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Recur(parts) => lower_recur(graph, parts, total, data, targets, rows, gpu, config)?,
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
-		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
-		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
+		Operation::Moe(moe) => lower_moe(graph, moe, total, data, targets, rows, gpu, config)?,
+		Operation::Sequence(parts) => {
+			for part in parts {
+				lower_block(graph, part, total, data, targets, rows, gpu, config)?;
+			}
+		}
 		Operation::Hyper(hyper) => lower_hyper(graph, hyper, total, data, targets, rows, gpu, config)?,
 		Operation::Collapse(read) => lower_collapse(graph, read, total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
@@ -21244,7 +21329,7 @@ fn rank_mask(graph: &mut Graph, scores: &[i32], higher: &[Vec<i32>], selected: u
 	}
 	Ok(rank)
 }
-fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize) -> Result<()> {
+fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top_k: usize, scoring: Option<Scoring>, renormalize: bool, config: Config) -> Result<()> {
 	let mut maximum_score = scores[0];
 	for &score in &scores[1..] {
 		maximum_score = maximum(graph, maximum_score, score, shape)?;
@@ -21257,21 +21342,29 @@ fn select(graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, top
 		}
 	}
 	let mut weighted = Vec::with_capacity(scores.len());
+	let mut unmasked = Vec::with_capacity(scores.len());
 	for (index, &score) in scores.iter().enumerate() {
-		let mut scalar = ScalarProgram(Vec::new());
-		let centered = scalar.op(ScalarOpcode::Subtract, -1.0, -2.0);
-		scalar.unary(ScalarOpcode::Exp, centered);
-		let exponential = program(graph, score, maximum_score, shape, &[], scalar)?;
+		let strength = if scoring == Some(Scoring::Sigmoid) {
+			activation(graph, score, shape, Activation::Sigmoid, config)?.0
+		} else {
+			let mut scalar = ScalarProgram(Vec::new());
+			let centered = scalar.op(ScalarOpcode::Subtract, -1.0, -2.0);
+			scalar.unary(ScalarOpcode::Exp, centered);
+			program(graph, score, maximum_score, shape, &[], scalar)?
+		};
+		if scoring == Some(Scoring::Softmax) && !renormalize { unmasked.push(strength); }
 		let mask = rank_mask(graph, scores, &higher, index, shape, top_k)?;
-		weighted.push(binary(graph, mask, exponential, shape, ScalarOpcode::Multiply)?);
+		weighted.push(binary(graph, mask, strength, shape, ScalarOpcode::Multiply)?);
 	}
-	let mut denominator = weighted[0];
-	for &value in &weighted[1..] {
-		denominator = binary(graph, denominator, value, shape, ScalarOpcode::Add)?;
-	}
+	let denominator = if scoring == Some(Scoring::Sigmoid) && !renormalize { None } else {
+		let values = if unmasked.is_empty() { &weighted } else { &unmasked };
+		let mut denominator = values[0];
+		for &value in &values[1..] { denominator = binary(graph, denominator, value, shape, ScalarOpcode::Add)?; }
+		Some(denominator)
+	};
 	let mut output = None;
 	for (index, &branch) in branches.iter().enumerate() {
-		let probability = binary(graph, weighted[index], denominator, shape, ScalarOpcode::Divide)?;
+		let probability = match denominator { Some(denominator) => binary(graph, weighted[index], denominator, shape, ScalarOpcode::Divide)?, None => weighted[index] };
 		let routed = binary(graph, probability, branch, shape, ScalarOpcode::Multiply)?;
 		output = Some(match output {
 			Some(previous) => binary(graph, previous, routed, shape, ScalarOpcode::Add)?,
@@ -21314,40 +21407,55 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
-	require(experts != 0, "moe requires an expert")?;
-	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
-	require(hidden != 0, "moe expert width must be positive")?;
+/// A gated expert expression whose projections can read one stored expert table.
+fn stored_expert(value: &Block, width: usize) -> Option<(usize, Activation)> {
+	let Operation::Sequence(parts) = &value.operation else { return None };
+	let [product, down] = parts.as_slice() else { return None };
+	let Operation::Product(left, right) = &product.operation else { return None };
+	let ([gate], [up]) = (left.blocks.as_slice(), right.blocks.as_slice()) else { return None };
+	let (Operation::Layer(hidden), Operation::Layer(up_width), Operation::Layer(down_width)) = (&gate.operation, &up.operation, &down.operation) else { return None };
+	if *hidden != 0 && *hidden == *up_width && *down_width == width && value.maps.is_empty() && product.maps.is_empty() && up.maps.is_empty() && down.maps.is_empty()
+		&& matches!(gate.maps.as_slice(), [OutputMap { kind: MapKind::Activation(Activation::Silu), precision: None }])
+	{
+		Some((*hidden, Activation::Silu))
+	} else {
+		None
+	}
+}
+fn lower_moe(graph: &mut Graph, moe: &MoeBlock, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let experts = &moe.experts;
+	require(!experts.is_empty(), "moe requires an expert")?;
+	require(moe.top_k != 0 && moe.top_k <= experts.len(), "moe top-k is invalid")?;
 	let (source, input) = (graph.source, graph.output);
-	// One router scores every expert per position. The top-k weights name the
-	// experts whose gated feed-forward runs, so a position costs top-k of them.
-	lower_project(graph, experts)?;
-	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
-	let routing = graph.source;
-	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
-	if !shared {
+	let shape = stored_expert(&experts[0], input.channels);
+	let packed = shape.is_some_and(|(hidden, _)| {
+		let elements = hidden.checked_mul(input.channels).and_then(|matrix| matrix.checked_mul(experts.len()));
+		graph.bound.as_ref().and_then(|plan| plan.get(1)).is_some_and(|node| Some(node.elements) == elements) && experts.iter().all(|expert| expert == &experts[0])
+	});
+	if let Some((hidden, activation)) = shape.filter(|_| packed) {
+		// A GGUF plan binds the router and three stored tables in this node order.
+		lower_project(graph, experts.len())?;
+		let route = [moe.top_k as f64, f64::from(moe.scoring.unwrap_or(Scoring::Softmax) as u8), f64::from(u8::from(moe.renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		push_node(graph, Primitive::TopK, graph.output, 0, route, -2)?;
+		let routing = graph.source;
+		lower_experts(graph, source, input, routing, experts.len(), moe.top_k, hidden, activation, config)?;
+		if let Some((shared, gate)) = &moe.shared {
+			require(stored_expert(shared, input.channels).is_some(), "stored MoE shared expert must be a gated projection")?;
+			let sigmoid = matches!(gate.as_slice(), [Block { operation: Operation::Layer(1), maps, .. }]
+				if matches!(maps.as_slice(), [OutputMap { kind: MapKind::Activation(Activation::Sigmoid), precision: None }]));
+			require(sigmoid, "stored MoE shared gate must be [layer(1).sigmoid()]")?;
+			let dispatched = graph.source;
+			reset(graph, source, input);
+			push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+			lower_activation(graph, Activation::Sigmoid, config)?;
+			let gate = graph.source;
+			let (shared_hidden, shared_activation) = stored_expert(shared, input.channels).unwrap();
+			lower_experts(graph, source, input, gate, 1, 1, shared_hidden, shared_activation, config)?;
+			binary(graph, dispatched, graph.source, input, ScalarOpcode::Add)?;
+		}
 		return Ok(());
 	}
-	// The shared expert is one more expert that every position takes. Its routing
-	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
-	// so the dispatch that runs the routed experts runs it under that per-position
-	// value and its gradient reaches the gate and the input through the same adjoints.
-	let dispatched = graph.source;
-	reset(graph, source, input);
-	// The gate is the `[width]` vector alone, trained or bound, so a view of it
-	// must hold exactly that many values.
-	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	let gate = graph.source;
-	lower_experts(graph, source, input, gate, 1, 1, hidden, activation, config)?;
-	let gated = graph.source;
-	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
-	Ok(())
-}
-fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	require(!experts.is_empty(), "moe requires an expert")?;
-	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
-	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
+	let mut branches = Vec::with_capacity(experts.len());
 	let mut output = None;
 	for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, total, data, targets, rows, gpu, config)?;
@@ -21359,22 +21467,29 @@ fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: u
 	let output = output.ok_or_else(|| RecipeError::new("moe has no output shape"))?;
 	let mut scores = Vec::with_capacity(experts.len());
 	for _ in experts {
-		// Every expert has its own learned router. Unlike an expert adapter, a
-		// router must not disappear when its input already has the canonical shape:
-		// identical input and output shapes still require a distinct projection.
 		reset(graph, source, input);
 		let named = graph.block_blck_precision;
 		graph.block_blck_precision = graph.block_precision.or(Some(graph.profile.atvn));
-		let projected = if input.length == output.length {
-			lower_project(graph, output.channels)
-		} else {
-			lower_flatten_project(graph, output)
-		};
+		let projected = if input.length == output.length { lower_project(graph, output.channels) } else { lower_flatten_project(graph, output) };
 		graph.block_blck_precision = named;
 		projected?;
 		scores.push(graph.source);
 	}
-	select(graph, &branches, &scores, output, top_k)
+	select(graph, &branches, &scores, output, moe.top_k, moe.scoring, moe.renormalize, config)?;
+	if let Some((shared, gate)) = &moe.shared {
+		let routed = graph.source;
+		let (shared_output, shared_shape) = expert(graph, source, input, shared, total, data, targets, rows, gpu, config)?;
+		let shared_output = project_moe_shape(graph, shared_output, shared_shape, output)?;
+		reset(graph, source, input);
+		for block in gate { lower_block(graph, block, total, data, targets, rows, gpu, config)?; }
+		require(graph.output.length == output.length && (graph.output.channels == 1 || graph.output.channels == output.channels), "MoE shared gate must produce one value per position or output channel")?;
+		if graph.output.channels == 1 && output.channels != 1 {
+			push_node(graph, Primitive::Expand, output, 0, arguments(output.channels as f64, 0.0), -2)?;
+		}
+		let gated = binary(graph, shared_output, graph.source, output, ScalarOpcode::Multiply)?;
+		binary(graph, routed, gated, output, ScalarOpcode::Add)?;
+	}
+	Ok(())
 }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
@@ -21479,8 +21594,10 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Collapse(parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Sequence(parts) | Operation::Collapse(parts) => parts.iter().map(estimator_count).sum(),
 		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).map(estimator_count).sum(),
+		Operation::Moe(moe) => moe.experts.iter().map(estimator_count).sum::<usize>()
+			+ moe.shared.as_ref().map_or(0, |(expert, gate)| estimator_count(expert) + gate.iter().map(estimator_count).sum::<usize>()),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
@@ -21488,8 +21605,10 @@ fn estimator_count(block: &Block) -> usize {
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Collapse(parts) => parts.iter().find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::Sequence(parts) | Operation::Collapse(parts) => parts.iter().find_map(first_estimator),
 		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).find_map(first_estimator),
+		Operation::Moe(moe) => moe.experts.iter().find_map(first_estimator)
+			.or_else(|| moe.shared.as_ref().and_then(|(expert, gate)| first_estimator(expert).or_else(|| gate.iter().find_map(first_estimator)))),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}

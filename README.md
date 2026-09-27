@@ -162,7 +162,7 @@ prec:
 	.res([blocks]) // f(x) + x = y
 	.recur([blocks]])
 	.ensemble([blocks])
-	.moe(topk, [blocks])
+	.moe(top_k, [experts]).route(softmax|sigmoid).renorm().shared(shared_expert, [gate])
 	.hyper(lanes, &branch).read([blocks]).write([blocks])
 	.collapse([read_blocks])
 ```
@@ -177,13 +177,10 @@ let short = ((layer(width).bind(w.clone()).rows(0, width)
 ```
 
 ```rust
-let expert = [
-	layer(640).silu() * layer(640),
-	layer(2560),
-];
-let routed = moe(10, [expert; 512]);
-let shared = expert * layer(1).sigmoid();
-let combined = routed + shared;
+let expert = (layer(640).silu() * layer(640)).layer(2560);
+let mixture = moe(10, vec![expert.clone(); 512])
+	.route(softmax).renorm()
+	.shared(expert, [layer(1).sigmoid()]);
 ```
 
 ## **Train**
@@ -378,10 +375,6 @@ model.memory(&data, positions).*|place().memory()[].*
 ```rust
 .yarn(factor, og_ctx, b_fast, b_slow).scale(direct|chain)       // .yarn(factor, og_ctx, b_fast, b_slow)
 
-
-moe(topk, [experts])                                            // moe(topk, [blocks])
-	.route(softmax|sigmoid)
-	.renorm()
 
 mtp([blocks])                                                   // .mtp(path)
 	.file(path)

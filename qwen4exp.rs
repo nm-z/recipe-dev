@@ -49,8 +49,11 @@ fn main() {
 		}
 		model = hyper(model, &attention);
 
-		let shared = file.tensor(&format!("blk.{block}.ffn_gate_shexp.weight")).is_some();
-		let mut experts = recipe.model().gguf_moe(512, 10, 640, Activation::Silu, Scoring::Softmax, true, shared);
+		let expert = (layer(640).silu() * layer(640)).layer(2560);
+		let mut experts = recipe.model().moe(10, vec![expert.clone(); 512]).route(softmax).renorm();
+		if file.tensor(&format!("blk.{block}.ffn_gate_shexp.weight")).is_some() {
+			experts = experts.shared(expert, [layer(1).sigmoid()]);
+		}
 		if file.tensor(&format!("blk.{block}.post_ffw_norm.weight")).is_some() {
 			experts = experts.norm(rms);
 		}
