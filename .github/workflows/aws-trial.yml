@@ -1,6 +1,6 @@
-name: camber trial
+name: aws trial
 
-# One bounded run of the composition harness on a Camber L4: build the
+# One bounded run of the composition harness on an AWS EC2 L4: build the
 # candidate on the worker, run `count` compositions from `cursor`, and return
 # the harness's stderr (composition lines and failure packets) as the evidence.
 # Dispatched by hand so every run is a counted allowance decision.
@@ -20,16 +20,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: camber-trial-${{ github.run_id }}
+  group: aws-trial-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   trial:
-    name: camber/l4 trial
+    name: aws/l4 trial
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      id-token: write
     env:
-      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_BUCKET: ${{ vars.AWS_BUCKET }}
+      AWS_SUBNET_ID: ${{ vars.AWS_SUBNET_ID }}
     steps:
       - name: Check out the controller
         uses: actions/checkout@v4
@@ -49,15 +54,17 @@ jobs:
           echo "candidate_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "snapshot sha256=$sha256"
 
-      - name: Require the Camber control credential
-        run: |
-          set -euo pipefail
-          [ -n "${CAMBER_API_KEY:-}" ] || { echo "CAMBER_API_KEY is not available to this run" >&2; exit 1; }
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 7200
 
-      - name: Submit, poll and collect the Camber trial job
+      - name: Launch, poll and collect the AWS trial instance
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-run.sh"
         env:
           RECIPE_WORKLOAD: trial
           RECIPE_TRIAL_CURSOR: ${{ inputs.cursor }}
@@ -67,21 +74,21 @@ jobs:
           SNAPSHOT_SHA256: ${{ steps.snapshot.outputs.sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
 
-      - name: Terminate the Camber job
+      - name: Terminate the AWS instance
         if: always()
         run: |
           set -euo pipefail
-          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
-            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
+          if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-terminate.sh"
           else
-            echo "no Camber job to terminate"
+            echo "no AWS credential; nothing was launched"
           fi
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: camber-trial
+          name: aws-trial
           path: evidence/
           retention-days: 14
           if-no-files-found: warn

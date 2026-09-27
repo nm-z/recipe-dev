@@ -31,10 +31,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Provider jobs are not cancelled in place. Camber's current CLI has no
-  # cancellation operation, and cancelling a run can leave a pending provider
-  # job alive after GitHub has forgotten its cleanup context. Give every push
-  # its own group so rapid pushes cannot replace an older pending run.
+  # Provider jobs are not cancelled in place: cancelling a run can leave a
+  # provider worker alive after GitHub has forgotten its cleanup context. Give
+  # every push its own group so rapid pushes cannot replace an older pending run.
   group: recipe-runtime-${{ inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
@@ -355,16 +354,23 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
+  # 2. recipe/linux-gpu -- NVIDIA L4 on an AWS EC2 g6.xlarge, driven by this
+  #    controller through GitHub OIDC.
   # ---------------------------------------------------------------------------
   linux-gpu:
     name: linux/nv
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      id-token: write
     env:
       CELL: recipe/linux-gpu
-      CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_BUCKET: ${{ vars.AWS_BUCKET }}
+      AWS_SUBNET_ID: ${{ vars.AWS_SUBNET_ID }}
     steps:
       - name: Check out the trusted controller
         uses: actions/checkout@v4
@@ -388,42 +394,48 @@ jobs:
           tar -xzf snapshot/recipe-source.tar.gz -C "$GITHUB_WORKSPACE/candidate"
           echo "snapshot verified and extracted to candidate sha256=$actual"
 
-      - name: Require the Camber control credential
+      - name: Require the AWS configuration
         run: |
           set -euo pipefail
           mkdir -p evidence
-          if [ -z "${CAMBER_API_KEY:-}" ]; then
+          if [ -z "${AWS_ROLE_ARN:-}" ] || [ -z "${AWS_BUCKET:-}" ]; then
             cat > evidence/blocker.json <<'JSON'
           {
-            "blocker": "camber-credential-absent",
-            "detail": "CAMBER_API_KEY is not available to this run. A fork pull request never receives it, and it has not been configured for this repository. The Camber student GPU allowance must be redeemed and the control credential stored as a repository secret before this cell can execute.",
-            "resolution": "Redeem the Camber Student Pack offer, confirm the workspace has the student GPU allowance, then store the API key as the CAMBER_API_KEY repository secret."
+            "blocker": "aws-configuration-absent",
+            "detail": "The AWS_ROLE_ARN secret or the AWS_BUCKET variable is not available to this run. A fork pull request never receives them.",
+            "resolution": "Create an IAM role that trusts GitHub OIDC for this repository with a maximum session of at least 2 hours, store its ARN as the AWS_ROLE_ARN secret, and set AWS_BUCKET (and optionally AWS_REGION) as repository variables."
           }
           JSON
             cat evidence/blocker.json
-            echo "recipe/linux-gpu is blocked: the Camber control credential is absent" >&2
+            echo "recipe/linux-gpu is blocked: the AWS configuration is absent" >&2
             exit 1
           fi
 
-      - name: Submit, poll and collect the Camber GPU job
-        id: camber
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 7200
+
+      - name: Launch, poll and collect the AWS GPU instance
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+          bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-run.sh"
         env:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
           SNAPSHOT_SHA256: ${{ needs.prepare.outputs.snapshot_sha256 }}
           TRUSTED_RUNTIME: ${{ github.workspace }}/controller/.github/runtime
 
-      - name: Terminate the Camber job
+      - name: Terminate the AWS instance
         if: always()
         run: |
           set -euo pipefail
-          if [ -n "${CAMBER_API_KEY:-}" ] && [ -f camber-job-id ]; then
-            bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-terminate.sh" "$(cat camber-job-id)"
+          if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+            bash "$GITHUB_WORKSPACE/controller/.github/runtime/aws-terminate.sh"
           else
-            echo "no Camber job to terminate"
+            echo "no AWS credential; nothing was launched"
           fi
 
       - name: Write the cell evidence
