@@ -4,6 +4,12 @@ use recipe::infer::{cached, input, out, pp, tg, time};
 const GGUF: &str = "/home/nate/models-hdd-backup/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf";
 const MTP: &str = "/home/nate/models-hdd-backup/Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B-Q8_0.gguf";
 
+fn hyper(model: Model, branch: &Model) -> Model {
+	model.hyper(4, branch)
+		.read([norm(rms), layer(320), scale(0.25), silu(), layer(4 * 2560), sigmoid()])
+		.write([norm(rms), layer(4), scale(0.25), sigmoid(), scale(2.0)])
+}
+
 fn main() {
 	let data = recipe.data(GGUF);
 	let file = recipe.gguf(GGUF);
@@ -44,16 +50,21 @@ fn main() {
 		if file.tensor(&format!("blk.{block}.post_attention_norm.weight")).is_some() {
 			attention = attention.norm(rms);
 		}
-		model = model.hyper(4, 320, &attention);
+		model = hyper(model, &attention);
 
 		let shared = file.tensor(&format!("blk.{block}.ffn_gate_shexp.weight")).is_some();
 		let mut experts = recipe.model().gguf_moe(512, 10, 640, Activation::Silu, Scoring::Softmax, true, shared);
 		if file.tensor(&format!("blk.{block}.post_ffw_norm.weight")).is_some() {
 			experts = experts.norm(rms);
 		}
-		model = model.hyper(4, 320, &experts);
+		model = hyper(model, &experts);
 	}
 
+	if file.tensor("output_hc_norm.weight").is_some() {
+		model = model.collapse([norm(rms), layer(320), scale(0.25), silu(), layer(4 * 2560), sigmoid()]);
+	} else {
+		model = model.collapse([]);
+	}
 	if file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight")).is_some() {
 		model = model.norm(rms);
 	}

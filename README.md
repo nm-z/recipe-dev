@@ -70,7 +70,9 @@ let attention = recipe.model()
 let model = recipe.model()
 	.e(qwen35.attention.layer_norm_rms_epsilon)
 	.embed(tokenizer.ggml.tokens, qwen35.embedding_length)
-	.hyper(4, 320, &attention);
+	.hyper(4, &attention)
+	.read([norm(rms), layer(320), scale(0.25), silu(), layer(4 * qwen35.embedding_length), sigmoid()])
+	.write([norm(rms), layer(4), scale(0.25), sigmoid(), scale(2.0)]);
 ```
 
 ```rust
@@ -157,7 +159,8 @@ prec:
 	.recur([blocks]])
 	.ensemble([blocks])
 	.moe(topk, [blocks])
-	.hyper(lanes, rank, [blocks])
+	.hyper(lanes, &branch).read([blocks]).write([blocks])
+	.collapse([read_blocks])
 ```
 
 ```rust
@@ -366,9 +369,6 @@ delta(heads, kernel)
 	.keys(count, width, tiled)                                  // .keys(count, width)
 	.qk(l2|rms)
 	.decay(softplus|sigmoid)
-
-hyper(lanes, [blocks])                                          // hyper(lanes, rank, &branch)
-hyper(lanes, [blocks], [blocks])
 
 moe(topk, [experts])                                            // moe(topk, [blocks])
 	.route(softmax|sigmoid)

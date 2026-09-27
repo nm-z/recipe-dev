@@ -11517,6 +11517,12 @@ mod bundle {
 	fn residual_text(value: &Block) -> String {
 		escape(&block_text(value))
 	}
+	fn block_list_text(blocks: &[Block]) -> String {
+		blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")
+	}
+	fn block_list(value: &str, role: &str) -> Result<Vec<Block>> {
+		value.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, role).and_then(|part| block(&part))).collect()
+	}
 	fn product_branch_text(value: &ProductBranch) -> String {
 		let blocks = value.blocks.iter().map(residual_text).collect::<Vec<_>>().join(";");
 		format!("{}:{blocks}", value.exclusions)
@@ -11622,7 +11628,8 @@ mod bundle {
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
 				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
 			}
-			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
+			Operation::Hyper(hyper) => format!("hyper,{},{},{},{}", hyper.lanes, block_list_text(&hyper.branch), block_list_text(&hyper.read), block_list_text(&hyper.write)),
+			Operation::Collapse(read) => format!("collapse,{}", block_list_text(read)),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
@@ -11772,14 +11779,16 @@ mod bundle {
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
-				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
-				let (rank, blocks) = rest.split_once(',').unwrap_or((rest, ""));
-				Ok(Operation::Hyper(
-					value_at(Some(lanes), "hyper-connection lanes")?,
-					value_at(Some(rank), "hyper-connection rank")?,
-					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?,
-				))
+				let parts = rest.split(',').collect::<Vec<_>>();
+				require(parts.len() == 4, "hyper-connection record must name lanes, branch, read, and write lists")?;
+				Ok(Operation::Hyper(Hyper {
+					lanes: value_at(Some(parts[0]), "hyper-connection lanes")?,
+					branch: block_list(parts[1], "hyper-connection branch")?,
+					read: block_list(parts[2], "hyper-connection read gate")?,
+					write: block_list(parts[3], "hyper-connection write gate")?,
+				}))
 			}
+			"collapse" => Ok(Operation::Collapse(block_list(rest, "head read gate")?)),
 			// A bundle written before the taps could sit apart names no dilation, so an
 			// absent field reads as the plain form of one position per tap.
 			"dconv" => Ok(Operation::Dconv(
@@ -12819,6 +12828,9 @@ pub fn fold(lanes: usize) -> Block {
 pub fn dconv(kernel: usize) -> Block {
 	Block::of(Operation::Dconv(kernel, 1))
 }
+pub fn scale(factor: f64) -> Block {
+	Block::of(Operation::Identity).scale(factor)
+}
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
 }
@@ -13033,7 +13045,8 @@ enum Operation {
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
-	Hyper(usize, usize, Vec<Block>),
+	Hyper(Hyper),
+	Collapse(Vec<Block>),
 	Dconv(usize, usize),
 	Group(BlockNormalization, usize),
 	Fold(usize),
@@ -13048,6 +13061,19 @@ enum Operation {
 	/// Keeps the last position reached by each forward window and collapses the
 	/// sequence axis to one position for a following projection.
 	Last,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Hyper {
+	lanes: usize,
+	branch: Vec<Block>,
+	read: Vec<Block>,
+	write: Vec<Block>,
+}
+fn hyper_read(lanes: usize, bottleneck: usize, width: usize) -> [Block; 6] {
+	[norm(rms), layer(bottleneck), scale(1.0 / lanes as f64), silu(), layer(lanes * width), sigmoid()]
+}
+fn hyper_write(lanes: usize) -> [Block; 5] {
+	[norm(rms), layer(lanes), scale(1.0 / lanes as f64), sigmoid(), scale(2.0)]
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -13481,7 +13507,7 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Model { self.model().ensemble(members) }
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Model { self.model().moe(top_k, experts) }
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Model { self.model().hyper(lanes, rank, branch) }
+	pub fn hyper(&self, lanes: usize, branch: &Model) -> Model { self.model().hyper(lanes, branch) }
 })+ }; }
 qualified_blocks! { Frozen }
 /// `frozen` before a part inside a composition: `frozen.layer(n)`.
@@ -13720,10 +13746,28 @@ impl Model {
 	}
 	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
 	/// through a gated read and takes its output back through gated writes.
-	/// `rank` sizes the gate bottleneck; zero fixes every gate at one.
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Self {
+	/// Empty gate lists use a gate of one.
+	pub fn hyper(&self, lanes: usize, branch: &Model) -> Self {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
-		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone()))
+		self.push(Operation::Hyper(Hyper { lanes, branch: branch.blocks.clone(), read: Vec::new(), write: Vec::new() }))
+	}
+	/// The blocks that compute the preceding hyper-connection's read gate.
+	pub fn read<const N: usize>(&self, blocks: [Block; N]) -> Self {
+		self.suffix().edit(|model| match &mut model.blocks.last_mut().expect("read requires a preceding hyper-connection").operation {
+			Operation::Hyper(hyper) => hyper.read = blocks.into(),
+			_ => panic!("read requires a preceding hyper-connection"),
+		})
+	}
+	/// The blocks that compute the preceding hyper-connection's write gate.
+	pub fn write<const N: usize>(&self, blocks: [Block; N]) -> Self {
+		self.suffix().edit(|model| match &mut model.blocks.last_mut().expect("write requires a preceding hyper-connection").operation {
+			Operation::Hyper(hyper) => hyper.write = blocks.into(),
+			_ => panic!("write requires a preceding hyper-connection"),
+		})
+	}
+	/// Reads the current hyper-connection stream into one lane for the head.
+	pub fn collapse<const N: usize>(&self, read: [Block; N]) -> Self {
+		self.push(Operation::Collapse(read.into()))
 	}
 	/// Gather `table`'s n-gram rows in machine RAM. The four following selectors
 	/// supply every map that turns the rows into a stream update.
@@ -15348,6 +15392,7 @@ impl Operation {
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
+			Self::Collapse(..) => "collapse",
 			Self::Dconv(..) => "dconv",
 			Self::Group(..) => "group",
 			Self::Fold(..) => "fold",
@@ -15360,13 +15405,15 @@ impl Operation {
 	/// Reports whether the operation owns weights that a qualifier can govern.
 	fn weighted(&self) -> bool {
 		let weighted_parts = |parts: &[Block]| parts.iter().any(|part| part.operation.weighted());
+		let weighted_gate = |block: &Block| block.operation.weighted() || block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(BlockNormalization::Rms)));
 		match self {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
 			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
 			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
-			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
+			Self::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(weighted_gate),
+			Self::Collapse(read) => read.iter().any(weighted_gate),
 			_ => true,
 		}
 	}
@@ -16310,14 +16357,19 @@ impl<'a> Builder<'a> {
 			}
 		}
 		let output_norm = builder.optional("output_norm.weight").or_else(|| builder.optional("token_embd_norm.weight"));
+		if let Some((lanes, bottleneck)) = dimensions.hyper {
+			if bottleneck != 0 && builder.file.tensor("output_hc_norm.weight").is_some() {
+				builder.whole("output_hc_norm.weight", "the head mixer normalization")?;
+				builder.whole("output_hc_down.weight", "the head mixer read gate")?;
+				builder.whole("output_hc_up.weight", "the head mixer read gate")?;
+				model = model.collapse(hyper_read(lanes, bottleneck, dimensions.width));
+			} else {
+				model = model.collapse([]);
+			}
+		}
 		if let Some(scale) = output_norm {
 			model = model.norm(rms);
 			builder.mapped(vec![scale]);
-		} else if dimensions.hyper.is_some_and(|(_, rank)| rank != 0) {
-			// The head mixer reads the stream through its own gates before the output.
-			builder.whole("output_hc_norm.weight", "the head mixer normalization")?;
-			builder.whole("output_hc_down.weight", "the head mixer read gate")?;
-			builder.whole("output_hc_up.weight", "the head mixer read gate")?;
 		}
 		model = model.layer(vocabulary);
 		// A file without an output tensor ties the output to the embedding.
@@ -16352,7 +16404,7 @@ impl<'a> Builder<'a> {
 	/// id's embedding, the layer's attention and feed-forward on that stream, and
 	/// the head's own mixer before the model's output.
 	fn draft(&mut self, layer: usize, vocabulary: usize, dimensions: &Dimensions, file: &Gguf) -> Result<Model> {
-		let (lanes, _) = dimensions.hyper.ok_or_else(|| RecipeError::new("a draft head joins a hyper-connection stream, and this model has none"))?;
+		let (lanes, bottleneck) = dimensions.hyper.ok_or_else(|| RecipeError::new("a draft head joins a hyper-connection stream, and this model has none"))?;
 		let width = dimensions.width;
 		let name = |suffix: &str| format!("blk.{layer}.nextn.{suffix}");
 		let role = format!("block {layer} draft head");
@@ -16382,9 +16434,14 @@ impl<'a> Builder<'a> {
 		};
 		let branch = self.post(layer, "ffn", branch, dimensions)?;
 		model = self.close(model, branch, dimensions);
-		self.whole(&name("hc_head_norm.weight"), "the draft head mixer normalization")?;
-		self.whole(&name("hc_head_down.weight"), "the draft head mixer read gate")?;
-		self.whole(&name("hc_head_up.weight"), "the draft head mixer read gate")?;
+		if bottleneck != 0 {
+			self.whole(&name("hc_head_norm.weight"), "the draft head mixer normalization")?;
+			self.whole(&name("hc_head_down.weight"), "the draft head mixer read gate")?;
+			self.whole(&name("hc_head_up.weight"), "the draft head mixer read gate")?;
+			model = model.collapse(hyper_read(lanes, bottleneck, width));
+		} else {
+			model = model.collapse([]);
+		}
 		model = model.layer(vocabulary);
 		let output = match self.optional("output.weight") {
 			Some(output) => output,
@@ -16847,13 +16904,13 @@ impl<'a> Builder<'a> {
 	fn open(&mut self, layer: usize, part: &str, dimensions: &Dimensions) -> Result<Model> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		match dimensions.hyper {
-			Some((lanes, rank)) => {
-				if rank != 0 {
+			Some((lanes, bottleneck)) => {
+				if bottleneck != 0 {
 					let role = format!("block {layer} {part} mixer");
 					let stream = lanes * dimensions.width;
 					self.whole(&name(&format!("hc_{part}_norm.weight")), &role)?;
-					let down = self.projection(&name(&format!("hc_{part}_down.weight")), &role, stream, rank)?;
-					let up = self.projection(&name(&format!("hc_{part}_up.weight")), &role, rank, stream)?;
+					let down = self.projection(&name(&format!("hc_{part}_down.weight")), &role, stream, bottleneck)?;
+					let up = self.projection(&name(&format!("hc_{part}_up.weight")), &role, bottleneck, stream)?;
 					let inject = self.projection(&name(&format!("hc_{part}_inject.weight")), &role, stream, lanes)?;
 					self.mapped(vec![down]);
 					self.mapped(vec![up]);
@@ -16891,11 +16948,12 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![scale]);
 		Ok(branch.norm(rms))
 	}
-	/// Closes a branch: the mixer's lanes and rank under hyper-connections, and
+	/// Closes a branch: the mixer's gate lists under hyper-connections, and
 	/// one ungated lane, the plain residual, otherwise.
 	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
 		match dimensions.hyper {
-			Some((lanes, rank)) => model.hyper(lanes, rank, &branch),
+			Some((lanes, 0)) => model.hyper(lanes, &branch),
+			Some((lanes, bottleneck)) => model.hyper(lanes, &branch).read(hyper_read(lanes, bottleneck, dimensions.width)).write(hyper_write(lanes)),
 			None => model.push(Operation::Residual(branch.blocks.clone())),
 		}
 	}
@@ -18647,7 +18705,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		frozen: graph.frozen[base..parameters].to_vec(),
 		programs: graph.programs.clone(),
 		lanes: graph.lanes,
-		rank: graph.rank,
+		gate_stream: graph.gate_stream,
 		stored: graph.stored[start..end].to_vec(),
 		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
@@ -19637,7 +19695,7 @@ struct Graph {
 	block_index: usize,
 	block_kind: &'static str,
 	lanes: usize,
-	rank: usize,
+	gate_stream: Option<(usize, usize)>,
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
@@ -19678,7 +19736,7 @@ impl Graph {
 			output: shape,
 			source: -1,
 			lanes: 0,
-			rank: 0,
+			gate_stream: None,
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -19753,7 +19811,8 @@ fn sequential_operation(operation: &Operation) -> bool {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
 		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
-		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		Operation::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(|block| sequential_operation(&block.operation)),
+		Operation::Collapse(read) => read.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
 }
@@ -19798,7 +19857,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		}
 	}
 	if graph.lanes != 0 {
-		lower_collapse(&mut graph, config)?;
+		lower_collapse(&mut graph, &[], model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	// A model whose last block already emits one value per target needs no projection; the
@@ -19957,8 +20016,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	let packed_from = graph.nodes.len();
 	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
 	// the stream open as a hyper-connection block does.
-	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-		lower_collapse(graph, config)?;
+	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..) | Operation::Collapse(..)) {
+		lower_collapse(graph, &[], total, data, targets, rows, gpu, config)?;
 	}
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
@@ -19997,7 +20056,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
-		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Hyper(hyper) => lower_hyper(graph, hyper, total, data, targets, rows, gpu, config)?,
+		Operation::Collapse(read) => lower_collapse(graph, read, total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -20015,7 +20075,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			MapKind::Activation(activation) => lower_activation(graph, activation, config)?,
 			MapKind::Normalization(normalization) => {
 				let channels = graph.output.channels;
-				lower_normalize(graph, normalization, channels, channels)?;
+				let width = graph.gate_stream.filter(|(stream, _)| *stream == channels).map_or(channels, |(_, lanes)| channels / lanes);
+				lower_normalize(graph, normalization, width, channels)?;
 			}
 		}
 		graph.block_precision = precision;
@@ -20263,6 +20324,9 @@ fn push_predictor(graph: &mut Graph, program: PredictorProgram) -> Result<()> {
 	Ok(())
 }
 fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -> Result<()> {
+	if let Activation::Scale(factor) = activation && graph.gate_stream.is_some() {
+		return lower_scale(graph, f64::from_bits(factor));
+	}
 	if activation == Activation::Relu {
 		let source = graph.source;
 		let last = graph.nodes.len() as i32 - 1;
@@ -21228,7 +21292,8 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Collapse(parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).map(estimator_count).sum(),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
@@ -21236,7 +21301,8 @@ fn estimator_count(block: &Block) -> usize {
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Collapse(parts) => parts.iter().find_map(first_estimator),
+		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).find_map(first_estimator),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}
@@ -21330,29 +21396,29 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
 	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
-fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
+fn lower_hyper(graph: &mut Graph, hyper: &Hyper, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let lanes = hyper.lanes;
+	require(lanes != 0 && !hyper.branch.is_empty(), "hyper-connections need at least one lane and one block")?;
 	if graph.lanes == 0 {
 		let shape = graph.output;
 		push_node(graph, Primitive::Expand, Shape { channels: checked_mul(shape.channels, lanes, "hyper-connection stream")?, length: shape.length }, 0, arguments(lanes as f64, 0.0), -2)?;
 		graph.lanes = lanes;
 	}
 	require(graph.lanes == lanes, format!("hyper-connections with {lanes} lanes follow a stream of {}", graph.lanes))?;
-	graph.rank = rank;
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	let (source, read, write) = lower_gates(graph, lanes, &hyper.read, &hyper.write, total, data, targets, rows, gpu, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
-	for block in blocks {
+	for block in &hyper.branch {
 		graph.block_frozen = outer_frozen || block.frozen;
 		graph.block_kind = block.operation.name();
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
 	if graph.lanes != 0 {
-		lower_collapse(graph, config)?;
+		lower_collapse(graph, &[], total, data, targets, rows, gpu, config)?;
 	}
 	(graph.block_frozen, graph.block_kind, graph.lanes) = (outer_frozen, outer_kind, lanes);
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
@@ -21361,38 +21427,53 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, stream, &[], program)
 }
-/// The mixer gates from the stream: per-lane RMS statistics under one trainable
-/// scale over the whole stream give `xn`; the read gate is
-/// `sigmoid(W_up · silu(W_down · xn / lanes))` over the stream, and the write
-/// gate is `2 sigmoid(W_inject · xn / lanes)` per lane, so a zero injection is
-/// the plain residual. No projection carries a bias. Returns the node the read
-/// consumes, the read gate, and the write gate. With `rank` zero no node is
-/// added, every gate is one, and the read takes the raw stream.
-fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config: Config) -> Result<(i32, i32, i32)> {
+/// Lowers a gate block through the ordinary block path. A stream-wide RMS block
+/// normalizes each lane separately, while its scale spans the whole stream.
+fn lower_gate_block(graph: &mut Graph, block: &Block, stream: Shape, lanes: usize, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let (outer_lanes, outer_gate_stream, outer_bias, outer_frozen, outer_kind) = (graph.lanes, graph.gate_stream, graph.bias, graph.block_frozen, graph.block_kind);
+	graph.lanes = 0;
+	graph.gate_stream = Some((stream.channels, lanes));
+	graph.bias = false;
+	graph.block_frozen = outer_frozen || block.frozen;
+	graph.block_kind = block.operation.name();
+	lower_block(graph, block, total, data, targets, rows, gpu, config)?;
+	(graph.lanes, graph.gate_stream, graph.bias, graph.block_frozen, graph.block_kind) = (outer_lanes, outer_gate_stream, outer_bias, outer_frozen, outer_kind);
+	Ok(())
+}
+/// The read and write lists start on one stream. Their identical leading blocks
+/// share nodes and parameters, including a single per-lane normalization scale.
+fn lower_gates(
+	graph: &mut Graph, lanes: usize, read: &[Block], write: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config,
+) -> Result<(i32, i32, i32)> {
 	let (stream, shape) = (graph.source, graph.output);
-	if rank == 0 {
-		return Ok((stream, -2, -2));
+	let common = read.iter().zip(write).take_while(|(left, right)| left == right).count();
+	let mut source = stream;
+	for (index, block) in read[..common].iter().enumerate() {
+		lower_gate_block(graph, block, shape, lanes, total, data, targets, rows, gpu, config)?;
+		if index == 0 && matches!(block.operation, Operation::Identity) && block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))) {
+			source = graph.source;
+		}
 	}
-	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
-	let normalized = graph.source;
-	lower_contraction(graph, rank, false)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Silu, config)?;
-	lower_contraction(graph, shape.channels, false)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	let read = graph.source;
-	if !write {
-		return Ok((normalized, read, -2));
+	let (shared, shared_shape) = (graph.source, graph.output);
+	for (index, block) in read[common..].iter().enumerate() {
+		lower_gate_block(graph, block, shape, lanes, total, data, targets, rows, gpu, config)?;
+		if common == 0 && index == 0 && matches!(block.operation, Operation::Identity) && block.maps.iter().any(|map| matches!(map.kind, MapKind::Normalization(_))) {
+			source = graph.source;
+		}
 	}
-	reset(graph, normalized, shape);
-	lower_contraction(graph, lanes, false)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	lower_scale(graph, 2.0)?;
-	Ok((normalized, read, graph.source))
+	let read_gate = if read.is_empty() { -2 } else { graph.source };
+	require(read.is_empty() || graph.output == shape, "hyper-connection read gate must match the stream")?;
+	reset(graph, shared, shared_shape);
+	for block in &write[common..] {
+		lower_gate_block(graph, block, shape, lanes, total, data, targets, rows, gpu, config)?;
+	}
+	let write_gate = if write.is_empty() { -2 } else { graph.source };
+	require(write.is_empty() || graph.output.channels == lanes && graph.output.length == shape.length, "hyper-connection write gate must produce one value per lane")?;
+	Ok((source, read_gate, write_gate))
 }
 /// Multiplies the graph output by `factor`.
 fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
+	require(factor.is_finite(), "scale factor must be finite")?;
 	let mut program = ScalarProgram(Vec::new());
 	let factor = program.constant(factor);
 	program.op(ScalarOpcode::Multiply, -1.0, factor);
@@ -21400,10 +21481,11 @@ fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 }
 /// The head read: the stream collapses to the mean of its lanes under its own
 /// read gate.
-fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
-	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
+fn lower_collapse(graph: &mut Graph, read: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let (lanes, shape) = (graph.lanes, graph.output);
+	require(lanes != 0, "head collapse requires a hyper-connection stream")?;
 	graph.stream = usize::try_from(graph.source).ok();
-	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
+	let (source, read, _) = lower_gates(graph, lanes, read, &[], total, data, targets, rows, gpu, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	graph.lanes = 0;
