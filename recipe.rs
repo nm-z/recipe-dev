@@ -23087,6 +23087,38 @@ mod precision_contract_checks {
 		assert!(Precisions::parse("missing", &base.replace("fp8=e4m3,", "")).is_err());
 	}
 	#[test]
+	fn two_float_formats_of_one_width_link_two_templates() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		// Two sums in e5m2 and e4m3, the f(5, 2) and f(4, 3) of the custom float
+		// before it: each links its own template under its own suffix, so the module
+		// defines every symbol once and each sum rounds in its own format.
+		let sums = |formats: [Compute; 2]| {
+			let mut graph = Graph::new(Shape { channels: 32, length: 1 }, 1e-5);
+			graph.profile = Config::load().unwrap().profile;
+			for format in formats {
+				graph.block_blck_precision = Some(format);
+				lower_project(&mut graph, 32).unwrap();
+			}
+			graph
+		};
+		let graph = sums([Compute::FP8_E5M2, Compute::FP8]);
+		assert_eq!(graph.nodes.iter().map(|node| node.precision).collect::<Vec<_>>(), [Compute::FP8_E5M2, Compute::FP8]);
+		// The CPU computes no fp8 sum, so the schedule comes from the same sums in fp32.
+		let input = vec![0.25; 32];
+		let schedule = NativeTape::new(&sums([Compute::FP32; 2]), TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap().program.schedule.clone();
+		let model = NativeModelIr::from_graph(&graph, 1, Compute::FP32, schedule.clone(), true).unwrap();
+		assert_eq!(graph.nodes.iter().map(|node| model.variant(node)).collect::<Vec<_>>(), ["_f8e5m2", "_f8"]);
+		let ir = model.emit(Backend::Cpu, None, None, false, false).unwrap();
+		let functions = ir.lines().filter(|line| line.starts_with("define ")).filter_map(|line| line.split_once('@')?.1.split_once('(').map(|(name, _)| name));
+		let globals = ir.lines().filter_map(|line| line.strip_prefix('@')?.split_once(" =").map(|(name, _)| name));
+		let mut defined = functions.chain(globals).collect::<Vec<_>>();
+		let count = defined.len();
+		defined.sort_unstable();
+		defined.dedup();
+		assert_eq!(defined.len(), count, "a symbol is defined twice");
+		compile_model(&gpu.native_target, &graph, Compute::FP32, None, 1, schedule).unwrap();
+	}
+	#[test]
 	fn capability_table_drives_routes_and_hard_errors() {
 		let cpu = BackendTarget::Cpu { target: "target=test;compiler=test;cpu=test;features=test".to_owned() };
 		let packed = resolve_capability(&cpu, ContractFormat::Int8).unwrap();
