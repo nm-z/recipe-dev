@@ -23230,6 +23230,37 @@ mod precision_contract_checks {
 		assert_eq!(training.nodes[0].int_bits, 16);
 	}
 	#[test]
+	fn rat_writes_the_fitted_evaluator_where_the_composed_tape_reads_it() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let mut config = Config::load().unwrap();
+		(config.profile.sum, config.precision) = (Compute::FP32, Compute::FP32);
+		// Two features, a layer(1) proposer and a layer(1) evaluator over the three-wide
+		// observation: the composition's spans of 3, 9, 6 and 4 weights each start
+		// on an aligned boundary, so the scorer is not where the weight count puts it.
+		let evaluator = recipe.model().layer(1).loss(mse);
+		let model = recipe.model().layer(1).loss(&evaluator);
+		let proposals = Prepared::matrix(vec![0.25, -0.5], vec![0.0], 1, 1).unwrap();
+		let composition = command_rat_graph(&model, &proposals, 1, gpu, config).unwrap();
+		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(&proposals.samples), &proposals.samples, &[0.0], gpu, config.precision, Some(composition.loss)).unwrap();
+		let layout = &tape.program.artifact.layout;
+		let scorer = layout.spans.iter().position(|&(start, _)| start == composition.offset).unwrap();
+		assert_ne!(layout.weights[scorer], composition.offset * layout.precisions[scorer].bytes());
+		let before = tape.weights().unwrap();
+		let fitted = [0.5, -0.25, 0.75, 0.125];
+		assert_eq!(before.len(), composition.offset + fitted.len());
+		rat_backward(&mut tape, composition.offset, &fitted, &proposals.samples, 0.01, config).unwrap();
+		let after = tape.weights().unwrap();
+		// The frozen evaluator holds the fitted weights and every other frozen weight
+		// keeps its own; only the proposer trains.
+		assert_eq!(&after[composition.offset..], &fitted);
+		for (index, (got, want)) in after.iter().zip(&before).enumerate().take(composition.offset) {
+			if composition.graph.frozen[index] != 0 {
+				assert_eq!(got, want, "frozen weight {index} changed");
+			}
+		}
+		assert_ne!(&after[..3], &before[..3], "the proposer did not train");
+	}
+	#[test]
 	fn integer_compute_uses_only_canonical_storage() {
 		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
 		let config = Config::load().unwrap();
