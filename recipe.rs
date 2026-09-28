@@ -19569,6 +19569,12 @@ mod precision_contract_checks {
 		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
 	}
 	#[test]
+	fn kfd_target_versions_name_hex_steppings() {
+		for (version, target) in [(90006, "gfx906"), (90008, "gfx908"), (90010, "gfx90a"), (90012, "gfx90c"), (90402, "gfx942"), (100300, "gfx1030"), (110001, "gfx1101"), (120001, "gfx1201")] {
+			assert_eq!(kfd_target(version), target, "KFD gfx_target_version {version}");
+		}
+	}
+	#[test]
 	fn nvidia_dp4a_replaces_portable_helpers() {
 		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
 		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
@@ -23332,6 +23338,12 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> {
 		.parse::<u32>()
 		.map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}")))
 }
+/// The LLVM processor a KFD `gfx_target_version` names. Major and minor are
+/// decimal and the stepping is one hex digit: 90010 is gfx90a, 90012 gfx90c.
+#[cfg(any(amd, test))]
+fn kfd_target(gfx: u32) -> String {
+	format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100)
+}
 #[cfg(amd)]
 impl Hsa {
 	unsafe fn native_dispatch(&self, executable: u64, bytes: &[u8], element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
@@ -23844,7 +23856,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
-		let target = format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100);
+		let target = kfd_target(gfx);
 		let native_target = BackendTarget::Amd { architecture: target.clone() };
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let reader_destroy: unsafe extern "C" fn(u64) -> i32 = runtime.function(b"hsa_code_object_reader_destroy\0")?;
