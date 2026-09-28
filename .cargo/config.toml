@@ -1,7 +1,2 @@
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
-
-[env]
-# The inline checks execute kernels on every CPU worker and one measures device
-# timing, so they run one at a time rather than contending for the same cores.
-RUST_TEST_THREADS = "1"

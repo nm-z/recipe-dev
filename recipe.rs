@@ -11412,7 +11412,7 @@ mod bundle {
 		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
 			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
 			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
+			assert_eq!(split_escaped(&text, '|').len(), 17);
 			assert_eq!(block(&text).unwrap(), original);
 			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
 			let legacy = block(legacy).unwrap();
@@ -19829,7 +19829,7 @@ mod precision_contract_checks {
 		let mut attention = AttentionBlock::new(1);
 		attention.width = 4;
 		attention.window = 4;
-		let error = lower_attention(&mut graph, attention, None, Config::load().unwrap()).unwrap_err().to_string();
+		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
 		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
 	}
 	#[test]
@@ -19869,7 +19869,7 @@ mod precision_contract_checks {
 		let mut operation = AttentionBlock::new(2);
 		operation.width = 4;
 		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
-		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms), Config::load().unwrap()).unwrap();
+		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
 		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
 		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
 		let model = recipe.model().res([projection.clone()]).fp(64);
@@ -20006,7 +20006,7 @@ mod precision_contract_checks {
 			graph.parameters.fill(sample);
 			graph.refresh_storage(config).unwrap();
 			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
+			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
 			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
 			tape.advance().unwrap();
 			tape.gradient_launch(0.01, config).unwrap();
