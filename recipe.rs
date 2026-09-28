@@ -10066,6 +10066,10 @@ mod tokenizer {
 		Qwen2,
 		CommandR,
 		SentencePiece,
+		/// Whole pieces of the scored vocabulary, the segmentation with the best
+		/// total score found by Viterbi, and a byte fallback for any character no
+		/// piece covers: the unigram model of Kudo (2018) as PLaMo 2 states it.
+		Unigram,
 	}
 
 	fn letter(value: char) -> bool {
@@ -10247,6 +10251,10 @@ mod tokenizer {
 		bytes: [u32; 256],
 		byte_of: HashMap<char, u8>,
 		family: Family,
+		/// Under a unigram vocabulary, each token's score in units of 1e-4, or
+		/// none for a byte token, and the longest piece in characters.
+		unigram: Vec<Option<i64>>,
+		longest: usize,
 		template: Option<String>,
 		add_space_prefix: bool,
 		add_bos: bool,
@@ -10271,7 +10279,7 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
+			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else if kind == "plamo2" { Family::Unigram } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
 			};
@@ -10306,7 +10314,9 @@ mod tokenizer {
 			let map = byte_map();
 			let mut bytes = [*ids.get("<unk>").unwrap_or(&0); 256];
 			let mut byte_of = HashMap::new();
-			if family != Family::SentencePiece {
+			if family == Family::Unigram {
+				for (byte, slot) in bytes.iter_mut().enumerate() { *slot = id(&format!("<0x{byte:02X}>"))?; }
+			} else if family != Family::SentencePiece {
 				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = id(&symbol.to_string())?; }
 				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
@@ -10327,7 +10337,19 @@ mod tokenizer {
 			stop.sort_unstable();
 			stop.dedup();
 			let suppress = token_ids(model, "tokenizer.ggml.suppress_tokens")?;
+			// Every token but a byte is a piece, scored as the vocabulary states it.
+			let (unigram, longest) = if family == Family::Unigram {
+				let scores = array("tokenizer.ggml.scores")?;
+				let pieces = (0..tokens.len()).map(|index| {
+					let score = scores.get(index).and_then(|score| match score { GgufValue::F32(value) => Some(f64::from(*value)), GgufValue::F64(value) => Some(*value), _ => None });
+					score.filter(|score| score.is_finite() && kind(index) != Some(6)).map(|score| (score * 1e4).round() as i64)
+				}).collect::<Vec<_>>();
+				let longest = tokens.iter().zip(&pieces).filter(|(_, piece)| piece.is_some()).map(|(token, _)| token.chars().count()).max().unwrap_or(1);
+				(pieces, longest)
+			} else { (Vec::new(), 0) };
 			Ok(Self {
+				unigram,
+				longest,
 				byte_of,
 				ids,
 				ranks,
@@ -10416,6 +10438,9 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+			if self.family == Family::Unigram {
+				return self.encode_unigram(text, output);
+			}
 			let normalized = (self.family == Family::SentencePiece).then(|| {
 				let mut normalized = text.replace(' ', "▁");
 				if self.add_space_prefix && !normalized.is_empty() { normalized.insert(0, '▁'); }
@@ -10451,6 +10476,46 @@ mod tokenizer {
 				output.extend(symbols);
 			}
 		}
+		/// The best-scoring segmentation of `text`, found from its end: each place
+		/// takes the piece starting there whose score plus the best from its end
+		/// is highest, the longest piece on a tie. A character no piece starts
+		/// with costs 1e3 points and spells out its UTF-8 bytes.
+		fn encode_unigram(&self, text: &str, output: &mut Vec<u32>) {
+			const UNKNOWN: i64 = 10_000_000;
+			let chars = text.strip_prefix('\u{feff}').unwrap_or(text).chars().collect::<Vec<_>>();
+			let mut cost = vec![i64::MAX; chars.len() + 1];
+			let mut step = vec![(1_usize, None::<u32>); chars.len() + 1];
+			cost[chars.len()] = 0;
+			for at in (0..chars.len()).rev() {
+				let mut piece = String::new();
+				let mut candidates = Vec::new();
+				for (length, value) in chars[at..].iter().take(self.longest).enumerate() {
+					piece.push(*value);
+					if let Some(&id) = self.ids.get(&piece) && let Some(score) = self.unigram[id as usize] {
+						candidates.push((length + 1, id, score));
+					}
+				}
+				for (length, id, score) in candidates.into_iter().rev() {
+					let total = cost[at + length].saturating_sub(score);
+					if total < cost[at] {
+						(cost[at], step[at]) = (total, (length, Some(id)));
+					}
+				}
+				let total = cost[at + 1].saturating_add(UNKNOWN);
+				if total < cost[at] {
+					(cost[at], step[at]) = (total, (1, None));
+				}
+			}
+			let mut at = 0;
+			while at < chars.len() {
+				let (length, id) = step[at];
+				match id {
+					Some(id) => output.push(id),
+					None => output.extend(chars[at].to_string().bytes().map(|byte| self.bytes[usize::from(byte)])),
+				}
+				at += length;
+			}
+		}
 		fn byte_of_token(&self, byte: u8) -> char {
 			self.tokens[self.bytes[usize::from(byte)] as usize].chars().next().unwrap()
 		}
@@ -10459,6 +10524,15 @@ mod tokenizer {
 		pub fn decode(&self, ids: &[u32]) -> String {
 			let mut bytes = Vec::new();
 			for id in ids {
+				// A unigram vocabulary spells a byte as its <0xXX> token.
+				if self.family == Family::Unigram {
+					let token = &self.tokens[*id as usize];
+					match token.strip_prefix("<0x").and_then(|rest| rest.strip_suffix('>')).and_then(|hex| u8::from_str_radix(hex, 16).ok()).filter(|_| token.len() == 6) {
+						Some(byte) => bytes.push(byte),
+						None => bytes.extend(token.as_bytes()),
+					}
+					continue;
+				}
 				for symbol in self.tokens[*id as usize].chars() {
 					match self.byte_of.get(&symbol) {
 						Some(byte) => bytes.push(*byte),
