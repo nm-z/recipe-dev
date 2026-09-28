@@ -19459,6 +19459,53 @@ mod precision_contract_checks {
 		}
 	}
 	#[test]
+	fn topk_backward_compiles_and_differentiates_when_model_and_accumulator_differ() {
+		let gpu = gradient_test_gpu();
+		let config = Config::load().unwrap();
+		let (experts, length, top) = (4, 2, 2);
+		// Expert e of position t sits at e * length + t; every score is exact in fp16.
+		let scores = [0.5, -0.25, 1.25, 0.75, -0.5, 1.5, 0.25, -1.0];
+		let targets = [0.25, 0.5, 0.0, 0.125, 0.5, 0.25, 0.125, 0.0];
+		for (model, acc, tolerance) in [(Compute::FP16, Compute::FP32, 2e-3), (Compute::FP32, Compute::FP64, 1e-6)] {
+			for (sigmoid, renormalize) in [(false, true), (false, false), (true, true), (true, false)] {
+				let mut graph = Graph::new(Shape { channels: experts, length }, 1e-5);
+				graph.profile = config.profile;
+				graph.profile.acc = acc;
+				graph.block_precision = Some(model);
+				let routed = graph.output;
+				push_node(&mut graph, Primitive::TopK, routed, 0, [top as f64, f64::from(u8::from(sigmoid)), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2).unwrap();
+				let case = format!("{} model, {} accumulator, sigmoid {sigmoid}, renormalize {renormalize}", model.label(), acc.label());
+				let mut tape = NativeTape::new(&graph, TapeInput::Values(&scores), &scores, &targets, gpu, Compute::FP32, Some(mse)).unwrap_or_else(|error| panic!("{case}: {error}"));
+				tape.advance().unwrap();
+				tape.gradient_launch(0.01, config).unwrap();
+				let weights = tape.predictions().unwrap();
+				let adjoint = tape.input_adjoint.download_float(scores.len(), tape.program.artifact.layout.input_adjoint_precision).unwrap();
+				for t in 0..length {
+					let at = |e: usize| e * length + t;
+					let mut ranked: Vec<usize> = (0..experts).collect();
+					ranked.sort_by(|&left, &right| scores[at(right)].total_cmp(&scores[at(left)]).then(left.cmp(&right)));
+					let kept = |e: usize| ranked[..top].contains(&e);
+					// A renormalized selection scores the kept experts; a plain one every expert.
+					let member = |e: usize| kept(e) || !renormalize;
+					let maximum = (0..experts).filter(|&e| member(e)).map(|e| scores[at(e)]).fold(f64::NEG_INFINITY, f64::max);
+					let raw = |e: usize| if sigmoid { 1.0 / (1.0 + (-scores[at(e)]).exp()) } else { (scores[at(e)] - maximum).exp() };
+					let divide = renormalize || !sigmoid;
+					let total = if divide { (0..experts).filter(|&e| member(e)).map(raw).sum::<f64>() } else { 1.0 };
+					let weight = |e: usize| if kept(e) { raw(e) / total } else { 0.0 };
+					let delta = |e: usize| 2.0 * (weights[at(e)] - targets[at(e)]) / scores.len() as f64;
+					let mean = if divide { (0..experts).map(|e| weight(e) * delta(e)).sum::<f64>() } else { 0.0 };
+					for e in 0..experts {
+						assert!((weights[at(e)] - weight(e)).abs() < tolerance, "{case}: weight {e} at {t}: {} vs {}", weights[at(e)], weight(e));
+						let slope = if sigmoid { raw(e) * (1.0 - raw(e)) } else { raw(e) };
+						let own = if kept(e) { delta(e) } else { 0.0 };
+						let expected = if renormalize && !kept(e) { 0.0 } else { slope / total * (own - mean) };
+						assert!((adjoint[at(e)] - expected).abs() < tolerance * 0.1, "{case}: score {e} at {t}: {} vs {expected}", adjoint[at(e)]);
+					}
+				}
+			}
+		}
+	}
+	#[test]
 	fn narrow_recurrence_carries_small_gradients() {
 		let gpu = gradient_test_gpu();
 		let scale = 2.0_f64.powi(-24);
