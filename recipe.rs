@@ -23278,6 +23278,42 @@ mod precision_contract_checks {
 		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
 	}
 	#[test]
+	fn a_second_requantize_converts_the_bound_bytes() {
+		let gpu = gradient_test_gpu();
+		let config = Config::load().unwrap();
+		let values: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 8.0).collect();
+		let source_format = StorageFormat::named("q4_0").unwrap();
+		let mut source = source_format.encode(&values, &[1.0; 32], config).unwrap();
+		source.arithmetic.clear();
+		let source_bytes = source.bytes.slice(0, source.bytes.len()).unwrap();
+		let source_values = source_format.decompress(&source_bytes, &source.codebook, 32).unwrap();
+		let mut prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
+		prepared.bound = Some(vec![BoundNode { names: "source.weight".to_owned(), elements: 32, weight: BoundWeight::Stored(source) }]);
+		// A saved block record names q8_0 storage for a block that computes in int4:
+		// the node converts on the device twice, first to q8_0 and then to int4's q4_1,
+		// and each conversion reads the bound bytes, never the first one's unwritten result.
+		let saved = StorageFormat::named("q8_0").unwrap().0;
+		let model = recipe.model().no(bias).layer(1).int(4).loss(mse).edit(|data| data.blocks[0].quantization = saved);
+		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+		let target = graph.stored[0].as_ref().unwrap();
+		assert!(target.format == StorageFormat::named("q4_1").unwrap() && target.bytes.absent_runs());
+		let source = graph.requantize[0].as_ref().unwrap();
+		assert!(source.format == source_format && !source.bytes.absent_runs());
+		assert_eq!(source.bytes.len(), 18);
+		let input: Vec<f64> = (0..32).map(|i| (i as f64 + 1.0) / 64.0).collect();
+		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
+		tape.forward(ForwardMode::Inference).unwrap();
+		let actual = tape.predictions().unwrap()[0];
+		let canonical = StorageFormat::named("q4_1").unwrap().encode(&source_values, &[1.0; 32], config).unwrap();
+		let bytes = canonical.bytes.slice(0, canonical.bytes.len()).unwrap();
+		let decoded = canonical.format.decompress(&bytes, &canonical.codebook, 32).unwrap();
+		let extreme = *input.iter().max_by(|left, right| left.abs().total_cmp(&right.abs())).unwrap();
+		let inverse = -127.0 / extreme;
+		let step = 1.0 / inverse;
+		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
+		assert!((actual - expected).abs() < 1e-5, "twice-converted weight produced {actual}, machine canonical encoding of the bound bytes produced {expected}");
+	}
+	#[test]
 	fn narrow_training_preserves_small_and_large_gradients() {
 		let gpu = gradient_test_gpu();
 		for format in [Compute::FP16, Compute::BF16] {
