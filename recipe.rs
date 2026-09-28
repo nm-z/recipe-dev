@@ -19024,6 +19024,22 @@ impl Drop for ExchangeBuffer {
 	}
 }
 impl Gpu {
+	/// Whether every other die of `peers` reaches this die's memory directly,
+	/// enabling that access on the way.
+	fn reaches(&'static self, peers: &[&'static Gpu]) -> bool {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => peers.iter().filter(|peer| !std::ptr::eq(**peer, self)).all(|peer| match &peer.driver {
+				Driver::Cuda(other) => unsafe {
+					(other.set)(other.context);
+					// 704: peer access is already on.
+					matches!((other.enable_peer)(driver.context, 0), 0 | 704)
+				},
+				_ => false,
+			}),
+			_ => false,
+		}
+	}
 	/// `bytes` of zeroed exchange memory for this die and `peers`: this die's
 	/// own memory when every peer reaches it directly, so exchanges never wait on
 	/// the machine's memory controller; else pinned machine RAM every context maps.
@@ -19031,14 +19047,7 @@ impl Gpu {
 		match &self.driver {
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => unsafe {
-				let reach = peers.iter().filter(|peer| !std::ptr::eq(**peer, self)).all(|peer| match &peer.driver {
-					Driver::Cuda(other) => {
-						(other.set)(other.context);
-						// 704: peer access is already on.
-						matches!((other.enable_peer)(driver.context, 0), 0 | 704)
-					}
-					_ => false,
-				});
+				let reach = self.reaches(peers);
 				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
 				if reach {
 					let mut device = 0_u64;
@@ -19786,7 +19795,14 @@ fn place_bound_with_suppressed(model: &Bound, positions: usize, split: &[usize],
 		Some(ids) => ids.to_vec(),
 		None => tokenizer::token_ids(&model.file, "tokenizer.ggml.suppress_tokens")?,
 	};
-	if env!("RECIPE_DEVICE_SPLIT") == "tensor" && devices.len() > 1 && split.is_empty() {
+	// Dies that reach each other peer to peer exchange fast enough that every
+	// layer over every die beats layers one die after another.
+	let tensor = match env!("RECIPE_DEVICE_SPLIT") {
+		"tensor" => true,
+		"auto" => devices[0].reaches(devices),
+		_ => false,
+	};
+	if tensor && devices.len() > 1 && split.is_empty() {
 		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 		let (dies, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
 		let draft = place_draft(model, positions, devices)?;

@@ -2112,11 +2112,12 @@ fn main() -> BuildResult<()> {
 			value => return Err(io::Error::other(format!("multi-device must be false, true, or \"auto\", not {value}")).into()),
 		}
 	);
-	// How a model placed on several devices divides: by layers, or every layer
-	// over every device (a tensor split).
+	// How a model placed on several devices divides: by layers, every layer over
+	// every device (a tensor split), or a tensor split whenever every die reaches
+	// the first peer to peer (auto).
 	let split = setting(&manifest, "device-split")?.trim_matches('"');
-	if !matches!(split, "layer" | "tensor") {
-		return Err(io::Error::other(format!("device-split must be \"layer\" or \"tensor\", not {split}")).into());
+	if !matches!(split, "layer" | "tensor" | "auto") {
+		return Err(io::Error::other(format!("device-split must be \"layer\", \"tensor\", or \"auto\", not {split}")).into());
 	}
 	println!("cargo:rustc-env=RECIPE_DEVICE_SPLIT={split}");
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
