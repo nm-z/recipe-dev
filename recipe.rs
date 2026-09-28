@@ -1699,6 +1699,9 @@ pub(crate) struct NativeLayout {
 	/// At inference, the byte offset in the context arena of the parts a packed
 	/// sum with too few rows for the device leaves before it adds them up.
 	pub split_scratch: Option<usize>,
+	/// At inference, the byte offset in the context arena of one i32 hardware
+	/// knob per node that the lane tuner writes between steps.
+	pub knobs: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -2403,9 +2406,12 @@ impl NativeLayout {
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
-		let clocks = if tracing() {
+		// The lane tuner reads the node clocks too.
+		let tuned = inference && lane_tuning();
+		let clocks = if tracing() || tuned {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
+		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let last_column = match graph.nodes.last().filter(|_| inference) {
 			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
 			None => None,
@@ -2414,7 +2420,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, indexer_blocks, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, kept })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, indexer_history, indexer_blocks, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -7600,6 +7606,14 @@ impl NativeModelIr {
 		// The runs a block holds: the places a run can start at inside one block.
 		let counts = (1..=256).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
 		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.length(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 32\n}}\n"));
+		// How many waves share a packed sum's row group is a hardware knob the lane
+		// tuner writes for each node while the model runs; zero keeps the body's
+		// own choice. The runtime points @recipe_knobs at the table.
+		if self.layout.knobs.is_some() && backend == Backend::Nvidia {
+			ir.push_str("@recipe_knobs = addrspace(1) externally_initialized global i64 0, align 8\ndefine internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\n%bits = load volatile i64, ptr addrspace(1) @recipe_knobs, align 8\n%bound = icmp ne i64 %bits, 0\nbr i1 %bound, label %read, label %none\nread:\n%base = inttoptr i64 %bits to ptr addrspace(1)\n%slot = getelementptr i32, ptr addrspace(1) %base, i32 %node\n%value = load volatile i32, ptr addrspace(1) %slot, align 4\nret i32 %value\nnone:\nret i32 0\n}\n");
+		} else {
+			ir.push_str("define internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\nret i32 0\n}\n");
+		}
 		for (precision, suffix) in self.precisions() {
 			let (ty, state) = (precision.model_type, precision.state_type);
 			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(String, NativeDequant, usize, usize, u32)>::new());
@@ -12888,6 +12902,90 @@ impl Drop for ChatInput {
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
 static TRACE: AtomicBool = AtomicBool::new(false);
+fn lane_tuning() -> bool {
+	env!("RECIPE_LANE_TUNING") == "1"
+}
+/// The team widths a packed sum can take: zero is the body's own choice.
+const LANE_TEAMS: [i32; 6] = [0, 1, 2, 4, 8, 16];
+/// Chooses each packed sum's team width from its measured node clocks. Nodes of
+/// one operation, shape, and format share a class, so every one of them adds to
+/// the estimate their class steps on. Each step draws a width per class from a
+/// softmax over the candidates' mean clocks in a rolling window, relative to the
+/// best; a width not yet run is drawn as though it matched the best.
+struct LaneTuner {
+	classes: Vec<Option<usize>>,
+	history: Vec<Vec<std::collections::VecDeque<f64>>>,
+	chosen: Vec<usize>,
+	random: u64,
+	window: usize,
+	temperature: f64,
+}
+impl LaneTuner {
+	fn new(graph: &Graph) -> Result<Self> {
+		let mut keys = Vec::<(u32, usize, usize, String)>::new();
+		let mut classes = Vec::with_capacity(graph.nodes.len());
+		for (index, node) in graph.nodes.iter().enumerate() {
+			let packed = matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) && packed_weight(graph, index, true).is_some();
+			classes.push(packed.then(|| {
+				let format = graph.stored.get(index).and_then(Option::as_ref).and_then(|stored| stored.format_segments().first().and_then(|(segment, _)| segment.spec()).map(|spec| spec.codec.quantization().name.to_owned())).unwrap_or_default();
+				let key = (node.op as u32, node.shard.terms.local(node.input.channels), node.shard.rows.local(node.output.channels), format);
+				keys.iter().position(|known| *known == key).unwrap_or_else(|| {
+					keys.push(key);
+					keys.len() - 1
+				})
+			}));
+		}
+		let window = natural("lane tuning window", env!("RECIPE_LANE_TUNING_WINDOW"))?.max(1);
+		let temperature = env!("RECIPE_LANE_TUNING_TEMPERATURE").parse::<f64>().map_err(|_| RecipeError::new("lane tuning temperature is not a number"))?;
+		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature })
+	}
+	/// The width each class runs next, and the table of one i32 per node slot.
+	fn choose(&mut self) -> Vec<u8> {
+		for (class, runs) in self.history.iter().enumerate() {
+			let means = runs.iter().map(|window| (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)).collect::<Vec<_>>();
+			let best = means.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+			let weights = means.iter().map(|mean| if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 }).collect::<Vec<_>>();
+			let total = weights.iter().sum::<f64>();
+			let mut draw = (next_random(&mut self.random) >> 11) as f64 / (1_u64 << 53) as f64 * total;
+			let mut pick = weights.len() - 1;
+			for (candidate, weight) in weights.iter().enumerate() {
+				if draw < *weight {
+					pick = candidate;
+					break;
+				}
+				draw -= weight;
+			}
+			self.chosen[class] = pick;
+		}
+		// Slot n + 1 holds node n's knob: the kernels number nodes from one.
+		let mut table = vec![0_u8; (self.classes.len() + 2) * 4];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let Some(class) = class {
+				table[(index + 1) * 4..(index + 2) * 4].copy_from_slice(&LANE_TEAMS[self.chosen[*class]].to_le_bytes());
+			}
+		}
+		table
+	}
+	/// Adds a step's node clocks: node n ran from clock n to clock n + 1.
+	fn observe(&mut self, ticks: &[i64]) {
+		let mut sums = vec![(0.0, 0_usize); self.history.len()];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let (Some(class), Some(end)) = (class, ticks.get(index + 1)) {
+				sums[*class].0 += end.wrapping_sub(ticks[index]).max(0) as f64;
+				sums[*class].1 += 1;
+			}
+		}
+		for (class, (sum, count)) in sums.into_iter().enumerate() {
+			if count != 0 {
+				let window = &mut self.history[class][self.chosen[class]];
+				window.push_back(sum / count as f64);
+				if window.len() > self.window {
+					window.pop_front();
+				}
+			}
+		}
+	}
+}
 fn tracing() -> bool {
 	static ENV_TRACE: OnceLock<bool> = OnceLock::new();
 	TRACE.load(Ordering::Relaxed) || *ENV_TRACE.get_or_init(|| std::env::var("RECIPE_TRACE").is_ok_and(|value| value == "1"))
@@ -23318,6 +23416,8 @@ struct NativeTape {
 	kept: Mutex<Option<(Buffer, u32, u32)>>,
 	/// The node whose stream the head collapses, when this tape holds it.
 	stream: Option<usize>,
+	/// The lane tuner of an inference tape whose program reads knobs.
+	tuner: Mutex<Option<LaneTuner>>,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -23698,8 +23798,10 @@ impl NativeTape {
 			window_begin: std::sync::atomic::AtomicU32::new(0),
 			kept: Mutex::new(None),
 			stream: graph.stream,
+			tuner: Mutex::new(None),
 		};
 		tape.stage_lookups(0, tape.positions)?;
+		tape.bind_knobs(graph)?;
 		Ok(tape)
 	}
 	/// Writes every contraction node's forward, gradient, and previous tiles
@@ -23854,6 +23956,12 @@ impl NativeTape {
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		#[cfg(nvidia)]
 		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
+		// A decode step runs with the knobs the lane tuner draws for it.
+		let mut tuner = self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))?;
+		let tuning = single && tuner.is_some();
+		if tuning && let (Some(tuner), Some(offset)) = (tuner.as_mut(), self.program.artifact.layout.knobs) {
+			self.contexts.write_bytes(offset, &tuner.choose())?;
+		}
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
 		if let Some(gate) = gate {
@@ -23866,16 +23974,42 @@ impl NativeTape {
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
-		if let Some(clocks) = self.program.artifact.layout.clocks {
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
-			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
-			let mut line = format!("clocks window {begin}..{end} {unit}");
-			for index in 1..count {
-				line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+			if tuning && let Some(tuner) = tuner.as_mut() {
+				tuner.observe(&ticks);
 			}
-			trace(&line)?;
+			if tracing() {
+				let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+				let mut line = format!("clocks window {begin}..{end} {unit}");
+				for index in 1..count {
+					line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+				}
+				trace(&line)?;
+			}
 		}
+		Ok(())
+	}
+	/// Points the program's knob table at this tape's context arena and starts
+	/// the lane tuner, where the program reads knobs.
+	fn bind_knobs(&self, graph: &Graph) -> Result<()> {
+		let Some(offset) = self.program.artifact.layout.knobs else { return Ok(()) };
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				let (mut address, mut bytes) = (0_u64, 0_usize);
+				if (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, b"recipe_knobs\0".as_ptr()) != 0 {
+					return Ok(());
+				}
+				let table = self.contexts.pointer + offset as u64;
+				driver_status(Backend::Nvidia, (driver.upload)(address, (&table as *const u64).cast(), 8), "knob table write")?;
+			},
+			_ => return Ok(()),
+		}
+		self.contexts.write_bytes(offset, &vec![0; (graph.nodes.len() + 2) * 4])?;
+		*self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))? = Some(LaneTuner::new(graph)?);
 		Ok(())
 	}
 	/// Points this tape's program at a tensor split's machine RAM and starts

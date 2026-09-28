@@ -40,6 +40,11 @@ tensor-split-region-bytes = 8388608
 lookup-readers = 16
 placement-launch-reserve-bytes = 134217728
 nvidia-step-registers = 128
+# The lane tuner: while a model decodes, each packed sum's team width is chosen
+# from its own recent node clocks, a softmax over each candidate's mean.
+lane-tuning = 1
+lane-tuning-window = 16
+lane-tuning-temperature = 0.03
 # relocatable ptxas held ~60 bytes of RAM per byte of Flash Next IR (2026-09-26)
 compile-memory-per-ir-byte = 100
 # archy nv0 has bad VRAM from ~5.9 GB up

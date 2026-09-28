@@ -2084,6 +2084,9 @@ fn main() -> BuildResult<()> {
 		("tensor-split-region-bytes", "RECIPE_TENSOR_SPLIT_REGION_BYTES"),
 		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
 		("nvidia-step-registers", "RECIPE_NVIDIA_STEP_REGISTERS"),
+		("lane-tuning", "RECIPE_LANE_TUNING"),
+		("lane-tuning-window", "RECIPE_LANE_TUNING_WINDOW"),
+		("lane-tuning-temperature", "RECIPE_LANE_TUNING_TEMPERATURE"),
 		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
