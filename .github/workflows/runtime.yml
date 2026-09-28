@@ -732,6 +732,9 @@ jobs:
   windows-gpu:
     name: win/nv
     needs: prepare
+    # Nothing new may be created on Azure subscription 1, where this job provisions
+    # its recipe-wgpu-* worker, so the job stays off until it has another home.
+    if: false
     runs-on: ubuntu-24.04
     environment: recipe-windows-gpu
     timeout-minutes: 90
