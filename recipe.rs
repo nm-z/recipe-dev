@@ -981,6 +981,8 @@ mod program_ir {
 		pub span: usize,
 		/// The per-channel scale applied after normalization, when the node carries one.
 		pub weight: Option<&'a str>,
+		/// Whether a per-channel shift follows the scale, stored after it.
+		pub shift: bool,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
 	}
@@ -1116,7 +1118,19 @@ mod program_ir {
 				let _ =
 					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul{suffix}({ty} {value}, {ty} {weight_value})", ty = context.value_type);
-				scaled
+				if context.shift {
+					let shift_column = format!("%{prefix}.shift.column");
+					let shift_pointer = format!("%{prefix}.shift.ptr");
+					let shift_value = format!("%{prefix}.shift");
+					let shifted = format!("%{prefix}.shifted");
+					let _ = writeln!(output, "{shift_column} = add i64 {column}, {span}", span = context.span);
+					let _ = writeln!(output, "{shift_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i64 {shift_column}", ty = context.value_type, ptrty = context.pointer_type);
+					let _ = writeln!(output, "{shift_value} = load {ty}, {ptrty} {shift_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+					let _ = writeln!(output, "{shifted} = call {ty} @recipe.add{suffix}({ty} {scaled}, {ty} {shift_value})", ty = context.value_type);
+					shifted
+				} else {
+					scaled
+				}
 			}
 		};
 		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
@@ -1191,7 +1205,7 @@ mod program_ir {
 			let normalized = emit_normalize(NormalizeContext {
 				value_type: mt, suffix, pointer_type: ptr, alignment: context.alignment,
 				source_value: &source, context: context.context, rows: context.rows, channels: context.channels,
-				length: context.length, width: context.width, span: context.span, weight: None, mode: context.mode, prefix: &replay_prefix,
+				length: context.length, width: context.width, span: context.span, weight: None, shift: false, mode: context.mode, prefix: &replay_prefix,
 			}, element);
 			code.push_str(&normalized.code);
 			normalized.value
@@ -5815,6 +5829,7 @@ impl NativeModelIr {
 								width: normalize_width(node),
 								span: normalize_span(node),
 								weight,
+								shift: node.parameters == 2 * normalize_span(node),
 								mode,
 								prefix: &prefix,
 							},
@@ -5948,6 +5963,7 @@ impl NativeModelIr {
 										width: normalize_width(node),
 										span: normalize_span(node),
 										weight: None,
+										shift: false,
 										mode,
 										prefix: &weight_prefix,
 									},
@@ -16807,6 +16823,8 @@ struct ManifestArchitecture {
 	parallel: bool,
 	/// Whether the stream's normalizations center as well as scale.
 	layer_norm: bool,
+	/// The activation of a feed-forward the file stores without a gate.
+	ffn: Activation,
 	conv: Option<Activation>,
 	qk: Option<BlockNormalization>,
 	norm: Option<BlockNormalization>,
@@ -16839,6 +16857,12 @@ impl ManifestArchitecture {
 			Some("layer") => true,
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] norms={value} must be rms or layer"))),
 		};
+		let ffn = match field("ffn") {
+			None | Some("gelu") => Activation::Gelu,
+			Some("relu") => Activation::Relu,
+			Some("silu") => Activation::Silu,
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] ffn={value} must be gelu, relu, or silu"))),
+		};
 		let conv = match field("conv") {
 			None => None,
 			Some("linear") => Some(Activation::Linear),
@@ -16867,7 +16891,7 @@ impl ManifestArchitecture {
 			Some("silu") => Some(Activation::Silu),
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] output={value} must be sigmoid or silu"))),
 		};
-		Ok(Self { rope, embed_scaled, parallel, layer_norm, conv, qk, norm, decay, output })
+		Ok(Self { rope, embed_scaled, parallel, layer_norm, ffn, conv, qk, norm, decay, output })
 	}
 	fn delta(self, name: &str) -> Result<(Activation, BlockNormalization, BlockNormalization, DeltaDecay, Activation)> {
 		let missing = |key: &str| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key} for a delta block"));
@@ -16982,6 +17006,8 @@ struct Dimensions {
 	width: usize,
 	/// Whether the stream's normalizations are layer normalizations.
 	layer_norm: bool,
+	/// The activation of a feed-forward stored without a gate, when it is.
+	ungated: Option<Activation>,
 	heads: usize,
 	kv: Vec<usize>,
 	head: Vec<usize>,
@@ -17265,7 +17291,11 @@ impl<'a> Builder<'a> {
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
 		let layer_norm = self.choices.is_some_and(|choices| choices.layer_norm);
-		Ok(Dimensions { width, layer_norm, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		// A feed-forward with no gate tensor whose up projection is as wide as the
+		// hidden layer applies the architecture's activation alone.
+		let up_rows = self.file.tensor("blk.0.ffn_up.weight").and_then(|up| up.shape.get(1).copied()).map(|rows| rows as usize);
+		let ungated = (self.file.tensor("blk.0.ffn_gate.weight").is_none() && feed_forward.is_some() && up_rows == feed_forward).then(|| self.choices.map_or(Activation::Gelu, |choices| choices.ffn));
+		Ok(Dimensions { width, layer_norm, ungated, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	/// The path a block being planned reads in place of the conventional `name`.
@@ -17452,7 +17482,12 @@ impl<'a> Builder<'a> {
 	/// One gated feed-forward: `down(silu(gate(x)) * up(x))`.
 	fn feed_forward(branch: Model, dimensions: &Dimensions) -> Result<Model> {
 		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
-		let feed_forward = (crate::layer(hidden).silu() * crate::layer(hidden)).layer(dimensions.width);
+		let feed_forward = match dimensions.ungated {
+			Some(Activation::Gelu) => recipe.model().layer(hidden).gelu().layer(dimensions.width),
+			Some(Activation::Relu) => recipe.model().layer(hidden).relu().layer(dimensions.width),
+			Some(_) => recipe.model().layer(hidden).silu().layer(dimensions.width),
+			None => (crate::layer(hidden).silu() * crate::layer(hidden)).layer(dimensions.width),
+		};
 		Ok(branch.edit(|model| model.blocks.extend(feed_forward.blocks.iter().cloned())))
 	}
 	/// One mixture of experts, with the shared expert the file stores.
@@ -18252,11 +18287,14 @@ impl Builder<'_> {
 							let widths = branch_widths(branch);
 							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 							hidden = widths[0];
-							let tensor = match &pair {
-								Some(pair) => pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?,
-								None => self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?,
+							let planes = match &pair {
+								Some(pair) => vec![pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?],
+								None => {
+									let tensor = self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?;
+									if branch.blocks[0].weight_rows.is_some() { vec![tensor] } else { self.with_bias(tensor)? }
+								}
 							};
-							self.mapped(vec![tensor]);
+							self.mapped(planes);
 						}
 					}
 					weighted = true;
@@ -18268,6 +18306,14 @@ impl Builder<'_> {
 					}
 					weighted = true;
 				}
+				// An ungated feed-forward's first layer is its up projection.
+				Operation::Layer(outputs) if part != "attn" && hidden == 0 && !weighted => {
+					let tensor = self.layer_projection(step, &name("ffn_up.weight"), &role, width, *outputs)?;
+					let planes = self.with_bias(tensor)?;
+					self.mapped(planes);
+					hidden = *outputs;
+					weighted = true;
+				}
 				Operation::Layer(outputs) => {
 					let (suffix, inputs) = if part == "attn" {
 						("attn_output.weight", attention_inner.take().ok_or_else(|| RecipeError::new(format!("layer({outputs}) in block {layer} follows no attention")))?)
@@ -18277,7 +18323,8 @@ impl Builder<'_> {
 					};
 					require(*outputs == width, format!("layer({outputs}) in block {layer} does not restore {width} channels"))?;
 					let tensor = self.layer_projection(step, &name(suffix), &role, inputs, width)?;
-					self.mapped(vec![tensor]);
+					let planes = if step.weight_rows.is_some() { vec![tensor] } else { self.with_bias(tensor)? };
+					self.mapped(planes);
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
@@ -18402,8 +18449,20 @@ impl Builder<'_> {
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let tensor = self.tensor(name, "a normalization")?;
 		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let planes = self.with_bias(tensor)?;
+		self.mapped(planes);
 		Ok(())
+	}
+	/// A weight with the bias the file stores beside it (`<name>.bias` for
+	/// `<name>.weight`), as the planes of one node: a projection's bias follows
+	/// its matrix and a normalization's shift follows its scale.
+	fn with_bias(&mut self, tensor: GgufTensor) -> Result<Vec<GgufTensor>> {
+		let outputs = tensor.shape.get(1).or(tensor.shape.first()).copied().unwrap_or(0);
+		let offset = tensor.name.strip_suffix(".weight").map(|stem| format!("{stem}.bias")).and_then(|name| self.optional(&name));
+		if let Some(offset) = &offset {
+			require(offset.elements() as u64 == outputs, format!("{} holds {} values; {} has {outputs} outputs", offset.name, offset.elements(), tensor.name))?;
+		}
+		Ok(std::iter::once(tensor).chain(offset).collect())
 	}
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and the
@@ -18419,6 +18478,8 @@ impl Builder<'_> {
 			let fused = self.projection(&name("attn_qkv.weight"), &role, width, (heads + 2 * kv) * head)?;
 			let mut planes = (0..heads + kv).map(|index| fused.rows(index * head, head)).collect::<Result<Vec<_>>>()?;
 			planes.push(fused.rows((heads + kv) * head, kv * head)?);
+			// The projection's bias rows follow its matrix, in the same order.
+			planes.extend(self.optional(&name("attn_qkv.bias")));
 			self.mapped(planes);
 			if normalized {
 				let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
@@ -18452,6 +18513,12 @@ impl Builder<'_> {
 			planes.push(key.rows(index * head, head)?);
 		}
 		planes.push(value);
+		// Query, key and value biases follow the matrix, in its row order.
+		if !query_gated && let Some(query_bias) = self.optional(&name("attn_q.bias")) {
+			planes.push(query_bias);
+			planes.push(self.tensor(&name("attn_k.bias"), &role)?);
+			planes.push(self.tensor(&name("attn_v.bias"), &role)?);
+		}
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
@@ -21910,7 +21977,10 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
-	let parameters = if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) { span } else { 0 };
+	// A layer normalization compiled over mapped tensors carries a shift after
+	// its scale where the views bound to it hold both.
+	let shifted = normalization == BlockNormalization::Layer && graph.bound.as_ref().and_then(std::collections::VecDeque::front).is_some_and(|bound| bound.elements == 2 * span);
+	let parameters = if shifted { 2 * span } else if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) { span } else { 0 };
 	lower_normalize_parameters(graph, normalization, width, span, parameters)
 }
 /// Pushes a normalization whose trainable scale may include deferred columns.

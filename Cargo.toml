@@ -152,6 +152,11 @@ embed = "sqrt-width"
 [architecture.lfm2]
 rope = "neox"
 
+[architecture.starcoder2]
+rope = "neox"
+norms = "layer"
+ffn = "gelu"
+
 [architecture.command-r]
 rope = "pairs"
 block = "parallel"

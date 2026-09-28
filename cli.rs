@@ -59,6 +59,29 @@ fn library_path(directory: &Path) -> PathBuf {
 }
 
 fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
+	let generated = if source.extension().and_then(|value| value.to_str()) == Some("recipe") {
+		let codex = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| invalid("HOME is required to compile a Recipe model"));
+		let directory = codex.join("codex");
+		fs::create_dir_all(&directory).unwrap_or_else(|error| invalid(&format!("cannot create {}: {error}", directory.display())));
+		let output = directory.join(format!("recipe-model-{}.rs", std::process::id()));
+		let langium = Path::new(env!("CARGO_MANIFEST_DIR")).join("langium/recipe-model/packages/cli/bin/cli.js");
+		let status = Command::new("node")
+			.arg(langium)
+			.arg("compile")
+			.arg(source)
+			.arg("--output")
+			.arg(&output)
+			.status()
+			.unwrap_or_else(|error| invalid(&format!("cannot run the Langium Recipe compiler: {error}")));
+		if !status.success() {
+			fs::remove_file(&output).ok();
+			std::process::exit(status.code().unwrap_or(1));
+		}
+		Some(output)
+	} else {
+		None
+	};
+	let source = generated.as_deref().unwrap_or(source);
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -77,6 +100,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		.expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
+		if let Some(generated) = &generated { fs::remove_file(generated).ok(); }
 		std::process::exit(status.code().unwrap_or(1));
 	}
 	for (key, value) in settings { unsafe { std::env::set_var(key, value); } }
@@ -85,10 +109,15 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		match recipe::run_remote_script(&output, selection, config, arguments) {
 			Ok(Some(status)) => {
 				fs::remove_file(&output).ok();
+				if let Some(generated) = &generated { fs::remove_file(generated).ok(); }
 				std::process::exit(status.code().unwrap_or(1));
 			}
 			Ok(None) => {}
-			Err(error) => { fs::remove_file(&output).ok(); invalid(&error.to_string()); }
+			Err(error) => {
+				fs::remove_file(&output).ok();
+				if let Some(generated) = &generated { fs::remove_file(generated).ok(); }
+				invalid(&error.to_string());
+			}
 		}
 	}
 	let mut command = Command::new(&output);
@@ -108,6 +137,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	}
 	let status = command.status();
 	fs::remove_file(&output).ok();
+	if let Some(generated) = &generated { fs::remove_file(generated).ok(); }
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	#[cfg(unix)]
 	let code = status.code().unwrap_or_else(|| 128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0));
@@ -182,8 +212,8 @@ fn main() {
 	let devices = device.as_ref().map(|names| recipe::device_names(names).unwrap_or_else(|error| invalid(&error.to_string())));
 	let device = device.as_deref();
 	let source = Path::new(&source);
-	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
-		invalid("recipe requires a Rust source")
+	if !matches!(source.extension().and_then(|value| value.to_str()), Some("rs" | "recipe")) {
+		invalid("recipe requires a Rust or Recipe model source")
 	}
 	if export_seen && devices.as_ref().is_some_and(|names| names.len() != 1) { invalid("export requires one device"); }
 	if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
