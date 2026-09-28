@@ -2982,7 +2982,13 @@ fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequa
 		return Some((spec.codec.quantization(), spec.codec.quantization().native, spec.block, spec.stride));
 	}
 	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
-	let [(segment, _)] = stored.format_segments()[..] else { return None };
+	// A bias after the matrix is read through the node's element decoder, so the
+	// runs take the matrix's format.
+	let segment = match stored.format_segments()[..] {
+		[(segment, _)] => segment,
+		[(segment, _), _] if bias_tail(stored).is_some_and(|(_, count, _)| count == plan.node.shard.rows.local(plan.node.output.channels)) => segment,
+		_ => return None,
+	};
 	run_segment_format(segment)
 }
 /// A run format a packed weight's segment can take: its quantization, decoder,
