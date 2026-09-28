@@ -282,7 +282,6 @@ declare void @llvm.nvvm.bar.warp.sync(i32)
 define internal void @grid_barrier(i32 %threads) #1 { entry:
 %phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
 call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
-%lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
 %leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
 fence syncscope("device") release
@@ -292,11 +291,11 @@ fence syncscope("device") acquire
 store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
 fence syncscope("device") release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
-br i1 %spinner, label %wait, label %waited wait:
+br label %waited wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %acquired, label %wait acquired:
 fence syncscope("device") acquire br label %waited waited:
-call void @llvm.nvvm.bar.warp.sync(i32 -1)
+call void @llvm.amdgcn.s.barrier()
 ret void }"#;
 // A workgroup barrier on AMD is s_barrier between two workgroup-scope
 // fences: s_barrier alone neither waits for in-flight LDS stores nor keeps
