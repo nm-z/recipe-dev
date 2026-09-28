@@ -19632,7 +19632,11 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		.iter()
 		.map(|node| {
 			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+			let mut node = Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() };
+			if let Some(body) = node.body_start() {
+				*body -= start as f64;
+			}
+			Ok(node)
 		})
 		.collect::<Result<Vec<_>>>()?;
 	let last = &graph.nodes[end - 1];
@@ -19924,6 +19928,10 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 		let mut node = original.clone();
 		node.source = map(node.source, &remap);
 		node.second = map(node.second, &remap);
+		// A scan is never split, so it lands next and its body right after it.
+		if let Some(body) = node.body_start() {
+			*body = nodes.len() as f64 + 1.0;
+		}
 		let weight = sliceable(graph, index);
 		// Outside a region, a large sum or expert table keeps a share of its rows
 		// and gathers them after itself; a small one runs whole.
@@ -20526,6 +20534,11 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
+	/// The node index a scan's recurrent body starts at, right after the scan. It
+	/// is a node reference like `source`, so it moves wherever the nodes move.
+	fn body_start(&mut self) -> Option<&mut f64> {
+		(self.op == Primitive::Scan && self.argument[5] == 1.0).then_some(&mut self.argument[3])
+	}
 	fn primitive_name(&self) -> &'static str {
 		match self.op {
 			Primitive::Contraction => "Contraction",
@@ -20908,6 +20921,9 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 	for node in &mut tail.nodes {
 		node.source = rebase(node.source)?;
 		node.second = rebase(node.second)?;
+		if let Some(body) = node.body_start() {
+			*body -= at as f64;
+		}
 	}
 	tail.input = tail.nodes[0].input;
 	tail.source = tail.nodes.len() as i32 - 1;
@@ -20947,6 +20963,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 			node.second = source;
 		} else if node.second >= 0 {
 			node.second += node_base
+		}
+		if let Some(body) = node.body_start() {
+			*body += f64::from(node_base);
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
 		if node.program_count != 0 {
@@ -23161,6 +23180,56 @@ mod precision_contract_checks {
 		assert!(!cuts_connection(&graph, 1));
 		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
 		assert!(cuts_connection(&graph, 2));
+	}
+	#[test]
+	fn a_recurrent_body_stays_with_its_scan_through_splits_and_appends() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let mut config = Config::load().unwrap();
+		(config.profile.sum, config.profile.atvn) = (Compute::FP32, Compute::FP32);
+		let input: Vec<f64> = (0..4).map(|i| (i as f64 - 1.5) / 4.0).collect();
+		let prepared = Prepared::matrix(input.clone(), vec![0.5], 1, 1).unwrap();
+		let forward = |graph: &Graph, input: &[f64]| {
+			let tape = NativeTape::new(graph, TapeInput::Values(input), input, &[], gpu, Compute::FP32, None).unwrap();
+			tape.forward(ForwardMode::Inference).unwrap();
+			tape.predictions().unwrap()
+		};
+		let compiled = |model: Model| {
+			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, true).unwrap();
+			for (i, parameter) in graph.parameters.iter_mut().enumerate() {
+				*parameter = ((i * 7 % 13) as f64 - 6.0) / 16.0;
+			}
+			graph.refresh_storage(config).unwrap();
+			graph
+		};
+		// A recurrence with a body stage: its body nodes follow its scan, and every
+		// per-node vector holds an entry for each of them.
+		let first = compiled(recipe.model().recur([layer(4).tanh(), layer(4)]).layer(1).loss(mse));
+		let graph = compiled(recipe.model().layer(4).recur([layer(4).tanh(), layer(4)]).layer(1).loss(mse));
+		for graph in [&first, &graph] {
+			assert!(graph.nodes.iter().any(|node| node.block_kind == "recur_body"));
+			assert_eq!((graph.stored.len(), graph.requantize.len()), (graph.nodes.len(), graph.nodes.len()));
+			// One device takes every node, as placing a saved model on one device does.
+			let blocks = graph.nodes.last().unwrap().block_index + 1;
+			assert_eq!(forward(&split_graph(graph, &[blocks]).unwrap()[0], &input), forward(graph, &input));
+		}
+		// Cut before the recurrence, the part that holds it finds its body.
+		let whole = forward(&graph, &input);
+		let parts = split_graph(&graph, &[1, 2]).unwrap();
+		assert_eq!(forward(&parts[1], &forward(&parts[0], &input)), whole);
+		let (head, tail) = split_at_block(&graph, 1).unwrap();
+		assert_eq!(forward(&tail, &forward(&head.unwrap(), &input)), whole);
+		// Appended after another graph, as a command-RAT evaluator follows its
+		// proposer, the recurrence still finds its body.
+		let mut proposer = Graph::new(Shape { channels: 4, length: 1 }, 1e-5);
+		proposer.profile = config.profile;
+		lower_project(&mut proposer, 4).unwrap();
+		for (i, parameter) in proposer.parameters.iter_mut().enumerate() {
+			*parameter = ((i * 5 % 11) as f64 - 5.0) / 16.0;
+		}
+		let expected = forward(&first, &forward(&proposer, &input));
+		append_graph(&mut proposer, first.clone()).unwrap();
+		assert_eq!((proposer.stored.len(), proposer.requantize.len()), (proposer.nodes.len(), proposer.nodes.len()));
+		assert_eq!(forward(&proposer, &input), expected);
 	}
 	#[test]
 	fn sampler_never_selects_suppressed_tokens() {
