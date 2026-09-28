@@ -23244,6 +23244,36 @@ mod precision_contract_checks {
 		}
 	}
 	#[test]
+	fn quantized_decoders_return_the_state_type_of_their_block() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let config = Config::load().unwrap();
+		let values: Vec<f64> = (0..256).map(|i| ((i * 37 % 97) as f64 - 48.0) / 32.0).collect();
+		let input: Vec<f64> = (0..256).map(|i| ((i * 11 % 23) as f64 - 5.0) / 64.0).collect();
+		// A block whose state type is not the run's decodes its bound bytes through
+		// the state helpers linked under its own suffix: fp64 in an fp32 run, fp32 in
+		// an fp64 run.
+		for (block, run) in [(Compute::FP64, Compute::FP32), (Compute::FP32, Compute::FP64)] {
+			for name in ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k", "q4k", "q5k", "q6k", "iq4nl"] {
+				let format = StorageFormat::named(name).unwrap();
+				let mut stored = format.encode(&values, &[1.0; 256], config).unwrap();
+				stored.arithmetic.clear();
+				let bytes = stored.bytes.slice(0, stored.bytes.len()).unwrap();
+				let decoded = format.decompress(&bytes, &stored.codebook, 256).unwrap();
+				let mut prepared = Prepared::matrix(vec![0.0; 256], vec![0.0], 1, 1).unwrap();
+				prepared.bound = Some(vec![BoundNode { names: "weight".to_owned(), elements: 256, weight: BoundWeight::Stored(stored) }]);
+				let model = recipe.model().no(bias).layer(1);
+				let model = if block == Compute::FP64 { model.fp(64) } else { model.fp(32) }.loss(mse);
+				let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+				assert_eq!((graph.nodes[0].precision, graph.nodes[0].packed), (block, true), "{name}");
+				let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, run, None).unwrap();
+				tape.forward(ForwardMode::Inference).unwrap();
+				let actual = tape.predictions().unwrap()[0];
+				let expected = input.iter().zip(&decoded).map(|(x, w)| x * w).sum::<f64>();
+				assert!((actual - expected).abs() <= expected.abs() * 1e-5, "{name} in a {} block of a {} run: {actual} vs {expected}", block.label(), run.label());
+			}
+		}
+	}
+	#[test]
 	fn quantized_source_converts_once_at_device_load() {
 		let gpu = gradient_test_gpu();
 		let config = Config::load().unwrap();
