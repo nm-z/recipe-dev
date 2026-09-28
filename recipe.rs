@@ -19838,7 +19838,7 @@ mod precision_contract_checks {
 			graph.parameters.fill(sample);
 			graph.refresh_storage(config).unwrap();
 			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
+			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
 			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
 			tape.advance().unwrap();
 			tape.gradient_launch(0.01, config).unwrap();
