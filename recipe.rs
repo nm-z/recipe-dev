@@ -981,6 +981,8 @@ mod program_ir {
 		pub span: usize,
 		/// The per-channel scale applied after normalization, when the node carries one.
 		pub weight: Option<&'a str>,
+		/// Whether a per-channel shift follows the scale, stored after it.
+		pub shift: bool,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
 	}
@@ -1116,7 +1118,19 @@ mod program_ir {
 				let _ =
 					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul{suffix}({ty} {value}, {ty} {weight_value})", ty = context.value_type);
-				scaled
+				if context.shift {
+					let shift_column = format!("%{prefix}.shift.column");
+					let shift_pointer = format!("%{prefix}.shift.ptr");
+					let shift_value = format!("%{prefix}.shift");
+					let shifted = format!("%{prefix}.shifted");
+					let _ = writeln!(output, "{shift_column} = add i64 {column}, {span}", span = context.span);
+					let _ = writeln!(output, "{shift_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i64 {shift_column}", ty = context.value_type, ptrty = context.pointer_type);
+					let _ = writeln!(output, "{shift_value} = load {ty}, {ptrty} {shift_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+					let _ = writeln!(output, "{shifted} = call {ty} @recipe.add{suffix}({ty} {scaled}, {ty} {shift_value})", ty = context.value_type);
+					shifted
+				} else {
+					scaled
+				}
 			}
 		};
 		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
@@ -1191,7 +1205,7 @@ mod program_ir {
 			let normalized = emit_normalize(NormalizeContext {
 				value_type: mt, suffix, pointer_type: ptr, alignment: context.alignment,
 				source_value: &source, context: context.context, rows: context.rows, channels: context.channels,
-				length: context.length, width: context.width, span: context.span, weight: None, mode: context.mode, prefix: &replay_prefix,
+				length: context.length, width: context.width, span: context.span, weight: None, shift: false, mode: context.mode, prefix: &replay_prefix,
 			}, element);
 			code.push_str(&normalized.code);
 			normalized.value
@@ -5815,6 +5829,7 @@ impl NativeModelIr {
 								width: normalize_width(node),
 								span: normalize_span(node),
 								weight,
+								shift: node.parameters == 2 * normalize_span(node),
 								mode,
 								prefix: &prefix,
 							},
@@ -5948,6 +5963,7 @@ impl NativeModelIr {
 										width: normalize_width(node),
 										span: normalize_span(node),
 										weight: None,
+										shift: false,
 										mode,
 										prefix: &weight_prefix,
 									},
@@ -9963,7 +9979,9 @@ mod gguf {
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
 					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
-					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
+					// A block-quantized plane packs with the raw F32 or F16 planes that follow it,
+					// such as a bias, as further segments rather than decoding the whole weight.
+					let packed = views.as_ref().is_some_and(|views| views[0].blocked() && views.iter().all(|view| view.blocked() || matches!(view.kind, 0 | 1)));
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
@@ -9978,7 +9996,7 @@ mod gguf {
 					};
 					let weight = match views.filter(|_| packed) {
 						Some(views) => {
-							let parts = views.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
+							let parts = views.iter().map(|plane| if plane.blocked() { self.stored(plane) } else { self.embedding_stored(plane) }).collect::<Result<Vec<_>>>()?;
 							let format = parts[0].format;
 							let mut segments = Vec::new();
 							for part in &parts {
@@ -16811,6 +16829,8 @@ struct ManifestArchitecture {
 	parallel: bool,
 	/// Whether the stream's normalizations center as well as scale.
 	layer_norm: bool,
+	/// The activation of a feed-forward the file stores without a gate.
+	ffn: Activation,
 	conv: Option<Activation>,
 	qk: Option<BlockNormalization>,
 	norm: Option<BlockNormalization>,
@@ -16843,6 +16863,12 @@ impl ManifestArchitecture {
 			Some("layer") => true,
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] norms={value} must be rms or layer"))),
 		};
+		let ffn = match field("ffn") {
+			None | Some("gelu") => Activation::Gelu,
+			Some("relu") => Activation::Relu,
+			Some("silu") => Activation::Silu,
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] ffn={value} must be gelu, relu, or silu"))),
+		};
 		let conv = match field("conv") {
 			None => None,
 			Some("linear") => Some(Activation::Linear),
@@ -16871,7 +16897,7 @@ impl ManifestArchitecture {
 			Some("silu") => Some(Activation::Silu),
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] output={value} must be sigmoid or silu"))),
 		};
-		Ok(Self { rope, embed_scaled, parallel, layer_norm, conv, qk, norm, decay, output })
+		Ok(Self { rope, embed_scaled, parallel, layer_norm, ffn, conv, qk, norm, decay, output })
 	}
 	fn delta(self, name: &str) -> Result<(Activation, BlockNormalization, BlockNormalization, DeltaDecay, Activation)> {
 		let missing = |key: &str| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key} for a delta block"));
@@ -16986,6 +17012,8 @@ struct Dimensions {
 	width: usize,
 	/// Whether the stream's normalizations are layer normalizations.
 	layer_norm: bool,
+	/// The activation of a feed-forward stored without a gate, when it is.
+	ungated: Option<Activation>,
 	heads: usize,
 	kv: Vec<usize>,
 	head: Vec<usize>,
@@ -17269,7 +17297,11 @@ impl<'a> Builder<'a> {
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
 		let layer_norm = self.choices.is_some_and(|choices| choices.layer_norm);
-		Ok(Dimensions { width, layer_norm, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		// A feed-forward with no gate tensor whose up projection is as wide as the
+		// hidden layer applies the architecture's activation alone.
+		let up_rows = self.file.tensor("blk.0.ffn_up.weight").and_then(|up| up.shape.get(1).copied()).map(|rows| rows as usize);
+		let ungated = (self.file.tensor("blk.0.ffn_gate.weight").is_none() && feed_forward.is_some() && up_rows == feed_forward).then(|| self.choices.map_or(Activation::Gelu, |choices| choices.ffn));
+		Ok(Dimensions { width, layer_norm, ungated, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	/// The path a block being planned reads in place of the conventional `name`.
@@ -17456,7 +17488,12 @@ impl<'a> Builder<'a> {
 	/// One gated feed-forward: `down(silu(gate(x)) * up(x))`.
 	fn feed_forward(branch: Model, dimensions: &Dimensions) -> Result<Model> {
 		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
-		let feed_forward = (crate::layer(hidden).silu() * crate::layer(hidden)).layer(dimensions.width);
+		let feed_forward = match dimensions.ungated {
+			Some(Activation::Gelu) => recipe.model().layer(hidden).gelu().layer(dimensions.width),
+			Some(Activation::Relu) => recipe.model().layer(hidden).relu().layer(dimensions.width),
+			Some(_) => recipe.model().layer(hidden).silu().layer(dimensions.width),
+			None => (crate::layer(hidden).silu() * crate::layer(hidden)).layer(dimensions.width),
+		};
 		Ok(branch.edit(|model| model.blocks.extend(feed_forward.blocks.iter().cloned())))
 	}
 	/// One mixture of experts, with the shared expert the file stores.
@@ -18256,11 +18293,14 @@ impl Builder<'_> {
 							let widths = branch_widths(branch);
 							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 							hidden = widths[0];
-							let tensor = match &pair {
-								Some(pair) => pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?,
-								None => self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?,
+							let planes = match &pair {
+								Some(pair) => vec![pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?],
+								None => {
+									let tensor = self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?;
+									if branch.blocks[0].weight_rows.is_some() { vec![tensor] } else { self.with_bias(tensor)? }
+								}
 							};
-							self.mapped(vec![tensor]);
+							self.mapped(planes);
 						}
 					}
 					weighted = true;
@@ -18272,6 +18312,14 @@ impl Builder<'_> {
 					}
 					weighted = true;
 				}
+				// An ungated feed-forward's first layer is its up projection.
+				Operation::Layer(outputs) if part != "attn" && hidden == 0 && !weighted => {
+					let tensor = self.layer_projection(step, &name("ffn_up.weight"), &role, width, *outputs)?;
+					let planes = self.with_bias(tensor)?;
+					self.mapped(planes);
+					hidden = *outputs;
+					weighted = true;
+				}
 				Operation::Layer(outputs) => {
 					let (suffix, inputs) = if part == "attn" {
 						("attn_output.weight", attention_inner.take().ok_or_else(|| RecipeError::new(format!("layer({outputs}) in block {layer} follows no attention")))?)
@@ -18281,7 +18329,8 @@ impl Builder<'_> {
 					};
 					require(*outputs == width, format!("layer({outputs}) in block {layer} does not restore {width} channels"))?;
 					let tensor = self.layer_projection(step, &name(suffix), &role, inputs, width)?;
-					self.mapped(vec![tensor]);
+					let planes = if step.weight_rows.is_some() { vec![tensor] } else { self.with_bias(tensor)? };
+					self.mapped(planes);
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
@@ -18406,8 +18455,20 @@ impl Builder<'_> {
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let tensor = self.tensor(name, "a normalization")?;
 		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let planes = self.with_bias(tensor)?;
+		self.mapped(planes);
 		Ok(())
+	}
+	/// A weight with the bias the file stores beside it (`<name>.bias` for
+	/// `<name>.weight`), as the planes of one node: a projection's bias follows
+	/// its matrix and a normalization's shift follows its scale.
+	fn with_bias(&mut self, tensor: GgufTensor) -> Result<Vec<GgufTensor>> {
+		let outputs = tensor.shape.get(1).or(tensor.shape.first()).copied().unwrap_or(0);
+		let offset = tensor.name.strip_suffix(".weight").map(|stem| format!("{stem}.bias")).and_then(|name| self.optional(&name));
+		if let Some(offset) = &offset {
+			require(offset.elements() as u64 == outputs, format!("{} holds {} values; {} has {outputs} outputs", offset.name, offset.elements(), tensor.name))?;
+		}
+		Ok(std::iter::once(tensor).chain(offset).collect())
 	}
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and the
@@ -18423,6 +18484,8 @@ impl Builder<'_> {
 			let fused = self.projection(&name("attn_qkv.weight"), &role, width, (heads + 2 * kv) * head)?;
 			let mut planes = (0..heads + kv).map(|index| fused.rows(index * head, head)).collect::<Result<Vec<_>>>()?;
 			planes.push(fused.rows((heads + kv) * head, kv * head)?);
+			// The projection's bias rows follow its matrix, in the same order.
+			planes.extend(self.optional(&name("attn_qkv.bias")));
 			self.mapped(planes);
 			if normalized {
 				let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
@@ -18456,6 +18519,12 @@ impl Builder<'_> {
 			planes.push(key.rows(index * head, head)?);
 		}
 		planes.push(value);
+		// Query, key and value biases follow the matrix, in its row order.
+		if !query_gated && let Some(query_bias) = self.optional(&name("attn_q.bias")) {
+			planes.push(query_bias);
+			planes.push(self.tensor(&name("attn_k.bias"), &role)?);
+			planes.push(self.tensor(&name("attn_v.bias"), &role)?);
+		}
 		self.mapped(planes);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
@@ -19683,9 +19752,27 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 /// A stored weight a split can slice: packed, one format, every byte on the
 /// machine, with its block of values and the bytes the block takes.
 fn sliceable(graph: &Graph, index: usize) -> Option<(&StoredWeight, usize, usize)> {
-	let weight = graph.stored[index].as_ref().filter(|weight| graph.nodes[index].packed && weight.format_segments().len() == 1 && !weight.bytes.absent_runs())?;
+	let rows = graph.nodes[index].output.channels;
+	let weight = graph.stored[index]
+		.as_ref()
+		.filter(|weight| graph.nodes[index].packed && !weight.bytes.absent_runs() && (weight.format_segments().len() == 1 || bias_tail(weight).is_some_and(|(_, count, _)| count == rows)))?;
 	let spec = weight.format.spec()?;
 	Some((weight, spec.block, spec.stride))
+}
+/// A sum's bias stored after its matrix as a raw segment of one value per
+/// output row: its format, its values, and its bytes.
+fn bias_tail(weight: &StoredWeight) -> Option<(StorageFormat, usize, usize)> {
+	match weight.format_segments()[..] {
+		[_, (format, count)] => format.spec().filter(|spec| spec.block == 1).map(|spec| (format, count, count * spec.stride)),
+		_ => None,
+	}
+}
+/// Whether node `index` is a plain sum of its inputs onto its outputs, with or
+/// without a bias row, so a split can take shares of its rows or its inputs.
+fn plain_sum(graph: &Graph, index: usize) -> bool {
+	let node = &graph.nodes[index];
+	let offsets = graph.stored[index].as_ref().and_then(bias_tail).map_or(0, |(_, count, _)| count);
+	node.op == Primitive::Contraction && node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels + offsets
 }
 /// Nodes that keep a split region together: a sum whose outputs a die can take
 /// a share of, ops that read and write only their own channels, and the sum over
@@ -19721,7 +19808,7 @@ fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
 	};
 	let (mut regions, mut claimed) = (Vec::new(), vec![false; graph.nodes.len()]);
 	for (end, node) in graph.nodes.iter().enumerate() {
-		let sums = matches!(node.op, Primitive::Contraction if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels) || node.op == Primitive::ExpertOut;
+		let sums = plain_sum(graph, end) || node.op == Primitive::ExpertOut;
 		let Some((_, block, _)) = sliceable(graph, end).filter(|_| sums) else { continue };
 		let (mut inside, mut starts, mut stack, mut whole) = (Vec::new(), Vec::new(), vec![node.source], true);
 		let (mut head, mut widths) = (None, vec![block]);
@@ -19736,7 +19823,7 @@ fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
 			}
 			let producer = &graph.nodes[at];
 			let row_split = match producer.op {
-				Primitive::Contraction => producer.argument[0] <= 1.0 && producer.parameters == producer.input.channels * producer.output.channels,
+				Primitive::Contraction => plain_sum(graph, at),
 				Primitive::ExpertIn => true,
 				_ => false,
 			} && sliceable(graph, at).is_some();
@@ -19809,30 +19896,55 @@ fn position_weight_bytes(graph: &Graph, index: usize) -> usize {
 /// Rows `run` of a row-major weight of `rows` rows repeated `repeats` times
 /// (once per expert), as views of the stored bytes.
 fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> Result<StoredWeight> {
-	let row_bytes = weight.bytes.len() / (repeats * rows);
-	let row_count = weight.count / (repeats * rows);
-	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
+	let tail = bias_tail(weight);
+	let (tail_count, tail_bytes) = tail.map_or((0, 0), |(_, count, bytes)| (count, bytes));
+	let (matrix_bytes, matrix_count) = (weight.bytes.len() - tail_bytes, weight.count - tail_count);
+	let matrix = weight.bytes.view(0, matrix_bytes);
+	let row_bytes = matrix_bytes / (repeats * rows);
+	let row_count = matrix_count / (repeats * rows);
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
 	let periods = if run.period == 0 { 1 } else { rows / run.period };
 	// Every repeat's periods are the same rows apart, so the share is one strided view.
-	let pitch = if run.period == 0 { rows } else { run.period } * row_bytes;
-	let bytes = weight.bytes.strided(run.first * row_bytes, run.count * row_bytes, pitch, repeats * periods);
+	let period_rows = if run.period == 0 { rows } else { run.period };
+	let bytes = matrix.strided(run.first * row_bytes, run.count * row_bytes, period_rows * row_bytes, repeats * periods);
 	let count = row_count * run.count * periods * repeats;
 	let format = weight.format_segments()[0].0;
-	Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+	let Some((tail_format, _, _)) = tail else {
+		return Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] });
+	};
+	// The bias keeps the same rows as the matrix, one value each.
+	let value = tail_bytes / (repeats * rows);
+	let offsets = weight.bytes.view(matrix_bytes, tail_bytes).strided(run.first * value, run.count * value, period_rows * value, repeats * periods);
+	let biased = run.count * periods * repeats;
+	Ok(StoredWeight { format, count: count + biased, bytes: StoredBytes::joined(vec![bytes, offsets]), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count), (tail_format, biased)] })
 }
 /// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
 /// inputs repeated `repeats` times, whole blocks at a time: each row's share
 /// is its own view of the stored bytes, so a die's share copies nothing.
 fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize, run: Run, block: usize, stride: usize) -> Result<StoredWeight> {
 	require(run.first % block == 0 && run.count % block == 0 && (run.period == 0 || run.period % block == 0), "a split of a sum's inputs must fall on whole blocks")?;
+	let tail = bias_tail(weight);
+	let matrix_bytes = weight.bytes.len() - tail.map_or(0, |(_, _, bytes)| bytes);
 	let row_bytes = terms / block * stride;
-	require(row_bytes * repeats * rows == weight.bytes.len(), "a split weight does not divide into its rows")?;
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
 	let periods = if run.period == 0 { 1 } else { terms / run.period };
 	// Every row's periods are the same bytes apart, so the share is one strided view.
-	let bytes = weight.bytes.strided(run.first / block * stride, run.count / block * stride, row_bytes / periods, repeats * rows * periods);
+	let bytes = weight.bytes.view(0, matrix_bytes).strided(run.first / block * stride, run.count / block * stride, row_bytes / periods, repeats * rows * periods);
 	let count = repeats * rows * periods * run.count;
 	let format = weight.format_segments()[0].0;
-	Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+	// The dies' partial sums add up to the whole sum, so only the die holding the
+	// first inputs adds the bias; the others carry none.
+	match tail.filter(|_| run.first == 0) {
+		Some((tail_format, biased, tail_bytes)) => Ok(StoredWeight {
+			format,
+			count: count + biased,
+			bytes: StoredBytes::joined(vec![bytes, weight.bytes.view(matrix_bytes, tail_bytes)]),
+			codebook: weight.codebook.clone(),
+			arithmetic: Vec::new(),
+			segments: vec![(format, count), (tail_format, biased)],
+		}),
+		None => Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] }),
+	}
 }
 /// How many units of each split item every die takes, keyed by the item's
 /// node: a region by its end, a sum or expert table split alone by itself.
@@ -19843,7 +19955,7 @@ fn lone_split(graph: &Graph, index: usize, dies: usize) -> Option<(usize, usize)
 	let node = &graph.nodes[index];
 	let (weight, _, _) = sliceable(graph, index)?;
 	match node.op {
-		Primitive::Contraction if node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels && weight.bytes.len() >= 16 << 20 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		Primitive::Contraction if plain_sum(graph, index) && weight.bytes.len() >= 16 << 20 && node.output.channels >= dies => Some((node.output.channels, 0)),
 		Primitive::ExpertIn if node.argument[0] as usize > 1 && node.argument[2] as usize >= dies => Some((node.argument[2] as usize, node.argument[2] as usize)),
 		Primitive::ExpertOut if node.argument[0] as usize > 1 && node.output.channels >= dies => Some((node.output.channels, 0)),
 		_ => None,
@@ -19967,6 +20079,9 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 			_ => (1, node.output.channels, node.input.channels),
 		};
 		let sliced = if shard.terms.count != 0 { weight_terms(weight, repeats, rows, terms, shard.terms, block, stride)? } else { weight_rows(weight, repeats, rows, shard.rows)? };
+		if bias_tail(weight).is_some() && bias_tail(&sliced).is_none() {
+			node.argument[2] = 1.0;
+		}
 		node.parameters = sliced.count;
 		node.shard = shard;
 		stored.push(Some(sliced));
@@ -21933,7 +22048,10 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
-	let parameters = if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) { span } else { 0 };
+	// A layer normalization compiled over mapped tensors carries a shift after
+	// its scale where the views bound to it hold both.
+	let shifted = normalization == BlockNormalization::Layer && graph.bound.as_ref().and_then(std::collections::VecDeque::front).is_some_and(|bound| bound.elements == 2 * span);
+	let parameters = if shifted { 2 * span } else if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) { span } else { 0 };
 	lower_normalize_parameters(graph, normalization, width, span, parameters)
 }
 /// Pushes a normalization whose trainable scale may include deferred columns.
