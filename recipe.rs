@@ -23038,6 +23038,37 @@ mod precision_contract_checks {
 		}
 	}
 	#[test]
+	fn fp64_attention_links_the_template_of_its_named_cache() {
+		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
+		let (heads, width, length) = (2, 4, 3);
+		let channels = width * (heads + 2);
+		// Eighths within one are exact in every cache type, so the cache changes no value.
+		let inputs: Vec<f64> = (0..channels * length).map(|i| ((i * 5 % 17) as f64 - 8.0) / 8.0).collect();
+		// The block is fp64 in an fp32 run, a variant of its own, and in an fp64 run,
+		// where only its cache differs from the run's template.
+		let attend = |run: Compute, kv: Compute| {
+			let mut graph = Graph::new(Shape { channels, length }, 1e-5);
+			graph.profile = Config::load().unwrap().profile;
+			graph.profile.attn = Compute::FP64;
+			graph.profile.kv = kv;
+			push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, [heads as f64, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0], -2).unwrap();
+			assert_eq!((graph.nodes[0].precision, graph.nodes[0].kv_precision), (Compute::FP64, kv));
+			let tape = NativeTape::new(&graph, TapeInput::Values(&inputs), &inputs, &[], gpu, run, None)
+				.unwrap_or_else(|error| panic!("fp64 attention with a {} cache in a {} run: {error}", kv.label(), run.label()));
+			tape.forward(ForwardMode::Inference).unwrap();
+			tape.predictions().unwrap()
+		};
+		for run in [Compute::FP32, Compute::FP64] {
+			let expected = attend(run, Compute::FP64);
+			assert_eq!(expected.len(), width * heads * length);
+			for kv in [Compute::FP16, Compute::BF16, Compute::FP32] {
+				for (i, (got, want)) in attend(run, kv).iter().zip(&expected).enumerate() {
+					assert!((got - want).abs() < 1e-12, "fp64 attention with a {} cache in a {} run, value {i}: {got} vs {want}", kv.label(), run.label());
+				}
+			}
+		}
+	}
+	#[test]
 	fn narrow_recurrence_carries_small_gradients() {
 		let gpu = gradient_test_gpu();
 		let scale = 2.0_f64.powi(-24);
