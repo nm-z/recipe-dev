@@ -143,9 +143,11 @@ rope = "pairs"
 
 [architecture.gemma3]
 rope = "neox"
+embed = "sqrt-width"
 
 [architecture.gemma4]
 rope = "neox"
+embed = "sqrt-width"
 
 [architecture.lfm2]
 rope = "neox"

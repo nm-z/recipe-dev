@@ -16701,6 +16701,8 @@ fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], c
 #[derive(Clone, Copy)]
 struct ManifestArchitecture {
 	rope: RopeLayout,
+	/// Whether the embedding's rows scale by the square root of the width.
+	embed_scaled: bool,
 	conv: Option<Activation>,
 	qk: Option<BlockNormalization>,
 	norm: Option<BlockNormalization>,
@@ -16717,6 +16719,11 @@ impl ManifestArchitecture {
 			"neox" => RopeLayout::Neox,
 			"pairs" => RopeLayout::Pairs,
 			value => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] rope={value} must be neox or pairs"))),
+		};
+		let embed_scaled = match field("embed") {
+			None => false,
+			Some("sqrt-width") => true,
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] embed={value} must be sqrt-width"))),
 		};
 		let conv = match field("conv") {
 			None => None,
@@ -16746,7 +16753,7 @@ impl ManifestArchitecture {
 			Some("silu") => Some(Activation::Silu),
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] output={value} must be sigmoid or silu"))),
 		};
-		Ok(Self { rope, conv, qk, norm, decay, output })
+		Ok(Self { rope, embed_scaled, conv, qk, norm, decay, output })
 	}
 	fn delta(self, name: &str) -> Result<(Activation, BlockNormalization, BlockNormalization, DeltaDecay, Activation)> {
 		let missing = |key: &str| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key} for a delta block"));
@@ -16910,7 +16917,7 @@ impl<'a> Builder<'a> {
 			model = model.e(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
-		if matches!(architecture, "gemma3" | "gemma4") {
+		if choices.embed_scaled {
 			model = model.scale((dimensions.width as f64).sqrt());
 		}
 		// The gather addresses rows of the file's own layout, so the block's
