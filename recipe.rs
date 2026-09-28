@@ -9872,8 +9872,10 @@ mod gguf {
 		pub fn tensors(&self) -> &[GgufTensor] {
 			&self.tensors
 		}
+		/// The tensor of that name. Some files leave a norm's ".weight" off its
+		/// name; either spelling finds it.
 		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
-			self.tensors.iter().find(|tensor| tensor.name == name)
+			self.tensors.iter().find(|tensor| tensor.name == name).or_else(|| name.strip_suffix(".weight").and_then(|bare| self.tensors.iter().find(|tensor| tensor.name == bare)))
 		}
 		pub(super) fn required(&self, key: &str) -> Result<&GgufValue> {
 			self.value(key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))
@@ -17057,7 +17059,14 @@ impl<'a> Builder<'a> {
 				values.iter().map(|value| match value { GgufValue::Bool(value) => Ok(*value), _ => Err(RecipeError::new(format!("{}.{} contains a non-boolean layer value", self.architecture, suffix))) }).collect()
 			}
 			Some(GgufValue::Bool(value)) => Ok(vec![*value; layers]),
-			Some(_) => Err(RecipeError::new(format!("{}.{} is not a boolean or boolean array", self.architecture, suffix))),
+			// A period p: every p-th layer is false and the others true, as the
+			// interleaved local and global attention of Gemma 2 and its kin
+			// states its layers; zero makes every layer true.
+			Some(value) if value.integer().is_some() => {
+				let period = value.integer().unwrap_or(0) as usize;
+				Ok((0..layers).map(|layer| period == 0 || layer % period < period - 1).collect())
+			}
+			Some(_) => Err(RecipeError::new(format!("{}.{} is not a boolean, boolean array, or period", self.architecture, suffix))),
 		}
 	}
 	fn dimensions(&self) -> Result<Dimensions> {
@@ -17134,7 +17143,7 @@ impl<'a> Builder<'a> {
 			return self.keyed_tensor(&path, role);
 		}
 		let tensor = self.file.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent; {role} reads it")))?.clone();
-		self.consumed.insert(name.to_owned());
+		self.consumed.insert(tensor.name.clone());
 		Ok(tensor)
 	}
 	fn keyed_tensor(&mut self, path: &KeyPath, role: &str) -> Result<GgufTensor> {
@@ -17147,7 +17156,7 @@ impl<'a> Builder<'a> {
 			return self.keyed_tensor(&path, "an optional tensor").ok();
 		}
 		let tensor = self.file.tensor(name)?.clone();
-		self.consumed.insert(name.to_owned());
+		self.consumed.insert(tensor.name.clone());
 		Some(tensor)
 	}
 	/// The next parameterized node, filled from mapped views.
@@ -17240,9 +17249,13 @@ impl<'a> Builder<'a> {
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
 		let sliding = dimensions.swa[layer];
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		// A gated layer stores each head's gate rows after its query rows.
-		let query = self.file.tensor(&name("attn_q.weight")).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
+		// A gated layer stores each head's gate rows after its query rows. A layer
+		// that fuses its projections stores the query, key and value rows in one
+		// tensor, ungated.
+		let fused = self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let query = self.file.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" })).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
 		let gated = match query.shape.get(1).map(|outputs| *outputs as usize) {
+			Some(outputs) if fused && outputs == (heads + 2 * kv) * head => false,
 			Some(outputs) if outputs == heads * head => false,
 			Some(outputs) if outputs == 2 * heads * head => true,
 			_ => return Err(RecipeError::new(format!("{} has shape {:?}; {heads} heads of {head} take {} or, gated, {} outputs", query.name, query.shape, heads * head, 2 * heads * head))),
@@ -18083,13 +18096,21 @@ impl Builder<'_> {
 						attention_inner = Some(inner);
 					} else {
 						// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
+						let branch_widths = |branch: &ProductBranch| branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
 						let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.maps.iter().any(|map| matches!(map.kind, MapKind::Activation(activation) if activation != Activation::Linear)));
 						let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
+						// A file that fuses the two stores the gate rows, then the up rows, in
+						// one ffn_up tensor twice the hidden width.
+						let fused = self.file.tensor(&name("ffn_gate.weight")).is_none() && branch_widths(left).len() == 1 && self.file.tensor(&name("ffn_up.weight")).is_some_and(|up| up.shape.get(1).is_some_and(|rows| *rows as usize == 2 * branch_widths(left)[0]));
+						let pair = if fused { Some(self.projection(&name("ffn_up.weight"), &role, width, 2 * branch_widths(left)[0])?) } else { None };
 						for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
-							let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
+							let widths = branch_widths(branch);
 							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 							hidden = widths[0];
-							let tensor = self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?;
+							let tensor = match &pair {
+								Some(pair) => pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?,
+								None => self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?,
+							};
 							self.mapped(vec![tensor]);
 						}
 					}
@@ -18248,6 +18269,20 @@ impl Builder<'_> {
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
+		// One fused tensor holds the query, key and value rows in that order.
+		if attention.query.is_none() && self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some() {
+			let fused = self.projection(&name("attn_qkv.weight"), &role, width, (heads + 2 * kv) * head)?;
+			let mut planes = (0..heads + kv).map(|index| fused.rows(index * head, head)).collect::<Result<Vec<_>>>()?;
+			planes.push(fused.rows((heads + kv) * head, kv * head)?);
+			self.mapped(planes);
+			if normalized {
+				let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads)?;
+				scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv)?);
+				self.slot(scales);
+			}
+			require(!attention.factors && attention.index.is_none_or(|index| index.heads == 0) && !gated, format!("block {layer} attention fuses its projections and also declares rotary factors, an indexer or a gate"))?;
+			return Ok(heads * head);
+		}
 		let query = if let Some(path) = &attention.query { self.keyed_tensor(path, &role)? } else { self.tensor(&name("attn_q.weight"), &role)? };
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		let query_gated = match query.shape[1] as usize {

@@ -152,6 +152,9 @@ embed = "sqrt-width"
 [architecture.lfm2]
 rope = "neox"
 
+[architecture.plamo3]
+rope = "neox"
+
 [architecture.qwen2]
 rope = "neox"
 
