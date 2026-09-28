@@ -8286,7 +8286,11 @@ impl NativeModelIr {
 		let mut previous = "optimizer.entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let node = &plan.node;
-			if node.parameters == 0 || plan.packed || plan.stored.is_some() {
+			// A weight bound to file bytes owns no parameter span, so no optimizer
+			// state sits at its offset. Training gives an int block no stored plan,
+			// bound or not, so the binding itself decides.
+			let bound = self.graph.stored.get(index).and_then(Option::as_ref).is_some_and(|weight| weight.arithmetic.is_empty());
+			if node.parameters == 0 || plan.packed || plan.stored.is_some() || bound {
 				continue;
 			}
 			let precision = self.node_precision(node);
@@ -19666,7 +19670,11 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		.iter()
 		.map(|node| {
 			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+			let mut node = Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() };
+			if let Some(body) = node.body_start() {
+				*body -= start as f64;
+			}
+			Ok(node)
 		})
 		.collect::<Result<Vec<_>>>()?;
 	let last = &graph.nodes[end - 1];
@@ -19958,6 +19966,10 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 		let mut node = original.clone();
 		node.source = map(node.source, &remap);
 		node.second = map(node.second, &remap);
+		// A scan is never split, so it lands next and its body right after it.
+		if let Some(body) = node.body_start() {
+			*body = nodes.len() as f64 + 1.0;
+		}
 		let weight = sliceable(graph, index);
 		// Outside a region, a large sum or expert table keeps a share of its rows
 		// and gathers them after itself; a small one runs whole.
@@ -20560,6 +20572,11 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
+	/// The node index a scan's recurrent body starts at, right after the scan. It
+	/// is a node reference like `source`, so it moves wherever the nodes move.
+	fn body_start(&mut self) -> Option<&mut f64> {
+		(self.op == Primitive::Scan && self.argument[5] == 1.0).then_some(&mut self.argument[3])
+	}
 	fn primitive_name(&self) -> &'static str {
 		match self.op {
 			Primitive::Contraction => "Contraction",
@@ -20942,6 +20959,9 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 	for node in &mut tail.nodes {
 		node.source = rebase(node.source)?;
 		node.second = rebase(node.second)?;
+		if let Some(body) = node.body_start() {
+			*body -= at as f64;
+		}
 	}
 	tail.input = tail.nodes[0].input;
 	tail.source = tail.nodes.len() as i32 - 1;
@@ -20981,6 +21001,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 			node.second = source;
 		} else if node.second >= 0 {
 			node.second += node_base
+		}
+		if let Some(body) = node.body_start() {
+			*body += f64::from(node_base);
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
 		if node.program_count != 0 {
