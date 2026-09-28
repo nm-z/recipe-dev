@@ -7045,7 +7045,11 @@ impl NativeModelIr {
 		let mut previous = "optimizer.entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let node = &plan.node;
-			if node.parameters == 0 || plan.packed || plan.stored.is_some() {
+			// A weight bound to file bytes owns no parameter span, so no optimizer
+			// state sits at its offset. Training gives an int block no stored plan,
+			// bound or not, so the binding itself decides.
+			let bound = self.graph.stored.get(index).and_then(Option::as_ref).is_some_and(|weight| weight.arithmetic.is_empty());
+			if node.parameters == 0 || plan.packed || plan.stored.is_some() || bound {
 				continue;
 			}
 			let precision = self.node_precision(node);
@@ -19739,6 +19743,51 @@ mod precision_contract_checks {
 		let step = 1.0 / inverse;
 		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
 		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
+	}
+	#[test]
+	fn optimizer_leaves_weights_bound_to_stored_bytes() {
+		let gpu = gradient_test_gpu();
+		let config = Config::load().unwrap();
+		// The hidden layer binds file bytes and owns no parameter span; the head binds values into the only span.
+		let hidden: Vec<f64> = (0..32 * 32).map(|i| ((i % 7) as f64 - 3.0) / 8.0).collect();
+		let format = StorageFormat::named("q8_0").unwrap();
+		let mut stored = format.encode(&hidden, &vec![1.0; hidden.len()], config).unwrap();
+		stored.arithmetic.clear();
+		let loaded = format.decompress(&stored.bytes.slice(0, stored.bytes.len()).unwrap(), &stored.codebook, hidden.len()).unwrap();
+		let head = vec![0.125; 32];
+		let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
+		let mut prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
+		let bound = vec![
+			BoundNode { names: "hidden.weight".to_owned(), elements: hidden.len(), weight: BoundWeight::Stored(stored) },
+			BoundNode { names: "head.weight".to_owned(), elements: head.len(), weight: BoundWeight::Values(head.clone()) },
+		];
+		prepared.bound = Some(bound.clone());
+		let model = recipe.model().no(bias).layer(32).fp(32).layer(1).fp(32).loss(mse);
+		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+		assert_eq!((graph.nodes.len(), graph.parameters.len()), (2, head.len()));
+		let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
+		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), false).unwrap().emit(Backend::Cpu, None, Some(mse), false, false).unwrap();
+		assert!(!emitted.contains("optimizer.n0.loop"), "the optimizer indexes its state for a float weight with no parameter span");
+		assert!(emitted.contains("optimizer.n1.loop"));
+		tape.advance().unwrap();
+		let before = tape.weights().unwrap();
+		assert_eq!(before[..hidden.len()], loaded[..], "the load kernel expands the bound bytes");
+		tape.full_epoch(0.01, config).unwrap();
+		let after = tape.weights().unwrap();
+		assert_eq!(after[..hidden.len()], before[..hidden.len()], "the stored-bound layer took an optimizer update");
+		assert!(after[hidden.len()..].iter().zip(&head).all(|(after, before)| after != before), "the head took no optimizer update");
+		// An int layer bound to the same bytes trains through a float plan with no stored weight.
+		let mut config = config;
+		config.profile.train = Some(Compute::FP32);
+		prepared.bound = Some(bound);
+		let model = recipe.model().no(bias).layer(32).int(8).layer(1).fp(32).loss(mse);
+		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+		assert_eq!((graph.nodes[0].int_bits, graph.parameters.len()), (8, head.len()));
+		let training = graph.training_graph().unwrap();
+		let program = gpu.native_program(&training, 1, Compute::FP32, Some(mse)).unwrap();
+		let emitted = NativeModelIr::from_graph(&training, 1, Compute::FP32, program.schedule.clone(), false).unwrap().emit(Backend::Cpu, None, Some(mse), false, false).unwrap();
+		assert!(!emitted.contains("optimizer.n0.loop"), "the optimizer indexes its state for an int weight with no parameter span");
+		assert!(emitted.contains("optimizer.n1.loop"));
 	}
 	#[test]
 	fn narrow_training_preserves_small_and_large_gradients() {
