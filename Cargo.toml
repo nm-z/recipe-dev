@@ -152,6 +152,11 @@ embed = "sqrt-width"
 [architecture.lfm2]
 rope = "neox"
 
+[architecture.command-r]
+rope = "pairs"
+block = "parallel"
+norms = "layer"
+
 [architecture.plamo3]
 rope = "neox"
 

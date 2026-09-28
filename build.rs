@@ -1657,7 +1657,7 @@ fn architecture_profiles(manifest: &str) -> BuildResult<String> {
 		let (key, value) = line.split_once('=').ok_or_else(|| io::Error::other(format!("invalid architecture entry {line}")))?;
 		let (key, value) = (key.trim(), value.trim());
 		let value = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("architecture {key} must be quoted")))?;
-		if !["rope", "embed", "conv", "qk", "norm", "decay", "output"].contains(&key) || profiles.last().is_some_and(|(_, fields)| fields.iter().any(|field| field.starts_with(&format!("{key}=")))) {
+		if !["rope", "embed", "block", "norms", "conv", "qk", "norm", "decay", "output"].contains(&key) || profiles.last().is_some_and(|(_, fields)| fields.iter().any(|field| field.starts_with(&format!("{key}=")))) {
 			return Err(io::Error::other(format!("invalid or duplicate architecture key {key}")).into());
 		}
 		profiles.last_mut().expect("architecture table is open").1.push(format!("{key}={value}"));

@@ -11950,6 +11950,7 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
+			Operation::Sum(left, right) => format!("sum,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Moe(moe) => format!(
 				"moe,{},{},{},{},{},{}",
 				moe.top_k,
@@ -12092,6 +12093,11 @@ mod bundle {
 				let branches = split_escaped(rest, ',');
 				require(branches.len() == 2, "product must contain two branches")?;
 				Ok(Operation::Product(product_branch(&branches[0])?, product_branch(&branches[1])?))
+			}
+			"sum" => {
+				let branches = split_escaped(rest, ',');
+				require(branches.len() == 2, "sum must contain two branches")?;
+				Ok(Operation::Sum(product_branch(&branches[0])?, product_branch(&branches[1])?))
 			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
@@ -13541,6 +13547,9 @@ enum Operation {
 	Residual(Vec<Block>),
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
+	/// Two branches read the same input and their outputs add: a transformer
+	/// layer whose attention and feed-forward run in parallel (GPT-J, PaLM).
+	Sum(ProductBranch, ProductBranch),
 	Moe(MoeBlock),
 	Sequence(Vec<Block>),
 	Perceptron(usize),
@@ -16013,6 +16022,7 @@ impl Operation {
 			Self::Recur(_) => "recur",
 			Self::Residual(_) => "residual",
 			Self::Product(..) => "product",
+			Self::Sum(..) => "sum",
 			Self::Ensemble(_) => "ensemble",
 			Self::Identity => "identity",
 			Self::Last => "last",
@@ -16040,7 +16050,7 @@ impl Operation {
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) | Self::Last => false,
 			Self::Residual(parts) | Self::Sequence(parts) => weighted_parts(parts),
 			Self::Moe(moe) => weighted_parts(&moe.experts) || moe.shared.as_ref().is_some_and(|(expert, gate)| weighted_gate(expert) || gate.iter().any(weighted_gate)),
-			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
+			Self::Product(left, right) | Self::Sum(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
 			Self::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(weighted_gate),
 			Self::Collapse(read) => read.iter().any(weighted_gate),
@@ -16129,6 +16139,19 @@ impl std::ops::Mul for Model {
 			ProductBranch { blocks: left.blocks, exclusions: left.exclusions },
 			ProductBranch { blocks: right.blocks, exclusions: right.exclusions },
 		))
+	}
+}
+/// Rust addition composes two model fragments from the same incoming
+/// activation and adds their outputs, so parallel branches can be placed in
+/// `res`: `res([norm(layer), attention + feed_forward])`.
+impl std::ops::Add for Model {
+	type Output = Block;
+	fn add(self, right: Self) -> Block {
+		let (left, right) = ((*self.inner).clone(), (*right.inner).clone());
+		assert!(!left.blocks.is_empty() && !right.blocks.is_empty(), "a sum branch has no blocks");
+		assert!(!left.pending_frozen && !right.pending_frozen, "sum branch qualifier requires a following block");
+		assert!(left.epsilon.to_bits() == right.epsilon.to_bits(), "sum branches must use the same normalization epsilon");
+		Block::of(Operation::Sum(ProductBranch { blocks: left.blocks, exclusions: left.exclusions }, ProductBranch { blocks: right.blocks, exclusions: right.exclusions }))
 	}
 }
 impl From<Model> for Block {
@@ -16779,6 +16802,11 @@ struct ManifestArchitecture {
 	rope: RopeLayout,
 	/// Whether the embedding's rows scale by the square root of the width.
 	embed_scaled: bool,
+	/// Whether a layer's attention and feed-forward read one normalized input
+	/// and add in one residual, rather than each in its own.
+	parallel: bool,
+	/// Whether the stream's normalizations center as well as scale.
+	layer_norm: bool,
 	conv: Option<Activation>,
 	qk: Option<BlockNormalization>,
 	norm: Option<BlockNormalization>,
@@ -16800,6 +16828,16 @@ impl ManifestArchitecture {
 			None => false,
 			Some("sqrt-width") => true,
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] embed={value} must be sqrt-width"))),
+		};
+		let parallel = match field("block") {
+			None => false,
+			Some("parallel") => true,
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] block={value} must be parallel"))),
+		};
+		let layer_norm = match field("norms") {
+			None | Some("rms") => false,
+			Some("layer") => true,
+			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] norms={value} must be rms or layer"))),
 		};
 		let conv = match field("conv") {
 			None => None,
@@ -16829,7 +16867,7 @@ impl ManifestArchitecture {
 			Some("silu") => Some(Activation::Silu),
 			Some(value) => return Err(RecipeError::new(format!("Cargo.toml [architecture.{name}] output={value} must be sigmoid or silu"))),
 		};
-		Ok(Self { rope, embed_scaled, conv, qk, norm, decay, output })
+		Ok(Self { rope, embed_scaled, parallel, layer_norm, conv, qk, norm, decay, output })
 	}
 	fn delta(self, name: &str) -> Result<(Activation, BlockNormalization, BlockNormalization, DeltaDecay, Activation)> {
 		let missing = |key: &str| RecipeError::new(format!("Cargo.toml [architecture.{name}] is missing {key} for a delta block"));
@@ -16942,6 +16980,8 @@ struct Builder<'a> {
 /// The dimensions every row reads from the `<architecture>.*` namespace.
 struct Dimensions {
 	width: usize,
+	/// Whether the stream's normalizations are layer normalizations.
+	layer_norm: bool,
 	heads: usize,
 	kv: Vec<usize>,
 	head: Vec<usize>,
@@ -16989,8 +17029,8 @@ impl<'a> Builder<'a> {
 		let vocabulary = embedding.shape[1] as usize;
 		let format = gguf::embedding_format(&embedding)?;
 		let mut model = recipe.model();
-		if builder.present("attention.layer_norm_rms_epsilon") {
-			model = model.e(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
+		if let Some(key) = ["attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon"].into_iter().find(|key| builder.present(key)) {
+			model = model.e(file.float_at(&builder.key(key))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
 		if choices.embed_scaled {
@@ -17015,6 +17055,20 @@ impl<'a> Builder<'a> {
 					.tail([dconv(ple.kernel()).dilate(ple.dilation()).silu()]);
 			}
 			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
+			// A parallel layer normalizes once and adds attention and feed-forward
+			// together to the stream: x + attn(n(x)) + ffn(n(x)).
+			if choices.parallel {
+				require(attends, format!("block {layer} of a parallel architecture has no attention"))?;
+				let mixer = builder.attention(recipe.model(), layer, &dimensions)?;
+				let feed_forward = match &dimensions.experts {
+					Some(experts) => builder.experts(recipe.model(), layer, experts, &dimensions),
+					None => Self::feed_forward(recipe.model(), &dimensions)?,
+				};
+				let both = mixer + feed_forward;
+				let branch = Self::open(&dimensions).edit(|model| model.blocks.push(both));
+				model = builder.close(model, branch, &dimensions);
+				continue;
+			}
 			let branch = Self::open(&dimensions);
 			let branch = if attends {
 				builder.attention(branch, layer, &dimensions)?
@@ -17045,10 +17099,16 @@ impl<'a> Builder<'a> {
 			}
 		}
 		if output_norm {
-			model = model.norm(rms);
+			model = Self::normalized(model, &dimensions);
 		}
 		let head = if builder.file.tensor("output.weight").is_some() { tensor::output.weight } else { tensor::token_embd.weight };
 		model = model.layer(vocabulary).bind(head);
+		// Some architectures scale the logits by a stated constant.
+		if builder.present("logit_scale") {
+			let scale = file.float_at(&builder.key("logit_scale"))?;
+			require(scale.is_finite() && scale != 0.0, "logit scale must be finite and nonzero")?;
+			model = model.scale(scale);
+		}
 		if builder.present("final_logit_softcapping") {
 			let cap = file.float_at(&builder.key("final_logit_softcapping"))?;
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
@@ -17080,8 +17140,8 @@ impl<'a> Builder<'a> {
 		let (lanes, bottleneck) = dimensions.hyper.ok_or_else(|| RecipeError::new("a draft head joins a hyper-connection stream, and this model has none"))?;
 		let width = dimensions.width;
 		let mut model = recipe.model();
-		if self.present("attention.layer_norm_rms_epsilon") {
-			model = model.e(file.float_at(&self.key("attention.layer_norm_rms_epsilon"))?);
+		if let Some(key) = ["attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon"].into_iter().find(|key| self.present(key)) {
+			model = model.e(file.float_at(&self.key(key))?);
 		}
 		model = model.join(lanes);
 		let branch = self.attention(Self::open(dimensions), layer, dimensions)?;
@@ -17204,7 +17264,8 @@ impl<'a> Builder<'a> {
 			None
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
-		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
+		let layer_norm = self.choices.is_some_and(|choices| choices.layer_norm);
+		Ok(Dimensions { width, layer_norm, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	/// The path a block being planned reads in place of the conventional `name`.
@@ -17299,7 +17360,7 @@ impl<'a> Builder<'a> {
 					require(tensor.shape == [*kernel as u64, channels as u64], format!("{} has shape {:?}; a depthwise convolution needs [{kernel}, {channels}]", tensor.name, tensor.shape))?;
 					self.mapped(vec![tensor]);
 				}
-				Operation::Product(left, right) => {
+				Operation::Product(left, right) | Operation::Sum(left, right) => {
 					let left_channels = self.bound_fragment(&left.blocks, channels)?;
 					let right_channels = self.bound_fragment(&right.blocks, channels)?;
 					require(left_channels == right_channels, format!("product branches produce {left_channels} and {right_channels} channels"))?;
@@ -17444,7 +17505,11 @@ impl<'a> Builder<'a> {
 	/// mixer, whose gates read the stream, and with its pre-normalization on a
 	/// plain residual.
 	fn open(dimensions: &Dimensions) -> Model {
-		if dimensions.hyper.is_some() { recipe.model() } else { recipe.model().norm(rms) }
+		if dimensions.hyper.is_some() { recipe.model() } else { Self::normalized(recipe.model(), dimensions) }
+	}
+	/// The stream's normalization: rms, or layer where the architecture centers.
+	fn normalized(model: Model, dimensions: &Dimensions) -> Model {
+		if dimensions.layer_norm { model.norm(crate::layer) } else { model.norm(rms) }
 	}
 	/// Applies an architecture's post-attention or post-FFN normalization inside
 	/// the branch, before the residual add, where the file stores its scale. A
@@ -17968,7 +18033,7 @@ fn bound_branch(parts: &[Block]) -> bool {
 		match &block.operation {
 			Operation::Identity => true,
 			Operation::Layer(_) | Operation::Dconv(..) => block.weight.is_some(),
-			Operation::Product(left, right) => left.blocks.iter().all(bound) && right.blocks.iter().all(bound),
+			Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().all(bound) && right.blocks.iter().all(bound),
 			_ => false,
 		}
 	}
@@ -17980,7 +18045,7 @@ fn bound_branch(parts: &[Block]) -> bool {
 fn mixes(parts: &[Block]) -> bool {
 	parts.iter().any(|part| match &part.operation {
 		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
-		Operation::Product(left, right) => mixes(&left.blocks) || mixes(&right.blocks),
+		Operation::Product(left, right) | Operation::Sum(left, right) => mixes(&left.blocks) || mixes(&right.blocks),
 		_ => false,
 	})
 }
@@ -17988,7 +18053,7 @@ fn mixes(parts: &[Block]) -> bool {
 fn layers_of(block: &Block) -> Vec<&Block> {
 	match &block.operation {
 		Operation::Layer(_) => vec![block],
-		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).flat_map(layers_of).collect(),
+		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).flat_map(layers_of).collect(),
 		Operation::Residual(parts) | Operation::Sequence(parts) => parts.iter().flat_map(layers_of).collect(),
 		_ => Vec::new(),
 	}
@@ -17997,7 +18062,7 @@ fn layers_of(block: &Block) -> Vec<&Block> {
 fn first_layer(block: &Block) -> Option<usize> {
 	match &block.operation {
 		Operation::Layer(width) => Some(*width),
-		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_layer),
+		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_layer),
 		Operation::Residual(parts) | Operation::Sequence(parts) => parts.iter().find_map(first_layer),
 		_ => None,
 	}
@@ -18157,6 +18222,12 @@ impl Builder<'_> {
 				}
 				Operation::Moe(moe) => {
 					self.expert_planes(layer, moe, width)?;
+					weighted = true;
+				}
+				// Parallel branches: the mixer's tensors, then the feed-forward's.
+				Operation::Sum(left, right) => {
+					self.plan_branch(&left.blocks, layer, "attn", width)?;
+					self.plan_branch(&right.blocks, layer, "ffn", width)?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
@@ -20696,7 +20767,7 @@ fn sequential_operation(operation: &Operation) -> bool {
 			moe.experts.iter().any(|part| sequential_operation(&part.operation))
 				|| moe.shared.as_ref().is_some_and(|(expert, gate)| sequential_operation(&expert.operation) || gate.iter().any(|part| sequential_operation(&part.operation)))
 		}
-		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
+		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
 		Operation::Hyper(hyper) => hyper.branch.iter().chain(&hyper.read).chain(&hyper.write).any(|block| sequential_operation(&block.operation)),
 		Operation::Collapse(read) => read.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
@@ -20939,7 +21010,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Residual(parts) => lower_residual(graph, parts, block.precision, skip, total, data, targets, rows, gpu, config)?,
 		Operation::Recur(parts) => lower_recur(graph, parts, total, data, targets, rows, gpu, config)?,
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
-		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
+		Operation::Product(left, right) => lower_product(graph, left, right, ScalarOpcode::Multiply, total, data, targets, rows, gpu, config)?,
+		Operation::Sum(left, right) => lower_product(graph, left, right, ScalarOpcode::Add, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(moe) => lower_moe(graph, moe, total, data, targets, rows, gpu, config)?,
 		Operation::Sequence(parts) => {
 			for part in parts {
@@ -21838,17 +21910,17 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
-	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	let parameters = if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) { span } else { 0 };
 	lower_normalize_parameters(graph, normalization, width, span, parameters)
 }
 /// Pushes a normalization whose trainable scale may include deferred columns.
 /// The ordinary forward path only applies the first `span` columns; an indexer
 /// uses the trailing columns as key scales after raw key pooling in its kernel.
 fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize, parameters: usize) -> Result<()> {
-	if normalization == BlockNormalization::Rms {
+	if matches!(normalization, BlockNormalization::Rms | BlockNormalization::Layer) {
 		require(parameters >= span, "normalization scale is narrower than its span")?;
 	} else {
-		require(parameters == 0, "non-RMS normalization cannot carry a scale")?;
+		require(parameters == 0, "batch and l2 normalizations carry no scale")?;
 	}
 	let epsilon = graph.epsilon;
 	// RMS carries one trainable scale per normalized channel, starting at identity.
@@ -22226,7 +22298,7 @@ fn estimator_count(block: &Block) -> usize {
 		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).map(estimator_count).sum(),
 		Operation::Moe(moe) => moe.experts.iter().map(estimator_count).sum::<usize>()
 			+ moe.shared.as_ref().map_or(0, |(expert, gate)| estimator_count(expert) + gate.iter().map(estimator_count).sum::<usize>()),
-		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
+		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
 }
@@ -22237,7 +22309,7 @@ fn first_estimator(block: &Block) -> Option<&Estimator> {
 		Operation::Hyper(hyper) => hyper.read.iter().chain(&hyper.write).chain(&hyper.branch).find_map(first_estimator),
 		Operation::Moe(moe) => moe.experts.iter().find_map(first_estimator)
 			.or_else(|| moe.shared.as_ref().and_then(|(expert, gate)| first_estimator(expert).or_else(|| gate.iter().find_map(first_estimator)))),
-		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
+		Operation::Product(left, right) | Operation::Sum(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}
 }
@@ -22306,7 +22378,7 @@ fn lower_residual(graph: &mut Graph, parts: &[Block], precision: Option<Compute>
 /// Lower two model fragments from one source and multiply their outputs
 /// elementwise. The scalar-program reverse pass supplies each branch with the
 /// other branch's value, so both branch gradients reach the shared source.
-fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch, combine: ScalarOpcode, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!left.blocks.is_empty() && !right.blocks.is_empty(), "a product branch must contain an operation")?;
 	let (source, input) = (graph.source, graph.output);
 	let inherited_bias = graph.bias;
@@ -22328,7 +22400,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	graph.bias = inherited_bias;
 	(graph.block_frozen, graph.block_kind) = (outer_frozen, outer_kind);
 	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
-	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
+	binary(graph, left_source, graph.source, shape, combine).map(drop)
 }
 fn lower_hyper(graph: &mut Graph, hyper: &Hyper, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let lanes = hyper.lanes;
