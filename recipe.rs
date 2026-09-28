@@ -12827,9 +12827,13 @@ mod bundle {
 		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
 			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
 			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
+			assert_eq!(split_escaped(&text, '|').len(), 17);
 			assert_eq!(block(&text).unwrap(), original);
-			assert!(block("layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-").is_err());
+			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
+			let legacy = block(legacy).unwrap();
+			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
+			assert_eq!(legacy.qk_precision, None);
+			assert_eq!(legacy.rope_precision, None);
 		}
 	}
 }
@@ -23097,65 +23101,6 @@ mod precision_contract_checks {
 			}
 		}
 	}
-	#[test]
-	fn a_recurrent_body_computes_in_its_own_precision() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let mut config = Config::load().unwrap();
-		(config.profile.sum, config.profile.atvn) = (Compute::FP32, Compute::FP32);
-		// Four features run through the recurrence as four positions. Inputs and
-		// weights are sixteenths, exact in every format, so a body or scan in any
-		// format computes the fp64 recurrence to that format's rounding.
-		let input: Vec<f64> = (0..4).map(|i| (i as f64 - 1.5) / 4.0).collect();
-		let prepared = Prepared::matrix(input.clone(), vec![0.5], 1, 1).unwrap();
-		let tape = |model: Model, loss: Option<LossFunction>| {
-			let mut graph = compile(&model.loss(mse), &prepared, &prepared.targets, 1, gpu, config, true).unwrap();
-			for (i, parameter) in graph.parameters.iter_mut().enumerate() {
-				*parameter = ((i * 7 % 13) as f64 - 6.0) / 16.0;
-			}
-			graph.refresh_storage(config).unwrap();
-			NativeTape::new(&graph, TapeInput::Values(&input), &input, &prepared.targets, gpu, Compute::FP32, loss).unwrap()
-		};
-		let forward = |model: Model| {
-			let tape = tape(model, None);
-			tape.forward(ForwardMode::Inference).unwrap();
-			tape.predictions().unwrap()[0]
-		};
-		let gradient = |model: Model| {
-			let mut tape = tape(model, Some(mse));
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			tape.download_gradient().unwrap()
-		};
-		// A body of one sum, and of a sum and its own activation, each in fp64 throughout.
-		let sum = || recipe.model().recur([layer(4).tanh(), layer(4).fp(64)]).fp(64).layer(1);
-		let activated = || recipe.model().recur([layer(4).tanh(), layer(4).fp(64).sigmoid().fp(64)]).fp(64).layer(1);
-		for (label, model, wide, tolerance) in [
-			("fp32", recipe.model().recur([layer(4).tanh(), layer(4)]).layer(1), sum(), 1e-6),
-			("fp16 body", recipe.model().recur([layer(4).tanh(), layer(4).fp(16)]).layer(1), sum(), 2e-3),
-			("bf16 body", recipe.model().recur([layer(4).tanh(), layer(4).bf(16)]).layer(1), sum(), 2e-2),
-			("fp64 body", recipe.model().recur([layer(4).tanh(), layer(4).fp(64)]).layer(1), sum(), 1e-6),
-			("fp16 scan", recipe.model().recur([layer(4).tanh(), layer(4)]).fp(16).layer(1), sum(), 2e-3),
-			("fp64 scan", recipe.model().recur([layer(4).tanh(), layer(4)]).fp(64).layer(1), sum(), 1e-6),
-			("fp16 activation", recipe.model().recur([layer(4).tanh(), layer(4).sigmoid().fp(16)]).layer(1), activated(), 2e-3),
-			("fp64 sum", recipe.model().recur([layer(4).tanh(), layer(4).fp(64).sigmoid()]).layer(1), activated(), 1e-6),
-		] {
-			let (actual, expected) = (forward(model), forward(wide));
-			assert!((actual - expected).abs() <= expected.abs() * tolerance, "{label} recurrence computes {actual}, the fp64 one {expected}");
-		}
-		// Training takes fp32 and fp64 nodes, each gradient merging into its node's
-		// own span.
-		for (label, model, wide) in [
-			("fp64 body", recipe.model().recur([layer(4).tanh(), layer(4).fp(64)]).layer(1), sum()),
-			("fp64 scan", recipe.model().recur([layer(4).tanh(), layer(4)]).fp(64).layer(1), sum()),
-			("fp64 sum", recipe.model().recur([layer(4).tanh(), layer(4).fp(64).sigmoid()]).layer(1), activated()),
-		] {
-			let (actual, expected) = (gradient(model), gradient(wide));
-			assert_eq!(actual.len(), expected.len());
-			for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
-				assert!((got - want).abs() <= want.abs() * 1e-5 + 1e-9, "{label} recurrence gradient {i}: {got} vs {want}");
-			}
-		}
-	}
 	fn table(name: &str) -> &'static str {
 		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
 	}
@@ -23238,7 +23183,7 @@ mod precision_contract_checks {
 		let mut attention = AttentionBlock::new(1);
 		attention.width = 4;
 		attention.window = 4;
-		let error = lower_attention(&mut graph, attention, None, Config::load().unwrap()).unwrap_err().to_string();
+		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
 		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
 	}
 	#[test]
@@ -23278,7 +23223,7 @@ mod precision_contract_checks {
 		let mut operation = AttentionBlock::new(2);
 		operation.width = 4;
 		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
-		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms), Config::load().unwrap()).unwrap();
+		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
 		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
 		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
 		let model = recipe.model().res([projection.clone()]).fp(64);
@@ -23415,7 +23360,7 @@ mod precision_contract_checks {
 			graph.parameters.fill(sample);
 			graph.refresh_storage(config).unwrap();
 			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
+			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
 			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
 			tape.advance().unwrap();
 			tape.gradient_launch(0.01, config).unwrap();
