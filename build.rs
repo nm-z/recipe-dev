@@ -322,8 +322,7 @@ define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyct
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
-declare i64 @llvm.readcyclecounter()
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @recipe.cpu.clock() ret i64 %now }
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
@@ -1728,9 +1727,11 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
 @recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
-define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+@recipe.cpu.clock.read = internal thread_local global ptr null, align 8
+define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait, ptr %clock) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 store ptr %clock, ptr @recipe.cpu.clock.read, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
-define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
+define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }
+define internal i64 @recipe.cpu.clock() #1 { entry: %read = load ptr, ptr @recipe.cpu.clock.read, align 8 %now = call i64 %read() ret i64 %now }"#;
 /// Contraction shape. Reverse K partitions use `split_span`, capped at
 /// `partitions`, for a fixed summation order across devices.
 #[derive(Clone, Copy)]

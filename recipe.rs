@@ -24305,8 +24305,7 @@ impl NativeTape {
 		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
 		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
@@ -24316,7 +24315,7 @@ impl NativeTape {
 				tuner.observe(&ticks);
 			}
 			if tracing() {
-				let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+				let unit = match self.program.backend { NativeBackend::Cpu(_) => "ns", _ => "ticks" };
 				let mut line = format!("clocks window {begin}..{end} {unit}");
 				for index in 1..count {
 					line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
@@ -24750,11 +24749,16 @@ impl NativeTape {
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
 		trace(&format!("epoch {} {operation:?} submitted", self.step))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
+	}
+	/// The last dispatch on the device's own clock: from the leading worker's
+	/// entry mark to the last worker's exit.
+	fn kernel_seconds(&self) -> Result<f64> {
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		Ok(ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9)
 	}
 	fn epoch_metrics(&self) -> Result<EpochMetrics> {
 		let values = self.metrics.download_float(EpochMetrics::VALUES, self.program.artifact.layout.output_adjoint_precision)?;
@@ -25027,7 +25031,8 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width, config.precision, config.precision), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &targets, gpu, config.precision, Some(mse))?;
-	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
+	// Each dispatch's machine time, then the interval its kernel marked on the device's own clock.
+	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<(f64, f64)> {
 		tape.advance()?;
 		let started = Instant::now();
 		if gradient {
@@ -25036,17 +25041,23 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 			tape.optimizer_launch(config.surrogate_rate, config)?;
 		}
 		gpu.synchronize()?;
-		Ok(started.elapsed().as_secs_f64())
+		Ok((started.elapsed().as_secs_f64(), tape.kernel_seconds()?))
 	};
 	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
 	timed(&mut tape, false)?;
-	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
+	let (mut overhead, mut epoch, mut kernel) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
 	for _ in 0..config.surrogate_epochs {
-		overhead = overhead.min(timed(&mut tape, false)?);
-		epoch = epoch.min(timed(&mut tape, true)?);
+		overhead = overhead.min(timed(&mut tape, false)?.0);
+		let (machine, own) = timed(&mut tape, true)?;
+		(epoch, kernel) = (epoch.min(machine), kernel.min(own));
 	}
-	let gradient = epoch - overhead;
+	// A CPU dispatch starts its worker threads and wakes them at every barrier,
+	// and a loaded scheduler defers each wake by up to a tick, longer than the
+	// whole surrogate gradient. The machine times of two such dispatches then
+	// need not differ by the work between them, so the epoch kernel's own clock
+	// times that work inside one dispatch.
+	let gradient = if gpu.backend == Backend::Cpu { kernel } else { epoch - overhead };
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
@@ -25987,7 +25998,7 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32, i32);
-type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
+type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
@@ -27523,6 +27534,12 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
 }
+/// The CPU kernels' `@recipe.clock`: nanoseconds on the machine's monotonic
+/// clock, so a kernel's own start and end marks time its work in seconds.
+extern "C" fn native_cpu_clock() -> i64 {
+	static ORIGIN: OnceLock<Instant> = OnceLock::new();
+	i64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
 
 macro_rules! launch_native_cpu_epoch {
 	($function:expr, $arguments:expr) => {
@@ -27596,6 +27613,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 	let barrier = std::sync::Barrier::new(threads as usize);
 	let context = ptr::from_ref(&barrier) as usize;
 	let wait = native_cpu_barrier as *const () as usize;
+	let clock = native_cpu_clock as *const () as usize;
 	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
 	std::thread::scope(|scope| {
 		let workers = (0..threads)
@@ -27605,7 +27623,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 					let thread_id = i32::try_from(thread_id).map_err(|_| RecipeError::new("native CPU worker ID exceeds i32"))?;
 					let arguments = slots.iter().map(|slot| *slot as Ptr).collect::<Vec<_>>();
 					unsafe {
-						thread(thread_id, context as Ptr, wait as Ptr);
+						thread(thread_id, context as Ptr, wait as Ptr, clock as Ptr);
 						launch_native_cpu_entry(forward, epoch, model_load, entry, &arguments)
 					}
 				})
