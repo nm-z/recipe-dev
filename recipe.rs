@@ -9627,10 +9627,25 @@ mod tokenizer {
 			match token {
 				Token::Str(text) => Ok(Value::Text(text)),
 				Token::Int(value) => Ok(Value::Int(value)),
+				// A parenthesized expression, or a tuple when a comma follows its first item.
 				Token::Op("(") => {
+					if self.eat_op(")") {
+						return Ok(Value::List(Vec::new()));
+					}
 					let value = self.expression(live)?;
-					self.expect_op(")")?;
-					Ok(value)
+					if !self.eat_op(",") {
+						self.expect_op(")")?;
+						return Ok(value);
+					}
+					let mut items = vec![value];
+					while !self.eat_op(")") {
+						items.push(self.expression(live)?);
+						if !self.eat_op(",") {
+							self.expect_op(")")?;
+							break;
+						}
+					}
+					Ok(Value::List(items))
 				}
 				Token::Op("[") => {
 					let mut items = Vec::new();
@@ -9843,6 +9858,56 @@ mod tokenizer {
 		match stop.is_empty() {
 			true => Ok(String::new()),
 			false => Err(RecipeError::new(format!("chat template ends before its {}", stop.join(" or ")))),
+		}
+	}
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		fn templated(template: &str) -> Tokenizer {
+			Tokenizer {
+				tokens: Vec::new(),
+				ids: HashMap::new(),
+				ranks: Ranks::Merges(HashMap::new()),
+				added: Vec::new(),
+				is_added: Vec::new(),
+				bytes: [0; 256],
+				byte_of: HashMap::new(),
+				family: Family::Qwen2,
+				template: Some(template.to_owned()),
+				add_bos: false,
+				add_eos: false,
+				bos: None,
+				eos: None,
+				pad: None,
+			}
+		}
+		#[test]
+		fn tuple_literals_are_sequences() {
+			// Qwen3.8's reasoning-effort check tests membership in a tuple literal.
+			let template = concat!(
+				"{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n",
+				"{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n",
+				"\t{{- raise_exception('reasoning_effort ' ~ resolved_reasoning_effort ~ ' is not supported') }}\n",
+				"{%- endif %}\n",
+				"{%- for message in messages %}\n",
+				"\t{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}\n",
+				"{%- endfor %}\n",
+				"{%- if add_generation_prompt %}\n",
+				"\t{{- '<|im_start|>assistant\\n' }}\n",
+				"{%- endif %}\n",
+			);
+			assert_eq!(templated(template).prompt(&[("user", "hi")], true).unwrap(), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+			assert_eq!(templated("{% for effort in ('low', 'medium',) %}{{ loop.index }}{{ effort }}{% endfor %}").prompt(&[], false).unwrap(), "1low2medium");
+			let scope = Scope { frames: vec![vec![("effort".to_owned(), Value::Text("high".to_owned()))]] };
+			let value = |source: &str| evaluate(source, &scope, true).unwrap_or_else(|error| panic!("{source}: {error}")).json();
+			assert_eq!(value("effort not in ('xhigh', 'medium', 'low')"), "true");
+			assert_eq!(value("effort in ('high',)"), "true");
+			assert_eq!(value("()"), "[]");
+			assert_eq!(value("(effort)"), "\"high\"");
+			assert_eq!(value("((1, 2), 3,)"), "[[1, 2], 3]");
+			assert_eq!(value("(1, 2)|length"), "2");
+			assert_eq!(value("('a', effort)|join('-')"), "\"a-high\"");
+			assert_eq!(value("(1 + 2) * 3"), "9");
 		}
 	}
 }
@@ -19789,7 +19854,7 @@ mod precision_contract_checks {
 			graph.parameters.fill(sample);
 			graph.refresh_storage(config).unwrap();
 			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
+			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
 			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
 			tape.advance().unwrap();
 			tape.gradient_launch(0.01, config).unwrap();
