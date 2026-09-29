@@ -19789,7 +19789,7 @@ mod precision_contract_checks {
 			graph.parameters.fill(sample);
 			graph.refresh_storage(config).unwrap();
 			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, if tail { 4 } else { 8 });
+			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
 			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
 			tape.advance().unwrap();
 			tape.gradient_launch(0.01, config).unwrap();
@@ -19833,6 +19833,68 @@ mod precision_contract_checks {
 				assert!((inputs[i] - expected).abs() < 1e-12, "{} input {i}: {} vs {expected}", format.label(), inputs[i]);
 				let gamma = delta * head_weights[i] * normalized[i];
 				assert!((gradients[norm_offset + i] - gamma).abs() < 1e-12, "{} norm weight {i}: {} vs {gamma}", format.label(), gradients[norm_offset + i]);
+			}
+		}
+	}
+	#[test]
+	fn scale_gradients_fold_in_their_operation_precision() {
+		let gpu = gradient_test_gpu();
+		let config = Config::load().unwrap();
+		let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
+		let head_weights: Vec<f64> = (0..32).map(|i| (i as f64 % 3.0 - 1.0) / 16.0).collect();
+		let prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
+		// An RMS scale and a prelu slope each sum their partition rows in the
+		// operation's own accumulator: fp32 under an fp16 run shares the run's
+		// float state, and fp64 under an fp32 run does not.
+		for (run, operation, tolerance) in [(Compute::FP16, Compute::FP32, 2e-3), (Compute::FP32, Compute::FP64, 1e-6)] {
+			for prelu in [false, true] {
+				let model = recipe.model().no(bias).layer(32).arithmetic(run);
+				let model = if prelu { model.prelu().arithmetic(operation) } else { model.norm(rms).arithmetic(operation) };
+				let model = model.layer(1).arithmetic(run).loss(mse);
+				let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
+				let scaled = graph.nodes.iter().position(|node| node.op != Primitive::Contraction && node.parameters != 0).unwrap();
+				let head = graph.nodes.iter().rposition(|node| node.op == Primitive::Contraction).unwrap();
+				let case = format!("{} {} in a {} run", if prelu { "prelu" } else { "rms norm" }, operation.label(), run.label());
+				assert_eq!((graph.nodes[scaled].precision, graph.nodes[0].precision, graph.nodes[head].precision), (operation, run, run), "{case}");
+				let (scaled_offset, scaled_parameters, head_offset) = (graph.nodes[scaled].offset, graph.nodes[scaled].parameters, graph.nodes[head].offset);
+				graph.parameters.fill(0.0);
+				for i in 0..32 {
+					graph.parameters[i * 32 + i] = 1.0;
+				}
+				graph.parameters[scaled_offset..scaled_offset + scaled_parameters].fill(if prelu { 0.25 } else { 1.0 });
+				graph.parameters[head_offset..head_offset + 32].copy_from_slice(&head_weights);
+				graph.refresh_storage(config).unwrap();
+				let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, run, Some(mse)).unwrap();
+				tape.advance().unwrap();
+				tape.gradient_launch(0.01, config).unwrap();
+				let delta = 2.0 * (tape.predictions().unwrap()[0] - 0.25);
+				let gradients = tape.download_gradient().unwrap();
+				let close = |got: f64, want: f64| (got - want).abs() <= tolerance * want.abs() + 1e-12;
+				// The head's inputs, the hidden layer's output adjoints, and the scaled operation's own gradient.
+				let (hidden, adjoints, own): (Vec<f64>, Vec<f64>, Vec<f64>) = if prelu {
+					let hidden = samples.iter().map(|x| if *x > 0.0 { *x } else { 0.25 * x }).collect();
+					let adjoints = samples.iter().zip(&head_weights).map(|(x, w)| delta * w * if *x > 0.0 { 1.0 } else { 0.25 }).collect();
+					let slope = samples.iter().zip(&head_weights).filter(|(x, _)| **x <= 0.0).map(|(x, w)| delta * w * x).sum::<f64>();
+					(hidden, adjoints, vec![slope])
+				} else {
+					let inverse = 1.0 / (samples.iter().map(|x| x * x).sum::<f64>() / 32.0 + graph.nodes[scaled].argument[1]).sqrt();
+					let normalized: Vec<f64> = samples.iter().map(|x| x * inverse).collect();
+					let projection = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).sum::<f64>() / 32.0;
+					let adjoints = head_weights.iter().zip(&normalized).map(|(w, x)| inverse * (delta * w - x * projection)).collect();
+					let own = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).collect();
+					(normalized, adjoints, own)
+				};
+				for (i, &want) in own.iter().enumerate() {
+					assert!(close(gradients[scaled_offset + i], want), "{case}: scale gradient {i}: {} vs {want}", gradients[scaled_offset + i]);
+				}
+				for i in 0..32 {
+					let want = delta * hidden[i];
+					assert!(close(gradients[head_offset + i], want), "{case}: head gradient {i}: {} vs {want}", gradients[head_offset + i]);
+					for j in 0..32 {
+						let want = adjoints[i] * samples[j];
+						assert!(close(gradients[i * 32 + j], want), "{case}: hidden gradient {i},{j}: {} vs {want}", gradients[i * 32 + j]);
+					}
+				}
 			}
 		}
 	}
