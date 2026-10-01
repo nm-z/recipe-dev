@@ -7633,7 +7633,18 @@ impl NativeModelIr {
 		// tuner writes for each node while the model runs; zero keeps the body's
 		// own choice. The runtime points @recipe_knobs at the table.
 		if self.layout.knobs.is_some() && backend == Backend::Nvidia {
-			ir.push_str("@recipe_knobs = addrspace(1) externally_initialized global i64 0, align 8\ndefine internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\n%bits = load volatile i64, ptr addrspace(1) @recipe_knobs, align 8\n%bound = icmp ne i64 %bits, 0\nbr i1 %bound, label %read, label %none\nread:\n%base = inttoptr i64 %bits to ptr addrspace(1)\n%slot = getelementptr i32, ptr addrspace(1) %base, i32 %node\n%value = load volatile i32, ptr addrspace(1) %slot, align 4\nret i32 %value\nnone:\nret i32 0\n}\n");
+			let mut lane_cases = String::new();
+			let mut lane_returns = String::new();
+			for (index, parts) in segments.iter().enumerate() {
+				if let Some(parts) = parts {
+					for part in parts {
+						lane_cases.push_str(&format!("i32 {}, label %n{index}\n", part.id));
+					}
+					lane_returns.push_str(&format!("n{index}:\nret i32 {}\n", index + 1));
+				}
+			}
+			ir.push_str(&format!("define internal i32 @recipe.model.lane.node(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %native [\n{lane_cases}]\n{lane_returns}native:\nret i32 %node\n}}\n"));
+			ir.push_str("@recipe_knobs = addrspace(1) externally_initialized global i64 0, align 8\ndefine internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\n%bits = load volatile i64, ptr addrspace(1) @recipe_knobs, align 8\n%bound = icmp ne i64 %bits, 0\nbr i1 %bound, label %read, label %none\nread:\n%base = inttoptr i64 %bits to ptr addrspace(1)\n%owner = call i32 @recipe.model.lane.node(i32 %node)\n%slot = getelementptr i32, ptr addrspace(1) %base, i32 %owner\n%value = load volatile i32, ptr addrspace(1) %slot, align 4\nret i32 %value\nnone:\nret i32 0\n}\n");
 		} else {
 			ir.push_str("define internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\nret i32 0\n}\n");
 		}
