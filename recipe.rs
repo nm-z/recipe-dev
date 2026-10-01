@@ -7683,6 +7683,46 @@ impl NativeModelIr {
 		let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
 		Some(if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() })
 	}
+	fn trace_precision_nodes(&self, device: &str) -> Result<()> {
+		for (index, plan) in self.plans.iter().enumerate() {
+			let node = &self.graph.nodes[index];
+			let detail = if node.weights() == 0 {
+				String::new()
+			} else {
+				let formats = if node.table() || plan.packed {
+					plan.stored.as_ref().map(|stored| stored.format_segments().into_iter().map(|(format, count)| {
+						let name = format.spec().map_or_else(|| if format.0 == 0 { node.precision.label().to_owned() } else { quantization(format.0).to_ascii_lowercase() }, |spec| spec.codec.quantization().name.to_owned());
+						format!("{name}:{count}")
+					}).collect::<Vec<_>>().join("+"))
+						.unwrap_or_else(|| format!("{}:{}", node.precision.label(), node.weights()))
+				} else {
+					format!("{}:{}", node.precision.label(), node.parameters)
+				};
+				let bytes = if node.table() {
+					0
+				} else if plan.packed {
+					plan.stored.as_ref().map_or(0, interleaved_span)
+				} else {
+					checked_mul(node.parameters, node.precision.bytes(), "trace stored weight bytes")?
+				};
+				let rows = node.shard.rows;
+				let terms = node.shard.terms;
+				format!(
+					" stored_formats={formats} stored_bytes={bytes} packed={} shard_rows={}:{}:{} shard_terms={}:{}:{} run_key={}",
+					plan.packed,
+					rows.first,
+					rows.count,
+					rows.period,
+					terms.first,
+					terms.count,
+					terms.period,
+					self.run_key(index).as_deref().unwrap_or("none")
+				)
+			};
+			trace(&format!("precision node {index} {} {} kv {} device={device}{detail}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
+		}
+		Ok(())
+	}
 	/// Copies of the lane bodies that call one run decoder directly. The shared
 	/// bodies reach every format's decoder through one switch and so hold every
 	/// decoder's registers, spilling them at each call; a copy holds one.
@@ -9340,10 +9380,13 @@ fn compile_native_artifact_within(target: &BackendTarget, source: &Path, output:
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	let compile_started = Instant::now();
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	if tracing() {
+		model.trace_precision_nodes(device)?;
+	}
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
 	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
@@ -19500,11 +19543,6 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 			graphs = shard(&plan, &whole)?;
 		}
 	}
-	if tracing() {
-		for (index, node) in graphs[0].nodes.iter().enumerate() {
-			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
-		}
-	}
 	for (part, device) in graphs.iter().zip(devices) {
 		let required = part_bytes(part, precision)? as u64;
 		let available = device.free_bytes()?.saturating_sub(reserve);
@@ -20947,11 +20985,6 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_kv_precision = None;
 	graph.block_qk_precision = None;
 	graph.block_rope_precision = None;
-	if tracing() {
-		for (index, node) in graph.nodes.iter().enumerate() {
-			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
-		}
-	}
 	if graph.lanes != 0 {
 		lower_collapse(&mut graph, &[], model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
@@ -24321,6 +24354,7 @@ impl NativeTape {
 				for index in 1..count {
 					line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
 				}
+				line.push_str(&format!(" device={}", self.device_label()?));
 				trace(&line)?;
 			}
 		}
@@ -26705,7 +26739,7 @@ impl Gpu {
 			attention,
 			lanes: self.lanes(),
 		};
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
+		let artifact = compile_model(&self.name, &self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		Ok((artifact, schedule, shapes, register_values, waves, element, shared_values))
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
