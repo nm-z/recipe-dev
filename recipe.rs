@@ -14363,6 +14363,42 @@ impl Recipe {
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
+	/// One output row per input row of a saved single-graph model, all rows in one forward pass:
+	/// `input` holds the rows back to back, and the result holds their outputs back to back.
+	pub fn predict_rows(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
+		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
+		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		let result = (|| -> Result<Vec<f64>> {
+			let (_, graphs) = bundle::load_semantic(&path)?;
+			require(graphs.len() == 1, "predict_rows needs a single-graph model")?;
+			let stored = &graphs[0];
+			let width = stored.inputs.len();
+			require(width != 0 && !input.is_empty() && input.len() % width == 0, format!("predict_rows expected rows of {width} values, received {}", input.len()))?;
+			let rows = input.len() / width;
+			let mut samples = input.to_vec();
+			if !stored.norm_mean.is_empty() {
+				for row in samples.chunks_exact_mut(width) {
+					for (value, (mean, scale)) in row.iter_mut().zip(stored.norm_mean.iter().zip(&stored.norm_scale)) {
+						*value = (*value - mean) / scale;
+					}
+				}
+			}
+			let config = Config::load()?;
+			let graph = materialize_saved_graph(stored, &samples[..width], device, config)?;
+			let tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &vec![0.0; rows * stored.outputs.len()], device, stored.precision, None)?;
+			tape.inject_bn_stats(&stored.bn_stats)?;
+			tape.forward(ForwardMode::Inference)?;
+			let mut result = tape.predictions()?;
+			if stored.target_span > 0.0 {
+				for value in &mut result {
+					*value = stored.target_min + stored.target_span * logistic(*value);
+				}
+			}
+			require(result.len() == rows * stored.outputs.len(), format!("predict_rows produced {} values for {rows} rows", result.len()))?;
+			Ok(result)
+		})();
+		result.unwrap_or_else(|error| panic!("{error}"))
+	}
 	/// Infer one output row for each token-id sequence in `sequences`.
 	pub fn infer_ids(&self, path: impl AsRef<Path>, sequences: &[&[u32]]) -> Vec<Vec<f64>> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
@@ -28965,6 +29001,28 @@ fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, config: Config) 
 	Ok((graph, offset))
 }
 /// The proposer's weights and optimizer state, read back out of the composition.
+/// The proposer and evaluator weights of a command RAT run, beside its bundle at `<path>.rat`:
+/// two little-endian u64 counts, then the proposer's and the evaluator's f64 values.
+fn write_rat_weights(path: &Path, proposer: &[f64], evaluator: &[f64]) -> Result<()> {
+	let mut bytes = Vec::with_capacity(16 + 8 * (proposer.len() + evaluator.len()));
+	bytes.extend((proposer.len() as u64).to_le_bytes());
+	bytes.extend((evaluator.len() as u64).to_le_bytes());
+	for value in proposer.iter().chain(evaluator) {
+		bytes.extend(value.to_le_bytes());
+	}
+	let sidecar = path.with_extension("rat");
+	fs::write(&sidecar, bytes).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", sidecar.display())))
+}
+fn read_rat_weights(path: &Path) -> Result<(Vec<f64>, Vec<f64>)> {
+	let sidecar = path.with_extension("rat");
+	let bytes = fs::read(&sidecar).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", sidecar.display())))?;
+	require(bytes.len() >= 16, "RAT weights file is truncated")?;
+	let count = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+	let (proposer, evaluator) = (count(0), count(8));
+	require(bytes.len() == 16 + 8 * (proposer + evaluator), "RAT weights file has the wrong size")?;
+	let values = bytes[16..].chunks_exact(8).map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap())).collect::<Vec<_>>();
+	Ok((values[..proposer].to_vec(), values[proposer..].to_vec()))
+}
 fn extract_rat_proposer(composed: &Graph, proposer: &mut Graph, proposer_parameters: usize) {
 	proposer.parameters.copy_from_slice(&composed.parameters[..proposer_parameters]);
 	proposer.state = composed.state.clone();
@@ -29497,7 +29555,6 @@ impl Train {
 	fn try_run_rat(&self, model: &Model, data: &Data, prepared: &Prepared, command: &RatCommand, gpu: &'static Gpu, config: Config, started: Instant) -> Result<TrainingReport> {
 		let capacity = command.policy.capacity(data, prepared.source_rows)?;
 		require(data.tests.is_empty(), "command RAT does not use held-out sources")?;
-		require(self.resume.is_none(), "a command RAT run does not support .resume()")?;
 		require(!data.target.is_empty() && data.target.len() == prepared.target_width, "a command RAT run requires one declared name for each target")?;
 		require(!prepared.target_categorical, "a command RAT run requires numeric targets")?;
 		let proposal_width = prepared.target_width;
@@ -29518,6 +29575,15 @@ impl Train {
 		let proposals = Prepared::matrix(prepared.samples[..prepared.features].to_vec(), vec![0.0; proposal_width], 1, proposal_width)?;
 		let samples = if full_set { &prepared.samples[..checked_mul(source_rows, prepared.features, "RAT proposal inputs")?] } else { proposals.samples.as_slice() };
 		let mut composition = command_rat_graph(model, &proposals, 1, gpu, config)?;
+		// A resumed command RAT starts from the proposer and evaluator a previous run saved
+		// beside its bundle, so knob-turning learned on other problems carries over.
+		if let Some(path) = &self.resume {
+			let (proposer, evaluator) = read_rat_weights(path)?;
+			require(proposer.len() == composition.proposer.parameters.len() && evaluator.len() == composition.evaluator.parameters.len(), "resumed RAT weights do not match these models")?;
+			composition.proposer.parameters.copy_from_slice(&proposer);
+			composition.graph.parameters[..proposer.len()].copy_from_slice(&proposer);
+			composition.evaluator.parameters.copy_from_slice(&evaluator);
+		}
 		composition.graph.state.training_rows = 1;
 		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
@@ -29654,6 +29720,9 @@ impl Train {
 		composition.proposer.state.trained_samples.extend_from_slice(&prepared.identities[..seen_rows]);
 		composition.proposer.state.trained_samples.sort_unstable();
 		composition.proposer.state.trained_samples.dedup();
+		if let Some(path) = &self.save {
+			write_rat_weights(path, &composition.proposer.parameters, &fitting.weights()?)?;
+		}
 		if let Some(path) = &self.save {
 			let mut stored = stored_graph(&composition.proposer, &composition.storage_model, data, None, config.precision, native_target_label(&gpu.native_target));
 			stored.bn_stats = tape.extract_bn_stats()?;
