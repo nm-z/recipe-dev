@@ -8014,6 +8014,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	let artifact = if cached {
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	} else {
+		require(std::env::var_os("RECIPE_NATIVE_CACHE_ONLY").is_none(), format!("native artifact {key} is absent in cache-only execution"))?;
 		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
@@ -14315,7 +14316,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, learning_rates: Vec::new(), weight_decay: None, tune: true, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -29497,6 +29498,9 @@ fn prepare_command_data(data: &Data) -> Result<Prepared> {
 pub struct Train {
 	epochs: usize,
 	learning_rate: f64,
+	learning_rates: Vec<f64>,
+	weight_decay: Option<f64>,
+	tune: bool,
 	log_metrics: Vec<Metric>,
 	stop: Option<f64>,
 	resume: Option<PathBuf>,
@@ -29603,6 +29607,38 @@ impl Train {
 	pub const fn lr(mut self, value: f64) -> Self {
 		self.learning_rate = value;
 		self
+	}
+	/// Absolute rates for successive epochs. An empty list uses `.lr()`;
+	/// otherwise its length must match `.epochs()`.
+	pub fn lr_schedule(mut self, rates: impl Into<Vec<f64>>) -> Self {
+		self.learning_rates = rates.into();
+		self
+	}
+	/// Override AdamW's configured decay without changing its compiled kernels.
+	pub const fn weight_decay(mut self, value: f64) -> Self {
+		self.weight_decay = Some(value);
+		self
+	}
+	/// Use the initial native schedule when false. This avoids timing-dependent
+	/// schedule selection in reproducible training experiments.
+	pub const fn tune(mut self, enabled: bool) -> Self {
+		self.tune = enabled;
+		self
+	}
+	fn epoch_rate(&self, index: usize) -> f64 {
+		self.learning_rates.get(index).copied().unwrap_or(self.learning_rate)
+	}
+	fn configure(&self, config: &mut Config) -> Result<()> {
+		require(self.learning_rate.is_finite() && self.learning_rate > 0.0, "learning rate must be finite and positive")?;
+		require(self.learning_rates.is_empty() || self.learning_rates.len() == self.epochs, "learning-rate schedule must have one rate per epoch")?;
+		require(self.learning_rates.iter().all(|rate| rate.is_finite() && *rate > 0.0), "scheduled learning rates must be finite and positive")?;
+		if let Some(decay) = self.weight_decay {
+			require(decay.is_finite() && decay >= 0.0, "weight decay must be finite and nonnegative")?;
+			config.decay = decay;
+		}
+		if let Some(seed) = self.seed { config.random_seed = seed; }
+		if !self.tune { config.schedule_budget = 0; }
+		Ok(())
 	}
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log_metrics = metrics.into_metrics();
@@ -29769,7 +29805,7 @@ impl Train {
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
 			let fitted_rows = if let Some(selector) = &mut selector {
-				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
+				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.epoch_rate(iteration), config)?.1
 			} else {
 				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
 				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
@@ -29779,7 +29815,7 @@ impl Train {
 			let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
 			let evaluator_r2 = evaluated.r2;
 			let evaluator_loss = evaluated.loss;
-			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
+			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.epoch_rate(iteration), config)?;
 			let composed = tape.metric_launch(config)?;
 			let predictions = node_values(&tape)?;
 			let (measured_score, reward) = if full_set {
@@ -29904,9 +29940,7 @@ impl Train {
 		prepared.schema = names.iter().map(|name| ("feature".to_owned(), format!("1 {name}"))).chain(outputs.iter().map(|name| ("target".to_owned(), name.clone()))).collect();
 		let gpu = selected_gpu()?;
 		let mut config = Config::load()?;
-		if let Some(seed) = self.seed {
-			config.random_seed = seed;
-		}
+		self.configure(&mut config)?;
 		let mut composition = command_rat_graph(model, &prepared, 1, gpu, config)?;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(&first.values), &first.values, &[self.rat_target.unwrap_or(0.0)], gpu, config.precision, Some(composition.loss))?;
@@ -29943,7 +29977,7 @@ impl Train {
 			}
 			let (samples, targets) = replay.snapshot();
 			let fitted_rows = if let Some(selector) = &mut selector {
-				selector.fit_selected(&mut fitting, &samples, &targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
+				selector.fit_selected(&mut fitting, &samples, &targets, 1, config.surrogate_rate, self.epoch_rate(iteration), config)?.1
 			} else {
 				fitting.fit(&samples, &targets, &(0..targets.len()).collect::<Vec<_>>(), 1, config.surrogate_rate, config)?;
 				targets.len()
@@ -29960,7 +29994,7 @@ impl Train {
 			// One proposer update uses a retained decision state. All labels are
 			// the evaluator's terminal score, never a fabricated intermediate score.
 			let row = iteration % targets.len();
-			rat_backward(&mut tape, composition.offset, &fitting.weights()?, &samples[row * width..row * width + names.len()], self.learning_rate, config)?;
+			rat_backward(&mut tape, composition.offset, &fitting.weights()?, &samples[row * width..row * width + names.len()], self.epoch_rate(iteration), config)?;
 			session.send("reset")?;
 			let first = match session.frame()? {
 				RatFrame::State(state) => state,
@@ -30046,9 +30080,7 @@ impl Train {
 			}
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
-			if let Some(seed) = self.seed {
-				config.random_seed = seed;
-			}
+			self.configure(&mut config)?;
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
 		}
 		let prepared = prepare(data)?;
@@ -30057,9 +30089,7 @@ impl Train {
 		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
 		let gpu = gpus[0];
 		let precision = config.precision;
-		if let Some(seed) = self.seed {
-			config.random_seed = seed;
-		}
+		self.configure(&mut config)?;
 		let probability = model.loss.0 >= 4;
 		let training_values = training_rows * prepared.target_width;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_values]));
@@ -30092,7 +30122,7 @@ impl Train {
 			&tape,
 			None,
 		)?;
-		if let Err(error) = tape.tune(self.learning_rate, self.epochs, config) {
+		if let Err(error) = tape.tune(self.epoch_rate(0), self.epochs, config) {
 			// An interrupt during pre-epoch tuning restores the measured state and
 			// follows the same one-checkpoint exit path as an interrupted real epoch.
 			let _ = self.finish_dispatch::<()>(Err(error), &mut stored, &prepared.schema, &tape, None)?;
@@ -30111,7 +30141,7 @@ impl Train {
 		let tolerance = self.stop.unwrap_or(0.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-		for _ in 0..self.epochs {
+		for iteration in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				self.finish_dispatch::<()>(Err(RecipeError::new("interrupted")), &mut stored, &prepared.schema, &tape, None).ok();
 				break;
@@ -30121,7 +30151,7 @@ impl Train {
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
 			let ((metrics, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
-				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
+				let dispatched = tape.epoch(self.epoch_rate(iteration), tolerance, config);
 				let ((metrics, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				let predictions = tape.predictions()?;
 				if checkpoint_requested {
