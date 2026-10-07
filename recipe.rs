@@ -2043,7 +2043,7 @@ fn window_signatures(graph: &Graph) -> Vec<String> {
 	for node in &graph.nodes {
 		let source = usize::try_from(node.source).map_or_else(|_| "input".to_owned(), |source| signatures[source].clone());
 		signatures.push(match node.op {
-			Primitive::Predictor => "whole".to_owned(),
+			Primitive::Predictor | Primitive::TensorValue | Primitive::TensorMap => "whole".to_owned(),
 			Primitive::Pool => format!("pool{}({source})", node.argument[0]),
 			Primitive::Last => "last".to_owned(),
 			Primitive::Contraction if node.argument[0] > 1.0 => format!("shift{}({source})", node.argument[0]),
@@ -2591,6 +2591,39 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
+	/// Tensor movement uses the same scheduled loops and adjoint storage as the
+	/// other native primitives. Index maps retain their transpose for reverse mode.
+	fn emit_tensor_movement(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, reverse: bool) -> Result<String> {
+		let node = &plan.node;
+		let native = self.node_precision(node);
+		let (ty, st, v, pointer) = (native.model_type, native.state_type, self.variant(node), pointer_type(backend));
+		require(self.rows == 1, "explicit tensor graphs represent batches in their tensor dimensions")?;
+		let mut ir = String::new();
+		let name = if reverse { "tensor.reverse" } else { "tensor" };
+		let p = format!("n{index}.{name}");
+		let shape = if reverse && node.op == Primitive::TensorMap { node.input } else { node.output };
+		let window = NodeWindow { begin: "0".into(), span: shape.length.to_string() };
+		let gradient = self.gradient_base(plan)?;
+		let zero = native_literal(native.state, st, 0.0);
+		emit_fixed_loop(&mut ir, index, name, 1, shape, &window, |ir, _, at| {
+			if node.op == Primitive::TensorValue {
+				if reverse {
+					ir.push_str(&format!("%{p}.in = getelementptr {st}, {pointer} {delta}, i64 {at}\n%{p}.x = load {st}, {pointer} %{p}.in, align {sa}\n%{p}.offset = add i64 {at}, {gradient}\n%{p}.out = getelementptr {st}, {pointer} %gradient, i64 %{p}.offset\nstore {st} %{p}.x, {pointer} %{p}.out, align {sa}\n", delta = pointers.delta, sa = alignment(st)));
+				} else {
+					ir.push_str(&format!("%{p}.in = getelementptr {ty}, {pointer} {weights}, i64 {at}\n%{p}.x = load {ty}, {pointer} %{p}.in, align {a}\n%{p}.out = getelementptr {ty}, {pointer} {value}, i64 {at}\nstore {ty} %{p}.x, {pointer} %{p}.out, align {a}\n", weights = pointers.weights, value = pointers.value, a = alignment(ty)));
+				}
+			} else if !reverse {
+				ir.push_str(&format!("%{p}.map = getelementptr {ty}, {pointer} {weights}, i64 {at}\n%{p}.mapped = load {ty}, {pointer} %{p}.map, align {a}\n%{p}.index = fptosi {ty} %{p}.mapped to i64\n%{p}.valid = icmp sge i64 %{p}.index, 0\n%{p}.safe = select i1 %{p}.valid, i64 %{p}.index, i64 0\n%{p}.in = getelementptr {ty}, {pointer} {source}, i64 %{p}.safe\n%{p}.raw = load {ty}, {pointer} %{p}.in, align {a}\n%{p}.x = select i1 %{p}.valid, {ty} %{p}.raw, {ty} {mz}\n%{p}.out = getelementptr {ty}, {pointer} {value}, i64 {at}\nstore {ty} %{p}.x, {pointer} %{p}.out, align {a}\n", weights = pointers.weights, source = pointers.source, value = pointers.value, a = alignment(ty), mz = native_literal(native.model, ty, 0.0)));
+			} else {
+				let first = node.output.elements();
+				let entries = first + node.input.elements() + 1;
+				ir.push_str(&format!("%{p}.start.index = add i64 {at}, {first}\n%{p}.end.index = add i64 %{p}.start.index, 1\n%{p}.start.ptr = getelementptr {ty}, {pointer} {weights}, i64 %{p}.start.index\n%{p}.end.ptr = getelementptr {ty}, {pointer} {weights}, i64 %{p}.end.index\n%{p}.start.raw = load {ty}, {pointer} %{p}.start.ptr, align {a}\n%{p}.end.raw = load {ty}, {pointer} %{p}.end.ptr, align {a}\n%{p}.start = fptoui {ty} %{p}.start.raw to i64\n%{p}.end = fptoui {ty} %{p}.end.raw to i64\nbr label %{p}.reduce\n{p}.reduce:\n%{p}.j = phi i64 [ %{p}.start, %{p}.body ], [ %{p}.next, %{p}.item ]\n%{p}.sum = phi {st} [ {zero}, %{p}.body ], [ %{p}.sum.next, %{p}.item ]\n%{p}.more = icmp ult i64 %{p}.j, %{p}.end\nbr i1 %{p}.more, label %{p}.item, label %{p}.finish\n{p}.item:\n%{p}.entry.index = add i64 %{p}.j, {entries}\n%{p}.entry.ptr = getelementptr {ty}, {pointer} {weights}, i64 %{p}.entry.index\n%{p}.entry.raw = load {ty}, {pointer} %{p}.entry.ptr, align {a}\n%{p}.entry = fptoui {ty} %{p}.entry.raw to i64\n%{p}.in = getelementptr {st}, {pointer} {delta}, i64 %{p}.entry\n%{p}.x = load {st}, {pointer} %{p}.in, align {sa}\n%{p}.sum.next = call {st} @recipe.state.add{v}({st} %{p}.sum, {st} %{p}.x)\n%{p}.next = add i64 %{p}.j, 1\nbr label %{p}.reduce\n{p}.finish:\n%{p}.out = getelementptr {st}, {pointer} {adjoint}, i64 {at}\n", weights = pointers.weights, delta = pointers.delta, adjoint = pointers.source_adjoint, a = alignment(ty), sa = alignment(st)));
+				ir.push_str(&accumulate_owned(&format!("%{p}.out"), &format!("%{p}.sum"), st, pointer, v, &format!("{p}.accumulate")));
+			}
+		})?;
+		Ok(ir)
+	}
+
 	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
 		// Integer inference stages activation codes; training uses the declared
 		// float arithmetic and keeps packed storage for checkpoint output only.
@@ -3914,6 +3947,10 @@ impl NativeModelIr {
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
+				(_, Primitive::TensorValue | Primitive::TensorMap) => {
+					ir.push_str(&self.emit_tensor_movement(backend, index, plan, &pointers, reverse)?);
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Contraction) => {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
@@ -3923,7 +3960,7 @@ impl NativeModelIr {
 						bias = node.argument[2] == 0.0,
 						decode = plan.decode(index),
 						source = pointers.source,
-						weights = pointers.weights,
+						weights = if node.argument[3] == 1.0 { &pointers.second } else { &pointers.weights },
 						value = pointers.value,
 						in_channels = node.input.channels,
 						in_length = node.input.length,
@@ -4395,8 +4432,20 @@ impl NativeModelIr {
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.reverse.schedule"), 3, 6, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
-					ir.push_str(&format!("call void @contraction_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = true, bias = node.argument[2] == 0.0, matrix_gradient = false, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = gradient_base, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
+					ir.push_str(&format!("call void @contraction_reverse_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = if node.argument[3] == 1.0 { &pointers.second } else { &pointers.weights }, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = true, bias = node.argument[2] == 0.0, matrix_gradient = false, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = gradient_base, relu = node.argument[1] == 1.0, gradient_m = tiles[0], gradient_n = tiles[1], gradient_k = tiles[2], previous_m = tiles[3], previous_n = tiles[4], previous_k = tiles[5]));
 					ir.push_str(barrier(backend));
+					if node.argument[3] == 1.0 {
+						let pointer = pointer_type(backend);
+						let st = self.node_precision(node).state_type;
+						let shape = Shape { channels: node.parameters, length: 1 };
+						let window = NodeWindow { begin: "0".into(), span: "1".into() };
+						emit_fixed_loop(&mut ir, index, "matrix.gradient", 1, shape, &window, |ir, _, at| {
+							let p = format!("n{index}.matrix.gradient");
+							ir.push_str(&format!("%{p}.offset = add i64 {at}, {gradient_base}\n%{p}.in = getelementptr {st}, {pointer} %gradient, i64 %{p}.offset\n%{p}.x = load {st}, {pointer} %{p}.in, align {a}\n%{p}.out = getelementptr {st}, {pointer} {adjoint}, i64 {at}\n", a = alignment(st), adjoint = pointers.second_adjoint));
+							ir.push_str(&accumulate_owned(&format!("%{p}.out"), &format!("%{p}.x"), st, pointer, v, &format!("{p}.add")));
+						})?;
+						ir.push_str(barrier(backend));
+					}
 				}
 				// The gather reads the packed table the run was given and the optimizer
 				// leaves it frozen, so the embedding contributes no reverse pass.
@@ -6165,7 +6214,7 @@ impl NativeModelIr {
 		};
 		let reinterpreted = source_length.is_some_and(|source_length| source_length != node.input.length);
 		match node.op {
-			Primitive::Predictor => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n")),
+			Primitive::Predictor | Primitive::TensorValue | Primitive::TensorMap => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n")),
 			_ if reinterpreted && !matches!(node.op, Primitive::Pool | Primitive::Last | Primitive::Gather) => {
 				ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n"))
 			}
@@ -7320,6 +7369,7 @@ fn emit_loss_value(ir: &mut String, suffix: &str, loss: LossFunction, precision:
 	let one = literal(1.0);
 	append_binary(ir, suffix, ty, "loss.difference", "sub", prediction, target);
 	match loss.0 {
+		7 => Ok(prediction.to_owned()),
 		0 | 1 => {
 			append_binary(ir, suffix, ty, "loss.scaled", "div", "%loss.difference", "%loss.normalizer");
 			append_binary(ir, suffix, ty, "loss.square", "mul", "%loss.scaled", "%loss.scaled");
@@ -7366,6 +7416,10 @@ fn emit_loss_gradient(ir: &mut String, suffix: &str, loss: LossFunction, precisi
 	let rows_value = "%seed.rows";
 	ir.push_str(&format!("{rows_value} = call {ty} @recipe.state.from.u32{suffix}(i32 {rows})\n", rows_value = rows_value, ty = ty, rows = rows));
 	match loss.0 {
+		7 => {
+			append_binary(ir, suffix, ty, "seed.objective", "div", &one, rows_value);
+			Ok("%seed.objective".to_owned())
+		}
 		0 => {
 			append_binary(ir, suffix, ty, "seed.twice", "add", "%seed.difference", "%seed.difference");
 			append_binary(ir, suffix, ty, "seed.mse", "div", "%seed.twice", rows_value);
@@ -14272,6 +14326,7 @@ impl LossFunction {
 			3 => "mae",
 			4 => "bce",
 			6 => "focal",
+			7 => "objective",
 			_ => unreachable!(),
 		}
 	}
@@ -17128,6 +17183,10 @@ enum Primitive {
 	Fold = 21,
 	/// The final position reached by a forward window, collapsed to length one.
 	Last = 22,
+	/// An explicit tensor value, shared by all of its consumers.
+	TensorValue = 23,
+	/// A static index map, with a transposed index for reverse accumulation.
+	TensorMap = 24,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -17192,6 +17251,8 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
+			Primitive::TensorValue => "TensorValue",
+			Primitive::TensorMap => "TensorMap",
 		}
 	}
 	fn identity(&self, index: usize) -> String {
@@ -30535,4 +30596,270 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+/// Explicit tensor composition through recipe's native graph and epoch runtime.
+/// Matrices use column-major device storage; public values use row-major order.
+pub mod tensor {
+	use super::*;
+
+	#[derive(Clone, Copy, Debug)]
+	pub struct Tensor {
+		pub id: usize,
+		pub rows: usize,
+		pub cols: usize,
+	}
+	impl Tensor {
+		fn shape(self) -> Shape { Shape { channels: self.cols, length: self.rows } }
+		pub fn len(self) -> usize { self.rows * self.cols }
+		pub fn is_empty(self) -> bool { self.len() == 0 }
+	}
+
+	pub struct GraphBuilder {
+		graph: Graph,
+		config: Config,
+	}
+	impl GraphBuilder {
+		pub fn new() -> Result<Self> {
+			let mut config = Config::load()?;
+			config.precision = Compute::FP64;
+			config.profile = Precisions { sum: Compute::FP64, embed: Compute::FP64, attn: Compute::FP64, rope: Compute::FP64, kv: Compute::FP64, atvn: Compute::FP64, norm: Compute::FP64, res: Compute::FP64, acc: Compute::FP64, ..Precisions::default() };
+			config.decay = 0.0;
+			config.beta1 = 0.9;
+			config.beta2 = 0.999;
+			config.epsilon = 1e-8;
+			config.schedule_budget = 0;
+			let mut graph = Graph::new(Shape { channels: 1, length: 1 }, 1e-6);
+			graph.profile = config.profile;
+			graph.block_kind = "tensor";
+			Ok(Self { graph, config })
+		}
+		fn result(&self) -> Tensor {
+			Tensor { id: self.graph.source as usize, rows: self.graph.output.length, cols: self.graph.output.channels }
+		}
+		fn take(&mut self, a: Tensor) -> Result<()> {
+			require(self.graph.nodes.get(a.id).is_some_and(|n| n.output == a.shape()), "tensor does not belong to this graph")?;
+			reset(&mut self.graph, a.id as i32, a.shape());
+			Ok(())
+		}
+		pub fn value(&mut self, rows: usize, cols: usize, values: &[f64], trainable: bool) -> Result<Tensor> {
+			let count = checked_mul(rows, cols, "tensor values")?;
+			require(count != 0 && values.len() == count, "tensor value shape mismatch")?;
+			require(values.iter().all(|x| x.is_finite()), "tensor values must be finite")?;
+			reset(&mut self.graph, -1, Shape { channels: 1, length: 1 });
+			push_node(&mut self.graph, Primitive::TensorValue, Shape { channels: cols, length: rows }, count, [0.0; 9], -2)?;
+			let node = self.graph.nodes.last().unwrap();
+			for r in 0..rows { for c in 0..cols { self.graph.parameters[node.offset + c * rows + r] = values[r * cols + c]; } }
+			self.graph.frozen[node.offset..node.offset + count].fill(u8::from(!trainable));
+			Ok(self.result())
+		}
+		/// Each output names an input's row-major index, or -1 for zero padding.
+		pub fn map(&mut self, a: Tensor, rows: usize, cols: usize, indices: &[isize]) -> Result<Tensor> {
+			self.take(a)?;
+			require(rows != 0 && cols != 0 && indices.len() == rows * cols, "tensor map shape mismatch")?;
+			require(indices.iter().all(|i| *i >= -1 && *i < a.len() as isize), "tensor map index out of bounds")?;
+			let mut forward = Vec::with_capacity(indices.len());
+			let mut reverse = vec![Vec::new(); a.len()];
+			for c in 0..cols { for r in 0..rows {
+				let from = indices[r * cols + c];
+				let at = if from < 0 { -1 } else { (from as usize % a.cols * a.rows + from as usize / a.cols) as isize };
+				if at >= 0 { reverse[at as usize].push(forward.len()); }
+				forward.push(at as f64);
+			} }
+			let mut words = forward;
+			let mut total = 0;
+			words.push(0.0);
+			for entries in &reverse { total += entries.len(); words.push(total as f64); }
+			for entries in &reverse { words.extend(entries.iter().map(|x| *x as f64)); }
+			push_node(&mut self.graph, Primitive::TensorMap, Shape { channels: cols, length: rows }, words.len(), [0.0; 9], -2)?;
+			let at = self.graph.nodes.last().unwrap().offset;
+			self.graph.parameters[at..].copy_from_slice(&words);
+			self.graph.frozen[at..].fill(1);
+			Ok(self.result())
+		}
+		pub fn transpose(&mut self, a: Tensor) -> Result<Tensor> {
+			let indices = (0..a.cols).flat_map(|r| (0..a.rows).map(move |c| (c * a.cols + r) as isize)).collect::<Vec<_>>();
+			self.map(a, a.cols, a.rows, &indices)
+		}
+		pub fn reshape(&mut self, a: Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+			require(a.len() == rows * cols, "reshape changes tensor size")?;
+			self.map(a, rows, cols, &(0..a.len() as isize).collect::<Vec<_>>())
+		}
+		pub fn broadcast_rows(&mut self, a: Tensor, rows: usize) -> Result<Tensor> {
+			require(a.rows == 1, "row broadcast requires one row")?;
+			self.map(a, rows, a.cols, &(0..rows * a.cols).map(|i| (i % a.cols) as isize).collect::<Vec<_>>())
+		}
+		pub fn broadcast_cols(&mut self, a: Tensor, cols: usize) -> Result<Tensor> {
+			require(a.cols == 1, "column broadcast requires one column")?;
+			self.map(a, a.rows, cols, &(0..a.rows * cols).map(|i| (i / cols) as isize).collect::<Vec<_>>())
+		}
+		pub fn matmul(&mut self, a: Tensor, b: Tensor) -> Result<Tensor> {
+			require(a.cols == b.rows, "matrix product shape mismatch")?;
+			self.take(a)?;
+			let mut args = arguments(1.0, 0.0);
+			args[2] = 1.0;
+			args[3] = 1.0;
+			push_node(&mut self.graph, Primitive::Contraction, Shape { channels: b.cols, length: a.rows }, b.len(), args, b.id as i32)?;
+			let at = self.graph.nodes.last().unwrap().offset;
+			self.graph.frozen[at..].fill(1);
+			Ok(self.result())
+		}
+		fn binary(&mut self, a: Tensor, b: Tensor, op: ScalarOpcode) -> Result<Tensor> {
+			require(a.rows == b.rows && a.cols == b.cols, "elementwise tensor shape mismatch")?;
+			self.take(a)?;
+			binary(&mut self.graph, a.id as i32, b.id as i32, a.shape(), op)?;
+			Ok(self.result())
+		}
+		pub fn add(&mut self, a: Tensor, b: Tensor) -> Result<Tensor> { self.binary(a, b, ScalarOpcode::Add) }
+		pub fn sub(&mut self, a: Tensor, b: Tensor) -> Result<Tensor> { self.binary(a, b, ScalarOpcode::Subtract) }
+		pub fn mul(&mut self, a: Tensor, b: Tensor) -> Result<Tensor> { self.binary(a, b, ScalarOpcode::Multiply) }
+		pub fn straight_through(&mut self, hard: Tensor, soft: Tensor) -> Result<Tensor> { self.binary(hard, soft, ScalarOpcode::StraightThrough) }
+		fn unary(&mut self, a: Tensor, op: ScalarOpcode) -> Result<Tensor> {
+			self.take(a)?;
+			let mut p = ScalarProgram(Vec::new());
+			p.unary(op, -1.0);
+			push_program(&mut self.graph, -2, &[], p)?;
+			Ok(self.result())
+		}
+		pub fn exp(&mut self, a: Tensor) -> Result<Tensor> { self.unary(a, ScalarOpcode::Exp) }
+		pub fn ln(&mut self, a: Tensor) -> Result<Tensor> { self.unary(a, ScalarOpcode::Log) }
+		pub fn tanh(&mut self, a: Tensor) -> Result<Tensor> { self.unary(a, ScalarOpcode::Tanh) }
+		pub fn square(&mut self, a: Tensor) -> Result<Tensor> { self.mul(a, a) }
+		pub fn scale(&mut self, a: Tensor, k: f64) -> Result<Tensor> {
+			self.take(a)?;
+			lower_scale(&mut self.graph, k)?;
+			Ok(self.result())
+		}
+		pub fn gelu(&mut self, a: Tensor) -> Result<Tensor> {
+			self.take(a)?;
+			lower_activation(&mut self.graph, Activation::Gelu, self.config)?;
+			Ok(self.result())
+		}
+		pub fn sigmoid(&mut self, a: Tensor) -> Result<Tensor> {
+			self.take(a)?;
+			lower_activation(&mut self.graph, Activation::Sigmoid, self.config)?;
+			Ok(self.result())
+		}
+		pub fn softplus(&mut self, a: Tensor) -> Result<Tensor> {
+			self.take(a)?;
+			let mut p = ScalarProgram(Vec::new());
+			let one = p.constant(1.0);
+			let hi = p.constant(30.0);
+			let lo = p.constant(-30.0);
+			let e = p.unary(ScalarOpcode::Exp, -1.0);
+			let sum = p.op(ScalarOpcode::Add, one, e);
+			let log = p.unary(ScalarOpcode::Log, sum);
+			let high = p.op(ScalarOpcode::Greater, -1.0, hi);
+			let low = p.op(ScalarOpcode::Greater, lo, -1.0);
+			let bottom = p.choose(low, e, log);
+			p.choose(high, -1.0, bottom);
+			push_program(&mut self.graph, -2, &[], p)?;
+			Ok(self.result())
+		}
+		pub fn softmax_rows(&mut self, a: Tensor) -> Result<Tensor> {
+			self.take(a)?;
+			push_node(&mut self.graph, Primitive::TopK, a.shape(), 0, [a.cols as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+			Ok(self.result())
+		}
+		pub fn standardize_rows(&mut self, a: Tensor, epsilon: f64) -> Result<Tensor> {
+			self.take(a)?;
+			let old = self.graph.epsilon;
+			self.graph.epsilon = epsilon;
+			lower_normalize(&mut self.graph, BlockNormalization::Layer, a.cols, a.cols)?;
+			self.graph.epsilon = old;
+			Ok(self.result())
+		}
+		pub fn sum_cols(&mut self, a: Tensor) -> Result<Tensor> {
+			self.take(a)?;
+			push_node(&mut self.graph, Primitive::Fold, Shape { channels: 1, length: a.rows }, 0, arguments(a.cols as f64, 0.0), -2)?;
+			Ok(self.result())
+		}
+		pub fn sum(&mut self, a: Tensor) -> Result<Tensor> {
+			let a = self.reshape(a, 1, a.len())?;
+			self.sum_cols(a)
+		}
+		pub fn concat(&mut self, tensors: &[Tensor], columns: bool) -> Result<Tensor> {
+			require(!tensors.is_empty(), "cannot concatenate no tensors")?;
+			let rows = if columns { tensors[0].rows } else { tensors.iter().map(|a| a.rows).sum() };
+			let cols = if columns { tensors.iter().map(|a| a.cols).sum() } else { tensors[0].cols };
+			let mut offset = 0;
+			let mut result = None;
+			for &a in tensors {
+				require(if columns { a.rows == rows } else { a.cols == cols }, "concatenation shape mismatch")?;
+				let mut indices = vec![-1; rows * cols];
+				for r in 0..a.rows { for c in 0..a.cols {
+					let (rr, cc) = if columns { (r, c + offset) } else { (r + offset, c) };
+					indices[rr * cols + cc] = (r * a.cols + c) as isize;
+				} }
+				let part = self.map(a, rows, cols, &indices)?;
+				result = Some(match result { None => part, Some(sum) => self.add(sum, part)? });
+				offset += if columns { a.cols } else { a.rows };
+			}
+			Ok(result.unwrap())
+		}
+		pub fn compile(mut self, output: Tensor) -> Result<Executable> {
+			self.take(output)?;
+			// Keep the selected output last while retaining values for diagnostics.
+			let mut program = ScalarProgram(Vec::new());
+			let zero = program.constant(0.0);
+			program.op(ScalarOpcode::Add, -1.0, zero);
+			push_program(&mut self.graph, -2, &[], program)?;
+			let gpu = selected_gpu()?;
+			require(gpu.backend != Backend::Cpu, "explicit tensor execution requires a GPU")?;
+			let targets = vec![0.0; output.len()];
+			let tape = NativeTape::new(&self.graph, TapeInput::Values(&[0.0]), &[0.0], &targets, gpu, Compute::FP64, Some(LossFunction(7)))?;
+			Ok(Executable { tape, config: self.config, graph: self.graph, forwards: 0, epochs: 0 })
+		}
+	}
+
+	pub struct Executable {
+		tape: NativeTape,
+		config: Config,
+		graph: Graph,
+		pub forwards: u64,
+		pub epochs: u64,
+	}
+	impl Executable {
+		pub fn forward(&mut self) -> Result<()> {
+			self.tape.forward(ForwardMode::Inference)?;
+			self.forwards += 1;
+			Ok(())
+		}
+		/// One complete native epoch, including the backward pass and Adam.
+		pub fn epoch(&mut self, rate: f64) -> Result<f64> {
+			self.tape.advance()?;
+			let loss = self.tape.full_epoch(rate, self.config)?;
+			self.epochs += 1;
+			Ok(loss)
+		}
+		pub fn gradients(&mut self) -> Result<f64> {
+			self.tape.advance()?;
+			let loss = self.tape.gradient_launch(0.0, self.config)?;
+			self.epochs += 1;
+			Ok(loss)
+		}
+		fn row_major(t: Tensor, values: &[f64]) -> Vec<f64> {
+			(0..t.rows).flat_map(|r| (0..t.cols).map(move |c| values[c * t.rows + r])).collect()
+		}
+		pub fn read(&self, tensor: Tensor) -> Result<Vec<f64>> {
+			Ok(Self::row_major(tensor, &self.tape.predictions_at(tensor.id as i32, tensor.len())?))
+		}
+		pub fn gradient(&self, tensor: Tensor) -> Result<Vec<f64>> {
+			let layout = &self.tape.program.artifact.layout;
+			let values = self.tape.adjoints.download_float_bytes(layout.adjoints[tensor.id], tensor.len(), layout.gradient_precisions[tensor.id])?;
+			Ok(Self::row_major(tensor, &values))
+		}
+		pub fn parameter(&self, tensor: Tensor) -> Result<Vec<f64>> {
+			require(self.graph.nodes[tensor.id].op == Primitive::TensorValue, "parameter access requires a value tensor")?;
+			let layout = &self.tape.program.artifact.layout;
+			Ok(Self::row_major(tensor, &self.tape.weights.download_float_bytes(layout.weights[tensor.id], tensor.len(), layout.precisions[tensor.id])?))
+		}
+		pub fn write(&self, tensor: Tensor, values: &[f64]) -> Result<()> {
+			require(values.len() == tensor.len() && self.graph.nodes[tensor.id].op == Primitive::TensorValue, "tensor write shape or kind mismatch")?;
+			let column_major = (0..tensor.cols).flat_map(|c| (0..tensor.rows).map(move |r| values[r * tensor.cols + c])).collect::<Vec<_>>();
+			let layout = &self.tape.program.artifact.layout;
+			self.tape.weights.write_float_bytes(layout.weights[tensor.id], &column_major, layout.precisions[tensor.id])
+		}
+		pub fn device(&self) -> Result<String> { self.tape.device_label() }
+	}
 }
