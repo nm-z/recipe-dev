@@ -28836,9 +28836,10 @@ struct RatCommand {
 impl RatCommand {
 	/// Scores `proposals`, one record per row of `names` values, with one
 	/// invocation: each record is a line of `name=value` fields on stdin, and the
-	/// command answers one finite score per line on stdout. Any stderr bytes or
-	/// an unsuccessful exit stop the run before a score is accepted.
-	fn evaluate(&self, names: &[String], proposals: &[f64]) -> Result<Vec<f64>> {
+	/// command answers one line per record on stdout: a finite score, or `invalid` (anything that went wrong
+	/// with that record: a failed build, a NaN, a crash), which is None. Any stderr bytes or an unsuccessful
+	/// exit stop the run before a score is accepted.
+	fn evaluate(&self, names: &[String], proposals: &[f64]) -> Result<Vec<Option<f64>>> {
 		require(!names.is_empty(), "RAT requires named inputs")?;
 		require(!proposals.is_empty() && proposals.len() % names.len() == 0, "RAT evaluator requires complete nonempty sample records")?;
 		let rows = proposals.len() / names.len();
@@ -28884,9 +28885,11 @@ impl RatCommand {
 		let scores = stdout
 			.lines()
 			.map(|line| {
+				if line.trim() == "invalid" {
+					return Ok(None);
+				}
 				let value = line.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
-				require(value.is_finite(), format!("RAT evaluator {} score must be finite", self.path.display()))?;
-				Ok(value)
+				Ok(value.is_finite().then_some(value))
 			})
 			.collect::<Result<Vec<_>>>()?;
 		require(scores.len() == rows, format!("RAT evaluator {} returned {} scores for {rows} samples", self.path.display(), scores.len()))?;
@@ -29220,11 +29223,13 @@ struct RatReplay {
 	capacity: usize,
 	rows: VecDeque<Vec<f64>>,
 	raw: VecDeque<f64>,
+	/// Observations the command answered `invalid`: kept for a validity model, never fitted as scores.
+	invalid: Vec<Vec<f64>>,
 }
 impl RatReplay {
 	fn new(width: usize, capacity: usize) -> Result<Self> {
 		require(width != 0 && capacity != 0, "RAT replay dimensions must be positive")?;
-		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new() })
+		Ok(Self { width, capacity, rows: VecDeque::new(), raw: VecDeque::new(), invalid: Vec::new() })
 	}
 	fn observe(&mut self, input: &[f64], value: f64) -> Result<f64> {
 		require(input.len() == self.width && input.iter().all(|entry| entry.is_finite()), "RAT observation has invalid features")?;
@@ -29236,6 +29241,18 @@ impl RatReplay {
 		self.rows.push_back(input.to_vec());
 		self.raw.push_back(value);
 		Ok(value)
+	}
+	/// Records a command answer: a score joins the fitted observations; `invalid` (None) is kept apart and
+	/// reported as NaN.
+	fn observe_answer(&mut self, input: &[f64], value: Option<f64>) -> Result<f64> {
+		match value {
+			Some(value) => self.observe(input, value),
+			None => {
+				require(input.len() == self.width && input.iter().all(|entry| entry.is_finite()), "RAT observation has invalid features")?;
+				self.invalid.push(input.to_vec());
+				Ok(f64::NAN)
+			}
+		}
 	}
 	fn snapshot(&self) -> (Vec<f64>, Vec<f64>) {
 		(self.rows.iter().flatten().copied().collect(), self.raw.iter().copied().collect())
@@ -29790,7 +29807,7 @@ impl Train {
 			f64::NAN
 		} else {
 			let initial_observation = observation(samples, &initial_predictions)?;
-			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
+			replay.observe_answer(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
 		};
 		// The `Loss` field reports the evaluator model's loss. The external
 		// command score is reported separately through `Score`; it is not a
@@ -29825,10 +29842,11 @@ impl Train {
 					.collect::<Vec<_>>();
 				let scores = command.evaluate(&input_names, &observed)?;
 				for (row, value) in observed.chunks_exact(observation_width).zip(scores) {
-					replay.observe(row, value)?;
+					replay.observe_answer(row, value)?;
 				}
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
+			require(!evaluation_targets.is_empty(), "every command answer so far was invalid, so the evaluator has nothing to fit")?;
 			let fitted_rows = if let Some(selector) = &mut selector {
 				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
 			} else {
@@ -29848,8 +29866,8 @@ impl Train {
 				(reward, reward)
 			} else {
 				let observed = observation(sample, &predictions)?;
-				let raw_score = command.evaluate(&input_names, &observed)?[0];
-				(raw_score, replay.observe(&observed, raw_score)?)
+				let answer = command.evaluate(&input_names, &observed)?[0];
+				(answer.unwrap_or(f64::NAN), replay.observe_answer(&observed, answer)?)
 			};
 			if iteration == 0 {
 				let before_fit = before_fit.unwrap_or(evaluated);
@@ -29882,7 +29900,7 @@ impl Train {
 				.collect::<Vec<_>>();
 			let scores = command.evaluate(&input_names, &observed)?;
 			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
-				replay.observe(row, value)?;
+				replay.observe_answer(row, value)?;
 			}
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
