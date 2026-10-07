@@ -14370,7 +14370,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, rat_valid: None, rat_steps: (1, 1) }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -29126,8 +29126,10 @@ struct CommandRatComposition {
 	loss: LossFunction,
 	proposal: usize,
 	offset: usize,
+	/// The validity model and where its weights start in the composed graph.
+	validity: Option<(Graph, usize)>,
 }
-fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
+fn command_rat_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
 	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
 	let proposer_model = model.edit(|proposer| proposer.downstream = None);
@@ -29138,8 +29140,17 @@ fn command_rat_graph(model: &Model, prepared: &Prepared, rows: usize, gpu: &'sta
 	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
 	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
 	let proposal = proposer.nodes.len() - 1;
-	let (graph, offset) = compose_scored_graph(&proposer, &evaluator, config)?;
-	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset })
+	let validity = match validity {
+		Some(model) => {
+			let graph = compile(model, &observations, &observations.targets, 1, gpu, config, true)?;
+			require(graph.output.elements() == 1, "a RAT validity model must emit one probability")?;
+			Some(graph)
+		}
+		None => None,
+	};
+	let (graph, offset, valid_offset) = compose_scored_graph(&proposer, &evaluator, validity.as_ref(), config)?;
+	let validity = validity.zip(valid_offset);
+	Ok(CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal, offset, validity })
 }
 /// Route input channels to output channels through a frozen projection whose
 /// only nonzero weights are ones: `channels[output]` names the input channel
@@ -29165,7 +29176,7 @@ fn embed(graph: &mut Graph, source: i32, shape: Shape, channels: impl IntoIterat
 }
 /// The proposer followed by the frozen scorer over `[input ; proposal]`. Returns
 /// the composed graph and the parameter offset where the scorer's weights start.
-fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, config: Config) -> Result<(Graph, usize)> {
+fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, validity: Option<&Graph>, config: Config) -> Result<(Graph, usize, Option<usize>)> {
 	let (features, targets) = if scorer_graph.input.length == 1 {
 		(Shape { channels: proposer.input.elements(), length: 1 }, Shape { channels: proposer.output.elements(), length: 1 })
 	} else {
@@ -29178,14 +29189,31 @@ fn compose_scored_graph(proposer: &Graph, scorer_graph: &Graph, config: Config) 
 	let tail = graph.source;
 	let carried = embed(&mut graph, -1, features, (0..features.channels).map(Some).chain(std::iter::repeat_n(None, targets.channels)))?;
 	let proposed = embed(&mut graph, tail, targets, std::iter::repeat_n(None, features.channels).chain((0..targets.channels).map(Some)))?;
-	binary(&mut graph, carried, proposed, wide, ScalarOpcode::Add)?;
+	let joined = binary(&mut graph, carried, proposed, wide, ScalarOpcode::Add)?;
 	let offset = graph.parameters.len();
-	append_graph(&mut graph, scorer_graph.clone())?;
+	let score = append_graph(&mut graph, scorer_graph.clone())?;
+	let score_shape = graph.output;
+	let mut valid_offset = None;
+	if let Some(validity) = validity {
+		require(validity.input == wide && validity.output.elements() == 1, "RAT validity model has an incompatible shape")?;
+		reset(&mut graph, joined, wide);
+		valid_offset = Some(graph.parameters.len());
+		let probability = append_graph(&mut graph, validity.clone())?;
+		// score - ln(eps + (1 - 2 eps) p): the validity term of Remy's loss, finite at p = 0
+		let mut scalar = ScalarProgram(Vec::new());
+		let eps = scalar.constant(1e-4);
+		let keep = scalar.constant(1.0 - 2e-4);
+		let kept = scalar.op(ScalarOpcode::Multiply, -2.0, keep);
+		let floored = scalar.op(ScalarOpcode::Add, kept, eps);
+		let log = scalar.unary(ScalarOpcode::Log, floored);
+		scalar.op(ScalarOpcode::Subtract, -1.0, log);
+		program(&mut graph, score, probability, score_shape, &[], scalar)?;
+	}
 	graph.frozen[offset..].fill(1);
 	graph.state.moments.resize(graph.parameters.len(), 0.0);
 	graph.state.variances.resize(graph.parameters.len(), 0.0);
 	graph.refresh_storage(config)?;
-	Ok((graph, offset))
+	Ok((graph, offset, valid_offset))
 }
 /// The proposer's weights and optimizer state, read back out of the composition.
 /// The proposer and evaluator weights of a command RAT run, beside its bundle at `<path>.rat`:
@@ -29345,6 +29373,25 @@ impl RatFit {
 		rat_fit_steps(&mut self.tape, 1, rate, config)
 	}
 }
+/// Update the proposer once through the fitted frozen models, each part `(offset, weights)` loaded where its
+/// weights start in the composed graph (parts in ascending offset order).
+fn rat_backward_parts(tape: &mut NativeTape, parts: &[(usize, &[f64])], input: &[f64], steps: usize, rate: f64, config: Config) -> Result<()> {
+	let layout = &tape.program.artifact.layout;
+	let mut written = vec![0usize; parts.len()];
+	for (index, &(start, count)) in layout.spans.iter().enumerate() {
+		if count == 0 { continue; }
+		let Some(part) = parts.iter().rposition(|(offset, _)| start >= *offset) else { continue };
+		let (offset, weights) = parts[part];
+		let first = start - offset;
+		let end = checked_add(first, count, "RAT frozen weight span")?;
+		let values = weights.get(first..end).ok_or_else(|| RecipeError::new("RAT frozen weights do not match the composed graph"))?;
+		tape.weights.write_float_bytes(layout.weights[index], values, layout.precisions[index])?;
+		written[part] = checked_add(written[part], count, "RAT frozen weights")?;
+	}
+	require(parts.iter().zip(&written).all(|((_, weights), written)| *written == weights.len()), "RAT frozen weights are incomplete")?;
+	tape.samples.write_float_bytes(0, input, layout.input_precision)?;
+	rat_fit_steps(tape, steps, rate, config)
+}
 /// Update the proposer once through the fitted evaluator.
 fn rat_backward(tape: &mut NativeTape, offset: usize, teacher_weights: &[f64], input: &[f64], rate: f64, config: Config) -> Result<()> {
 	let layout = &tape.program.artifact.layout;
@@ -29428,7 +29475,7 @@ impl LearnedReplay {
 		let scorer = self.selection_score.as_ref().ok_or_else(|| RecipeError::new("learned RAT selection scorer is absent"))?;
 		let selector_node = selector.graph.nodes.len().checked_sub(1).ok_or_else(|| RecipeError::new("learned RAT selector has no output node"))?;
 		let selector_parameters = selector.graph.parameters.len();
-		let (mut graph, score_offset) = compose_scored_graph(&selector.graph, &scorer.graph, config)?;
+		let (mut graph, score_offset, _) = compose_scored_graph(&selector.graph, &scorer.graph, None, config)?;
 		if let Some(previous) = previous {
 			copy_learned_state(&previous.graph, &mut graph)?;
 			graph.refresh_storage(config)?;
@@ -29582,6 +29629,8 @@ pub struct Train {
 	seed: Option<usize>,
 	rat: Option<RatCommand>,
 	rat_target: Option<f64>,
+	rat_valid: Option<Model>,
+	rat_steps: (usize, usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -29729,6 +29778,20 @@ impl Train {
 		self.rat = Some(RatCommand { path: resolve_path(command).unwrap_or_else(|error| panic!("{error}")), policy });
 		self
 	}
+	/// A validity model for command RAT: it fits every scored observation as valid (0.95) or `invalid` (0.05)
+	/// and ends in a sigmoid; the proposer then trains on the evaluator's output minus ln of the validity
+	/// model's probability, so it moves away from proposals the command answers `invalid`.
+	/// Command RAT training steps per epoch: `evaluators` for the evaluator and validity model, `proposer` for
+	/// the proposer through them. Defaults to one each.
+	pub fn rat_steps(mut self, evaluators: usize, proposer: usize) -> Self {
+		assert!(evaluators > 0 && proposer > 0, "RAT steps must be positive");
+		self.rat_steps = (evaluators, proposer);
+		self
+	}
+	pub fn valid(mut self, model: &Model) -> Self {
+		self.rat_valid = Some(model.clone());
+		self
+	}
 	/// Desired raw command score for proposer optimization. Defaults to zero.
 	/// This does not replace the measured scores used to fit the evaluator.
 	pub fn target(mut self, value: f64) -> Self {
@@ -29775,7 +29838,7 @@ impl Train {
 		let proposal_rows = if full_set { source_rows } else { 1 };
 		let proposals = Prepared::matrix(prepared.samples[..prepared.features].to_vec(), vec![0.0; proposal_width], 1, proposal_width)?;
 		let samples = if full_set { &prepared.samples[..checked_mul(source_rows, prepared.features, "RAT proposal inputs")?] } else { proposals.samples.as_slice() };
-		let mut composition = command_rat_graph(model, &proposals, 1, gpu, config)?;
+		let mut composition = command_rat_graph(model, self.rat_valid.as_ref(), &proposals, 1, gpu, config)?;
 		// A resumed command RAT starts from the proposer and evaluator a previous run saved
 		// beside its bundle, so knob-turning learned on other problems carries over.
 		if let Some(path) = &self.resume {
@@ -29814,6 +29877,7 @@ impl Train {
 		// substitute for the evaluator's loss.
 		let mut initial_loss = f64::NAN;
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let mut validity_fit = composition.validity.as_ref().map(|(graph, _)| RatFit::new(graph, gpu, bce, config)).transpose()?;
 		let mut selector = (command.policy == RatPolicy::Learned).then(|| LearnedReplay::new(observation_width, gpu, config)).transpose()?;
 		let mut measured_reward = initial_reward;
 		let mut measured_predictions = initial_predictions.clone();
@@ -29851,14 +29915,33 @@ impl Train {
 				selector.fit_selected(&mut fitting, &evaluation_samples, &evaluation_targets, 1, config.surrogate_rate, self.learning_rate, config)?.1
 			} else {
 				let indices = (0..evaluation_targets.len()).collect::<Vec<_>>();
-				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, 1, config.surrogate_rate, config)?;
+				fitting.fit(&evaluation_samples, &evaluation_targets, &indices, self.rat_steps.0, config.surrogate_rate, config)?;
 				indices.len()
 			};
 			let before_fit = (iteration == 0 && fitting.tape.step != 0).then(|| fitting.tape.epoch_metrics()).transpose()?;
 			let evaluated = fitting.measure(&evaluation_samples, &evaluation_targets, config)?;
 			let evaluator_r2 = evaluated.r2;
 			let evaluator_loss = evaluated.loss;
-			rat_backward(&mut tape, composition.offset, &fitting.weights()?, sample, self.learning_rate, config)?;
+			// the validity model fits every observation: valid (0.95) or `invalid` (0.05), label-smoothed
+			let validity_weights = match &mut validity_fit {
+				Some(fit) => {
+					let mut valid_samples = evaluation_samples.clone();
+					let mut valid_targets = vec![0.95; evaluation_targets.len()];
+					for row in &replay.invalid {
+						valid_samples.extend_from_slice(row);
+						valid_targets.push(0.05);
+					}
+					let indices = (0..valid_targets.len()).collect::<Vec<_>>();
+					fit.fit(&valid_samples, &valid_targets, &indices, self.rat_steps.0, config.surrogate_rate, config)?;
+					Some(fit.weights()?)
+				}
+				None => None,
+			};
+			let score_weights = fitting.weights()?;
+			match (&composition.validity, &validity_weights) {
+				(Some((_, valid_offset)), Some(weights)) => rat_backward_parts(&mut tape, &[(composition.offset, &score_weights), (*valid_offset, weights)], sample, self.rat_steps.1, self.learning_rate, config)?,
+				_ => rat_backward_parts(&mut tape, &[(composition.offset, &score_weights)], sample, self.rat_steps.1, self.learning_rate, config)?,
+			}
 			let composed = tape.metric_launch(config)?;
 			let predictions = node_values(&tape)?;
 			let (measured_score, reward) = if full_set {
@@ -29986,7 +30069,7 @@ impl Train {
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}
-		let mut composition = command_rat_graph(model, &prepared, 1, gpu, config)?;
+		let mut composition = command_rat_graph(model, None, &prepared, 1, gpu, config)?;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(&first.values), &first.values, &[self.rat_target.unwrap_or(0.0)], gpu, config.precision, Some(composition.loss))?;
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
