@@ -14370,7 +14370,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, rat_valid: None, rat_steps: (1, 1) }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, rat_valid: None, rat_steps: (1, 1), rat_space: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -28839,6 +28839,49 @@ impl RatCommand {
 	/// command answers one line per record on stdout: a finite score, or `invalid` (anything that went wrong
 	/// with that record: a failed build, a NaN, a crash), which is None. Any stderr bytes or an unsuccessful
 	/// exit stop the run before a score is accepted.
+	/// Scores whole `name=value,...` lines with one invocation, as `evaluate` does.
+	fn evaluate_lines(&self, lines: &[String]) -> Result<Vec<Option<f64>>> {
+		require(!lines.is_empty() && lines.iter().all(|line| !line.contains('\n')), "RAT evaluator lines are invalid")?;
+		let mut child = Command::new(&self.path)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.map_err(|error| RecipeError::new(format!("cannot start RAT evaluator {}: {error}", self.path.display())))?;
+		let input = child.stdin.take().ok_or_else(|| RecipeError::new("RAT evaluator stdin is unavailable"))?;
+		let (output, write) = std::thread::scope(|scope| {
+			let writer = scope.spawn(move || -> std::io::Result<()> {
+				let mut input = std::io::BufWriter::new(input);
+				for line in lines {
+					input.write_all(line.as_bytes())?;
+					input.write_all(b"\n")?;
+				}
+				input.flush()
+			});
+			let output = child.wait_with_output();
+			(output, writer.join())
+		});
+		let output = output.map_err(|error| RecipeError::new(format!("cannot wait for RAT evaluator {}: {error}", self.path.display())))?;
+		if !output.status.success() || !output.stderr.is_empty() {
+			let error = if output.stderr.is_empty() { output.status.to_string() } else { String::from_utf8_lossy(&output.stderr).trim().to_owned() };
+			return Err(RecipeError::new(format!("{} failed with {error:?}", self.path.display())));
+		}
+		write.map_err(|_| RecipeError::new("RAT input writer panicked"))?.map_err(|error| RecipeError::new(format!("cannot write to RAT evaluator {}: {error}", self.path.display())))?;
+		let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RecipeError::new(format!("RAT evaluator {} wrote non-UTF-8 stdout", self.path.display())))?;
+		let scores = stdout
+			.lines()
+			.map(|line| {
+				if line.trim() == "invalid" {
+					return Ok(None);
+				}
+				let value = line.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("RAT evaluator {} wrote an invalid score: {error}", self.path.display())))?;
+				Ok(value.is_finite().then_some(value))
+			})
+			.collect::<Result<Vec<_>>>()?;
+		require(scores.len() == lines.len(), format!("RAT evaluator {} returned {} scores for {} lines", self.path.display(), scores.len(), lines.len()))?;
+		Ok(scores)
+	}
+
 	fn evaluate(&self, names: &[String], proposals: &[f64]) -> Result<Vec<Option<f64>>> {
 		require(!names.is_empty(), "RAT requires named inputs")?;
 		require(!proposals.is_empty() && proposals.len() % names.len() == 0, "RAT evaluator requires complete nonempty sample records")?;
@@ -29129,6 +29172,290 @@ struct CommandRatComposition {
 	/// The validity model and where its weights start in the composed graph.
 	validity: Option<(Graph, usize)>,
 }
+/// One knob of a command RAT knob space (`Train::space`), read from the table `remy knob-table` writes: its
+/// softmax points' positions on the knob's scale and value texts, whether it is continuous (the evaluators then read
+/// its position instead of a one-hot), the condition that makes it active, and the design's first guess.
+#[derive(Clone, Debug)]
+struct RatKnob {
+	name: String,
+	continuous: bool,
+	parent: Option<(usize, Vec<usize>)>,
+	u: Vec<f64>,
+	text: Vec<String>,
+	first: Option<usize>,
+}
+fn read_knob_table(path: &Path) -> Result<Vec<RatKnob>> {
+	let text = std::fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read knob table {}: {error}", path.display())))?;
+	let mut knobs: Vec<RatKnob> = Vec::new();
+	for (index, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+		let bad = |what: &str| RecipeError::new(format!("knob table {} line {}: invalid {what}", path.display(), index + 1));
+		let field: Vec<&str> = line.split('\t').collect();
+		if field.len() != 7 {
+			return Err(bad("field count (7 tab-separated fields)"));
+		}
+		let parent: i64 = field[2].parse().map_err(|_| bad("parent"))?;
+		let parent = if parent < 0 {
+			None
+		} else {
+			let allowed = field[3].split(',').map(|o| o.parse::<usize>().map_err(|_| bad("allowed options"))).collect::<Result<Vec<_>>>()?;
+			if parent as usize >= knobs.len() {
+				return Err(bad("parent (it must come earlier)"));
+			}
+			Some((parent as usize, allowed))
+		};
+		let u = field[4].split(',').map(|x| x.parse::<f64>().map_err(|_| bad("positions"))).collect::<Result<Vec<_>>>()?;
+		let text = field[5].split('|').map(str::to_owned).collect::<Vec<_>>();
+		if u.is_empty() || u.len() != text.len() {
+			return Err(bad("points"));
+		}
+		let first: i64 = field[6].parse().map_err(|_| bad("first guess"))?;
+		knobs.push(RatKnob { name: field[0].to_owned(), continuous: field[1] == "1", parent, u, text, first: (first >= 0).then_some(first as usize) });
+	}
+	require(!knobs.is_empty(), "knob table is empty")?;
+	Ok(knobs)
+}
+/// (softmax width, evaluator width): every point of every knob, and one value per continuous knob plus one per
+/// option of every other knob.
+fn knob_widths(knobs: &[RatKnob]) -> (usize, usize) {
+	(knobs.iter().map(|kn| kn.u.len()).sum(), knobs.iter().map(|kn| if kn.continuous { 1 } else { kn.u.len() }).sum())
+}
+/// Inactive conditional knobs set to None.
+fn knob_canonical(knobs: &[RatKnob], choice: &[Option<usize>]) -> Vec<Option<usize>> {
+	let mut out = choice.to_vec();
+	for k in 0..knobs.len() {
+		let active = match &knobs[k].parent {
+			None => true,
+			Some((p, allowed)) => out[*p].is_some_and(|o| allowed.contains(&o)),
+		};
+		if !active {
+			out[k] = None;
+		}
+	}
+	out
+}
+fn knob_one_hot(knobs: &[RatKnob], choice: &[Option<usize>]) -> Vec<f64> {
+	let mut out = Vec::new();
+	for (kn, c) in knobs.iter().zip(choice) {
+		out.extend((0..kn.u.len()).map(|o| if *c == Some(o) { 1.0 } else { 0.0 }));
+	}
+	out
+}
+/// What the evaluators read about a configuration: a one-hot per knob with options, the position on its scale of a
+/// continuous knob, zeros for an inactive knob.
+fn knob_observation(knobs: &[RatKnob], choice: &[Option<usize>]) -> Vec<f64> {
+	let mut out = Vec::new();
+	for (kn, c) in knobs.iter().zip(choice) {
+		if kn.continuous {
+			out.push(c.map_or(0.0, |o| kn.u[o]));
+		} else {
+			out.extend((0..kn.u.len()).map(|o| if *c == Some(o) { 1.0 } else { 0.0 }));
+		}
+	}
+	out
+}
+fn knob_line(knobs: &[RatKnob], choice: &[Option<usize>]) -> String {
+	knobs.iter().zip(choice).filter_map(|(kn, c)| c.map(|o| format!("{}={}", kn.name, kn.text[o]))).collect::<Vec<_>>().join(",")
+}
+struct KnobCandidate {
+	score: f64,
+	ranks: Vec<usize>,
+}
+impl PartialEq for KnobCandidate {
+	fn eq(&self, other: &Self) -> bool {
+		self.cmp(other) == std::cmp::Ordering::Equal
+	}
+}
+impl Eq for KnobCandidate {}
+impl PartialOrd for KnobCandidate {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+impl Ord for KnobCandidate {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.score.total_cmp(&other.score).then_with(|| other.ranks.cmp(&self.ranks))
+	}
+}
+/// The most probable configuration the run hasn't guessed (remy-core's `decode`): each knob's options ranked by
+/// probability, then a best-first search over rank vectors. None if 20,000 candidates were all guessed.
+fn decode_knobs(knobs: &[RatKnob], probabilities: &[f64], seen: &std::collections::HashSet<Vec<Option<usize>>>) -> Option<Vec<Option<usize>>> {
+	let mut ranked: Vec<Vec<(usize, f64)>> = Vec::new();
+	let mut start = 0;
+	for kn in knobs {
+		let n = kn.u.len();
+		let mut alts: Vec<(usize, f64)> = (0..n).map(|o| (o, probabilities[start + o].max(1e-300).ln())).collect();
+		alts.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+		ranked.push(alts);
+		start += n;
+	}
+	let build = |ranks: &[usize]| knob_canonical(knobs, &ranks.iter().enumerate().map(|(k, &r)| Some(ranked[k][r].0)).collect::<Vec<_>>());
+	let score = |ranks: &[usize]| ranks.iter().enumerate().map(|(k, &r)| ranked[k][r].1).sum::<f64>();
+	let mut heap = std::collections::BinaryHeap::new();
+	let mut visited = std::collections::HashSet::new();
+	let begin = vec![0usize; knobs.len()];
+	visited.insert(begin.clone());
+	heap.push(KnobCandidate { score: score(&begin), ranks: begin });
+	let mut pops = 0;
+	while let Some(candidate) = heap.pop() {
+		pops += 1;
+		let choice = build(&candidate.ranks);
+		if !seen.contains(&choice) {
+			return Some(choice);
+		}
+		if pops > 20_000 {
+			return None;
+		}
+		for k in 0..knobs.len() {
+			if choice[k].is_none() || candidate.ranks[k] + 1 >= ranked[k].len() {
+				continue;
+			}
+			let mut ranks = candidate.ranks.clone();
+			ranks[k] += 1;
+			if visited.insert(ranks.clone()) {
+				heap.push(KnobCandidate { score: score(&ranks), ranks });
+			}
+		}
+	}
+	None
+}
+/// Rank scores of the valid scores, in (-1, 1), lower is better, ties sharing their mean rank (remy-core's targets).
+fn rank_targets(raw: &[f64]) -> Vec<f64> {
+	let n = raw.len();
+	let mut order: Vec<usize> = (0..n).collect();
+	order.sort_by(|&a, &b| raw[a].total_cmp(&raw[b]));
+	let mut out = vec![0.0; n];
+	let mut i = 0;
+	while i < n {
+		let mut j = i;
+		while j + 1 < n && raw[order[j + 1]] == raw[order[i]] {
+			j += 1;
+		}
+		let rank = (i + j) as f64 / 2.0;
+		for t in i..=j {
+			out[order[t]] = 2.0 * (rank + 0.5) / n as f64 - 1.0;
+		}
+		i = j + 1;
+	}
+	out
+}
+/// A frozen projection of `source` onto `weights.len() / shape.channels` channels, with row-major [output][input]
+/// weights and an optional bias. Returns the node and the offset where its weights start.
+fn frozen_projection(graph: &mut Graph, source: i32, shape: Shape, weights: &[f64], offsets: Option<&[f64]>) -> Result<(i32, usize)> {
+	require(shape.length == 1 && weights.len() % shape.channels == 0, "frozen projection shape is invalid")?;
+	let outputs = weights.len() / shape.channels;
+	reset(graph, source, shape);
+	let saved = (graph.block_precision, graph.block_blck_precision, graph.bias);
+	graph.block_precision = Some(Compute::FP32);
+	graph.block_blck_precision = Some(Compute::FP32);
+	graph.bias = offsets.is_some();
+	lower_contraction(graph, outputs, offsets.is_some())?;
+	(graph.block_precision, graph.block_blck_precision, graph.bias) = saved;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("frozen projection node is absent"))?;
+	let (offset, count) = (node.offset, node.parameters);
+	require(count == weights.len() + offsets.map_or(0, <[f64]>::len), "frozen projection did not get the requested bias")?;
+	graph.parameters[offset..offset + weights.len()].copy_from_slice(weights);
+	if let Some(offsets) = offsets {
+		graph.parameters[offset + weights.len()..offset + count].copy_from_slice(offsets);
+	}
+	graph.frozen[offset..offset + count].fill(1);
+	Ok((graph.source, offset))
+}
+/// The command RAT composition for a knob space: the proposer's logits, standardized per knob, become one softmax per
+/// knob; a straight-through node passes the decoded one-hot forward (its bias, one-hot minus softmax, is written
+/// before every step) and the gradient back to the softmax; a frozen projection turns the decoded configuration into
+/// what the evaluators read; then the evaluator and validity model as in `compose_scored_graph`. Returns the
+/// composition, where the straight-through weights start, and the softmax node.
+fn command_rat_knob_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, knobs: &[RatKnob], gpu: &'static Gpu, config: Config) -> Result<(CommandRatComposition, usize, i32)> {
+	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
+	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
+	let proposer_model = model.edit(|proposer| proposer.downstream = None);
+	let mut proposer = compile(&proposer_model, prepared, &prepared.targets, 1, gpu, config, true)?;
+	proposer.refresh_storage(config)?;
+	let (p, q) = knob_widths(knobs);
+	require(proposer.output.elements() == p, format!("the proposer must emit {p} logits (one per option, 21 per continuous knob); it emits {}", proposer.output.elements()))?;
+	let shape = Shape { channels: p, length: 1 };
+	let mut front = proposer.clone();
+	let logits = front.source;
+	// standardize each knob's logits (remy-core's Linguini): (z - mean) / (tau sd), tau = 1.5, so the softmax can't
+	// collapse and the gradient stays alive
+	let mut average = vec![0.0; p * p];
+	let mut start = 0;
+	for kn in knobs {
+		let n = kn.u.len();
+		for i in start..start + n {
+			for j in start..start + n {
+				average[i * p + j] = 1.0 / n as f64;
+			}
+		}
+		start += n;
+	}
+	let (mean, _) = frozen_projection(&mut front, logits, shape, &average, None)?;
+	let centered = binary(&mut front, logits, mean, shape, ScalarOpcode::Subtract)?;
+	let squared = binary(&mut front, centered, centered, shape, ScalarOpcode::Multiply)?;
+	let (variance, _) = frozen_projection(&mut front, squared, shape, &average, None)?;
+	let mut scalar = ScalarProgram(Vec::new());
+	let floor = scalar.constant(1e-6);
+	let floored = scalar.op(ScalarOpcode::Add, -1.0, floor);
+	let log = scalar.unary(ScalarOpcode::Log, floored);
+	let half = scalar.constant(-0.5);
+	let power = scalar.op(ScalarOpcode::Multiply, log, half);
+	let root = scalar.unary(ScalarOpcode::Exp, power);
+	let temperature = scalar.constant(1.0 / 1.5);
+	scalar.op(ScalarOpcode::Multiply, root, temperature);
+	let inverse = program(&mut front, variance, -2, shape, &[], scalar)?;
+	let standardized = binary(&mut front, centered, inverse, shape, ScalarOpcode::Multiply)?;
+	let (exps, _) = activation(&mut front, standardized, shape, Activation::Exp, config)?;
+	let mut ones = vec![0.0; p * p];
+	let mut start = 0;
+	for kn in knobs {
+		let n = kn.u.len();
+		for i in start..start + n {
+			for j in start..start + n {
+				ones[i * p + j] = 1.0;
+			}
+		}
+		start += n;
+	}
+	let (sums, _) = frozen_projection(&mut front, exps, shape, &ones, None)?;
+	let probabilities = binary(&mut front, exps, sums, shape, ScalarOpcode::Divide)?;
+	let identity = (0..p * p).map(|i| if i / p == i % p { 1.0 } else { 0.0 }).collect::<Vec<_>>();
+	let (decoded, straight_through) = frozen_projection(&mut front, probabilities, shape, &identity, Some(&vec![0.0; p]))?;
+	let mut read = vec![0.0; q * p];
+	let (mut start, mut row) = (0, 0);
+	for kn in knobs {
+		let n = kn.u.len();
+		if kn.continuous {
+			for j in 0..n {
+				read[row * p + start + j] = kn.u[j];
+			}
+			row += 1;
+		} else {
+			for j in 0..n {
+				read[(row + j) * p + start + j] = 1.0;
+			}
+			row += n;
+		}
+		start += n;
+	}
+	frozen_projection(&mut front, decoded, shape, &read, None)?;
+	let observation_width = checked_add(prepared.features, q, "RAT evaluator input width")?;
+	let observations = Prepared::matrix(vec![0.0; observation_width], vec![0.0], 1, 1)?;
+	let evaluator = compile(evaluator_model, &observations, &observations.targets, 1, gpu, config, true)?;
+	require(evaluator.output.elements() == 1, "a RAT evaluator must emit one reward")?;
+	let validity = match validity {
+		Some(model) => {
+			let graph = compile(model, &observations, &observations.targets, 1, gpu, config, true)?;
+			require(graph.output.elements() == 1, "a RAT validity model must emit one probability")?;
+			Some(graph)
+		}
+		None => None,
+	};
+	let (graph, offset, valid_offset) = compose_scored_graph(&front, &evaluator, validity.as_ref(), config)?;
+	let validity = validity.zip(valid_offset);
+	let composition = CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal: probabilities as usize, offset, validity };
+	Ok((composition, straight_through, probabilities))
+}
+
 fn command_rat_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
 	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
@@ -29631,6 +29958,7 @@ pub struct Train {
 	rat_target: Option<f64>,
 	rat_valid: Option<Model>,
 	rat_steps: (usize, usize),
+	rat_space: Option<PathBuf>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -29783,6 +30111,13 @@ impl Train {
 	/// model's probability, so it moves away from proposals the command answers `invalid`.
 	/// Command RAT training steps per epoch: `evaluators` for the evaluator and validity model, `proposer` for
 	/// the proposer through them. Defaults to one each.
+	/// A command RAT over a knob space: the knob table `remy knob-table SPACE` writes. The proposer emits one logit
+	/// per option (21 per continuous knob); guesses are decoded configurations, sent as `name=value` lines over the
+	/// active knobs, and each epoch is one guess after the design's first guess.
+	pub fn space(mut self, table: impl AsRef<Path>) -> Self {
+		self.rat_space = Some(resolve_path(table).unwrap_or_else(|error| panic!("{error}")));
+		self
+	}
 	pub fn rat_steps(mut self, evaluators: usize, proposer: usize) -> Self {
 		assert!(evaluators > 0 && proposer > 0, "RAT steps must be positive");
 		self.rat_steps = (evaluators, proposer);
@@ -29816,6 +30151,129 @@ impl Train {
 			true,
 		)
 	}
+	/// Command RAT over a knob space (`Train::space`): Remy's first order. Guess 1 is the design's first guess; each
+	/// later guess fits the evaluator (rank scores of the valid answers) and the validity model, then trains the
+	/// proposer through both for `rat_steps.1` steps, decoding the softmax before every step (straight-through, with
+	/// repeat rejection), then decodes and asks the command. Prints one `remy-guess` line per guess.
+	fn try_run_rat_knobs(&self, model: &Model, data: &Data, command: &RatCommand, knobs: &[RatKnob], gpu: &'static Gpu, config: Config, started: Instant) -> Result<TrainingReport> {
+		require(data.tests.is_empty(), "command RAT does not use held-out sources")?;
+		require(command.policy == RatPolicy::History, "a knob-space command RAT uses the history policy")?;
+		let (p, q) = knob_widths(knobs);
+		let observations = Data {
+			sources: data.sources.clone(),
+			tests: data.tests.clone(),
+			autoregressive: false,
+			target: Vec::new(),
+			features: data.features.clone(),
+			normalize: data.normalize,
+			split: 1.0,
+			split_supplied: false,
+			prepared: OnceLock::new(),
+			file: None,
+		};
+		let prepared = prepare_data(&observations)?;
+		let sample = prepared.samples[..prepared.features].to_vec();
+		let proposals = Prepared::matrix(sample.clone(), vec![0.0; p], 1, p)?;
+		let (mut composition, straight_through, probability_node) = command_rat_knob_graph(model, self.rat_valid.as_ref(), &proposals, knobs, gpu, config)?;
+		composition.graph.state.training_rows = 1;
+		composition.proposer.state.training_rows = 1;
+		let objectives = vec![self.rat_target.unwrap_or(0.0); 1];
+		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(&sample), &sample, &objectives, gpu, config.precision, Some(composition.loss))?;
+		let st_span = {
+			let layout = &tape.program.artifact.layout;
+			let index = layout.spans.iter().position(|&(start, count)| start == straight_through && count == p * p + p).ok_or_else(|| RecipeError::new("straight-through weights are absent from the composed graph"))?;
+			(layout.weights[index], layout.precisions[index])
+		};
+		let identity = (0..p * p).map(|i| if i / p == i % p { 1.0 } else { 0.0 }).collect::<Vec<_>>();
+		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
+		let mut validity_fit = composition.validity.as_ref().map(|(graph, _)| RatFit::new(graph, gpu, bce, config)).transpose()?;
+		let mut replay = RatReplay::new(prepared.features + q, self.epochs + 1)?;
+		let mut seen = std::collections::HashSet::new();
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		let mut best: Option<f64> = None;
+		let mut epoch_seconds = 0.0;
+		let mut ask = |choice: Vec<Option<usize>>, number: usize, seconds: f64, replay: &mut RatReplay, seen: &mut std::collections::HashSet<Vec<Option<usize>>>| -> Result<()> {
+			let line = knob_line(knobs, &choice);
+			let answer = command.evaluate_lines(std::slice::from_ref(&line))?[0];
+			let observation = sample.iter().copied().chain(knob_observation(knobs, &choice)).collect::<Vec<_>>();
+			replay.observe_answer(&observation, answer)?;
+			seen.insert(choice);
+			if let Some(score) = answer {
+				best = Some(best.map_or(score, |b: f64| b.min(score)));
+			}
+			println!("remy-guess\t{number}\t{line}\t{}\t{seconds:.6}", answer.map_or("invalid".to_owned(), |s| format!("{s:?}")));
+			Ok(())
+		};
+		let first = knob_canonical(knobs, &knobs.iter().map(|kn| Some(kn.first.unwrap_or(0))).collect::<Vec<_>>());
+		ask(first, 1, 0.0, &mut replay, &mut seen)?;
+		for iteration in 0..self.epochs {
+			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted")?;
+			let epoch_started = Instant::now();
+			let (samples, raw) = replay.snapshot();
+			if !raw.is_empty() {
+				let targets = rank_targets(&raw);
+				let indices = (0..targets.len()).collect::<Vec<_>>();
+				fitting.fit(&samples, &targets, &indices, self.rat_steps.0, config.surrogate_rate, config)?;
+			}
+			let validity_weights = match &mut validity_fit {
+				Some(fit) => {
+					let mut valid_samples = samples.clone();
+					let mut valid_targets = vec![0.95; raw.len()];
+					for row in &replay.invalid {
+						valid_samples.extend_from_slice(row);
+						valid_targets.push(0.05);
+					}
+					let indices = (0..valid_targets.len()).collect::<Vec<_>>();
+					fit.fit(&valid_samples, &valid_targets, &indices, self.rat_steps.0, config.surrogate_rate, config)?;
+					Some(fit.weights()?)
+				}
+				None => None,
+			};
+			let score_weights = fitting.weights()?;
+			let mut parts: Vec<(usize, &[f64])> = vec![(composition.offset, &score_weights)];
+			if let (Some((_, valid_offset)), Some(weights)) = (&composition.validity, &validity_weights) {
+				parts.push((*valid_offset, weights));
+			}
+			let mut decoded = None;
+			for _ in 0..self.rat_steps.1 {
+				tape.metric_launch(config)?;
+				let probabilities = tape.predictions_at(probability_node, p)?[..p].to_vec();
+				let choice = decode_knobs(knobs, &probabilities, &seen).ok_or_else(|| RecipeError::new("every configuration near the proposal was already guessed"))?;
+				let one_hot = knob_one_hot(knobs, &choice);
+				let values = identity.iter().copied().chain(one_hot.iter().zip(&probabilities).map(|(h, s)| h - s)).collect::<Vec<_>>();
+				tape.weights.write_float_bytes(st_span.0, &values, st_span.1)?;
+				rat_backward_parts(&mut tape, &parts, &sample, 1, self.learning_rate, config)?;
+				decoded = Some(choice);
+			}
+			tape.metric_launch(config)?;
+			let probabilities = tape.predictions_at(probability_node, p)?[..p].to_vec();
+			let choice = decode_knobs(knobs, &probabilities, &seen).or(decoded).ok_or_else(|| RecipeError::new("every configuration near the proposal was already guessed"))?;
+			let seconds = epoch_started.elapsed().as_secs_f64();
+			epoch_seconds += seconds;
+			ask(choice, iteration + 2, seconds, &mut replay, &mut seen)?;
+		}
+		let point = |loss: f64| TrainingPoint { loss, predictions: Vec::new(), r2: f64::NAN, rat: RatPoint::default() };
+		let observability = single_training_observability(data.report_path()?, 1, &tape, None, None, point(f64::NAN), ScalarHistory::default(), PredictionHistory::default(), ScalarHistory::default(), RatHistory::default(), point(best.unwrap_or(f64::NAN)), self.epochs, epoch_seconds)?;
+		Ok(TrainingReport {
+			observability,
+			initial_loss: f64::NAN,
+			final_loss: best.unwrap_or(f64::NAN),
+			initial_predictions: Vec::new(),
+			final_predictions: Vec::new(),
+			final_r2: f64::NAN,
+			evaluator_r2: None,
+			validation_r2: None,
+			predicted_reward: None,
+			measured_reward: best,
+			tile: tape.tile(),
+			schedule: tape.schedule(),
+			run,
+			epoch: tape.step as usize,
+			seconds: started.elapsed().as_secs_f64(),
+			epoch_seconds,
+		})
+	}
+
 	fn try_run_rat(&self, model: &Model, data: &Data, prepared: &Prepared, command: &RatCommand, gpu: &'static Gpu, config: Config, started: Instant) -> Result<TrainingReport> {
 		let capacity = command.policy.capacity(data, prepared.source_rows)?;
 		require(data.tests.is_empty(), "command RAT does not use held-out sources")?;
@@ -30205,6 +30663,14 @@ impl Train {
 			}
 			if data.autoregressive && data.sources.is_empty() {
 				return self.try_run_stateful_rat(model, data, command, started);
+			}
+			if let Some(table) = &self.rat_space {
+				let knobs = read_knob_table(table)?;
+				let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+				if let Some(seed) = self.seed {
+					config.random_seed = seed;
+				}
+				return self.try_run_rat_knobs(model, data, command, &knobs, gpu, config, started);
 			}
 			let prepared = prepare_command_data(data)?;
 			let (gpu, mut config) = (selected_gpu()?, Config::load()?);
