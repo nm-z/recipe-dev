@@ -14316,7 +14316,20 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, learning_rates: Vec::new(), weight_decay: None, tune: true, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
+		Train {
+			epochs: 1,
+			learning_rate: 0.001,
+			learning_rates: Vec::new(),
+			weight_decay: None,
+			tune: true,
+			log_metrics: Vec::new(),
+			stop: Some(1.0),
+			resume: None,
+			save: None,
+			seed: None,
+			rat: None,
+			rat_target: None,
+		}
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -29625,9 +29638,7 @@ impl Train {
 		self.tune = enabled;
 		self
 	}
-	fn epoch_rate(&self, index: usize) -> f64 {
-		self.learning_rates.get(index).copied().unwrap_or(self.learning_rate)
-	}
+	fn epoch_rate(&self, index: usize) -> f64 { self.learning_rates.get(index).copied().unwrap_or(self.learning_rate) }
 	fn configure(&self, config: &mut Config) -> Result<()> {
 		require(self.learning_rate.is_finite() && self.learning_rate > 0.0, "learning rate must be finite and positive")?;
 		require(self.learning_rates.is_empty() || self.learning_rates.len() == self.epochs, "learning-rate schedule must have one rate per epoch")?;
@@ -29636,8 +29647,12 @@ impl Train {
 			require(decay.is_finite() && decay >= 0.0, "weight decay must be finite and nonnegative")?;
 			config.decay = decay;
 		}
-		if let Some(seed) = self.seed { config.random_seed = seed; }
-		if !self.tune { config.schedule_budget = 0; }
+		if let Some(seed) = self.seed {
+			config.random_seed = seed;
+		}
+		if !self.tune {
+			config.schedule_budget = 0;
+		}
 		Ok(())
 	}
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
