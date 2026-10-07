@@ -197,6 +197,10 @@ dev:
 	tile, score, choices, window
 ```
 
+```bash
+RECIPE_TILES="8x8x1024/8x8x48/8x8x64 8x8x64/8x8x48/8x8x64 8x8x64/8x8x48/8x8x32 8x8x32/8x8x48/8x8x1" recipe run model.rs --device cpu
+```
+
 ## **RAT**
 
 ```rust
@@ -310,6 +314,7 @@ train().run().*
 	(initial_predictions|predictions)()[]
 	(evaluator_r2|validation_r2|predicted_reward|measured_reward)()
 	tile()[]
+	candidates[]
 	rows
 infer().run().*
 	(pp|tg)()

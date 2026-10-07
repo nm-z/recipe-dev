@@ -20250,6 +20250,74 @@ impl NativeTape {
 			}))
 			.collect())
 	}
+	/// Every extent the compiled artifact can dispatch, per contraction node and
+	/// direction: forward, weight gradient, and input gradient.
+	fn contraction_candidates(&self) -> Result<Vec<Option<[Vec<Tile>; 3]>>> {
+		let ratio = narrow(self.precision.state.bytes().div_ceil(usize::from(self.program.forward.kernel.element)), "native contraction state ratio")? as u32;
+		let schedule = &self.program.schedule;
+		self.program
+			.shapes
+			.iter()
+			.zip(&self.program.compiled)
+			.map(|(shape, compiled)| match (shape, compiled) {
+				(Some(shape), Some(compiled)) => Ok(Some([
+					runtime_extents(shape.forward, compiled.forward, schedule, true, ratio)?,
+					runtime_extents(shape.gradient, compiled.gradient, schedule, false, ratio)?,
+					runtime_extents(shape.previous, compiled.previous, schedule, false, ratio)?,
+				])),
+				_ => Ok(None),
+			})
+			.collect()
+	}
+	fn candidate_lines(&self) -> Result<Vec<String>> {
+		let device = self.device_label()?;
+		let directions: &[&str] = if self.program.epoch.is_some() { &["fwd", "wgd", "igd"] } else { &["pp"] };
+		let mut lines = Vec::new();
+		for (index, candidates) in self.contraction_candidates()?.iter().enumerate() {
+			let Some(candidates) = candidates else { continue };
+			for (direction, extents) in directions.iter().zip(candidates) {
+				let extents = extents.iter().map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).collect::<Vec<_>>().join(" ");
+				lines.push(format!("{device}  candidates: {} {direction} {extents}", self.nodes[index].identity(index)));
+			}
+		}
+		Ok(lines)
+	}
+	/// Dispatches the `RECIPE_TILES` schedule: one `fwd/wgd/igd` group of
+	/// `MxNxK` extents per contraction node in execution order, the form
+	/// `.log([tile])` prints. Every extent must be one of its candidates.
+	fn apply_fixed_schedule(&mut self, text: &str) -> Result<()> {
+		let candidates = self.contraction_candidates()?;
+		let nodes = candidates.iter().enumerate().filter_map(|(index, candidates)| candidates.as_ref().map(|candidates| (index, candidates))).collect::<Vec<_>>();
+		let groups = text.split_whitespace().collect::<Vec<_>>();
+		require(groups.len() == nodes.len(), format!("RECIPE_TILES has {} contraction groups, the model has {}", groups.len(), nodes.len()))?;
+		let mut contractions = self.program.compiled.clone();
+		for ((index, candidates), group) in nodes.into_iter().zip(groups) {
+			let extents = group
+				.split('/')
+				.map(|extent| match extent.split('x').map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>().as_deref() {
+					Ok(&[m, n, k]) => Ok(Tile { m, n, k }),
+					_ => Err(RecipeError::new(format!("RECIPE_TILES extent {extent:?} is not MxNxK"))),
+				})
+				.collect::<Result<Vec<_>>>()?;
+			let [forward, gradient, previous] = extents[..] else { return Err(RecipeError::new(format!("RECIPE_TILES group {group:?} is not fwd/wgd/igd"))) };
+			for ((direction, extent), allowed) in ["fwd", "wgd", "igd"].into_iter().zip([forward, gradient, previous]).zip(candidates) {
+				require(
+					allowed.contains(&extent),
+					format!(
+						"RECIPE_TILES {direction} {}x{}x{} is not a candidate for {}; candidates: {}",
+						extent.m,
+						extent.n,
+						extent.k,
+						self.nodes[index].identity(index),
+						allowed.iter().map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).collect::<Vec<_>>().join(" ")
+					),
+				)?;
+			}
+			let slot = contractions[index].as_mut().ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
+			(slot.forward, slot.gradient, slot.previous) = (forward, gradient, previous);
+		}
+		self.apply_contraction_schedule(contractions)
+	}
 	fn grid_lines(&self) -> Result<Vec<String>> {
 		let device = self.device_label()?;
 		let mut lines = Vec::new();
@@ -21345,6 +21413,9 @@ impl DeviceTape {
 	fn tile_report(&self) -> Result<ReportLines> {
 		Ok(ReportLines::new(self.shards.iter().map(NativeTape::tile_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
 	}
+	fn candidate_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.shards.iter().map(NativeTape::candidate_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
 	fn grid_report(&self) -> Result<ReportLines> {
 		Ok(ReportLines::new(self.shards.iter().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
 	}
@@ -21434,8 +21505,13 @@ impl DeviceTape {
 	fn tile(&self) -> Tile {
 		self.shards[0].tile()
 	}
-	/// Cap total tuning launches by the requested epoch count.
+	/// Cap total tuning launches by the requested epoch count. `RECIPE_TILES`
+	/// replaces tuning with its fixed schedule on every shard.
 	fn tune(&mut self, rate: f64, epochs: usize, config: Config) -> Result<()> {
+		if let Some(tiles) = std::env::var_os("RECIPE_TILES") {
+			let tiles = tiles.into_string().map_err(|_| RecipeError::new("RECIPE_TILES is not text"))?;
+			return self.shards.iter_mut().try_for_each(|shard| shard.apply_fixed_schedule(&tiles));
+		}
 		let budget = config.schedule_budget.min(epochs);
 		if config.schedule_candidates == 0 || budget == 0 {
 			return Ok(());
@@ -21543,6 +21619,7 @@ fn training_observability(
 		links: tape.link_report()?,
 		aot: tape.aot_report()?,
 		tiles: tape.tile_report()?,
+		candidates: tape.candidate_report()?,
 		grids: tape.grid_report()?,
 		load: DurationReport(tape.load_seconds()),
 		compile: DurationReport(tape.compile_seconds()),
@@ -21582,6 +21659,7 @@ fn single_training_observability(
 		links,
 		aot: ReportLines::new([predicted_epoch.map_or_else(|| format!("{device}  aot: rows {rows}"), |seconds| format!("{device}  aot: rows {rows} predicted epoch {:.3} µs", seconds * 1e6))]),
 		tiles: ReportLines::new(tape.tile_lines()?),
+		candidates: ReportLines::new(tape.candidate_lines()?),
 		grids: ReportLines::new(tape.grid_lines()?),
 		load: DurationReport(tape.load_seconds),
 		compile: DurationReport(tape.compile_seconds),
@@ -22191,6 +22269,9 @@ struct NativeProgram {
 	tile: Tile,
 	shapes: Vec<Option<NativeContractionShapes>>,
 	schedule: NativeSchedule,
+	/// The analytic tiles the artifact was compiled for. Runtime candidates are
+	/// relative to them, whatever schedule is dispatched now.
+	compiled: Vec<Option<NativeContractionTiles>>,
 	shared_values: u32,
 	reduction_values: u32,
 	gradient_bytes: usize,
@@ -23648,7 +23729,21 @@ impl NativeProgram {
 		let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_bytes = if artifact.training { native_gradient_bytes(graph, schedule.scratch_base as usize, &schedule.contractions)? } else { 0 };
-		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, shapes, shared_values: schedule.shared_values, schedule, reduction_values, gradient_bytes })
+		Ok(Self {
+			gpu,
+			artifact,
+			backend,
+			forward,
+			epoch,
+			model_load,
+			tile: schedule.tile,
+			shapes,
+			shared_values: schedule.shared_values,
+			compiled: schedule.contractions.clone(),
+			schedule,
+			reduction_values,
+			gradient_bytes,
+		})
 	}
 
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
@@ -25597,6 +25692,34 @@ fn schedule_candidates(limits: Tile, current: Tile, schedule: &NativeSchedule, f
 		}
 	}
 	Ok(candidates)
+}
+
+/// Every extent one contraction direction can dispatch with the compiled
+/// artifact: the tuning candidates, then each of their vector M/N spans with a
+/// shorter staged K. A shorter K stages whole chunks, the multi-tile walk the
+/// analytic tile takes when the whole K does not fit. As in the chunk buffer's
+/// sizing, only a workgroup wider than one lane has k lanes that own chunks.
+fn runtime_extents(limits: Tile, current: Tile, schedule: &NativeSchedule, forward: bool, ratio: u32) -> Result<Vec<Tile>> {
+	let mut extents = schedule_candidates(limits, current, schedule, forward, ratio, usize::MAX)?;
+	if schedule.matrix && forward {
+		return Ok(extents);
+	}
+	let owned_capacity = schedule.chunk_values.div_ceil(schedule.register_count).max(1);
+	for span in extents.clone() {
+		for k in (1..span.k.div_ceil(schedule.chunk_k)).rev().map(|chunks| chunks * schedule.chunk_k) {
+			let extent = Tile { k, ..span };
+			let output_lanes = (extent.m / schedule.register_m).max(1) * (extent.n / schedule.register_n).max(1);
+			let owned = k.div_ceil(schedule.chunk_k).div_ceil((schedule.block / output_lanes).max(2));
+			if (schedule.block > 1 && owned > owned_capacity)
+				|| native_contraction_shared_values(extent, schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k, ratio, false)? > schedule.shared_values
+				|| extents.contains(&extent)
+			{
+				continue;
+			}
+			extents.push(extent);
+		}
+	}
+	Ok(extents)
 }
 
 fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Tile> {
@@ -30289,6 +30412,8 @@ pub struct TrainingObservability {
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
+	/// Every runtime extent each contraction direction can dispatch, the values `RECIPE_TILES` accepts.
+	pub candidates: ReportLines,
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
