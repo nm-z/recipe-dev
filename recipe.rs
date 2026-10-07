@@ -14370,7 +14370,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, rat_valid: None, rat_steps: (1, 1), rat_space: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, rat_valid: None, rat_steps: (1, 1), rat_space: None, rat_entropy: 0.0 }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -29347,6 +29347,68 @@ fn rank_targets(raw: &[f64]) -> Vec<f64> {
 	}
 	out
 }
+/// remy-core's `continuous_entropy`: the normalized nearest-neighbor (Kozachenko-Leonenko, k = 1) entropy of
+/// positions on [0, 1], with distances floored at 0.005; 0 when the guesses coincide, 1 when evenly spread.
+fn knob_continuous_entropy(us: &[f64]) -> f64 {
+	let n = us.len();
+	if n < 2 {
+		return 0.0;
+	}
+	let mut s = us.to_vec();
+	s.sort_by(f64::total_cmp);
+	let mut sum = 0.0;
+	for i in 0..n {
+		let left = if i > 0 { s[i] - s[i - 1] } else { f64::INFINITY };
+		let right = if i + 1 < n { s[i + 1] - s[i] } else { f64::INFINITY };
+		sum += (left.min(right) + 0.005).ln();
+	}
+	(n - 1) as f64 * ((sum / n as f64).exp() - 0.005)
+}
+/// The gradient of -lambda H(x) with respect to the decoded configuration's softmax inputs, at that configuration:
+/// H is the run's exploration entropy with x added (remy-core's definition: per knob, the entropy of the option
+/// counts over ln(option count), or the nearest-neighbor entropy of a continuous knob's positions; averaged over the
+/// knobs). History includes invalid guesses; an inactive knob contributes nothing.
+fn knob_entropy_gradient(knobs: &[RatKnob], guessed: &[Vec<Option<usize>>], choice: &[Option<usize>], lambda: f64) -> Vec<f64> {
+	let mut g = vec![0.0; KNOB_SLOTS * KNOB_OPTIONS];
+	let counted = knobs.iter().filter(|kn| kn.continuous || kn.u.len() >= 2).count() as f64;
+	if counted == 0.0 || lambda == 0.0 {
+		return g;
+	}
+	for (k, kn) in knobs.iter().enumerate() {
+		let Some(chosen) = choice[k] else { continue };
+		let base = k * KNOB_OPTIONS;
+		if kn.continuous {
+			let us: Vec<f64> = guessed.iter().filter_map(|c| c[k].map(|o| kn.u[o])).collect();
+			let at = |u: f64| {
+				let mut positions = us.clone();
+				positions.push(u);
+				knob_continuous_entropy(&positions)
+			};
+			let (lo, hi) = ((kn.u[chosen] - 1e-4).max(0.0), (kn.u[chosen] + 1e-4).min(1.0));
+			let slope = (at(hi) - at(lo)) / (hi - lo);
+			for j in 0..kn.u.len() {
+				g[base + j] = -lambda * slope * kn.u[j] / counted;
+			}
+		} else if kn.u.len() >= 2 {
+			let n = kn.u.len();
+			let mut c = vec![0.0; n];
+			for h in guessed {
+				if let Some(o) = h[k] {
+					c[o] += 1.0;
+				}
+			}
+			c[chosen] += 1.0;
+			let total: f64 = c.iter().sum();
+			let log_q: Vec<f64> = c.iter().map(|x| (x / total).max(0.5 / total).ln()).collect();
+			let mean: f64 = c.iter().zip(&log_q).map(|(x, l)| x / total * l).sum();
+			for j in 0..n {
+				g[base + j] = -lambda * (-(log_q[j] - mean) / (total * (n as f64).ln())) / counted;
+			}
+		}
+	}
+	g
+}
+
 /// A frozen projection of `source` onto `weights.len() / shape.channels` channels, with row-major [output][input]
 /// weights and an optional bias. Returns the node and the offset where its weights start.
 fn frozen_projection(graph: &mut Graph, source: i32, shape: Shape, weights: &[f64], offsets: Option<&[f64]>) -> Result<(i32, usize)> {
@@ -29374,7 +29436,7 @@ fn frozen_projection(graph: &mut Graph, source: i32, shape: Shape, weights: &[f6
 /// before every step) and the gradient back to the softmax; a frozen projection turns the decoded configuration into
 /// what the evaluators read; then the evaluator and validity model as in `compose_scored_graph`. Returns the
 /// composition, where the straight-through weights start, and the softmax node.
-fn command_rat_knob_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, knobs: &[RatKnob], gpu: &'static Gpu, config: Config) -> Result<(CommandRatComposition, usize, i32)> {
+fn command_rat_knob_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, knobs: &[RatKnob], gpu: &'static Gpu, config: Config) -> Result<(CommandRatComposition, usize, i32, usize)> {
 	let evaluator_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT proposal model requires .loss(&evaluator)"))?;
 	require(evaluator_model.downstream.is_none(), "a RAT evaluator cannot have a downstream model")?;
 	let proposer_model = model.edit(|proposer| proposer.downstream = None);
@@ -29428,6 +29490,8 @@ fn command_rat_knob_graph(model: &Model, validity: Option<&Model>, prepared: &Pr
 	let probabilities = binary(&mut front, exps, sums, shape, ScalarOpcode::Divide)?;
 	let identity = (0..p * p).map(|i| if i / p == i % p { 1.0 } else { 0.0 }).collect::<Vec<_>>();
 	let (decoded, straight_through) = frozen_projection(&mut front, probabilities, shape, &identity, Some(&vec![0.0; p]))?;
+	// the exploration term: a frozen projection whose weights are the gradient of -lambda H, written before every step
+	let (entropy, entropy_weights) = frozen_projection(&mut front, decoded, shape, &vec![0.0; p], None)?;
 	let mut read = vec![0.0; q * p];
 	for (k, kn) in knobs.iter().enumerate() {
 		let (start, row) = (k * KNOB_OPTIONS, k * (KNOB_OPTIONS + 1));
@@ -29452,10 +29516,13 @@ fn command_rat_knob_graph(model: &Model, validity: Option<&Model>, prepared: &Pr
 		}
 		None => None,
 	};
-	let (graph, offset, valid_offset) = compose_scored_graph(&front, &evaluator, validity.as_ref(), config)?;
+	let (mut graph, offset, valid_offset) = compose_scored_graph(&front, &evaluator, validity.as_ref(), config)?;
+	let scored = graph.source;
+	binary(&mut graph, scored, entropy, Shape { channels: 1, length: 1 }, ScalarOpcode::Add)?;
+	graph.refresh_storage(config)?;
 	let validity = validity.zip(valid_offset);
 	let composition = CommandRatComposition { graph, proposer, storage_model: proposer_model, evaluator, loss: evaluator_model.loss, proposal: probabilities as usize, offset, validity };
-	Ok((composition, straight_through, probabilities))
+	Ok((composition, straight_through, probabilities, entropy_weights))
 }
 
 fn command_rat_graph(model: &Model, validity: Option<&Model>, prepared: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<CommandRatComposition> {
@@ -29988,6 +30055,7 @@ pub struct Train {
 	rat_valid: Option<Model>,
 	rat_steps: (usize, usize),
 	rat_space: Option<PathBuf>,
+	rat_entropy: f64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -30143,6 +30211,13 @@ impl Train {
 	/// A command RAT over a knob space: the knob table `remy knob-table SPACE` writes. The proposer emits one logit
 	/// per option (21 per continuous knob); guesses are decoded configurations, sent as `name=value` lines over the
 	/// active knobs, and each epoch is one guess after the design's first guess.
+	/// The exploration weight lambda of a knob-space command RAT: the proposer's loss becomes evaluator output minus
+	/// ln P_valid minus lambda times the run's exploration entropy with the proposal added. Defaults to 0.
+	pub fn entropy(mut self, lambda: f64) -> Self {
+		assert!(lambda.is_finite() && lambda >= 0.0, "exploration weight must be finite and nonnegative");
+		self.rat_entropy = lambda;
+		self
+	}
 	pub fn space(mut self, table: impl AsRef<Path>) -> Self {
 		self.rat_space = Some(resolve_path(table).unwrap_or_else(|error| panic!("{error}")));
 		self
@@ -30203,7 +30278,7 @@ impl Train {
 		let prepared = prepare_data(&observations)?;
 		let sample = prepared.samples[..prepared.features].to_vec();
 		let proposals = Prepared::matrix(sample.clone(), vec![0.0; p], 1, p)?;
-		let (mut composition, straight_through, probability_node) = command_rat_knob_graph(model, self.rat_valid.as_ref(), &proposals, knobs, gpu, config)?;
+		let (mut composition, straight_through, probability_node, entropy_weights) = command_rat_knob_graph(model, self.rat_valid.as_ref(), &proposals, knobs, gpu, config)?;
 		let proposer_parameters = composition.proposer.parameters.len();
 		// fixed values: a resumed run starts from saved weights; whatever it learns is live and never saved unless asked
 		if let Some(path) = &self.resume {
@@ -30224,6 +30299,12 @@ impl Train {
 			let index = layout.spans.iter().position(|&(start, count)| start == straight_through && count == p * p + p).ok_or_else(|| RecipeError::new("straight-through weights are absent from the composed graph"))?;
 			(layout.weights[index], layout.precisions[index])
 		};
+		let entropy_span = {
+			let layout = &tape.program.artifact.layout;
+			let index = layout.spans.iter().position(|&(start, count)| start == entropy_weights && count == p).ok_or_else(|| RecipeError::new("exploration weights are absent from the composed graph"))?;
+			(layout.weights[index], layout.precisions[index])
+		};
+		let mut guessed: Vec<Vec<Option<usize>>> = Vec::new();
 		let identity = (0..p * p).map(|i| if i / p == i % p { 1.0 } else { 0.0 }).collect::<Vec<_>>();
 		let mut fitting = RatFit::new(&composition.evaluator, gpu, composition.loss, config)?;
 		let mut validity_fit = composition.validity.as_ref().map(|(graph, _)| RatFit::new(graph, gpu, bce, config)).transpose()?;
@@ -30232,11 +30313,12 @@ impl Train {
 		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
 		let mut best: Option<f64> = None;
 		let mut epoch_seconds = 0.0;
-		let mut ask = |choice: Vec<Option<usize>>, number: usize, seconds: f64, replay: &mut RatReplay, seen: &mut std::collections::HashSet<Vec<Option<usize>>>| -> Result<()> {
+		let mut ask = |choice: Vec<Option<usize>>, number: usize, seconds: f64, replay: &mut RatReplay, seen: &mut std::collections::HashSet<Vec<Option<usize>>>, guessed: &mut Vec<Vec<Option<usize>>>| -> Result<()> {
 			let line = knob_line(knobs, &choice);
 			let answer = command.evaluate_lines(std::slice::from_ref(&line))?[0];
 			let observation = sample.iter().copied().chain(knob_observation(knobs, &choice)).collect::<Vec<_>>();
 			replay.observe_answer(&observation, answer)?;
+			guessed.push(choice.clone());
 			seen.insert(choice);
 			if let Some(score) = answer {
 				best = Some(best.map_or(score, |b: f64| b.min(score)));
@@ -30245,7 +30327,7 @@ impl Train {
 			Ok(())
 		};
 		let first = knob_canonical(knobs, &knobs.iter().map(|kn| Some(kn.first.unwrap_or(0))).collect::<Vec<_>>());
-		ask(first, 1, 0.0, &mut replay, &mut seen)?;
+		ask(first, 1, 0.0, &mut replay, &mut seen, &mut guessed)?;
 		for iteration in 0..self.epochs {
 			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted")?;
 			let epoch_started = Instant::now();
@@ -30282,6 +30364,7 @@ impl Train {
 				let one_hot = knob_one_hot(knobs, &choice);
 				let values = identity.iter().copied().chain(one_hot.iter().zip(&probabilities).map(|(h, s)| h - s)).collect::<Vec<_>>();
 				tape.weights.write_float_bytes(st_span.0, &values, st_span.1)?;
+				tape.weights.write_float_bytes(entropy_span.0, &knob_entropy_gradient(knobs, &guessed, &choice, self.rat_entropy), entropy_span.1)?;
 				rat_backward_parts(&mut tape, &parts, &sample, 1, self.learning_rate, config)?;
 				decoded = Some(choice);
 			}
@@ -30290,7 +30373,7 @@ impl Train {
 			let choice = decode_knobs(knobs, &probabilities, &seen).or(decoded).ok_or_else(|| RecipeError::new("every configuration near the proposal was already guessed"))?;
 			let seconds = epoch_started.elapsed().as_secs_f64();
 			epoch_seconds += seconds;
-			ask(choice, iteration + 2, seconds, &mut replay, &mut seen)?;
+			ask(choice, iteration + 2, seconds, &mut replay, &mut seen, &mut guessed)?;
 		}
 		if let Some(path) = &self.save {
 			tape.capture(&mut composition.graph)?;
