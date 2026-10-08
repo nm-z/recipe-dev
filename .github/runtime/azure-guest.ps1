@@ -4,7 +4,12 @@ param(
 	[Parameter(Mandatory = $true)] [string] $snapshotSha256,
 	[Parameter(Mandatory = $true)] [string] $runtimeSuiteSha256,
 	[Parameter(Mandatory = $true)] [string] $snapshotUriEncoded,
-	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded
+	[Parameter(Mandatory = $true)] [string] $runtimeSuiteUriEncoded,
+	[Parameter(Mandatory = $true)] [string] $progressUriEncoded,
+	[string] $workload = "suite",
+	[string] $trialCursor = "0",
+	[string] $trialCount = "0",
+	[string] $trialUriEncoded = ""
 )
 
 # Runs inside the Windows GPU worker, invoked through managed Run Command. It
@@ -16,6 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$script:ProgressHistory = [Collections.Generic.List[string]]::new()
 
 function Invoke-Native {
 	param([string] $Path, [string[]] $Arguments, [string] $What)
@@ -46,6 +52,18 @@ function Convert-EncodedUri {
 		default { throw "protected URL encoding has an invalid length" }
 	}
 	return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+}
+
+function Report-Phase {
+	param([string] $Name)
+	try {
+		$uri = Convert-EncodedUri $progressUriEncoded
+		$script:ProgressHistory.Add("$candidateSha $phase $Name $([DateTime]::UtcNow.ToString('o'))")
+		$body = [Text.Encoding]::UTF8.GetBytes(($script:ProgressHistory -join "`n"))
+		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $uri -Body $body -Headers @{ "x-ms-blob-type" = "BlockBlob" } -TimeoutSec 30 | Out-Null
+	} catch {
+		Write-Output "guest progress upload failed at $Name"
+	}
 }
 
 function Enter-VsDeveloperEnvironment {
@@ -124,9 +142,16 @@ function Confirm-Gpu {
 	if (-not $script:Smi) { throw "nvidia-smi is absent from the DSVM image" }
 	$nvcuda = "C:\Windows\System32\nvcuda.dll"
 	if (![IO.File]::Exists($nvcuda)) { throw "the NVIDIA runtime library is absent: $nvcuda" }
-	Invoke-Native $script:Smi @("--query-gpu=name,driver_version,memory.total", "--format=csv,noheader") "nvidia-smi"
-	$script:Gpu = (& $script:Smi --query-gpu=name --format=csv,noheader) -join ""
-	if ($LASTEXITCODE -ne 0) { throw "GPU identity query failed with exit code $LASTEXITCODE" }
+	for ($attempt = 1; $attempt -le 12; $attempt++) {
+		$inventory = & $script:Smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null
+		$code = $LASTEXITCODE
+		if ($code -eq 0 -and $inventory) { break }
+		if ($attempt -eq 12) { throw "nvidia-smi could not see the GPU after 12 checks (exit code $code)" }
+		Write-Output "nvidia-smi not ready (exit code $code); retrying"
+		Start-Sleep -Seconds 5
+	}
+	Write-Output $inventory
+	$script:Gpu = ([string]($inventory | Select-Object -First 1)).Split(',')[0].Trim()
 	if ($script:Gpu -notmatch "T4") { throw "the allocated GPU is not a T4: $script:Gpu" }
 }
 
@@ -208,8 +233,11 @@ function Initialize-Toolchain {
 
 try {
 	$root = "C:\recipe"
+	Report-Phase "gpu-check"
 	Confirm-Gpu
+	Report-Phase "toolchain-start"
 	Initialize-Toolchain -Root $root -AllowInstall ($phase -eq "execute")
+	Report-Phase "toolchain-ready"
 	if ($phase -eq "preflight") {
 		Write-Output "PREFLIGHT EXIT 0"
 		exit 0
@@ -237,16 +265,59 @@ try {
 	New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 	Invoke-Native "tar.exe" @("-xzf", $runtimeArchive, "-C", $runtime) "trusted runtime extraction"
 	Write-Output "trusted runtime verified sha256=$runtimeActual"
+	Report-Phase "snapshot-ready"
 
 	Write-Output "== guest: building with the NVIDIA backend =="
+	Report-Phase "build-start"
 	Push-Location $work
 	Invoke-Native "cargo" @("build", "--release", "--lib", "--bin", "recipe") "the native GPU build"
+	Report-Phase "build-ready"
+
+	if ($workload -eq "trial") {
+		Report-Phase "trial-start"
+		Write-Output "== guest: running the composition harness on nv0, cursor $trialCursor count $trialCount =="
+		$trial = Join-Path $work "trial"
+		New-Item -ItemType Directory -Force -Path $trial | Out-Null
+		Copy-Item -LiteralPath (Join-Path $runtime "harness.rs") -Destination (Join-Path $work "harness.rs")
+		$env:RECIPE_DEVICE = "nv0"
+		$env:RECIPE_COMPOSITION_CAPABILITY = "sm75"
+		$env:RECIPE_COMPOSITION_RUNNER = Join-Path $work "target\release\recipe.exe"
+		$env:RECIPE_COMPOSITION_CURSOR = $trialCursor
+		$env:RECIPE_COMPOSITION_COUNT = $trialCount
+		$env:RECIPE_COMPOSITION_REPLAY_SEED = "17"
+		$env:RECIPE_COMPOSITION_REPRO = Join-Path $trial "repro.rs"
+		$env:RECIPE_TRIAL_DIRECTORY = $trial
+		# The harness prints one composition line per cursor and a failure packet per defect
+		# on stderr; that stream is the evidence, so its exit code is recorded, not thrown.
+		$trialStdout = Join-Path $trial "harness.out"
+		$trialStderr = Join-Path $trial "harness.log"
+		$trialProcess = Start-Process `
+			-FilePath (Join-Path $work "target\release\recipe.exe") `
+			-ArgumentList @((Join-Path $work "harness.rs")) `
+			-Wait -PassThru `
+			-RedirectStandardOutput $trialStdout `
+			-RedirectStandardError $trialStderr
+		Pop-Location
+		$packets = @(Select-String -LiteralPath $trialStderr -Pattern '^RECIPE FAILURE BEGIN$' -SimpleMatch:$false).Count
+		$compositions = @(Select-String -LiteralPath $trialStderr -Pattern '^composition [0-9]+:').Count
+		Write-Output "TRIAL EXIT $($trialProcess.ExitCode) compositions=$compositions packets=$packets"
+		Report-Phase "trial-ready"
+		# Run Command output is capped, so the log goes back through the private container.
+		$trialUri = Convert-EncodedUri $trialUriEncoded
+		Invoke-WebRequest -UseBasicParsing -Method Put -Uri $trialUri -InFile $trialStderr -Headers @{ "x-ms-blob-type" = "BlockBlob" } | Out-Null
+		Write-Output "uploaded the trial log"
+		Write-Output "GUEST EXIT 0"
+		return
+	}
 
 	Write-Output "== guest: executing the suite on nv0 =="
+	Report-Phase "suite-start"
 	New-Item -ItemType Directory -Force -Path (Join-Path $work "evidence"), (Join-Path $work "gpu-work") | Out-Null
 	$env:RECIPE_SUITE_ROOT = $runtime
 	$env:RECIPE_SUITE_WORK = Join-Path $work "gpu-work"
 	$env:RECIPE_EVIDENCE = Join-Path $work "evidence\suite.json"
+	$env:RECIPE_SUITE_PROGRESS = "1"
+	$env:RECIPE_TRACE_PATH = Join-Path $root "suite-trace-$candidateSha.log"
 	# --device nv0 hard-errors when the device is absent; a build carrying the
 	# nvidia cfg does not add a CPU device, so there is no silent fallback.
 	$runStdout = Join-Path $work "run.stdout.log"
@@ -254,20 +325,50 @@ try {
 	$runProcess = Start-Process `
 		-FilePath (Join-Path $work "target\release\recipe.exe") `
 		-ArgumentList @("--device", "nv0", (Join-Path $runtime "suite.rs")) `
-		-Wait -PassThru `
+		-PassThru `
 		-RedirectStandardOutput $runStdout `
 		-RedirectStandardError $runStderr
+	$runStarted = [DateTime]::UtcNow
+	$lastSample = $runStarted
+	$lastChecks = -1
+	while (!$runProcess.HasExited) {
+		Start-Sleep -Seconds 10
+		$checks = @(Select-String -LiteralPath $runStdout -Pattern '^check ' -ErrorAction SilentlyContinue).Count
+		$last = [string](Get-Content -LiteralPath $runStdout -Tail 1 -ErrorAction SilentlyContinue)
+		if (!$last) { $last = [string](Get-Content -LiteralPath $runStderr -Tail 1 -ErrorAction SilentlyContinue) }
+		$trace = [string](Get-Content -LiteralPath $env:RECIPE_TRACE_PATH -Tail 1 -ErrorAction SilentlyContinue)
+		if ($trace) { $last = $trace }
+		if ($last.Length -gt 180) { $last = $last.Substring(0, 180) }
+		if ($checks -ne $lastChecks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge 60) {
+			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($runProcess.Id)" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ","
+			$gpu = (& $script:Smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>$null) -join ","
+			Report-Phase "suite-checks-$checks child=$children gpu=$gpu stderr=$last"
+			$lastChecks = $checks
+			$lastSample = [DateTime]::UtcNow
+		}
+		if (([DateTime]::UtcNow - $runStarted).TotalSeconds -ge 600) {
+			Report-Phase "suite-timeout-checks-$checks stderr=$last"
+			& taskkill.exe /PID $runProcess.Id /T /F *> $null
+			throw "the runtime suite exceeded 600s after $checks completed checks"
+		}
+	}
+	$runProcess.WaitForExit()
+	$exitCode = $runProcess.ExitCode
 	$log = ((Get-Content -Raw -LiteralPath $runStdout), (Get-Content -Raw -LiteralPath $runStderr)) -join "`n"
 	[IO.File]::WriteAllText((Join-Path $work "run.log"), $log, [Text.UTF8Encoding]::new($false))
 	Write-Output $log
-	if ($runProcess.ExitCode -ne 0) { throw "the runtime suite failed with exit code $($runProcess.ExitCode)" }
+	if ($null -ne $exitCode -and $exitCode -ne 0) { throw "the runtime suite failed with exit code $exitCode" }
 	Pop-Location
 
-	if ($log -notmatch "SUITE PASS") { throw "the suite did not report SUITE PASS" }
-	$route = ([regex]::Match($log, '(?m)^selected route (\S+)')).Groups[1].Value
-	if (-not $route) { throw "no route line: the suite did not dispatch" }
+	if ($log -notmatch "SUITE PASS executed=8") { throw "the suite did not report eight passing checks" }
+	$route = ([regex]::Match($log, '(?m)^suite device (\S+)')).Groups[1].Value
+	if (-not $route) { throw "no suite device: training did not report its device" }
 	$device = $route.Split(':')[-1]
 	if ($device -notlike "nv*") { throw "expected an nv device, got '$device'; CPU fallback is a failure" }
+	$evidence = Get-Content -Raw -LiteralPath (Join-Path $work "evidence\suite.json") | ConvertFrom-Json
+	if ($evidence.executed -ne 8 -or $evidence.failed -ne 0) { throw "the suite evidence does not contain eight passing checks" }
+	$exitLabel = if ($null -eq $exitCode) { "unavailable" } else { [string]$exitCode }
+	Report-Phase "suite-ready checks=8 exit=$exitLabel"
 	Write-Output "executed on $route"
 
 	Write-Output "SUITE-EVIDENCE-BEGIN"

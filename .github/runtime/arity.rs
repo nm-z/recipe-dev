@@ -170,9 +170,9 @@ fn digest(mut hash: u64, bytes: &[u8]) -> u64 {
 
 fn run(case: &Case, index: usize, work: &Path) -> u64 {
 	let data = declaration(case);
-	let model = recipe.model().layer(4).gelu().layer(1).loss(mse);
+	let model = recipe.model().layer(4).fp(32).gelu().layer(1).fp(32).loss(mse);
 	let saved_path = work.join(format!("case-{index:03}.ogdl"));
-	let cold = recipe.train().fp(32).seed(234).epochs(1).stop(0.0).save(&saved_path).run(&model, &data);
+	let cold = recipe.train().seed(234).epochs(1).stop(0.0).save(&saved_path).run(&model, &data);
 	assert!(cold.initial_loss().is_finite() && cold.final_loss().is_finite(), "{} has a nonfinite cold loss", case.label);
 	let saved = bundle(&saved_path);
 	ordered_groups("input", &saved.features, &case.inputs);
@@ -184,7 +184,7 @@ fn run(case: &Case, index: usize, work: &Path) -> u64 {
 	assert_eq!(saved.outputs.len(), case.output_width, "{} output width changed", case.label);
 	assert_eq!(cold.predictions().len(), case.evaluation_rows * case.output_width, "{} cold evaluation lost or duplicated sample boundaries", case.label);
 
-	let resumed = recipe.train().fp(32).seed(234).epochs(1).stop(0.0).resume(&saved_path).save(&saved_path).run(&model, &data);
+	let resumed = recipe.train().seed(234).epochs(1).stop(0.0).resume(&saved_path).save(&saved_path).run(&model, &data);
 	assert!(resumed.initial_loss().is_finite() && resumed.final_loss().is_finite(), "{} has a nonfinite resumed loss", case.label);
 	let after = bundle(&saved_path);
 	assert_eq!(after.training_rows, case.training_rows, "{} resumed training row count changed", case.label);
@@ -196,8 +196,8 @@ fn run(case: &Case, index: usize, work: &Path) -> u64 {
 	assert_eq!(resumed.predictions().len(), case.evaluation_rows * case.output_width, "{} resumed evaluation lost or duplicated sample boundaries", case.label);
 
 	let input = vec![0.0; saved.inputs.len()];
-	let first = recipe.infer(&saved_path, &input);
-	let second = recipe.infer(&saved_path, &input);
+	let first = recipe.predict(&saved_path, &input);
+	let second = recipe.predict(&saved_path, &input);
 	assert_eq!(first.len(), case.output_width, "{} inference output width changed", case.label);
 	assert!(first.iter().all(|value| value.is_finite()), "{} inference produced a nonfinite value", case.label);
 	assert_eq!(bits(&first), bits(&second), "{} repeated inference changed output bits", case.label);

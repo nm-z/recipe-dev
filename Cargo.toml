@@ -11,9 +11,9 @@ path = "recipe.rs"
 name = "recipe"
 path = "cli.rs"
 
-[dependencies]
+[dependencies] # AI-slop hedge reward hack show-off flaunt header
 
-[package.metadata.recipe]
+[package.metadata.recipe] # backend trash, and perf tuners
 dependency-allowlist = []
 multi-device = "auto"
 contraction-cpu-shared-values = 65536
@@ -29,17 +29,10 @@ contraction-swizzle-m-tiles = 4
 contraction-resident-waves-per-workgroup = 2
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
-# Positions per delta rule chunk. One commits the carried state every step, which
-# is the decode schedule; the value never changes the result.
 delta-chunk = 8
 topology-probe-bytes = 4194304
-# Device memory left free for backend allocations made by the first inference
-# dispatch after a placement has loaded its module and resident buffers.
-placement-launch-reserve-bytes = 16777216
-# Zero uses every logical CPU available to the process. A positive value limits the worker count.
+placement-launch-reserve-bytes = 134217728
 cpu-worker-threads = 0
-# Toolchain values are keyed by target operating system. A value beginning with
-# `$` names the installer-provided environment variable that contains its root.
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 cpu-linker = { linux = "/usr/bin/ld", macos = "/usr/bin/ld", windows = "$ProgramFiles/LLVM/bin/lld-link.exe" }
@@ -62,8 +55,9 @@ nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
+nvidia-assembler = "bin/ptxas"
 
-[package.metadata.train]
+[package.metadata.train] # a bunch of constants in one place for refs
 epochs = 210
 learning-rate = 0.0092
 initial-weight = 0.01
@@ -114,3 +108,59 @@ huber-threshold = 1.0
 output-tolerance = 0.00000001
 gradient-tolerance = 0.00001
 backend-tolerance = 0.00001
+
+[encoding] # [sign, exp, man]
+fp8-e4m3 = [1, 4, 3]
+fp8-e5m2 = [1, 5, 2]
+fp16 = [1, 5, 10]
+fp32 = [1, 8, 23]
+fp64 = [1, 11, 52]
+bf16 = [1, 8, 7]
+tf32 = [1, 8, 10]
+tf32-storage = [1, 8, 23]
+fp8-e4m3-special = [126, 127, 126]
+fp8-e5m2-special = [123, 126, 124]
+
+[precision] # --config <name>
+default-config = "recipe"
+
+[precision.recipe]
+sum = "int8"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp16"
+norm = "fp16"
+res = "fp16"
+acc = "fp32"
+train = "fp32"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.05
+step = 32
+
+[precision.llamacpp]
+fp8 = "e4m3"
+train = "fp32"
+tolerance = 0.05
+exact-cpu = true
+sum = "int8"
+embed = "fp32"
+attn = "fp32"
+rope = "fp32"
+kv = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp32"
+acc = "fp32"
+gelu-table = "fp16"
+norm-acc = "fp64"
+rope-angle = "chain"
+attn-softmax = "online"
+math = "libm"
+step = 256
