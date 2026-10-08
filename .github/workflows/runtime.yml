@@ -358,10 +358,13 @@ jobs:
   # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
   # ---------------------------------------------------------------------------
   linux-gpu:
-    name: linux/nv
+    name: linux/nv admission
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      admission_blocked: ${{ steps.camber.outputs.admission_blocked }}
+      gpu_passed: ${{ steps.camber.outputs.gpu_passed }}
     env:
       CELL: recipe/linux-gpu
       CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
@@ -409,7 +412,18 @@ jobs:
         id: camber
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+          if bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"; then
+            jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' evidence/suite.json >/dev/null
+            echo 'gpu_passed=true' >> "$GITHUB_OUTPUT"
+          else
+            result=$?
+            if [ "$result" -eq 75 ] && [ ! -f camber-job-id ] && jq -e '.category == "compute-admission" and .provider == "camber" and .code == 1005 and .gpu_execution == false' evidence/blocker.json >/dev/null; then
+              echo 'admission_blocked=true' >> "$GITHUB_OUTPUT"
+              echo 'NVIDIA acceptance is pending validation on existing authorized compute.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              exit "$result"
+            fi
+          fi
         env:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
@@ -461,6 +475,24 @@ jobs:
   #    shared suite and preserves the train/save/resume/infer lifecycle
   #    coverage from windows-native-lifecycle.yml.
   # ---------------------------------------------------------------------------
+  linux-nv:
+    name: linux/nv
+    needs: [prepare, linux-gpu]
+    if: always() && needs.linux-gpu.outputs.admission_blocked != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require completed NVIDIA execution
+        env:
+          ADMISSION_RESULT: ${{ needs.linux-gpu.result }}
+          GPU_PASSED: ${{ needs.linux-gpu.outputs.gpu_passed }}
+        run: |
+          set -euo pipefail
+          [ "$ADMISSION_RESULT" = success ] && [ "$GPU_PASSED" = true ] || {
+            echo 'The NVIDIA runtime suite did not pass.' >&2
+            exit 1
+          }
+          echo 'The NVIDIA runtime suite passed all eight checks.'
+
   windows-cpu:
     name: win/cpu
     needs: prepare
