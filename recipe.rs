@@ -2102,6 +2102,11 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 				last[operand] = index;
 			}
 		}
+		if node.op == Primitive::Attention && attention_blocks(node) != 0 {
+			if let Ok(binding) = attention_index_nodes(&graph.nodes, node) {
+				last[binding.raw] = last[binding.raw].max(index);
+			}
+		}
 	}
 	last
 }
@@ -4226,7 +4231,7 @@ impl NativeModelIr {
 					require(!online_order || node.output.channels <= 256 * heads.max(1) as usize, "online attention head width exceeds 256")?;
 					let attention = if !compact && !online_order && matrix && node.kv_precision == node.precision && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
 					let geometry = self.indexer_geometry(index)?;
-					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
+					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base, geometry.score_offset, geometry.cache_offset)?;
 					let (from, channels) = (node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
@@ -4234,6 +4239,17 @@ impl NativeModelIr {
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
 						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
+						let norm_index = geometry.normalization.ok_or_else(|| RecipeError::new("indexer normalization binding is absent"))?;
+						let norm = &self.plans[norm_index].node;
+						let raw_index = geometry.raw.ok_or_else(|| RecipeError::new("indexer raw binding is absent"))?;
+						let raw_source = format!("%n{index}.index.raw.source");
+						ir.push_str(&ptr_gep(backend, "values", self.plans[raw_index].value, raw_source.trim_start_matches('%')));
+						let (rope_weights, rope_context) = geometry.rotary.map_or_else(
+							|| (key_weights.clone(), context.clone()),
+							|rope| (format!("%n{rope}.weights"), format!("%n{rope}.context")),
+						);
+						let append_selectors = attention_selectors(node, &self.node_precision(norm), geometry.mode, geometry.dims, geometry.pooled, geometry.base, geometry.score_offset, geometry.cache_offset)?;
+						let append_shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {append_selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						// The selection clears the block score gradients the reverse pass
 						// accumulates; an inference layout holds none.
@@ -4247,7 +4263,7 @@ impl NativeModelIr {
 						let touched = NodeWindow { begin: first, span: count };
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"
+								"call void @recipe_index_append_{index}( {pointer} {raw_source}, {pointer} {key_weights}, {pointer} {rope_weights}, {pointer} {rope_context}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {append_shared} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
@@ -4680,7 +4696,7 @@ impl NativeModelIr {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = "attention_reverse_body";
 					let geometry = self.indexer_geometry(index)?;
-					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
+					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base, geometry.score_offset, geometry.cache_offset)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					ir.push_str(&format!("call void @{attention}{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
@@ -6866,6 +6882,100 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
+	/// Specialize the append call with the declared side-node types. Conversion
+	/// happens in scalar registers; cached sums retain their declared storage.
+	fn emit_indexer_support(&self, backend: Backend) -> Result<String> {
+		let pointer = pointer_type(backend);
+		let mut output = String::new();
+		for (index, plan) in self.plans.iter().enumerate().filter(|(_, plan)| plan.node.op == Primitive::Attention && attention_blocks(&plan.node) != 0) {
+			let geometry = self.indexer_geometry(index)?;
+			let norm_index = geometry.normalization.ok_or_else(|| RecipeError::new("indexer normalization binding is absent"))?;
+			let norm = &self.plans[norm_index].node;
+			let raw = &self.plans[geometry.raw.ok_or_else(|| RecipeError::new("indexer raw binding is absent"))?].node;
+			let precision = self.node_precision(norm);
+			let nv = self.variant(norm);
+			let ty = precision.model_type;
+			let template = backend_template(backend, precision, None, Some(norm.kv_precision))?;
+			let template = if nv.is_empty() { template } else { link_variant("", &template, nv) };
+			let symbol = format!("@attention_index_body{nv}(");
+			let name = template.find(&symbol).ok_or_else(|| RecipeError::new("indexer append template is absent"))?;
+			let start = template[..name].rfind("define ").ok_or_else(|| RecipeError::new("indexer append definition is absent"))?;
+			let stop = template[name..].find("\n}\n").map(|end| name + end + 3).ok_or_else(|| RecipeError::new("indexer append definition is incomplete"))?;
+			let mut append = template[start..stop].replace(&symbol, &format!("@recipe_index_append_{index}("));
+			let header_end = append.find(") #").ok_or_else(|| RecipeError::new("indexer append header is incomplete"))?;
+			let header = append[..header_end].replace("%key.weights,", &format!("%key.weights, {pointer} %rope.weights, {pointer} %rope.context,"));
+			append.replace_range(..header_end, &header);
+			append = append.replace(&format!("@attention_index_pool{nv}("), &format!("@recipe_index_cache_{index}("));
+			append = append.replace(&format!("({pointer} %key.weights, {pointer} %context,"), &format!("({pointer} %key.weights, {pointer} %rope.weights, {pointer} %rope.context, {pointer} %context,"));
+			let raw_ty = self.node_precision(raw).model_type;
+			let old = format!("%dim.ptr = getelementptr inbounds {ty}, {pointer} %indexer, i64 %dim.index\n%dim.value = load {ty}, {pointer} %dim.ptr, align {}", alignment(ty));
+			let mut load = format!("%dim.ptr = getelementptr inbounds {raw_ty}, {pointer} %indexer, i64 %dim.index\n%dim.raw = load {raw_ty}, {pointer} %dim.ptr, align {}\n", alignment(raw_ty));
+			let converted = self.emit_convert(&mut load, &format!("index{index}.raw"), raw, norm, "%dim.raw");
+			load.push_str(&format!("%dim.value = freeze {ty} {converted}"));
+			require(append.contains(&old), "indexer raw load contract differs from its template")?;
+			append = append.replace(&old, &load);
+			let layout = attention_index_layout(&self.graph.nodes, &self.graph.nodes[index], self.rows)?;
+			let attn = self.node_precision(&plan.node);
+			let at = attn.model_type;
+			for (name, offset) in [("representative.base", layout.sums), ("raw.base", layout.raw), ("prefix.base", layout.prefix_sums)] {
+				let marker = format!("%{name} = ");
+				let first = append.find(&marker).ok_or_else(|| RecipeError::new("indexer byte-offset contract is absent"))?;
+				let last = append[first..].find('\n').map(|at| first + at).ok_or_else(|| RecipeError::new("indexer byte-offset contract is incomplete"))?;
+				append.replace_range(first..last, &format!("%{name} = add i64 0, {}", offset / precision.model.bytes()));
+			}
+			let marker = "%counts.byte.base = ";
+			let first = append.find(marker).ok_or_else(|| RecipeError::new("indexer count-offset contract is absent"))?;
+			let last = append[first..].find('\n').map(|at| first + at).ok_or_else(|| RecipeError::new("indexer count-offset contract is incomplete"))?;
+			append.replace_range(first..last, &format!("%counts.byte.base = add i64 0, {}", layout.counts));
+			let old = "%cache.start = add i64 %cache.base, %cache.local";
+			require(append.contains(old), "indexer scratch contract differs from its template")?;
+			append = append.replace(old, &format!("%scratch.local = mul i64 %p, %index.width.wide\n%cache.start = add i64 %scratch.local, {}\n%output.start = add i64 %cache.local, {}", layout.scratch / precision.model.bytes(), layout.representatives / attn.model.bytes()));
+			append = append.replace("i64 %cache.start, i32 %filled.i32", "i64 %cache.start, i64 %output.start, i32 %filled.i32");
+			output.push_str(&append);
+			let st = precision.state_type;
+			let header = format!("define internal void @recipe_index_cache_{index}({pointer} %key.weights, {pointer} %rope.weights, {pointer} %rope.context, {pointer} %context, i64 %sum.start, i64 %cache.start, i64 %output.start, i32 %filled, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %mode, i32 %dims, {st} %base, {ty} %epsilon, i1 %pooled) #1 {{\nentry:\n");
+			output.push_str(&header);
+			let epsilon = native_literal(precision.model, ty, norm.argument[1]);
+			output.push_str(&format!("call void @attention_index_pool{nv}({pointer} %key.weights, {pointer} %context, i64 %sum.start, i64 %cache.start, i32 %filled, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %mode, i32 0, {st} %base, {ty} {epsilon}, i1 %pooled)\n"));
+			let Some(rope_index) = geometry.rotary else {
+				output.push_str(&format!("br label %copy.loop\ncopy.loop:\n%copy.d = phi i32 [ 0, %entry ], [ %copy.next, %copy.step ]\n%copy.more = icmp ult i32 %copy.d, %index.width\nbr i1 %copy.more, label %copy.step, label %exit\ncopy.step:\n%copy.wide = zext i32 %copy.d to i64\n%copy.source = add i64 %cache.start, %copy.wide\n%copy.destination = add i64 %output.start, %copy.wide\n%copy.source.ptr = getelementptr inbounds {ty}, {pointer} %context, i64 %copy.source\n%copy.destination.ptr = getelementptr inbounds {at}, {pointer} %context, i64 %copy.destination\n%copy.raw = load {ty}, {pointer} %copy.source.ptr, align {align}\n", align = alignment(ty)));
+				let converted = self.emit_convert(&mut output, &format!("index{index}.cache.copy"), norm, &plan.node, "%copy.raw");
+				output.push_str(&format!("store {at} {converted}, {pointer} %copy.destination.ptr, align {align}\n%copy.next = add i32 %copy.d, 1\nbr label %copy.loop\nexit:\nret void\n}}\n", align = alignment(at)));
+				continue;
+			};
+			let rope = &self.plans[rope_index].node;
+			let rp = self.node_precision(rope);
+			let rv = self.variant(rope);
+			let rt = rp.model_type;
+			let rs = rp.state_type;
+			for (name, argument) in [("base", 1), ("mscale", 4), ("factor", 5), ("low", 7), ("high", 8)] {
+				let literal = native_literal(rp.model, rt, rope.argument[argument]);
+				output.push_str(&format!("%rope.{name} = call {rs} @recipe.decode{rv}({rt} {literal})\n"));
+			}
+			let dims = integer_argument(rope.argument[0], "indexer rotary dimensions")?;
+			let half = dims / 2;
+			let chain = rope.argument[6] != 0.0;
+			output.push_str(&format!("%rope.position = mul i32 %block.index, %select.block\n%rope.one = call {rs} @recipe.state.from.u1{rv}(i1 true)\nbr label %rotate.loop\nrotate.loop:\n%rotate.d = phi i32 [ 0, %entry ], [ %rotate.next, %rotate.store ]\n%rotate.more = icmp ult i32 %rotate.d, {half}\nbr i1 %rotate.more, label %rotate.step, label %tail.prepare\nrotate.step:\n%rotate.upper = add i32 %rotate.d, {half}\n%rotate.d.wide = zext i32 %rotate.d to i64\n%rotate.upper.wide = zext i32 %rotate.upper to i64\n%rotate.lower.index = add i64 %cache.start, %rotate.d.wide\n%rotate.upper.index = add i64 %cache.start, %rotate.upper.wide\n%rotate.lower.ptr = getelementptr inbounds {ty}, {pointer} %context, i64 %rotate.lower.index\n%rotate.upper.ptr = getelementptr inbounds {ty}, {pointer} %context, i64 %rotate.upper.index\n%rotate.lower.output = add i64 %output.start, %rotate.d.wide\n%rotate.upper.output = add i64 %output.start, %rotate.upper.wide\n%rotate.lower.out = getelementptr inbounds {at}, {pointer} %context, i64 %rotate.lower.output\n%rotate.upper.out = getelementptr inbounds {at}, {pointer} %context, i64 %rotate.upper.output\n%rotate.lower.raw = load {ty}, {pointer} %rotate.lower.ptr, align {align}\n%rotate.upper.raw = load {ty}, {pointer} %rotate.upper.ptr, align {align}\n", align = alignment(ty)));
+			let lower = self.emit_convert(&mut output, &format!("index{index}.rope.lower"), norm, rope, "%rotate.lower.raw");
+			let upper = self.emit_convert(&mut output, &format!("index{index}.rope.upper"), norm, rope, "%rotate.upper.raw");
+			output.push_str(&format!("%rotate.lower = call {rs} @recipe.decode{rv}({rt} {lower})\n%rotate.upper.value = call {rs} @recipe.decode{rv}({rt} {upper})\n"));
+			let frequency = if rope.parameters == 0 { "%rope.one".to_owned() } else {
+				output.push_str(&format!("%rope.frequency.ptr = getelementptr inbounds {rt}, {pointer} %rope.weights, i64 %rotate.d.wide\n%rope.frequency.raw = load {rt}, {pointer} %rope.frequency.ptr, align {align}\n%rope.frequency = call {rs} @recipe.decode{rv}({rt} %rope.frequency.raw)\n", align = alignment(rt)));
+				"%rope.frequency".to_owned()
+			};
+			for (name, value, partner, upper) in [("lower", "%rotate.lower", "%rotate.upper.value", false), ("upper", "%rotate.upper.value", "%rotate.lower", true)] {
+				output.push_str(&format!("%rotate.{name}.result = call {rs} @rope_pair{rv}({rs} {value}, {rs} {partner}, {rs} %rope.base, {rs} %rope.mscale, {rs} %rope.factor, {rs} %rope.low, {rs} %rope.high, {rs} {frequency}, i64 %rotate.d.wide, i32 {dims}, i32 %rope.position, i1 {upper}, i1 false, i1 {chain})\n%rotate.{name}.model = call {rt} @recipe.encode{rv}({rs} %rotate.{name}.result)\n"));
+				let converted = self.emit_convert(&mut output, &format!("index{index}.attention.{name}"), rope, &plan.node, &format!("%rotate.{name}.model"));
+				output.push_str(&format!("store {at} {converted}, {pointer} %rotate.{name}.out, align {align}\n", align = alignment(at)));
+			}
+			output.push_str(&format!("br label %rotate.store\nrotate.store:\n%rotate.next = add i32 %rotate.d, 1\nbr label %rotate.loop\ntail.prepare:\nbr label %tail.loop\ntail.loop:\n%tail.d = phi i32 [ {dims}, %tail.prepare ], [ %tail.next, %tail.step ]\n%tail.more = icmp ult i32 %tail.d, %index.width\nbr i1 %tail.more, label %tail.step, label %exit\ntail.step:\n%tail.d.wide = zext i32 %tail.d to i64\n%tail.index = add i64 %cache.start, %tail.d.wide\n%tail.ptr = getelementptr inbounds {ty}, {pointer} %context, i64 %tail.index\n%tail.output = add i64 %output.start, %tail.d.wide\n%tail.out = getelementptr inbounds {at}, {pointer} %context, i64 %tail.output\n%tail.raw = load {ty}, {pointer} %tail.ptr, align {align}\n", align = alignment(ty)));
+			let converted = self.emit_convert(&mut output, &format!("index{index}.rope.tail"), norm, rope, "%tail.raw");
+			let converted = self.emit_convert(&mut output, &format!("index{index}.attention.tail"), rope, &plan.node, &converted);
+			output.push_str(&format!("store {at} {converted}, {pointer} %tail.out, align {align}\n%tail.next = add i32 %tail.d, 1\nbr label %tail.loop\nexit:\nret void\n}}\n", align = alignment(at)));
+		}
+		Ok(output)
+	}
+
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, nvidia_dp4a: bool, nvidia_widen: bool) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let substitute = |template: String, element: usize| {
@@ -6907,6 +7017,7 @@ impl NativeModelIr {
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&self.emit_recurrent_stage_metadata()?);
 		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
+		ir.push_str(&self.emit_indexer_support(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
 		ir.push_str(&source_decode);
@@ -7159,11 +7270,16 @@ struct IndexerGeometry {
 	pooled: bool,
 	base: f64,
 	key_weights: String,
+	score_offset: usize,
+	cache_offset: usize,
+	normalization: Option<usize>,
+	rotary: Option<usize>,
+	raw: Option<usize>,
 }
 
 impl IndexerGeometry {
 	fn none(index: usize) -> Self {
-		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: format!("%n{index}.weights") }
+		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: format!("%n{index}.weights"), score_offset: 0, cache_offset: 0, normalization: None, rotary: None, raw: None }
 	}
 }
 
@@ -7175,48 +7291,32 @@ impl NativeModelIr {
 	fn indexer_geometry(&self, index: usize) -> Result<IndexerGeometry> {
 		let node = &self.plans[index].node;
 		let mut geometry = IndexerGeometry::none(index);
-		if attention_blocks(node) == 0 {
-			return Ok(geometry);
-		}
+		if attention_blocks(node) == 0 { return Ok(geometry); }
+		let binding = attention_index_nodes(&self.graph.nodes, &self.graph.nodes[index])?;
+		let norm = &self.plans[binding.normalization].node;
 		let query_channels = checked_mul(node.argument[5] as usize, node.argument[6] as usize, "indexer query width")?;
-		let mut cursor = node.second;
-		let (mut mode_seen, mut dims_seen) = (false, false);
-		while cursor >= 0 {
-			let candidate = &self.plans[usize::try_from(cursor).map_err(|_| RecipeError::new("indexer side node is invalid"))?].node;
-			match candidate.op {
-				Primitive::Normalize if !mode_seen => {
-					geometry.mode = integer_argument(candidate.argument[0], "indexer scoring normalization")?;
-					geometry.pooled = candidate.argument[3] as usize == query_channels;
-					if geometry.pooled {
-						let (normalization, attention) = (self.node_precision(candidate), self.node_precision(node));
-						require(
-							normalization.model == attention.model && normalization.state == attention.state,
-							"cached indexer pooling does not support differing normalization and attention arithmetic",
-						)?;
-					}
-					mode_seen = true;
-					if geometry.pooled && candidate.parameters > query_channels {
-						geometry.key_weights = format!("%n{cursor}.weights");
-					}
-				}
-				Primitive::Rope if !dims_seen => {
-					let (rotary, attention) = (self.node_precision(candidate), self.node_precision(node));
-					require(
-						rotary.model == attention.model && rotary.state == attention.state,
-						"cached indexer rotary does not support differing rotary and attention arithmetic",
-					)?;
-					require(
-						candidate.argument[6] == 0.0 && candidate.argument[4] == 1.0 && candidate.argument[5] == 1.0 && candidate.parameters == 0,
-						"cached indexer rotary does not support chained, scaled, or weighted angles",
-					)?;
-					geometry.dims = integer_argument(candidate.argument[0], "indexer rotary dimensions")?;
-					geometry.base = candidate.argument[1];
-					dims_seen = true;
-				}
-				_ => {}
-			}
-			cursor = candidate.source;
+		let channels = checked_add(query_channels, node.argument[6] as usize, "indexer key width")?;
+		require(norm.output.channels == channels && normalize_width(norm) == node.argument[6] as usize, "indexer side normalization differs from its declared heads and width")?;
+		let span = normalize_span(norm);
+		require(span == query_channels || span == channels, "indexer side normalization has an incomplete query or key span")?;
+		geometry.normalization = Some(binding.normalization);
+		geometry.rotary = binding.rotary;
+		geometry.raw = Some(binding.raw);
+		geometry.mode = integer_argument(norm.argument[0], "indexer scoring normalization")?;
+		geometry.pooled = span == query_channels;
+		if geometry.pooled && geometry.mode == 2 {
+			require(norm.parameters == channels, "trained RMS indexer has no complete query and key scales")?;
+			geometry.key_weights = format!("%n{}.weights", binding.normalization);
 		}
+		if let Some(rotary) = binding.rotary {
+			let rope = &self.plans[rotary].node;
+			geometry.dims = integer_argument(rope.argument[0], "indexer rotary dimensions")?;
+			require(geometry.dims % 2 == 0 && geometry.dims as usize <= node.argument[6] as usize, "indexer rotary dimensions exceed its key width")?;
+			geometry.base = rope.argument[1];
+		}
+		let layout = attention_index_layout(&self.graph.nodes, &self.graph.nodes[index], self.rows)?;
+		geometry.score_offset = layout.scores;
+		geometry.cache_offset = layout.representatives;
 		Ok(geometry)
 	}
 }
@@ -7225,10 +7325,12 @@ impl NativeModelIr {
 /// model epsilon stays in model storage; the rotary base stays in arithmetic
 /// state so narrow or integer model encodings cannot clip it.
 fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { node.argument[1] as usize } else { node.argument[8] as usize } }
-fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
+fn attention_selectors(
+	node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64, score_offset: usize, cache_offset: usize,
+) -> Result<String> {
 	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
-		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
+		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}, i64 {index_score}, i64 {index_cache}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
@@ -7242,6 +7344,8 @@ fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32
 		index_dims = index_dims,
 		pooled = index_pooled,
 		index_base = native_literal(precision.state, precision.state_type, index_base),
+		index_score = score_offset / precision.model.bytes(),
+		index_cache = cache_offset / precision.model.bytes(),
 	))
 }
 /// Whether a traced run dumps (and so keeps the arena of) node `index` of
@@ -18657,6 +18761,28 @@ fn attention_blocks(node: &Node) -> usize {
 	let block = if node.argument[3] > 0.0 { node.argument[3] as usize } else { 0 };
 	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
 }
+/// The side nodes define key storage and arithmetic independently of attention.
+struct AttentionIndexNodes {
+	raw: usize,
+	normalization: usize,
+	rotary: Option<usize>,
+}
+fn attention_index_nodes(nodes: &[Node], node: &Node) -> Result<AttentionIndexNodes> {
+	let mut cursor = node.second;
+	let (mut normalization, mut rotary) = (None, None);
+	while let Ok(index) = usize::try_from(cursor) {
+		let candidate = nodes.get(index).ok_or_else(|| RecipeError::new("indexer side node exceeds its graph"))?;
+		if candidate.op == Primitive::Rope && rotary.is_none() { rotary = Some(index); }
+		if candidate.op == Primitive::Normalize && normalization.is_none() { normalization = Some(index); break; }
+		cursor = candidate.source;
+	}
+	let normalization = normalization.ok_or_else(|| RecipeError::new("indexer has no normalization node"))?;
+	let norm = &nodes[normalization];
+	let queries = checked_mul(node.argument[5] as usize, node.argument[6] as usize, "indexer query channels")?;
+	let raw = if norm.argument[3] as usize == queries { usize::try_from(norm.source).map_err(|_| RecipeError::new("trained indexer has no raw projection"))? } else { normalization };
+	require(raw < nodes.len(), "indexer raw projection exceeds its graph")?;
+	Ok(AttentionIndexNodes { raw, normalization, rotary })
+}
 /// The indexer carries raw keys, one causal representative for each position,
 /// and one filled count for each block. Scores precede these retained regions.
 fn attention_index_state(node: &Node, rows: usize) -> Result<(usize, usize)> {
@@ -18667,30 +18793,49 @@ fn attention_index_state(node: &Node, rows: usize) -> Result<(usize, usize)> {
 	let counts = checked_mul(rows, attention_blocks(node), "indexer filled counts")?;
 	Ok((keys, counts))
 }
-/// Byte offsets in an attention context, including the exact sum needed to
-/// commit a partially accepted block without repeating numerical operations.
+/// Byte offsets and storage types shared by allocation, lowering, and prefix
+/// commit. Each numerical region uses its declaring node's model storage.
 struct AttentionIndexLayout {
 	sums: usize,
+	scores: usize,
+	raw: usize,
+	representatives: usize,
 	prefix_sums: usize,
+	scratch: usize,
 	counts: usize,
 	bytes: usize,
+	storage: Compute,
 }
-fn attention_index_layout(node: &Node, rows: usize) -> Result<AttentionIndexLayout> {
-	let (keys, counts) = attention_index_state(node, rows)?;
+fn attention_index_layout(nodes: &[Node], node: &Node, rows: usize) -> Result<AttentionIndexLayout> {
+	let blocks = attention_blocks(node);
 	let queries = checked_mul(rows, node.output.length, "indexer context queries")?;
 	let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer context heads")?, 2, "indexer context statistics")?;
-	let sums = checked_mul(counts, node.argument[6] as usize, "indexer context sums")?;
-	let scores = checked_mul(queries, checked_mul(attention_blocks(node), 2, "indexer context score width")?, "indexer context scores")?;
-	let prefix = checked_add(checked_add(statistics, sums, "indexer context prefix")?, scores, "indexer context scores end")?;
-	let prefix_sums = checked_add(prefix, checked_mul(keys, 2, "indexer raw and representative caches")?, "indexer prefix sums start")?;
-	let count_start = checked_add(prefix_sums, keys, "indexer counts start")?;
-	let bytes = node.precision.bytes();
-	Ok(AttentionIndexLayout {
-		sums: checked_mul(statistics, bytes, "indexer sums byte offset")?,
-		prefix_sums: checked_mul(prefix_sums, bytes, "indexer prefix sum byte offset")?,
-		counts: checked_mul(count_start, bytes, "indexer count byte offset")?,
-		bytes: checked_add(checked_mul(count_start, bytes, "indexer cache bytes")?, checked_mul(counts, size_of::<u64>(), "indexer count bytes")?, "indexer carried bytes")?,
-	})
+	let statistics_bytes = checked_mul(statistics, node.precision.bytes(), "indexer statistics bytes")?;
+	if blocks == 0 {
+		return Ok(AttentionIndexLayout { sums: statistics_bytes, scores: statistics_bytes, raw: statistics_bytes, representatives: statistics_bytes, prefix_sums: statistics_bytes, scratch: statistics_bytes, counts: statistics_bytes, bytes: statistics_bytes, storage: node.precision });
+	}
+	let binding = attention_index_nodes(nodes, node)?;
+	let storage = nodes[binding.normalization].precision;
+	let (keys, counts) = attention_index_state(node, rows)?;
+	let block_values = checked_mul(counts, node.argument[6] as usize, "indexer context sums")?;
+	let sum_bytes = checked_mul(block_values, storage.bytes(), "indexer sum bytes")?;
+	let score_bytes = checked_mul(checked_mul(queries, checked_mul(blocks, 2, "indexer context score width")?, "indexer context scores")?, node.precision.bytes(), "indexer score bytes")?;
+	let key_bytes = checked_mul(keys, storage.bytes(), "indexer raw and prefix bytes")?;
+	let representative_bytes = checked_mul(keys, node.precision.bytes(), "indexer representative bytes")?;
+	let mut at = statistics_bytes;
+	let mut region = |bytes: usize| -> Result<usize> {
+		let start = align(at, 8)?;
+		at = checked_add(start, bytes, "indexer context region")?;
+		Ok(start)
+	};
+	let sums = region(sum_bytes)?;
+	let scores = region(score_bytes)?;
+	let raw = region(key_bytes)?;
+	let representatives = region(representative_bytes)?;
+	let prefix_sums = region(key_bytes)?;
+	let scratch = region(sum_bytes)?;
+	let counts = region(checked_mul(counts, size_of::<u64>(), "indexer count bytes")?)?;
+	Ok(AttentionIndexLayout { sums, scores, raw, representatives, prefix_sums, scratch, counts, bytes: at, storage })
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -20730,13 +20875,13 @@ impl NativeTape {
 		let mut patches = Vec::new();
 		for (index, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
 			require(end <= node.output.length, "indexer prefix exceeds its sequence")?;
-			let layout = attention_index_layout(node, self.rows as usize)?;
+			let layout = attention_index_layout(&self.nodes, node, self.capacity)?;
 			let in_values = self.program.artifact.layout.contexts_in_values[index];
 			let base = self.program.artifact.layout.contexts[index];
 			let image = if in_values { &*values } else { &*contexts };
 			require(checked_add(base, layout.bytes, "indexer prefix context")? <= image.len(), "indexer prefix context exceeds its buffer")?;
 			let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
-			let bytes = checked_mul(width, node.precision.bytes(), "indexer sum row bytes")?;
+			let bytes = checked_mul(width, layout.storage.bytes(), "indexer sum row bytes")?;
 			let count_at = checked_add(base, layout.counts, "indexer count address")?;
 			let count_bytes = checked_mul(checked_mul(self.rows as usize, blocks, "indexer count rows")?, size_of::<u64>(), "indexer count bytes")?;
 			let mut counts = image[count_at..count_at + count_bytes].to_vec();
@@ -20751,7 +20896,7 @@ impl NativeTape {
 					if saved != count as u64 {
 						let destination = checked_add(base, checked_add(layout.sums, checked_mul(slot, bytes, "indexer sum slot")?, "indexer sum local")?, "indexer sum address")?;
 						let sum = if count == 0 {
-							encode_floats(&vec![0.0; width], node.precision)
+							encode_floats(&vec![0.0; width], layout.storage)
 						} else {
 							let position = checked_add(
 								checked_mul(row, node.output.length, "indexer prefix row")?,
@@ -21978,20 +22123,13 @@ impl Carried {
 /// dilated taps span, a pool every position it reduces, a per-layer embedding the
 /// rows the host staged for every settled position, and an evaluation
 /// normalization the statistics its training saved.
-fn carried(node: &Node, rows: usize) -> Result<Carried> {
+fn carried(nodes: &[Node], node: &Node, rows: usize) -> Result<Carried> {
 	let carried = match node.op {
 		// Softmax statistics per query and head, then the indexer's block
 		// representatives, both written as the positions settle.
 		Primitive::Attention => {
-			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
-			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
-			let representatives = checked_mul(checked_mul(rows, attention_blocks(node), "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
-			let (keys, counts) = attention_index_state(node, rows)?;
-			let scores = checked_mul(queries, checked_mul(attention_blocks(node), 2, "indexer score row")?, "indexer scores")?;
-			let prefix = checked_add(checked_add(statistics, representatives, "attention state")?, scores, "indexer score state")?;
-			let count_values = checked_mul(counts, size_of::<u64>() / node.precision.bytes(), "indexer count storage")?;
-			let cache = checked_add(checked_mul(keys, 3, "indexer raw, representative, and sum caches")?, count_values, "indexer cached state")?;
-			Carried { history: History::Sequence, values: checked_add(prefix, cache, "attention carried state")? }
+			let layout = attention_index_layout(nodes, node, rows)?;
+			Carried { history: History::Sequence, values: layout.bytes.div_ceil(node.precision.bytes()) }
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -22032,7 +22170,7 @@ fn carried(node: &Node, rows: usize) -> Result<Carried> {
 fn carried_state(nodes: &[Node], rows: usize) -> Result<Vec<(usize, Carried)>> {
 	let mut declared = Vec::new();
 	for (index, node) in nodes.iter().enumerate() {
-		let state = carried(node, rows)?;
+		let state = carried(nodes, node, rows)?;
 		if state.any() {
 			declared.push((index, state));
 		}
@@ -22145,7 +22283,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 	if let Some(regions) = recurrent_body_regions(graph, node, rows, inference, step)? {
 		return regions.into_iter().map(|(elements, lifetime)| Ok((checked_mul(elements, precision.bytes(), "recurrent body context bytes")?, lifetime))).collect();
 	}
-	let state = carried(node, rows)?.values;
+	let state = carried(&graph.nodes, node, rows)?.values;
 	let regions = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
@@ -22159,24 +22297,21 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let elements = checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?;
 			vec![(checked_mul(elements.max(1), precision.bytes(), "predictor workspace bytes")?, local)]
 		}
-		// Softmax statistics, then the indexer block representatives, then one
-		// row of block scores and one admission flag per block per query, then
-		// raw keys, causal representatives, and filled counts.
+		// Statistics and scores use attention storage; keys and ordered sums use
+		// normalization storage. Counts remain integers. Scratch expires here.
 		Primitive::Attention => {
-			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention statistics rows")?, attention_blocks(node));
-			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
-			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
-			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
-			let (keys, counts) = attention_index_state(node, rows)?;
+			let layout = attention_index_layout(&graph.nodes, node, rows)?;
+			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention derivative rows")?, attention_blocks(node));
 			let derivatives = if inference { 0 } else { checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")? };
 			vec![
-				(checked_mul(statistics, precision.bytes(), "attention statistics bytes")?, local),
-				(checked_mul(representatives, precision.bytes(), "indexer representatives bytes")?, Retained),
-				(checked_mul(scores, precision.bytes(), "indexer scores bytes")?, local),
-				(checked_mul(keys, precision.bytes(), "indexer raw key bytes")?, Retained),
-				(checked_mul(keys, precision.bytes(), "indexer causal representative bytes")?, Retained),
-				(checked_mul(keys, precision.bytes(), "indexer causal sum bytes")?, Retained),
-				(checked_mul(counts, size_of::<u64>(), "indexer filled count bytes")?, Retained),
+				(layout.sums, local),
+				(layout.scores - layout.sums, Retained),
+				(layout.raw - layout.scores, local),
+				(layout.representatives - layout.raw, Retained),
+				(layout.prefix_sums - layout.representatives, Retained),
+				(layout.scratch - layout.prefix_sums, Retained),
+				(layout.counts - layout.scratch, local),
+				(layout.bytes - layout.counts, Retained),
 				(checked_mul(derivatives, precision.bytes(), "indexer derivatives bytes")?, Retained),
 			]
 		}
