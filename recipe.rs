@@ -15688,7 +15688,7 @@ impl ArchitectureKeys {
 					.unwrap_or_else(|error| panic!("{error}")).unwrap_or_default(),
 				ngram_size: count("ple.ngram_size"),
 				heads_per_ngram: count("ple.heads_per_ngram"),
-				embedding_length_per_layer_input: count("ple.embedding_length_per_layer_input"),
+				embedding_length_per_layer_input: count("embedding_length_per_layer_input"),
 				conv_kernel: count("ple.conv_kernel"),
 				eos_token_id: count("ple.eos_token_id"),
 				image_token_id: count("ple.image_token_id"),
