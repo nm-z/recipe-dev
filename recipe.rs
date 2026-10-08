@@ -15680,6 +15680,7 @@ struct MtpRuntime {
 	logits: Vec<f64>,
 	sequence: usize,
 	head_valid: usize,
+	poisoned: bool,
 }
 impl MtpRuntime {
 	fn place(head: MtpHead, sequence: usize, devices: &'static [&'static Gpu]) -> Result<Self> {
@@ -15688,7 +15689,7 @@ impl MtpRuntime {
 		let (split, ranges, resident, movement, moved) = place_ranges(&graph, &[], devices, Config::load()?.precision, &[])?;
 		let samples = Vec::new();
 		let placed = Placed { source: PlacedSource::Bound(graph.input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved };
-		Ok(Self { head, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0 })
+		Ok(Self { head, placed, samples, hidden: Vec::new(), hidden_released: 0, ids: Vec::new(), logits: Vec::new(), sequence, head_valid: 0, poisoned: false })
 	}
 	fn clear(&mut self) {
 		self.ids.clear();
@@ -15722,7 +15723,29 @@ impl MtpRuntime {
 		self.release_hidden(end)?;
 		Ok(())
 	}
-	fn decode(&mut self, main: &Placed, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+	fn decode(&mut self, main: &Placed, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		require(!self.poisoned, "MTP state is invalid after an unsuccessful transaction")?;
+		let target = MtpCheckpoint::keep(main);
+		let target = match target { Ok(target) => target, Err(error) => { self.poisoned = true; return Err(error); } };
+		let head = match MtpCheckpoint::keep(&self.placed) {
+			Ok(head) => head,
+			Err(error) => { self.poisoned = true; target.restore(main)?; return Err(error); }
+		};
+		let saved = (self.samples.clone(), self.hidden.clone(), self.hidden_released, self.ids.clone(), self.logits.clone(), self.head_valid);
+		match self.decode_inner(main, prompt, sampler, stop, budget, progress, emit) {
+			Ok(generation) => Ok(generation),
+			Err(error) => {
+				self.poisoned = true;
+				let target_result = target.restore(main);
+				let head_result = head.restore(&self.placed);
+				(self.samples, self.hidden, self.hidden_released, self.ids, self.logits, self.head_valid) = saved;
+				target_result?; head_result?;
+				Err(error)
+			}
+		}
+	}
+	fn decode_inner(&mut self, main: &Placed, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, progress: Option<&InferenceLive>, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+		require(sampler.temperature == 0.0, "MTP verification requires greedy sampling")?;
 		require(!prompt.is_empty() && prompt.len() + budget <= self.sequence, "MTP request exceeds its context")?;
 		let profile = main.tapes[0][0].profile;
 		let exact = profile.exact_cpu && main.devices.iter().all(|device| device.backend == Backend::Cpu);
@@ -15761,6 +15784,7 @@ impl MtpRuntime {
 			let limit = self.head.tokens.min(remaining.saturating_sub(1));
 			let mut proposed = vec![next];
 			let mut hidden = self.hidden[base - 1].clone();
+			let mut head_checkpoint = None;
 			for offset in 0..limit {
 				let position = base + offset - 1;
 				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
@@ -15769,6 +15793,7 @@ impl MtpRuntime {
 				if offset == 0 {
 					self.head_valid = position + 1;
 					self.release_hidden(self.head_valid)?;
+					head_checkpoint = Some(MtpCheckpoint::keep(&self.placed)?);
 				}
 				let logits = self.placed.last_logits(&output, position as u32, position as u32 + 1)?;
 				let mut draft_sampler = recipe.sampler().temperature(0.0);
@@ -15804,11 +15829,17 @@ impl MtpRuntime {
 				if stop.contains(&next) { stopped = Some(Instant::now()); break; }
 				if let Some(progress) = progress { progress.generated(true); }
 			}
-			self.ids = generation.ids.clone();
+			let terminal = generation.ids.last().is_some_and(|id| stop.contains(id));
+			generation.mtp.rejected += proposed.len() - accepted;
+			let committed = base + accepted - usize::from(terminal);
+			if committed < end { main.commit_mtp_prefix(committed as u32)?; }
+			if let Some(checkpoint) = head_checkpoint { checkpoint.restore(&self.placed)?; }
+			self.ids = generation.ids[..committed.min(generation.ids.len())].to_vec();
+			self.hidden.truncate(committed);
 			if let Some(progress) = progress { progress.mtp(generation.mtp); }
 			generation.logits = self.logits.clone();
-			if generation.ids.last().is_some_and(|id| stop.contains(id)) {
-				self.logits = output_tape.logits_at(&predictions, base + accepted - 1)?;
+			if terminal {
+				self.logits = output_tape.logits_at(&predictions, committed - 1)?;
 				break;
 			}
 			// Replace speculative head inputs with the verified main-model states.
@@ -17280,6 +17311,7 @@ impl Sampler {
 pub struct MtpReport {
 	pub drafted: usize,
 	pub accepted: usize,
+	pub rejected: usize,
 	pub verifications: usize,
 }
 pub struct Generation {
@@ -18155,6 +18187,44 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	/// Commit an evaluated speculative prefix without replaying model arithmetic.
+	fn commit_mtp_prefix(&self, end: u32) -> Result<()> {
+		let mut images = Vec::new();
+		for tape in self.tapes.iter().flatten() {
+			let mut contexts = tape.contexts.download::<u8>(tape.contexts.bytes)?;
+			let mut values = tape.values.download::<u8>(tape.values.bytes)?;
+			tape.commit_index_prefix(&mut contexts, &mut values, end)?;
+			for (index, node) in tape.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Delta) {
+				let slots = integer_argument(node.argument[5], "delta checkpoint slots")? as usize;
+				require(slots != 0, "MTP delta prefix has no checkpoint slots")?;
+				let (_, keys, heads, width) = delta_extent(node)?;
+				let cells = checked_mul(keys as usize, width as usize, "MTP delta state cells")?;
+				let bytes = checked_mul(cells, NativePrecision::new(node.precision, node.acc)?.state.bytes(), "MTP delta state bytes")?;
+				let pairs = checked_mul(tape.rows as usize, heads as usize, "MTP delta state pairs")?;
+				let live = checked_mul(pairs, bytes, "MTP delta live bytes")?;
+				let base = tape.program.artifact.layout.contexts[index];
+				let image = if tape.program.artifact.layout.contexts_in_values[index] { &mut values } else { &mut contexts };
+				let extent = checked_mul(live, checked_add(slots, 1, "MTP delta slots")?, "MTP delta checkpoint extent")?;
+				require(checked_add(base, extent, "MTP delta checkpoint end")? <= image.len(), "MTP delta checkpoint exceeds its image")?;
+				if end == 0 { image[base..base + live].fill(0); continue; }
+				let slot = (end as usize - 1) % slots;
+				for pair in 0..pairs {
+					let cell = checked_add(checked_mul(pair, slots, "MTP delta checkpoint pair")?, slot, "MTP delta checkpoint slot")?;
+					let source = checked_add(checked_add(base, live, "MTP delta checkpoint region")?, checked_mul(cell, bytes, "MTP delta checkpoint offset")?, "MTP delta checkpoint address")?;
+					let target = checked_add(base, checked_mul(pair, bytes, "MTP delta live offset")?, "MTP delta live address")?;
+					image.copy_within(source..source + bytes, target);
+				}
+			}
+			images.push((tape, contexts, values));
+		}
+		// All images pass their layout and prefix checks before the first device write.
+		for (tape, contexts, values) in &images {
+			tape.contexts.write_bytes(0, contexts)?; tape.values.write_bytes(0, values)?;
+			tape.program.gpu.synchronize()?;
+		}
+		for (tape, _, _) in images { tape.reached.store(end, Ordering::Release); }
+		Ok(())
+	}
 	fn take_operations(&self, model: &str) -> Vec<OperationReport> {
 		self.tapes.iter().flatten().flat_map(|tape| {
 			std::mem::take(&mut *tape.operations.lock().unwrap()).into_iter().map(|mut observation| {
