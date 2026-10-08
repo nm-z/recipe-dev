@@ -15613,11 +15613,25 @@ pub struct GgmlKeys {
 	pub eos_token_id: u32,
 	pub add_bos_token: bool,
 }
-pub struct TokenizerNamespace(OnceLock<TokenizerKeys>);
+pub struct TokenizerNamespace {
+	keys: OnceLock<TokenizerKeys>,
+	coder: OnceLock<Tokenizer>,
+}
+impl TokenizerNamespace {
+	fn coder(&self) -> &Tokenizer { self.coder.get_or_init(|| script_file().tokenizer()) }
+	/// Encodes text with the opened GGUF source's vocabulary and pre-tokenizer.
+	pub fn encode(&self, text: &str) -> Vec<u32> { self.coder().encode(text) }
+	/// Joins token bytes before decoding UTF-8 text.
+	pub fn decode(&self, ids: &[u32]) -> String { self.coder().decode(ids) }
+	/// Renders the opened GGUF source's chat template.
+	pub fn chat(&self, messages: &[(&str, &str)], generation: bool) -> String { self.coder().chat(messages, generation) }
+	/// Returns the end-of-turn ids selected by the source's template and EOS metadata.
+	pub fn stop_ids(&self) -> Vec<u32> { self.coder().stop_ids() }
+}
 impl std::ops::Deref for TokenizerNamespace {
 	type Target = TokenizerKeys;
 	fn deref(&self) -> &TokenizerKeys {
-		self.0.get_or_init(|| {
+		self.keys.get_or_init(|| {
 			let file = script_file();
 			let text = |key: &str| -> &'static str { Box::leak(file.value(key).and_then(GgufValue::text).unwrap_or("").to_owned().into_boxed_str()) };
 			let id = |key: &str| file.value(key).and_then(GgufValue::integer).map_or(u32::MAX, |value| value as u32);
@@ -15639,7 +15653,7 @@ impl std::ops::Deref for TokenizerNamespace {
 		})
 	}
 }
-pub static tokenizer: TokenizerNamespace = TokenizerNamespace(OnceLock::new());
+pub static tokenizer: TokenizerNamespace = TokenizerNamespace { keys: OnceLock::new(), coder: OnceLock::new() };
 /// A width a model file gives as a count or as the vocabulary itself:
 /// `layer(4096)`, `embed(tokenizer.ggml.tokens, width)`.
 pub trait Width {
@@ -25959,10 +25973,6 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	}
 }
 impl Data {
-	/// Builds the encoder, decoder, and chat template from this GGUF source's metadata.
-	pub fn tokenizer(&self) -> Tokenizer {
-		self.file.as_ref().unwrap_or_else(|| panic!("a tokenizer requires a GGUF data source")).tokenizer()
-	}
 	fn report_path(&self) -> Result<String> {
 		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
 		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
