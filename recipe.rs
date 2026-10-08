@@ -11182,6 +11182,7 @@ mod bundle {
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared)),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -11293,6 +11294,15 @@ mod bundle {
 			"moe_blocks" => {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
+			}
+			"moe" => {
+				let fields = rest.split(',').collect::<Vec<_>>();
+				require(fields.len() == 7, "MoE record requires seven fields")?;
+				let scoring = match value_at::<u8>(fields.get(4).copied(), "MoE scoring")? {
+					0 => Scoring::Softmax, 1 => Scoring::Sigmoid,
+					_ => return Err(RecipeError::new("MoE scoring is invalid")),
+				};
+				Ok(Operation::Moe(value_at(fields.first().copied(), "MoE experts")?, value_at(fields.get(1).copied(), "MoE top-k")?, value_at(fields.get(2).copied(), "MoE expert width")?, activation(fields[3])?, scoring, bool_value(fields[5], "MoE renormalization")?, bool_value(fields[6], "MoE shared expert")?))
 			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
@@ -12465,6 +12475,7 @@ fn intern_ple(ple: PleBlock) -> &'static PleBlock {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
+	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
 	Layer(usize),
 	Conv(usize, usize),
 	Pool(usize),
@@ -12547,6 +12558,12 @@ impl Activation {
 			Self::Scale(_) => 16,
 		}
 	}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Scoring {
+	Softmax,
+	Sigmoid,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockNormalization {
@@ -12694,7 +12711,7 @@ impl Suffix {
 			// These operations lower their declared arithmetic through a sum,
 			// table lookup, or attention node. Their trailing suffix therefore
 			// names the block's primary numeric operation, not a later activation.
-			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::MoeBlocks(..) => Self::Blck,
+			Operation::Layer(_) | Operation::Conv(..) | Operation::Perceptron(_) | Operation::Embed(..) | Operation::Attention(..) | Operation::Glu(..) | Operation::Moe(..) | Operation::MoeBlocks(..) => Self::Blck,
 			// Every other operation lowers its primary node through the ordinary
 			// operation precision. Weight ownership alone does not choose a slot:
 			// a depthwise convolution owns taps but is not a matrix sum.
@@ -13032,6 +13049,9 @@ impl Model {
 	}
 	pub fn moe<const N: usize, E: Into<Block>>(&self, top_k: usize, experts: [E; N]) -> Self {
 		self.push(Operation::MoeBlocks(top_k, branch(experts.map(Into::into))))
+	}
+	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
+		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
 	/// and a standalone `attn(...)` block share one configuration path.
@@ -14675,7 +14695,7 @@ impl Operation {
 			Self::Ensemble(_) => "ensemble",
 			Self::Identity => "identity",
 			Self::Last => "last",
-			Self::MoeBlocks(..) => "moe",
+			Self::Moe(..) | Self::MoeBlocks(..) => "moe",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
@@ -15400,7 +15420,7 @@ impl MtpHead {
 		builder.mapped(vec![enorm, hnorm]);
 		let projection = builder.projection(&name("nextn.eh_proj.weight"), "MTP embedding-hidden projection", input_width, width)?;
 		builder.mapped(vec![projection]);
-		let mut model = recipe.model().epsilon(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).norm(rms).layer(width);
+		let mut model = recipe.model().e(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).norm(rms).layer(width);
 		let attention = builder.open(layer, "attn", &dimensions)?;
 		let mut attention = builder.attention(attention, layer, &dimensions)?.fp(32);
 		let mut scaling = None;
@@ -15693,6 +15713,7 @@ struct Dimensions {
 	interval: Option<usize>,
 	delta: Option<DeltaDims>,
 	feed_forward: Option<usize>,
+	experts: Option<ExpertDims>,
 	hyper: Option<(usize, usize)>,
 	indexer: Option<(usize, usize, usize)>,
 	compression: Vec<usize>,
@@ -15703,6 +15724,13 @@ struct DeltaDims {
 	state: usize,
 	kernel: usize,
 	inner: usize,
+}
+struct ExpertDims {
+	count: usize,
+	used: usize,
+	hidden: usize,
+	scoring: Scoring,
+	renormalize: bool,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
@@ -15867,8 +15895,26 @@ impl<'a> Builder<'a> {
 			}),
 			None => None,
 		};
+		let experts = match self.integer_or("expert_count", 0)? {
+			0 => None,
+			count => Some(ExpertDims {
+				count,
+				used: self.integer("expert_used_count")?,
+				hidden: self.integer("expert_feed_forward_length")?,
+				scoring: match self.integer_or("expert_gating_func", 1)? {
+					1 => Scoring::Softmax,
+					2 => Scoring::Sigmoid,
+					other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))),
+				},
+				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
+					Some(GgufValue::Bool(value)) => *value,
+					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
+					None => true,
+				},
+			}),
+		};
 		let feed_forward = if self.present("feed_forward_length") { Some(self.integer("feed_forward_length")?) } else { None };
-		require(self.integer_or("expert_count", 0)? != 0 || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
+		require(experts.is_some() || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
 		let hyper = if self.present("hyper_connection.count") { Some((self.integer("hyper_connection.count")?, self.integer("hyper_connection.low_rank")?)) } else { None };
 		let indexer = if self.present("attention.indexer.head_count") {
 			Some((self.integer("attention.indexer.head_count")?, self.integer("attention.indexer.key_length")?, self.integer("attention.indexer.top_k")?))
@@ -15876,7 +15922,7 @@ impl<'a> Builder<'a> {
 			None
 		};
 		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
-		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, hyper, indexer, compression })
+		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, swa, window, shortconv, interval, delta, feed_forward, experts, hyper, indexer, compression })
 	}
 	/// The named tensor, which `role` reads, marked as read.
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
@@ -16004,7 +16050,7 @@ impl<'a> Builder<'a> {
 		}
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
-			block = block.index(index_heads, index_width, block_size, 1).budget(top_k);
+			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size));
 			let query_norm = name("indexer.q_norm.weight");
 			let key_norm = name("indexer.k_norm.weight");
 			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
@@ -16110,6 +16156,35 @@ impl<'a> Builder<'a> {
 			self.mapped(vec![tensor]);
 		}
 		Ok(branch.glu(hidden, Activation::Silu))
+	}
+	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} experts");
+		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
+		self.mapped(vec![router]);
+		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
+			let table = self.tensor(&name(suffix), &role)?;
+			require(
+				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
+				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
+			)?;
+			self.mapped(vec![table]);
+		}
+		let shared = self.file.tensor(&name("ffn_gate_shexp.weight")).is_some();
+		if shared {
+			let shared_role = format!("block {layer} shared expert");
+			// The per-position gate is the first weighted node in the shared path.
+			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
+			self.mapped(vec![gate]);
+			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
+				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+				self.mapped(vec![tensor]);
+			}
+		}
+		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
 	}
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
@@ -18728,6 +18803,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Product(left, right) => lower_product(graph, left, right, ScalarOpcode::Multiply, total, data, targets, rows, gpu, config)?,
 		Operation::Sum(left, right) => lower_product(graph, left, right, ScalarOpcode::Add, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
@@ -19727,6 +19803,39 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	let product = lower_gated(graph, gate, up, wide, activation, config)?;
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
+}
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+	require(experts != 0, "moe requires an expert")?;
+	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
+	require(hidden != 0, "moe expert width must be positive")?;
+	let (source, input) = (graph.source, graph.output);
+	let mut gate = Block::of(Operation::Layer(hidden));
+	gate.activation = activation;
+	let expert = [gate, Block::of(Operation::Layer(hidden)), Block::of(Operation::Layer(input.channels))];
+	// One router scores every expert per position. The top-k weights name the
+	// experts whose gated feed-forward runs, so a position costs top-k of them.
+	lower_project(graph, experts)?;
+	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let routing = graph.source;
+	lower_experts(graph, source, input, routing, experts, top_k, hidden, expert.clone(), config)?;
+	if !shared {
+		return Ok(());
+	}
+	// The shared expert is one more expert that every position takes. Its routing
+	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
+	// so the dispatch that runs the routed experts runs it under that per-position
+	// value and its gradient reaches the gate and the input through the same adjoints.
+	let dispatched = graph.source;
+	reset(graph, source, input);
+	// The gate is the `[width]` vector alone, trained or bound, so a view of it
+	// must hold exactly that many values.
+	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
+	let gate = graph.source;
+	lower_experts(graph, source, input, gate, 1, 1, hidden, expert.clone(), config)?;
+	let gated = graph.source;
+	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
+	Ok(())
 }
 fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;

@@ -6,7 +6,7 @@ const MTP: &str = "/home/nate/models-hdd-backup/Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B
 
 fn main() {
 	let data = recipe.data(GGUF);
-	let mut model = recipe.model().epsilon(qwen35.attention.layer_norm_rms_epsilon).embed(tokenizer.ggml.tokens, qwen35.embedding_length);
+	let mut model = recipe.model().e(qwen35.attention.layer_norm_rms_epsilon).embed(tokenizer.ggml.tokens, qwen35.embedding_length);
 	for _ in 0..qwen35.block_count / 4 {
 		for _ in 0..3 {
 			model = model

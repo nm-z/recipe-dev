@@ -10,7 +10,7 @@ fn main() {
 		GgufValue::Array(values) => values.iter().map(|value| value.integer().unwrap() as usize).collect::<Vec<_>>(),
 		_ => panic!("attention.compress_ratios must be an array"),
 	};
-	let mut model = recipe.model().epsilon(qwen4exp.attention.layer_norm_rms_epsilon).embed(tokenizer.ggml.tokens, qwen4exp.embedding_length);
+	let mut model = recipe.model().e(qwen4exp.attention.layer_norm_rms_epsilon).embed(tokenizer.ggml.tokens, qwen4exp.embedding_length);
 	for block in 0..qwen4exp.block_count {
 		if block == ngram.layer() { model = model.ple(&ngram); }
 		let mut attention = if (block + 1) % 4 == 0 {
