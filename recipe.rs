@@ -8595,19 +8595,32 @@ mod gguf {
 			let format = embedding_format(tensor)?;
 			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, tensor.elements())] })
 		}
+		/// One decoder segment, preserving mapped quantized bytes when another
+		/// plane of the same node contains an ordinary bias or rewritten scale.
+		fn bound_plane(&self, plane: &Plane) -> Result<StoredWeight> {
+			let values = match plane {
+				Plane::Mapped(tensor) if tensor.blocked() => return self.stored(tensor),
+				Plane::Mapped(tensor) if matches!(tensor.kind, 0 | 1) => return self.embedding_stored(tensor),
+				Plane::Mapped(tensor) => self.values(tensor)?,
+				Plane::Owned { values, .. } => values.clone(),
+			};
+			require(values.iter().all(|value| f64::from(*value as f32).to_bits() == value.to_bits()), format!("{} cannot join a mapped quantized plane without losing its stored precision", plane.name()))?;
+			let format = StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 decoder layout is unavailable"))?;
+			let count = values.len();
+			let bytes = values.iter().flat_map(|value| (*value as f32).to_le_bytes()).collect::<Vec<_>>();
+			Ok(StoredWeight { format, count, bytes: bytes.into(), codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+		}
 		/// Resolves a plan against this file, one bound weight per entry. Block-
-		/// quantized views join as runs of their own mappings, so nothing is decoded
-		/// or copied here; when adjacent views use different layouts, the stored
-		/// weight retains one decoder segment for each layout. Views in an unblocked
-		/// layout, or values the host rewrote, decode into values instead.
+		/// quantized views retain their mappings, including beside ordinary bias
+		/// planes. Each source layout has its own decoder segment. A node without
+		/// quantized planes can bind ordinary values directly.
 		pub(super) fn bound(&self, plan: &Binding) -> Result<Vec<BoundNode>> {
 			plan.nodes
 				.iter()
 				.enumerate()
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
-					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
-					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
+					let packed = planes.iter().filter_map(Plane::mapped).any(GgufTensor::blocked);
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
@@ -8620,9 +8633,9 @@ mod gguf {
 						(1, Plane::Owned { name, .. }) => format!("values {name}"),
 						(count, _) => format!("{count} views of {}", names.join(", ")),
 					};
-					let weight = match views.filter(|_| packed) {
-						Some(views) => {
-							let parts = views.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
+					let weight = match packed {
+						true => {
+							let parts = planes.iter().map(|plane| self.bound_plane(plane)).collect::<Result<Vec<_>>>()?;
 							let format = parts[0].format;
 							let mut segments = Vec::new();
 							for part in &parts {
@@ -8635,14 +8648,14 @@ mod gguf {
 							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
 							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments })
 						}
-						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
+						false if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
 							let tensor = match first {
 								Plane::Mapped(tensor) => tensor,
 								Plane::Owned { .. } => unreachable!(),
 							};
 							BoundWeight::Stored(self.embedding_stored(tensor)?)
 						}
-						None => {
+						false => {
 							let mut values = Vec::with_capacity(elements);
 							for plane in planes {
 								match plane {
@@ -12669,8 +12682,39 @@ impl Model {
 		self.edit(|model| { model.epsilon = value; model.epsilon_explicit = true; })
 	}
 	fn for_file(&self, file: &Gguf) -> Self {
-		if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) }
+		let model = if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) };
+		let Some((vocabulary, width)) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, width) => Some((rows, width)), _ => None }) else { return model };
+		model.edit(|model| {
+			let mut layers = 0;
+			for block in &mut model.blocks {
+				let (parts, plain) = match &mut block.operation {
+					Operation::Residual(parts) => (parts, true),
+					Operation::Hyper(_, _, parts) => (parts, false),
+					_ => continue,
+				};
+				let attends = mixes(parts);
+				if attends { layers += 1; }
+				if layers == 0 { continue; }
+				let part = if attends { "attn" } else { "ffn" };
+				adapt_file_branch(file, parts, layers - 1, part, width, plain);
+			}
+			let output_scale = file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight"));
+			if output_scale.is_none() { return; }
+			let Some(projection) = model.blocks.iter().rposition(|block| matches!(block.operation, Operation::Layer(rows) if rows == vocabulary)) else { return };
+			let previous = (0..projection).rev().find(|index| !matches!(model.blocks[*index].operation, Operation::Last));
+			if let Some(index) = previous {
+				let block = &mut model.blocks[index];
+				if block.normalization.is_some() && !matches!(block.operation, Operation::Hyper(..)) { return; }
+				// The final scale reads the collapsed stream, not its widened lanes.
+				let normalization = block.normalization.take().unwrap_or(BlockNormalization::Rms);
+				let mut scale = Block::of(Operation::Identity);
+				scale.normalization = Some(normalization);
+				scale.norm_precision = block.norm_precision;
+				model.blocks.insert(projection, scale);
+			}
+		})
 	}
+
 	/// `.fp(16)`, `.int(4)`, `.bf(16)`, or `.tf(32)` after a block sets that
 	/// block's arithmetic; before any block they set the default for every block
 	/// that names none.
@@ -12711,14 +12755,14 @@ impl Model {
 	/// Resolve every weighted node against GGUF data before selecting devices.
 	pub fn binding(&self, data: &Data) -> Result<Binding> {
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("binding requires GGUF data"))?;
-		conventional_plan(file, &with_last_projection(self))
+		conventional_plan(file, &with_last_projection(self).for_file(file))
 	}
 	/// Inspect the planned inference arenas before compiling or allocating GPU
 	/// kernels. This uses the same graph and arena layout as a real run.
 	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
 		require(positions > 0, "memory inspection requires context positions")?;
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
-		let model = with_last_projection(self);
+		let model = with_last_projection(self).for_file(file);
 		let plan = conventional_plan(file, &model)?;
 		let gpu = selected_gpu()?;
 		let graph = bound_graph_on(file, &model, &plan, &vec![0.0; positions], 1, gpu)?;
@@ -15817,7 +15861,7 @@ impl Infer {
 		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		let model = with_last_projection(model);
+		let model = with_last_projection(model).for_file(&file);
 		let plan = conventional_plan(&file, &model)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
@@ -16033,6 +16077,40 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 	Ok(builder.plan)
+}
+/// Resolve optional source planes inside the model builder. The user declares
+/// each branch's operation and dimensions; the file determines its trained
+/// gates and normalization scales.
+fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, width: usize, plain: bool) {
+	let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	for block in parts.iter_mut() {
+		if let Operation::Attention(attention) = &mut block.operation {
+			let head = if attention.width == 0 { width.div_ceil(attention.heads.max(1)) } else { attention.width };
+			if file.tensor(&name("attn_q.weight")).and_then(|tensor| tensor.shape.get(1)).is_some_and(|rows| *rows as usize == 2 * attention.heads * head) {
+				attention.gate = true;
+			}
+			if block.qk.is_none() && (file.tensor(&name("attn_q_norm.weight")).is_some() || file.tensor(&name("attn_k_norm.weight")).is_some()) { block.qk = Some(BlockNormalization::Rms); }
+			attention.factors |= attention.rope.is_some() && attention.window == 0 && file.tensor("rope_freqs.weight").is_some();
+			if let Some(index) = &mut attention.index {
+				if index.score.is_none() && (file.tensor(&name("indexer.q_norm.weight")).is_some() || file.tensor(&name("indexer.k_norm.weight")).is_some()) {
+					index.score = Some((BlockNormalization::Rms, attention.rope.map_or(0, |(_, dims, _)| dims)));
+				}
+			}
+		}
+	}
+	let post = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
+	if file.tensor(&name(post)).is_some() {
+		if let Some(block) = parts.last_mut().filter(|block| block.normalization.is_none()) { block.normalization = Some(BlockNormalization::Rms); }
+	}
+	if plain {
+		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.normalization.is_some());
+		if !normalized && file.tensor(&name(pre)).is_some() {
+			let mut scale = Block::of(Operation::Identity);
+			scale.normalization = Some(BlockNormalization::Rms);
+			parts.insert(0, scale);
+		}
+	}
 }
 /// A branch that mixes positions starts a GGUF block; its feed-forward reads
 /// the tensors at the same block index.
