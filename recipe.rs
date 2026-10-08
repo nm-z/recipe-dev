@@ -12458,7 +12458,8 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
-	fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
+	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
@@ -12517,6 +12518,10 @@ impl Model {
 	/// need not partition the stream.
 	pub fn values(&self, width: usize) -> Self {
 		self.delta_block("values", |delta| delta.value_width = width)
+	}
+	/// Activations of the preceding delta block's convolution and output gate.
+	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
+		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (convolution, output))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
@@ -12660,6 +12665,11 @@ impl Model {
 			})
 			.collect::<Vec<_>>()
 			.join("/")
+	}
+	/// Resolve every weighted node against GGUF data before selecting devices.
+	pub fn binding(&self, data: &Data) -> Result<Binding> {
+		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("binding requires GGUF data"))?;
+		conventional_plan(file, &with_last_projection(self))
 	}
 	/// Inspect the planned inference arenas before compiling or allocating GPU
 	/// kernels. This uses the same graph and arena layout as a real run.
@@ -14668,7 +14678,7 @@ impl Gguf {
 	pub fn place(&self, blocks: &Model, positions: usize, split: &[usize]) -> Placed {
 		let model = with_last_projection(blocks);
 		let plan = conventional_plan(self, &model).unwrap_or_else(|error| panic!("{error}"));
-		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
+		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.tensors(), vocabulary: 0, model, plan };
 		selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
@@ -14689,6 +14699,7 @@ impl Gguf {
 /// row as its bias.
 #[derive(Clone, Default)]
 pub struct Binding {
+	tensors: BTreeSet<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
@@ -14720,9 +14731,14 @@ impl Plane {
 	}
 }
 impl Binding {
+	/// Distinct source tensors read by this plan, including rewritten scales.
+	pub fn tensors(&self) -> usize { self.tensors.len() }
+	/// Weighted nodes filled by the plan in lowering order.
+	pub fn nodes(&self) -> usize { self.nodes.len() }
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
+		self.tensors.extend(planes.iter().map(|tensor| tensor.name.clone()));
 		self.nodes.push(planes.iter().cloned().map(Plane::Mapped).collect());
 		self
 	}
@@ -14926,7 +14942,6 @@ struct Builder<'a> {
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
 	plan: Binding,
-	consumed: std::collections::BTreeSet<String>,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
 struct Dimensions {
@@ -14970,7 +14985,7 @@ impl<'a> Builder<'a> {
 			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15049,9 +15064,9 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
-		let tensors = builder.consumed.len();
+		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
 	fn key(&self, suffix: &str) -> String {
@@ -15158,12 +15173,12 @@ impl<'a> Builder<'a> {
 	/// The named tensor, which `role` reads, marked as read.
 	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
 		let tensor = self.file.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent; {role} reads it")))?.clone();
-		self.consumed.insert(name.to_owned());
+		self.plan.tensors.insert(name.to_owned());
 		Ok(tensor)
 	}
 	fn optional(&mut self, name: &str) -> Option<GgufTensor> {
 		let tensor = self.file.tensor(name)?.clone();
-		self.consumed.insert(name.to_owned());
+		self.plan.tensors.insert(name.to_owned());
 		Some(tensor)
 	}
 	/// The next parameterized node, filled from mapped views.
@@ -15222,91 +15237,28 @@ impl<'a> Builder<'a> {
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
 		let (width, heads) = (dimensions.width, dimensions.heads);
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
-		let sliding = dimensions.swa[layer];
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
-		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
-		let gated = match query.shape[1] as usize {
-			outputs if outputs == heads * head => false,
-			outputs if outputs == 2 * heads * head => true,
-			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
-		};
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
-			Some(value) => {
-				require(value.shape.len() == 2 && value.shape[0] as usize == width && value.shape[1] as usize == kv * head, format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-				value
-			}
-			None => key.clone(),
-		};
-		let order = self.head_order(head, rope_dims);
-		let stride = if gated { 2 * head } else { head };
-		let mut planes = Vec::new();
-		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
-		}
-		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
-		}
-		planes.push(value);
+		let query = self.file.tensor(&name("attn_q.weight")).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
 		let mut block = branch.attn(heads).kv(kv).head(head);
-		if gated {
-			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?);
-			}
-			block = block.gate();
-		}
+		if query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head) { block = block.gate(); }
 		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
-		if normalized {
-			block = block.qk(rms);
-		}
+		if normalized { block = block.qk(rms); }
 		block = block.rope(self.rope, rope_dims, rope_base);
-		let factors = !sliding && self.file.tensor("rope_freqs.weight").is_some();
 		block = block.edit(|model| {
 			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
-			attention.window = if sliding { dimensions.window } else { 0 };
-			attention.factors = factors;
+			attention.window = if dimensions.swa[layer] { dimensions.window } else { 0 };
+			attention.factors = !dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some();
 		});
-		self.mapped(planes);
-		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
-			self.slot(scales);
-		}
-		if factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
-			require(factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
-			self.mapped(vec![factors]);
-		}
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
-			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
-			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
-			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
-			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
-			// reaches the adjacent-pair Rope with the matching columns.
-			let index_order = self.head_order(index_width, rope_dims);
-			let mut index_planes = Vec::new();
-			for index in 0..index_heads {
-				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
-			}
-			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
-			self.mapped(index_planes);
 			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size));
-			let query_norm = name("indexer.q_norm.weight");
-			let key_norm = name("indexer.k_norm.weight");
-			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
-				block = block.score(rms, rope_dims);
-				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
-				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
-				self.slot(scales);
-			}
+			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
-		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
-		self.mapped(vec![output]);
+		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
+		self.attention_planes(layer, attention, normalized, width)?;
 		Ok(block)
 	}
+
 	/// LFM2 short convolution: project B, C and X in one stored tensor, run
 	/// `C * depthwise_conv(B * X)`, then project back to the residual width.
 	fn shortconv(&mut self, branch: Model, layer_index: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -15343,9 +15295,18 @@ impl<'a> Builder<'a> {
 	/// query-key-value projection, its convolution taps, its decay, its output
 	/// scale, its output gate and its output projection.
 	fn delta(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
-		let width = dimensions.width;
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
+		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation };
+		self.delta_planes(layer, &delta, dimensions.width)?;
+		Ok(branch.push(Operation::Delta(delta)))
+	}
+	/// Bind the planes of the declared delta block in lowering order.
+	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize) -> Result<()> {
+		let (key_heads, key_width, value_width, output) = delta.extent(width)?;
+		let (heads, kernel) = (delta.heads, delta.kernel);
+		let inner = heads * value_width;
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} delta");
 		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
@@ -15359,7 +15320,7 @@ impl<'a> Builder<'a> {
 			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
-		let conv_width = 2 * key_heads * state + inner;
+		let conv_width = 2 * key_heads * key_width + inner;
 		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
 		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
@@ -15373,21 +15334,14 @@ impl<'a> Builder<'a> {
 		let values = self.file.values(&decay)?;
 		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
 		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
-		let order = (0..state).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, state, heads, &order)?;
+		let order = (0..value_width).collect::<Vec<_>>();
+		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
 		self.slot(scales);
 		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
 		self.mapped(vec![gate]);
-		let output = self.projection(&name("ssm_out.weight"), &role, inner, width)?;
+		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
 		self.mapped(vec![output]);
-		// A missing row selector keeps the historical hand-built defaults;
-		// architecture rows that use this block provide their trained pair.
-		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
-		let block = branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width);
-		Ok(block.delta_block("activations", |delta| {
-			delta.conv_activation = conv_activation;
-			delta.output_activation = output_activation;
-		}))
+		Ok(())
 	}
 	/// One gated feed-forward and the plan of its gate, up and down projections.
 	fn feed_forward(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -15404,8 +15358,13 @@ impl<'a> Builder<'a> {
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let width = dimensions.width;
 		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
+		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
+		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
+		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+	}
+	/// Bind the router, packed expert tables, and optional shared expert.
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
@@ -15418,7 +15377,6 @@ impl<'a> Builder<'a> {
 			)?;
 			self.mapped(vec![table]);
 		}
-		let shared = self.file.tensor(&name("ffn_gate_shexp.weight")).is_some();
 		if shared {
 			let shared_role = format!("block {layer} shared expert");
 			// The per-position gate is the first weighted node in the shared path.
@@ -15430,24 +15388,26 @@ impl<'a> Builder<'a> {
 				self.mapped(vec![tensor]);
 			}
 		}
-		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		Ok(())
 	}
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
 	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
+		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes))
+	}
+	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize) -> Result<()> {
 		let role = format!("block {layer} per-layer embedding");
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let (table_name, _, _) = ple.table();
 		let table = self.tensor(table_name, &role)?;
 		self.mapped(vec![table]);
-		let lanes = dimensions.hyper.map_or(1, |(lanes, _)| lanes);
-		let stream = checked_mul(lanes, dimensions.width, "per-layer embedding stream")?;
+		let stream = checked_mul(lanes, width, "per-layer embedding stream")?;
 		let gathered = ple.width();
 		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
 		self.mapped(vec![key]);
 		self.whole(&name("ple_norm_key.weight"), &role)?;
 		self.whole(&name("ple_norm_query.weight"), &role)?;
-		let value = self.projection(&name("ple_value.weight"), &role, gathered, dimensions.width)?;
+		let value = self.projection(&name("ple_value.weight"), &role, gathered, width)?;
 		self.mapped(vec![value]);
 		self.whole(&name("ple_norm_conv.weight"), &role)?;
 		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
@@ -15979,101 +15939,158 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// embedding when the file has none. The walk follows the order the lowering
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
-	// Architecture-built models carry tensor arrangements beyond the flat
-	// residual convention, including hyper-connections and per-layer embeddings.
-	if model.blocks.iter().any(|block| matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..))) {
-		let bound = Builder::build(file)?;
-		require(model.blocks == with_last_projection(&bound.model).blocks, "this model requires the GGUF architecture's model definition for tensor binding")?;
-		return Ok(bound.plan);
-	}
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
-	let embedding = builder.tensor("token_embd.weight", "the embedding")?;
-	require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
-	let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-	let mut layers = 0;
-	for block in &model.blocks {
-		match &block.operation {
-			Operation::Embed(rows, columns) => {
-				require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
-				builder.mapped(vec![embedding.clone()]);
-			}
-			Operation::Residual(parts) => {
-				let attends = parts.iter().any(|part| matches!(part.operation, Operation::Attention(_)));
-				if attends {
-					layers += 1;
-				}
-				require(layers != 0, "a feed-forward residual comes before any attention residual, so no block index names its tensors")?;
-				let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
-				let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-				let role = format!("block {layer} feed-forward");
-				let (mut weighted, mut hidden) = (false, 0);
-				for step in parts {
-					match &step.operation {
-						Operation::Identity => {}
-						Operation::Attention(attention) => {
-							builder.attention_planes(layer, attention, step.qk.is_some(), width)?;
-							weighted = true;
-						}
-						Operation::Product(left, right) => {
-							// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
-							let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.activation != Activation::Linear);
-							let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
-							for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
-								let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
-								require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
-								hidden = widths[0];
-								let tensor = builder.projection(&name(suffix), &role, width, hidden)?;
-								builder.mapped(vec![tensor]);
-							}
-							weighted = true;
-						}
-						Operation::Glu(inner, _) => {
-							for (suffix, inputs, outputs) in [("ffn_gate.weight", width, *inner), ("ffn_up.weight", width, *inner), ("ffn_down.weight", *inner, width)] {
-								let tensor = builder.projection(&name(suffix), &role, inputs, outputs)?;
-								builder.mapped(vec![tensor]);
-							}
-							weighted = true;
-						}
-						Operation::Layer(outputs) => {
-							require(part == "ffn" && hidden != 0 && *outputs == width, format!("layer({outputs}) in block {layer} follows no feed-forward product, so no tensor name is its convention"))?;
-							let tensor = builder.projection(&name("ffn_down.weight"), &role, hidden, width)?;
-							builder.mapped(vec![tensor]);
-						}
-						other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
-					}
-					if step.normalization.is_some() {
-						let suffix = match (part, weighted) {
-							("attn", false) => "attn_norm.weight",
-							("attn", true) => "post_attention_norm.weight",
-							(_, false) => "ffn_norm.weight",
-							(_, true) => "post_ffw_norm.weight",
-						};
-						builder.norm_scale(&name(suffix), width)?;
-					}
-				}
-				if block.normalization.is_some() {
-					builder.norm_scale("output_norm.weight", width)?;
-				}
-			}
-			Operation::Layer(outputs) => {
-				require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
-				require(block.normalization.is_none(), "a normalization after the vocabulary projection has no tensor name")?;
-				let output = match builder.optional("output.weight") {
-					Some(output) => output,
-					None => embedding.clone(),
-				};
-				require(output.shape.len() == 2 && output.shape[0] as usize == width && output.shape[1] as usize == vocabulary, format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
-				builder.mapped(vec![output]);
-			}
-			Operation::Identity | Operation::Last => require(block.normalization.is_none(), "a normalization outside the blocks has no tensor name")?,
-			other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
-		}
-	}
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
+	builder.plan_model(model)?;
+	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 	Ok(builder.plan)
 }
+/// A branch that mixes positions starts a GGUF block; its feed-forward reads
+/// the tensors at the same block index.
+fn mixes(parts: &[Block]) -> bool {
+	parts.iter().any(|part| match &part.operation {
+		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
+		Operation::Product(left, right) => mixes(&left.blocks) || mixes(&right.blocks),
+		_ => false,
+	})
+}
+
 impl Builder<'_> {
+	/// Bind the user-declared model in the order lowering emits weighted nodes.
+	fn plan_model(&mut self, model: &Model) -> Result<()> {
+		let embedding = self.tensor("token_embd.weight", "the embedding")?;
+		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
+		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
+		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		for block in &model.blocks {
+			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
+				self.head_planes(lanes, rank, width)?;
+				lanes = 0;
+			}
+			match &block.operation {
+				Operation::Embed(rows, columns) => {
+					require(*rows == vocabulary && *columns == width, format!("embed({rows}, {columns}) reads token_embd.weight, which holds {vocabulary} rows of {width}"))?;
+					self.mapped(vec![embedding.clone()]);
+				}
+				Operation::Ple(formula) => {
+					let ngram = Ngram::new(self.file)?;
+					require(*formula == ngram.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+					self.ple_planes(ngram.layer(), &ngram, width, lanes.max(1))?;
+				}
+				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
+					let attends = mixes(parts);
+					if attends { layers += 1; }
+					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
+					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
+					if let Operation::Hyper(count, bottleneck, _) = block.operation {
+						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
+						(lanes, rank) = (count, bottleneck);
+						self.mixer_planes(layer, part, lanes, rank, width)?;
+					}
+					self.plan_branch(parts, layer, part, width)?;
+				}
+				Operation::Layer(outputs) => {
+					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
+					require(block.normalization.is_none(), "a normalization after the vocabulary projection has no tensor name")?;
+					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
+					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
+					self.mapped(vec![output]);
+				}
+				Operation::Identity | Operation::Last => {}
+				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
+			}
+			if block.normalization.is_some() {
+				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
+				self.norm_scale(name, width)?;
+			}
+		}
+		if lanes != 0 { self.head_planes(lanes, rank, width)?; }
+		Ok(())
+	}
+	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize) -> Result<()> {
+		if rank == 0 { return Ok(()); }
+		let role = format!("block {layer} {part} mixer");
+		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		let stream = checked_mul(lanes, width, "hyper-connection stream")?;
+		self.norm_scale(&name("norm"), stream)?;
+		for (suffix, inputs, outputs) in [("down", stream, rank), ("up", rank, stream), ("inject", stream, lanes)] {
+			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+			self.mapped(vec![tensor]);
+		}
+		Ok(())
+	}
+	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize) -> Result<()> {
+		if rank == 0 { return Ok(()); }
+		let stream = checked_mul(lanes, width, "head mixer stream")?;
+		self.norm_scale("output_hc_norm.weight", stream)?;
+		for (name, inputs, outputs) in [("output_hc_down.weight", stream, rank), ("output_hc_up.weight", rank, stream)] {
+			let tensor = self.projection(name, "the head mixer", inputs, outputs)?;
+			self.mapped(vec![tensor]);
+		}
+		Ok(())
+	}
+	fn plan_branch(&mut self, parts: &[Block], layer: usize, part: &str, width: usize) -> Result<()> {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} feed-forward");
+		let (mut weighted, mut hidden) = (false, 0);
+		for step in parts {
+			match &step.operation {
+				Operation::Identity => {}
+				Operation::Attention(attention) => {
+					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					weighted = true;
+				}
+				Operation::Delta(delta) => {
+					self.delta_planes(layer, delta, width)?;
+					weighted = true;
+				}
+				Operation::Moe(count, _, hidden_width, _, _, _, shared) => {
+					self.expert_planes(layer, *count, *hidden_width, *shared, width)?;
+					weighted = true;
+				}
+				Operation::Product(left, right) => {
+					// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
+					let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.activation != Activation::Linear);
+					let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
+					for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
+						let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
+						require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
+						hidden = widths[0];
+						let tensor = self.projection(&name(suffix), &role, width, hidden)?;
+						self.mapped(vec![tensor]);
+					}
+					weighted = true;
+				}
+				Operation::Glu(inner, _) => {
+					for (suffix, inputs, outputs) in [("ffn_gate.weight", width, *inner), ("ffn_up.weight", width, *inner), ("ffn_down.weight", *inner, width)] {
+						let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+						self.mapped(vec![tensor]);
+					}
+					weighted = true;
+				}
+				Operation::Layer(outputs) => {
+					require(part == "ffn" && hidden != 0 && *outputs == width, format!("layer({outputs}) in block {layer} follows no feed-forward product, so no tensor name is its convention"))?;
+					let tensor = self.projection(&name("ffn_down.weight"), &role, hidden, width)?;
+					self.mapped(vec![tensor]);
+				}
+				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
+			}
+			if step.normalization.is_some() {
+				let suffix = match (part, weighted) {
+					("attn", false) => "attn_norm.weight",
+					("attn", true) => "post_attention_norm.weight",
+					(_, false) if self.file.tensor(&name("ffn_norm.weight")).is_none() => "post_attention_norm.weight",
+					(_, false) => "ffn_norm.weight",
+					(_, true) => "post_ffw_norm.weight",
+				};
+				self.norm_scale(&name(suffix), width)?;
+			}
+		}
+		Ok(())
+	}
+
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let tensor = self.tensor(name, "a normalization")?;
@@ -16100,7 +16117,13 @@ impl Builder<'_> {
 		};
 		require(gated == attention.gate, format!("{} {} an output gate, and the attention block {}", query.name, if gated { "holds" } else { "holds no" }, if attention.gate { "declares one" } else { "declares none" }))?;
 		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = self.projection(&name("attn_v.weight"), &role, width, kv * head)?;
+		let value = match self.optional(&name("attn_v.weight")) {
+			Some(value) => {
+				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
+				value
+			}
+			None => key.clone(),
+		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
@@ -16121,6 +16144,33 @@ impl Builder<'_> {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
 			self.slot(scales);
+		}
+		if attention.factors {
+			let factors = self.tensor("rope_freqs.weight", &role)?;
+			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			self.mapped(vec![factors]);
+		}
+		if let Some(index) = attention.index {
+			let (index_heads, index_width) = (index.heads, index.width);
+			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
+			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
+			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
+			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
+			// reaches the adjacent-pair Rope with the matching columns.
+			let index_order = self.head_order(index_width, index.score.map_or(0, |(_, dims)| dims));
+			let mut index_planes = Vec::new();
+			for index in 0..index_heads {
+				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
+			}
+			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
+			self.mapped(index_planes);
+			let query_norm = name("indexer.q_norm.weight");
+			let key_norm = name("indexer.k_norm.weight");
+			if index.score.is_some_and(|(normalization, _)| normalization == BlockNormalization::Rms) {
+				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
+				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
+				self.slot(scales);
+			}
 		}
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
@@ -17973,10 +18023,13 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		Some(Some(bound)) => {
 			require(bound.elements == weights, format!("{} hold {} values; {} takes {weights}", bound.names, bound.elements, node.identity(index)))?;
 			match bound.weight {
-				// The block's `packed` qualifier decides whether the bytes stay
-				// packed in the weight arena or the load expands them into it.
+				// A bound contraction or expert decodes the mapped source layout;
+				// compute precision does not expand its stored table.
 				BoundWeight::Stored(weight) => {
-					if node.table() { node.storage = weight.format.0; }
+					if node.table() || matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) {
+						node.storage = weight.format.0;
+						node.packed = !node.table();
+					}
 					Some(weight)
 				}
 				// A table has no parameter span: its rows decode from the bound
