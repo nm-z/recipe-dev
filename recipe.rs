@@ -22485,6 +22485,31 @@ struct KfdMapArgs {
 	success: u32,
 }
 #[cfg(amd)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KfdApertures {
+	lds_base: u64,
+	lds_limit: u64,
+	scratch_base: u64,
+	scratch_limit: u64,
+	vm_base: u64,
+	vm_limit: u64,
+	gpu_id: u32,
+	pad: u32,
+}
+#[cfg(amd)]
+#[repr(C)]
+#[derive(Default)]
+struct KfdApertureArgs {
+	devices: u64,
+	count: u32,
+	pad: u32,
+}
+#[cfg(amd)]
+const _: [(); 56] = [(); size_of::<KfdApertures>()];
+#[cfg(amd)]
+const _: [(); 16] = [(); size_of::<KfdApertureArgs>()];
+#[cfg(amd)]
 const _: [(); 40] = [(); size_of::<KfdMemoryArgs>()];
 #[cfg(amd)]
 const _: [(); 24] = [(); size_of::<KfdMapArgs>()];
@@ -22500,6 +22525,7 @@ struct KfdDevice {
 	kfd: fs::File,
 	drm: fs::File,
 	gpu_id: u32,
+	apertures: KfdApertures,
 	allocations: Mutex<std::collections::BTreeMap<usize, KfdAllocation>>,
 	retain_after_failure: std::sync::atomic::AtomicBool,
 }
@@ -22520,8 +22546,23 @@ impl KfdDevice {
 		let open = |path: &Path| fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())));
 		let kfd = open(Path::new("/dev/kfd"))?;
 		let drm = open(Path::new(&format!("/dev/dri/renderD{render_minor}")))?;
-		let device = Self { kfd, drm, gpu_id, allocations: Mutex::new(std::collections::BTreeMap::new()), retain_after_failure: std::sync::atomic::AtomicBool::new(false) };
+		let mut device = Self { kfd, drm, gpu_id, apertures: KfdApertures::default(), allocations: Mutex::new(std::collections::BTreeMap::new()), retain_after_failure: std::sync::atomic::AtomicBool::new(false) };
 		device.call(0x15, &mut [device.drm.as_raw_fd() as u32, gpu_id])?;
+		let mut query = KfdApertureArgs::default();
+		device.call(0x14, &mut query)?;
+		require(query.count != 0, "KFD process has no device apertures")?;
+		let mut apertures = Vec::new();
+		apertures.try_reserve_exact(query.count as usize).map_err(|_| RecipeError::new("cannot allocate KFD aperture records"))?;
+		apertures.resize(query.count as usize, KfdApertures::default());
+		query.devices = apertures.as_mut_ptr() as u64;
+		device.call(0x14, &mut query)?;
+		require(query.count as usize <= apertures.len(), "KFD aperture result exceeds its allocation")?;
+		let mut selected = apertures[..query.count as usize].iter().filter(|aperture| aperture.gpu_id == gpu_id);
+		device.apertures = *selected.next().ok_or_else(|| RecipeError::new("KFD aperture record for the selected device is absent"))?;
+		require(selected.next().is_none(), "KFD aperture identity is duplicated")?;
+		require(device.apertures.vm_base <= device.apertures.vm_limit, "KFD GPU virtual-address range is invalid")?;
+		require(device.apertures.lds_base != 0 && device.apertures.lds_base <= device.apertures.lds_limit, "KFD LDS aperture is invalid")?;
+		require(device.apertures.scratch_base != 0 && device.apertures.scratch_base <= device.apertures.scratch_limit, "KFD scratch aperture is invalid")?;
 		Ok(device)
 	}
 	fn allocate(&self, bytes: usize, executable: bool) -> Result<u64> {
@@ -22532,6 +22573,10 @@ impl KfdDevice {
 		let bytes = bytes.max(1).checked_add(4095).map(|value| value & !4095).ok_or_else(|| RecipeError::new("KFD allocation size overflows"))?;
 		let address = unsafe { mmap(ptr::null_mut(), bytes, 0, 0x22, -1, 0) };
 		require(address as isize != -1, format!("KFD address reservation: {}", std::io::Error::last_os_error()))?;
+		if !(address as u64 >= self.apertures.vm_base && (address as u64).checked_add(bytes as u64 - 1).is_some_and(|end| end <= self.apertures.vm_limit)) {
+			unsafe { munmap(address, bytes); }
+			return Err(RecipeError::new("KFD buffer address is outside the selected GPU virtual-address range"));
+		}
 		let mut allocation = KfdMemoryArgs { address: address as u64, size: bytes as u64, gpu_id: self.gpu_id, flags: (1 << 1) | (1 << 31) | (1 << 29) | (1 << 26) | if executable { 1 << 30 } else { 0 } | if uncached { 1 << 25 } else { 0 }, ..Default::default() };
 		if let Err(error) = self.call(0x16, &mut allocation) {
 			unsafe { munmap(address, bytes); }
@@ -22551,7 +22596,7 @@ impl KfdDevice {
 			return Err(error);
 		}
 		self.allocations.lock().map_err(|_| RecipeError::new("KFD allocation registry is poisoned"))?.insert(address as usize, KfdAllocation { address: address as usize, bytes, handle: allocation.handle, gpu_mapped: true });
-		trace(&format!("allocate {bytes} GPU-visible GTT bytes with KFD gpu_id={}", self.gpu_id))?;
+		trace(&format!("allocate {bytes} GPU-visible GTT bytes with KFD gpu_id={} address={:#x} flags={:#x} mapped_devices={}", self.gpu_id, allocation.address, allocation.flags, mapping.success))?;
 		Ok(address as u64)
 	}
 	fn free(&self, address: u64) -> Result<()> {
@@ -22782,7 +22827,8 @@ impl Hsa {
 			vgprs_per_simd: if gfx >= 110000 { 1536 } else if gfx >= 100000 { 1024 } else { 256 },
 			vgpr_granule: if gfx >= 110000 { 24 } else if gfx >= 100000 { 16 } else { 4 },
 		};
-		require(driver.cus != 0 && driver.wave == 32, "direct AMD queue requires a validated wave32 device")?;
+		require(driver.cus != 0 && driver.wave == 32 && driver.waves_per_simd != 0, "direct AMD queue requires a validated wave32 device")?;
+		let max_wave_id = driver.waves_per_simd.checked_mul(driver.simd_per_cu).and_then(|waves| waves.checked_sub(1)).ok_or_else(|| RecipeError::new("AMD wave index range is invalid"))?;
 		driver.ring = driver.device.allocate_flags(16384, true, true)?;
 		for index in 0..256 { unsafe { (driver.ring as *mut HsaPacket).add(index).write(HsaPacket { header: 1, setup: 0, workgroup_x: 0, workgroup_y: 0, workgroup_z: 0, reserved0: 0, grid_x: 0, grid_y: 0, grid_z: 0, private: 0, group: 0, object: 0, kernarg: ptr::null_mut(), reserved1: 0, completion: 0 }); } }
 		driver.control = driver.device.allocate_flags(4096, false, true)?;
@@ -22810,9 +22856,12 @@ impl Hsa {
 		unsafe { ptr::copy_nonoverlapping(words.as_ptr(), driver.signal as *mut u64, words.len()); }
 		unsafe {
 			(driver.control as *mut HsaQueue).write(HsaQueue { kind: 1, features: 1, base: driver.ring as Ptr, doorbell: 0, size: 256, reserved: 0, id: 0 });
+			((driver.control + 64) as *mut u32).write((driver.device.apertures.lds_base >> 32) as u32);
+			((driver.control + 68) as *mut u32).write((driver.device.apertures.scratch_base >> 32) as u32);
 			((driver.control + 136) as *mut u32).write(128);
-			((driver.control + 72) as *mut u32).write(driver.cus);
-			((driver.control + 76) as *mut u32).write(driver.waves_per_simd * driver.simd_per_cu);
+			((driver.control + 72) as *mut u32).write(driver.cus - 1);
+			((driver.control + 76) as *mut u32).write(max_wave_id);
+			((driver.control + 180) as *mut u32).write(1 << 1);
 			((driver.control + 192) as *mut u64).write(driver.signal);
 		}
 		#[cfg(target_arch = "x86_64")]
