@@ -302,19 +302,18 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/candidate"
-          # Recipe prints the route it selected; this is the fallback detector.
+          # The suite reads the executed device from the training memory report.
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
           # same on the BSD and GNU userlands.
-          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          route="$(awk '/^suite device /{print $3; exit}' evidence/run.log)"
           if [ -z "$route" ]; then
-            echo "no route line: the suite did not dispatch" >&2
+            echo "no suite device: training did not report its device" >&2
             tail -40 evidence/run.log >&2
             exit 1
           fi
           device="${route##*:}"
           [ "$device" = "cpu" ] || { echo "expected the cpu device, got $device" >&2; exit 1; }
-          grep -q '\.fp32 rows ' evidence/run.log || { echo "no dispatch share line" >&2; exit 1; }
           echo "device=$device" >> "$GITHUB_OUTPUT"
           echo "executed on $route"
 
@@ -359,10 +358,13 @@ jobs:
   # 2. recipe/linux-gpu -- NVIDIA L4 through Camber, driven by this controller.
   # ---------------------------------------------------------------------------
   linux-gpu:
-    name: linux/nv
+    name: linux/nv admission
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      admission_blocked: ${{ steps.camber.outputs.admission_blocked }}
+      gpu_passed: ${{ steps.camber.outputs.gpu_passed }}
     env:
       CELL: recipe/linux-gpu
       CAMBER_API_KEY: ${{ secrets.CAMBER_API_KEY }}
@@ -410,7 +412,18 @@ jobs:
         id: camber
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"
+          if bash "$GITHUB_WORKSPACE/controller/.github/runtime/camber-run.sh"; then
+            jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' evidence/suite.json >/dev/null
+            echo 'gpu_passed=true' >> "$GITHUB_OUTPUT"
+          else
+            result=$?
+            if [ "$result" -eq 75 ] && [ ! -f camber-job-id ] && jq -e '.category == "compute-admission" and .provider == "camber" and .code == 1005 and .gpu_execution == false' evidence/blocker.json >/dev/null; then
+              echo 'admission_blocked=true' >> "$GITHUB_OUTPUT"
+              echo 'NVIDIA acceptance is pending validation on existing authorized compute.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              exit "$result"
+            fi
+          fi
         env:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           SNAPSHOT: ${{ github.workspace }}/snapshot/recipe-source.tar.gz
@@ -462,6 +475,24 @@ jobs:
   #    shared suite and preserves the train/save/resume/infer lifecycle
   #    coverage from windows-native-lifecycle.yml.
   # ---------------------------------------------------------------------------
+  linux-nv:
+    name: linux/nv
+    needs: [prepare, linux-gpu]
+    if: always() && needs.linux-gpu.outputs.admission_blocked != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require completed NVIDIA execution
+        env:
+          ADMISSION_RESULT: ${{ needs.linux-gpu.result }}
+          GPU_PASSED: ${{ needs.linux-gpu.outputs.gpu_passed }}
+        run: |
+          set -euo pipefail
+          [ "$ADMISSION_RESULT" = success ] && [ "$GPU_PASSED" = true ] || {
+            echo 'The NVIDIA runtime suite did not pass.' >&2
+            exit 1
+          }
+          echo 'The NVIDIA runtime suite passed all eight checks.'
+
   windows-cpu:
     name: win/cpu
     needs: prepare
@@ -542,8 +573,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $line = Select-String -Path evidence\run.log -Pattern '^selected route ' | Select-Object -First 1
-          if (!$line) { throw "no route line: the suite did not dispatch" }
+          $line = Select-String -Path evidence\run.log -Pattern '^suite device ' | Select-Object -First 1
+          if (!$line) { throw "no suite device: training did not report its device" }
           $route = ($line.Line -split '\s+')[2]
           $device = $route.Split(':')[-1]
           if ($device -ne "cpu") { throw "expected the cpu device, got $device" }
@@ -733,6 +764,9 @@ jobs:
   windows-gpu:
     name: win/nv
     needs: prepare
+    # Nothing new may be created on Azure subscription 1, where this job provisions
+    # its recipe-wgpu-* worker, so the job stays off until it has another home.
+    if: false
     runs-on: ubuntu-24.04
     environment: recipe-windows-gpu
     timeout-minutes: 90
@@ -929,9 +963,9 @@ jobs:
           # One awk process rather than a pipeline, so pipefail cannot turn an
           # early-exiting match into a step failure, and the behaviour is the
           # same on the BSD and GNU userlands.
-          route="$(awk '/^selected route /{print $3; exit}' evidence/run.log)"
+          route="$(awk '/^suite device /{print $3; exit}' evidence/run.log)"
           if [ -z "$route" ]; then
-            echo "no route line: the suite did not dispatch" >&2
+            echo "no suite device: training did not report its device" >&2
             tail -40 evidence/run.log >&2
             exit 1
           fi

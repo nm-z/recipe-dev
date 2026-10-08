@@ -5,13 +5,81 @@
 # only the archive, the worker program, and fixed digest and commit values.
 set -euo pipefail
 
+if [ "${1:-}" = "--existing" ]; then
+	: "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
+	: "${RECIPE_EXISTING_SOURCE:?the existing source checkout is required}"
+	: "${RECIPE_EXISTING_TARGET:?the private build directory is required}"
+	: "${RECIPE_EXISTING_WORK:?the private suite directory is required}"
+	: "${RECIPE_EXISTING_DEVICE:?an explicit NVIDIA device is required}"
+	: "${RECIPE_EXISTING_UUID:?the allocated NVIDIA UUID is required}"
+	: "${RECIPE_EXISTING_LOCK_DIR:?the existing coordination lock directory is required}"
+	[[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'candidate commit must have 40 lowercase hexadecimal characters' >&2; exit 1; }
+	[[ "$RECIPE_EXISTING_DEVICE" =~ ^nv([0-9]+)$ ]] || { echo 'the existing device must be nv followed by its ordinal' >&2; exit 1; }
+	existing_ordinal="${BASH_REMATCH[1]}"
+	existing_source="$(cd "$RECIPE_EXISTING_SOURCE" && pwd -P)"
+	mkdir -p "$RECIPE_EXISTING_TARGET" "$RECIPE_EXISTING_WORK"
+	existing_target="$(cd "$RECIPE_EXISTING_TARGET" && pwd -P)"
+	existing_work="$(cd "$RECIPE_EXISTING_WORK" && pwd -P)"
+	case "$existing_target/" in "$existing_source/"*) echo 'the build directory must be outside the source checkout' >&2; exit 1 ;; esac
+	case "$existing_work/" in "$existing_source/"*) echo 'the suite directory must be outside the source checkout' >&2; exit 1 ;; esac
+	cd "$existing_source"
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] || { echo 'the checkout does not match the candidate commit' >&2; exit 1; }
+	git diff --quiet && git diff --cached --quiet || { echo 'the candidate has tracked source changes' >&2; exit 1; }
+	[ -f .github/runtime/suite.rs ] && [ -d .github/runtime/data ] || { echo 'the checked-in runtime suite is absent' >&2; exit 1; }
+	cargo build --release --lib --bin recipe --target-dir "$existing_target"
+	exec 8>"$RECIPE_EXISTING_LOCK_DIR/nv0.lock"
+	flock -n 8 || { echo 'the existing nv0 coordination lock is busy' >&2; exit 75; }
+	exec 9>"$RECIPE_EXISTING_LOCK_DIR/nv4.lock"
+	flock -n 9 || { echo 'the existing nv4 coordination lock is busy' >&2; exit 75; }
+	if [ "$existing_ordinal" != 0 ] && [ "$existing_ordinal" != 4 ]; then
+		exec 10>"$RECIPE_EXISTING_LOCK_DIR/nv${existing_ordinal}.lock"
+		flock -n 10 || { echo 'the selected NVIDIA device lock is busy' >&2; exit 75; }
+	fi
+	existing_uuid="$(nvidia-smi -i "$existing_ordinal" --query-gpu=uuid --format=csv,noheader)"
+	[ "$existing_uuid" = "$RECIPE_EXISTING_UUID" ] || { echo 'the selected NVIDIA UUID differs from the allocated device' >&2; exit 1; }
+	existing_owners="$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | awk -F ', *' -v uuid="$existing_uuid" '$1 == uuid {print $2}')"
+	[ -z "$existing_owners" ] || { echo 'the selected NVIDIA device has an existing compute owner' >&2; exit 75; }
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] && git diff --quiet && git diff --cached --quiet || { echo 'the candidate changed during the build' >&2; exit 1; }
+	printf 'existing NVIDIA candidate=%s device=%s uuid=%s\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid"
+	timeout --signal=INT --kill-after=10s "${WORKER_EXECUTION_TIMEOUT_SECONDS:-300}s" env \
+		RECIPE_SUITE_ROOT="$existing_source/.github/runtime" \
+		RECIPE_SUITE_WORK="$existing_work" \
+		RECIPE_EVIDENCE="$existing_work/suite.json" \
+		"$existing_target/release/recipe" run "$existing_source/.github/runtime/suite.rs" --device "$RECIPE_EXISTING_DEVICE" 2>&1 | tee "$existing_work/run.log"
+	jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' "$existing_work/suite.json" >/dev/null
+	existing_route="$(awk '/^suite device / {print $3; exit}' "$existing_work/run.log")"
+	case "$existing_route" in "$RECIPE_EXISTING_DEVICE"|*:"$RECIPE_EXISTING_DEVICE") ;; *) echo 'the suite did not execute on the selected NVIDIA backend' >&2; exit 1 ;; esac
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] && git diff --quiet && git diff --cached --quiet || { echo 'the candidate changed during execution' >&2; exit 1; }
+	printf 'EXISTING NVIDIA PASS candidate=%s device=%s uuid=%s executed=8 failed=0\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid"
+	exit 0
+fi
+
 : "${CAMBER_API_KEY:?the Camber control credential is required}"
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${SNAPSHOT:?SNAPSHOT is required}"
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
+# The worker runs one workload: the suite (default), or the composition harness over
+# RECIPE_TRIAL_COUNT cursors from RECIPE_TRIAL_CURSOR, whose stderr packets are the evidence.
+RECIPE_WORKLOAD="${RECIPE_WORKLOAD:-suite}"
+case "$RECIPE_WORKLOAD" in
+	suite) ;;
+	trial)
+		: "${RECIPE_TRIAL_CURSOR:?RECIPE_TRIAL_CURSOR is required}"
+		: "${RECIPE_TRIAL_COUNT:?RECIPE_TRIAL_COUNT is required}"
+		case "$RECIPE_TRIAL_CURSOR$RECIPE_TRIAL_COUNT" in
+			''|*[!0-9]*) echo "the trial cursor and count must be integers" >&2; exit 1 ;;
+		esac
+		;;
+	*) echo "RECIPE_WORKLOAD must be suite or trial" >&2; exit 1 ;;
+esac
 
-QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-900}"
+# A queued job costs nothing but the wait, while a job the controller gives up
+# on keeps its queue place and runs the whole worker for nobody; so the queue
+# wait is bounded by the room the 60-minute job leaves after the worker's own
+# 1500 s, and the execution deadline counts from the first poll that finds the
+# job running rather than from submission.
+QUEUE_DEADLINE_SECONDS="${QUEUE_DEADLINE_SECONDS:-1500}"
 RUN_DEADLINE_SECONDS="${RUN_DEADLINE_SECONDS:-1800}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 WORKER_EXECUTION_TIMEOUT_SECONDS="${WORKER_EXECUTION_TIMEOUT_SECONDS:-1500}"
@@ -59,17 +127,30 @@ if [ "$actual_sha256" != "$SNAPSHOT_SHA256" ]; then
 	echo "snapshot checksum mismatch before upload: $actual_sha256 != $SNAPSHOT_SHA256" >&2
 	exit 1
 fi
-[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
-[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
-tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	[ -f "$TRUSTED_RUNTIME/harness.rs" ] || { echo "the trial harness is absent" >&2; exit 1; }
+	tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" harness.rs
+else
+	[ -f "$TRUSTED_RUNTIME/suite.rs" ] || { echo "trusted suite is absent" >&2; exit 1; }
+	[ -d "$TRUSTED_RUNTIME/data" ] || { echo "trusted suite data is absent" >&2; exit 1; }
+	tar -czf trusted-runtime.tar.gz -C "$TRUSTED_RUNTIME" suite.rs data
+fi
 
 request_key="${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-${CANDIDATE_SHA:0:12}"
-stash_root="stash://${username}/recipe-runtime/${request_key}"
+stash_root="stash://${username}/recipe-${RECIPE_WORKLOAD/suite/runtime}/${request_key}"
 printf '%s\n' "$stash_root" > camber-stash-root
 
 cat > worker.sh <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# The controller marks the run directory abandoned when it stops waiting for
+# this job (queue deadline, cancellation); a job that starts afterwards has no
+# reader, so it returns at once instead of building and running the suite.
+if [ -f abandoned ]; then
+	echo "the controller abandoned this job before it started: $(cat abandoned)"
+	exit 0
+fi
 
 : "${SNAPSHOT_SHA256:?SNAPSHOT_SHA256 is required}"
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
@@ -156,6 +237,36 @@ if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}
 	echo "the Camber worker build failed or reached its hard timeout" >&2
 	exit 1
 fi
+if [ "${RECIPE_WORKLOAD:-suite}" = trial ]; then
+	echo "== worker: run the composition harness on nv0, cursor $RECIPE_TRIAL_CURSOR count $RECIPE_TRIAL_COUNT =="
+	mkdir -p "$root/evidence" "$work/trial"
+	cp "$work/.github/runtime/harness.rs" "$work/harness.rs"
+	trial_started="$(date +%s)"
+	# The harness prints one composition line per cursor and a failure packet per defect on
+	# stderr; that stream is the evidence, so a nonzero exit is recorded rather than fatal.
+	set +e
+	timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" env \
+		RECIPE_DEVICE=nv0 \
+		RECIPE_COMPOSITION_RUNNER="$work/target/release/recipe" \
+		RECIPE_COMPOSITION_CURSOR="$RECIPE_TRIAL_CURSOR" \
+		RECIPE_COMPOSITION_COUNT="$RECIPE_TRIAL_COUNT" \
+		RECIPE_COMPOSITION_REPLAY_SEED=17 \
+		RECIPE_COMPOSITION_REPRO="$work/trial/repro.rs" \
+		RECIPE_TRIAL_DIRECTORY="$work/trial" \
+		"$work/target/release/recipe" harness.rs > "$work/trial/harness.out" 2> "$work/trial/harness.log"
+	harness_status=$?
+	set -e
+	echo "== worker: harness exit $harness_status after $(( $(date +%s) - trial_started ))s =="
+	nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+	# The snapshot has no history, so the harness base line carries no commit; the candidate stands in.
+	awk -v sha="$CANDIDATE_SHA" '{ sub(/^base=commit=[0-9a-f]*/, "base=commit=" sha); print }' "$work/trial/harness.log" > "$root/evidence/trial.log"
+	[ -s "$root/evidence/trial.log" ] || { echo "the harness wrote no evidence" >&2; exit 1; }
+	printf '%s\n' "RECIPE_TRIAL_LOG_BEGIN"
+	base64 -w0 "$root/evidence/trial.log"
+	printf '\n%s\n' "RECIPE_TRIAL_LOG_END"
+	echo "WORKER EXIT 0"
+	exit 0
+fi
 echo "== worker: execute the suite on nv0 =="
 mkdir -p "$work/evidence" "$work/gpu-work"
 if ! timeout --signal=TERM --kill-after=30s "${WORKER_EXECUTION_TIMEOUT_SECONDS}s" env \
@@ -170,7 +281,7 @@ mkdir -p "$root/evidence"
 cp -r "$work/evidence/." "$root/evidence/"
 cp "$work/run.log" "$root/evidence/worker-run.log"
 
-route="$(awk '/^selected route / { print $3; exit }' "$root/evidence/worker-run.log")"
+route="$(awk '/^suite device / { print $3; exit }' "$root/evidence/worker-run.log")"
 device="${route##*:}"
 case "$device" in
 	nv*) echo "executed on $route" ;;
@@ -190,9 +301,32 @@ camber stash cp "$SNAPSHOT" "$stash_root/recipe-source.tar.gz"
 camber stash cp trusted-runtime.tar.gz "$stash_root/trusted-runtime.tar.gz"
 camber stash cp worker.sh "$stash_root/worker.sh"
 
-job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS bash worker.sh"
+echo "== jobs of this workflow still queued ahead =="
+# Jobs an earlier run abandoned keep their queue place until they start; the
+# count says how many of them this job waits behind. The list pages oldest
+# first (page 1 is the account's first jobs), so the newest jobs are on the
+# last page, found from the total the first page reports.
+if queued_json="$(camber job list --size 50 --output json 2>/dev/null)"; then
+	last_page="$(printf '%s' "$queued_json" | jq -r '(((.total // 0) + 49) / 50 | floor) | if . < 1 then 1 else . end' 2>/dev/null || echo 1)"
+	if [ "$last_page" -gt 1 ]; then
+		queued_json="$(camber job list --size 50 --page "$last_page" --output json 2>/dev/null || printf '%s' "$queued_json")"
+	fi
+	printf '%s' "$queued_json" | jq -r '[.. | objects | select(has("job_id") and has("mount_dir")) | select((.mount_dir // "") | startswith("recipe-runtime/") or startswith("recipe-trial/")) | select(((.job_status // "") | ascii_upcase) as $s | $s == "PENDING" or $s == "QUEUED" or $s == "SUBMITTED" or $s == "RUNNING")] | "\(length) queued or running: \([.[] | "\(.job_id):\(.job_status):\(.mount_dir)"] | join(" "))"' || echo "could not summarize the job list"
+else
+	echo "could not list jobs"
+fi
+
+# A trial job the controller stops waiting for cannot be cancelled (the CLI has no cancel), so the
+# worker itself carries a hard wall-clock budget: toolchain, build and harness together end within it.
+TRIAL_BUDGET_SECONDS="${TRIAL_BUDGET_SECONDS:-2400}"
+worker_launch="bash worker.sh"
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	worker_launch="timeout --signal=TERM --kill-after=30s ${TRIAL_BUDGET_SECONDS}s bash worker.sh"
+fi
+job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS RECIPE_WORKLOAD=$RECIPE_WORKLOAD RECIPE_TRIAL_CURSOR=${RECIPE_TRIAL_CURSOR:-0} RECIPE_TRIAL_COUNT=${RECIPE_TRIAL_COUNT:-0} $worker_launch"
 for provider_attempt in 1 2; do
 	echo "== creating the Camber L4 job, attempt $provider_attempt of 2 =="
+	rm -f evidence/blocker.json
 	create_output="$(printf 'y\n' | camber job create \
 		--engine base \
 		--size xsmall \
@@ -201,6 +335,14 @@ for provider_attempt in 1 2; do
 		--path "$stash_root/" \
 		--cmd "$job_command" 2>&1)" || {
 		printf '%s\n' "$create_output" >&2
+		if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' <<< "$create_output" &&
+			! grep -Eiq 'Job ID:[[:space:]]*[0-9]|"job_id"[[:space:]]*:|"id"[[:space:]]*:[[:space:]]*"?[0-9]|submitted Camber job [0-9]|== worker:|SUITE PASS|"gpu_execution"[[:space:]]*:[[:space:]]*true' <<< "$create_output"; then
+			cat > evidence/blocker.json <<'JSON'
+{"category":"compute-admission","provider":"camber","code":1005,"gpu_execution":false,"status":"unavailable"}
+JSON
+			echo 'NVIDIA acceptance is incomplete: the provider did not admit a job.' >&2
+			exit 75
+		fi
 		exit 1
 	}
 	printf '%s\n' "$create_output"
@@ -216,6 +358,7 @@ for provider_attempt in 1 2; do
 
 	echo "== polling the Camber job =="
 	started="$(date +%s)"
+	running_since=""
 	state=""
 	while :; do
 		now="$(date +%s)"
@@ -234,7 +377,11 @@ for provider_attempt in 1 2; do
 			fi
 			;;
 		*)
-			if [ "$elapsed" -ge "$RUN_DEADLINE_SECONDS" ]; then
+			if [ -z "$running_since" ]; then
+				running_since="$now"
+				echo "  running after ${elapsed}s in the queue"
+			fi
+			if [ $((now - running_since)) -ge "$RUN_DEADLINE_SECONDS" ]; then
 				echo "execution deadline of ${RUN_DEADLINE_SECONDS}s exceeded" >&2
 				exit 1
 			fi
@@ -268,20 +415,43 @@ for provider_attempt in 1 2; do
 	exit 1
 done
 [ -f evidence/worker-run.log ] || { echo "worker log is absent" >&2; exit 1; }
+grep -q "WORKER EXIT 0" evidence/worker-run.log || { echo "the worker did not report a zero exit status" >&2; exit 1; }
+if [ "$RECIPE_WORKLOAD" = trial ]; then
+	# The trial's evidence is the harness stderr: composition lines and failure packets, named
+	# the way the issue machine's inbox expects (device prefix before "-run", then the cursor span).
+	trial_file="evidence/camber-l4-run-${RECIPE_TRIAL_CURSOR}-$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1)).txt"
+	awk '/^RECIPE_TRIAL_LOG_BEGIN$/{capture=1; next} /^RECIPE_TRIAL_LOG_END$/{capture=0; exit} capture{print}' evidence/worker-run.log | tr -d '\r\n' | base64 -d > "$trial_file" || {
+		echo "the Camber job log did not contain the trial log" >&2
+		exit 1
+	}
+	grep -E '^== worker: harness exit' evidence/worker-run.log
+	harness_status="$(sed -n 's/^== worker: harness exit \([0-9][0-9]*\).*/\1/p' evidence/worker-run.log | head -1)"
+	case "$harness_status" in
+		''|*[!0-9]*) echo "the worker log has no valid harness exit status" >&2; exit 1 ;;
+	esac
+	compositions="$(grep -c '^composition [0-9]*:' "$trial_file" || true)"
+	packets="$(grep -c '^RECIPE FAILURE BEGIN$' "$trial_file" || true)"
+	echo "compositions: $compositions, packets: $packets, file: $trial_file"
+	if [ "$harness_status" -ne 0 ] || [ "$compositions" -ne "$RECIPE_TRIAL_COUNT" ]; then
+		echo "the Camber trial returned partial evidence: status=$harness_status compositions=$compositions expected=$RECIPE_TRIAL_COUNT" >&2
+		exit 1
+	fi
+	echo "recipe/camber-trial completed for cursors $RECIPE_TRIAL_CURSOR..$((RECIPE_TRIAL_CURSOR + RECIPE_TRIAL_COUNT - 1))"
+	exit 0
+fi
 awk '/^RECIPE_SUITE_JSON_BEGIN$/{capture=1; next} /^RECIPE_SUITE_JSON_END$/{capture=0; exit} capture{print}' evidence/worker-run.log | tr -d '\r\n' | base64 -d > evidence/suite.json || {
 	echo "the Camber job log did not contain valid suite evidence" >&2
 	exit 1
 }
 [ -s evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
-grep -q "WORKER EXIT 0" evidence/worker-run.log || { echo "the worker did not report a zero exit status" >&2; exit 1; }
-route="$(awk '/^selected route / { print $3; exit }' evidence/worker-run.log)"
+route="$(awk '/^suite device / { print $3; exit }' evidence/worker-run.log)"
 device="${route##*:}"
 case "$device" in
 	nv*) ;;
 	*) echo "the retrieved evidence does not show an NVIDIA device" >&2; exit 1 ;;
 esac
 gpu_name="$(awk 'BEGIN { IGNORECASE=1 } /NVIDIA L4|Tesla L4|L4/ { print "NVIDIA L4"; exit }' evidence/worker-run.log)"
-[ -n "$gpu_name" ] || gpu_name="NVIDIA L4"
+[ -n "$gpu_name" ] || { echo 'the worker did not report its verified NVIDIA model' >&2; exit 1; }
 
 cat > evidence/cell.json <<JSON
 {
