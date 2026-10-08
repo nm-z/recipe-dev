@@ -4352,9 +4352,11 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Read) => {
+					let pick = integer_argument(node.argument[1], "lane pick")?;
+					require(pick >= 0 && pick <= integer_argument(node.argument[0], "stream lanes")?, "lane pick exceeds the stream")?;
 					emit_runtime_window_loop(&mut ir, index, "read", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4453,9 +4455,11 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Outer) => {
+					let pick = integer_argument(node.argument[1], "lane write")?;
+					require(pick >= 0 && pick <= integer_argument(node.argument[0], "stream lanes")?, "lane write exceeds the stream")?;
 					emit_runtime_window_loop(&mut ir, index, "outer", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -9099,6 +9103,10 @@ mod gguf {
 				.enumerate()
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
+					if let Plane::Stored { name, weight } = first {
+						require(planes.len() == 1, "a stored source requires one binding plane")?;
+						return Ok(BoundNode { names: name.clone(), elements: weight.count, weight: BoundWeight::Stored(weight.clone()) });
+					}
 					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
 					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
@@ -9111,6 +9119,7 @@ mod gguf {
 					let names = match (planes.len(), first) {
 						(1, Plane::Mapped(tensor)) => format!("tensor {} {:?}", tensor.name, tensor.shape),
 						(1, Plane::Owned { name, .. }) => format!("values {name}"),
+						(1, Plane::Stored { .. }) => unreachable!(),
 						(count, _) => format!("{count} views of {}", names.join(", ")),
 					};
 					let weight = match views.filter(|_| packed) {
@@ -9131,7 +9140,7 @@ mod gguf {
 						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
 							let tensor = match first {
 								Plane::Mapped(tensor) => tensor,
-								Plane::Owned { .. } => unreachable!(),
+								Plane::Owned { .. } | Plane::Stored { .. } => unreachable!(),
 							};
 							BoundWeight::Stored(self.embedding_stored(tensor)?)
 						}
@@ -9141,6 +9150,7 @@ mod gguf {
 								match plane {
 									Plane::Mapped(tensor) => values.extend(self.values(tensor)?),
 									Plane::Owned { values: owned, .. } => values.extend_from_slice(owned),
+									Plane::Stored { .. } => return Err(RecipeError::new("a stored source requires one binding plane")),
 								}
 							}
 							BoundWeight::Values(values)
@@ -11183,6 +11193,7 @@ mod bundle {
 			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared)),
+			Operation::Join(lanes) => format!("join,{lanes}"),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -11295,6 +11306,7 @@ mod bundle {
 				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?.into()))
 			}
+			"join" => Ok(Operation::Join(value_at(Some(rest), "MTP joined lanes")?)),
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
 				require(fields.len() == 7, "MoE record requires seven fields")?;
@@ -12475,6 +12487,7 @@ fn intern_ple(ple: PleBlock) -> &'static PleBlock {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
+	Join(usize),
 	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
 	Layer(usize),
 	Conv(usize, usize),
@@ -14696,6 +14709,7 @@ impl Operation {
 			Self::Identity => "identity",
 			Self::Last => "last",
 			Self::Moe(..) | Self::MoeBlocks(..) => "moe",
+			Self::Join(_) => "join",
 			Self::Perceptron(_) => "perc",
 			Self::Embed(..) => "embed",
 			Self::Hyper(..) => "hyper",
@@ -15282,24 +15296,27 @@ pub struct Binding {
 pub(crate) enum Plane {
 	Mapped(GgufTensor),
 	Owned { name: String, values: Vec<f64> },
+	Stored { name: String, weight: StoredWeight },
 }
 impl Plane {
 	fn elements(&self) -> usize {
 		match self {
 			Self::Mapped(tensor) => tensor.elements(),
 			Self::Owned { values, .. } => values.len(),
+			Self::Stored { weight, .. } => weight.count,
 		}
 	}
 	fn name(&self) -> &str {
 		match self {
 			Self::Mapped(tensor) => &tensor.name,
 			Self::Owned { name, .. } => name,
+			Self::Stored { name, .. } => name,
 		}
 	}
 	fn mapped(&self) -> Option<&GgufTensor> {
 		match self {
 			Self::Mapped(tensor) => Some(tensor),
-			Self::Owned { .. } => None,
+			Self::Owned { .. } | Self::Stored { .. } => None,
 		}
 	}
 }
@@ -15387,8 +15404,9 @@ pub struct Bound {
 }
 struct MtpHead {
 	bound: Bound,
-	embedding: GgufTensor,
+	embedding: StoredWeight,
 	width: usize,
+	lanes: usize,
 	tokens: usize,
 	probs: f64,
 }
@@ -15396,7 +15414,7 @@ impl MtpHead {
 	fn open(path: &Path, target: &Gguf, target_model: &Model) -> Result<Self> {
 		let file = Gguf::open(&resolve_path(path)?)?;
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("MTP architecture is not a string"))?;
-		require(architecture == "qwen35", format!("MTP binding does not support architecture {architecture:?}"))?;
+		require(matches!(architecture, "qwen35" | "qwen4exp"), format!("MTP binding does not support architecture {architecture:?}"))?;
 		require(target.value("general.architecture").and_then(GgufValue::text) == Some(architecture), "MTP and main-model architectures differ")?;
 		let mut builder = Builder { file: &file, architecture, rope: RopePairs::Halves, delta_activation: None, plan: Binding::default(), consumed: BTreeSet::new() };
 		require(builder.integer("nextn_predict_layers")? == 1, "Qwen MTP requires one prediction layer")?;
@@ -15404,9 +15422,14 @@ impl MtpHead {
 		require(target.integer_at(&format!("{architecture}.block_count"))? == layer, "MTP layer does not follow the main model's layers")?;
 		let dimensions = builder.dimensions()?;
 		let width = dimensions.width;
+		let lanes = dimensions.hyper.map_or(1, |(lanes, _)| lanes);
+		let stream = checked_mul(lanes, width, "MTP hidden stream")?;
 		require(target.integer_at(&format!("{architecture}.embedding_length"))? == width, "MTP and main-model hidden widths differ")?;
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let embedding = builder.tensor("token_embd.weight", "the MTP token embedding")?;
+		let shared = matches!(file.value(&format!("{architecture}.nextn_shared_target_tensors")), Some(GgufValue::Bool(true)));
+		let embedding = if shared {
+			target.tensor("token_embd.weight").ok_or_else(|| RecipeError::new("shared MTP embedding is absent from the target"))?.clone()
+		} else { builder.tensor("token_embd.weight", "the MTP token embedding")? };
 		let main_embedding = target.tensor("token_embd.weight").ok_or_else(|| RecipeError::new("main-model embedding is absent"))?;
 		require(embedding.shape.len() == 2 && embedding.shape[0] == width as u64 && embedding.shape == main_embedding.shape, "MTP and main-model embedding shapes differ")?;
 		let vocabulary = usize::try_from(embedding.shape[1]).map_err(|_| RecipeError::new("MTP vocabulary exceeds this machine's address space"))?;
@@ -15416,11 +15439,15 @@ impl MtpHead {
 		let input_width = checked_mul(2, width, "MTP input width")?;
 		let enorm = builder.tensor(&name("nextn.enorm.weight"), "MTP embedding normalization")?;
 		let hnorm = builder.tensor(&name("nextn.hnorm.weight"), "MTP hidden-state normalization")?;
-		require(enorm.shape == [width as u64] && hnorm.shape == [width as u64], "MTP input normalization shapes differ from the hidden width")?;
-		builder.mapped(vec![enorm, hnorm]);
+		require(enorm.shape == [width as u64] && hnorm.shape == [stream as u64], "MTP input normalization shapes differ from the hidden stream")?;
+		builder.mapped(vec![enorm]);
 		let projection = builder.projection(&name("nextn.eh_proj.weight"), "MTP embedding-hidden projection", input_width, width)?;
-		builder.mapped(vec![projection]);
-		let mut model = recipe.model().e(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).norm(rms).layer(width);
+		let scales = file.values(&hnorm)?;
+		for lane in 0..lanes {
+			builder.slot(vec![Plane::Owned { name: format!("{} (lane {lane})", hnorm.name), values: scales[lane * width..(lane + 1) * width].to_vec() }]);
+			builder.mapped(vec![projection.clone()]);
+		}
+		let mut model = recipe.model().e(file.float_at(&format!("{architecture}.attention.layer_norm_rms_epsilon"))?).push(Operation::Join(lanes));
 		let attention = builder.open(layer, "attn", &dimensions)?;
 		let mut attention = builder.attention(attention, layer, &dimensions)?.fp(32);
 		let mut scaling = None;
@@ -15435,12 +15462,31 @@ impl MtpHead {
 		}
 		model = builder.close(model, attention, &dimensions);
 		let ffn = builder.open(layer, "ffn", &dimensions)?;
-		let ffn = builder.feed_forward(ffn, layer, &dimensions)?;
+		let ffn = match &dimensions.experts {
+			Some(experts) => builder.experts(ffn, layer, experts, &dimensions)?,
+			None => builder.feed_forward(ffn, layer, &dimensions)?,
+		};
 		model = builder.close(model, ffn, &dimensions);
-		builder.norm_scale(&name("nextn.shared_head_norm.weight"), width)?;
-		model = model.norm(rms).layer(vocabulary);
-		let output = builder.projection("output.weight", "MTP vocabulary projection", width, vocabulary)?;
-		builder.mapped(vec![output]);
+		if let Some((_, rank)) = dimensions.hyper {
+			if rank != 0 {
+				builder.norm_scale(&name("nextn.hc_head_norm.weight"), stream)?;
+				let down = builder.projection(&name("nextn.hc_head_down.weight"), "MTP head read gate", stream, rank)?;
+				let up = builder.projection(&name("nextn.hc_head_up.weight"), "MTP head read gate", rank, stream)?;
+				builder.mapped(vec![down]); builder.mapped(vec![up]);
+			}
+		} else {
+			builder.norm_scale(&name("nextn.shared_head_norm.weight"), width)?;
+			model = model.norm(rms);
+		}
+		model = model.layer(vocabulary);
+		if shared {
+			let output = target.tensor("output.weight").unwrap_or(&embedding);
+			require(output.shape == [width as u64, vocabulary as u64], "shared MTP vocabulary projection shape differs from the target")?;
+			builder.slot(vec![Plane::Stored { name: format!("target {}", output.name), weight: target.stored(output)? }]);
+		} else {
+			let output = builder.projection("output.weight", "MTP vocabulary projection", width, vocabulary)?;
+			builder.mapped(vec![output]);
+		}
 		// Split checkpoints also carry the main model's final norm. MTP uses
 		// nextn.shared_head_norm instead, so this is not an MTP parameter.
 		if let Some(scale) = builder.optional("output_norm.weight") {
@@ -15452,19 +15498,17 @@ impl MtpHead {
 		let plan = builder.plan;
 		let tokens = natural("MTP draft tokens", env!("RECIPE_MTP_TOKENS"))?;
 		let probs = env!("RECIPE_MTP_PROBS").parse::<f64>().map_err(|_| RecipeError::new("MTP probability is invalid"))?;
-		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, width, tokens, probs })
+		let embedding = if shared { target.embedding_stored(&embedding)? } else { file.embedding_stored(&embedding)? };
+		Ok(Self { bound: Bound { file, model, plan, blocks: 1, tensors, vocabulary }, embedding, width, lanes, tokens, probs })
 	}
 	fn graph(&self, positions: usize, device: &'static Gpu) -> Result<Graph> {
-		let channels = checked_mul(2, self.width, "MTP input width")?;
+		let stream = checked_mul(self.lanes, self.width, "MTP hidden stream")?;
+		let channels = checked_add(self.width, stream, "MTP input width")?;
 		let mut graph = bound_graph_shape(&self.bound.file, &self.bound.model, &self.bound.plan, Shape { channels, length: positions }, device)?;
-		let norm = graph.nodes.first_mut().ok_or_else(|| RecipeError::new("MTP input normalization is absent"))?;
-		require(norm.op == Primitive::Normalize && norm.output.channels == channels, "MTP graph does not begin with paired input normalization")?;
-		// Each half has its own RMS statistic and scale: [embedding, hidden].
-		norm.argument[2] = self.width as f64;
-		norm.argument[3] = channels as f64;
-		let table = self.bound.file.embedding_stored(&self.embedding)?;
-		let input = Shape { channels: self.width + 1, length: positions };
-		let mut gather = norm.clone();
+		let first = graph.nodes.first().ok_or_else(|| RecipeError::new("MTP lane join is absent"))?;
+		let table = self.embedding.clone();
+		let input = Shape { channels: stream + 1, length: positions };
+		let mut gather = first.clone();
 		gather.op = Primitive::Gather;
 		gather.input = input;
 		gather.output = graph.input;
@@ -15499,7 +15543,13 @@ impl MtpHead {
 fn retain_mtp_hidden(graph: &mut Graph) -> Result<()> {
 	let projection = graph.nodes.last().ok_or_else(|| RecipeError::new("MTP model has no output projection"))?;
 	require(projection.op == Primitive::Contraction && projection.output.length == graph.input.length, "MTP requires a vocabulary projection at every input position")?;
-	let source = usize::try_from(projection.source).map_err(|_| RecipeError::new("MTP output projection has no hidden state"))?;
+	let mut source = usize::try_from(projection.source).map_err(|_| RecipeError::new("MTP output projection has no hidden state"))?;
+	while matches!(graph.nodes[source].op, Primitive::Last | Primitive::Normalize) {
+		source = usize::try_from(graph.nodes[source].source).map_err(|_| RecipeError::new("MTP hidden stream is absent"))?;
+	}
+	if graph.nodes[source].op == Primitive::Read && graph.nodes[source].argument[1] == 0.0 {
+		source = usize::try_from(graph.nodes[source].source).map_err(|_| RecipeError::new("MTP lane stream is absent"))?;
+	}
 	graph.nodes[source].retain_output = true;
 	Ok(())
 }
@@ -15534,6 +15584,66 @@ fn mtp_hidden(placed: &Placed, begin: usize, end: usize) -> Result<Vec<Vec<f64>>
 	}
 	Err(RecipeError::new("MTP hidden state was not retained"))
 }
+struct MtpTapeState {
+	values: Vec<u8>,
+	contexts: Vec<u8>,
+	samples: Vec<u8>,
+	tokens: Vec<f64>,
+	saved_output: Vec<f64>,
+	request: Option<NativeRequest>,
+	reached: u32,
+	begin: u32,
+}
+/// Owns the complete carried state and the request buffers its control records address.
+struct MtpCheckpoint {
+	tapes: Vec<MtpTapeState>,
+	decode: DecodeState,
+}
+impl MtpCheckpoint {
+	fn keep(placed: &Placed) -> Result<Self> {
+		let tapes = placed.tapes.iter().flatten().collect::<Vec<_>>();
+		let mut requests = tapes.iter().map(|tape| tape.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))).collect::<Result<Vec<_>>>()?;
+		let mut states = Vec::with_capacity(tapes.len());
+		let mut shadows = Vec::with_capacity(tapes.len());
+		for (tape, request) in tapes.iter().zip(&requests) {
+			states.push(MtpTapeState {
+				values: tape.values.download(tape.values.bytes)?, contexts: tape.contexts.download(tape.contexts.bytes)?, samples: tape.samples.download(tape.samples.bytes)?,
+				tokens: tape.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.clone(),
+				saved_output: tape.saved_output.lock().map_err(|_| RecipeError::new("saved outputs are poisoned"))?.clone(),
+				request: None, reached: tape.reached.load(Ordering::Acquire), begin: tape.window_begin.load(Ordering::Acquire),
+			});
+			shadows.push(request.as_ref().map(NativeRequest::shadow).transpose()?);
+		}
+		let decode = placed.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))?.clone();
+		// Complete every fallible capture before transferring ownership. A trial may
+		// grow its shadow request without freeing addresses kept by this checkpoint.
+		for ((state, request), shadow) in states.iter_mut().zip(&mut requests).zip(shadows) {
+			state.request = std::mem::replace(&mut **request, shadow);
+		}
+		Ok(Self { tapes: states, decode })
+	}
+	fn restore(self, placed: &Placed) -> Result<()> {
+		let tapes = placed.tapes.iter().flatten().collect::<Vec<_>>();
+		require(self.tapes.len() == tapes.len(), "MTP checkpoint tape count differs")?;
+		let mut requests = tapes.iter().map(|tape| tape.request.lock().map_err(|_| RecipeError::new("request buffers are poisoned"))).collect::<Result<Vec<_>>>()?;
+		for (state, tape) in self.tapes.iter().zip(&tapes) {
+			require(state.values.len() == tape.values.bytes && state.contexts.len() == tape.contexts.bytes && state.samples.len() == tape.samples.bytes, "MTP checkpoint buffer sizes differ")?;
+		}
+		for ((state, tape), request) in self.tapes.into_iter().zip(tapes.iter().copied()).zip(&mut requests) {
+			// Restore the original owned addresses before pointer-bearing control bytes.
+			**request = state.request;
+			tape.values.write_bytes(0, &state.values)?;
+			tape.contexts.write_bytes(0, &state.contexts)?;
+			tape.samples.write_bytes(0, &state.samples)?;
+			*tape.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))? = state.tokens;
+			*tape.saved_output.lock().map_err(|_| RecipeError::new("saved outputs are poisoned"))? = state.saved_output;
+			tape.reached.store(state.reached, Ordering::Release);
+			tape.window_begin.store(state.begin, Ordering::Release);
+		}
+		*placed.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))? = self.decode;
+		Ok(())
+	}
+}
 struct MtpRuntime {
 	head: MtpHead,
 	placed: Placed,
@@ -15563,7 +15673,7 @@ impl MtpRuntime {
 		self.placed.clear();
 	}
 	fn input(&mut self, position: usize, positions: usize, id: u32, hidden: &[f64]) -> Result<()> {
-		require(hidden.len() == self.head.width, "MTP hidden state has the wrong width")?;
+		require(hidden.len() == self.head.width * self.head.lanes, "MTP hidden state has the wrong width")?;
 		require(position < positions, "MTP input position is outside its request")?;
 		require((id as usize) < self.head.bound.vocabulary, "MTP token id exceeds its embedding vocabulary")?;
 		self.samples[position] = f64::from(id);
@@ -15579,7 +15689,7 @@ impl MtpRuntime {
 	fn refresh(&mut self, ids: &[u32], begin: usize, end: usize) -> Result<()> {
 		if begin >= end { return Ok(()); }
 		let positions = end - begin;
-		self.samples.resize(checked_mul(self.head.width + 1, positions, "MTP request input")?, 0.0);
+		self.samples.resize(checked_mul(self.head.width * self.head.lanes + 1, positions, "MTP request input")?, 0.0);
 		for position in begin..end { self.input(position - begin, positions, ids[position + 1], &self.hidden[position].clone())?; }
 		self.placed.run_window(&self.samples, begin as u32, end as u32)?;
 		self.head_valid = end;
@@ -15627,7 +15737,7 @@ impl MtpRuntime {
 			let mut hidden = self.hidden[base - 1].clone();
 			for offset in 0..limit {
 				let position = base + offset - 1;
-				self.samples.resize(self.head.width + 1, 0.0);
+				self.samples.resize(self.head.width * self.head.lanes + 1, 0.0);
 				self.input(0, 1, proposed[offset], &hidden)?;
 				let output = self.placed.run_window(&self.samples, position as u32, position as u32 + 1)?;
 				if offset == 0 {
@@ -17151,7 +17261,7 @@ pub struct Generation {
 }
 /// Only evaluated tokens belong here. The final sampled token has no KV state
 /// until the next forward evaluates it. Logits stay in machine RAM.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DecodeState {
 	ids: Vec<u32>,
 	predictions: Vec<f64>,
@@ -18804,6 +18914,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Sum(left, right) => lower_product(graph, left, right, ScalarOpcode::Add, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
+		Operation::Join(lanes) => lower_mtp_join(graph, *lanes)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
@@ -20151,8 +20262,41 @@ fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 	program.op(ScalarOpcode::Multiply, -1.0, factor);
 	push_program(graph, -2, &[], program)
 }
-/// The head read: the stream collapses to the mean of its lanes under its own
-/// read gate.
+/// Joins the common embedding with each normalized hidden lane in projection order.
+fn lower_mtp_join(graph: &mut Graph, lanes: usize) -> Result<()> {
+	let (input, shape) = (graph.source, graph.output);
+	let parts = checked_add(lanes, 1, "MTP input lanes")?;
+		require(graph.lanes == 0 && lanes != 0 && shape.channels % parts == 0, "MTP join has an invalid hidden stream")?;
+	let width = shape.channels / parts;
+	let lane = Shape { channels: width, length: shape.length };
+	let pair = Shape { channels: checked_mul(2, width, "MTP paired channels")?, length: shape.length };
+	let stream = Shape { channels: checked_mul(lanes, width, "MTP output stream")?, length: shape.length };
+	// Gather emits the common embedding first, followed by the hidden lanes.
+	push_node(graph, Primitive::Read, lane, 0, arguments(parts as f64, 1.0), -2)?;
+	lower_normalize(graph, BlockNormalization::Rms, width, width)?;
+	let common = graph.source;
+	let mut total = -1;
+	for index in 0..lanes {
+		reset(graph, input, shape);
+		push_node(graph, Primitive::Read, lane, 0, arguments(parts as f64, (index + 2) as f64), -2)?;
+		lower_normalize(graph, BlockNormalization::Rms, width, width)?;
+		let own = graph.source;
+		reset(graph, common, lane);
+		push_node(graph, Primitive::Outer, pair, 0, arguments(2.0, 1.0), -2)?;
+		let first = graph.source;
+		reset(graph, own, lane);
+		push_node(graph, Primitive::Outer, pair, 0, arguments(2.0, 2.0), -2)?;
+		binary(graph, first, graph.source, pair, ScalarOpcode::Add)?;
+		lower_contraction(graph, width, false)?;
+		push_node(graph, Primitive::Outer, stream, 0, arguments(lanes as f64, (index + 1) as f64), -2)?;
+		let written = graph.source;
+		total = if total < 0 { written } else { binary(graph, total, written, stream, ScalarOpcode::Add)? };
+	}
+	reset(graph, total, stream);
+	graph.lanes = if lanes == 1 { 0 } else { lanes };
+	Ok(())
+}
+/// The head read collapses the stream to the mean of its lanes under its read gate.
 fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
 	let first = graph.nodes.len();
 	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
@@ -21426,6 +21570,13 @@ impl NativeRequest {
 	fn grow(buffer: &mut Buffer, bytes: usize) -> Result<()> {
 		if bytes > buffer.bytes { *buffer = Buffer::zeroed(buffer.runtime, bytes)?; }
 		Ok(())
+	}
+	fn shadow(&self) -> Result<Self> {
+		let copy = |buffer: &Buffer| Buffer::upload(buffer.runtime, &buffer.download::<u8>(buffer.bytes)?);
+		Ok(Self {
+			input: copy(&self.input)?, output: copy(&self.output)?, hidden: copy(&self.hidden)?,
+			lookups: self.lookups.iter().map(copy).collect::<Result<Vec<_>>>()?, begin: self.begin, positions: self.positions,
+		})
 	}
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
