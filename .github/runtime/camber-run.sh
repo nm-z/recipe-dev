@@ -5,6 +5,55 @@
 # only the archive, the worker program, and fixed digest and commit values.
 set -euo pipefail
 
+if [ "${1:-}" = "--existing" ]; then
+	: "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
+	: "${RECIPE_EXISTING_SOURCE:?the existing source checkout is required}"
+	: "${RECIPE_EXISTING_TARGET:?the private build directory is required}"
+	: "${RECIPE_EXISTING_WORK:?the private suite directory is required}"
+	: "${RECIPE_EXISTING_DEVICE:?an explicit NVIDIA device is required}"
+	: "${RECIPE_EXISTING_UUID:?the allocated NVIDIA UUID is required}"
+	: "${RECIPE_EXISTING_LOCK_DIR:?the existing coordination lock directory is required}"
+	[[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'candidate commit must have 40 lowercase hexadecimal characters' >&2; exit 1; }
+	[[ "$RECIPE_EXISTING_DEVICE" =~ ^nv([0-9]+)$ ]] || { echo 'the existing device must be nv followed by its ordinal' >&2; exit 1; }
+	existing_ordinal="${BASH_REMATCH[1]}"
+	existing_source="$(cd "$RECIPE_EXISTING_SOURCE" && pwd -P)"
+	mkdir -p "$RECIPE_EXISTING_TARGET" "$RECIPE_EXISTING_WORK"
+	existing_target="$(cd "$RECIPE_EXISTING_TARGET" && pwd -P)"
+	existing_work="$(cd "$RECIPE_EXISTING_WORK" && pwd -P)"
+	case "$existing_target/" in "$existing_source/"*) echo 'the build directory must be outside the source checkout' >&2; exit 1 ;; esac
+	case "$existing_work/" in "$existing_source/"*) echo 'the suite directory must be outside the source checkout' >&2; exit 1 ;; esac
+	cd "$existing_source"
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] || { echo 'the checkout does not match the candidate commit' >&2; exit 1; }
+	git diff --quiet && git diff --cached --quiet || { echo 'the candidate has tracked source changes' >&2; exit 1; }
+	[ -f .github/runtime/suite.rs ] && [ -d .github/runtime/data ] || { echo 'the checked-in runtime suite is absent' >&2; exit 1; }
+	cargo build --release --lib --bin recipe --target-dir "$existing_target"
+	exec 8>"$RECIPE_EXISTING_LOCK_DIR/nv0.lock"
+	flock -n 8 || { echo 'the existing nv0 coordination lock is busy' >&2; exit 75; }
+	exec 9>"$RECIPE_EXISTING_LOCK_DIR/nv4.lock"
+	flock -n 9 || { echo 'the existing nv4 coordination lock is busy' >&2; exit 75; }
+	if [ "$existing_ordinal" != 0 ] && [ "$existing_ordinal" != 4 ]; then
+		exec 10>"$RECIPE_EXISTING_LOCK_DIR/nv${existing_ordinal}.lock"
+		flock -n 10 || { echo 'the selected NVIDIA device lock is busy' >&2; exit 75; }
+	fi
+	existing_uuid="$(nvidia-smi -i "$existing_ordinal" --query-gpu=uuid --format=csv,noheader)"
+	[ "$existing_uuid" = "$RECIPE_EXISTING_UUID" ] || { echo 'the selected NVIDIA UUID differs from the allocated device' >&2; exit 1; }
+	existing_owners="$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | awk -F ', *' -v uuid="$existing_uuid" '$1 == uuid {print $2}')"
+	[ -z "$existing_owners" ] || { echo 'the selected NVIDIA device has an existing compute owner' >&2; exit 75; }
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] && git diff --quiet && git diff --cached --quiet || { echo 'the candidate changed during the build' >&2; exit 1; }
+	printf 'existing NVIDIA candidate=%s device=%s uuid=%s\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid"
+	timeout --signal=INT --kill-after=10s "${WORKER_EXECUTION_TIMEOUT_SECONDS:-300}s" env \
+		RECIPE_SUITE_ROOT="$existing_source/.github/runtime" \
+		RECIPE_SUITE_WORK="$existing_work" \
+		RECIPE_EVIDENCE="$existing_work/suite.json" \
+		"$existing_target/release/recipe" run "$existing_source/.github/runtime/suite.rs" --device "$RECIPE_EXISTING_DEVICE" 2>&1 | tee "$existing_work/run.log"
+	jq -e '.executed == 8 and .failed == 0 and (.checks | length) == 8 and all(.checks[]; .passed == true)' "$existing_work/suite.json" >/dev/null
+	existing_route="$(awk '/^suite device / {print $3; exit}' "$existing_work/run.log")"
+	case "$existing_route" in "$RECIPE_EXISTING_DEVICE"|*:"$RECIPE_EXISTING_DEVICE") ;; *) echo 'the suite did not execute on the selected NVIDIA backend' >&2; exit 1 ;; esac
+	[ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ] && git diff --quiet && git diff --cached --quiet || { echo 'the candidate changed during execution' >&2; exit 1; }
+	printf 'EXISTING NVIDIA PASS candidate=%s device=%s uuid=%s executed=8 failed=0\n' "$CANDIDATE_SHA" "$RECIPE_EXISTING_DEVICE" "$existing_uuid"
+	exit 0
+fi
+
 : "${CAMBER_API_KEY:?the Camber control credential is required}"
 : "${CANDIDATE_SHA:?CANDIDATE_SHA is required}"
 : "${SNAPSHOT:?SNAPSHOT is required}"
@@ -232,7 +281,7 @@ mkdir -p "$root/evidence"
 cp -r "$work/evidence/." "$root/evidence/"
 cp "$work/run.log" "$root/evidence/worker-run.log"
 
-route="$(awk '/^selected route / { print $3; exit }' "$root/evidence/worker-run.log")"
+route="$(awk '/^suite device / { print $3; exit }' "$root/evidence/worker-run.log")"
 device="${route##*:}"
 case "$device" in
 	nv*) echo "executed on $route" ;;
@@ -285,6 +334,13 @@ for provider_attempt in 1 2; do
 		--path "$stash_root/" \
 		--cmd "$job_command" 2>&1)" || {
 		printf '%s\n' "$create_output" >&2
+		if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' <<< "$create_output"; then
+			cat > evidence/blocker.json <<'JSON'
+{"category":"compute-admission","provider":"camber","code":1005,"gpu_execution":false,"status":"unavailable"}
+JSON
+			echo 'NVIDIA acceptance is incomplete: the provider did not admit a job.' >&2
+			exit 75
+		fi
 		exit 1
 	}
 	printf '%s\n' "$create_output"
@@ -386,14 +442,14 @@ awk '/^RECIPE_SUITE_JSON_BEGIN$/{capture=1; next} /^RECIPE_SUITE_JSON_END$/{capt
 	exit 1
 }
 [ -s evidence/suite.json ] || { echo "suite evidence is absent" >&2; exit 1; }
-route="$(awk '/^selected route / { print $3; exit }' evidence/worker-run.log)"
+route="$(awk '/^suite device / { print $3; exit }' evidence/worker-run.log)"
 device="${route##*:}"
 case "$device" in
 	nv*) ;;
 	*) echo "the retrieved evidence does not show an NVIDIA device" >&2; exit 1 ;;
 esac
 gpu_name="$(awk 'BEGIN { IGNORECASE=1 } /NVIDIA L4|Tesla L4|L4/ { print "NVIDIA L4"; exit }' evidence/worker-run.log)"
-[ -n "$gpu_name" ] || gpu_name="NVIDIA L4"
+[ -n "$gpu_name" ] || { echo 'the worker did not report its verified NVIDIA model' >&2; exit 1; }
 
 cat > evidence/cell.json <<JSON
 {

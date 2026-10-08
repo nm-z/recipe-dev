@@ -365,17 +365,56 @@ jobs:
             .conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or
             .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or
             .state == "FAILURE" or .state == "ERROR")] | length > 0'
+          skipped_nv='any(.statusCheckRollup[]?; .name == "linux/nv" and .conclusion == "SKIPPED")'
+          admission_unavailable() {
+            local url="$1" base="https://github.com/$REPOSITORY/actions/runs/" ids log
+            [[ "$url" == "$base"* ]] || return 1
+            ids="${url#"$base"}"
+            [[ "$ids" =~ ^([0-9]+)/job/([0-9]+)$ ]] || return 1
+            log="$(mktemp "${RUNNER_TEMP:-.}/recipe-admission.XXXXXX")"
+            if ! gh run view "${BASH_REMATCH[1]}" --repo "$REPOSITORY" --job "${BASH_REMATCH[2]}" --log > "$log" 2>/dev/null; then
+              rm -f "$log"
+              return 1
+            fi
+            if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' "$log" &&
+              ! grep -Eq 'submitted Camber job [0-9]|== worker:|SUITE PASS' "$log"; then
+              rm -f "$log"
+              return 0
+            fi
+            rm -f "$log"
+            return 1
+          }
           candidates="$(gh pr list --repo "$REPOSITORY" --state open --limit 1000 \
             --json number,isDraft,statusCheckRollup \
-            --jq ".[] | select(.isDraft == false) | select($failed) | .number")"
+            --jq ".[] | select(.isDraft == false) | select(($failed) or ($skipped_nv)) | .number")"
           while IFS= read -r number; do
             [[ -n "$number" ]] || continue
             pull="$(gh pr view "$number" --repo "$REPOSITORY" \
               --json state,isDraft,headRefOid,statusCheckRollup)"
-            if ! jq -e "(.state == \"OPEN\" and .isDraft == false) and ($failed)" <<< "$pull" >/dev/null; then
+            if ! jq -e "(.state == \"OPEN\" and .isDraft == false) and (($failed) or ($skipped_nv))" <<< "$pull" >/dev/null; then
               continue
             fi
             sha="$(jq -r .headRefOid <<< "$pull")"
+            current="$(gh pr view "$number" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
+            [[ "$sha" == "$current" ]] || continue
+            # Existing-compute status is published after the same runtime suite
+            # passes on this exact head. It covers a verified admission denial.
+            if jq -e 'any(.statusCheckRollup[]?; .context == "recipe/linux-nv-existing" and .state == "SUCCESS")' <<< "$pull" >/dev/null; then
+              covered=true
+              while IFS= read -r check; do
+                name="$(jq -r '.name // ""' <<< "$check")"
+                conclusion="$(jq -r '.conclusion // ""' <<< "$check")"
+                url="$(jq -r '.detailsUrl // ""' <<< "$check")"
+                if [ "$name" != linux/nv ] || [ "$conclusion" != FAILURE ] || ! admission_unavailable "$url"; then
+                  covered=false
+                  break
+                fi
+              done < <(jq -c '.statusCheckRollup[]? | select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or .state == "FAILURE" or .state == "ERROR")' <<< "$pull")
+              if [ "$covered" = true ]; then
+                printf 'PR #%s: existing NVIDIA compute validated %s; provider admission remains unavailable.\n' "$number" "$sha" >> "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+            fi
             current="$(gh pr view "$number" --repo "$REPOSITORY" --json headRefOid --jq .headRefOid)"
             [[ "$sha" == "$current" ]] || continue
             gh pr ready "$number" --repo "$REPOSITORY" --undo
