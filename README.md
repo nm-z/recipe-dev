@@ -117,6 +117,7 @@ atvn:
 	elu()
 	prelu()
 	cos()
+	sqrt()
 	exp()
 	log()
 	ln()
