@@ -2069,8 +2069,12 @@ fn retained_operand(graph: &Graph, index: usize, position: usize, signatures: &[
 	let node = &graph.nodes[index];
 	let operand = [node.source, node.second][position];
 	let Ok(operand) = usize::try_from(operand) else { return false };
-	if position == 0 { node.op != Primitive::Attention && reads_beyond_window(node) }
-	else { reads_beyond_window(node) || signatures[operand] != signatures[index] }
+	// Attention appends both KV and indexer keys to its own retained context.
+	// The side projection's queries and new keys are consumed in this window.
+	if node.op == Primitive::Attention {
+		return false;
+	}
+	if position == 0 { node.op != Primitive::Attention && reads_beyond_window(node) } else { reads_beyond_window(node) || signatures[operand] != signatures[index] }
 }
 
 /// The outputs a later forward window reads, so their slots must outlive the
@@ -4291,7 +4295,9 @@ impl NativeModelIr {
 						));
 						let touched = NodeWindow { begin: first, span: count };
 						emit_runtime_window_loop(&mut ir, index, "index", Shape { channels: 1, length: blocks }, &touched, |ir, _p, wide| {
-							ir.push_str(&format!("call void @attention_index_body{v}( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
+							ir.push_str(&format!(
+								"call void @attention_index_body{v}( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"
+							));
 						})?;
 						ir.push_str(barrier(backend));
 						emit_runtime_window_loop(&mut ir, index, "select", Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
@@ -6176,8 +6182,8 @@ impl NativeModelIr {
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
 		let source_length = match usize::try_from(node.source) {
-			Ok(source) => self.graph.nodes.get(source).map(|source| source.output.length),
-			Err(_) => Some(graph_positions(&self.graph)),
+			Ok(source) => self.plans.get(source).map(|source| source.node.output.length),
+			Err(_) => Some(self.layout.window_positions),
 		};
 		let reinterpreted = source_length.is_some_and(|source_length| source_length != node.input.length);
 		match node.op {
@@ -7224,12 +7230,28 @@ impl NativeModelIr {
 				Primitive::Normalize if !mode_seen => {
 					geometry.mode = integer_argument(candidate.argument[0], "indexer scoring normalization")?;
 					geometry.pooled = candidate.argument[3] as usize == query_channels;
+					if geometry.pooled {
+						let (normalization, attention) = (self.node_precision(candidate), self.node_precision(node));
+						require(
+							normalization.model == attention.model && normalization.state == attention.state,
+							"cached indexer pooling does not support differing normalization and attention arithmetic",
+						)?;
+					}
 					mode_seen = true;
 					if geometry.pooled && candidate.parameters > query_channels {
 						geometry.key_weights = format!("%n{cursor}.weights");
 					}
 				}
 				Primitive::Rope if !dims_seen => {
+					let (rotary, attention) = (self.node_precision(candidate), self.node_precision(node));
+					require(
+						rotary.model == attention.model && rotary.state == attention.state,
+						"cached indexer rotary does not support differing rotary and attention arithmetic",
+					)?;
+					require(
+						candidate.argument[6] == 0.0 && candidate.argument[4] == 1.0 && candidate.argument[5] == 1.0 && candidate.parameters == 0,
+						"cached indexer rotary does not support chained, scaled, or weighted angles",
+					)?;
 					geometry.dims = integer_argument(candidate.argument[0], "indexer rotary dimensions")?;
 					geometry.base = candidate.argument[1];
 					dims_seen = true;
@@ -7728,7 +7750,7 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
-		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v5".as_slice(),
+		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
 	};
 	let requirement = match target {
@@ -7742,9 +7764,11 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => String::new(),
 	};
+	let optimization = native_cpu_optimization_flags(&producer);
 	let mut parts = vec![version, requirement.as_bytes()];
 	if matches!(target, BackendTarget::Cpu { .. }) {
 		parts.push(producer.as_bytes());
+		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	for part in parts {
@@ -7843,6 +7867,14 @@ fn native_cpu_compiler_identity() -> Result<String> {
 	let identity = format!("{compiler}@{}", cpu_compiler_version(&text)?);
 	cpu_llvm_major(&identity)?;
 	Ok(identity)
+}
+
+fn native_cpu_optimization_flags(identity: &str) -> &'static str {
+	let compiler = identity.split_once('@').map_or(identity, |(_, compiler)| compiler);
+	let version = compiler.strip_prefix("clang version ").and_then(|rest| rest.split_whitespace().next());
+	// This producer's loop vectorizer collapses temporal projection positions.
+	// Keep the other O2 passes and the explicit register vectors in the kernels.
+	if version == Some("23.1.1") { "-O2 -fno-vectorize" } else { "-O2" }
 }
 
 fn native_cpu_setting(name: &str) -> Result<&'static str> {
@@ -7950,7 +7982,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
 			command
-				.args(["-x", "ir", "-O2"])
+				.args(["-x", "ir"])
+				.args(native_cpu_optimization_flags(&compiler_identity).split_whitespace())
 				.args(native_cpu_setting("library-flags")?.split_whitespace())
 				.arg(format!("-B{}", linker_directory.display()))
 				.arg(format!("-fuse-ld={}", native_cpu_setting("linker-driver")?))
@@ -8466,7 +8499,8 @@ mod gguf {
 		tensors: Vec<GgufTensor>,
 	}
 	impl Gguf {
-		pub(super) fn open(path: &Path) -> Result<Self> {
+		/// Open one GGUF file or the complete split model it names.
+		pub fn open(path: &Path) -> Result<Self> {
 			let first = Self::shard(path, 0)?;
 			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
 			let mut shards = vec![first];
@@ -8604,19 +8638,32 @@ mod gguf {
 			let format = embedding_format(tensor)?;
 			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, tensor.elements())] })
 		}
+		/// One decoder segment, preserving mapped quantized bytes when another
+		/// plane of the same node contains an ordinary bias or rewritten scale.
+		fn bound_plane(&self, plane: &Plane) -> Result<StoredWeight> {
+			let values = match plane {
+				Plane::Mapped(tensor) if tensor.blocked() => return self.stored(tensor),
+				Plane::Mapped(tensor) if matches!(tensor.kind, 0 | 1) => return self.embedding_stored(tensor),
+				Plane::Mapped(tensor) => self.values(tensor)?,
+				Plane::Owned { values, .. } => values.clone(),
+			};
+			require(values.iter().all(|value| f64::from(*value as f32).to_bits() == value.to_bits()), format!("{} cannot join a mapped quantized plane without losing its stored precision", plane.name()))?;
+			let format = StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 decoder layout is unavailable"))?;
+			let count = values.len();
+			let bytes = values.iter().flat_map(|value| (*value as f32).to_le_bytes()).collect::<Vec<_>>();
+			Ok(StoredWeight { format, count, bytes: bytes.into(), codebook: Vec::new(), arithmetic: Vec::new(), segments: vec![(format, count)] })
+		}
 		/// Resolves a plan against this file, one bound weight per entry. Block-
-		/// quantized views join as runs of their own mappings, so nothing is decoded
-		/// or copied here; when adjacent views use different layouts, the stored
-		/// weight retains one decoder segment for each layout. Views in an unblocked
-		/// layout, or values the host rewrote, decode into values instead.
+		/// quantized views retain their mappings, including beside ordinary bias
+		/// planes. Each source layout has its own decoder segment. A node without
+		/// quantized planes can bind ordinary values directly.
 		pub(super) fn bound(&self, plan: &Binding) -> Result<Vec<BoundNode>> {
 			plan.nodes
 				.iter()
 				.enumerate()
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
-					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
-					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
+					let packed = planes.iter().filter_map(Plane::mapped).any(GgufTensor::blocked);
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
@@ -8629,9 +8676,9 @@ mod gguf {
 						(1, Plane::Owned { name, .. }) => format!("values {name}"),
 						(count, _) => format!("{count} views of {}", names.join(", ")),
 					};
-					let weight = match views.filter(|_| packed) {
-						Some(views) => {
-							let parts = views.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
+					let weight = match packed {
+						true => {
+							let parts = planes.iter().map(|plane| self.bound_plane(plane)).collect::<Result<Vec<_>>>()?;
 							let format = parts[0].format;
 							let mut segments = Vec::new();
 							for part in &parts {
@@ -8644,14 +8691,14 @@ mod gguf {
 							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
 							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new(), segments })
 						}
-						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
+						false if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
 							let tensor = match first {
 								Plane::Mapped(tensor) => tensor,
 								Plane::Owned { .. } => unreachable!(),
 							};
 							BoundWeight::Stored(self.embedding_stored(tensor)?)
 						}
-						None => {
+						false => {
 							let mut values = Vec::with_capacity(elements);
 							for plane in planes {
 								match plane {
@@ -10167,7 +10214,7 @@ mod ngram {
 			let count = |index: usize| {
 				words.get(index).copied().filter(|value| value.fract() == 0.0 && *value >= 0.0).map(|value| value as usize).ok_or_else(|| RecipeError::new("row hash words are invalid"))
 			};
-			let (ngram, per_order) = (count(0)?, count(1)?);
+			let (order_length, per_order) = (count(0)?, count(1)?);
 			let (multipliers, seeds, heads, ends) = (count(2)?, count(3)?, count(4)?, count(5)?);
 			let mut at = 6;
 			let mut wide = |count: usize| -> Result<Vec<u64>> {
@@ -10178,7 +10225,7 @@ mod ngram {
 			let fixed = wide(2)?;
 			let (multipliers, seeds, offsets, vocabularies) = (wide(multipliers)?, wide(seeds)?, wide(heads)?, wide(heads)?);
 			let ends = words.get(at..at + ends).ok_or_else(|| RecipeError::new("row hash words are incomplete"))?.iter().map(|end| *end as u32).collect();
-			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent: fixed[0], image: fixed[1] };
+			let hash = Self { ngram: order_length, per_order, multipliers, seeds, offsets, vocabularies, ends, absent: fixed[0], image: fixed[1] };
 			hash.validate()?;
 			Ok(hash)
 		}
@@ -10202,14 +10249,14 @@ mod ngram {
 			let mut next = |role: &str| fields.next().ok_or_else(|| RecipeError::new(format!("row hash {role} is absent")));
 			let value = |text: &str, role: &str| text.parse::<u64>().map_err(|error| RecipeError::new(format!("invalid row hash {role}: {error}")));
 			let list = |text: &str, role: &str| text.split(':').filter(|item| !item.is_empty()).map(|item| value(item, role)).collect::<Result<Vec<_>>>();
-			let (ngram, per_order) = (value(next("ids")?, "ids")? as usize, value(next("heads per order")?, "heads per order")? as usize);
+			let (order_length, per_order) = (value(next("ids")?, "ids")? as usize, value(next("heads per order")?, "heads per order")? as usize);
 			let (absent, image) = (value(next("absent id")?, "absent id")?, value(next("image id")?, "image id")?);
 			let multipliers = list(next("multipliers")?, "multiplier")?;
 			let seeds = list(next("seeds")?, "seed")?;
 			let offsets = list(next("offsets")?, "offset")?;
 			let vocabularies = list(next("vocabularies")?, "vocabulary")?;
 			let ends = list(next("end ids")?, "end id")?.into_iter().map(|end| u32::try_from(end).map_err(|_| RecipeError::new("row hash end id exceeds u32"))).collect::<Result<Vec<_>>>()?;
-			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent, image };
+			let hash = Self { ngram: order_length, per_order, multipliers, seeds, offsets, vocabularies, ends, absent, image };
 			hash.validate()?;
 			Ok(hash)
 		}
@@ -10277,11 +10324,11 @@ mod ngram {
 			} else if model.value(&ple("ngram_size")).is_some() {
 				// The reference form: the metadata names every head's range and the
 				// multipliers of the fold, and the end id stands in for a missing id.
-				let ngram = model.integer_at(&ple("ngram_size"))?;
+				let order_length = model.integer_at(&ple("ngram_size"))?;
 				let per_order = model.integer_at(&ple("heads_per_ngram"))?;
 				let eos = model.integer_at(&ple("eos_token_id"))?;
 				let hash = RowHash {
-					ngram,
+					ngram: order_length,
 					per_order,
 					multipliers: model.integers_at(&ple("layer_multipliers"))?,
 					seeds: Vec::new(),
@@ -10434,6 +10481,10 @@ mod ngram {
 	}
 }
 pub use ngram::{Ngram, RowHash};
+/// The per-layer embedding source described by the file already opened with
+/// `recipe.data`. The source borrows that mapping and validates its table before
+/// a model uses it through `ple(&ngram)`.
+pub static ngram: std::sync::LazyLock<Ngram<'static>> = std::sync::LazyLock::new(|| script_file().ngram());
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -12273,6 +12324,22 @@ impl Block {
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
 		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
 	}
+	/// Sparse key selection with a token budget. Admission rounds up to whole
+	/// blocks; `index` continues to accept a block count.
+	pub fn index_tokens(self, heads: usize, width: usize, block: usize, tokens: usize) -> Self {
+		assert!(block != 0 && tokens != 0, "indexer block size and token budget must be positive");
+		self.index(heads, width, block, tokens.div_ceil(block))
+	}
+	/// Normalize trained indexer queries and pooled keys, then rotate `dims`
+	/// leading channels at the attention block's rotary base.
+	pub fn score(self, normalization: impl NormalizationSelector, dims: usize) -> Self {
+		let normalization = normalization.normalization();
+		assert!(matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2), "indexer scoring normalization must be rms or l2");
+		self.attention("score", |attention| match &mut attention.index {
+			Some(index) => index.score = Some((normalization, dims)),
+			None => panic!("score requires a preceding index"),
+		})
+	}
 	/// Sigmoid gate on the output of this `attn` block.
 	pub fn gate(self) -> Self {
 		self.attention("gate", |attention| attention.gate = true)
@@ -12589,24 +12656,16 @@ impl Model {
 	pub fn index(&self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
 		self.attention("index", |value| value.index(heads, width, block, keep))
 	}
+	/// Sparse key selection with `tokens` admitted in whole blocks.
+	pub fn index_tokens(&self, heads: usize, width: usize, block: usize, tokens: usize) -> Self {
+		self.attention("index_tokens", |value| value.index_tokens(heads, width, block, tokens))
+	}
 	/// Trained scoring geometry of the preceding `index`: every indexer query and
 	/// key head normalizes under `normalization` with its own trained scale, and
 	/// its leading `dims` channels rotate at the block's `rope` base before the
 	/// indexer scores. Zero `dims` leaves the planes unrotated.
 	pub fn score(&self, normalization: impl NormalizationSelector, dims: usize) -> Self {
-		let normalization = normalization.normalization();
-		if !matches!(normalization, BlockNormalization::Rms | BlockNormalization::L2) {
-			panic!("indexer scoring normalization must be rms or l2");
-		}
-		self.indexer("score", |index| index.score = Some((normalization, dims)))
-	}
-	fn indexer(&self, selector: &str, apply: impl FnOnce(&mut Indexer)) -> Self {
-		self.attention(selector, |block| {
-			block.attention(selector, |attention| match &mut attention.index {
-				Some(index) => apply(index),
-				None => panic!("{selector} requires a preceding index"),
-			})
-		})
+		self.attention("score", |block| block.score(normalization, dims))
 	}
 	/// Sigmoid gate on the output of the preceding `attn` block, from its own
 	/// projection of the block input.
@@ -12673,8 +12732,39 @@ impl Model {
 		self.edit(|model| { model.epsilon = value; model.epsilon_explicit = true; })
 	}
 	fn for_file(&self, file: &Gguf) -> Self {
-		if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) }
+		let model = if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) };
+		let Some((vocabulary, width)) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, width) => Some((rows, width)), _ => None }) else { return model };
+		model.edit(|model| {
+			let mut layers = 0;
+			for block in &mut model.blocks {
+				let (parts, plain) = match &mut block.operation {
+					Operation::Residual(parts) => (parts, true),
+					Operation::Hyper(_, _, parts) => (parts, false),
+					_ => continue,
+				};
+				let attends = mixes(parts);
+				if attends { layers += 1; }
+				if layers == 0 { continue; }
+				let part = if attends { "attn" } else { "ffn" };
+				adapt_file_branch(file, parts, layers - 1, part, width, plain);
+			}
+			let output_scale = file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight"));
+			if output_scale.is_none() { return; }
+			let Some(projection) = model.blocks.iter().rposition(|block| matches!(block.operation, Operation::Layer(rows) if rows == vocabulary)) else { return };
+			let previous = (0..projection).rev().find(|index| !matches!(model.blocks[*index].operation, Operation::Last));
+			if let Some(index) = previous {
+				let block = &mut model.blocks[index];
+				if block.normalization.is_some() && !matches!(block.operation, Operation::Hyper(..)) { return; }
+				// The final scale reads the collapsed stream, not its widened lanes.
+				let normalization = block.normalization.take().unwrap_or(BlockNormalization::Rms);
+				let mut scale = Block::of(Operation::Identity);
+				scale.normalization = Some(normalization);
+				scale.norm_precision = block.norm_precision;
+				model.blocks.insert(projection, scale);
+			}
+		})
 	}
+
 	/// `.fp(16)`, `.int(4)`, `.bf(16)`, or `.tf(32)` after a block sets that
 	/// block's arithmetic; before any block they set the default for every block
 	/// that names none.
@@ -12715,14 +12805,14 @@ impl Model {
 	/// Resolve every weighted node against GGUF data before selecting devices.
 	pub fn binding(&self, data: &Data) -> Result<Binding> {
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("binding requires GGUF data"))?;
-		conventional_plan(file, &with_last_projection(self))
+		conventional_plan(file, &with_last_projection(self).for_file(file))
 	}
 	/// Inspect the planned inference arenas before compiling or allocating GPU
 	/// kernels. This uses the same graph and arena layout as a real run.
 	pub fn memory(&self, data: &Data, positions: usize) -> Result<DeviceMemory> {
 		require(positions > 0, "memory inspection requires context positions")?;
 		let file = data.file.as_ref().ok_or_else(|| RecipeError::new("memory inspection requires GGUF data"))?;
-		let model = with_last_projection(self);
+		let model = with_last_projection(self).for_file(file);
 		let plan = conventional_plan(file, &model)?;
 		let gpu = selected_gpu()?;
 		let graph = bound_graph_on(file, &model, &plan, &vec![0.0; positions], 1, gpu)?;
@@ -14927,6 +15017,12 @@ pub struct Bound {
 	tensors: usize,
 	vocabulary: usize,
 }
+/// Resolve an explicit user declaration before assigning checkpoint planes.
+fn explicit_bound(file: &Gguf, model: &Model) -> Result<Bound> {
+	let model = with_last_projection(model).for_file(file);
+	let plan = conventional_plan(file, &model)?;
+	Ok(Bound { file: file.clone(), blocks: model.blocks.len(), tensors: plan.tensors.len(), vocabulary: 0, model, plan })
+}
 impl Gguf {
 	/// The model this file describes: `general.architecture` selects the row of
 	/// the architecture table, the `<architecture>.*` namespace sizes every block,
@@ -15305,7 +15401,7 @@ impl<'a> Builder<'a> {
 		});
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
-			block = block.index(index_heads, index_width, block_size, top_k.div_ceil(block_size));
+			block = block.index_tokens(index_heads, index_width, block_size, top_k);
 			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
@@ -15553,6 +15649,15 @@ impl Gguf {
 /// `gemma3.attention.head_count`, `gemma3.rope.scaling.factor`. A count the
 /// file lacks reads as the convention its readers apply, or zero.
 pub struct ArchitectureKeys {
+	pub expert_count: usize,
+	pub expert_used_count: usize,
+	pub expert_feed_forward_length: usize,
+	pub expert_shared_feed_forward_length: usize,
+	pub expert_gating_func: usize,
+	pub expert_weights_norm: bool,
+	pub full_attention_interval: usize,
+	pub hyper_connection: HyperKeys,
+	pub ssm: SsmKeys,
 	pub embedding_length: usize,
 	pub block_count: usize,
 	pub feed_forward_length: usize,
@@ -15561,13 +15666,41 @@ pub struct ArchitectureKeys {
 	pub final_logit_softcapping: f64,
 	pub attention: AttentionKeys,
 	pub rope: RopeKeys,
+	pub ple: PleKeys,
+}
+pub struct PleKeys {
+	pub layers: Vec<usize>,
+	pub ngram_size: usize,
+	pub heads_per_ngram: usize,
+	pub embedding_length_per_layer_input: usize,
+	pub conv_kernel: usize,
+	pub eos_token_id: usize,
+	pub image_token_id: usize,
 }
 pub struct AttentionKeys {
+	pub compress_ratios: Vec<usize>,
+	pub indexer: IndexerKeys,
 	pub head_count: usize,
 	pub head_count_kv: usize,
 	pub key_length: usize,
 	pub value_length: usize,
 	pub layer_norm_rms_epsilon: f64,
+}
+pub struct IndexerKeys {
+	pub head_count: usize,
+	pub key_length: usize,
+	pub top_k: usize,
+}
+pub struct HyperKeys {
+	pub count: usize,
+	pub low_rank: usize,
+}
+pub struct SsmKeys {
+	pub time_step_rank: usize,
+	pub group_count: usize,
+	pub state_size: usize,
+	pub conv_kernel: usize,
+	pub inner_size: usize,
 }
 pub struct RopeKeys {
 	pub freq_base: f64,
@@ -15587,14 +15720,42 @@ impl ArchitectureKeys {
 		let or = |value: usize, default: usize| if value == 0 { default } else { value };
 		let (embedding_length, head_count) = (count("embedding_length"), count("attention.head_count"));
 		let key_length = or(count("attention.key_length"), embedding_length / head_count.max(1));
+		let compress_ratios = match file.value(&format!("{prefix}.attention.compress_ratios")) {
+			Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| usize::try_from(value).ok()).expect("attention.compress_ratios contains an invalid count")).collect(),
+			None => Vec::new(),
+			_ => panic!("attention.compress_ratios must be an array"),
+		};
 		Self {
+			expert_count: count("expert_count"),
+			expert_used_count: count("expert_used_count"),
+			expert_feed_forward_length: count("expert_feed_forward_length"),
+			expert_shared_feed_forward_length: count("expert_shared_feed_forward_length"),
+			expert_gating_func: file.value(&format!("{prefix}.expert_gating_func")).and_then(GgufValue::integer).unwrap_or(1) as usize,
+			expert_weights_norm: match file.value(&format!("{prefix}.expert_weights_norm")) { Some(GgufValue::Bool(value)) => *value, None => true, _ => panic!("expert_weights_norm must be a boolean") },
+			full_attention_interval: count("full_attention_interval"),
+			hyper_connection: HyperKeys { count: count("hyper_connection.count"), low_rank: count("hyper_connection.low_rank") },
+			ssm: SsmKeys {
+				time_step_rank: count("ssm.time_step_rank"), group_count: count("ssm.group_count"), state_size: count("ssm.state_size"), conv_kernel: count("ssm.conv_kernel"), inner_size: count("ssm.inner_size"),
+			},
 			embedding_length,
 			block_count: count("block_count"),
 			feed_forward_length: count("feed_forward_length"),
 			context_length: count("context_length"),
 			vocab_size: count("vocab_size"),
 			final_logit_softcapping: real("final_logit_softcapping", 0.0),
+			ple: PleKeys {
+				layers: file.value(&format!("{prefix}.ple.layers")).map(|_| file.indices_at(&format!("{prefix}.ple.layers"))).transpose()
+					.unwrap_or_else(|error| panic!("{error}")).unwrap_or_default(),
+				ngram_size: count("ple.ngram_size"),
+				heads_per_ngram: count("ple.heads_per_ngram"),
+				embedding_length_per_layer_input: count("embedding_length_per_layer_input"),
+				conv_kernel: count("ple.conv_kernel"),
+				eos_token_id: count("ple.eos_token_id"),
+				image_token_id: count("ple.image_token_id"),
+			},
 			attention: AttentionKeys {
+				compress_ratios,
+				indexer: IndexerKeys { head_count: count("attention.indexer.head_count"), key_length: count("attention.indexer.key_length"), top_k: count("attention.indexer.top_k") },
 				head_count,
 				head_count_kv: or(count("attention.head_count_kv"), head_count),
 				key_length,
@@ -15627,7 +15788,7 @@ impl std::ops::Deref for Namespace {
 	}
 }
 macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 phi3 deepseek2 glm4 granite }
+namespaces! { gemma3 llama qwen2 qwen3 qwen4exp phi3 deepseek2 glm4 granite }
 /// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
 /// ids and the chat template sit beside it.
 pub struct TokenizerKeys {
@@ -15760,6 +15921,16 @@ impl Recipe {
 	}
 }
 impl Infer {
+	/// Keep the explicit Model+Data declaration resident for full forwards,
+	/// incremental decode, or serving through the same persistent stepper.
+	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
+		let result = (|| -> Result<Placed> {
+			let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference placement requires GGUF data"))?;
+			let bound = explicit_bound(file, model)?;
+			selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices))
+		})();
+		result.unwrap_or_else(|error| panic!("{error}"))
+	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -15784,8 +15955,7 @@ impl Infer {
 		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		let model = with_last_projection(model);
-		let plan = conventional_plan(&file, &model)?;
+		let bound = explicit_bound(&file, model)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -15798,10 +15968,9 @@ impl Infer {
 		let stop = stop_ids(&coder)?;
 		let sequence = match requested {
 			Some(context) => context,
-			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
+			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
-		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
 		let placed = place_bound_observed(&bound, sequence, &[], devices, tensor_observation_mask(&self.log))?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
@@ -16004,6 +16173,40 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 	Ok(builder.plan)
 }
+/// Resolve optional source planes inside the model builder. The user declares
+/// each branch's operation and dimensions; the file determines its trained
+/// gates and normalization scales.
+fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, width: usize, plain: bool) {
+	let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	for block in parts.iter_mut() {
+		if let Operation::Attention(attention) = &mut block.operation {
+			let head = if attention.width == 0 { width.div_ceil(attention.heads.max(1)) } else { attention.width };
+			if file.tensor(&name("attn_q.weight")).and_then(|tensor| tensor.shape.get(1)).is_some_and(|rows| *rows as usize == 2 * attention.heads * head) {
+				attention.gate = true;
+			}
+			if block.qk.is_none() && (file.tensor(&name("attn_q_norm.weight")).is_some() || file.tensor(&name("attn_k_norm.weight")).is_some()) { block.qk = Some(BlockNormalization::Rms); }
+			attention.factors |= attention.rope.is_some() && attention.window == 0 && file.tensor("rope_freqs.weight").is_some();
+			if let Some(index) = &mut attention.index {
+				if index.score.is_none() && (file.tensor(&name("indexer.q_norm.weight")).is_some() || file.tensor(&name("indexer.k_norm.weight")).is_some()) {
+					index.score = Some((BlockNormalization::Rms, attention.rope.map_or(0, |(_, dims, _)| dims)));
+				}
+			}
+		}
+	}
+	let post = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
+	if file.tensor(&name(post)).is_some() {
+		if let Some(block) = parts.last_mut().filter(|block| block.normalization.is_none()) { block.normalization = Some(BlockNormalization::Rms); }
+	}
+	if plain {
+		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.normalization.is_some());
+		if !normalized && file.tensor(&name(pre)).is_some() {
+			let mut scale = Block::of(Operation::Identity);
+			scale.normalization = Some(BlockNormalization::Rms);
+			parts.insert(0, scale);
+		}
+	}
+}
 /// A branch that mixes positions starts a GGUF block; its feed-forward reads
 /// the tensors at the same block index.
 fn mixes(parts: &[Block]) -> bool {
@@ -16032,9 +16235,9 @@ impl Builder<'_> {
 					self.mapped(vec![embedding.clone()]);
 				}
 				Operation::Ple(formula) => {
-					let ngram = Ngram::new(self.file)?;
-					require(*formula == ngram.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(ngram.layer(), &ngram, width, lanes.max(1))?;
+					let table = Ngram::new(self.file)?;
+					require(*formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
 					let attends = mixes(parts);
@@ -16148,6 +16351,28 @@ impl Builder<'_> {
 		Ok(())
 	}
 
+	/// Bind the same side projection and deferred key scales for architecture
+	/// models and script-defined resident attention.
+	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer) -> Result<()> {
+		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+		let role = format!("block {layer} indexer");
+		let query = self.projection(&name("q_proj.weight"), &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
+		let key = self.projection(&name("k_proj.weight"), &role, width, index.width)?;
+		let dims = index.score.map_or(0, |(_, dims)| dims);
+		let order = self.head_order(index.width, dims);
+		let mut planes = Vec::new();
+		for head in 0..index.heads {
+			planes.extend(Self::head_rows(&query, head * index.width, &order)?);
+		}
+		planes.extend(Self::head_rows(&key, 0, &order)?);
+		self.mapped(planes);
+		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
+			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
+			scales.extend(self.scale(&name("k_norm.weight"), &role, index.width, 1, &order)?);
+			self.slot(scales);
+		}
+		Ok(())
+	}
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let tensor = self.tensor(name, "a normalization")?;
@@ -16208,26 +16433,7 @@ impl Builder<'_> {
 			self.mapped(vec![factors]);
 		}
 		if let Some(index) = attention.index {
-			let (index_heads, index_width) = (index.heads, index.width);
-			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
-			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
-			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
-			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
-			// reaches the adjacent-pair Rope with the matching columns.
-			let index_order = self.head_order(index_width, index.score.map_or(0, |(_, dims)| dims));
-			let mut index_planes = Vec::new();
-			for index in 0..index_heads {
-				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
-			}
-			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
-			self.mapped(index_planes);
-			let query_norm = name("indexer.q_norm.weight");
-			let key_norm = name("indexer.k_norm.weight");
-			if index.score.is_some_and(|(normalization, _)| normalization == BlockNormalization::Rms) {
-				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
-				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
-				self.slot(scales);
-			}
+			self.indexer_planes(layer, width, index)?;
 		}
 		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
 		self.mapped(vec![output]);
@@ -16939,10 +17145,10 @@ fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> 
 			}
 		}
 	}
-	let ngram = if tables.is_empty() { String::new() } else {
+	let table_note = if tables.is_empty() { String::new() } else {
 		format!("  n-gram table {:.3} GiB ({ngram_bytes} bytes) in RAM, outside allocation total; gathered rows included in buffer size", gib(ngram_bytes))
 	};
-	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{ngram}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
+	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{table_note}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
@@ -17183,6 +17389,59 @@ impl Placed {
 		}
 		Ok(tensors)
 	}
+	/// Fill exactly the supplied prefix without sampling another token.
+	pub fn prefill(&self, ids: &[u32]) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap_or_else(|_| panic!("decode state is poisoned"));
+		*state = DecodeState::default();
+		self.forward_ids(&mut state, ids, 0).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Extend the completed prefix by one supplied token on the same parts.
+	pub fn step(&self, id: u32) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap_or_else(|_| panic!("decode state is poisoned"));
+		assert!(!state.ids.is_empty(), "step requires a completed prefill");
+		let begin = state.ids.len();
+		let mut ids = state.ids.clone();
+		ids.push(id);
+		self.forward_ids(&mut state, &ids, begin).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn forward_ids(&self, state: &mut DecodeState, ids: &[u32], begin: usize) -> Result<Vec<f64>> {
+		let result = (|| -> Result<Vec<f64>> {
+			let capacity = self.decode_capacity()?;
+			require(!ids.is_empty() && ids.len() <= capacity && begin < ids.len(), "token window is outside the placement capacity")?;
+			require(begin == 0 || state.ids.as_slice() == &ids[..begin], "token step changes the retained prefix")?;
+			let mut samples = vec![0.0; capacity];
+			for (sample, id) in samples.iter_mut().zip(ids) { *sample = f64::from(*id); }
+			let begin = narrow(begin, "token window start")? as u32;
+			let end = narrow(ids.len(), "token window end")? as u32;
+			let predictions = self.run_window(&samples, begin, end)?;
+			let logits = self.last_logits(&predictions, begin, end)?;
+			state.ids = ids.to_vec();
+			state.predictions = predictions;
+			state.logits = logits.clone();
+			Ok(logits)
+		})();
+		if result.is_err() { *state = DecodeState::default(); }
+		result
+	}
+	fn decode_capacity(&self) -> Result<usize> {
+		let sequence = match &self.source {
+			PlacedSource::Saved(graphs) => {
+				let first = graphs.first().ok_or_else(|| RecipeError::new("decode has no input graph"))?;
+				require(first.input.channels == 1 || first.input.length == 1, "decode expects one input value per position")?;
+				require(graphs.len() == self.tapes.len(), "decode graph and range sets differ")?;
+				first.inputs.len()
+			},
+			PlacedSource::Bound(input, _) => {
+				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
+				input.elements()
+			}
+		};
+		for ranges in &self.tapes {
+			require(!ranges.is_empty(), "decode graph has no persistent ranges")?;
+			for tape in ranges { require(tape.positions as usize == sequence, format!("decode range has {} positions, expected {sequence}", tape.positions))?; }
+		}
+		Ok(sequence)
+	}
 	fn llvm_report(&self) -> LlvmReport {
 		let mut report = LlvmReport::default();
 		for tape in self.tapes.iter().flatten() {
@@ -17299,20 +17558,7 @@ impl Placed {
 			PlacedSource::Bound(_, suppressed) => sampler.suppressed.clone_from(suppressed),
 			PlacedSource::Saved(_) => sampler.suppressed.clear(),
 		}
-		let sequence = match &self.source {
-			PlacedSource::Saved(graphs) => match graphs.as_slice() {
-				[only] => {
-					require(only.input.channels == 1 || only.input.length == 1, "decode expects one input value per position")?;
-					only.inputs.len()
-				}
-				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
-			},
-			PlacedSource::Bound(input, _) => {
-				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
-				input.elements()
-			}
-		};
-		require(self.tapes.len() == 1, format!("decode expects one range set, this placement has {}", self.tapes.len()))?;
+		let sequence = self.decode_capacity()?;
 		require(!prompt.is_empty(), "decode prompt is empty")?;
 		require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
 		let mut samples = vec![0.0; sequence];
@@ -17341,7 +17587,7 @@ impl Placed {
 		result
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
 	}
 	/// Run a window through either a saved semantic pipeline or one directly
@@ -17356,7 +17602,7 @@ impl Placed {
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None })
+					self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None })
 				})
 			}
 			PlacedSource::Bound(input, _) => {
@@ -17372,11 +17618,23 @@ impl Placed {
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress)
+	}
+	/// Every part receives the original token IDs, independently of transformed
+	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		require(begin <= end, "window begins after its end")?;
+		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		for tape in tapes {
+			require(end <= tape.positions, "token window exceeds a persistent range")?;
+		}
+		for (start, count) in first.input_runs(begin, end) {
+			require(start.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
+		}
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
-		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 		tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
 		for (start, count) in first.input_runs(begin, end) {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
@@ -18777,6 +19035,41 @@ fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalizati
 fn attention_blocks(node: &Node) -> usize {
 	let block = if node.argument[3] > 0.0 { node.argument[3] as usize } else { 0 };
 	if block == 0 { 0 } else { node.output.length.div_ceil(block) }
+}
+/// The indexer carries raw keys, one causal representative for each position,
+/// and one filled count for each block. Scores precede these retained regions.
+fn attention_index_state(node: &Node, rows: usize) -> Result<(usize, usize)> {
+	if attention_blocks(node) == 0 {
+		return Ok((0, 0));
+	}
+	let keys = checked_mul(checked_mul(rows, node.output.length, "indexer key rows")?, node.argument[6] as usize, "indexer key cache")?;
+	let counts = checked_mul(rows, attention_blocks(node), "indexer filled counts")?;
+	Ok((keys, counts))
+}
+/// Byte offsets in an attention context, including the exact sum needed to
+/// commit a partially accepted block without repeating numerical operations.
+struct AttentionIndexLayout {
+	sums: usize,
+	prefix_sums: usize,
+	counts: usize,
+	bytes: usize,
+}
+fn attention_index_layout(node: &Node, rows: usize) -> Result<AttentionIndexLayout> {
+	let (keys, counts) = attention_index_state(node, rows)?;
+	let queries = checked_mul(rows, node.output.length, "indexer context queries")?;
+	let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer context heads")?, 2, "indexer context statistics")?;
+	let sums = checked_mul(counts, node.argument[6] as usize, "indexer context sums")?;
+	let scores = checked_mul(queries, checked_mul(attention_blocks(node), 2, "indexer context score width")?, "indexer context scores")?;
+	let prefix = checked_add(checked_add(statistics, sums, "indexer context prefix")?, scores, "indexer context scores end")?;
+	let prefix_sums = checked_add(prefix, checked_mul(keys, 2, "indexer raw and representative caches")?, "indexer prefix sums start")?;
+	let count_start = checked_add(prefix_sums, keys, "indexer counts start")?;
+	let bytes = node.precision.bytes();
+	Ok(AttentionIndexLayout {
+		sums: checked_mul(statistics, bytes, "indexer sums byte offset")?,
+		prefix_sums: checked_mul(prefix_sums, bytes, "indexer prefix sum byte offset")?,
+		counts: checked_mul(count_start, bytes, "indexer count byte offset")?,
+		bytes: checked_add(checked_mul(count_start, bytes, "indexer cache bytes")?, checked_mul(counts, size_of::<u64>(), "indexer count bytes")?, "indexer carried bytes")?,
+	})
 }
 fn reset(graph: &mut Graph, source: i32, shape: Shape) {
 	graph.source = source;
@@ -20813,6 +21106,65 @@ impl NativeTape {
 	fn write_schedule(&self) -> Result<()> {
 		write_contraction_schedule(&self.contexts, &self.program.artifact.layout, &self.program.schedule.contractions)
 	}
+	/// Commit cached indexer sums at an accepted prefix without another model
+	/// invocation. Preflight every span before changing the saved image. The
+	/// caller restores the image with its other accepted state and poisons the
+	/// transaction if restoration fails.
+	fn commit_index_prefix(&self, contexts: &mut [u8], values: &mut [u8], end: u32) -> Result<()> {
+		require(contexts.len() == self.contexts.bytes && values.len() == self.values.bytes, "indexer prefix image has the wrong capacity")?;
+		let end = end as usize;
+		require(end <= self.reached.load(Ordering::Acquire) as usize, "indexer prefix exceeds evaluated positions")?;
+		let mut patches = Vec::new();
+		for (index, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Attention && attention_blocks(node) != 0) {
+			require(end <= node.output.length, "indexer prefix exceeds its sequence")?;
+			let layout = attention_index_layout(node, self.rows as usize)?;
+			let in_values = self.program.artifact.layout.contexts_in_values[index];
+			let base = self.program.artifact.layout.contexts[index];
+			let image = if in_values { &*values } else { &*contexts };
+			require(checked_add(base, layout.bytes, "indexer prefix context")? <= image.len(), "indexer prefix context exceeds its buffer")?;
+			let (blocks, width, block) = (attention_blocks(node), node.argument[6] as usize, node.argument[3] as usize);
+			let bytes = checked_mul(width, node.precision.bytes(), "indexer sum row bytes")?;
+			let count_at = checked_add(base, layout.counts, "indexer count address")?;
+			let count_bytes = checked_mul(checked_mul(self.rows as usize, blocks, "indexer count rows")?, size_of::<u64>(), "indexer count bytes")?;
+			let mut counts = image[count_at..count_at + count_bytes].to_vec();
+			for row in 0..self.rows as usize {
+				for b in 0..blocks {
+					let start = checked_mul(b, block, "indexer prefix block start")?;
+					let count = end.saturating_sub(start).min(block);
+					let slot = checked_add(checked_mul(row, blocks, "indexer count row")?, b, "indexer count slot")?;
+					let at = checked_mul(slot, size_of::<u64>(), "indexer count offset")?;
+					let saved = u64::from_le_bytes(counts[at..at + size_of::<u64>()].try_into().unwrap());
+					require(saved <= block.min(node.output.length - start) as u64 && saved >= count as u64, "indexer prefix count is invalid or was not evaluated")?;
+					if saved != count as u64 {
+						let destination = checked_add(base, checked_add(layout.sums, checked_mul(slot, bytes, "indexer sum slot")?, "indexer sum local")?, "indexer sum address")?;
+						let sum = if count == 0 {
+							encode_floats(&vec![0.0; width], node.precision)
+						} else {
+							let position = checked_add(
+								checked_mul(row, node.output.length, "indexer prefix row")?,
+								checked_add(start, count - 1, "indexer prefix last")?,
+								"indexer prefix position",
+							)?;
+							let source = checked_add(
+								base,
+								checked_add(layout.prefix_sums, checked_mul(position, bytes, "indexer prefix row offset")?, "indexer prefix local")?,
+								"indexer prefix address",
+							)?;
+							image[source..source + bytes].to_vec()
+						};
+						patches.push((in_values, destination, sum));
+					}
+					counts[at..at + size_of::<u64>()].copy_from_slice(&(count as u64).to_le_bytes());
+				}
+			}
+			patches.push((in_values, count_at, counts));
+		}
+		for (in_values, destination, bytes) in patches {
+			let image = if in_values { &mut *values } else { &mut *contexts };
+			image[destination..destination + bytes.len()].copy_from_slice(&bytes);
+		}
+		Ok(())
+	}
 	/// Applies a runtime contraction schedule to both the host description and
 	/// the words read by the native kernels.
 	fn apply_contraction_schedule(&mut self, contractions: Vec<Option<NativeContractionTiles>>) -> Result<()> {
@@ -22058,7 +22410,12 @@ fn carried(node: &Node, rows: usize) -> Result<Carried> {
 			let queries = checked_mul(rows, node.output.length, "attention statistics rows")?;
 			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
 			let representatives = checked_mul(checked_mul(rows, attention_blocks(node), "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
-			Carried { history: History::Sequence, values: checked_add(statistics, representatives, "attention state")? }
+			let (keys, counts) = attention_index_state(node, rows)?;
+			let scores = checked_mul(queries, checked_mul(attention_blocks(node), 2, "indexer score row")?, "indexer scores")?;
+			let prefix = checked_add(checked_add(statistics, representatives, "attention state")?, scores, "indexer score state")?;
+			let count_values = checked_mul(counts, size_of::<u64>() / node.precision.bytes(), "indexer count storage")?;
+			let cache = checked_add(checked_mul(keys, 3, "indexer raw, representative, and sum caches")?, count_values, "indexer cached state")?;
+			Carried { history: History::Sequence, values: checked_add(prefix, cache, "attention carried state")? }
 		}
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
@@ -22209,17 +22566,23 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			vec![(checked_mul(elements.max(1), precision.bytes(), "predictor workspace bytes")?, local)]
 		}
 		// Softmax statistics, then the indexer block representatives, then one
-		// row of block scores and one admission flag per block per query.
+		// row of block scores and one admission flag per block per query, then
+		// raw keys, causal representatives, and filled counts.
 		Primitive::Attention => {
 			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention statistics rows")?, attention_blocks(node));
 			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
 			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
+			let (keys, counts) = attention_index_state(node, rows)?;
 			let derivatives = if inference { 0 } else { checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")? };
 			vec![
 				(checked_mul(statistics, precision.bytes(), "attention statistics bytes")?, local),
 				(checked_mul(representatives, precision.bytes(), "indexer representatives bytes")?, Retained),
 				(checked_mul(scores, precision.bytes(), "indexer scores bytes")?, local),
+				(checked_mul(keys, precision.bytes(), "indexer raw key bytes")?, Retained),
+				(checked_mul(keys, precision.bytes(), "indexer causal representative bytes")?, Retained),
+				(checked_mul(keys, precision.bytes(), "indexer causal sum bytes")?, Retained),
+				(checked_mul(counts, size_of::<u64>(), "indexer filled count bytes")?, Retained),
 				(checked_mul(derivatives, precision.bytes(), "indexer derivatives bytes")?, Retained),
 			]
 		}
