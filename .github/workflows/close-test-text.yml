@@ -377,7 +377,7 @@ jobs:
               return 1
             fi
             if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' "$log" &&
-              ! grep -Eq 'submitted Camber job [0-9]|== worker:|SUITE PASS' "$log"; then
+              ! grep -Eiq 'Job ID:[[:space:]]*[0-9]|"job_id"[[:space:]]*:|"id"[[:space:]]*:[[:space:]]*"?[0-9]|submitted Camber job [0-9]|== worker:|SUITE PASS|"gpu_execution"[[:space:]]*:[[:space:]]*true' "$log"; then
               rm -f "$log"
               return 0
             fi
@@ -401,16 +401,34 @@ jobs:
             # passes on this exact head. It covers a verified admission denial.
             if jq -e 'any(.statusCheckRollup[]?; .context == "recipe/linux-nv-existing" and .state == "SUCCESS")' <<< "$pull" >/dev/null; then
               covered=true
+              admission_confirmed=false
               while IFS= read -r check; do
                 name="$(jq -r '.name // ""' <<< "$check")"
                 conclusion="$(jq -r '.conclusion // ""' <<< "$check")"
                 url="$(jq -r '.detailsUrl // ""' <<< "$check")"
-                if [ "$name" != linux/nv ] || [ "$conclusion" != FAILURE ] || ! admission_unavailable "$url"; then
+                confirmed=false
+                if [ "$name" = linux/nv ] && [ "$conclusion" = FAILURE ] && admission_unavailable "$url"; then
+                  confirmed=true
+                elif [ "$name" = linux/nv ] && [ "$conclusion" = SKIPPED ]; then
+                  base="https://github.com/$REPOSITORY/actions/runs/"
+                  ids="${url#"$base"}"
+                  if [[ "$url" == "$base"* && "$ids" =~ ^([0-9]+)/job/([0-9]+)$ ]]; then
+                    run_url="${base}${BASH_REMATCH[1]}/job/"
+                    while IFS= read -r admission_url; do
+                      if admission_unavailable "$admission_url"; then
+                        confirmed=true
+                        break
+                      fi
+                    done < <(jq -r --arg run_url "$run_url" '.statusCheckRollup[]? | select(.name == "linux/nv admission" and .conclusion == "SUCCESS" and ((.detailsUrl // "") | startswith($run_url))) | .detailsUrl' <<< "$pull")
+                  fi
+                fi
+                if [ "$confirmed" != true ]; then
                   covered=false
                   break
                 fi
-              done < <(jq -c '.statusCheckRollup[]? | select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or .state == "FAILURE" or .state == "ERROR")' <<< "$pull")
-              if [ "$covered" = true ]; then
+                admission_confirmed=true
+              done < <(jq -c '.statusCheckRollup[]? | select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED" or .state == "FAILURE" or .state == "ERROR" or (.name == "linux/nv" and .conclusion == "SKIPPED"))' <<< "$pull")
+              if [ "$covered" = true ] && [ "$admission_confirmed" = true ]; then
                 printf 'PR #%s: existing NVIDIA compute validated %s; provider admission remains unavailable.\n' "$number" "$sha" >> "$GITHUB_STEP_SUMMARY"
                 continue
               fi

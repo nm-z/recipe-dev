@@ -326,6 +326,7 @@ fi
 job_command="SNAPSHOT_SHA256=$SNAPSHOT_SHA256 CANDIDATE_SHA=$CANDIDATE_SHA WORKER_EXECUTION_TIMEOUT_SECONDS=$WORKER_EXECUTION_TIMEOUT_SECONDS RECIPE_WORKLOAD=$RECIPE_WORKLOAD RECIPE_TRIAL_CURSOR=${RECIPE_TRIAL_CURSOR:-0} RECIPE_TRIAL_COUNT=${RECIPE_TRIAL_COUNT:-0} $worker_launch"
 for provider_attempt in 1 2; do
 	echo "== creating the Camber L4 job, attempt $provider_attempt of 2 =="
+	rm -f evidence/blocker.json
 	create_output="$(printf 'y\n' | camber job create \
 		--engine base \
 		--size xsmall \
@@ -334,7 +335,8 @@ for provider_attempt in 1 2; do
 		--path "$stash_root/" \
 		--cmd "$job_command" 2>&1)" || {
 		printf '%s\n' "$create_output" >&2
-		if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' <<< "$create_output"; then
+		if grep -Fq 'API error: code=1005, message=Job creation is not available on the free tier.' <<< "$create_output" &&
+			! grep -Eiq 'Job ID:[[:space:]]*[0-9]|"job_id"[[:space:]]*:|"id"[[:space:]]*:[[:space:]]*"?[0-9]|submitted Camber job [0-9]|== worker:|SUITE PASS|"gpu_execution"[[:space:]]*:[[:space:]]*true' <<< "$create_output"; then
 			cat > evidence/blocker.json <<'JSON'
 {"category":"compute-admission","provider":"camber","code":1005,"gpu_execution":false,"status":"unavailable"}
 JSON
