@@ -41,14 +41,8 @@ cpu-library-flags = { linux = "-fPIC", macos = "-fPIC", windows = "" }
 cpu-entry-linkage = { linux = "", macos = "", windows = "dllexport" }
 cpu-link-flags = { linux = "", macos = "", windows = "-Wl,-noimplib" }
 cpu-module-suffix = { linux = "", macos = "", windows = "@_fltused = dso_local constant i32 39029" }
-hsa-compiler = { linux = "/opt/rocm/lib/llvm/bin/clang" }
-hsa-runtime = { linux = "libhsa-runtime64.so.1" }
-hsa-device-library = { linux = "/opt/rocm/amdgcn/bitcode/ocml.bc" }
-hsa-clock-library = { linux = "/opt/rocm/amdgcn/bitcode/ockl.bc" }
-hsa-abi-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_abi_version_600.bc" }
-hsa-device-library-directory = { linux = "/opt/rocm/amdgcn/bitcode" }
-hsa-finite-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc" }
-hsa-math-library = { linux = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc" }
+amd-compiler = { linux = "/usr/bin/clang" }
+amd-linker = { linux = "/usr/bin/ld.lld" }
 nvidia-ptx = "ptx71"
 nvidia-compiler = { linux = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc.exe" }

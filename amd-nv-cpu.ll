@@ -36,7 +36,7 @@ define internal double @recipe.log(double %value) #1 { entry: %result = call dou
 define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }
 ; NUMERIC END
 declare i32 @llvm.amdgcn.workitem.id.x()
-declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
+declare void @llvm.amdgcn.s.barrier()
 ; RECIPE_WAVE_HELPERS
 ; RECIPE_BLOCK_HELPERS
 declare void @llvm.trap() @contraction_tile = external addrspace(3) global [0 x double], align 16

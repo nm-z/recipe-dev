@@ -261,8 +261,33 @@ define internal i32 @global_id() #1 { entry:
 %lane = call i32 @llvm.amdgcn.workitem.id.x() %group = call i32 @llvm.amdgcn.workgroup.id.x()
 %width = call i32 @recipe.workgroup.size.x() %base = mul i32 %group, %width %id = add i32 %base, %lane ret i32 %id }
 @RECIPE_GRID_BARRIER@"#;
-const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
-define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
+const AMD_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
+@grid.phase = internal addrspace(1) global i32 0, align 4
+define internal void @grid_barrier(i32 %threads) #1 { entry:
+%phase = load atomic i32, ptr addrspace(1) @grid.phase syncscope("agent") acquire, align 4
+call void @recipe.workgroup.barrier()
+%tid = call i32 @llvm.amdgcn.workitem.id.x()
+%leader = icmp eq i32 %tid, 0
+br i1 %leader, label %arrive, label %joined
+arrive:
+%width = call i32 @recipe.workgroup.size.x()
+%groups = udiv i32 %threads, %width
+%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 syncscope("agent") acq_rel
+%limit = sub i32 %groups, 1
+%last = icmp eq i32 %prior, %limit
+br i1 %last, label %release, label %wait
+release:
+store atomic i32 0, ptr addrspace(1) @grid.count syncscope("agent") monotonic, align 4
+%next = xor i32 %phase, 1
+store atomic i32 %next, ptr addrspace(1) @grid.phase syncscope("agent") release, align 4
+br label %joined
+wait:
+%seen = load atomic i32, ptr addrspace(1) @grid.phase syncscope("agent") acquire, align 4
+%ready = icmp ne i32 %seen, %phase
+br i1 %ready, label %joined, label %wait
+joined:
+call void @recipe.workgroup.barrier()
+ret void }"#;
 // PTX only accepts ordered atomics on sm_70 and newer, so the counting barrier uses
 // relaxed atomics with explicit fences. A release fence before each arrival publishes the
 // block's writes; the last arriver acquires them, republishes with a release fence, and
@@ -311,14 +336,16 @@ const AMD_WAVE_HELPERS: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
 define internal i1 @recipe.int8.dots() #1 { entry: ret i1 true }
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyctr_u64() ret i64 %now }
+declare i64 @llvm.amdgcn.s.sendmsg.rtn.i64(i32 immarg)
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.amdgcn.s.sendmsg.rtn.i64(i32 131) ret i64 %now }
 define internal float @recipe.wave.partner(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const AMD_WAVE_HELPERS_DOUBLE: &str = r#"declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
 declare i32 @llvm.amdgcn.wavefrontsize()
 define internal i32 @recipe.wavefront.width() #1 { entry: %width = call i32 @llvm.amdgcn.wavefrontsize() ret i32 %width }
 define internal i1 @recipe.int8.dots() #1 { entry: ret i1 true }
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyctr_u64() ret i64 %now }
+declare i64 @llvm.amdgcn.s.sendmsg.rtn.i64(i32 immarg)
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.amdgcn.s.sendmsg.rtn.i64(i32 131) ret i64 %now }
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
@@ -1696,7 +1723,6 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	("call void @grid_barrier(i32 %threads)", "call void @recipe.cpu.barrier()"),
 	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
 	("declare void @llvm.amdgcn.s.barrier()", ""),
-	("declare i64 @__ockl_steadyctr_u64()", ""),
 	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }"),
 ];
 const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
@@ -1891,16 +1917,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 		}
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
-	for (key, environment) in [
-		("hsa-compiler", "RECIPE_HSA_COMPILER"),
-		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
-		("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"),
-		("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"),
-		("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"),
-		("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"),
-		("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"),
-		("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY"),
-	] {
+	for (key, environment) in [("amd-compiler", "RECIPE_AMD_COMPILER"), ("amd-linker", "RECIPE_AMD_LINKER")] {
 		println!("cargo:rustc-env={environment}={}", platform(manifest, key, os)?);
 	}
 	Ok(())
@@ -2079,7 +2096,7 @@ fn main() -> BuildResult<()> {
 	compile_cpu(&manifest, &out, &os, schedule)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
-	let amd = native && installed("hsa-compiler")? && installed("hsa-device-library")?;
+	let amd = native && os == "linux" && installed("amd-compiler")? && installed("amd-linker")?;
 	let toolkit = nvidia_toolkit(&manifest, &os)?;
 	if let Some(toolkit) = &toolkit
 		&& toolkit.required

@@ -7836,7 +7836,7 @@ fn native_entry(backend: Backend) -> Result<(&'static str, &'static str)> {
 }
 
 fn native_amd_compiler() -> Result<&'static str> {
-	option_env!("RECIPE_HSA_COMPILER").ok_or_else(|| RecipeError::new("AMD native compiler is unavailable"))
+	option_env!("RECIPE_AMD_COMPILER").ok_or_else(|| RecipeError::new("AMD native compiler is unavailable"))
 }
 
 fn native_nvidia_compiler() -> Result<&'static str> {
@@ -7870,16 +7870,6 @@ fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
 	let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
 	let supported = *targets.entry(architecture.to_owned()).or_insert_with(|| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()));
 	supported.then_some(path)
-}
-
-fn native_amd_library(name: &'static str) -> Result<&'static str> {
-	option_env!("RECIPE_HSA_DEVICE_LIBRARY")
-		.filter(|_| name == "device")
-		.or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock"))
-		.or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi"))
-		.or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite"))
-		.or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math"))
-		.ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
 fn native_nvidia_device_library() -> Result<&'static str> {
@@ -7937,6 +7927,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
+			let linker = option_env!("RECIPE_AMD_LINKER").ok_or_else(|| RecipeError::new("AMD native linker is unavailable"))?;
+			let object = output.with_extension("o");
 			let mut command = Command::new(compiler);
 			// The resource-usage remarks are the only route to the register
 			// allocation of the compiled kernel, which decides whether the requested
@@ -7948,13 +7940,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			// return address s[30:31] (llvm/llvm-project#224205). Disabling the reservation
 			// makes branch relaxation use the liveness-aware scavenger instead.
 			command.args(["-mllvm", "-amdgpu-long-branch-factor=0"]);
-			for name in ["device", "clock", "abi", "finite", "math"] {
-				command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", native_amd_library(name)?]);
-			}
-			let library_directory = option_env!("RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY").ok_or_else(|| RecipeError::new("AMD native device library directory is unavailable"))?;
-			let isa = Path::new(library_directory).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
-			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(source).arg("-o").arg(output);
-			native_command(command, "AMD LLVM IR compiler", key).map(|diagnostic| kernel_resources(&diagnostic))
+			command.args(["-x", "ir", "-c", "-fPIC", "-mcode-object-version=5"]).arg(source).arg("-o").arg(&object);
+			let diagnostic = native_command(command, "AMD LLVM IR compiler", key)?;
+			let mut link = Command::new(linker);
+			link.args(["-shared", "--no-undefined"]).arg(&object).arg("-o").arg(output);
+			let linked = native_command(link, "AMD code-object linker", key);
+			let _ = fs::remove_file(&object);
+			linked?;
+			Ok(kernel_resources(&diagnostic))
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
@@ -22335,61 +22328,17 @@ struct NativeCpuProgram {
 }
 
 #[cfg(amd)]
-struct HsaReader {
-	handle: u64,
-	destroy: unsafe extern "C" fn(u64) -> i32,
-}
-
-#[cfg(amd)]
-impl Drop for HsaReader {
-	fn drop(&mut self) {
-		if self.handle != 0 {
-			unsafe { (self.destroy)(self.handle) };
-		}
-	}
-}
-
-#[cfg(amd)]
-struct HsaExecutable {
-	handle: u64,
-	destroy: unsafe extern "C" fn(u64) -> i32,
-}
-
-#[cfg(amd)]
-impl Drop for HsaExecutable {
-	fn drop(&mut self) {
-		if self.handle != 0 {
-			unsafe { (self.destroy)(self.handle) };
-		}
-	}
-}
-
-#[cfg(amd)]
 struct NativeHsaProgram {
-	executable: HsaExecutable,
+	image: KfdImage,
 	step: Option<Dispatch>,
 	kernarg: usize,
 	kernarg_size: usize,
-	/// The grid barrier's words, in device memory: ockl's grid sync promises
-	/// its atomics coarse-grained memory (`!amdgpu.no.fine.grained.memory`),
-	/// and on the fine-grained KERNARG pool they released workgroups early.
-	grid_sync: usize,
-	free: unsafe extern "C" fn(Ptr) -> i32,
-	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32,
 }
 
 #[cfg(amd)]
 const HSA_IMPLICIT_ARGUMENT_ALIGNMENT: usize = 8;
 #[cfg(amd)]
 const HSA_IMPLICIT_ARGUMENT_BYTES: usize = 256;
-#[cfg(amd)]
-const HSA_MULTIGRID_SYNC_POINTER_OFFSET: usize = 88;
-#[cfg(amd)]
-const HSA_GRID_SYNC_ALIGNMENT: usize = 8;
-#[cfg(amd)]
-const HSA_GRID_SYNC_BYTES: usize = 48;
-#[cfg(amd)]
-const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 
 #[cfg(nvidia)]
 struct NativeCudaProgram {
@@ -22435,10 +22384,7 @@ struct NativeProgram {
 impl Drop for NativeHsaProgram {
 	fn drop(&mut self) {
 		if self.kernarg != 0 {
-			unsafe { (self.free)(self.kernarg as Ptr) };
-		}
-		if self.grid_sync != 0 {
-			unsafe { (self.free)(self.grid_sync as Ptr) };
+			let _ = self.image.device.free(self.kernarg as u64);
 		}
 	}
 }
@@ -22520,40 +22466,458 @@ impl Kernel {
 	}
 }
 #[cfg(amd)]
+#[repr(C)]
+#[derive(Default)]
+struct KfdMemoryArgs {
+	address: u64,
+	size: u64,
+	handle: u64,
+	mmap_offset: u64,
+	gpu_id: u32,
+	flags: u32,
+}
+#[cfg(amd)]
+#[repr(C)]
+struct KfdMapArgs {
+	handle: u64,
+	devices: u64,
+	count: u32,
+	success: u32,
+}
+#[cfg(amd)]
+const _: [(); 40] = [(); size_of::<KfdMemoryArgs>()];
+#[cfg(amd)]
+const _: [(); 24] = [(); size_of::<KfdMapArgs>()];
+#[cfg(amd)]
+struct KfdAllocation {
+	address: usize,
+	bytes: usize,
+	handle: u64,
+	gpu_mapped: bool,
+}
+#[cfg(amd)]
+struct KfdDevice {
+	kfd: fs::File,
+	drm: fs::File,
+	gpu_id: u32,
+	allocations: Mutex<std::collections::BTreeMap<usize, KfdAllocation>>,
+	retain_after_failure: std::sync::atomic::AtomicBool,
+}
+#[cfg(amd)]
+impl KfdDevice {
+	fn call<T>(&self, number: u32, arguments: &mut T) -> Result<()> {
+		use std::os::fd::AsRawFd;
+		let bytes = size_of::<T>();
+		require(bytes < 16384, "KFD ioctl argument is too large")?;
+		let direction = match number { 0x09 | 0x15 | 0x17 => 1_usize, 0x01 => 2, _ => 3 };
+		let request = (direction << 30) | (bytes << 16) | (usize::from(b'K') << 8) | number as usize;
+		unsafe extern "C" { fn ioctl(descriptor: i32, request: usize, ...) -> i32; }
+		let status = unsafe { ioctl(self.kfd.as_raw_fd(), request, arguments as *mut T) };
+		require(status == 0, format!("KFD ioctl {number:#x}: {}", std::io::Error::last_os_error()))
+	}
+	fn open(gpu_id: u32, render_minor: u32) -> Result<Self> {
+		use std::os::fd::AsRawFd;
+		let open = |path: &Path| fs::OpenOptions::new().read(true).write(true).open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())));
+		let kfd = open(Path::new("/dev/kfd"))?;
+		let drm = open(Path::new(&format!("/dev/dri/renderD{render_minor}")))?;
+		let device = Self { kfd, drm, gpu_id, allocations: Mutex::new(std::collections::BTreeMap::new()), retain_after_failure: std::sync::atomic::AtomicBool::new(false) };
+		device.call(0x15, &mut [device.drm.as_raw_fd() as u32, gpu_id])?;
+		Ok(device)
+	}
+	fn allocate(&self, bytes: usize, executable: bool) -> Result<u64> {
+		self.allocate_flags(bytes, executable, false)
+	}
+	fn allocate_flags(&self, bytes: usize, executable: bool, uncached: bool) -> Result<u64> {
+		use std::os::fd::AsRawFd;
+		let bytes = bytes.max(1).checked_add(4095).map(|value| value & !4095).ok_or_else(|| RecipeError::new("KFD allocation size overflows"))?;
+		let address = unsafe { mmap(ptr::null_mut(), bytes, 0, 0x22, -1, 0) };
+		require(address as isize != -1, format!("KFD address reservation: {}", std::io::Error::last_os_error()))?;
+		let mut allocation = KfdMemoryArgs { address: address as u64, size: bytes as u64, gpu_id: self.gpu_id, flags: (1 << 1) | (1 << 31) | (1 << 29) | (1 << 26) | if executable { 1 << 30 } else { 0 } | if uncached { 1 << 25 } else { 0 }, ..Default::default() };
+		if let Err(error) = self.call(0x16, &mut allocation) {
+			unsafe { munmap(address, bytes); }
+			return Err(error);
+		}
+		let mapped = unsafe { mmap(address, bytes, 3, 0x11, self.drm.as_raw_fd(), allocation.mmap_offset as i64) };
+		if mapped != address {
+			let _ = self.call(0x17, &mut allocation.handle);
+			unsafe { munmap(address, bytes); }
+			return Err(RecipeError::new(format!("KFD CPU mapping: {}", std::io::Error::last_os_error())));
+		}
+		let mut mapping = KfdMapArgs { handle: allocation.handle, devices: (&self.gpu_id as *const u32) as u64, count: 1, success: 0 };
+		if let Err(error) = self.call(0x18, &mut mapping).and_then(|_| require(mapping.success == 1, "KFD mapping did not map the selected device")) {
+			if mapping.success != 0 { mapping.success = 0; let _ = self.call(0x19, &mut mapping); }
+			let _ = self.call(0x17, &mut allocation.handle);
+			unsafe { munmap(address, bytes); }
+			return Err(error);
+		}
+		self.allocations.lock().map_err(|_| RecipeError::new("KFD allocation registry is poisoned"))?.insert(address as usize, KfdAllocation { address: address as usize, bytes, handle: allocation.handle, gpu_mapped: true });
+		trace(&format!("allocate {bytes} GPU-visible GTT bytes with KFD gpu_id={}", self.gpu_id))?;
+		Ok(address as u64)
+	}
+	fn free(&self, address: u64) -> Result<()> {
+		require(!self.retain_after_failure.load(Ordering::Acquire), "KFD allocations remain owned after an uncompleted dispatch")?;
+		let mut allocations = self.allocations.lock().map_err(|_| RecipeError::new("KFD allocation registry is poisoned"))?;
+		let allocation = allocations.get_mut(&(address as usize)).ok_or_else(|| RecipeError::new("KFD allocation is not owned by this device"))?;
+		if allocation.gpu_mapped {
+			let mut mapping = KfdMapArgs { handle: allocation.handle, devices: (&self.gpu_id as *const u32) as u64, count: 1, success: 0 };
+			self.call(0x19, &mut mapping)?;
+			require(mapping.success == 1, "KFD unmapping did not release the selected device")?;
+			allocation.gpu_mapped = false;
+		}
+		if allocation.handle != 0 {
+			self.call(0x17, &mut allocation.handle)?;
+			allocation.handle = 0;
+		}
+		let unmapped = unsafe { munmap(allocation.address as Ptr, allocation.bytes) };
+		require(unmapped == 0, format!("KFD CPU unmap: {}", std::io::Error::last_os_error()))?;
+		allocations.remove(&(address as usize));
+		Ok(())
+	}
+	fn contains(&self, address: usize, bytes: usize) -> Result<bool> {
+		let allocations = self.allocations.lock().map_err(|_| RecipeError::new("KFD allocation registry is poisoned"))?;
+		Ok(allocations.range(..=address).next_back().is_some_and(|(_, allocation)| allocation.gpu_mapped && allocation.handle != 0 && address.checked_add(bytes).is_some_and(|end| end <= allocation.address + allocation.bytes)))
+	}
+	fn copy(&self, destination: usize, source: usize, bytes: usize) -> Result<()> {
+		require(self.contains(destination, bytes)? || self.contains(source, bytes)?, "KFD transfer has no owned GPU mapping")?;
+		unsafe { ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, bytes); }
+		std::sync::atomic::fence(Ordering::SeqCst);
+		Ok(())
+	}
+}
+
+#[cfg(amd)]
+struct KfdImage {
+	device: std::sync::Arc<KfdDevice>,
+	address: u64,
+	base: u64,
+	bytes: usize,
+	symbols: std::collections::BTreeMap<String, u64>,
+}
+#[cfg(amd)]
+impl Drop for KfdImage {
+	fn drop(&mut self) { let _ = self.device.free(self.address); }
+}
+#[cfg(amd)]
+impl KfdImage {
+	fn load(device: std::sync::Arc<KfdDevice>, image: &[u8]) -> Result<Self> {
+		let word = |offset: usize, count: usize| -> Result<u64> {
+			let slice = image.get(offset..offset.checked_add(count).ok_or_else(|| RecipeError::new("AMD ELF offset overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF word is truncated"))?;
+			let mut bytes = [0; 8]; bytes[..count].copy_from_slice(slice); Ok(u64::from_le_bytes(bytes))
+		};
+		require(image.get(..6) == Some(b"\x7fELF\x02\x01"), "AMD code object must be little-endian ELF64")?;
+		require(word(16, 2)? == 3 && word(18, 2)? == 224, "AMD code object must be an AMDGPU shared image")?;
+		let (programs, program_size, program_count) = (word(32, 8)? as usize, word(54, 2)? as usize, word(56, 2)? as usize);
+		require(program_size >= 56, "AMD ELF program header is too short")?;
+		let mut segments = Vec::new();
+		let (mut minimum, mut maximum) = (u64::MAX, 0_u64);
+		for index in 0..program_count {
+			let at = programs.checked_add(index.checked_mul(program_size).ok_or_else(|| RecipeError::new("AMD ELF program index overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF program offset overflows"))?;
+			if word(at, 4)? != 1 { continue; }
+			let (offset, address, file_bytes, memory_bytes) = (word(at + 8, 8)?, word(at + 16, 8)?, word(at + 32, 8)?, word(at + 40, 8)?);
+			require(file_bytes <= memory_bytes, "AMD ELF segment exceeds its memory extent")?;
+			minimum = minimum.min(address & !4095);
+			maximum = maximum.max(address.checked_add(memory_bytes).ok_or_else(|| RecipeError::new("AMD ELF segment address overflows"))?);
+			segments.push((offset, address, file_bytes));
+		}
+		require(!segments.is_empty() && maximum > minimum, "AMD ELF has no loadable image")?;
+		let bytes = usize::try_from(maximum - minimum).map_err(|_| RecipeError::new("AMD ELF image exceeds machine address space"))?;
+		let address = device.allocate(bytes, true)?;
+		let mut loaded = Self { device, address, base: address.wrapping_sub(minimum), bytes, symbols: std::collections::BTreeMap::new() };
+		unsafe { ptr::write_bytes(address as *mut u8, 0, bytes); }
+		for (offset, target, length) in segments {
+			let offset = usize::try_from(offset).map_err(|_| RecipeError::new("AMD ELF file offset exceeds machine address space"))?;
+			let length = usize::try_from(length).map_err(|_| RecipeError::new("AMD ELF segment size exceeds machine address space"))?;
+			let source = image.get(offset..offset.checked_add(length).ok_or_else(|| RecipeError::new("AMD ELF segment file extent overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF segment payload is truncated"))?;
+			loaded.device.copy((loaded.base + target) as usize, source.as_ptr() as usize, length)?;
+		}
+		let (sections, section_size, section_count) = (word(40, 8)? as usize, word(58, 2)? as usize, word(60, 2)? as usize);
+		require(section_size >= 64, "AMD ELF section header is too short")?;
+		let section_at = |index: usize| -> Result<usize> { require(index < section_count, "AMD ELF section index is invalid")?; sections.checked_add(index.checked_mul(section_size).ok_or_else(|| RecipeError::new("AMD ELF section index overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF section offset overflows")) };
+		for index in 0..section_count {
+			let at = section_at(index)?;
+			if !matches!(word(at + 4, 4)?, 2 | 11) { continue; }
+			let strings = section_at(word(at + 40, 4)? as usize)?;
+			let (strings_offset, strings_bytes) = (word(strings + 24, 8)? as usize, word(strings + 32, 8)? as usize);
+			let strings = image.get(strings_offset..strings_offset.checked_add(strings_bytes).ok_or_else(|| RecipeError::new("AMD ELF string extent overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF strings are truncated"))?;
+			let (offset, length, entry) = (word(at + 24, 8)? as usize, word(at + 32, 8)? as usize, word(at + 56, 8)? as usize);
+			require(entry >= 24 && length % entry == 0, "AMD ELF symbol table is malformed")?;
+			for symbol in 0..length / entry {
+				let symbol = offset.checked_add(symbol.checked_mul(entry).ok_or_else(|| RecipeError::new("AMD ELF symbol index overflows"))?).ok_or_else(|| RecipeError::new("AMD ELF symbol offset overflows"))?;
+				if word(symbol + 6, 2)? == 0 { continue; }
+				let name_offset = word(symbol, 4)? as usize;
+				let tail = strings.get(name_offset..).ok_or_else(|| RecipeError::new("AMD ELF symbol name is invalid"))?;
+				let end = tail.iter().position(|byte| *byte == 0).ok_or_else(|| RecipeError::new("AMD ELF symbol name is unterminated"))?;
+				let name = std::str::from_utf8(&tail[..end]).map_err(|_| RecipeError::new("AMD ELF symbol name is not UTF-8"))?;
+				let value = word(symbol + 8, 8)?;
+				if value >= minimum && value < maximum { loaded.symbols.insert(name.to_owned(), loaded.base + value); }
+			}
+		}
+		for index in 0..section_count {
+			let at = section_at(index)?;
+			if word(at + 4, 4)? != 4 { continue; }
+			let (offset, length, entry) = (word(at + 24, 8)? as usize, word(at + 32, 8)? as usize, word(at + 56, 8)? as usize);
+			require(entry == 24 && length % entry == 0, "AMD ELF relocation table is malformed")?;
+			for relocation in 0..length / entry {
+				let at = offset + relocation * entry;
+				let (target, info, addend) = (word(at, 8)?, word(at + 8, 8)?, word(at + 16, 8)?);
+				require(info as u32 == 13 && info >> 32 == 0, format!("AMD ELF relocation {} requires an unresolved symbol", info as u32))?;
+				require(target >= minimum && target.checked_add(8).is_some_and(|end| end <= maximum), "AMD ELF relocation target is outside the image")?;
+				unsafe { ((loaded.base + target) as *mut u64).write_unaligned(loaded.base.wrapping_add(addend)); }
+			}
+		}
+		std::sync::atomic::fence(Ordering::SeqCst);
+		Ok(loaded)
+	}
+	fn kernel(&self, name: &str, element: u8, layout: &'static [u8]) -> Result<Kernel> {
+		let object = *self.symbols.get(&format!("{name}.kd")).ok_or_else(|| RecipeError::new(format!("AMD kernel descriptor {name} is absent")))?;
+		require(object >= self.address && object.checked_add(64).is_some_and(|end| end <= self.address + self.bytes as u64), "AMD kernel descriptor is outside its image")?;
+		let descriptor = unsafe { std::slice::from_raw_parts(object as *const u8, 64) };
+		let field = |offset| u32::from_le_bytes(descriptor[offset..offset + 4].try_into().unwrap());
+		Ok(Kernel { object, shared: field(0), private: field(4), kernarg: field(8) as usize, element, layout })
+	}
+}
+
+#[cfg(amd)]
 #[allow(dead_code)]
 struct Hsa {
-	_runtime: std::sync::Arc<Library>,
-	reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32,
-	reader_destroy: unsafe extern "C" fn(u64) -> i32,
-	executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32,
-	executable_destroy: unsafe extern "C" fn(u64) -> i32,
-	executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32,
-	executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32,
-	symbol: HsaSymbol,
-	symbol_info: HsaSymbolInfo,
-	info: HsaInfo,
-	allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32,
-	free: unsafe extern "C" fn(Ptr) -> i32,
-	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
-	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32,
-	clear: unsafe extern "C" fn(Ptr, u32, usize) -> i32,
-	store: unsafe extern "C" fn(u64, i64),
-	wait: unsafe extern "C" fn(u64, i32, i64, u64, i32) -> i64,
-	write: unsafe extern "C" fn(*const HsaQueue, u64) -> u64,
-	queue: Ptr,
+	device: std::sync::Arc<KfdDevice>,
+	ring: u64,
+	control: u64,
+	eop: u64,
+	cwsr: u64,
+	scratch: u64,
+	doorbell_mapping: usize,
+	doorbell: usize,
+	queue_id: u32,
+	event_id: u32,
+	event_page: u64,
 	signal: u64,
-	cpu_agent: u64,
-	vram_pool: u64,
-	kernarg_pool: u64,
-	agent: u64,
+	write_index: std::sync::atomic::AtomicU64,
+	pending: std::sync::atomic::AtomicBool,
+	poisoned: std::sync::atomic::AtomicBool,
+	domain: u32,
+	bdf: u32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
 	lds: u32,
 	simd_per_cu: u32,
 	waves_per_simd: u32,
+	shader_engines: u32,
+	scratch_waves_per_cu: u32,
 	vgprs_per_simd: u32,
 	vgpr_granule: u32,
+}
+
+#[cfg(amd)]
+#[repr(C)]
+#[derive(Default)]
+struct KfdQueueArgs {
+	ring: u64,
+	write: u64,
+	read: u64,
+	doorbell: u64,
+	bytes: u32,
+	gpu_id: u32,
+	kind: u32,
+	percentage: u32,
+	priority: u32,
+	id: u32,
+	eop: u64,
+	eop_bytes: u64,
+	cwsr: u64,
+	cwsr_bytes: u32,
+	control_stack_bytes: u32,
+	sdma_engine: u32,
+	metadata_ring_bytes: u32,
+}
+#[cfg(amd)]
+#[repr(C)]
+#[derive(Default)]
+struct KfdEventArgs {
+	page: u64,
+	trigger: u32,
+	kind: u32,
+	auto_reset: u32,
+	node: u32,
+	id: u32,
+	slot: u32,
+}
+#[cfg(amd)]
+#[repr(C)]
+#[derive(Default)]
+struct KfdWaitArgs {
+	events: u64,
+	count: u32,
+	all: u32,
+	milliseconds: u32,
+	result: u32,
+}
+#[cfg(amd)]
+const _: [(); 96] = [(); size_of::<KfdQueueArgs>()];
+#[cfg(amd)]
+const _: [(); 32] = [(); size_of::<KfdEventArgs>()];
+#[cfg(amd)]
+const _: [(); 24] = [(); size_of::<KfdWaitArgs>()];
+#[cfg(amd)]
+impl Hsa {
+	fn create(device: std::sync::Arc<KfdDevice>, properties: &str, domain: u32, bdf: u32, gfx: u32) -> Result<Self> {
+		let simd_per_cu = kfd_property(properties, "simd_per_cu")?;
+		let simds = kfd_property(properties, "simd_count")?;
+		let arrays_per_engine = kfd_property(properties, "simd_arrays_per_engine")?;
+		let arrays = kfd_property(properties, "array_count")?;
+		require(simd_per_cu != 0 && simds != 0 && simds % simd_per_cu == 0, "AMD compute-unit topology is invalid")?;
+		require(arrays_per_engine != 0 && arrays != 0 && arrays % arrays_per_engine == 0, "AMD shader-engine topology is invalid")?;
+		let scratch_waves_per_cu = kfd_property(properties, "max_slots_scratch_cu")?;
+		require(scratch_waves_per_cu != 0, "AMD scratch wave capacity is absent")?;
+		let mut driver = Self {
+			device, ring: 0, control: 0, eop: 0, cwsr: 0, scratch: 0, doorbell_mapping: 0, doorbell: 0,
+			queue_id: u32::MAX, event_id: u32::MAX, event_page: 0, signal: 0,
+			write_index: std::sync::atomic::AtomicU64::new(0), pending: std::sync::atomic::AtomicBool::new(false), poisoned: std::sync::atomic::AtomicBool::new(false), domain, bdf,
+			cus: simds / simd_per_cu,
+			wave: kfd_property(properties, "wave_front_size")?, workgroup: 1024,
+			lds: kfd_property(properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?,
+			simd_per_cu, waves_per_simd: kfd_property(properties, "max_waves_per_simd")?,
+			shader_engines: arrays / arrays_per_engine, scratch_waves_per_cu,
+			vgprs_per_simd: if gfx >= 110000 { 1536 } else if gfx >= 100000 { 1024 } else { 256 },
+			vgpr_granule: if gfx >= 110000 { 24 } else if gfx >= 100000 { 16 } else { 4 },
+		};
+		require(driver.cus != 0 && driver.wave == 32, "direct AMD queue requires a validated wave32 device")?;
+		driver.ring = driver.device.allocate_flags(16384, true, true)?;
+		for index in 0..256 { unsafe { (driver.ring as *mut HsaPacket).add(index).write(HsaPacket { header: 1, setup: 0, workgroup_x: 0, workgroup_y: 0, workgroup_z: 0, reserved0: 0, grid_x: 0, grid_y: 0, grid_z: 0, private: 0, group: 0, object: 0, kernarg: ptr::null_mut(), reserved1: 0, completion: 0 }); } }
+		driver.control = driver.device.allocate_flags(4096, false, true)?;
+		driver.eop = driver.device.allocate(4096, false)?;
+		let cwsr_bytes = kfd_property(properties, "cwsr_size")?;
+		let waves = driver.cus.checked_mul(driver.simd_per_cu).and_then(|value| value.checked_mul(driver.waves_per_simd)).ok_or_else(|| RecipeError::new("AMD saved-wave count overflows"))?;
+		let debug_bytes = waves.checked_mul(32).and_then(|value| value.checked_add(63)).map(|value| value & !63).ok_or_else(|| RecipeError::new("AMD debug save extent overflows"))?;
+		let save_bytes = cwsr_bytes.checked_add(debug_bytes).ok_or_else(|| RecipeError::new("AMD context save extent overflows"))?;
+		driver.cwsr = driver.device.allocate(save_bytes as usize, false)?;
+		driver.scratch = driver.device.allocate(64 * 1024 * 1024, false)?;
+		for (address, bytes) in [(driver.control, 4096), (driver.eop, 4096), (driver.cwsr, save_bytes as usize)] { unsafe { ptr::write_bytes(address as *mut u8, 0, bytes); } }
+		unsafe {
+			((driver.cwsr + 16) as *mut u32).write(cwsr_bytes);
+			((driver.cwsr + 20) as *mut u32).write(debug_bytes);
+		}
+		driver.device.call(0x11, &mut [driver.scratch, u64::from(driver.device.gpu_id)])?;
+		driver.event_page = driver.device.allocate(32768, false)?;
+		let event_handle = driver.device.allocations.lock().map_err(|_| RecipeError::new("KFD allocation registry is poisoned"))?.get(&(driver.event_page as usize)).ok_or_else(|| RecipeError::new("KFD event page allocation is absent"))?.handle;
+		let mut event = KfdEventArgs { page: event_handle, auto_reset: 1, ..Default::default() };
+		driver.device.call(0x08, &mut event)?;
+		driver.event_id = event.id;
+		require(event.slot < 4096, "KFD event slot is outside its page")?;
+		driver.signal = driver.device.allocate_flags(64, false, true)?;
+		let words = [1_u64, 0, driver.event_page + u64::from(event.slot) * 8, u64::from(event.id), 0, 0, 0, 0];
+		unsafe { ptr::copy_nonoverlapping(words.as_ptr(), driver.signal as *mut u64, words.len()); }
+		unsafe {
+			(driver.control as *mut HsaQueue).write(HsaQueue { kind: 1, features: 1, base: driver.ring as Ptr, doorbell: 0, size: 256, reserved: 0, id: 0 });
+			((driver.control + 136) as *mut u32).write(128);
+			((driver.control + 72) as *mut u32).write(driver.cus);
+			((driver.control + 76) as *mut u32).write(driver.waves_per_simd * driver.simd_per_cu);
+			((driver.control + 192) as *mut u64).write(driver.signal);
+		}
+		#[cfg(target_arch = "x86_64")]
+		unsafe { std::arch::asm!("sfence", options(nostack, preserves_flags)); }
+		let mut queue = KfdQueueArgs { ring: driver.ring, write: driver.control + 56, read: driver.control + 128, bytes: 16384, gpu_id: driver.device.gpu_id, kind: 2, percentage: 5, priority: 0, eop: driver.eop, eop_bytes: 4096, cwsr: driver.cwsr, cwsr_bytes, control_stack_bytes: kfd_property(properties, "ctl_stack_size")?, ..Default::default() };
+		trace(&format!("KFD queue args bytes={} gpu_id={} ring={:#x} cwsr={} control_stack={}", size_of::<KfdQueueArgs>(), queue.gpu_id, queue.ring, queue.cwsr_bytes, queue.control_stack_bytes))?;
+		driver.device.call(0x02, &mut queue)?;
+		driver.queue_id = queue.id;
+		use std::os::fd::AsRawFd;
+		let page = queue.doorbell & !8191;
+		let mapping = unsafe { mmap(ptr::null_mut(), 8192, 3, 1, driver.device.kfd.as_raw_fd(), page as i64) };
+		require(mapping as isize != -1, format!("KFD doorbell mapping: {}", std::io::Error::last_os_error()))?;
+		driver.doorbell_mapping = mapping as usize;
+		driver.doorbell = mapping as usize + (queue.doorbell & 8191) as usize;
+		Ok(driver)
+	}
+	fn synchronize(&self) -> Result<()> {
+		require(!self.poisoned.load(Ordering::Acquire), "AMD queue is unavailable after a failed dispatch")?;
+		if !self.pending.load(Ordering::Acquire) { return require(!self.poisoned.load(Ordering::Acquire), "AMD queue is unavailable after a failed dispatch"); }
+		let mut event = [0_u64; 6]; event[5] = u64::from(self.event_id);
+		let mut wait = KfdWaitArgs { events: event.as_mut_ptr() as u64, count: 1, all: 1, milliseconds: 10000, result: 2 };
+		let signal = unsafe { &*((self.signal + 8) as *const std::sync::atomic::AtomicI64) };
+		let result = self.device.call(0x0c, &mut wait)
+			.and_then(|_| require(wait.result == 0, format!("AMD dispatch event wait returned {}", wait.result)))
+			.and_then(|_| require(signal.load(Ordering::Acquire) == 0, "AMD dispatch event arrived before completion"));
+		if let Err(error) = result {
+			self.poisoned.store(true, Ordering::Release);
+			self.device.retain_after_failure.store(true, Ordering::Release);
+			if tracing() {
+				let read = unsafe { ptr::read_volatile((self.control + 128) as *const u64) };
+				let write = unsafe { ptr::read_volatile((self.control + 56) as *const u64) };
+				let signal = unsafe { ptr::read_volatile((self.signal + 8) as *const i64) };
+				let header = unsafe { ptr::read_volatile(self.ring as *const u16) };
+				let _ = trace(&format!("AMD dispatch failure snapshot queue={} read={read} write={write} completion={signal} event={} header={header:#x}", self.queue_id, self.event_id));
+			}
+			match self.device.call(0x03, &mut [self.queue_id, 0_u32]) {
+				Ok(()) => { self.pending.store(false, Ordering::Release); let _ = trace("AMD owned queue destroy returned success after dispatch failure; allocations remain retained"); }
+				Err(cleanup) => { let _ = trace(&format!("AMD owned queue destroy failed: {cleanup}; dispatch and allocation ownership remain unresolved")); }
+			}
+			return Err(error);
+		}
+		std::sync::atomic::fence(Ordering::Acquire);
+		self.pending.store(false, Ordering::Release);
+		Ok(())
+	}
+	unsafe fn submit(&self, mut packet: HsaPacket) -> Result<()> {
+		self.synchronize()?;
+		let private = packet.private.checked_add(31).map(|bytes| bytes & !31).ok_or_else(|| RecipeError::new("AMD private lane size overflows"))?;
+		if private != 0 {
+			let wave_bytes = private.checked_mul(self.wave).ok_or_else(|| RecipeError::new("AMD scratch wave size overflows"))?;
+			let wave_units = wave_bytes.div_ceil(256);
+			require(wave_units <= 0x7fff, "AMD scratch wave exceeds the register field")?;
+			let max_waves = self.cus.checked_mul(self.scratch_waves_per_cu).ok_or_else(|| RecipeError::new("AMD scratch wave capacity overflows"))?;
+			let waves = ((64 * 1024 * 1024) / (wave_units * 256) / self.shader_engines).min(max_waves);
+			require(waves != 0 && waves <= 0xfff, "AMD scratch wave count is invalid")?;
+			unsafe {
+				((self.control + 140) as *mut u32).write(waves | wave_units << 12);
+				((self.control + 144) as *mut u32).write(self.scratch as u32);
+				((self.control + 148) as *mut u32).write((self.scratch >> 32) as u32 & 0xffff | 1 << 30);
+				((self.control + 152) as *mut u32).write(64 * 1024 * 1024);
+				((self.control + 156) as *mut u32).write(4 | 5 << 3 | 6 << 6 | 7 << 9 | 0x14 << 12 | 1 << 23 | 2 << 28);
+				((self.control + 160) as *mut u64).write(self.scratch);
+				((self.control + 176) as *mut u32).write(private / 2);
+			}
+		} else { unsafe { ((self.control + 140) as *mut u32).write(0); } }
+		let index = self.write_index.fetch_add(1, Ordering::AcqRel);
+		let slot = (index as usize & 255) as usize;
+		let destination = unsafe { (self.ring as *mut HsaPacket).add(slot) };
+		let signal = unsafe { &*((self.signal + 8) as *const std::sync::atomic::AtomicI64) };
+		signal.store(1, Ordering::Release);
+		packet.header = 1; packet.completion = self.signal;
+		unsafe { destination.write(packet); }
+		std::sync::atomic::fence(Ordering::Release);
+		unsafe { (&*((&mut (*destination).header as *mut u16).cast::<std::sync::atomic::AtomicU16>())).store(2 | 2 << 9 | 2 << 11, Ordering::Release); }
+		unsafe { (&*((self.control + 56) as *const std::sync::atomic::AtomicU64)).store(index + 1, Ordering::Release); }
+		self.pending.store(true, Ordering::Release);
+		#[cfg(target_arch = "x86_64")]
+		unsafe { std::arch::asm!("sfence", options(nostack, preserves_flags)); }
+		#[cfg(not(target_arch = "x86_64"))]
+		std::sync::atomic::fence(Ordering::SeqCst);
+		unsafe { ptr::write_volatile(self.doorbell as *mut u64, index); }
+		#[cfg(target_arch = "x86_64")]
+		unsafe { std::arch::asm!("sfence", options(nostack, preserves_flags)); }
+		trace(&format!("AMD AQL dispatch submitted queue={} packet={index} grid={} workgroup={}", self.queue_id, packet.grid_x, packet.workgroup_x))?;
+		self.synchronize()?;
+		trace("AMD AQL dispatch completed")
+	}
+}
+#[cfg(amd)]
+impl Drop for Hsa {
+	fn drop(&mut self) {
+		if self.poisoned.load(Ordering::Acquire) { return; }
+		if self.pending.load(Ordering::Acquire) { self.device.retain_after_failure.store(true, Ordering::Release); }
+		if self.queue_id != u32::MAX {
+			if let Err(error) = self.device.call(0x03, &mut [self.queue_id, 0_u32]) {
+				self.device.retain_after_failure.store(true, Ordering::Release);
+				let _ = trace(&format!("AMD owned queue destroy failed during release: {error}; allocations remain retained"));
+				return;
+			}
+		}
+		if self.device.retain_after_failure.load(Ordering::Acquire) { return; }
+		if self.doorbell_mapping != 0 { unsafe { munmap(self.doorbell_mapping as Ptr, 8192); } }
+		if self.event_id != u32::MAX { let _ = self.device.call(0x09, &mut [self.event_id, 0_u32]); }
+		for address in [self.signal, self.event_page, self.scratch, self.cwsr, self.eop, self.control, self.ring] { if address != 0 { let _ = self.device.free(address); } }
+	}
 }
 const REMOTE_ALLOCATE: u8 = 1;
 const REMOTE_FREE: u8 = 2;
@@ -22677,6 +23041,7 @@ struct HsaQueue {
 }
 #[cfg(amd)]
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct HsaPacket {
 	header: u16,
 	setup: u16,
@@ -22694,6 +23059,8 @@ struct HsaPacket {
 	reserved1: u64,
 	completion: u64,
 }
+#[cfg(amd)]
+const _: [(); 64] = [(); size_of::<HsaPacket>()];
 #[cfg(nvidia)]
 type NvQuery = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
 struct Library(usize);
@@ -22972,17 +23339,7 @@ impl Gpu {
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
-					let mut pointer = ptr::null_mut();
-					let status = (driver.allocate)(driver.vram_pool, bytes, 0, &mut pointer);
-					if status == 4104 && std::env::var("RECIPE_HOST_SPILL").as_deref() == Ok("1") {
-						self.status((driver.allocate)(driver.kernarg_pool, bytes, 0, &mut pointer), "system memory allocation")?;
-						self.status((driver.allow)(1, &driver.agent, ptr::null(), pointer), "GPU system memory access")?;
-						trace(&format!("GPU allocation uses {} MiB of machine memory", bytes.div_ceil(1024 * 1024)))?;
-					} else {
-						self.status(status, "allocation")?;
-					}
-					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
-					Ok(pointer as u64)
+					driver.device.allocate(bytes, false)
 				}
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
@@ -23011,7 +23368,7 @@ impl Gpu {
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
-					(driver.free)(pointer as Ptr);
+					let _ = driver.device.free(pointer);
 				}
 				Driver::Remote(remote) => {
 					if let Ok(mut channel) = remote.channel.lock() {
@@ -23035,7 +23392,7 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
-				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
+				Driver::Hsa(driver) => driver.device.copy(dst as usize, src as usize, bytes).map(|_| dst),
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
 					channel.write_u8(REMOTE_UPLOAD)?;
@@ -23063,13 +23420,9 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.clear)(pointer, 0, bytes), "clear"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
-					let words = bytes / size_of::<u32>();
-					self.status((driver.clear)(pointer as Ptr, 0, words), "clear")?;
-					let tail = bytes - words * size_of::<u32>();
-					if tail != 0 {
-						let zero = [0_u8; size_of::<u32>() - 1];
-						self.status((driver.copy)((pointer as usize + words * size_of::<u32>()) as Ptr, zero.as_ptr().cast(), tail), "clear")?;
-					}
+					require(driver.device.contains(pointer as usize, bytes)?, "AMD clear is outside an owned allocation")?;
+					ptr::write_bytes(pointer as *mut u8, 0, bytes);
+					std::sync::atomic::fence(Ordering::SeqCst);
 					Ok(())
 				}
 				Driver::Remote(remote) => {
@@ -23096,7 +23449,7 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
-				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
+				Driver::Hsa(driver) => driver.device.copy(dst as usize, src as usize, bytes),
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
 					channel.write_u8(REMOTE_DOWNLOAD)?;
@@ -23127,21 +23480,8 @@ impl Gpu {
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
-					// HSA_AMD_AGENT_INFO_MEMORY_AVAIL counts what the runtime may still
-					// take, not what a compositor and other processes already hold: on
-					// the desktop card it said 11.8 GB free with 2.4 GB in use. The DRM
-					// counters of the same device (matched by its bus address,
-					// HSA_AMD_AGENT_INFO_BDFID) bound it.
-					let mut free = 0_u64;
-					self.status((driver.info)(driver.agent, 0xA015, (&mut free as *mut u64).cast()), "free memory")?;
-					let (mut bdf, mut domain) = (0_u32, 0_u32);
-					if (driver.info)(driver.agent, 0xA006, (&mut bdf as *mut u32).cast()) == 0
-						&& (driver.info)(driver.agent, 0xA00F, (&mut domain as *mut u32).cast()) == 0
-						&& let Some(drm_free) = amd_drm_free_bytes(domain, bdf)
-					{
-						free = free.min(drm_free);
-					}
-					Ok(free)
+					let machine = host_available_bytes().unwrap_or(self.memory);
+					Ok(machine.min(amd_drm_free_bytes(driver.domain, driver.bdf).unwrap_or(self.memory)))
 				}
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
@@ -23162,7 +23502,7 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
-				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
+				Driver::Hsa(driver) => driver.synchronize(),
 				Driver::Remote(remote) => {
 					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
 					channel.write_u8(REMOTE_SYNCHRONIZE)?;
@@ -23262,10 +23602,13 @@ fn devices() -> Result<&'static [&'static Gpu]> {
 			let selection = device_selection()?;
 			let mut found = Vec::new();
 			let mut errors = Vec::new();
-			for load in [load_amd as fn(Option<&[String]>) -> Result<Vec<Gpu>>, load_nvidia] {
+			for (prefix, load) in [("amd", load_amd as fn(Option<&[String]>) -> Result<Vec<Gpu>>), ("nv", load_nvidia)] {
 				match load(selection.as_deref()) {
 					Ok(mut devices) => found.append(&mut devices),
-					Err(error) => errors.push(error.to_string()),
+					Err(error) => {
+						if selection.as_ref().is_some_and(|names| names.iter().any(|name| name.starts_with(prefix))) { return Err(error); }
+						errors.push(error.to_string());
+					}
 				}
 			}
 			let mut found: Vec<&'static Gpu> = found.into_iter().map(|gpu| &*Box::leak(Box::new(gpu))).collect();
@@ -23521,80 +23864,6 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	Ok(gpu)
 }
 #[cfg(amd)]
-type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
-#[cfg(amd)]
-struct HsaQuery {
-	info: HsaInfo,
-	attribute: i32,
-	expected: u32,
-	secondary: i32,
-	mask: u32,
-	found: u64,
-}
-#[cfg(amd)]
-extern "C" fn collect_hsa(handle: u64, pointer: Ptr) -> i32 {
-	unsafe {
-		let query = &mut *pointer.cast::<HsaQuery>();
-		let mut value = 0;
-		let mut status = (query.info)(handle, query.attribute, (&mut value as *mut u32).cast());
-		if status != 0 || value != query.expected {
-			return status;
-		}
-		if query.secondary >= 0 {
-			status = (query.info)(handle, query.secondary, (&mut value as *mut u32).cast());
-			if status != 0 || value & query.mask == 0 {
-				return status;
-			}
-		}
-		if query.found == 0 {
-			query.found = handle;
-		}
-		0
-	}
-}
-#[cfg(amd)]
-struct HsaGpuQuery {
-	info: HsaInfo,
-	found: Vec<u64>,
-}
-#[cfg(amd)]
-extern "C" fn collect_discrete_hsa(handle: u64, pointer: Ptr) -> i32 {
-	unsafe {
-		let query = &mut *pointer.cast::<HsaGpuQuery>();
-		let mut device = 0_u32;
-		let mut status = (query.info)(handle, 17, (&mut device as *mut u32).cast());
-		if status != 0 || device != 1 {
-			return status;
-		}
-		let mut properties = 0_u64;
-		status = (query.info)(handle, 0xA114, (&mut properties as *mut u64).cast());
-		if status != 0 || properties & 1 != 0 {
-			return status;
-		}
-		query.found.push(handle);
-		0
-	}
-}
-#[cfg(amd)]
-type HsaSymbol = unsafe extern "C" fn(u64, *const u8, *const u64, *mut u64) -> i32;
-#[cfg(amd)]
-type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
-#[cfg(amd)]
-unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, agent: u64, name: &std::ffi::CStr, element: u8, layout: &'static [u8]) -> Result<Kernel> {
-	let mut handle = 0;
-	driver_status(Backend::Amd, unsafe { symbol(executable, name.as_ptr().cast(), &agent, &mut handle) }, "kernel lookup")?;
-	let mut kernel = Kernel { object: 0, shared: 0, element, kernarg: 0, private: 0, layout };
-	for (attribute, output) in [
-		(22, (&mut kernel.object as *mut u64).cast()),
-		(11, (&mut kernel.kernarg as *mut usize).cast()),
-		(13, (&mut kernel.shared as *mut u32).cast()),
-		(14, (&mut kernel.private as *mut u32).cast()),
-	] {
-		driver_status(Backend::Amd, unsafe { info(handle, attribute, output) }, "kernel metadata")?;
-	}
-	Ok(kernel)
-}
-#[cfg(amd)]
 fn kfd_property(text: &str, name: &str) -> Result<u32> {
 	text.lines()
 		.find_map(|line| line.split_once(' ').filter(|value| value.0 == name))
@@ -23605,43 +23874,25 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> {
 }
 #[cfg(amd)]
 impl Hsa {
-	unsafe fn native_dispatch(&self, executable: u64, bytes: &[u8], element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
-		unsafe {
-			let vgprs = amd_kernel_vgprs(bytes, name)?;
-			let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
-			let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, element, layout)?;
-			let residency = AmdResidency { vgprs, vgprs_per_simd: self.vgprs_per_simd, vgpr_granule: self.vgpr_granule, waves_per_simd: self.waves_per_simd, simd_per_cu: self.simd_per_cu };
-			let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup }, residency)?;
-			Ok(Dispatch { kernel, geometry })
-		}
+	unsafe fn native_dispatch(&self, image: &KfdImage, bytes: &[u8], element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
+		let vgprs = amd_kernel_vgprs(bytes, name)?;
+		let kernel = image.kernel(name, element, layout)?;
+		let residency = AmdResidency { vgprs, vgprs_per_simd: self.vgprs_per_simd, vgpr_granule: self.vgpr_granule, waves_per_simd: self.waves_per_simd, simd_per_cu: self.simd_per_cu };
+		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup }, residency)?;
+		let scratch_bytes = u64::from(kernel.private).checked_mul(u64::from(self.cus) * u64::from(self.wave) * u64::from(self.waves_per_simd) * u64::from(self.simd_per_cu)).ok_or_else(|| RecipeError::new("AMD scratch requirement overflows"))?;
+		require(scratch_bytes <= 64 * 1024 * 1024, "AMD kernel exceeds the owned scratch allocation")?;
+		Ok(Dispatch { kernel, geometry })
 	}
-
-	unsafe fn load_native(
-		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32,
-	) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
-		unsafe {
-			require(!bytes.is_empty(), "native AMD artifact is empty")?;
-			let mut reader = HsaReader { handle: 0, destroy: self.reader_destroy };
-			let mut executable = HsaExecutable { handle: 0, destroy: self.executable_destroy };
-			driver_status(Backend::Amd, (self.reader_create)(bytes.as_ptr().cast(), bytes.len(), &mut reader.handle), "native code-object reader")?;
-			driver_status(Backend::Amd, (self.executable_create)(1, 0, ptr::null_mut(), &mut executable.handle), "native executable creation")?;
-			driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
-			driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
-			let forward = self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
-			let step = (!training).then(|| self.native_dispatch(executable.handle, bytes, element, step_waves, "recipe_model_step", NATIVE_FORWARD_LAYOUT)).transpose()?;
-			let epoch = training.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
-			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-			let kernarg_size = [Some(forward), step, epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
-			let allocation_size = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT).max(HSA_GRID_SYNC_ALIGNMENT);
-			let mut kernarg = ptr::null_mut();
-			driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, allocation_size, 0, &mut kernarg), "native KERNARG allocation")?;
-			driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), kernarg), "native GPU KERNARG access")?;
-			let mut grid_sync = ptr::null_mut();
-			driver_status(Backend::Amd, (self.allocate)(self.vram_pool, HSA_GRID_SYNC_BYTES, 0, &mut grid_sync), "native grid sync allocation")?;
-			driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), grid_sync), "native GPU grid sync access")?;
-			Ok((NativeHsaProgram { executable, step, kernarg: kernarg as usize, kernarg_size, grid_sync: grid_sync as usize, free: self.free, copy: self.copy }, forward, epoch, model_load))
-		}
+	unsafe fn load_native(&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
+		let image = KfdImage::load(self.device.clone(), bytes)?;
+		let forward = unsafe { self.native_dispatch(&image, bytes, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)? };
+		let step_waves = (self.workgroup.min(512) / self.wave).max(1);
+		let step = if !training && image.symbols.contains_key("recipe_model_step.kd") { Some(unsafe { self.native_dispatch(&image, bytes, element, step_waves, "recipe_model_step", NATIVE_FORWARD_LAYOUT)? }) } else { None };
+		let epoch = if training { Some(unsafe { self.native_dispatch(&image, bytes, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)? }) } else { None };
+		let model_load = if has_storage { Some(unsafe { self.native_dispatch(&image, bytes, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)? }) } else { None };
+		let kernarg_size = [Some(forward), step, epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
+		let kernarg = self.device.allocate(kernarg_size.max(16), false)? as usize;
+		Ok((NativeHsaProgram { image, step, kernarg, kernarg_size }, forward, epoch, model_load))
 	}
 }
 #[cfg(nvidia)]
@@ -23947,89 +24198,29 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
-				require(program.executable.handle != 0, "native AMD executable is absent")?;
+				require(program.image.address != 0, "native AMD image is absent")?;
 				let kernarg = program.kernarg as Ptr;
 				ptr::write_bytes(kernarg.cast::<u8>(), 0, program.kernarg_size);
 				let mut offset = 0_usize;
 				for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
-					let bytes = usize::from(*kind - b'0');
-					offset = offset.next_multiple_of(bytes);
-					ptr::copy_nonoverlapping((*argument).cast::<u8>(), kernarg.cast::<u8>().add(offset), bytes);
-					offset += bytes;
+					let bytes = usize::from(*kind - b'0'); offset = offset.next_multiple_of(bytes);
+					require(offset.checked_add(bytes).is_some_and(|end| end <= program.kernarg_size), "AMD arguments exceed the owned kernarg buffer")?;
+					ptr::copy_nonoverlapping((*argument).cast::<u8>(), kernarg.cast::<u8>().add(offset), bytes); offset += bytes;
 				}
 				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-				// A kernel that reads no hidden argument (the load kernel without a
-				// grid barrier) is described by its explicit bytes alone.
-				let implicit_bytes = if dispatch.kernel.kernarg == offset {
-					0
-				} else {
-					dispatch
-						.kernel
-						.kernarg
-						.checked_sub(implicit)
-						.ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?
-				};
-				require(
-					matches!(implicit_bytes, 0 | HSA_IMPLICIT_ARGUMENT_BYTES) && dispatch.kernel.kernarg <= program.kernarg_size,
-					format!(
-						"native HSA KERNARG layout is invalid: entry={entry:?} metadata={} explicit={offset} implicit={implicit} allocation={} layout={:?}",
-						dispatch.kernel.kernarg, program.kernarg_size, dispatch.kernel.layout
-					),
-				)?;
-				let groups = threads
-					.checked_div(block)
-					.filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX))
-					.ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
-				let grid_sync = program.grid_sync as Ptr;
-				// The words live in device memory; the host writes them whole before
-				// each launch, the group count at its offset.
-				let mut sync_image = [0_u8; HSA_GRID_SYNC_BYTES];
-				let sync_words = |image: &mut [u8; HSA_GRID_SYNC_BYTES], program: &NativeHsaProgram| -> [u32; 2] {
-					let copied = (program.copy)(image.as_mut_ptr().cast(), program.grid_sync as *const c_void, HSA_GRID_SYNC_BYTES);
-					if copied != 0 {
-						return [u32::MAX; 2];
-					}
-					[u32::from_le_bytes([image[0], image[1], image[2], image[3]]), u32::from_le_bytes([image[4], image[5], image[6], image[7]])]
-				};
-				if tracing() {
-					trace(&format!("AMD grid sync before reset {:?}", sync_words(&mut sync_image, program)))?;
+				require(dispatch.kernel.kernarg == offset || dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES, "AMD implicit kernarg layout is unsupported")?;
+				if dispatch.kernel.kernarg > offset {
+					let hidden = kernarg.cast::<u8>().add(implicit);
+					hidden.cast::<u32>().write(threads / block);
+					hidden.add(4).cast::<u32>().write(1); hidden.add(8).cast::<u32>().write(1);
+					hidden.add(12).cast::<u16>().write(block as u16);
+					hidden.add(14).cast::<u16>().write(1); hidden.add(16).cast::<u16>().write(1);
+					hidden.add(64).cast::<u16>().write(1);
+					hidden.add(120).cast::<u32>().write(dynamic);
 				}
-				sync_image = [0_u8; HSA_GRID_SYNC_BYTES];
-				sync_image[HSA_GRID_SYNC_GROUPS_OFFSET..HSA_GRID_SYNC_GROUPS_OFFSET + 4].copy_from_slice(&groups.to_le_bytes());
-				driver_status(Backend::Amd, (program.copy)(grid_sync, sync_image.as_ptr().cast(), HSA_GRID_SYNC_BYTES), "native grid sync reset")?;
-				if implicit_bytes != 0 {
-					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
-				}
-				(driver.store)(driver.signal, 1);
-				let queue = &mut *(driver.queue as *mut HsaQueue);
-				let index = (driver.write)(queue, 1);
-				let packet = queue.base.cast::<HsaPacket>().add(index as usize & (queue.size as usize - 1));
-				packet.write(HsaPacket {
-					header: 1,
-					setup: 1,
-					workgroup_x: block as u16,
-					workgroup_y: 1,
-					workgroup_z: 1,
-					reserved0: 0,
-					grid_x: threads,
-					grid_y: 1,
-					grid_z: 1,
-					private: dispatch.kernel.private,
-					group: _shared,
-					object: dispatch.kernel.object,
-					kernarg,
-					reserved1: 0,
-					completion: driver.signal,
-				});
-				std::sync::atomic::fence(Ordering::Release);
-				let header = &*(&mut (*packet).header as *mut u16 as *mut std::sync::atomic::AtomicU16);
-				header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
-				(driver.store)(queue.doorbell, index as i64);
-				trace("AMD dispatch submitted")?;
-				// Keep the kernel's buffers alive until its completion signal changes.
-				while (driver.wait)(driver.signal, 0, 0, u64::MAX, 1) != 0 {}
-				trace("AMD dispatch completed")?;
-				Ok(())
+				driver.submit(HsaPacket { header: 1, setup: 1, workgroup_x: block as u16, workgroup_y: 1, workgroup_z: 1, reserved0: 0,
+					grid_x: threads, grid_y: 1, grid_z: 1, private: dispatch.kernel.private, group: _shared, object: dispatch.kernel.object,
+					kernarg, reserved1: 0, completion: driver.signal })
 			}
 			#[cfg(nvidia)]
 			(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
@@ -24064,119 +24255,54 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 	}
 }
 
-fn load_amd(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
+fn load_amd(selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
 	#[cfg(amd)]
-	unsafe {
-		let runtime = std::sync::Arc::new(Library::open(env!("RECIPE_HSA_RUNTIME"))?);
-		let init: unsafe extern "C" fn() -> i32 = runtime.function(b"hsa_init\0")?;
-		let iterate: unsafe extern "C" fn(extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 = runtime.function(b"hsa_iterate_agents\0")?;
-		let info: HsaInfo = runtime.function(b"hsa_agent_get_info\0")?;
-		let check = |s, a| driver_status(Backend::Amd, s, a);
-		check(init(), "initialization")?;
-		let mut cpu = HsaQuery { info, attribute: 17, expected: 0, secondary: -1, mask: 0, found: 0 };
-		let mut gpu = HsaGpuQuery { info, found: Vec::new() };
-		check(iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
-		check(iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent")?;
-		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?;
-		gpu.found
-			.into_iter()
-			.enumerate()
-			.filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("amd{index}"))))
-			.map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index))
-			.collect()
-	}
-}
-#[cfg(amd)]
-fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64, agent: u64, index: usize) -> Result<Gpu> {
-	unsafe {
-		let pool_info: HsaInfo = runtime.function(b"hsa_amd_memory_pool_get_info\0")?;
-		let pool_iterate: unsafe extern "C" fn(u64, extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 = runtime.function(b"hsa_amd_agent_iterate_memory_pools\0")?;
-		let check = |s, a| driver_status(Backend::Amd, s, a);
-		let mut vram = HsaQuery { info: pool_info, attribute: 0, expected: 0, secondary: 1, mask: 4, found: 0 };
-		let mut kernarg = HsaQuery { info: pool_info, attribute: 0, expected: 0, secondary: 1, mask: 1, found: 0 };
-		check(pool_iterate(agent, collect_hsa, (&mut vram as *mut HsaQuery).cast()), "VRAM pools")?;
-		check(pool_iterate(cpu_agent, collect_hsa, (&mut kernarg as *mut HsaQuery).cast()), "KERNARG pools")?;
-		require(vram.found != 0 && kernarg.found != 0, "AMD VRAM or KERNARG pool is absent")?;
-		let mut memory = 0_usize;
-		check(pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
-		let (mut wave, mut workgroup, mut available, mut node, mut cus) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
-		for (attribute, output, action) in [
-			(6, (&mut wave as *mut u32).cast(), "wave query"),
-			(8, (&mut workgroup as *mut u32).cast(), "workgroup query"),
-			(0xA002, (&mut available as *mut u32).cast(), "CU query"),
-			(0xA004, (&mut node as *mut u32).cast(), "KFD node query"),
-			(0xA014, (&mut cus as *mut u32).cast(), "cooperative CU query"),
-		] {
-			check(info(agent, attribute, output), action)?;
+	{
+		let directory = Path::new("/sys/class/kfd/kfd/topology/nodes");
+		let mut nodes = fs::read_dir(directory).map_err(|error| RecipeError::new(format!("cannot read KFD topology: {error}")))?.collect::<std::result::Result<Vec<_>, _>>().map_err(|error| RecipeError::new(format!("cannot list KFD nodes: {error}")))?;
+		nodes.sort_by_key(|node| node.file_name().to_string_lossy().parse::<u32>().unwrap_or(u32::MAX));
+		let mut devices = Vec::new();
+		let mut ordinal = 0;
+		for node in nodes {
+			let gpu_id = fs::read_to_string(node.path().join("gpu_id")).map_err(|error| RecipeError::new(format!("cannot read KFD device identity: {error}")))?.trim().parse::<u32>().map_err(|_| RecipeError::new("KFD device identity is invalid"))?;
+			if gpu_id == 0 { continue; }
+			let name = format!("amd{ordinal}"); ordinal += 1;
+			if selection.is_some_and(|names| !names.contains(&name)) { continue; }
+			let properties = fs::read_to_string(node.path().join("properties")).map_err(|error| RecipeError::new(format!("cannot read KFD properties: {error}")))?;
+			let domain = kfd_property(&properties, "domain")?;
+			let bdf = kfd_property(&properties, "location_id")?;
+			let pci = format!("{domain:04x}:{:02x}:{:02x}.{}", bdf >> 8, bdf >> 3 & 31, bdf & 7);
+			let mut config = fs::File::open(format!("/sys/bus/pci/devices/{pci}/config")).map_err(|error| RecipeError::new(format!("cannot open AMD PCI configuration: {error}")))?;
+			let mut vendor = [0; 2]; config.read_exact(&mut vendor).map_err(|error| RecipeError::new(format!("cannot read AMD PCI vendor: {error}")))?;
+			require(u16::from_le_bytes(vendor) == 0x1002 && kfd_property(&properties, "vendor_id")? == 0x1002, "AMD PCI device is absent or its vendor differs from KFD")?;
+			let drm_path = PathBuf::from(format!("/sys/bus/pci/devices/{pci}/drm"));
+			let entries = fs::read_dir(&drm_path).map_err(|error| RecipeError::new(format!("cannot inspect AMD display ownership: {error}")))?;
+			let mut display = false;
+			for entry in entries {
+				let entry = entry.map_err(|error| RecipeError::new(format!("cannot inspect AMD DRM identity: {error}")))?;
+				let card = entry.file_name().to_string_lossy().into_owned();
+				if !card.starts_with("card") || card.contains('-') { continue; }
+				for connector in fs::read_dir("/sys/class/drm").map_err(|error| RecipeError::new(format!("cannot inspect display connectors: {error}")))? {
+					let connector = connector.map_err(|error| RecipeError::new(format!("cannot inspect display connector: {error}")))?;
+					if !connector.file_name().to_string_lossy().starts_with(&format!("{card}-")) { continue; }
+					let status = fs::read_to_string(connector.path().join("status")).map_err(|error| RecipeError::new(format!("cannot read display connector state: {error}")))?;
+					display |= status.trim() == "connected";
+				}
+			}
+			require(!display || std::env::var("RECIPE_AMD_DISPLAY_FINAL_PROOF").as_deref() == Ok("1"), "experimental direct KFD dispatch is disabled on a display device; final proof requires prior non-display validation and explicit operator admission")?;
+			let gfx = kfd_property(&properties, "gfx_target_version")?;
+			require((110000..120000).contains(&gfx), "direct AMD queue currently requires GFX11 scratch and clock interfaces")?;
+			let architecture = format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100);
+			let device = std::sync::Arc::new(KfdDevice::open(gpu_id, kfd_property(&properties, "drm_render_minor")?)?);
+			let driver = Hsa::create(device, &properties, domain, bdf, gfx)?;
+			let memory = fs::read_to_string(node.path().join("mem_banks/0/properties")).map_err(|error| RecipeError::new(format!("cannot read AMD memory size: {error}")))?.lines().find_map(|line| line.strip_prefix("size_in_bytes ")).ok_or_else(|| RecipeError::new("AMD memory size is absent"))?.parse::<u64>().map_err(|_| RecipeError::new("AMD memory size is invalid"))?;
+			let shared_limit = driver.lds;
+			devices.push(Gpu { name, backend: Backend::Amd, native_target: BackendTarget::Amd { architecture }, driver: Driver::Hsa(driver), memory, shared_limit, dispatch: Mutex::new(()) });
 		}
-		require(cus <= available, "AMD cooperative CU count exceeds available CUs")?;
-		let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
-		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
-		let gfx = kfd_property(&properties, "gfx_target_version")?;
-		let target = format!("gfx{}{}{:x}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let native_target = BackendTarget::Amd { architecture: target.clone() };
-		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
-		let reader_destroy: unsafe extern "C" fn(u64) -> i32 = runtime.function(b"hsa_code_object_reader_destroy\0")?;
-		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
-		let executable_destroy: unsafe extern "C" fn(u64) -> i32 = runtime.function(b"hsa_executable_destroy\0")?;
-		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 = runtime.function(b"hsa_executable_load_agent_code_object\0")?;
-		let executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32 = runtime.function(b"hsa_executable_freeze\0")?;
-		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
-		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
-		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
-		let simd_per_cu = kfd_property(&properties, "simd_per_cu")?.max(1);
-		let waves_per_simd = kfd_property(&properties, "max_waves_per_simd")?.max(1);
-		let (vgprs_per_simd, vgpr_granule) = match gfx {
-			120500..130000 => (1024, if wave == 32 { 16 } else { 8 }),
-			110000..120500 => (1536, if wave == 32 { 24 } else { 12 }),
-			100000..110000 => (1024, if wave == 32 { 16 } else { 8 }),
-			90010 | 90012 | 90400..90500 => (512, 8),
-			_ => (256, 4),
-		};
-		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
-		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
-		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
-		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
-		let (mut queue, mut completion) = (ptr::null_mut(), 0);
-		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
-		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
-		let hsa = Hsa {
-			_runtime: runtime.clone(),
-			reader_create,
-			reader_destroy,
-			executable_create,
-			executable_destroy,
-			executable_load,
-			executable_freeze,
-			symbol,
-			symbol_info,
-			info,
-			allocate,
-			allow,
-			queue,
-			cpu_agent,
-			free: runtime.function(b"hsa_amd_memory_pool_free\0")?,
-			copy: runtime.function(b"hsa_memory_copy\0")?,
-			clear: runtime.function(b"hsa_amd_memory_fill\0")?,
-			store: runtime.function(b"hsa_signal_store_screlease\0")?,
-			wait: runtime.function(b"hsa_signal_wait_scacquire\0")?,
-			write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?,
-			signal: completion,
-			vram_pool: vram.found,
-			kernarg_pool: kernarg.found,
-			agent,
-			cus,
-			wave,
-			workgroup,
-			lds,
-			simd_per_cu,
-			waves_per_simd,
-			vgprs_per_simd,
-			vgpr_granule,
-		};
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
+		require(!devices.is_empty(), "the selected AMD KFD device is absent")?;
+		Ok(devices)
 	}
 }
 fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
