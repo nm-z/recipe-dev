@@ -7685,7 +7685,7 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
-		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v5".as_slice(),
+		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
 	};
 	let requirement = match target {
@@ -7699,9 +7699,11 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
 		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => String::new(),
 	};
+	let optimization = native_cpu_optimization_flags(&producer);
 	let mut parts = vec![version, requirement.as_bytes()];
 	if matches!(target, BackendTarget::Cpu { .. }) {
 		parts.push(producer.as_bytes());
+		parts.push(optimization.as_bytes());
 	}
 	parts.extend([env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()]);
 	for part in parts {
@@ -7800,6 +7802,14 @@ fn native_cpu_compiler_identity() -> Result<String> {
 	let identity = format!("{compiler}@{}", cpu_compiler_version(&text)?);
 	cpu_llvm_major(&identity)?;
 	Ok(identity)
+}
+
+fn native_cpu_optimization_flags(identity: &str) -> &'static str {
+	let compiler = identity.split_once('@').map_or(identity, |(_, compiler)| compiler);
+	let version = compiler.strip_prefix("clang version ").and_then(|rest| rest.split_whitespace().next());
+	// This producer's loop vectorizer collapses temporal projection positions.
+	// Keep the other O2 passes and the explicit register vectors in the kernels.
+	if version == Some("23.1.1") { "-O2 -fno-vectorize" } else { "-O2" }
 }
 
 fn native_cpu_setting(name: &str) -> Result<&'static str> {
@@ -7907,7 +7917,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
 			command
-				.args(["-x", "ir", "-O2"])
+				.args(["-x", "ir"])
+				.args(native_cpu_optimization_flags(&compiler_identity).split_whitespace())
 				.args(native_cpu_setting("library-flags")?.split_whitespace())
 				.arg(format!("-B{}", linker_directory.display()))
 				.arg(format!("-fuse-ld={}", native_cpu_setting("linker-driver")?))
