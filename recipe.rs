@@ -42,6 +42,7 @@ mod program_ir {
 		FusedAdd = 16,
 		/// The left operand rounded through fp16 and back.
 		Half = 17,
+		SquareRoot = 18,
 	}
 
 	impl ScalarOpcode {
@@ -64,6 +65,7 @@ mod program_ir {
 				15 => Ok(Self::Select),
 				16 => Ok(Self::FusedAdd),
 				17 => Ok(Self::Half),
+				18 => Ok(Self::SquareRoot),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -336,7 +338,7 @@ mod program_ir {
 						_ => unreachable!(),
 					}
 				}
-				ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => {
+				ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh | ScalarOpcode::SquareRoot => {
 					let left = scalar_operand(instruction.left, &values, &first, &second)?;
 					let operation = match instruction.opcode {
 						ScalarOpcode::Absolute => "abs",
@@ -345,6 +347,7 @@ mod program_ir {
 						ScalarOpcode::Sin => "sin",
 						ScalarOpcode::Cos => "cos",
 						ScalarOpcode::Tanh => "tanh",
+						ScalarOpcode::SquareRoot => "sqrt",
 						_ => unreachable!(),
 					};
 					let _ = writeln!(output, "{name} = call {ty} @{family}.{operation}{suffix}({ty} {left})", family = scalar_math(context.libm, operation));
@@ -428,6 +431,7 @@ mod program_ir {
 				| ScalarOpcode::Cos
 				| ScalarOpcode::Tanh
 				| ScalarOpcode::FusedAdd
+				| ScalarOpcode::SquareRoot
 				| ScalarOpcode::Half => format!("%{}.scalar.{index}", context.prefix),
 			};
 			values.push(value);
@@ -529,6 +533,14 @@ mod program_ir {
 				}
 				ScalarOpcode::Log => {
 					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.log.{sequence}", context.prefix), "div", &adjoint, &left);
+					sequence += 1;
+					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+				}
+				ScalarOpcode::SquareRoot => {
+					let two = (context.literal)(2.0, ty);
+					let denominator = state_binary(&mut output, ty, context.suffix, &format!("%{}.sqrt.denominator.{sequence}", context.prefix), "mul", &two, &values[index]);
+					sequence += 1;
+					let contribution = state_binary(&mut output, ty, context.suffix, &format!("%{}.sqrt.{sequence}", context.prefix), "div", &adjoint, &denominator);
 					sequence += 1;
 					add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
@@ -10562,6 +10574,7 @@ mod bundle {
 			13 => Ok(Activation::Silu),
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
+			17 => Ok(Activation::Sqrt),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
@@ -11940,6 +11953,7 @@ pub enum Activation {
 	/// Multiplies every value by one constant, held as its bit pattern so the
 	/// activation stays comparable. Owns no weights and preserves shape.
 	Scale(u64),
+	Sqrt,
 }
 impl Activation {
 	/// The saved code of the activation. A parameterized activation writes its
@@ -11963,6 +11977,7 @@ impl Activation {
 			Self::Elu => 14,
 			Self::Prelu => 15,
 			Self::Scale(_) => 16,
+			Self::Sqrt => 17,
 		}
 	}
 }
@@ -12026,7 +12041,7 @@ macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const 
 pub mod atv {
 	use super::{Activation, Block, Operation, Suffix};
 	slots! {
-	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn huber = Huber,
+	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn sqrt = Sqrt, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
 	fn selu = Selu, fn gelu = Gelu, fn silu = Silu, fn elu = Elu, fn prelu = Prelu, }
 }
@@ -12232,7 +12247,7 @@ impl Block {
 		self.attention("gate", |attention| attention.gate = true)
 	}
 	block_activations! {
-		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn huber = Huber;
+		fn cos = Cos; fn exp = Exp; fn log = Log; fn ln = Ln; fn sqrt = Sqrt; fn huber = Huber;
 		fn tan = Tan; fn relu = Relu; fn leak = Leak; fn sigmoid = Sigmoid; fn tanh = Tanh;
 		fn selu = Selu; fn gelu = Gelu; fn silu = Silu; fn elu = Elu; fn prelu = Prelu;
 	}
@@ -14146,6 +14161,7 @@ impl Activation {
 			Self::Elu => "elu",
 			Self::Prelu => "prelu",
 			Self::Scale(_) => "scale",
+			Self::Sqrt => "sqrt",
 		}
 	}
 }
@@ -14166,6 +14182,7 @@ fn cos = Cos;
 fn exp = Exp;
 fn log = Log;
 fn ln = Ln;
+fn sqrt = Sqrt;
 fn huber = Huber;
 fn tan = Tan;
 fn relu = Relu;
@@ -18105,6 +18122,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	let result = match activation {
 		Activation::Cos => program.unary(ScalarOpcode::Cos, x),
 		Activation::Exp => program.unary(ScalarOpcode::Exp, x),
+		Activation::Sqrt => program.unary(ScalarOpcode::SquareRoot, x),
 		Activation::Log | Activation::Ln => {
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let shifted = program.op(ScalarOpcode::Add, one, absolute);
@@ -18402,14 +18420,12 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
 	let scale = program.constant(1.0 / (channels as f64).sqrt());
 	let s = program.op(ScalarOpcode::Multiply, x, scale);
-	let (zero, one, half) = (program.constant(0.0), program.constant(1.0), program.constant(0.5));
+	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let magnitude = program.unary(ScalarOpcode::Absolute, s);
 	let floor = program.constant(1e-6);
 	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
 	let clamped = program.choose(above, magnitude, floor);
-	let log = program.unary(ScalarOpcode::Log, clamped);
-	let half_log = program.op(ScalarOpcode::Multiply, half, log);
-	let root = program.unary(ScalarOpcode::Exp, half_log);
+	let root = program.unary(ScalarOpcode::SquareRoot, clamped);
 	let positive = program.op(ScalarOpcode::Greater, s, zero);
 	let negative = program.op(ScalarOpcode::Greater, zero, s);
 	let sign = program.op(ScalarOpcode::Subtract, positive, negative);
