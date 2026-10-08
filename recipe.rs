@@ -10136,7 +10136,7 @@ mod ngram {
 			let count = |index: usize| {
 				words.get(index).copied().filter(|value| value.fract() == 0.0 && *value >= 0.0).map(|value| value as usize).ok_or_else(|| RecipeError::new("row hash words are invalid"))
 			};
-			let (ngram, per_order) = (count(0)?, count(1)?);
+			let (order_length, per_order) = (count(0)?, count(1)?);
 			let (multipliers, seeds, heads, ends) = (count(2)?, count(3)?, count(4)?, count(5)?);
 			let mut at = 6;
 			let mut wide = |count: usize| -> Result<Vec<u64>> {
@@ -10147,7 +10147,7 @@ mod ngram {
 			let fixed = wide(2)?;
 			let (multipliers, seeds, offsets, vocabularies) = (wide(multipliers)?, wide(seeds)?, wide(heads)?, wide(heads)?);
 			let ends = words.get(at..at + ends).ok_or_else(|| RecipeError::new("row hash words are incomplete"))?.iter().map(|end| *end as u32).collect();
-			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent: fixed[0], image: fixed[1] };
+			let hash = Self { ngram: order_length, per_order, multipliers, seeds, offsets, vocabularies, ends, absent: fixed[0], image: fixed[1] };
 			hash.validate()?;
 			Ok(hash)
 		}
@@ -10171,14 +10171,14 @@ mod ngram {
 			let mut next = |role: &str| fields.next().ok_or_else(|| RecipeError::new(format!("row hash {role} is absent")));
 			let value = |text: &str, role: &str| text.parse::<u64>().map_err(|error| RecipeError::new(format!("invalid row hash {role}: {error}")));
 			let list = |text: &str, role: &str| text.split(':').filter(|item| !item.is_empty()).map(|item| value(item, role)).collect::<Result<Vec<_>>>();
-			let (ngram, per_order) = (value(next("ids")?, "ids")? as usize, value(next("heads per order")?, "heads per order")? as usize);
+			let (order_length, per_order) = (value(next("ids")?, "ids")? as usize, value(next("heads per order")?, "heads per order")? as usize);
 			let (absent, image) = (value(next("absent id")?, "absent id")?, value(next("image id")?, "image id")?);
 			let multipliers = list(next("multipliers")?, "multiplier")?;
 			let seeds = list(next("seeds")?, "seed")?;
 			let offsets = list(next("offsets")?, "offset")?;
 			let vocabularies = list(next("vocabularies")?, "vocabulary")?;
 			let ends = list(next("end ids")?, "end id")?.into_iter().map(|end| u32::try_from(end).map_err(|_| RecipeError::new("row hash end id exceeds u32"))).collect::<Result<Vec<_>>>()?;
-			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent, image };
+			let hash = Self { ngram: order_length, per_order, multipliers, seeds, offsets, vocabularies, ends, absent, image };
 			hash.validate()?;
 			Ok(hash)
 		}
@@ -10246,11 +10246,11 @@ mod ngram {
 			} else if model.value(&ple("ngram_size")).is_some() {
 				// The reference form: the metadata names every head's range and the
 				// multipliers of the fold, and the end id stands in for a missing id.
-				let ngram = model.integer_at(&ple("ngram_size"))?;
+				let order_length = model.integer_at(&ple("ngram_size"))?;
 				let per_order = model.integer_at(&ple("heads_per_ngram"))?;
 				let eos = model.integer_at(&ple("eos_token_id"))?;
 				let hash = RowHash {
-					ngram,
+					ngram: order_length,
 					per_order,
 					multipliers: model.integers_at(&ple("layer_multipliers"))?,
 					seeds: Vec::new(),
@@ -10403,6 +10403,10 @@ mod ngram {
 	}
 }
 pub use ngram::{Ngram, RowHash};
+/// The per-layer embedding source described by the file already opened with
+/// `recipe.data`. The source borrows that mapping and validates its table before
+/// a model uses it through `ple(&ngram)`.
+pub static ngram: std::sync::LazyLock<Ngram<'static>> = std::sync::LazyLock::new(|| script_file().ngram());
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -15524,6 +15528,16 @@ pub struct ArchitectureKeys {
 	pub final_logit_softcapping: f64,
 	pub attention: AttentionKeys,
 	pub rope: RopeKeys,
+	pub ple: PleKeys,
+}
+pub struct PleKeys {
+	pub layers: Vec<usize>,
+	pub ngram_size: usize,
+	pub heads_per_ngram: usize,
+	pub embedding_length_per_layer_input: usize,
+	pub conv_kernel: usize,
+	pub eos_token_id: usize,
+	pub image_token_id: usize,
 }
 pub struct AttentionKeys {
 	pub head_count: usize,
@@ -15557,6 +15571,16 @@ impl ArchitectureKeys {
 			context_length: count("context_length"),
 			vocab_size: count("vocab_size"),
 			final_logit_softcapping: real("final_logit_softcapping", 0.0),
+			ple: PleKeys {
+				layers: file.value(&format!("{prefix}.ple.layers")).map(|_| file.indices_at(&format!("{prefix}.ple.layers"))).transpose()
+					.unwrap_or_else(|error| panic!("{error}")).unwrap_or_default(),
+				ngram_size: count("ple.ngram_size"),
+				heads_per_ngram: count("ple.heads_per_ngram"),
+				embedding_length_per_layer_input: count("ple.embedding_length_per_layer_input"),
+				conv_kernel: count("ple.conv_kernel"),
+				eos_token_id: count("ple.eos_token_id"),
+				image_token_id: count("ple.image_token_id"),
+			},
 			attention: AttentionKeys {
 				head_count,
 				head_count_kv: or(count("attention.head_count_kv"), head_count),
@@ -15992,9 +16016,9 @@ impl Builder<'_> {
 					self.mapped(vec![embedding.clone()]);
 				}
 				Operation::Ple(formula) => {
-					let ngram = Ngram::new(self.file)?;
-					require(*formula == ngram.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(ngram.layer(), &ngram, width, lanes.max(1))?;
+					let table = Ngram::new(self.file)?;
+					require(*formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
 					let attends = mixes(parts);
@@ -16874,10 +16898,10 @@ fn placement_memory_error(graph: &Graph, precision: Compute, available: u64) -> 
 			}
 		}
 	}
-	let ngram = if tables.is_empty() { String::new() } else {
+	let table_note = if tables.is_empty() { String::new() } else {
 		format!("  n-gram table {:.3} GiB ({ngram_bytes} bytes) in RAM, outside allocation total; gathered rows included in buffer size", gib(ngram_bytes))
 	};
-	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{ngram}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
+	Ok(RecipeError::new(format!("total {:.3} GiB  available {:.3} GiB  model size {:.3} GiB  buffer size {:.3} GiB{table_note}", gib(total), available as f64 / (1_u64 << 30) as f64, gib(model), gib(buffers))))
 }
 /// The first eight values of a stored weight's first block, decoded on the host.
 fn stored_first_values(weight: &StoredWeight, span: StorageFormat, stride: usize, block: usize) -> Result<Vec<f64>> {
