@@ -727,18 +727,26 @@ entry:
 br i1 %local, label %local.owner.check, label %shared.chunk.loop
 local.owner.check:
 br i1 %local.owner.active, label %local.k.begin, label %exit
+; Use the same chunk boundaries and fold as the shared path, even when
+; one lane computes every chunk. The schedule must not change rounding.
 local.k.begin:
-%local.sums.initial = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
-%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 0, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
-%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 0, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
+br label %local.chunk.loop
+local.chunk.loop:
+%local.chunk.first = phi i32 [ 0, %local.k.begin ], [ %local.chunk.limit, %local.store ]
+%local.chunk.end = add i32 %local.chunk.first, RECIPE_CHUNK_K
+%local.chunk.over = icmp ugt i32 %local.chunk.end, %k.count
+%local.chunk.limit = select i1 %local.chunk.over, i32 %k.count, i32 %local.chunk.end
+%local.sums.prior = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.chunk.first, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
+%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.chunk.first, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 br label %local.k.loop
 local.k.loop:
-%local.k = phi i32 [ 0, %local.k.begin ], [ %local.k.next, %local.product.done ]
-%local.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %local.sums.initial, %local.k.begin ], [ %local.sums.current, %local.product.done ]
-%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.k.begin ], [ %local.a.next, %local.product.done ]
-%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.k.begin ], [ %local.b.next, %local.product.done ]
+%local.k = phi i32 [ %local.chunk.first, %local.chunk.loop ], [ %local.k.next, %local.product.done ]
+%local.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ zeroinitializer, %local.chunk.loop ], [ %local.sums.current, %local.product.done ]
+%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.chunk.loop ], [ %local.a.next, %local.product.done ]
+%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.chunk.loop ], [ %local.b.next, %local.product.done ]
 %local.k.next = add i32 %local.k, 1
-%local.k.more = icmp ult i32 %local.k.next, %k.count
+%local.k.more = icmp ult i32 %local.k.next, %local.chunk.limit
 %local.k.prefetch = select i1 %local.k.more, i32 %local.k.next, i32 %local.k
 %local.a.next = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.k.prefetch, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
 %local.b.next = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.k.prefetch, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
@@ -763,8 +771,10 @@ br label %local.product.loop, !llvm.loop !0
 local.product.done:
 br i1 %local.k.more, label %local.k.loop, label %local.store
 local.store:
-store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
-br label %exit
+%local.folded = fadd <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.prior, %local.sums.current
+store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.folded, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+%local.chunk.more = icmp ult i32 %local.chunk.limit, %k.count
+br i1 %local.chunk.more, label %local.chunk.loop, label %exit
 shared.chunk.loop:
 %chunk = phi i32 [ %chunk.first, %entry ], [ %chunk.next, %chunk.finish ]
 %slot = phi i32 [ 0, %entry ], [ %slot.next, %chunk.finish ]

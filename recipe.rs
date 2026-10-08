@@ -5918,6 +5918,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 	fn emit_normalize_stats(&self, backend: Backend, index: usize, node: &Node, pointers: &ModelPointers, mode: program_ir::NormalizeMode, window: &NodeWindow) -> Result<String> {
+		use std::fmt::Write as _;
 		let v = self.variant(node);
 		let pointer = pointer_type(backend);
 		let ty = self.node_precision(node).model_type;
@@ -5954,6 +5955,8 @@ impl NativeModelIr {
 		let wave_id = format!("%{prefix}.wave.id");
 		let wave_count = format!("%{prefix}.wave.count");
 		let wave_width_half = format!("%{prefix}.wave.width.half");
+		let wave_origin = format!("%{prefix}.wave.origin");
+		let wave_broadcast = format!("%{prefix}.wave.broadcast");
 		ir.push_str(&format!("%{prefix}.tid.wide = zext i32 %tid to i64\n{rows} = zext i32 %rows to i64\n{threads} = zext i32 %threads to i64\n",));
 		let per_row = mode.per_row();
 		let items = if per_row { width.to_string() } else { items };
@@ -6000,7 +6003,8 @@ impl NativeModelIr {
 			)
 		};
 		if per_row {
-			ir.push_str(&format!("{wave_width} = call i32 @recipe.wavefront.width()\n{wave_width_wide} = zext i32 {wave_width} to i64\n{wave_width_half} = udiv i64 {wave_width_wide}, 2\n{wave_lane} = urem i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_id} = udiv i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_count} = udiv i64 {threads}, {wave_width_wide}\n"));
+			let lanes = if backend == Backend::Cpu { 1 } else { 32 };
+			ir.push_str(&format!("{wave_width} = add i32 0, {lanes}\n{wave_width_wide} = zext i32 {wave_width} to i64\n{wave_width_half} = udiv i64 {wave_width_wide}, 2\n{wave_lane} = urem i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_id} = udiv i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_count} = udiv i64 {threads}, {wave_width_wide}\n%{prefix}.physical.width = call i32 @recipe.wavefront.width()\n%{prefix}.physical.width.wide = zext i32 %{prefix}.physical.width to i64\n%{prefix}.physical.lane = urem i64 %{prefix}.tid.wide, %{prefix}.physical.width.wide\n{wave_origin} = and i64 %{prefix}.physical.lane, -32\n%{prefix}.wave.broadcast.wide = mul i64 {wave_origin}, 4\n{wave_broadcast} = trunc i64 %{prefix}.wave.broadcast.wide to i32\n"));
 		}
 		let emit_index = |code: &mut String, phase: &str, p: &str| {
 			let row = format!("%{prefix}.{phase}.row");
@@ -6031,7 +6035,42 @@ impl NativeModelIr {
 		let variance_entry = if mode.per_row() { format!("%{prefix}.mean.reduce.done") } else { format!("%{prefix}.mean.loop") };
 		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
 		let mean_broadcast = format!("%{prefix}.mean.broadcast");
+		// Per-row sums use 32 interleaved partials and a fixed tree on every
+		// backend. CPU vectors own all partials; GPUs assign each group of 32
+		// physical lanes one row, including each half of a 64-lane wave.
+		let cpu_partials = per_row && backend == Backend::Cpu;
+		let sum_phi = |phase: &str, entry: &str| {
+			if cpu_partials {
+				format!("%{prefix}.{phase}.sums = phi <32 x {state_ty}> [ zeroinitializer, {entry} ], [ %{prefix}.{phase}.sums.next, %{prefix}.{phase}.step ]\n%{prefix}.{phase}.lane = and i64 %{prefix}.{phase}.p, 31\n%{prefix}.{phase}.sum = extractelement <32 x {state_ty}> %{prefix}.{phase}.sums, i64 %{prefix}.{phase}.lane\n")
+			} else {
+				format!("%{prefix}.{phase}.sum = phi {state_ty} [ {zero}, {entry} ], [ %{prefix}.{phase}.sum.next, %{prefix}.{phase}.step ]\n")
+			}
+		};
+		let sum_update = |phase: &str| {
+			if cpu_partials {
+				format!("%{prefix}.{phase}.sums.next = insertelement <32 x {state_ty}> %{prefix}.{phase}.sums, {state_ty} %{prefix}.{phase}.sum.next, i64 %{prefix}.{phase}.lane\n")
+			} else { String::new() }
+		};
+		let mean_phi = sum_phi("mean", &mean_entry);
+		let variance_phi = sum_phi("variance", &variance_entry);
+		let mean_update = sum_update("mean");
+		let variance_update = sum_update("variance");
 		let wave_reduce = |phase: &str, source: &str, done_target: &str, tail: &str| {
+			if cpu_partials {
+				let mut code = format!("{prefix}.{phase}.reduce.loop:\n");
+				let mut partials = format!("%{prefix}.{phase}.sums");
+				for offset in [16, 8, 4, 2, 1] {
+					let mask = (0..32).map(|lane| format!("i32 {}", lane ^ offset)).collect::<Vec<_>>().join(", ");
+					let shuffled = format!("%{prefix}.{phase}.shuffle.{offset}");
+					let next = format!("%{prefix}.{phase}.reduced.{offset}");
+					let _ = writeln!(code, "{shuffled} = shufflevector <32 x {state_ty}> {partials}, <32 x {state_ty}> poison, <32 x i32> <{mask}>\n{next} = fadd <32 x {state_ty}> {partials}, {shuffled}");
+					partials = next;
+				}
+				let _ = writeln!(code, "%{prefix}.{phase}.reduced = extractelement <32 x {state_ty}> {partials}, i32 0\nbr label {done_target}");
+				if done_target.ends_with("reduce.done") { let _ = writeln!(code, "{prefix}.{phase}.reduce.done:\n{tail}"); }
+				else { code.push_str(tail); }
+				return code;
+			}
 			let (offset, reduced, partner, partner_lane, partner_index, partner_index_i32) = (
 				format!("%{prefix}.{phase}.reduce.offset"),
 				format!("%{prefix}.{phase}.reduced"),
@@ -6041,10 +6080,10 @@ impl NativeModelIr {
 				format!("%{prefix}.{phase}.partner.index.i32"),
 			);
 			let done_code = if done_target.starts_with('%') && done_target.ends_with("reduce.done") { format!("{prefix}.{phase}.reduce.done:\n{tail}") } else { tail.to_owned() };
-			format!("{prefix}.{phase}.reduce.loop:\n{offset} = phi i64 [ {wave_width_half}, %{prefix}.{phase}.loop ], [ {offset}.next, %{prefix}.{phase}.reduce.step ]\n{reduced} = phi {state_ty} [ {source}, %{prefix}.{phase}.loop ], [ {reduced}.next, %{prefix}.{phase}.reduce.step ]\n%{prefix}.{phase}.reduce.more = icmp ugt i64 {offset}, 0\nbr i1 %{prefix}.{phase}.reduce.more, label %{prefix}.{phase}.reduce.step, label {done_target}\n{prefix}.{phase}.reduce.step:\n{partner_lane} = xor i64 {wave_lane}, {offset}\n{partner_index} = mul i64 {partner_lane}, 4\n{partner_index_i32} = trunc i64 {partner_index} to i32\n{partner} = call {state_ty} @recipe.wave.partner{v}({state_ty} {reduced}, i32 {partner_index_i32})\n{reduced}.next = call {state_ty} @recipe.state.add{v}({state_ty} {reduced}, {state_ty} {partner})\n{offset}.next = udiv i64 {offset}, 2\nbr label %{prefix}.{phase}.reduce.loop\n{done_code}")
+			format!("{prefix}.{phase}.reduce.loop:\n{offset} = phi i64 [ {wave_width_half}, %{prefix}.{phase}.loop ], [ {offset}.next, %{prefix}.{phase}.reduce.step ]\n{reduced} = phi {state_ty} [ {source}, %{prefix}.{phase}.loop ], [ {reduced}.next, %{prefix}.{phase}.reduce.step ]\n%{prefix}.{phase}.reduce.more = icmp ugt i64 {offset}, 0\nbr i1 %{prefix}.{phase}.reduce.more, label %{prefix}.{phase}.reduce.step, label {done_target}\n{prefix}.{phase}.reduce.step:\n{partner_lane} = xor i64 {wave_lane}, {offset}\n{partner_lane}.physical = add i64 {partner_lane}, {wave_origin}\n{partner_index} = mul i64 {partner_lane}.physical, 4\n{partner_index_i32} = trunc i64 {partner_index} to i32\n{partner} = call {state_ty} @recipe.wave.partner{v}({state_ty} {reduced}, i32 {partner_index_i32})\n{reduced}.next = call {state_ty} @recipe.state.add{v}({state_ty} {reduced}, {state_ty} {partner})\n{offset}.next = udiv i64 {offset}, 2\nbr label %{prefix}.{phase}.reduce.loop\n{done_code}")
 		};
 		let mean_reduce_code = if mode.per_row() {
-			let tail = format!("{mean_broadcast} = call {state_ty} @recipe.wave.partner{v}({state_ty} %{prefix}.mean.reduced, i32 0)\nbr label %{prefix}.variance.loop\n");
+			let tail = format!("{mean_broadcast} = call {state_ty} @recipe.wave.partner{v}({state_ty} %{prefix}.mean.reduced, i32 {wave_broadcast})\nbr label %{prefix}.variance.loop\n");
 			wave_reduce("mean", &format!("%{prefix}.mean.sum"), &format!("%{prefix}.mean.reduce.done"), &tail)
 		} else {
 			String::new()
@@ -6062,9 +6101,9 @@ impl NativeModelIr {
 			if zero_mean { String::new() } else { format!("%{prefix}.variance.centered = call {state_ty} @recipe.state.sub{v}({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n") };
 		let mean_next = if per_row { format!("%{prefix}.mean.p.next") } else { format!("%{prefix}.mean.next") };
 		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
-		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {state_ty} [ {zero}, {mean_entry} ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, state_ty = state_ty, zero = zero, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
+		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n{mean_phi}%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
 		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, {variance_entry} ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
+		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.model)\n{centered_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_code = centered_code, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
@@ -6107,7 +6146,7 @@ impl NativeModelIr {
 			format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n")
 		};
 		ir.push_str(&format!(
-			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_update}{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
 			prefix = prefix,
 			state_ty = state_ty,
 			centered_model = if wide_sum_only && !zero_mean { format!("%{prefix}.variance.centered.model = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.centered)\n") } else { String::new() },
@@ -26113,7 +26152,7 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
 		let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
 		let room = staging_k.min(partial_k);
-		// Reduction chunks are RECIPE_FRAGMENT_K elements of K, aligned to the
+		// Reduction chunks are RECIPE_CHUNK_K elements of K, aligned to the
 		// start of the walk. A multi-tile walk must therefore stage whole chunks,
 		// so the tile is rounded down to a chunk multiple; a walk that fits in one
 		// staged tile has no interior tile boundary and may keep its exact length.
