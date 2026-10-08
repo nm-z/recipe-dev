@@ -14980,6 +14980,12 @@ pub struct Bound {
 	tensors: usize,
 	vocabulary: usize,
 }
+/// Resolve an explicit user declaration before assigning checkpoint planes.
+fn explicit_bound(file: &Gguf, model: &Model) -> Result<Bound> {
+	let model = with_last_projection(model).for_file(file);
+	let plan = conventional_plan(file, &model)?;
+	Ok(Bound { file: file.clone(), blocks: model.blocks.len(), tensors: plan.tensors.len(), vocabulary: 0, model, plan })
+}
 impl Gguf {
 	/// The model this file describes: `general.architecture` selects the row of
 	/// the architecture table, the `<architecture>.*` namespace sizes every block,
@@ -15878,6 +15884,16 @@ impl Recipe {
 	}
 }
 impl Infer {
+	/// Keep the explicit Model+Data declaration resident for full forwards,
+	/// incremental decode, or serving through the same persistent stepper.
+	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
+		let result = (|| -> Result<Placed> {
+			let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference placement requires GGUF data"))?;
+			let bound = explicit_bound(file, model)?;
+			selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices))
+		})();
+		result.unwrap_or_else(|error| panic!("{error}"))
+	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -15902,8 +15918,7 @@ impl Infer {
 		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		let model = with_last_projection(model).for_file(&file);
-		let plan = conventional_plan(&file, &model)?;
+		let bound = explicit_bound(&file, model)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -15916,10 +15931,9 @@ impl Infer {
 		let stop = stop_ids(&coder)?;
 		let sequence = match requested {
 			Some(context) => context,
-			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
+			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling)?,
 			None => ceiling,
 		};
-		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
 		let placed = place_bound(&bound, sequence, &[], devices)?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
@@ -17298,6 +17312,59 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	/// Fill exactly the supplied prefix without sampling another token.
+	pub fn prefill(&self, ids: &[u32]) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap_or_else(|_| panic!("decode state is poisoned"));
+		*state = DecodeState::default();
+		self.forward_ids(&mut state, ids, 0).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Extend the completed prefix by one supplied token on the same parts.
+	pub fn step(&self, id: u32) -> Vec<f64> {
+		let mut state = self.decode.lock().unwrap_or_else(|_| panic!("decode state is poisoned"));
+		assert!(!state.ids.is_empty(), "step requires a completed prefill");
+		let begin = state.ids.len();
+		let mut ids = state.ids.clone();
+		ids.push(id);
+		self.forward_ids(&mut state, &ids, begin).unwrap_or_else(|error| panic!("{error}"))
+	}
+	fn forward_ids(&self, state: &mut DecodeState, ids: &[u32], begin: usize) -> Result<Vec<f64>> {
+		let result = (|| -> Result<Vec<f64>> {
+			let capacity = self.decode_capacity()?;
+			require(!ids.is_empty() && ids.len() <= capacity && begin < ids.len(), "token window is outside the placement capacity")?;
+			require(begin == 0 || state.ids.as_slice() == &ids[..begin], "token step changes the retained prefix")?;
+			let mut samples = vec![0.0; capacity];
+			for (sample, id) in samples.iter_mut().zip(ids) { *sample = f64::from(*id); }
+			let begin = narrow(begin, "token window start")? as u32;
+			let end = narrow(ids.len(), "token window end")? as u32;
+			let predictions = self.run_window(&samples, begin, end)?;
+			let logits = self.last_logits(&predictions, begin, end)?;
+			state.ids = ids.to_vec();
+			state.predictions = predictions;
+			state.logits = logits.clone();
+			Ok(logits)
+		})();
+		if result.is_err() { *state = DecodeState::default(); }
+		result
+	}
+	fn decode_capacity(&self) -> Result<usize> {
+		let sequence = match &self.source {
+			PlacedSource::Saved(graphs) => {
+				let first = graphs.first().ok_or_else(|| RecipeError::new("decode has no input graph"))?;
+				require(first.input.channels == 1 || first.input.length == 1, "decode expects one input value per position")?;
+				require(graphs.len() == self.tapes.len(), "decode graph and range sets differ")?;
+				first.inputs.len()
+			},
+			PlacedSource::Bound(input, _) => {
+				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
+				input.elements()
+			}
+		};
+		for ranges in &self.tapes {
+			require(!ranges.is_empty(), "decode graph has no persistent ranges")?;
+			for tape in ranges { require(tape.positions as usize == sequence, format!("decode range has {} positions, expected {sequence}", tape.positions))?; }
+		}
+		Ok(sequence)
+	}
 	fn llvm_report(&self) -> LlvmReport {
 		let mut report = LlvmReport::default();
 		for tape in self.tapes.iter().flatten() {
@@ -17414,20 +17481,7 @@ impl Placed {
 			PlacedSource::Bound(_, suppressed) => sampler.suppressed.clone_from(suppressed),
 			PlacedSource::Saved(_) => sampler.suppressed.clear(),
 		}
-		let sequence = match &self.source {
-			PlacedSource::Saved(graphs) => match graphs.as_slice() {
-				[only] => {
-					require(only.input.channels == 1 || only.input.length == 1, "decode expects one input value per position")?;
-					only.inputs.len()
-				}
-				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
-			},
-			PlacedSource::Bound(input, _) => {
-				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
-				input.elements()
-			}
-		};
-		require(self.tapes.len() == 1, format!("decode expects one range set, this placement has {}", self.tapes.len()))?;
+		let sequence = self.decode_capacity()?;
 		require(!prompt.is_empty(), "decode prompt is empty")?;
 		require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
 		let mut samples = vec![0.0; sequence];
@@ -17456,7 +17510,7 @@ impl Placed {
 		result
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
 	}
 	/// Run a window through either a saved semantic pipeline or one directly
@@ -17471,7 +17525,7 @@ impl Placed {
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window(ranges, prepared, begin, end, if graphs.len() == 1 { progress } else { None })
+					self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None })
 				})
 			}
 			PlacedSource::Bound(input, _) => {
@@ -17487,11 +17541,23 @@ impl Placed {
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress)
+	}
+	/// Every part receives the original token IDs, independently of transformed
+	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		require(begin <= end, "window begins after its end")?;
+		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		for tape in tapes {
+			require(end <= tape.positions, "token window exceeds a persistent range")?;
+		}
+		for (start, count) in first.input_runs(begin, end) {
+			require(start.checked_add(count).is_some_and(|limit| limit <= samples.len()), "input window is outside the model input")?;
+		}
 		if begin == 0 {
 			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
-		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 		tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
 		for (start, count) in first.input_runs(begin, end) {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
