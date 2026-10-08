@@ -20,6 +20,7 @@ set -euo pipefail
 : "${TRUSTED_RUNTIME:?TRUSTED_RUNTIME is required}"
 : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT is required}"
 : "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER is required}"
+source "$TRUSTED_RUNTIME/azure-cleanup.sh"
 if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]] || [[ ! "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
 	echo "RUN_ID and RUN_ATTEMPT must be decimal workflow identifiers" >&2
 	exit 2
@@ -244,16 +245,17 @@ if command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITO
 		fi
 		prior_run="${BASH_REMATCH[1]}"
 		prior_attempt="${BASH_REMATCH[2]}"
-		if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+		if ! prior_state="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq '.status + " " + (.run_attempt|tostring)' 2>/dev/null)"; then
 			echo "could not confirm the owner of prior worker $prior_worker" >&2
 			continue
 		fi
-		if [ "$prior_status" = "completed" ]; then
+		if azure_attempt_is_terminal "${prior_state% *}" "${prior_state#* }" "$prior_attempt"; then
 			echo "== reclaiming terminal-run worker $prior_worker =="
 			AZURE_RESOURCE_GROUP="$prior_group" \
 			RUN_ID="$prior_run" \
 			RUN_ATTEMPT="$prior_attempt" \
-				bash "$TRUSTED_RUNTIME/azure-cleanup.sh"
+				bash "$TRUSTED_RUNTIME/azure-cleanup.sh" \
+				|| echo "reclamation of $prior_worker did not fully complete; quota admission will check available capacity" >&2
 		fi
 	done < <(jq -r --arg current "$WORKER" '.[] | select(.name != $current) | [.name, .resource_group] | @tsv' <<< "$inventory")
 fi
@@ -339,7 +341,7 @@ echo "candidate regions: ${quota_locations[*]}"
 # controller may be reclaiming the same worker, and the quota read decides
 # whether this run can proceed.
 reclaim_terminal_workers() {
-	local inventory prior_worker prior_group prior_run prior_attempt prior_status
+	local inventory prior_worker prior_group prior_run prior_attempt prior_state
 	if ! inventory="$(az vm list --show-details \
 		--query "[?hardwareProfile.vmSize=='$SIZE'].{name:name,resource_group:resourceGroup,location:location,power_state:powerState,created_at:timeCreated,recipe_owner:tags.\"recipe-owner\",recipe_pool:tags.\"recipe-pool\",recipe_worker:tags.\"recipe-worker\"}" \
 		--only-show-errors -o json)"; then
@@ -354,16 +356,16 @@ reclaim_terminal_workers() {
 		prior_run="${BASH_REMATCH[1]}"
 		prior_attempt="${BASH_REMATCH[2]}"
 		if [ "$prior_run" = "$RUN_ID" ] && [ "$prior_attempt" -lt "$RUN_ATTEMPT" ]; then
-			prior_status=completed
+			prior_state="in_progress $RUN_ATTEMPT"
 		elif command -v gh >/dev/null && [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-			if ! prior_status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq .status 2>/dev/null)"; then
+			if ! prior_state="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$prior_run" --jq '.status + " " + (.run_attempt|tostring)' 2>/dev/null)"; then
 				echo "could not confirm the owner of prior worker $prior_worker" >&2
 				continue
 			fi
 		else
 			continue
 		fi
-		if [ "$prior_status" = "completed" ]; then
+		if azure_attempt_is_terminal "${prior_state% *}" "${prior_state#* }" "$prior_attempt"; then
 			echo "== reclaiming terminal-run worker $prior_worker =="
 			AZURE_RESOURCE_GROUP="$prior_group" \
 			RUN_ID="$prior_run" \
@@ -500,6 +502,10 @@ purge_worker() {
 		return 1
 	fi
 	if [ -n "$current" ]; then
+		if [ "$current" != "$WORKER" ]; then
+			echo "VM readback does not match worker $WORKER" >&2
+			return 1
+		fi
 		az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true --only-show-errors || status=1
 	fi
 	wait_for_worker_absent || status=1
@@ -512,6 +518,7 @@ purge_worker() {
 		esac || { status=1; continue; }
 		while IFS= read -r resource; do
 			[ -n "$resource" ] || continue
+			azure_resource_belongs_to "$resource" "$WORKER" || continue
 			echo "removing $kind $resource left by the refused allocation"
 			case "$kind" in
 				nic) az network nic delete --resource-group "$GROUP" --name "$resource" --only-show-errors ;;
@@ -533,6 +540,9 @@ cleanup_on_exit() {
 	if ! current="$(list_worker)"; then
 		cleanup_status=1
 		echo "could not determine whether worker $WORKER exists" >&2
+	elif [ -n "$current" ] && [ "$current" != "$WORKER" ]; then
+		cleanup_status=1
+		echo "VM readback does not match worker $WORKER" >&2
 	elif [ -n "$current" ]; then
 		if ! az vm delete --resource-group "$GROUP" --name "$WORKER" --yes --force-deletion true --only-show-errors; then
 			cleanup_status=1
