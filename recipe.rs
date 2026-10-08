@@ -2276,7 +2276,8 @@ impl NativeLayout {
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
 		let signatures = window_signatures(graph);
 		let lifetimes = (0..graph.nodes.len()).map(|index| {
-			let observed = tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
+			let observed = graph.nodes[index].observation.is_some_and(|site| graph.observations & site.family != 0)
+				|| tracing() && traced_node(index, graph.nodes.len()) && std::env::var("RECIPE_TRACE_REUSE").is_err();
 			if inference && !retained[index] && !observed {
 				Ok(BufferLifetime::Until(checked_add(checked_mul(last[index], 2, "buffer lifetime")?, 1, "buffer lifetime")?))
 			} else { Ok(BufferLifetime::Retained) }
@@ -14455,6 +14456,9 @@ pub const Choices: Metric = Metric(13);
 pub const all: Metric = Metric(16);
 /// The development fields: tile, score, choices, and window.
 pub const dev: Metric = Metric(17);
+/// Capture actual Hyper mixer value buffers in `report.tensors`.
+pub const hc_values: Metric = Metric(18);
+const TENSOR_HYPER: u8 = 1;
 /// Lowercase field selectors for `.log(...)`; groups and the uncommon `blck`
 /// and `tile` selectors remain available from the crate root.
 pub mod log {
@@ -14485,7 +14489,7 @@ impl<const N: usize> IntoMetrics for [Metric; N] {
 fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
 	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
 	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
-	const ORDER: [Metric; 12] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug];
+	const ORDER: [Metric; 13] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values];
 	let mut selected = Vec::new();
 	for metric in metrics {
 		match metric {
@@ -14497,6 +14501,9 @@ fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
 	let metrics = ORDER.into_iter().filter(|metric| selected.iter().any(|selected| selected.0 == metric.0)).collect::<Vec<_>>();
 	assert!(!metrics.is_empty(), "log requires at least one option");
 	metrics
+}
+fn tensor_observation_mask(metrics: &[Metric]) -> u8 {
+	if metrics.iter().any(|metric| metric.0 == hc_values.0) { TENSOR_HYPER } else { 0 }
 }
 pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
@@ -15791,11 +15798,11 @@ impl Infer {
 		let stop = stop_ids(&coder)?;
 		let sequence = match requested {
 			Some(context) => context,
-			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling)?,
+			None if devices.len() == 1 => fitting_context(&file, &model, &plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
 		let bound = Bound { file, blocks: model.blocks.len(), tensors: plan.nodes.len(), vocabulary: 0, model, plan };
-		let placed = place_bound(&bound, sequence, &[], devices)?;
+		let placed = place_bound_observed(&bound, sequence, &[], devices, tensor_observation_mask(&self.log))?;
 		let load_seconds = loading.as_ref().map_or_else(|| load_started.elapsed().as_secs_f64(), InferenceLive::finish);
 		drop(loading);
 		let input = ChatInput::new(interactive)?;
@@ -15866,11 +15873,13 @@ impl Infer {
 			if streaming && !framed { println!(); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot finish reply: {error}")))?; }
 			drop(progress);
 			let reply = coder.decode(&ids);
+			let tensors = placed.take_tensors()?;
+			print_tensor_observations(&tensors)?;
 			request_history.push(Arc::new(InferenceRequest {
 				time: DurationReport(seconds),
 				input: prompt.len(), out: ids.len(), cached: generation.cached, reply_limit: budget,
 				input_ids: prompt, output_ids: ids, logits: generation.logits, prediction: reply.clone(),
-				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds,
+				pp_seconds: generation.prefill_seconds, tg_seconds: generation.generation_seconds, tensors,
 			}));
 			if !interactive { break; }
 			conversation.push(("assistant".to_owned(), reply));
@@ -15943,12 +15952,13 @@ fn with_last_projection(model: &Model) -> Model {
 /// linearly with the context, so the ceiling and its half give the slope, the
 /// longest fitting length follows from it, and that length is checked and
 /// stepped down while it is over.
-fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static Gpu, ceiling: usize) -> Result<usize> {
+fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static Gpu, ceiling: usize, observations: u8) -> Result<usize> {
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let free = device.free_bytes()?.saturating_sub(reserve);
 	let bytes_at = |length: usize| -> Result<u64> {
 		let samples = vec![0.0; length];
-		let graph = bound_graph_on(file, model, plan, &samples, 1, device)?;
+		let mut graph = bound_graph_on(file, model, plan, &samples, 1, device)?;
+		graph.observations = observations;
 		let bytes = part_bytes(&graph, Config::load()?.precision)? as u64;
 		trace(&format!("context {length}: {bytes} bytes resident, {free} bytes free"))?;
 		Ok(bytes)
@@ -16326,6 +16336,30 @@ struct DecodeState {
 	predictions: Vec<f64>,
 	logits: Vec<f64>,
 }
+/// Owned bytes from a selected value buffer after a completed pass.
+/// Storage axes are batch row, channel, and position, in that order.
+/// `input_window` describes the completed input positions; storage can also
+/// include retained positions outside that window.
+#[derive(Clone, Debug)]
+pub struct TensorObservation {
+	pub name: &'static str,
+	pub device: String,
+	pub block: usize,
+	pub node: usize,
+	pub row_start: usize,
+	pub shape: [usize; 3],
+	pub input_window: [u32; 2],
+	pub dtype: String,
+	pub bytes: Vec<u8>,
+}
+fn print_tensor_observations(tensors: &[TensorObservation]) -> Result<()> {
+	for tensor in tensors {
+		let line = format!("{} {} block={} node={} {} shape={:?} input={}..{} bytes={}",
+			tensor.name, tensor.device, tensor.block, tensor.node, tensor.dtype, tensor.shape, tensor.input_window[0], tensor.input_window[1], tensor.bytes.len());
+		Train::write_progress(&line, false, true)?;
+	}
+	Ok(())
+}
 pub struct InferenceReport {
 	pub llvm: LlvmReport,
 	pub path: String,
@@ -16364,6 +16398,7 @@ pub struct InferenceRequest {
 	pub output_ids: Vec<u32>,
 	pub logits: Vec<f64>,
 	pub prediction: String,
+	pub tensors: Vec<TensorObservation>,
 	pp_seconds: f64,
 	tg_seconds: f64,
 }
@@ -17015,6 +17050,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 	// span. The next node's offset is the actual end of this part's span.
 	let parameters = graph.nodes.get(end).map_or(graph.parameters.len(), |node| node.offset);
 	Ok(Graph {
+		observations: graph.observations,
 		nodes,
 		parameters: graph.parameters[base..parameters].to_vec(),
 		frozen: graph.frozen[base..parameters].to_vec(),
@@ -17123,9 +17159,13 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
 fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
+	place_bound_observed(model, positions, split, devices, 0)
+}
+fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu], observations: u8) -> Result<Placed> {
 	require(positions != 0, "a placed bound model has no positions")?;
 	let samples = vec![0.0; positions];
-	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
+	let mut graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
+	graph.observations = observations;
 	let input = graph.input;
 	let suppressed = match model.file.value("tokenizer.ggml.suppress_tokens") {
 		Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| RecipeError::new("tokenizer suppress_tokens contains an invalid id"))).collect::<Result<Vec<_>>>()?,
@@ -17136,6 +17176,13 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	fn take_tensors(&self) -> Result<Vec<TensorObservation>> {
+		let mut tensors = Vec::new();
+		for ranges in &self.tapes {
+			for tape in ranges { tensors.extend(tape.take_tensors()?); }
+		}
+		Ok(tensors)
+	}
 	fn llvm_report(&self) -> LlvmReport {
 		let mut report = LlvmReport::default();
 		for tape in self.tapes.iter().flatten() {
@@ -17464,8 +17511,14 @@ impl Node {
 		)
 	}
 }
+#[derive(Clone, Copy)]
+struct TensorSite {
+	family: u8,
+	name: &'static str,
+}
 #[derive(Clone)]
 struct Node {
+	observation: Option<TensorSite>,
 	op: Primitive,
 	source: i32,
 	second: i32,
@@ -17509,6 +17562,7 @@ struct TrainingState {
 }
 #[derive(Clone)]
 struct Graph {
+	observations: u8,
 	nodes: Vec<Node>,
 	parameters: Vec<f64>,
 	frozen: Vec<u8>,
@@ -17553,6 +17607,7 @@ struct Graph {
 impl Graph {
 	fn new(shape: Shape, epsilon: f64) -> Self {
 		Self {
+			observations: 0,
 			epsilon,
 			nodes: Vec::new(),
 			parameters: Vec::new(),
@@ -17584,6 +17639,12 @@ impl Graph {
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
 		encode_graph_storage(self, config)
+	}
+	fn observe(&mut self, name: &'static str, family: u8) -> Result<()> {
+		let index = usize::try_from(self.source).map_err(|_| RecipeError::new("tensor observation has no computed source"))?;
+		let node = self.nodes.get_mut(index).ok_or_else(|| RecipeError::new("tensor observation source is outside the graph"))?;
+		node.observation = Some(TensorSite { family, name });
+		Ok(())
 	}
 	fn training_graph(&self) -> Result<std::borrow::Cow<'_, Self>> {
 		if !self.nodes.iter().any(|node| node.int_bits != 0) {
@@ -18038,6 +18099,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	let int_step = graph.profile.step;
 	let kv_precision = if op == Primitive::Attention { graph.block_kv_precision.unwrap_or(graph.profile.kv) } else { precision };
 	let mut node = Node {
+		observation: None,
 		op,
 		source,
 		second,
@@ -19147,6 +19209,7 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
 	for block in blocks {
@@ -19162,7 +19225,8 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
 	let mut program = ScalarProgram(Vec::new());
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
-	push_program(graph, stream, &[], program)
+	push_program(graph, stream, &[], program)?;
+	graph.observe("hc_combine", TENSOR_HYPER)
 }
 /// The mixer gates from the stream: per-lane RMS statistics under one trainable
 /// scale over the whole stream give `xn`; the read gate is
@@ -19189,6 +19253,7 @@ fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config
 	}
 	reset(graph, normalized, shape);
 	lower_contraction(graph, lanes, false)?;
+	graph.observe("hc_inject", TENSOR_HYPER)?;
 	lower_scale(graph, 1.0 / lanes as f64)?;
 	lower_activation(graph, Activation::Sigmoid, config)?;
 	lower_scale(graph, 2.0)?;
@@ -19208,6 +19273,7 @@ fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
 	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	graph.lanes = 0;
 	Ok(())
 }
@@ -20322,6 +20388,8 @@ struct HostLookup {
 	length: usize,
 }
 struct NativeTape {
+	observations: u8,
+	tensor_history: Mutex<Vec<TensorObservation>>,
 	profile: Precisions,
 	program: NativeProgram,
 	precision: NativePrecision,
@@ -20699,6 +20767,8 @@ impl NativeTape {
 			formats.join("+")
 		}).collect();
 		let tape = Self {
+			observations: graph.observations,
+			tensor_history: Mutex::new(Vec::new()),
 			profile: graph.profile,
 			program,
 			precision,
@@ -20883,6 +20953,10 @@ impl NativeTape {
 		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
+		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
+			let tensors = self.capture_tensors(begin, end)?;
+			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
+		}
 		if let Some(clocks) = self.program.artifact.layout.clocks {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
@@ -21111,6 +21185,27 @@ impl NativeTape {
 			}
 		}
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	fn capture_tensors(&self, begin: u32, end: u32) -> Result<Vec<TensorObservation>> {
+		if self.observations == 0 { return Ok(Vec::new()); }
+		require(begin <= end && end <= self.positions, "tensor observation window is outside the tape")?;
+		self.program.gpu.synchronize()?;
+		let mut tensors = Vec::new();
+		for (index, node) in self.nodes.iter().enumerate() {
+			let Some(site) = node.observation.filter(|site| self.observations & site.family != 0) else { continue };
+			let shape = window_shape(node.output, self.input.length, self.program.artifact.layout.window_positions);
+			let precision = self.program.artifact.layout.precisions[index];
+			let count = graph_rows_buffer(shape, self.rows as usize, precision.bytes())?;
+			let bytes = self.values.download_completed_bytes(self.program.artifact.layout.values[index], count)?;
+			tensors.push(TensorObservation {
+				name: site.name, device: self.device_label()?, block: node.block_index, node: index, row_start: 0,
+				shape: [self.rows as usize, shape.channels, shape.length], input_window: [begin, end], dtype: precision.label(), bytes,
+			});
+		}
+		Ok(tensors)
+	}
+	fn take_tensors(&self) -> Result<Vec<TensorObservation>> {
+		Ok(std::mem::take(&mut *self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?))
 	}
 	fn predictions_at(&self, node: i32, output: usize) -> Result<Vec<f64>> {
 		let index = usize::try_from(node).map_err(|_| RecipeError::new("native output source is absent"))?;
@@ -21572,6 +21667,16 @@ struct DeviceTape {
 	placement: Placement,
 }
 impl DeviceTape {
+	fn capture_tensors(&self) -> Result<Vec<TensorObservation>> {
+		let (mut tensors, mut row_start) = (Vec::new(), 0);
+		for shard in &self.shards {
+			let mut captured = shard.capture_tensors(0, shard.positions)?;
+			for tensor in &mut captured { tensor.row_start = row_start; }
+			tensors.extend(captured);
+			row_start = checked_add(row_start, shard.rows as usize, "tensor observation row range")?;
+		}
+		Ok(tensors)
+	}
 	fn llvm_report(&self) -> LlvmReport {
 		let mut report = LlvmReport::default();
 		for shard in &self.shards {
@@ -21800,6 +21905,7 @@ fn training_observability(
 	epoch_seconds: f64,
 ) -> Result<TrainingObservability> {
 	Ok(TrainingObservability {
+		tensors: Vec::new(),
 		llvm: tape.llvm_report(),
 		path: data.report_path()?,
 		rows,
@@ -21839,6 +21945,7 @@ fn single_training_observability(
 	let device = tape.device_label()?;
 	let links = transfer_report([tape.program.gpu])?;
 	Ok(TrainingObservability {
+		tensors: Vec::new(),
 		llvm: tape.llvm_report(),
 		path,
 		rows,
@@ -22187,6 +22294,15 @@ struct Buffer {
 /// clears without a host copy of its own size.
 const ZERO_FILL_BYTES: usize = 64 << 20;
 impl Buffer {
+	/// Copy bytes after the caller has synchronized the completed pass.
+	fn download_completed_bytes(&self, offset: usize, count: usize) -> Result<Vec<u8>> {
+		require(checked_add(offset, count, "tensor observation read")? <= self.bytes, "tensor observation exceeds its value buffer")?;
+		let mut bytes = Vec::new();
+		bytes.try_reserve_exact(count).map_err(|_| RecipeError::new("cannot allocate tensor observation bytes"))?;
+		bytes.resize(count, 0);
+		self.runtime.download(bytes.as_mut_ptr().cast(), self.pointer + offset as u64, count)?;
+		Ok(bytes)
+	}
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
 		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
@@ -30122,6 +30238,7 @@ impl Train {
 	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
+		require(self.rat.is_none() || tensor_observation_mask(&self.log_metrics) == 0, "tensor observation is unavailable for command RAT training")?;
 		require(self.rat.is_some() || model.downstream.is_none(), ".loss(&model) requires .rat(policy, command)")?;
 		require(self.rat.is_some() || self.rat_target.is_none(), "Train::target requires command RAT")?;
 		if let Some(command) = &self.rat {
@@ -30156,6 +30273,7 @@ impl Train {
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_values]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
 		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
+		graph.observations = tensor_observation_mask(&self.log_metrics);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
@@ -30236,6 +30354,8 @@ impl Train {
 		tape.inject_bn_stats(&stored.bn_stats)?;
 		let (mut final_metrics, _) = self.finish_dispatch(tape.metrics(config), &mut stored, &prepared.schema, &tape, None)?;
 		let raw_predictions = tape.predictions()?;
+		let tensors = tape.capture_tensors()?;
+		print_tensor_observations(&tensors)?;
 		let mut final_loss = final_metrics.loss;
 		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
 		let mut evaluated = Vec::new();
@@ -30286,7 +30406,8 @@ impl Train {
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
 		let itl = TrainingPoint { loss: initial_loss, predictions: initial_predictions.clone(), r2: initial_r2, rat: RatPoint::default() };
 		let fnl = TrainingPoint { loss: final_loss, predictions: predictions.clone(), r2, rat: RatPoint::default() };
-		let observability = training_observability(data, training_rows, &tape, itl, loss_history, prediction_history, r2_history, RatHistory::default(), fnl, tape.step() as usize, epoch_seconds)?;
+		let mut observability = training_observability(data, training_rows, &tape, itl, loss_history, prediction_history, r2_history, RatHistory::default(), fnl, tape.step() as usize, epoch_seconds)?;
+		observability.tensors = tensors;
 		Ok(TrainingReport {
 			observability,
 			initial_loss,
@@ -30384,7 +30505,7 @@ impl Train {
 					Some(value) => format!("score \x1b[38\x3b2\x3b135\x3b90\x3b251m{value:.9}\x1b[0m"),
 					None => continue,
 				},
-				12 | 13 | 14 | 15 => continue,
+				12 | 13 | 14 | 15 | 18 => continue,
 				_ => unreachable!(),
 			};
 			values.push(value);
@@ -30495,6 +30616,7 @@ struct Metrics {
 }
 #[derive(Default)]
 pub struct TrainingObservability {
+	pub tensors: Vec<TensorObservation>,
 	pub llvm: LlvmReport,
 	pub path: String,
 	pub rows: usize,
