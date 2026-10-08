@@ -15499,6 +15499,15 @@ impl Gguf {
 /// `gemma3.attention.head_count`, `gemma3.rope.scaling.factor`. A count the
 /// file lacks reads as the convention its readers apply, or zero.
 pub struct ArchitectureKeys {
+	pub expert_count: usize,
+	pub expert_used_count: usize,
+	pub expert_feed_forward_length: usize,
+	pub expert_shared_feed_forward_length: usize,
+	pub expert_gating_func: usize,
+	pub expert_weights_norm: bool,
+	pub full_attention_interval: usize,
+	pub hyper_connection: HyperKeys,
+	pub ssm: SsmKeys,
 	pub embedding_length: usize,
 	pub block_count: usize,
 	pub feed_forward_length: usize,
@@ -15509,11 +15518,29 @@ pub struct ArchitectureKeys {
 	pub rope: RopeKeys,
 }
 pub struct AttentionKeys {
+	pub compress_ratios: Vec<usize>,
+	pub indexer: IndexerKeys,
 	pub head_count: usize,
 	pub head_count_kv: usize,
 	pub key_length: usize,
 	pub value_length: usize,
 	pub layer_norm_rms_epsilon: f64,
+}
+pub struct IndexerKeys {
+	pub head_count: usize,
+	pub key_length: usize,
+	pub top_k: usize,
+}
+pub struct HyperKeys {
+	pub count: usize,
+	pub low_rank: usize,
+}
+pub struct SsmKeys {
+	pub time_step_rank: usize,
+	pub group_count: usize,
+	pub state_size: usize,
+	pub conv_kernel: usize,
+	pub inner_size: usize,
 }
 pub struct RopeKeys {
 	pub freq_base: f64,
@@ -15533,7 +15560,23 @@ impl ArchitectureKeys {
 		let or = |value: usize, default: usize| if value == 0 { default } else { value };
 		let (embedding_length, head_count) = (count("embedding_length"), count("attention.head_count"));
 		let key_length = or(count("attention.key_length"), embedding_length / head_count.max(1));
+		let compress_ratios = match file.value(&format!("{prefix}.attention.compress_ratios")) {
+			Some(GgufValue::Array(values)) => values.iter().map(|value| value.integer().and_then(|value| usize::try_from(value).ok()).expect("attention.compress_ratios contains an invalid count")).collect(),
+			None => Vec::new(),
+			_ => panic!("attention.compress_ratios must be an array"),
+		};
 		Self {
+			expert_count: count("expert_count"),
+			expert_used_count: count("expert_used_count"),
+			expert_feed_forward_length: count("expert_feed_forward_length"),
+			expert_shared_feed_forward_length: count("expert_shared_feed_forward_length"),
+			expert_gating_func: file.value(&format!("{prefix}.expert_gating_func")).and_then(GgufValue::integer).unwrap_or(1) as usize,
+			expert_weights_norm: match file.value(&format!("{prefix}.expert_weights_norm")) { Some(GgufValue::Bool(value)) => *value, None => true, _ => panic!("expert_weights_norm must be a boolean") },
+			full_attention_interval: count("full_attention_interval"),
+			hyper_connection: HyperKeys { count: count("hyper_connection.count"), low_rank: count("hyper_connection.low_rank") },
+			ssm: SsmKeys {
+				time_step_rank: count("ssm.time_step_rank"), group_count: count("ssm.group_count"), state_size: count("ssm.state_size"), conv_kernel: count("ssm.conv_kernel"), inner_size: count("ssm.inner_size"),
+			},
 			embedding_length,
 			block_count: count("block_count"),
 			feed_forward_length: count("feed_forward_length"),
@@ -15541,6 +15584,8 @@ impl ArchitectureKeys {
 			vocab_size: count("vocab_size"),
 			final_logit_softcapping: real("final_logit_softcapping", 0.0),
 			attention: AttentionKeys {
+				compress_ratios,
+				indexer: IndexerKeys { head_count: count("attention.indexer.head_count"), key_length: count("attention.indexer.key_length"), top_k: count("attention.indexer.top_k") },
 				head_count,
 				head_count_kv: or(count("attention.head_count_kv"), head_count),
 				key_length,
@@ -15573,7 +15618,7 @@ impl std::ops::Deref for Namespace {
 	}
 }
 macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 phi3 deepseek2 glm4 granite }
+namespaces! { gemma3 llama qwen2 qwen3 qwen4exp phi3 deepseek2 glm4 granite }
 /// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
 /// ids and the chat template sit beside it.
 pub struct TokenizerKeys {
