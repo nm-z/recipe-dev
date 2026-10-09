@@ -216,6 +216,7 @@ feed-forward-activation = "silu"
 expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
+expert-scale = "1.0"
 
 [architecture.qwen3moe]
 rope-pairs = "halves"
@@ -223,6 +224,7 @@ feed-forward-activation = "silu"
 expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
+expert-scale = "1.0"
 
 [architecture.qwen35]
 rope-pairs = "halves"
@@ -250,6 +252,7 @@ feed-forward-activation = "silu"
 expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
+expert-scale = "1.0"
 delta-convolution = "silu"
 delta-output = "sigmoid"
 delta-decay = "softplus"
