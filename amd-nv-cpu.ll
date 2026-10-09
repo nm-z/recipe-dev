@@ -3842,13 +3842,9 @@ define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(
 %rotates = icmp ult i64 %channel, %rotated.wide %inside = icmp ult i64 %local, %dims.wide %active = and i1 %rotates, %inside
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
 %base.wide = call RECIPE_STATE @recipe.decode(double %base) %mscale.wide = call RECIPE_STATE @recipe.decode(double %yarn.mscale) %factor.wide = call RECIPE_STATE @recipe.decode(double %yarn.factor) %low.wide = call RECIPE_STATE @recipe.decode(double %yarn.low) %high.wide = call RECIPE_STATE @recipe.decode(double %yarn.high)
-br i1 %active, label %rotate, label %finish rotate: %upper.halves = icmp uge i64 %local, %half
-%local.pair.bit = urem i64 %local, 2 %upper.pairs = icmp eq i64 1, %local.pair.bit
-%upper = select i1 %pairs, i1 %upper.pairs, i1 %upper.halves
-%local.upper = sub i64 %local, %half %index.halves = select i1 %upper.halves, i64 %local.upper, i64 %local
-%index.pairs = udiv i64 %local, 2 %index = select i1 %pairs, i64 %index.pairs, i64 %index.halves
-%half.stride = mul i64 %half, %length.wide %stride = select i1 %pairs, i64 %length.wide, i64 %half.stride
-%partner.up = add i64 %p, %stride %partner.down = sub i64 %p, %stride
+br i1 %active, label %rotate, label %finish rotate: %upper = icmp uge i64 %local, %half
+%local.upper = sub i64 %local, %half %index = select i1 %upper, i64 %local.upper, i64 %local
+%half.stride = mul i64 %half, %length.wide %partner.up = add i64 %p, %half.stride %partner.down = sub i64 %p, %half.stride
 %partner = select i1 %upper, i64 %partner.down, i64 %partner.up
 %partner.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input, i64 %partner
 %other = load RECIPE_STATE, ptr addrspace(1) %partner.ptr, align RECIPE_STATE_ALIGN
@@ -4586,9 +4582,9 @@ br i1 %mr.more, label %max.reduce.step, label %sum.entry
 max.reduce.step:
 %mr.partner.lane = xor i32 %lane, %mr.offset %mr.partner.index = mul i32 %mr.partner.lane, 4
 %mr.partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %mr.value, i32 %mr.partner.index)
-%mr.empty.float = select i1 %mr.empty, float 1.0, float 0.0
+%mr.empty.float = uitofp i1 %mr.empty to float
 %mr.partner.empty.float = call float @recipe.wave.partner.f32(float %mr.empty.float, i32 %mr.partner.index)
-%mr.partner.empty = fcmp une float %mr.partner.empty.float, 0.0
+%mr.partner.empty = fcmp une float %mr.partner.empty.float, zeroinitializer
 %mr.partner.full = xor i1 %mr.partner.empty, true
 %mr.higher = call i1 @recipe.state.ogt(RECIPE_STATE %mr.partner, RECIPE_STATE %mr.value)
 %mr.better = or i1 %mr.empty, %mr.higher

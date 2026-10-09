@@ -5125,7 +5125,7 @@ impl NativeModelIr {
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin}, i32 0, i32 0 )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
 						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
