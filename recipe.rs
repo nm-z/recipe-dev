@@ -19440,17 +19440,33 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
 }
-/// The yarn correction dims and magnitude scale for either rotary angle, in fp32
-/// and in llama.cpp's operation order: the correction dims as `n_dims *
-/// logf(n_ctx_orig / (n_rot * 2 * pi)) / (2 * logf(base))`, floored and ceiled, and
-/// the magnitude scale as `(0.1 ln s + 1) * (1 / (1 + 0.1 ln s))` times
-/// `1 + 0.1 ln(1 / freq_scale)`, every step rounded to fp32 as its own does.
-/// The `rope-angle` setting selects only the angle, not this formula.
-fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
+fn yarn_parameters(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64, chain: bool) -> Result<(f64, f64, f64)> {
 	require(factor.is_finite() && factor >= 1.0, "yarn factor must be finite and at least one")?;
+	if chain {
+		return yarn_parameters_chain(factor, context, dims, base, fast, slow);
+	}
 	require(context != 0 && dims != 0, "yarn context and dimensions must be positive")?;
 	require(base.is_finite() && base > 1.0, "yarn rotary base must exceed one")?;
 	require(fast.is_finite() && slow.is_finite() && fast > slow && slow > 0.0, "yarn boundaries must be positive and ordered")?;
+	let correction = |value: f64| -> Result<f64> {
+		let value = dims as f64 * (context as f64 / (value * std::f64::consts::TAU)).ln() / (2.0 * base.ln());
+		require(value.is_finite(), "yarn correction dimension is nonfinite")?;
+		Ok(value)
+	};
+	let low = correction(fast)?.floor().max(0.0);
+	let high = correction(slow)?.ceil().min((dims - 1) as f64);
+	require(high >= low, "yarn correction range is empty")?;
+	let high = if high == low { high + 0.001 } else { high };
+	let mscale = 1.0 + 0.1 * factor.ln();
+	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
+	Ok((mscale, low, high))
+}
+/// The yarn values of a chain-angle rope, in fp32 and in llama.cpp's order:
+/// the correction dims as `n_dims * logf(n_ctx_orig / (n_rot * 2 * pi)) / (2 *
+/// logf(base))` floored and ceiled, and the magnitude scale as the attention
+/// factor `(0.1 ln s + 1) * (1 / (1 + 0.1 ln s))` times `1 + 0.1 ln(1 / freq_scale)`,
+/// every step rounded to fp32 as its own does.
+fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fast: f64, slow: f64) -> Result<(f64, f64, f64)> {
 	let (factor, base, fast, slow) = (factor as f32, base as f32, fast as f32, slow as f32);
 	let correction = |rot: f32| -> Result<f32> {
 		let value = dims as f32 * (context as f32 / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
@@ -19569,7 +19585,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 			None => (1.0, 1.0, 0.0, 0.0, 1.0),
 			Some((factor, context, fast, slow)) => {
 				let factor = f64::from_bits(factor);
-				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+				let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
@@ -19628,7 +19644,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				None => (1.0, 1.0, 0.0, 0.0, 1.0),
 				Some((factor, context, fast, slow)) => {
 					let factor = f64::from_bits(factor);
-					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow))?;
+					let (mscale, low, high) = yarn_parameters(factor, context, dims, f64::from_bits(base), f64::from_bits(fast), f64::from_bits(slow), graph.profile.chain_angle)?;
 					(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 				}
 			};
