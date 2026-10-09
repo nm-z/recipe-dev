@@ -8639,6 +8639,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
+		pub(crate) paths: Vec<PathBuf>,
 	}
 	impl Gguf {
 		/// Open one GGUF file or the complete split model it names.
@@ -8646,8 +8647,11 @@ mod gguf {
 			let first = Self::shard(path, 0)?;
 			let count = first.1.iter().find(|(key, _)| key == "split.count").and_then(|(_, value)| value.integer()).unwrap_or(1);
 			let mut shards = vec![first];
+			let mut paths = vec![path.to_path_buf()];
 			for index in 1..count {
-				shards.push(Self::shard(&sibling(path, index, count)?, index)?);
+				let next = sibling(path, index, count)?;
+				shards.push(Self::shard(&next, index)?);
+				paths.push(next);
 			}
 			let (metadata, mut tensors) = (shards[0].1.clone(), Vec::new());
 			let declared = metadata.iter().find(|(key, _)| key == "split.tensors.count").and_then(|(_, value)| value.integer());
@@ -8660,7 +8664,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, paths })
 		}
 		/// Parses one shard's header.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -16389,6 +16393,7 @@ impl Infer {
 			grids: placed.grid_report()?,
 			load: DurationReport(load_seconds),
 			compile: DurationReport(placed.compile_seconds()),
+			residency: placed.residency(),
 			context: sequence,
 			requests: request_history.len(),
 			last: request_history.last().cloned().unwrap_or_default(),
@@ -16904,6 +16909,8 @@ pub struct InferenceReport {
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
+	/// Each tape's weight arena: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
+	pub residency: Vec<WeightResidency>,
 	pub context: usize,
 	pub requests: usize,
 	/// Completed requests in execution order, retained across `/clear`.
@@ -17711,7 +17718,7 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
 /// Build one persistent tape for every contiguous device range of `graph`.
-fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64], source: Option<&RetainedSource>) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, Vec<usize>, usize)> {
 	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
 	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
 	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
@@ -17732,7 +17739,7 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
-		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics)?;
+		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics, source)?;
 		resident[index] = tape.resident_bytes();
 		if index + 1 < split.len() {
 			movement[index] = part.output.channels * precision.bytes();
@@ -17751,7 +17758,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 	let (mut chosen, mut tapes, mut resident, mut movement, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		let (next, ranges, bytes, graph_movement, graph_moved) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats, None)?;
 		if chosen.is_empty() {
 			chosen = next;
 		}
@@ -17782,10 +17789,14 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
 		None => Vec::new(),
 	};
-	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[])?;
+	let retained = retained_source(&model.file)?;
+	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[], retained.as_ref())?;
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
 }
 impl Placed {
+	pub fn residency(&self) -> Vec<WeightResidency> {
+		self.tapes.iter().flatten().map(|tape| tape.residency.clone()).collect()
+	}
 	fn take_tensors(&self) -> Result<Vec<TensorObservation>> {
 		let mut tensors = Vec::new();
 		for ranges in &self.tapes {
@@ -18531,8 +18542,8 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 }
 /// The tape of one part of a split graph on its device, holding the batch
 /// normalization statistics that follow the parts already made.
-fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize) -> Result<NativeTape> {
-	let tape = NativeTape::new(graph, TapeInput::Values(samples), tokens, &[], gpu, precision, None)?;
+fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize, source: Option<&RetainedSource>) -> Result<NativeTape> {
+	let tape = NativeTape::build(graph, TapeInput::Values(samples), tokens, &[], gpu, precision, None, source)?;
 	let count = tape.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
 	tape.inject_bn_stats(bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
@@ -18540,7 +18551,7 @@ fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu,
 }
 /// One part of a split graph run forward on its device.
 fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let tape = range_tape(graph, samples, tokens, gpu, stored.precision, &stored.bn_stats, statistics)?;
+	let tape = range_tape(graph, samples, tokens, gpu, stored.precision, &stored.bn_stats, statistics, None)?;
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
@@ -21138,6 +21149,9 @@ struct NativeTape {
 	targets: Buffer,
 	weights: Buffer,
 	frozen: Buffer,
+	residency: WeightResidency,
+	#[allow(dead_code)]
+	hold: Option<RetainedHold>,
 	moments: Buffer,
 	variances: Buffer,
 	gradient: Buffer,
@@ -21335,6 +21349,9 @@ impl NativeTape {
 	/// lookups of this graph gather rows for; a whole graph reads its own
 	/// samples, and a part of a split graph reads the ids its stream came from.
 	fn new(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+		Self::build(graph, samples, tokens, targets, gpu, precision, loss, None)
+	}
+	fn build(graph: &Graph, samples: TapeInput<'_>, tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>, source: Option<&RetainedSource>) -> Result<Self> {
 		let prepare_started = Instant::now();
 		let training_graph;
 		let graph = if loss.is_some() {
@@ -21404,8 +21421,10 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let weights = Buffer::upload_weights(gpu, graph, precision.model, inference)?;
-		if program.model_load.is_some() {
+		let Acquired { mut weights, mut residency, mut load, hold: reused_hold } = acquire_weights(gpu, graph, precision.model, inference, source)?;
+		let reused = residency.outcome == "reused";
+		let mut hold = reused_hold;
+		if program.model_load.is_some() && !reused {
 			let image = &program.artifact.storage;
 			require(!image.is_empty(), "native model-load storage is empty")?;
 			// One node at a time through one scratch the size of the largest
@@ -21415,6 +21434,8 @@ impl NativeTape {
 			for (node, stored) in &image.segments {
 				if tracing() { trace(&format!("load write node {node} bytes {}", stored.len()))?; }
 				storage.write_runs(0, stored)?;
+				residency.read_bytes += stored.len();
+				residency.uploaded_bytes += stored.len();
 				let index = i32::try_from(*node).map_err(|_| RecipeError::new("native model-load node index exceeds i32"))?;
 				if tracing() { trace(&format!("load dispatch node {node} bytes {} threads {threads}", stored.len()))?; }
 				let mut call = ptrs![weights.pointer, storage.pointer, threads, index];
@@ -21441,8 +21462,12 @@ impl NativeTape {
 					trace(&format!("load node {node} {} wrote {written:?} machine {host:?} bytes {raw:02x?} offset {}", quantization(weight.format.0), offsets[*node]))?;
 				}
 			}
-		} else {
+		} else if program.model_load.is_none() {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
+		}
+		if let Some(pending) = load.take() {
+			weights.seal();
+			hold = Some(pending.commit(&mut residency)?);
 		}
 		// The arenas are cleared on the device rather than staged whole on the
 		// host: a later position reads the zeros the earlier windows left.
@@ -21516,13 +21541,15 @@ impl NativeTape {
 			context_resets,
 			lookups,
 			tokens,
-			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
+			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes, mapped: false, sealed: false },
 			batch_normalizations,
 			samples,
-			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
+			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes, mapped: false, sealed: false },
 			targets: Buffer::upload_float(gpu, &target_buffer, layout.output_precision)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen_mask)?,
+			residency,
+			hold,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
@@ -23128,6 +23155,10 @@ struct Buffer {
 	runtime: &'static Gpu,
 	pointer: u64,
 	bytes: usize,
+	/// A retained arena mapped from a shared file rather than allocated by the runtime.
+	mapped: bool,
+	/// A retained arena a tape reads; writes fail once it is sealed.
+	sealed: bool,
 }
 /// The largest host buffer a zero fill stages at once, so an arena of any size
 /// clears without a host copy of its own size.
@@ -23144,7 +23175,7 @@ impl Buffer {
 	}
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
-		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
+		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes, mapped: false, sealed: false })
 	}
 	/// A device buffer of `bytes` zeros, filled one bounded host block at a time.
 	/// A zeroed buffer with `guard` zeroed bytes on both sides of it; the
@@ -23154,13 +23185,13 @@ impl Buffer {
 			return Self::zeroed(runtime, bytes);
 		}
 		let whole = Self::zeroed(runtime, bytes.max(1) + 2 * guard)?;
-		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1) };
+		let inner = Self { runtime, pointer: whole.pointer + guard as u64, bytes: bytes.max(1), mapped: false, sealed: false };
 		std::mem::forget(whole);
 		Ok(inner)
 	}
 	fn zeroed(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false };
 		let zeros = vec![0_u8; bytes.min(ZERO_FILL_BYTES)];
 		for offset in (0..bytes).step_by(zeros.len()) {
 			buffer.write_bytes(offset, &zeros[..zeros.len().min(bytes - offset)])?;
@@ -23181,26 +23212,37 @@ impl Buffer {
 	/// A device buffer of `bytes` left as allocated, for a scratch every write fills before a read.
 	fn reserve(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
 		let bytes = bytes.max(1);
-		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes })
+		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false })
 	}
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
-	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<Self> {
+	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<(Self, (usize, usize, usize))> {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
-		let bytes = bytes.max(1);
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes.max(1))?, bytes: bytes.max(1), mapped: false, sealed: false };
+		let fill = buffer.fill_weights(graph, &offsets, inference)?;
+		Ok((buffer, fill))
+	}
+	/// Writes every weight node into the arena. Returns the bytes read from the
+	/// stored source, the bytes converted on the host, and the bytes uploaded.
+	fn fill_weights(&self, graph: &Graph, offsets: &[usize], inference: bool) -> Result<(usize, usize, usize)> {
+		let (mut read, mut converted, mut uploaded) = (0, 0, 0);
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
-				buffer.write_runs(offsets[index], &weight.bytes)?;
+				self.write_runs(offsets[index], &weight.bytes)?;
+				read += weight.bytes.len();
+				uploaded += weight.bytes.len();
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
 				// The load kernel writes this node from its stored bytes.
 				continue;
 			} else {
-				buffer.write_bytes(offsets[index], &encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision))?;
+				let encoded = encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], node.precision);
+				converted += encoded.len();
+				uploaded += encoded.len();
+				self.write_bytes(offsets[index], &encoded)?;
 			}
 		}
-		Ok(buffer)
+		Ok((read, converted, uploaded))
 	}
 	fn write_float_bytes(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -23208,6 +23250,7 @@ impl Buffer {
 		self.write_bytes(offset, &encoded)
 	}
 	fn write_bytes(&self, offset: usize, values: &[u8]) -> Result<()> {
+		require(!self.sealed, "retained weights are read-only")?;
 		require(checked_add(offset, values.len(), "GPU byte write")? <= self.bytes, "GPU byte write exceeds buffer")?;
 		self.runtime.upload(self.pointer + offset as u64, values.as_ptr().cast(), values.len()).map(|_| ())
 	}
@@ -23257,8 +23300,508 @@ impl Buffer {
 }
 impl Drop for Buffer {
 	fn drop(&mut self) {
-		self.runtime.free(self.pointer);
+		if self.mapped { unmap_retained(self.pointer, self.bytes) } else { self.runtime.free(self.pointer) }
 	}
+}
+
+impl Buffer {
+	/// A weight arena mapped at a retained address, filled and sealed by its tape.
+	fn retained(runtime: &'static Gpu, pointer: u64, bytes: usize) -> Self {
+		Self { runtime, pointer, bytes, mapped: true, sealed: false }
+	}
+	fn seal(&mut self) {
+		self.sealed = true;
+	}
+}
+/// Weight arenas retained across invocations on the CPU. Each arena is a shared
+/// file mapped at an address recorded in its lease, so a later process maps the
+/// same bytes at the addresses its compiled kernels already name.
+const RETAINED_ROOT: &str = "recipe-retained-v1";
+const RETAINED_BASE: usize = 0x1000_0000_0000;
+const RETAINED_SLOT: usize = 1 << 30;
+const RETAINED_SLOTS: u64 = 1 << 16;
+const SHA256_ROUNDS: [u32; 64] = [
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+struct Sha256 {
+	state: [u32; 8],
+	block: [u8; 64],
+	filled: usize,
+	length: u64,
+}
+impl Sha256 {
+	fn new() -> Self {
+		Self { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], block: [0; 64], filled: 0, length: 0 }
+	}
+	fn compress(&mut self, block: &[u8; 64]) {
+		let mut words = [0_u32; 64];
+		for (index, chunk) in block.chunks_exact(4).enumerate() {
+			words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+		}
+		for index in 16..64 {
+			let early = words[index - 15];
+			let late = words[index - 2];
+			let small_early = early.rotate_right(7) ^ early.rotate_right(18) ^ (early >> 3);
+			let small_late = late.rotate_right(17) ^ late.rotate_right(19) ^ (late >> 10);
+			words[index] = words[index - 16].wrapping_add(small_early).wrapping_add(words[index - 7]).wrapping_add(small_late);
+		}
+		let mut v = self.state;
+		for index in 0..64 {
+			let big_e = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+			let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
+			let first = v[7].wrapping_add(big_e).wrapping_add(choose).wrapping_add(SHA256_ROUNDS[index]).wrapping_add(words[index]);
+			let big_a = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+			let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+			let second = big_a.wrapping_add(majority);
+			v = [first.wrapping_add(second), v[0], v[1], v[2], v[3].wrapping_add(first), v[4], v[5], v[6]];
+		}
+		for (state, value) in self.state.iter_mut().zip(v) {
+			*state = state.wrapping_add(value);
+		}
+	}
+	fn update(&mut self, mut data: &[u8]) {
+		self.length = self.length.wrapping_add(data.len() as u64);
+		if self.filled > 0 {
+			let take = (64 - self.filled).min(data.len());
+			self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+			self.filled += take;
+			data = &data[take..];
+			if self.filled < 64 {
+				return;
+			}
+			let block = self.block;
+			self.compress(&block);
+			self.filled = 0;
+		}
+		let mut chunks = data.chunks_exact(64);
+		for chunk in &mut chunks {
+			self.compress(chunk.try_into().expect("64-byte chunk"));
+		}
+		let rest = chunks.remainder();
+		self.block[..rest.len()].copy_from_slice(rest);
+		self.filled = rest.len();
+	}
+	fn finish(mut self) -> [u8; 32] {
+		let bits = self.length.wrapping_mul(8);
+		self.block[self.filled] = 0x80;
+		self.filled += 1;
+		if self.filled > 56 {
+			self.block[self.filled..].fill(0);
+			let block = self.block;
+			self.compress(&block);
+			self.filled = 0;
+		}
+		self.block[self.filled..56].fill(0);
+		self.block[56..].copy_from_slice(&bits.to_be_bytes());
+		let block = self.block;
+		self.compress(&block);
+		let mut digest = [0_u8; 32];
+		for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+			chunk.copy_from_slice(&word.to_be_bytes());
+		}
+		digest
+	}
+}
+fn sha256(data: &[u8]) -> [u8; 32] {
+	let mut hash = Sha256::new();
+	hash.update(data);
+	hash.finish()
+}
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+	use std::io::Read as _;
+	let unreadable = |error: std::io::Error| RecipeError::new(format!("cannot read {}: {error}", path.display()));
+	let mut file = fs::File::open(path).map_err(unreadable)?;
+	let mut hash = Sha256::new();
+	let mut buffer = vec![0_u8; 1 << 20];
+	loop {
+		let read = file.read(&mut buffer).map_err(unreadable)?;
+		if read == 0 {
+			return Ok(hash.finish());
+		}
+		hash.update(&buffer[..read]);
+	}
+}
+fn hex(bytes: &[u8]) -> String {
+	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+fn unhex(text: &str) -> Option<[u8; 32]> {
+	if text.len() != 64 {
+		return None;
+	}
+	let mut digest = [0_u8; 32];
+	for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+		digest[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+	}
+	Some(digest)
+}
+fn unix_now() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
+}
+fn private_directory(path: &Path) -> Result<()> {
+	use std::os::unix::fs::DirBuilderExt as _;
+	fs::DirBuilder::new().recursive(true).mode(0o700).create(path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", path.display())))
+}
+fn retained_root() -> Result<PathBuf> {
+	let root = home_directory()?.join(".cache").join("recipe").join("retained");
+	private_directory(&root)?;
+	Ok(root)
+}
+/// The content identity of a GGUF source: the SHA-256 of each shard, cached
+/// beside the stat stamp of that shard. A stamp change rehashes the shard.
+fn source_digest(paths: &[PathBuf], root: &Path) -> Result<[u8; 32]> {
+	use std::os::unix::fs::MetadataExt as _;
+	let cache = root.join("sources");
+	private_directory(&cache)?;
+	let mut combined = Sha256::new();
+	for path in paths {
+		let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+		let canonical = fs::canonicalize(path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?;
+		let name = canonical.display().to_string();
+		let stamp = format!("{} {} {} {} {} {} {}", metadata.len(), metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec());
+		let entry = cache.join(format!("{}.stamp", hex(&sha256(name.as_bytes()))));
+		let cached = fs::read_to_string(&entry).ok().and_then(|text| {
+			let mut lines = text.lines();
+			if lines.next()? != stamp {
+				return None;
+			}
+			unhex(lines.next()?)
+		});
+		let digest = match cached {
+			Some(digest) => digest,
+			None => {
+				let digest = sha256_file(path)?;
+				fs::write(&entry, format!("{stamp}\n{}\n", hex(&digest))).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", entry.display())))?;
+				digest
+			}
+		};
+		combined.update(name.as_bytes());
+		combined.update(&digest);
+	}
+	Ok(combined.finish())
+}
+/// Lease and loading records, one `name value` pair per line.
+type Fields = std::collections::BTreeMap<String, String>;
+fn read_fields(path: &Path, owner: u32) -> Option<Fields> {
+	use std::os::unix::fs::MetadataExt as _;
+	if fs::metadata(path).ok()?.uid() != owner {
+		return None;
+	}
+	let text = fs::read_to_string(path).ok()?;
+	Some(text.lines().filter_map(|line| line.split_once(' ')).map(|(name, value)| (name.to_owned(), value.to_owned())).collect())
+}
+fn write_fields(path: &Path, fields: &Fields) -> Result<()> {
+	let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+	let text: String = fields.iter().map(|(name, value)| format!("{name} {value}\n")).collect();
+	fs::write(&temporary, text).and_then(|()| fs::rename(&temporary, path)).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+}
+fn field_number(fields: &Fields, name: &str) -> Option<u64> {
+	fields.get(name)?.parse().ok()
+}
+fn field_address(fields: &Fields, name: &str) -> Option<usize> {
+	usize::from_str_radix(fields.get(name)?.trim_start_matches("0x"), 16).ok()
+}
+/// The start time of a process, used to tell a live holder from a reused pid.
+fn process_start(pid: u32) -> Option<u64> {
+	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+	stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+fn holder_alive(holder: Option<&String>) -> bool {
+	let Some(holder) = holder else { return false };
+	let mut parts = holder.split_whitespace().map(|part| part.parse::<u64>().ok());
+	let (Some(Some(pid)), Some(Some(start))) = (parts.next(), parts.next()) else { return false };
+	process_start(pid as u32) == Some(start)
+}
+fn remove_retained(lease: &Path) {
+	fs::remove_file(lease).ok();
+	fs::remove_file(lease.with_extension("loading")).ok();
+	fs::remove_file(lease.with_extension("arena")).ok();
+}
+/// Releases expired leases and recovers loads whose holder has exited.
+fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
+	let (mut released, mut recovered) = (0, 0);
+	let Ok(entries) = fs::read_dir(root) else { return (0, 0) };
+	for entry in entries.flatten() {
+		let path = entry.path();
+		let Some(fields) = read_fields(&path, owner) else { continue };
+		match path.extension().and_then(|extension| extension.to_str()) {
+			Some("lease") if field_number(&fields, "expires").is_some_and(|expires| expires <= now) => {
+				remove_retained(&path);
+				released += 1;
+			}
+			Some("loading") if !holder_alive(fields.get("holder")) => {
+				remove_retained(&path);
+				recovered += 1;
+			}
+			_ => {}
+		}
+	}
+	(released, recovered)
+}
+/// Removes retained arenas of this source whose content no longer matches.
+fn invalidate_sources(root: &Path, owner: u32, source: &str, digest: &str) -> usize {
+	let Ok(entries) = fs::read_dir(root) else { return 0 };
+	let mut removed = 0;
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.extension().and_then(|extension| extension.to_str()) != Some("lease") {
+			continue;
+		}
+		let Some(fields) = read_fields(&path, owner) else { continue };
+		if fields.get("source").map(String::as_str) == Some(source) && fields.get("source_digest").map(String::as_str) != Some(digest) {
+			remove_retained(&path);
+			removed += 1;
+		}
+	}
+	removed
+}
+fn renew_retained(lease: &Path, owner: u32, ttl: u64) {
+	let Some(mut fields) = read_fields(lease, owner) else { return };
+	fields.insert("expires".to_owned(), (unix_now() + ttl).to_string());
+	write_fields(lease, &fields).ok();
+}
+fn retained_length(bytes: usize) -> usize {
+	bytes.max(1).next_multiple_of(4096)
+}
+unsafe extern "C" {
+	#[link_name = "mmap"]
+	fn retained_map(address: *mut std::ffi::c_void, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> *mut std::ffi::c_void;
+	#[link_name = "munmap"]
+	fn retained_unmap(address: *mut std::ffi::c_void, length: usize) -> i32;
+}
+/// Maps the arena file at `address` when that range is free.
+fn map_retained(arena: &fs::File, bytes: usize, address: usize) -> Option<u64> {
+	use std::os::fd::AsRawFd as _;
+	const READ_WRITE: i32 = 0x1 | 0x2;
+	const SHARED_FIXED_NOREPLACE: i32 = 0x01 | 0x10_0000;
+	let length = retained_length(bytes);
+	let pointer = unsafe { retained_map(address as *mut _, length, READ_WRITE, SHARED_FIXED_NOREPLACE, arena.as_raw_fd(), 0) };
+	if pointer as isize == -1 {
+		return None;
+	}
+	// Kernels without MAP_FIXED_NOREPLACE treat the address as a hint.
+	if pointer as usize != address {
+		unsafe { retained_unmap(pointer, length) };
+		return None;
+	}
+	Some(address as u64)
+}
+fn unmap_retained(pointer: u64, bytes: usize) {
+	unsafe { retained_unmap(pointer as *mut _, retained_length(bytes)) };
+}
+/// The source a placement retains weights for: the GGUF shards, their content
+/// digest, the label used for invalidation, and the lease lifetime in seconds.
+pub(crate) struct RetainedSource {
+	digest: [u8; 32],
+	path: String,
+	ttl: u64,
+}
+fn retained_source(file: &Gguf) -> Result<Option<RetainedSource>> {
+	let Some(minutes) = std::env::var("RECIPE_TTL").ok().map(|value| value.parse::<u64>().map_err(|_| RecipeError::new("--ttl must be a non-negative whole number of minutes"))).transpose()? else {
+		return Ok(None);
+	};
+	let root = retained_root()?;
+	let path = file.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(";");
+	let ttl = minutes.checked_mul(60).ok_or_else(|| RecipeError::new("--ttl is too large"))?;
+	Ok(Some(RetainedSource { digest: source_digest(&file.paths, &root)?, path, ttl }))
+}
+/// Whether a tape's weights came from a retained arena, and what that arena cost.
+#[derive(Clone, Debug, Default)]
+pub struct WeightResidency {
+	pub device: String,
+	/// `private` without a TTL, `created`, `reused`, or `bypassed` with a reason.
+	pub outcome: &'static str,
+	pub reason: String,
+	/// The first 16 hex digits of the retained-allocation identity.
+	pub identity: String,
+	/// The address of the retained arena, or zero when the arena is private.
+	pub address: usize,
+	pub bytes: usize,
+	/// Stored source bytes staged for the arena, read in this invocation.
+	pub read_bytes: usize,
+	/// Parameter bytes encoded on the host in this invocation.
+	pub converted_bytes: usize,
+	/// Bytes copied into the arena in this invocation.
+	pub uploaded_bytes: usize,
+	/// Unix seconds when the retained arena expires, or zero when it is private.
+	pub expires: u64,
+	/// Expired or superseded arenas removed by this invocation.
+	pub released: usize,
+	/// Interrupted loads recovered by this invocation.
+	pub recovered: usize,
+}
+/// Keeps a retained arena's lease alive for its TTL after the tape is dropped.
+pub(crate) struct RetainedHold {
+	lease: PathBuf,
+	ttl: u64,
+	owner: u32,
+}
+impl Drop for RetainedHold {
+	fn drop(&mut self) {
+		renew_retained(&self.lease, self.owner, self.ttl);
+	}
+}
+/// A retained arena being created. Its lease is written once the weights and
+/// model-load kernel have finished; an earlier exit leaves a loading record
+/// that the next invocation recovers.
+struct RetainedLoad {
+	lease: PathBuf,
+	loading: PathBuf,
+	owner: u32,
+	ttl: u64,
+	fields: Fields,
+}
+impl RetainedLoad {
+	fn commit(mut self, residency: &mut WeightResidency) -> Result<RetainedHold> {
+		let expires = unix_now() + self.ttl;
+		self.fields.insert("state".to_owned(), "ready".to_owned());
+		self.fields.insert("expires".to_owned(), expires.to_string());
+		write_fields(&self.lease, &self.fields)?;
+		fs::remove_file(&self.loading).ok();
+		residency.expires = expires;
+		Ok(RetainedHold { lease: self.lease, ttl: self.ttl, owner: self.owner })
+	}
+}
+/// One tape's weight arena and the residency decision that produced it.
+struct Acquired {
+	weights: Buffer,
+	residency: WeightResidency,
+	load: Option<RetainedLoad>,
+	hold: Option<RetainedHold>,
+}
+fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, reason: &str) -> Result<Acquired> {
+	let (weights, (read_bytes, converted_bytes, uploaded_bytes)) = Buffer::upload_weights(gpu, graph, precision, inference)?;
+	let residency = WeightResidency {
+		device: gpu.name.clone(),
+		outcome: if reason.is_empty() { "private" } else { "bypassed" },
+		reason: reason.to_owned(),
+		bytes: weights.bytes,
+		read_bytes,
+		converted_bytes,
+		uploaded_bytes,
+		..Default::default()
+	};
+	Ok(Acquired { weights, residency, load: None, hold: None })
+}
+/// The buffer interface of the weight arena: offsets, sizes, precisions, and
+/// stored representations of every weighted node. Node operations and indices
+/// are excluded, so a kernel-only change keeps a compatible arena.
+fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
+	let mut text = format!("bytes {bytes}\n");
+	for (index, node) in graph.nodes.iter().enumerate() {
+		let stored = graph.stored.get(index).and_then(Option::as_ref);
+		if node.parameters == 0 && stored.is_none() && !node.packed {
+			continue;
+		}
+		let storage = stored.map_or("none".to_owned(), |weight| format!("{}:{}:{}", quantization(weight.format.0), weight.count, weight.segments.len()));
+		text.push_str(&format!("{} {} {} {} {} {storage}\n", offsets[index], node.parameters, node.precision.label(), node.int_bits, node.packed));
+	}
+	text
+}
+#[cfg(target_os = "linux")]
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, source: Option<&RetainedSource>) -> Result<Acquired> {
+	use std::io::Write as _;
+	use std::os::unix::fs::MetadataExt as _;
+	let Some(source) = source else { return private_weights(gpu, graph, precision, inference, "") };
+	if !inference {
+		return private_weights(gpu, graph, precision, inference, "training weights are mutable");
+	}
+	if !matches!(gpu.driver, Driver::Cpu) {
+		return private_weights(gpu, graph, precision, inference, "device weights are not retained on this device");
+	}
+	let root = retained_root()?;
+	let owner = fs::metadata(&root).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", root.display())))?.uid();
+	let now = unix_now();
+	let (released, recovered) = sweep_retained(&root, owner, now);
+	let (offsets, arena) = native_weight_arena(graph, precision, inference)?;
+	let bytes = arena.max(1);
+	let digest = hex(&source.digest);
+	let interface = weight_interface(graph, &offsets, bytes);
+	let identity = format!(
+		"{RETAINED_ROOT}\nsource {}\nsource_digest {digest}\ninterface {interface}\ndevice {}\ntarget {}\nprecision {}\n",
+		source.path,
+		gpu.name,
+		native_target_label(&gpu.native_target),
+		precision.label()
+	);
+	let key = hex(&sha256(identity.as_bytes()));
+	let invalidated = invalidate_sources(&root, owner, &source.path, &digest);
+	let lease = root.join(format!("{key}.lease"));
+	let loading = root.join(format!("{key}.loading"));
+	let arena_path = root.join(format!("{key}.arena"));
+	let mut residency = WeightResidency { device: gpu.name.clone(), outcome: "created", identity: key[..16].to_owned(), bytes, released: released + invalidated, recovered, ..Default::default() };
+	if let Some(fields) = read_fields(&lease, owner) {
+		let current = field_number(&fields, "expires").is_some_and(|expires| expires > now) && field_number(&fields, "bytes") == Some(bytes as u64);
+		if current {
+			let mapped = fs::OpenOptions::new().read(true).write(true).open(&arena_path).ok().zip(field_address(&fields, "address")).and_then(|(file, address)| map_retained(&file, bytes, address));
+			let Some(pointer) = mapped else {
+				return private_weights(gpu, graph, precision, inference, "retained address is unavailable");
+			};
+			let expires = now + source.ttl;
+			let mut renewed = fields;
+			renewed.insert("expires".to_owned(), expires.to_string());
+			write_fields(&lease, &renewed)?;
+			let mut weights = Buffer::retained(gpu, pointer, bytes);
+			weights.seal();
+			residency.outcome = "reused";
+			residency.address = pointer as usize;
+			residency.expires = expires;
+			return Ok(Acquired { weights, residency, load: None, hold: Some(RetainedHold { lease, ttl: source.ttl, owner }) });
+		}
+	}
+	let mut claimed = false;
+	for _ in 0..2 {
+		match fs::OpenOptions::new().write(true).create_new(true).open(&loading) {
+			Ok(mut file) => {
+				let holder = format!("holder {} {}\n", std::process::id(), process_start(std::process::id()).unwrap_or(0));
+				file.write_all(holder.as_bytes()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", loading.display())))?;
+				claimed = true;
+				break;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+				let stale = read_fields(&loading, owner).is_some_and(|fields| !holder_alive(fields.get("holder")));
+				if !stale {
+					return private_weights(gpu, graph, precision, inference, "another process is loading these weights");
+				}
+				remove_retained(&lease);
+				residency.recovered += 1;
+			}
+			Err(error) => return Err(RecipeError::new(format!("cannot create {}: {error}", loading.display()))),
+		}
+	}
+	if !claimed {
+		return private_weights(gpu, graph, precision, inference, "another process is loading these weights");
+	}
+	let arena_file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&arena_path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", arena_path.display())))?;
+	arena_file.set_len(retained_length(bytes) as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", arena_path.display())))?;
+	let slot = u64::from_str_radix(&key[..16], 16).unwrap_or(0) % RETAINED_SLOTS;
+	let mapped = (0..64).find_map(|attempt| {
+		let address = RETAINED_BASE + ((slot + attempt) % RETAINED_SLOTS) as usize * RETAINED_SLOT;
+		map_retained(&arena_file, bytes, address)
+	});
+	let Some(pointer) = mapped else {
+		remove_retained(&lease);
+		return private_weights(gpu, graph, precision, inference, "no retained address is free");
+	};
+	let weights = Buffer::retained(gpu, pointer, bytes);
+	let (read_bytes, converted_bytes, uploaded_bytes) = weights.fill_weights(graph, &offsets, inference)?;
+	residency.address = pointer as usize;
+	residency.read_bytes = read_bytes;
+	residency.converted_bytes = converted_bytes;
+	residency.uploaded_bytes = uploaded_bytes;
+	let fields = Fields::from([
+		("address".to_owned(), format!("{pointer:#x}")),
+		("bytes".to_owned(), bytes.to_string()),
+		("source".to_owned(), source.path.clone()),
+		("source_digest".to_owned(), digest),
+	]);
+	Ok(Acquired { weights, residency, load: Some(RetainedLoad { lease, loading, owner, ttl: source.ttl, fields }), hold: None })
+}
+#[cfg(not(target_os = "linux"))]
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, _source: Option<&RetainedSource>) -> Result<Acquired> {
+	private_weights(gpu, graph, precision, inference, "retained weights require Linux")
 }
 #[derive(Clone, Copy)]
 struct Kernel {
