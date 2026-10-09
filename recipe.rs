@@ -20978,6 +20978,7 @@ impl Primitive {
 			Primitive::Lookup => "lookup",
 			Primitive::Fold => "fold",
 			Primitive::Last => "last",
+			Primitive::Exchange => "exchange",
 		}
 	}
 }
