@@ -15330,6 +15330,8 @@ struct Architecture {
 	delta_activation: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
 }
 #[derive(Clone, Copy)]
 enum PleGateChoice { SignedRootSigmoid }
@@ -15348,6 +15350,8 @@ struct ArchitectureDraft {
 	ple_gate: Option<PleGateChoice>,
 	ple_floor: Option<u64>,
 	ple_width_scaled: Option<bool>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -15364,7 +15368,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -15408,6 +15412,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"delta-output" => current.output = Some(architecture_activation(value)?),
 			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
 			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
+			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
+			"expert-activation" => current.expert_activation = Some(architecture_activation(value)?),
 			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
 			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
 			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
@@ -15519,6 +15525,8 @@ struct Builder<'a> {
 	delta_activation: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15564,7 +15572,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15934,7 +15942,8 @@ impl<'a> Builder<'a> {
 			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
-		Ok(branch.glu(hidden, Activation::Silu))
+		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
+		Ok(branch.glu(hidden, activation))
 	}
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
@@ -15942,7 +15951,8 @@ impl<'a> Builder<'a> {
 		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
 		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
 		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
-		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
+		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
 	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
@@ -16610,7 +16620,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
