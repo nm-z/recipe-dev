@@ -24355,14 +24355,16 @@ impl NativeTape {
 		observed(end, seconds);
 		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
 			let count = self.program.artifact.layout.precisions.len();
-			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			let mut ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			// The last node has no entry stamp after it; the kernel's final timestamp ends its interval.
+			ticks.push(self.kernel_ticks()?[1]);
 			if tuning && let Some(tuner) = tuner.as_mut() {
 				tuner.observe(&ticks);
 			}
 			if tracing() {
 				let unit = match self.program.backend { NativeBackend::Cpu(_) => "ns", _ => "ticks" };
 				let mut line = format!("clocks window {begin}..{end} {unit}");
-				for index in 1..count {
+				for index in 1..ticks.len() {
 					line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
 				}
 				line.push_str(&format!(" device={}", self.device_label()?));
@@ -24800,10 +24802,13 @@ impl NativeTape {
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
 	}
-	/// The last dispatch on the device's own clock: from the leading worker's
-	/// entry mark to the last worker's exit.
+	/// The last dispatch's entry and exit marks on the device's own clock.
+	fn kernel_ticks(&self) -> Result<Vec<i64>> {
+		self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)
+	}
+	/// The last dispatch in seconds: from the leading worker's entry mark to the last worker's exit.
 	fn kernel_seconds(&self) -> Result<f64> {
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		let ticks = self.kernel_ticks()?;
 		Ok(ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9)
 	}
 	fn epoch_metrics(&self) -> Result<EpochMetrics> {
