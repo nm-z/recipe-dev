@@ -18160,7 +18160,7 @@ impl<'a> Builder<'a> {
 		} else {
 			(tensors.q_bias, tensors.k_bias, tensors.v_bias) = (None, None, None);
 		}
-		if values_from_keys { tensors.v = None; } else { self.require_tensors(&[name("attn_v.weight")], "values-from-keys", "false")?; }
+		if fused || values_from_keys { tensors.v = None; } else { self.require_tensors(&[name("attn_v.weight")], "values-from-keys", "false")?; }
 		if !normalized { (tensors.q_norm, tensors.k_norm) = (None, None); }
 		if !factors {
 			tensors.factors = None;
