@@ -19041,7 +19041,7 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&key, index * head, &order, width)?);
 		}
 		planes.push(value);
-		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		let mut slot = planes;
 		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
 		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
 			// The bias row follows the matrix rows, in the order the planes read them.
