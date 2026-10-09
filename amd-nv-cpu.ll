@@ -5369,7 +5369,8 @@ ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly 
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
-i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin ) #3 { entry:
+i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin, i32 %query.capacity ) #3 { entry:
+%query.capacity.wide = zext i32 %query.capacity to i64
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -5408,7 +5409,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %query.tiles.rounded = add i32 %query.span, %tile.m.less.one
 %query.tiles = udiv i32 %query.tiles.rounded, %tile.m
 %head.jobs = mul i32 %rows, %heads
-%statistics.plane = mul i32 %head.jobs, %length
+%statistics.plane = mul i32 %head.jobs, %query.capacity
 %representative.base = mul i32 %statistics.plane, 2
 %representative.stride = mul i32 %blocks, %index.width
 %representative.total = mul i32 %representative.stride, %rows
@@ -5418,11 +5419,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %index.query.channels.global = mul i64 %index.heads.global, %index.width.global %index.channels.global = add i64 %index.query.channels.global, %index.width.global %index.plane.global = mul i64 %index.channels.global, %length.global
 %gate.plane.global = select i1 %gate, i64 %from.global, i64 0 %index.query.base.global = add i64 %from.global, %kv.planes.global %gate.base.global = add i64 %index.query.base.global, 0 %row.stride.global = add i64 %gate.base.global, %gate.plane.global
 %blocks.numerator.global = add i64 %length.global, %block.divisor.global %blocks.less.global = sub i64 %blocks.numerator.global, 1 %blocks.full.global = udiv i64 %blocks.less.global, %block.divisor.global %blocks.selected.global = select i1 %select, i64 %blocks.full.global, i64 0
-%score.stride.global = mul i64 %blocks.selected.global, 2 %head.jobs.global = mul i64 %rows.global, %heads.global %statistics.plane.global = mul i64 %head.jobs.global, %length.global %representative.base.global = mul i64 %statistics.plane.global, 2 %representative.stride.global = mul i64 %blocks.selected.global, %index.width.global %representative.total.global = mul i64 %representative.stride.global, %rows.global %score.base.global = add i64 %representative.base.global, %representative.total.global
+%score.stride.global = mul i64 %blocks.selected.global, 2 %head.jobs.global = mul i64 %rows.global, %heads.global %statistics.plane.global = mul i64 %head.jobs.global, %query.capacity.wide %representative.base.global = mul i64 %statistics.plane.global, 2 %representative.stride.global = mul i64 %blocks.selected.global, %index.width.global %representative.total.global = mul i64 %representative.stride.global, %rows.global %score.base.global = add i64 %representative.base.global, %representative.total.global
 %score.base.wide = add i64 %score.base.global, 0
 %length.wide = add i64 %length.global, 0
 %score.stride.wide = add i64 %score.stride.global, 0
-%score.row.stride = mul i64 %length.wide, %score.stride.wide
+%score.row.stride = mul i64 %query.capacity.wide, %score.stride.wide
 %jobs = mul i32 %head.jobs, %query.tiles
 %query.values = mul i32 %tile.m, %head.width
 %key.values = mul i32 %tile.n, %head.width
