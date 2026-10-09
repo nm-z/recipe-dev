@@ -322,10 +322,23 @@ define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyct
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
-declare i64 @llvm.readcyclecounter()
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
+RECIPE_CLOCK
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
+/// The CPU node clock in nanoseconds. Unix reads the monotonic clock, which is
+/// one clock for every core: the time-stamp counter is not synchronized across
+/// cores on every machine, and a node's thread can move between cores. Windows
+/// has no `clock_gettime` in its link set, so it reads the cycle counter, which
+/// Recipe calibrates against `Instant` on the host.
+fn cpu_clock(os: &str) -> String {
+	if os == "windows" {
+		return "declare i64 @llvm.readcyclecounter()\ndefine internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }".to_string();
+	}
+	let monotonic = if os == "macos" { 6 } else { 1 };
+	format!(
+		"declare i32 @clock_gettime(i32, ptr)\ndefine internal i64 @recipe.clock() #1 {{ entry: %ts = alloca [2 x i64], align 8 %status = call i32 @clock_gettime(i32 {monotonic}, ptr %ts) %seconds = load i64, ptr %ts, align 8 %nanoseconds.ptr = getelementptr [2 x i64], ptr %ts, i64 0, i64 1 %nanoseconds = load i64, ptr %nanoseconds.ptr, align 8 %scaled = mul i64 %seconds, 1000000000 %now = add i64 %scaled, %nanoseconds ret i64 %now }}"
+	)
+}
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
 /// state, none under a double one.
 /// The int8 activation record of one 32-input step: the step's scale in the
@@ -1936,7 +1949,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let mut ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", &IDENTITY_WAVE_HELPERS.replace("RECIPE_CLOCK", &cpu_clock(os))).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}

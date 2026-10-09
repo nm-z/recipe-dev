@@ -22533,8 +22533,9 @@ impl TapeTiming {
 		Ok(Self { work, totals, measured, peak })
 	}
 }
-/// The counter that `recipe.clock` reads, as the host reads it: the synchronized
-/// counter LLVM lowers `llvm.readcyclecounter` to on each target.
+/// The counter that `recipe.clock` reads on Windows, as the host reads it: the
+/// synchronized counter LLVM lowers `llvm.readcyclecounter` to on each target.
+#[cfg(windows)]
 fn read_counter() -> Option<u64> {
 	#[cfg(target_arch = "x86_64")]
 	{ Some(unsafe { std::arch::x86_64::_rdtsc() }) }
@@ -22547,20 +22548,26 @@ fn read_counter() -> Option<u64> {
 	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 	{ None }
 }
-/// Seconds per counter tick, calibrated once per process against the host
-/// monotonic clock over a short host-side spin at first use. The spin runs
-/// outside any inference dispatch. It is `None` where no counter can be read.
+/// Seconds per tick of the node clock. Unix nodes read the monotonic clock in
+/// nanoseconds. Windows nodes read the cycle counter, calibrated once per
+/// process against the host monotonic clock over a short host-side spin at first
+/// use, outside any inference dispatch. It is `None` where no counter can be read.
 fn clock_seconds_per_tick() -> Option<f64> {
-	static RATE: OnceLock<Option<f64>> = OnceLock::new();
-	*RATE.get_or_init(|| {
-		let first = read_counter()?;
-		let begin = Instant::now();
-		while begin.elapsed() < Duration::from_millis(50) { std::hint::spin_loop(); }
-		let seconds = begin.elapsed().as_secs_f64();
-		let last = read_counter()?;
-		let ticks = last.wrapping_sub(first) as f64;
-		(ticks > 0.0).then(|| seconds / ticks)
-	})
+	#[cfg(not(windows))]
+	{ Some(1e-9) }
+	#[cfg(windows)]
+	{
+		static RATE: OnceLock<Option<f64>> = OnceLock::new();
+		*RATE.get_or_init(|| {
+			let first = read_counter()?;
+			let begin = Instant::now();
+			while begin.elapsed() < Duration::from_millis(50) { std::hint::spin_loop(); }
+			let seconds = begin.elapsed().as_secs_f64();
+			let last = read_counter()?;
+			let ticks = last.wrapping_sub(first) as f64;
+			(ticks > 0.0).then(|| seconds / ticks)
+		})
+	}
 }
 /// Adds one forward window to every node's totals. A node's measured time runs
 /// from its clock to the next node's clock, and the last node runs to completion.
