@@ -9070,3 +9070,835 @@ invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = 
 !3 = distinct !{!3, !1}
 !4 = distinct !{!4, !1}
 !5 = distinct !{!5, !1}
+
+; TURBOQUANT BEGIN
+; Key-value cache storage by TurboQuant: every head vector is scaled to unit length, rotated by a
+; randomized Walsh-Hadamard transform, and each coordinate goes to a Lloyd-Max codebook of a unit
+; Gaussian. A key also keeps one bit per coordinate: the sign of a second randomized transform of
+; the residual, with the residual's length, so that a query's inner product with the key is unbiased
+; (the QJL correction). A value keeps only its codes. All arithmetic here is in double.
+define internal double @tq.sign(i32 %seed, i32 %i) #1 {
+entry:
+%a = add i32 %i, 1
+%b = mul i32 %a, -1640531535
+%c = mul i32 %seed, -2048144789
+%x = xor i32 %b, %c
+%x1 = lshr i32 %x, 15
+%x2 = xor i32 %x, %x1
+%x3 = mul i32 %x2, 739982445
+%x4 = lshr i32 %x3, 13
+%x5 = xor i32 %x3, %x4
+%x6 = mul i32 %x5, -1028477387
+%x7 = lshr i32 %x6, 16
+%x8 = xor i32 %x6, %x7
+%bit = and i32 %x8, 1
+%minus = icmp eq i32 %bit, 0
+%result = select i1 %minus, double -1.0, double 1.0
+ret double %result
+}
+define internal void @tq.hadamard(ptr addrspace(5) %v, i32 %n) #1 {
+entry:
+%pairs = lshr i32 %n, 1
+br label %span.loop
+span.loop:
+%h = phi i32 [ 1, %entry ], [ %h.next, %span.next ]
+%h.more = icmp ult i32 %h, %n
+br i1 %h.more, label %pair.loop, label %done
+pair.loop:
+%p = phi i32 [ 0, %span.loop ], [ %p.next, %pair.step ]
+%p.more = icmp ult i32 %p, %pairs
+br i1 %p.more, label %pair.step, label %span.next
+pair.step:
+%hi = udiv i32 %p, %h
+%lo = urem i32 %p, %h
+%h2 = shl i32 %h, 1
+%base = mul i32 %hi, %h2
+%ia = add i32 %base, %lo
+%ib = add i32 %ia, %h
+%pa = getelementptr double, ptr addrspace(5) %v, i32 %ia
+%pb = getelementptr double, ptr addrspace(5) %v, i32 %ib
+%a = load double, ptr addrspace(5) %pa, align 8
+%b = load double, ptr addrspace(5) %pb, align 8
+%s = fadd double %a, %b
+%t = fsub double %a, %b
+store double %s, ptr addrspace(5) %pa, align 8
+store double %t, ptr addrspace(5) %pb, align 8
+%p.next = add i32 %p, 1
+br label %pair.loop
+span.next:
+%h.next = shl i32 %h, 1
+br label %span.loop
+done:
+ret void
+}
+; v[i] *= sign(seed, i) * factor
+define internal void @tq.diagonal(ptr addrspace(5) %v, i32 %n, i32 %seed, double %factor) #1 {
+entry:
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
+%more = icmp ult i32 %i, %n
+br i1 %more, label %step, label %done
+step:
+%s = call double @tq.sign(i32 %seed, i32 %i)
+%p = getelementptr double, ptr addrspace(5) %v, i32 %i
+%x = load double, ptr addrspace(5) %p, align 8
+%y = fmul double %x, %s
+%z = fmul double %y, %factor
+store double %z, ptr addrspace(5) %p, align 8
+%i.next = add i32 %i, 1
+br label %loop
+done:
+ret void
+}
+define internal void @tq.scale(ptr addrspace(5) %v, i32 %n, double %factor) #1 {
+entry:
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
+%more = icmp ult i32 %i, %n
+br i1 %more, label %step, label %done
+step:
+%p = getelementptr double, ptr addrspace(5) %v, i32 %i
+%x = load double, ptr addrspace(5) %p, align 8
+%y = fmul double %x, %factor
+store double %y, ptr addrspace(5) %p, align 8
+%i.next = add i32 %i, 1
+br label %loop
+done:
+ret void
+}
+; The orthonormal rotation
+; (1/sqrt(n)) H D and its inverse D H (1/sqrt(n)).
+define internal void @tq.rotate(ptr addrspace(5) %v, i32 %n, i32 %seed) #1 {
+entry:
+%nd = call double @recipe.from.u32(i32 %n)
+%root = call double @recipe.sqrt(double %nd)
+%inverse = fdiv double 1.0, %root
+call void @tq.diagonal(ptr addrspace(5) %v, i32 %n, i32 %seed, double 1.0)
+call void @tq.hadamard(ptr addrspace(5) %v, i32 %n)
+call void @tq.scale(ptr addrspace(5) %v, i32 %n, double %inverse)
+ret void
+}
+define internal void @tq.unrotate(ptr addrspace(5) %v, i32 %n, i32 %seed) #1 {
+entry:
+%nd = call double @recipe.from.u32(i32 %n)
+%root = call double @recipe.sqrt(double %nd)
+%inverse = fdiv double 1.0, %root
+call void @tq.hadamard(ptr addrspace(5) %v, i32 %n)
+call void @tq.diagonal(ptr addrspace(5) %v, i32 %n, i32 %seed, double %inverse)
+ret void
+}
+define internal double @tq.level.2(i32 %idx) #1 {
+entry:
+%negative = icmp ult i32 %idx, 2
+%mirror.base = sub i32 1, %idx
+%above = sub i32 %idx, 2
+%m = select i1 %negative, i32 %mirror.base, i32 %above
+%mag.1 = select i1 true, double TQ{1.5104176084990977}, double 0.0
+%is.0 = icmp eq i32 %m, 0
+%mag.0 = select i1 %is.0, double TQ{0.45278003463649247}, double %mag.1
+%minus = fneg double %mag.0
+%result = select i1 %negative, double %minus, double %mag.0
+ret double %result
+}
+define internal double @tq.level.3(i32 %idx) #1 {
+entry:
+%negative = icmp ult i32 %idx, 4
+%mirror.base = sub i32 3, %idx
+%above = sub i32 %idx, 4
+%m = select i1 %negative, i32 %mirror.base, i32 %above
+%mag.3 = select i1 true, double TQ{2.1519457045369957}, double 0.0
+%is.2 = icmp eq i32 %m, 2
+%mag.2 = select i1 %is.2, double TQ{1.3439092785050005}, double %mag.3
+%is.1 = icmp eq i32 %m, 1
+%mag.1 = select i1 %is.1, double TQ{0.75600528120588}, double %mag.2
+%is.0 = icmp eq i32 %m, 0
+%mag.0 = select i1 %is.0, double TQ{0.24509417894422170}, double %mag.1
+%minus = fneg double %mag.0
+%result = select i1 %negative, double %minus, double %mag.0
+ret double %result
+}
+define internal double @tq.level.4(i32 %idx) #1 {
+entry:
+%negative = icmp ult i32 %idx, 8
+%mirror.base = sub i32 7, %idx
+%above = sub i32 %idx, 8
+%m = select i1 %negative, i32 %mirror.base, i32 %above
+%mag.7 = select i1 true, double TQ{2.7325895709953212}, double 0.0
+%is.6 = icmp eq i32 %m, 6
+%mag.6 = select i1 %is.6, double TQ{2.06901722653136844}, double %mag.7
+%is.5 = icmp eq i32 %m, 5
+%mag.5 = select i1 %is.5, double TQ{1.61804638602187645}, double %mag.6
+%is.4 = icmp eq i32 %m, 4
+%mag.4 = select i1 %is.4, double TQ{1.25623119734716937}, double %mag.5
+%is.3 = icmp eq i32 %m, 3
+%mag.3 = select i1 %is.3, double TQ{0.94234045648695852}, double %mag.4
+%is.2 = icmp eq i32 %m, 2
+%mag.2 = select i1 %is.2, double TQ{0.65675911853246321}, double %mag.3
+%is.1 = icmp eq i32 %m, 1
+%mag.1 = select i1 %is.1, double TQ{0.38804829949028946}, double %mag.2
+%is.0 = icmp eq i32 %m, 0
+%mag.0 = select i1 %is.0, double TQ{0.12839502985114705}, double %mag.1
+%minus = fneg double %mag.0
+%result = select i1 %negative, double %minus, double %mag.0
+ret double %result
+}
+define internal i32 @tq.index.2(double %x) #1 {
+entry:
+%a = call double @recipe.abs(double %x)
+%ge.0 = fcmp oge double %a, TQ{0.9815988215677951}
+%one.0 = zext i1 %ge.0 to i32
+%sum.0 = add i32 0, %one.0
+%positive = fcmp oge double %x, 0.0
+%upper = add i32 2, %sum.0
+%lower.base = sub i32 1, %sum.0
+%result = select i1 %positive, i32 %upper, i32 %lower.base
+ret i32 %result
+}
+define internal i32 @tq.index.3(double %x) #1 {
+entry:
+%a = call double @recipe.abs(double %x)
+%ge.0 = fcmp oge double %a, TQ{0.5005497300750500}
+%one.0 = zext i1 %ge.0 to i32
+%sum.0 = add i32 0, %one.0
+%ge.1 = fcmp oge double %a, TQ{1.0499572798554393}
+%one.1 = zext i1 %ge.1 to i32
+%sum.1 = add i32 %sum.0, %one.1
+%ge.2 = fcmp oge double %a, TQ{1.7479274915209988}
+%one.2 = zext i1 %ge.2 to i32
+%sum.2 = add i32 %sum.1, %one.2
+%positive = fcmp oge double %x, 0.0
+%upper = add i32 4, %sum.2
+%lower.base = sub i32 3, %sum.2
+%result = select i1 %positive, i32 %upper, i32 %lower.base
+ret i32 %result
+}
+define internal i32 @tq.index.4(double %x) #1 {
+entry:
+%a = call double @recipe.abs(double %x)
+%ge.0 = fcmp oge double %a, TQ{0.2582216646707183}
+%one.0 = zext i1 %ge.0 to i32
+%sum.0 = add i32 0, %one.0
+%ge.1 = fcmp oge double %a, TQ{0.5224037090113763}
+%one.1 = zext i1 %ge.1 to i32
+%sum.1 = add i32 %sum.0, %one.1
+%ge.2 = fcmp oge double %a, TQ{0.7995497875097104}
+%one.2 = zext i1 %ge.2 to i32
+%sum.2 = add i32 %sum.1, %one.2
+%ge.3 = fcmp oge double %a, TQ{1.0992858269170640}
+%one.3 = zext i1 %ge.3 to i32
+%sum.3 = add i32 %sum.2, %one.3
+%ge.4 = fcmp oge double %a, TQ{1.4371387916845231}
+%one.4 = zext i1 %ge.4 to i32
+%sum.4 = add i32 %sum.3, %one.4
+%ge.5 = fcmp oge double %a, TQ{1.8435318062766172}
+%one.5 = zext i1 %ge.5 to i32
+%sum.5 = add i32 %sum.4, %one.5
+%ge.6 = fcmp oge double %a, TQ{2.4008033987633230}
+%one.6 = zext i1 %ge.6 to i32
+%sum.6 = add i32 %sum.5, %one.6
+%positive = fcmp oge double %x, 0.0
+%upper = add i32 8, %sum.6
+%lower.base = sub i32 7, %sum.6
+%result = select i1 %positive, i32 %upper, i32 %lower.base
+ret i32 %result
+}
+define internal double @tq.level(i32 %bits, i32 %idx) #1 {
+entry:
+%two = icmp eq i32 %bits, 2
+%three = icmp eq i32 %bits, 3
+%l2 = call double @tq.level.2(i32 %idx)
+%l3 = call double @tq.level.3(i32 %idx)
+%l4 = call double @tq.level.4(i32 %idx)
+%r3 = select i1 %three, double %l3, double %l4
+%r = select i1 %two, double %l2, double %r3
+ret double %r
+}
+define internal i32 @tq.index(i32 %bits, double %x) #1 {
+entry:
+%two = icmp eq i32 %bits, 2
+%three = icmp eq i32 %bits, 3
+%i2 = call i32 @tq.index.2(double %x)
+%i3 = call i32 @tq.index.3(double %x)
+%i4 = call i32 @tq.index.4(double %x)
+%r3 = select i1 %three, i32 %i3, i32 %i4
+%r = select i1 %two, i32 %i2, i32 %r3
+ret i32 %r
+}
+; The code width of coordinate i: the base width, one more in the second half when the format has half bits.
+define internal i32 @tq.width(i32 %d, i32 %base, i1 %extra, i32 %i) #1 {
+entry:
+%half = lshr i32 %d, 1
+%second = icmp uge i32 %i, %half
+%plus = and i1 %extra, %second
+%more = zext i1 %plus to i32
+%width = add i32 %base, %more
+ret i32 %width
+}
+define internal i32 @tq.code.bits(i32 %d, i32 %base, i1 %extra) #1 {
+entry:
+%full = mul i32 %d, %base
+%half = lshr i32 %d, 1
+%more = select i1 %extra, i32 %half, i32 0
+%bits = add i32 %full, %more
+ret i32 %bits
+}
+define internal i32 @tq.key.bytes(i32 %d, i32 %base, i1 %extra) #1 {
+entry:
+%bits = call i32 @tq.code.bits(i32 %d, i32 %base, i1 %extra)
+%rounded = add i32 %bits, 7
+%code.bytes = lshr i32 %rounded, 3
+%sign.bytes = lshr i32 %d, 3
+%head = add i32 %code.bytes, 4
+%total = add i32 %head, %sign.bytes
+ret i32 %total
+}
+define internal i32 @tq.value.bytes(i32 %d, i32 %base, i1 %extra) #1 {
+entry:
+%bits = call i32 @tq.code.bits(i32 %d, i32 %base, i1 %extra)
+%rounded = add i32 %bits, 7
+%code.bytes = lshr i32 %rounded, 3
+%total = add i32 %code.bytes, 2
+ret i32 %total
+}
+; Sets `width` bits of a zeroed private byte buffer at bit `bit`.
+define internal void @tq.put(ptr addrspace(5) %buffer, i32 %bit, i32 %width, i32 %value) #1 {
+entry:
+br label %loop
+loop:
+%j = phi i32 [ 0, %entry ], [ %j.next, %step ]
+%more = icmp ult i32 %j, %width
+br i1 %more, label %step, label %done
+step:
+%position = add i32 %bit, %j
+%byte = lshr i32 %position, 3
+%shift = and i32 %position, 7
+%moved = lshr i32 %value, %j
+%one = and i32 %moved, 1
+%mask = shl i32 %one, %shift
+%small = trunc i32 %mask to i8
+%pointer = getelementptr i8, ptr addrspace(5) %buffer, i32 %byte
+%old = load i8, ptr addrspace(5) %pointer, align 1
+%new = or i8 %old, %small
+store i8 %new, ptr addrspace(5) %pointer, align 1
+%j.next = add i32 %j, 1
+br label %loop
+done:
+ret void
+}
+; Reads `width` (at most 8) bits at bit `bit` of a record. One byte past the record may be read.
+define internal i32 @tq.get(ptr addrspace(1) %record, i32 %bit, i32 %width) #1 {
+entry:
+%byte = lshr i32 %bit, 3
+%shift = and i32 %bit, 7
+%low.ptr = getelementptr i8, ptr addrspace(1) %record, i32 %byte
+%high.index = add i32 %byte, 1
+%high.ptr = getelementptr i8, ptr addrspace(1) %record, i32 %high.index
+%low = load i8, ptr addrspace(1) %low.ptr, align 1
+%high = load i8, ptr addrspace(1) %high.ptr, align 1
+%low.wide = zext i8 %low to i32
+%high.wide = zext i8 %high to i32
+%high.moved = shl i32 %high.wide, 8
+%both = or i32 %low.wide, %high.moved
+%shifted = lshr i32 %both, %shift
+%one = shl i32 1, %width
+%mask = sub i32 %one, 1
+%value = and i32 %shifted, %mask
+ret i32 %value
+}
+define internal void @tq.header(ptr addrspace(5) %buffer, i32 %at, double %value) #1 {
+entry:
+%high = fcmp ogt double %value, 65504.0
+%clamped = select i1 %high, double 65504.0, double %value
+%half = call half @recipe.to.f16(double %clamped)
+%bits = bitcast half %half to i16
+%low = trunc i16 %bits to i8
+%shifted = lshr i16 %bits, 8
+%upper = trunc i16 %shifted to i8
+%p0 = getelementptr i8, ptr addrspace(5) %buffer, i32 %at
+%at1 = add i32 %at, 1
+%p1 = getelementptr i8, ptr addrspace(5) %buffer, i32 %at1
+store i8 %low, ptr addrspace(5) %p0, align 1
+store i8 %upper, ptr addrspace(5) %p1, align 1
+ret void
+}
+define internal double @tq.header.read(ptr addrspace(1) %record, i32 %at) #1 {
+entry:
+%pointer = getelementptr i8, ptr addrspace(1) %record, i32 %at
+%half = load half, ptr addrspace(1) %pointer, align 1
+%result = call double @recipe.from.f16(half %half)
+ret double %result
+}
+define internal void @tq.clear(ptr addrspace(5) %buffer, i32 %bytes) #1 {
+entry:
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
+%more = icmp ult i32 %i, %bytes
+br i1 %more, label %step, label %done
+step:
+%pointer = getelementptr i8, ptr addrspace(5) %buffer, i32 %i
+store i8 0, ptr addrspace(5) %pointer, align 1
+%i.next = add i32 %i, 1
+br label %loop
+done:
+ret void
+}
+define internal void @tq.copy(ptr addrspace(1) %record, ptr addrspace(5) %buffer, i32 %bytes) #1 {
+entry:
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
+%more = icmp ult i32 %i, %bytes
+br i1 %more, label %step, label %done
+step:
+%from = getelementptr i8, ptr addrspace(5) %buffer, i32 %i
+%byte = load i8, ptr addrspace(5) %from, align 1
+%to = getelementptr i8, ptr addrspace(1) %record, i32 %i
+store i8 %byte, ptr addrspace(1) %to, align 1
+%i.next = add i32 %i, 1
+br label %loop
+done:
+ret void
+}
+; The length of the d values in x, and x scaled to unit length in place; returns the length.
+define internal double @tq.unit(ptr addrspace(5) %x, i32 %d) #1 {
+entry:
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %step ]
+%sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+%more = icmp ult i32 %i, %d
+br i1 %more, label %step, label %done
+step:
+%pointer = getelementptr double, ptr addrspace(5) %x, i32 %i
+%value = load double, ptr addrspace(5) %pointer, align 8
+%square = fmul double %value, %value
+%sum.next = fadd double %sum, %square
+%i.next = add i32 %i, 1
+br label %loop
+done:
+%norm = call double @recipe.sqrt(double %sum)
+%positive = fcmp ogt double %norm, 0.0
+%divisor = select i1 %positive, double %norm, double 1.0
+%inverse = fdiv double 1.0, %divisor
+call void @tq.scale(ptr addrspace(5) %x, i32 %d, double %inverse)
+ret double %norm
+}
+; Encodes the d values in x as a key record: length, residual length, codes, residual signs.
+define internal void @tq.encode.key(ptr addrspace(1) %record, ptr addrspace(5) %x, ptr addrspace(5) %r, ptr addrspace(5) %buffer, i32 %d, i32 %base, i1 %extra) #1 {
+entry:
+%bytes = call i32 @tq.key.bytes(i32 %d, i32 %base, i1 %extra)
+%code.bits = call i32 @tq.code.bits(i32 %d, i32 %base, i1 %extra)
+%dd = call double @recipe.from.u32(i32 %d)
+%root = call double @recipe.sqrt(double %dd)
+%inverse.root = fdiv double 1.0, %root
+call void @tq.clear(ptr addrspace(5) %buffer, i32 %bytes)
+%norm = call double @tq.unit(ptr addrspace(5) %x, i32 %d)
+call void @tq.rotate(ptr addrspace(5) %x, i32 %d, i32 101)
+br label %code.loop
+code.loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %code.step ]
+%offset = phi i32 [ 0, %entry ], [ %offset.next, %code.step ]
+%residual = phi double [ 0.0, %entry ], [ %residual.next, %code.step ]
+%more = icmp ult i32 %i, %d
+br i1 %more, label %code.step, label %code.done
+code.step:
+%width = call i32 @tq.width(i32 %d, i32 %base, i1 %extra, i32 %i)
+%x.ptr = getelementptr double, ptr addrspace(5) %x, i32 %i
+%v = load double, ptr addrspace(5) %x.ptr, align 8
+%z = fmul double %v, %root
+%code = call i32 @tq.index(i32 %width, double %z)
+%level = call double @tq.level(i32 %width, i32 %code)
+%rebuilt = fmul double %level, %inverse.root
+%left = fsub double %v, %rebuilt
+%r.ptr = getelementptr double, ptr addrspace(5) %r, i32 %i
+store double %left, ptr addrspace(5) %r.ptr, align 8
+%square = fmul double %left, %left
+%residual.next = fadd double %residual, %square
+%at = add i32 %offset, 32
+call void @tq.put(ptr addrspace(5) %buffer, i32 %at, i32 %width, i32 %code)
+%offset.next = add i32 %offset, %width
+%i.next = add i32 %i, 1
+br label %code.loop
+code.done:
+%residual.norm = call double @recipe.sqrt(double %residual)
+call void @tq.diagonal(ptr addrspace(5) %r, i32 %d, i32 303, double 1.0)
+call void @tq.hadamard(ptr addrspace(5) %r, i32 %d)
+%sign.base = add i32 %code.bits, 32
+br label %sign.loop
+sign.loop:
+%j = phi i32 [ 0, %code.done ], [ %j.next, %sign.step ]
+%j.more = icmp ult i32 %j, %d
+br i1 %j.more, label %sign.step, label %sign.done
+sign.step:
+%s.ptr = getelementptr double, ptr addrspace(5) %r, i32 %j
+%s = load double, ptr addrspace(5) %s.ptr, align 8
+%non.negative = fcmp oge double %s, 0.0
+%bit = zext i1 %non.negative to i32
+%at.bit = add i32 %sign.base, %j
+call void @tq.put(ptr addrspace(5) %buffer, i32 %at.bit, i32 1, i32 %bit)
+%j.next = add i32 %j, 1
+br label %sign.loop
+sign.done:
+call void @tq.header(ptr addrspace(5) %buffer, i32 0, double %norm)
+call void @tq.header(ptr addrspace(5) %buffer, i32 2, double %residual.norm)
+call void @tq.copy(ptr addrspace(1) %record, ptr addrspace(5) %buffer, i32 %bytes)
+ret void
+}
+; Encodes the d values in x as a value record: length and codes.
+define internal void @tq.encode.value(ptr addrspace(1) %record, ptr addrspace(5) %x, ptr addrspace(5) %buffer, i32 %d, i32 %base, i1 %extra) #1 {
+entry:
+%bytes = call i32 @tq.value.bytes(i32 %d, i32 %base, i1 %extra)
+%dd = call double @recipe.from.u32(i32 %d)
+%root = call double @recipe.sqrt(double %dd)
+call void @tq.clear(ptr addrspace(5) %buffer, i32 %bytes)
+%norm = call double @tq.unit(ptr addrspace(5) %x, i32 %d)
+call void @tq.rotate(ptr addrspace(5) %x, i32 %d, i32 202)
+br label %code.loop
+code.loop:
+%i = phi i32 [ 0, %entry ], [ %i.next, %code.step ]
+%offset = phi i32 [ 0, %entry ], [ %offset.next, %code.step ]
+%more = icmp ult i32 %i, %d
+br i1 %more, label %code.step, label %code.done
+code.step:
+%width = call i32 @tq.width(i32 %d, i32 %base, i1 %extra, i32 %i)
+%x.ptr = getelementptr double, ptr addrspace(5) %x, i32 %i
+%v = load double, ptr addrspace(5) %x.ptr, align 8
+%z = fmul double %v, %root
+%code = call i32 @tq.index(i32 %width, double %z)
+%at = add i32 %offset, 16
+call void @tq.put(ptr addrspace(5) %buffer, i32 %at, i32 %width, i32 %code)
+%offset.next = add i32 %offset, %width
+%i.next = add i32 %i, 1
+br label %code.loop
+code.done:
+call void @tq.header(ptr addrspace(5) %buffer, i32 0, double %norm)
+call void @tq.copy(ptr addrspace(1) %record, ptr addrspace(5) %buffer, i32 %bytes)
+ret void
+}
+; The inference attention body for the TurboQuant cache: the window's keys and values enter the cache as
+; records first, then one thread per row, head and query walks the records. Scores come from a query
+; rotated into the keys' basis; values accumulate in their rotated basis and are rotated back once.
+define internal void @attention_forward_tq_body(
+ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
+ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
+i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
+i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
+i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin,
+i32 %tq.k, i32 %tq.v, i1 %tq.extra ) #3 {
+entry:
+%x = alloca [256 x double], align 8, addrspace(5)
+%r = alloca [256 x double], align 8, addrspace(5)
+%a = alloca [256 x double], align 8, addrspace(5)
+%buffer = alloca [192 x i8], align 1, addrspace(5)
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%online.global = mul i32 %group, %block
+%online.id = add i32 %online.global, %lid
+%length = udiv i32 %from, %channels
+%d = udiv i32 %channels, %heads
+%dd = call double @recipe.from.u32(i32 %d)
+%root = call double @recipe.sqrt(double %dd)
+%inverse.root = fdiv double 1.0, %root
+%unscaled = call i1 @recipe.ogt(double 0.0, double %epsilon)
+%q.scale = select i1 %unscaled, double 1.0, double %inverse.root
+%correction = fdiv double TQ{1.2533141373155003}, %dd
+%kv.group = udiv i32 %heads, %kv.heads
+%value.group = udiv i32 %heads, %value.heads
+%kv.channels = mul i32 %kv.heads, %d
+%kv.plane = mul i32 %kv.channels, %length
+%value.channels = mul i32 %value.heads, %d
+%value.plane = mul i32 %value.channels, %length
+%kv.planes = add i32 %kv.plane, %value.plane
+%gate.plane = select i1 %gate, i32 %from, i32 0
+%row.base = add i32 %from, %kv.planes
+%row.stride = add i32 %row.base, %gate.plane
+%row.stride.wide = zext i32 %row.stride to i64
+%row.base.wide = zext i32 %row.base to i64
+%from.wide = zext i32 %from to i64
+%length.wide = zext i32 %length to i64
+%d.wide = zext i32 %d to i64
+%kv.plane.wide = zext i32 %kv.plane to i64
+%key.bytes = call i32 @tq.key.bytes(i32 %d, i32 %tq.k, i1 %tq.extra)
+%value.bytes = call i32 @tq.value.bytes(i32 %d, i32 %tq.v, i1 %tq.extra)
+%key.bytes.wide = zext i32 %key.bytes to i64
+%value.bytes.wide = zext i32 %value.bytes to i64
+%code.bits = call i32 @tq.code.bits(i32 %d, i32 %tq.k, i1 %tq.extra)
+%sign.base = add i32 %code.bits, 32
+%kv.heads.wide = zext i32 %kv.heads to i64
+%value.heads.wide = zext i32 %value.heads to i64
+%key.positions = mul i64 %kv.heads.wide, %length.wide
+%key.area = mul i64 %key.positions, %key.bytes.wide
+%value.positions = mul i64 %value.heads.wide, %length.wide
+%value.area = mul i64 %value.positions, %value.bytes.wide
+%cache.row = add i64 %key.area, %value.area
+%cache.heads = add i32 %kv.heads, %value.heads
+%cache.per.row = mul i32 %cache.heads, %query.span
+%cache.total = mul i32 %cache.per.row, %rows
+br label %cache.loop
+cache.loop:
+%cj = phi i32 [ %online.id, %entry ], [ %cj.next, %cache.next ]
+%cj.more = icmp ult i32 %cj, %cache.total
+br i1 %cj.more, label %cache.step, label %cache.done
+cache.step:
+%c.local = urem i32 %cj, %query.span
+%c.rest = udiv i32 %cj, %query.span
+%c.plane = urem i32 %c.rest, %cache.heads
+%c.row = udiv i32 %c.rest, %cache.heads
+%c.position = add i32 %query.begin, %c.local
+%c.is.value = icmp uge i32 %c.plane, %kv.heads
+%c.value.head = sub i32 %c.plane, %kv.heads
+%c.head = select i1 %c.is.value, i32 %c.value.head, i32 %c.plane
+%c.source.plane = select i1 %c.is.value, i32 %kv.plane, i32 0
+%c.source.plane.wide = zext i32 %c.source.plane to i64
+%c.row.wide = zext i32 %c.row to i64
+%c.source.row = mul i64 %c.row.wide, %row.stride.wide
+%c.source.start = add i64 %c.source.row, %from.wide
+%c.source.base = add i64 %c.source.start, %c.source.plane.wide
+%c.head.wide = zext i32 %c.head to i64
+%c.channel.base = mul i64 %c.head.wide, %d.wide
+%c.position.wide = zext i32 %c.position to i64
+br label %gather.loop
+gather.loop:
+%gd = phi i32 [ 0, %cache.step ], [ %gd.next, %gather.step ]
+%gd.more = icmp ult i32 %gd, %d
+br i1 %gd.more, label %gather.step, label %gather.done
+gather.step:
+%gd.wide = zext i32 %gd to i64
+%g.channel = add i64 %c.channel.base, %gd.wide
+%g.offset = mul i64 %g.channel, %length.wide
+%g.local = add i64 %g.offset, %c.position.wide
+%g.index = add i64 %c.source.base, %g.local
+%g.phys = call i64 @recipe.window.index(i64 %g.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%g.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %g.phys
+%g.value = load double, ptr addrspace(1) %g.ptr, align 8
+%x.ptr = getelementptr double, ptr addrspace(5) %x, i32 %gd
+store double %g.value, ptr addrspace(5) %x.ptr, align 8
+%gd.next = add i32 %gd, 1
+br label %gather.loop
+gather.done:
+%c.cache.row = mul i64 %c.row.wide, %cache.row
+%c.index = mul i64 %c.head.wide, %length.wide
+%c.slot = add i64 %c.index, %c.position.wide
+br i1 %c.is.value, label %encode.value, label %encode.key
+encode.key:
+%ek.offset = mul i64 %c.slot, %key.bytes.wide
+%ek.at = add i64 %c.cache.row, %ek.offset
+%ek.ptr = getelementptr i8, ptr addrspace(1) %kv.context, i64 %ek.at
+call void @tq.encode.key(ptr addrspace(1) %ek.ptr, ptr addrspace(5) %x, ptr addrspace(5) %r, ptr addrspace(5) %buffer, i32 %d, i32 %tq.k, i1 %tq.extra)
+br label %cache.next
+encode.value:
+%ev.offset = mul i64 %c.slot, %value.bytes.wide
+%ev.area = add i64 %c.cache.row, %key.area
+%ev.at = add i64 %ev.area, %ev.offset
+%ev.ptr = getelementptr i8, ptr addrspace(1) %kv.context, i64 %ev.at
+call void @tq.encode.value(ptr addrspace(1) %ev.ptr, ptr addrspace(5) %x, ptr addrspace(5) %buffer, i32 %d, i32 %tq.v, i1 %tq.extra)
+br label %cache.next
+cache.next:
+%cj.next = add i32 %cj, %threads
+br label %cache.loop
+cache.done:
+call void @grid_barrier(i32 %threads)
+%query.per.row = mul i32 %heads, %query.span
+%query.total = mul i32 %query.per.row, %rows
+br label %query.loop
+query.loop:
+%qj = phi i32 [ %online.id, %cache.done ], [ %qj.next, %query.end ]
+%qj.more = icmp ult i32 %qj, %query.total
+br i1 %qj.more, label %query.step, label %exit
+query.step:
+%q.local = urem i32 %qj, %query.span
+%q.rest = udiv i32 %qj, %query.span
+%q.head = urem i32 %q.rest, %heads
+%q.row = udiv i32 %q.rest, %heads
+%q.position = add i32 %query.begin, %q.local
+%q.kv.head = udiv i32 %q.head, %kv.group
+%q.value.head = udiv i32 %q.head, %value.group
+%q.row.wide = zext i32 %q.row to i64
+%q.source.row = mul i64 %q.row.wide, %row.stride.wide
+%q.head.wide = zext i32 %q.head to i64
+%q.channel.base = mul i64 %q.head.wide, %d.wide
+%q.position.wide = zext i32 %q.position to i64
+br label %load.loop
+load.loop:
+%ld = phi i32 [ 0, %query.step ], [ %ld.next, %load.step ]
+%ld.more = icmp ult i32 %ld, %d
+br i1 %ld.more, label %load.step, label %load.done
+load.step:
+%ld.wide = zext i32 %ld to i64
+%l.channel = add i64 %q.channel.base, %ld.wide
+%l.offset = mul i64 %l.channel, %length.wide
+%l.local = add i64 %l.offset, %q.position.wide
+%l.index = add i64 %q.source.row, %l.local
+%l.phys = call i64 @recipe.window.index(i64 %l.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%l.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %l.phys
+%l.value = load double, ptr addrspace(1) %l.ptr, align 8
+%l.scaled = fmul double %l.value, %q.scale
+%lx.ptr = getelementptr double, ptr addrspace(5) %x, i32 %ld
+store double %l.scaled, ptr addrspace(5) %lx.ptr, align 8
+%lr.ptr = getelementptr double, ptr addrspace(5) %r, i32 %ld
+store double %l.scaled, ptr addrspace(5) %lr.ptr, align 8
+%la.ptr = getelementptr double, ptr addrspace(5) %a, i32 %ld
+store double 0.0, ptr addrspace(5) %la.ptr, align 8
+%ld.next = add i32 %ld, 1
+br label %load.loop
+load.done:
+; The score basis: x holds the rotated query, r the residual projection of it.
+call void @tq.rotate(ptr addrspace(5) %x, i32 %d, i32 101)
+br label %copy.loop
+copy.loop:
+%cd = phi i32 [ 0, %load.done ], [ %cd.next, %copy.step ]
+%cd.more = icmp ult i32 %cd, %d
+br i1 %cd.more, label %copy.step, label %copy.done
+copy.step:
+%cx.ptr = getelementptr double, ptr addrspace(5) %x, i32 %cd
+%cx = load double, ptr addrspace(5) %cx.ptr, align 8
+%cr.ptr = getelementptr double, ptr addrspace(5) %r, i32 %cd
+store double %cx, ptr addrspace(5) %cr.ptr, align 8
+%cd.next = add i32 %cd, 1
+br label %copy.loop
+copy.done:
+call void @tq.diagonal(ptr addrspace(5) %r, i32 %d, i32 303, double 1.0)
+call void @tq.hadamard(ptr addrspace(5) %r, i32 %d)
+%q.cache.row = mul i64 %q.row.wide, %cache.row
+%q.kv.head.wide = zext i32 %q.kv.head to i64
+%q.value.head.wide = zext i32 %q.value.head to i64
+%q.key.heads = mul i64 %q.kv.head.wide, %length.wide
+%q.value.heads = mul i64 %q.value.head.wide, %length.wide
+%q.value.area = add i64 %q.cache.row, %key.area
+br label %key.loop
+key.loop:
+%key = phi i32 [ 0, %copy.done ], [ %key.next, %key.end ]
+%m = phi double [ 0xFFF0000000000000, %copy.done ], [ %m.next, %key.end ]
+%s.sum = phi double [ 0.0, %copy.done ], [ %s.sum.next, %key.end ]
+%key.more = icmp ule i32 %key, %q.position
+br i1 %key.more, label %key.score, label %key.done
+key.score:
+%key.wide = zext i32 %key to i64
+%k.slot = add i64 %q.key.heads, %key.wide
+%k.offset = mul i64 %k.slot, %key.bytes.wide
+%k.at = add i64 %q.cache.row, %k.offset
+%k.ptr = getelementptr i8, ptr addrspace(1) %kv.context, i64 %k.at
+%k.norm = call double @tq.header.read(ptr addrspace(1) %k.ptr, i32 0)
+%k.residual = call double @tq.header.read(ptr addrspace(1) %k.ptr, i32 2)
+br label %dot.loop
+dot.loop:
+%i = phi i32 [ 0, %key.score ], [ %i.next, %dot.step ]
+%offset = phi i32 [ 0, %key.score ], [ %offset.next, %dot.step ]
+%dot.codes = phi double [ 0.0, %key.score ], [ %dot.codes.next, %dot.step ]
+%dot.signs = phi double [ 0.0, %key.score ], [ %dot.signs.next, %dot.step ]
+%i.more = icmp ult i32 %i, %d
+br i1 %i.more, label %dot.step, label %dot.done
+dot.step:
+%width = call i32 @tq.width(i32 %d, i32 %tq.k, i1 %tq.extra, i32 %i)
+%at = add i32 %offset, 32
+%code = call i32 @tq.get(ptr addrspace(1) %k.ptr, i32 %at, i32 %width)
+%level = call double @tq.level(i32 %width, i32 %code)
+%dx.ptr = getelementptr double, ptr addrspace(5) %x, i32 %i
+%dx = load double, ptr addrspace(5) %dx.ptr, align 8
+%dot.product = fmul double %dx, %level
+%dot.codes.next = fadd double %dot.codes, %dot.product
+%sign.at = add i32 %sign.base, %i
+%sign.bit = call i32 @tq.get(ptr addrspace(1) %k.ptr, i32 %sign.at, i32 1)
+%dr.ptr = getelementptr double, ptr addrspace(5) %r, i32 %i
+%dr = load double, ptr addrspace(5) %dr.ptr, align 8
+%dr.minus = fneg double %dr
+%positive = icmp ne i32 %sign.bit, 0
+%signed = select i1 %positive, double %dr, double %dr.minus
+%dot.signs.next = fadd double %dot.signs, %signed
+%offset.next = add i32 %offset, %width
+%i.next = add i32 %i, 1
+br label %dot.loop
+dot.done:
+%rebuilt = fmul double %dot.codes, %inverse.root
+%residual.part = fmul double %dot.signs, %correction
+%residual.scaled = fmul double %residual.part, %k.residual
+%estimate = fadd double %rebuilt, %residual.scaled
+%score = fmul double %estimate, %k.norm
+%greater = fcmp ogt double %score, %m
+%m.next = select i1 %greater, double %score, double %m
+%m.drop = fsub double %m, %m.next
+%ms.raw = call double @recipe.exp(double %m.drop)
+%ms = select i1 %greater, double %ms.raw, double 1.0
+%s.drop = fsub double %score, %m.next
+%vs.raw = call double @recipe.exp(double %s.drop)
+%vs = select i1 %greater, double 1.0, double %vs.raw
+%v.slot = add i64 %q.value.heads, %key.wide
+%v.offset = mul i64 %v.slot, %value.bytes.wide
+%v.at = add i64 %q.value.area, %v.offset
+%v.ptr = getelementptr i8, ptr addrspace(1) %kv.context, i64 %v.at
+%v.norm = call double @tq.header.read(ptr addrspace(1) %v.ptr, i32 0)
+%v.weight = fmul double %vs, %v.norm
+%v.scaled = fmul double %v.weight, %inverse.root
+br label %value.loop
+value.loop:
+%vi = phi i32 [ 0, %dot.done ], [ %vi.next, %value.step ]
+%voffset = phi i32 [ 0, %dot.done ], [ %voffset.next, %value.step ]
+%vi.more = icmp ult i32 %vi, %d
+br i1 %vi.more, label %value.step, label %value.done
+value.step:
+%vwidth = call i32 @tq.width(i32 %d, i32 %tq.v, i1 %tq.extra, i32 %vi)
+%vat = add i32 %voffset, 16
+%vcode = call i32 @tq.get(ptr addrspace(1) %v.ptr, i32 %vat, i32 %vwidth)
+%vlevel = call double @tq.level(i32 %vwidth, i32 %vcode)
+%va.ptr = getelementptr double, ptr addrspace(5) %a, i32 %vi
+%va = load double, ptr addrspace(5) %va.ptr, align 8
+%va.old = fmul double %va, %ms
+%va.add = fmul double %v.scaled, %vlevel
+%va.new = fadd double %va.old, %va.add
+store double %va.new, ptr addrspace(5) %va.ptr, align 8
+%voffset.next = add i32 %voffset, %vwidth
+%vi.next = add i32 %vi, 1
+br label %value.loop
+value.done:
+%s.old = fmul double %s.sum, %ms
+%s.sum.next = fadd double %s.old, %vs
+br label %key.end
+key.end:
+%key.next = add i32 %key, 1
+br label %key.loop
+key.done:
+%inverse = fdiv double 1.0, %s.sum
+call void @tq.scale(ptr addrspace(5) %a, i32 %d, double %inverse)
+call void @tq.unrotate(ptr addrspace(5) %a, i32 %d, i32 202)
+%q.output.row = mul i64 %q.row.wide, %from.wide
+%q.gate.row = add i64 %q.source.row, %row.base.wide
+br label %out.loop
+out.loop:
+%od = phi i32 [ 0, %key.done ], [ %od.next, %out.store ]
+%od.more = icmp ult i32 %od, %d
+br i1 %od.more, label %out.step, label %query.end
+out.step:
+%od.wide = zext i32 %od to i64
+%o.channel = add i64 %q.channel.base, %od.wide
+%o.offset = mul i64 %o.channel, %length.wide
+%o.local = add i64 %o.offset, %q.position.wide
+%o.index = add i64 %q.output.row, %o.local
+%oa.ptr = getelementptr double, ptr addrspace(5) %a, i32 %od
+%o.model = load double, ptr addrspace(5) %oa.ptr, align 8
+br i1 %gate, label %out.gate, label %out.store
+out.gate:
+%gate.index = add i64 %q.gate.row, %o.local
+%gate.phys = call i64 @recipe.window.index(i64 %gate.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %gate.phys
+%gate.value = load double, ptr addrspace(1) %gate.ptr, align 8
+%gate.factor = call double @recipe.sigmoid(double %gate.value)
+%o.gated = call double @recipe.mul(double %o.model, double %gate.factor)
+br label %out.store
+out.store:
+%o.result = phi double [ %o.model, %out.step ], [ %o.gated, %out.gate ]
+%o.phys = call i64 @recipe.window.index(i64 %o.index, i32 %length, i32 %buffer.length, i32 %buffer.origin)
+%o.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %o.phys
+store double %o.result, ptr addrspace(1) %o.ptr, align 8
+%od.next = add i32 %od, 1
+br label %out.loop
+query.end:
+%qj.next = add i32 %qj, %threads
+br label %query.loop
+exit:
+ret void
+}
+; TURBOQUANT END

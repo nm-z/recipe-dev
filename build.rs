@@ -1455,6 +1455,21 @@ const ACC64: &str = "-acc64";
 fn state_align(state: &str) -> String {
 	if state == "double" { "8".to_owned() } else { "4".to_owned() }
 }
+/// Spells each `TQ{x}` constant of the TurboQuant kernels in the encoding of the compute type, since the IR parser rejects a decimal the type cannot hold exactly.
+fn tq_constants(kernel: String, spell: &dyn Fn(f64) -> String) -> String {
+	let (mut output, mut rest) = (String::with_capacity(kernel.len()), kernel.as_str());
+	while let Some(index) = rest.find("TQ{") {
+		let close = rest[index..].find('}').map_or(rest.len(), |offset| index + offset);
+		output.push_str(&rest[..index]);
+		match rest[index + 3..close].parse::<f64>() {
+			Ok(value) => output.push_str(&spell(value)),
+			Err(_) => output.push_str(&rest[index..=close]),
+		}
+		rest = &rest[(close + 1).min(rest.len())..];
+	}
+	output.push_str(rest);
+	output
+}
 fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let bits = format.storage.bits();
@@ -1478,6 +1493,12 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &
 			.replace("0x3CB0000000000000", &literal(f64::from_bits(0x3CB0000000000000)))
 			.replace("0x3FEFFFFFFFFFFFFE", &literal(f64::from_bits(0x3FEFFFFFFFFFFFFE)))
 	}
+	let kernel = tq_constants(kernel, &|value| match llvm {
+		"half" => format!("0xH{:04X}", format.pack(value)),
+		"bfloat" => format!("0xR{:04X}", format.pack(value)),
+		_ if bits < 64 => format!("0x{:016X}", format.unpack(format.pack(value)).to_bits()),
+		_ => format!("{value:?}"),
+	});
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn fp8_encoder(name: &str, format: FloatFormat) -> String {
@@ -1557,6 +1578,7 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
 		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("{}", pack(f64::from_bits(bits))))
 	}
+	let kernel = tq_constants(kernel, &|value| format!("{value:?}"));
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
@@ -1575,6 +1597,7 @@ fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
 	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
 		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("0xH{:04X}", FloatFormat::FP16.pack(f64::from_bits(bits))))
 	}
+	let kernel = tq_constants(kernel, &|value| format!("0xH{:04X}", FloatFormat::FP16.pack(value)));
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn int_codec(format: IntFormat) -> String {
@@ -1589,6 +1612,17 @@ fn int_codec(format: IntFormat) -> String {
 fn setting<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let prefix = format!("{key} = ");
 	manifest.lines().find_map(|line| line.trim().strip_prefix(&prefix)).ok_or_else(|| io::Error::other(format!("{key} must be configured")).into())
+}
+/// The shared kernel template. The TurboQuant cache kernels are in it only when `kv-turboquant` is on.
+fn template() -> BuildResult<String> {
+	let source = fs::read_to_string("amd-nv-cpu.ll")?;
+	if env::var_os("CARGO_FEATURE_KV_TURBOQUANT").is_some() {
+		return Ok(source);
+	}
+	let (begin, end) = ("; TURBOQUANT BEGIN\n", "; TURBOQUANT END\n");
+	let first = source.find(begin).ok_or_else(|| io::Error::other("amd-nv-cpu.ll lacks the TurboQuant region"))?;
+	let last = source.find(end).ok_or_else(|| io::Error::other("amd-nv-cpu.ll lacks the end of the TurboQuant region"))? + end.len();
+	Ok(format!("{}{}", &source[..first], &source[last..]))
 }
 fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let value = setting(manifest, key)?;
@@ -1864,7 +1898,7 @@ fn backward_accumulate_variants(ir: &str) -> BuildResult<String> {
 	Ok(format!("{}{b_state}{a_state}{}", &ir[..end], &ir[end..]))
 }
 fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let source = backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?;
+	let source = backward_accumulate_variants(&template()?)?;
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER)
 		.replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers())
 		.replace("call void @llvm.amdgcn.s.barrier()", "call void @recipe.workgroup.barrier()")
@@ -1907,7 +1941,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let ir = wmma_source(&backward_accumulate_variants(&template()?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
@@ -1937,10 +1971,11 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let mut ir = wmma_source(&backward_accumulate_variants(&template()?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
+	ir.push('\n');
 	ir.push_str(&CPU_PARALLEL.replace("RECIPE_CPU_ENTRY_LINKAGE", &platform(manifest, "cpu-entry-linkage", os)?));
 	let clang = platform(manifest, "cpu-compiler", os)?;
 	for (key, tool) in [("cpu-compiler", &clang), ("cpu-linker", &platform(manifest, "cpu-linker", os)?)] {
@@ -2041,6 +2076,10 @@ fn main() -> BuildResult<()> {
 		("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"),
 		("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"),
 		("backend-tolerance", "RECIPE_BACKEND_TOLERANCE"),
+		("kv-turboquant-bits", "RECIPE_KV_TURBOQUANT_BITS"),
+		("logit-error-bound", "RECIPE_LOGIT_ERROR_BOUND"),
+		("logit-error-growth", "RECIPE_LOGIT_ERROR_GROWTH"),
+		("logit-error-growth-positions", "RECIPE_LOGIT_ERROR_GROWTH_POSITIONS"),
 		("contraction-cpu-shared-values", "RECIPE_CONTRACTION_CPU_SHARED_VALUES"),
 		("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"),
 		("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N"),
