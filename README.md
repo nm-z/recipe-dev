@@ -177,6 +177,11 @@ let shared = expert * layer(1).sigmoid();
 let combined = routed + shared;
 ```
 
+```rust
+let experts = recipe.model().gguf_moe(256, 8, 512, Activation::Silu, Scoring::Softmax, true,
+	SharedExpert::Gated { count: 1, gate: Activation::Sigmoid }, 1.0, false);
+```
+
 ## **Train**
 
 ```rust
