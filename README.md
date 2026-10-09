@@ -37,12 +37,11 @@ let model = recipe.model()
 ```
 
 ```rust
-frozen.blck.atvn.norm.prec = block
-	│      │    │    │    └─ precision it computes in
-	│      │    │    └────── normalization
-	│      │    └─────────── activation
-	│      └──────────────── ""
-	└─────────────────────── frozen qualifier
+frozen.blck.atvn.prec = block
+	│      │    │    └─ precision it computes in
+	│      │    └────── activation maps in written order
+	│      └─────────── ""
+	└────────────────── frozen qualifier
 ```
 
 ```rust
@@ -127,12 +126,11 @@ atvn:
 	tan()
 	scale(factor)
 	e(value)
+	norm(batch|layer|rms|l2)
 feature reduction:
 	pool(size)
 	kmeans(clusters)
 	knn(neighbors)
-norm:
-	.norm(batch|layer|rms|l2)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
