@@ -4010,10 +4010,12 @@ impl NativeModelIr {
 					let positions = Shape { channels: 1, length: node.output.length };
 					emit_runtime_window_loop(&mut ir, index, "topk", positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {selection}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 {biased} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
+							selection = if node.parameters != 0 { &pointers.weights } else { &pointers.source },
+							biased = u8::from(node.parameters != 0),
 							experts = node.output.channels,
 							length = node.output.length,
 							top = node.argument[0],
@@ -10615,7 +10617,7 @@ mod ngram {
 		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
 		/// size, and the table's row count.
 		pub(super) fn block(&self) -> PleBlock {
-			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
+			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone(), math: None }
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -10884,18 +10886,36 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				format!("moe,{experts},{top_k},{hidden},{},{},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared), f64::from_bits(*scale_bits), u8::from(*selection_bias))
 			}
-			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
+			Operation::Hyper(lanes, rank, blocks, gate, mean) => {
+				let branch = blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";");
+				let (read, write) = gate.as_ref().map_or_else(|| ("-".to_owned(), "-".to_owned()), |gate| (product_branch_text(&gate.read), product_branch_text(&gate.write)));
+				format!("hyper,v3,{lanes},{rank},{branch},{read},{write},{mean:016x}")
+			},
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,{},{},{},{},{},{},{},{}",
-					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
+				"delta,v3,{},{},{},{},{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
+				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				delta.decay_gate.map_or("-".to_owned(), |decay| decay.code().to_string()),
+				delta.write_gate.map_or("-".to_owned(), |write| write.code().to_string()),
+				normalization_text(delta.qk_norm), normalization_text(delta.value_norm)
 			),
-			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Ple(ple) => {
+				let math = match ple.math {
+					None => "-".to_owned(),
+					Some(math) => {
+						let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+						format!("v2,{},{},{},{},sr,{floor_bits},{}", normalization_text(Some(math.key_norm)), normalization_text(Some(math.query_norm)), normalization_text(Some(math.output_norm)), math.convolution.code(), u8::from(width_scaled))
+					}
+				};
+				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
+			},
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
@@ -11009,7 +11029,7 @@ mod bundle {
 			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				if fields.len() >= 7 {
+				if fields.len() >= 9 {
 					Ok(Operation::Moe(
 						value_at(fields.first().copied(), "MoE experts")?,
 						value_at(fields.get(1).copied(), "MoE top-k")?,
@@ -11018,6 +11038,8 @@ mod bundle {
 						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
 						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
 						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
+						value_at::<f64>(fields.get(7).copied(), "MoE routed scale")?.to_bits(),
+						bool_value(fields.get(8).copied().unwrap_or(""), "MoE selection bias")?,
 					))
 				} else {
 					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
@@ -11027,12 +11049,22 @@ mod bundle {
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
-				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
-				let (rank, blocks) = rest.split_once(',').unwrap_or((rest, ""));
+				let fields = split_escaped(rest, ',');
+				require(fields.len() == 7 && fields[0] == "v3", "saved hyper-connection record is not current format")?;
+				let mean = u64::from_str_radix(&fields[6], 16).map_err(|_| RecipeError::new("saved hyper-connection mean is not a bit pattern"))?;
+				let lanes = value_at(Some(&fields[1]), "hyper-connection lanes")?;
+				let rank = value_at(Some(&fields[2]), "hyper-connection rank")?;
+				let blocks = split_escaped(&fields[3], ';').iter().filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?;
+				let gate = if fields[4] == "-" && fields[5] == "-" { None } else {
+					Some(HyperGateBlocks { read: product_branch(&fields[4])?, write: product_branch(&fields[5])? })
+				};
+				require((rank == 0) == gate.is_none(), "hyper-connection rank and gate disagree")?;
 				Ok(Operation::Hyper(
-					value_at(Some(lanes), "hyper-connection lanes")?,
-					value_at(Some(rank), "hyper-connection rank")?,
-					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?,
+					lanes,
+					rank,
+					blocks,
+					gate,
+					mean,
 				))
 			}
 			// A bundle written before the taps could sit apart names no dilation, so an
@@ -11042,17 +11074,18 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
+				require(fields.next() == Some("v3"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
-				// A bundle written before the extents were separable names neither, so
-				// an absent field takes the extent from the stream, as the builder does.
-				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
-				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
-				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				// Older bundles always used a linear convolution and sigmoid output gate.
-				// Keep those defaults when the optional activation selectors are absent.
-				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
-				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
+				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
+				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
+				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let decay_gate = fields.next().filter(|value| *value != "-").map(delta_decay_code).transpose()?;
+				let write_gate = fields.next().filter(|value| *value != "-").map(delta_write_code).transpose()?;
+				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
+				let value_norm = normalization(fields.next(), "delta value normalization")?;
+				require(fields.next().is_none(), "delta record has extra fields")?;
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, decay_gate, write_gate, qk_norm, value_norm }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -11060,7 +11093,23 @@ mod bundle {
 				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
 				let hash = RowHash::parse(&mut fields)?;
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
-				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
+				let math = match fields.next() {
+					Some("-") => None,
+					Some("v2") => {
+						let key_norm = normalization(fields.next(), "per-layer embedding key normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding key normalization is absent"))?;
+						let query_norm = normalization(fields.next(), "per-layer embedding query normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding query normalization is absent"))?;
+						let output_norm = normalization(fields.next(), "per-layer embedding output normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding output normalization is absent"))?;
+						let convolution = activation(fields.next().ok_or_else(|| RecipeError::new("per-layer embedding convolution activation is absent"))?)?;
+						require(fields.next() == Some("sr"), "per-layer embedding gate is not a signed-root sigmoid")?;
+						let floor_bits = value_at(fields.next(), "per-layer embedding gate floor")?;
+						let width_scaled = match value_at::<u8>(fields.next(), "per-layer embedding gate width scale")? { 0 => false, 1 => true, _ => return Err(RecipeError::new("per-layer embedding gate width scale is invalid")) };
+						require(f64::from_bits(floor_bits).is_finite() && f64::from_bits(floor_bits) > 0.0, "per-layer embedding gate floor is invalid")?;
+						Some(PleMath { key_norm, query_norm, output_norm, convolution, gate: PleGate::SignedRootSigmoid { floor_bits, width_scaled } })
+					}
+					_ => return Err(RecipeError::new("saved per-layer embedding math is not current format")),
+				};
+				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
+				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
@@ -12206,6 +12255,26 @@ impl AttentionBlock {
 
 
 }
+/// The decay of a delta block: each step scales the state by exp(-softplus(a) * rate), with rate from the block's ssm_a.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaDecay {
+	Softplus,
+}
+impl DeltaDecay {
+	const fn code(self) -> u8 {
+		match self { Self::Softplus => 1 }
+	}
+}
+/// The write strength of a delta block: sigmoid of the beta projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaWrite {
+	Sigmoid,
+}
+impl DeltaWrite {
+	const fn code(self) -> u8 {
+		match self { Self::Sigmoid => 1 }
+	}
+}
 /// One gated delta rule block: value heads, the convolution kernel, and the key
 /// and value extents. A zero extent takes it from the stream, so the value heads
 /// exactly partition the block input and the keys match the values.
@@ -12217,17 +12286,20 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
-	/// Activation applied after the causal convolution. Existing hand-built
-	/// models default to linear for compatibility; GGUF Qwen delta blocks set
-	/// this to SiLU from their architecture row.
-	conv_activation: Activation,
-	/// Activation applied to the output gate. Existing hand-built models
-	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
-	output_activation: Activation,
+	/// Activation applied after the causal convolution, named by the model.
+	conv_activation: Option<Activation>,
+	/// Activation applied to the output gate, named by the model.
+	output_activation: Option<Activation>,
+	/// Decay gate of the recurrence, named by the model.
+	decay_gate: Option<DeltaDecay>,
+	/// Write gate of the recurrence, named by the model.
+	write_gate: Option<DeltaWrite>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None, decay_gate: None, write_gate: None, qk_norm: None, value_norm: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -12258,6 +12330,27 @@ struct PleBlock {
 	kernel: usize,
 	dilation: usize,
 	hash: RowHash,
+	math: Option<PleMath>,
+}
+/// The transform applied to a per-layer embedding gate's folded score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleGate {
+	SignedRootSigmoid { floor_bits: u64, width_scaled: bool },
+}
+impl PleGate {
+	pub fn signed_root_sigmoid(floor: f64, width_scaled: bool) -> Self {
+		assert!(floor.is_finite() && floor > 0.0, "per-layer embedding gate floor must be positive and finite");
+		Self::SignedRootSigmoid { floor_bits: floor.to_bits(), width_scaled }
+	}
+}
+/// The normalization, gate, and convolution choices of a per-layer embedding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PleMath {
+	pub key_norm: BlockNormalization,
+	pub query_norm: BlockNormalization,
+	pub output_norm: BlockNormalization,
+	pub gate: PleGate,
+	pub convolution: Activation,
 }
 impl PleBlock {
 	/// Values the table holds: its rows of the head width.
@@ -12281,11 +12374,13 @@ enum Operation {
 	Residual(Vec<Block>),
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
+	/// The routed scale is kept as its bits, so the operation stays `Eq`.
+	Moe(usize, usize, usize, Activation, Scoring, bool, bool, u64, bool),
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
-	Hyper(usize, usize, Vec<Block>),
+	/// Lanes, rank, branch blocks, the optional gate, and the lane mean as its bit pattern.
+	Hyper(usize, usize, Vec<Block>, Option<HyperGateBlocks>, u64),
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
@@ -12550,6 +12645,11 @@ struct ProductBranch {
 	blocks: Vec<Block>,
 	exclusions: u8,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HyperGateBlocks {
+	read: ProductBranch,
+	write: ProductBranch,
+}
 /// The blocks and model-level forward settings captured by one product branch.
 /// Product lowering applies exclusions locally, so one branch cannot alter the
 /// bias configuration of its sibling.
@@ -12682,6 +12782,14 @@ pub struct Model {
 	/// `model.frozen.layer(n)`: the next block trains no weight.
 	pub frozen: Frozen,
 }
+/// Separate read and write paths of a learned hyper-connection gate.
+#[derive(Clone)]
+pub struct HyperGate {
+	pub read: Model,
+	pub write: Model,
+	/// Scale of the lane sum, which the read applies after its gated sum; the model spells 1 / lanes.
+	pub mean: f64,
+}
 #[derive(Clone)]
 pub struct ModelData {
 	blocks: Vec<Block>,
@@ -12739,7 +12847,8 @@ macro_rules! qualified_blocks { ($($qualifier:ident),+) => { $(impl $qualifier {
 	pub fn recur<const N: usize>(&self, parts: [Block; N]) -> Model { self.model().recur(parts) }
 	pub fn ensemble<const N: usize>(&self, members: [Block; N]) -> Model { self.model().ensemble(members) }
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Model { self.model().moe(top_k, experts) }
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Model { self.model().hyper(lanes, rank, branch) }
+	pub fn hyper(&self, lanes: usize, branch: &Model, mean: f64) -> Model { self.model().hyper(lanes, branch, mean) }
+	pub fn hyper_gate(&self, lanes: usize, branch: &Model, gate: HyperGate) -> Model { self.model().hyper_gate(lanes, branch, gate) }
 })+ }; }
 qualified_blocks! { Frozen }
 /// `frozen` before a part inside a composition: `frozen.layer(n)`.
@@ -12868,8 +12977,10 @@ impl Model {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
 	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
-		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
+	/// `scale` multiplies every routing weight. `selection_bias` adds a per-expert bias to the
+	/// scores that choose the top-k experts; the weights themselves stay unbiased.
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool) -> Self {
+		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale.to_bits(), selection_bias))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
 	/// and a standalone `attn(...)` block share one configuration path.
@@ -12930,7 +13041,14 @@ impl Model {
 	}
 	/// Activations of the preceding delta block's convolution and output gate.
 	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
-		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (convolution, output))
+		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (Some(convolution), Some(output)))
+	}
+	pub fn delta_norms(&self, query_key: impl NormalizationSelector, value: impl NormalizationSelector) -> Self {
+		self.delta_block("delta_norms", |delta| (delta.qk_norm, delta.value_norm) = (Some(query_key.normalization()), Some(value.normalization())))
+	}
+	/// Decay and write gates of the preceding delta block, named by the model.
+	pub fn delta_gates(&self, decay: DeltaDecay, write: DeltaWrite) -> Self {
+		self.delta_block("delta_gates", |delta| (delta.decay_gate, delta.write_gate) = (Some(decay), Some(write)))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
@@ -12968,18 +13086,31 @@ impl Model {
 	pub fn gate(&self) -> Self {
 		self.attention("gate", |block| block.gate())
 	}
-	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
-	/// through a gated read and takes its output back through gated writes.
-	/// `rank` sizes the gate bottleneck; zero fixes every gate at one.
-	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Self {
+	/// Static hyper-connections read `mean` times the sum over `lanes` and add the branch result.
+	pub fn hyper(&self, lanes: usize, branch: &Model, mean: f64) -> Self {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
-		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone()))
+		assert!(mean.is_finite(), "hyper-connection lane mean must be finite");
+		self.push(Operation::Hyper(lanes, 0, branch.blocks.clone(), None, mean.to_bits()))
+	}
+	/// Read and write gates are separate block lists over the same stream.
+	pub fn hyper_gate(&self, lanes: usize, branch: &Model, gate: HyperGate) -> Self {
+		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
+		let rank = gate.read.blocks.iter().find_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).expect("hyper read gate needs a bottleneck layer");
+		let read = ProductBranch { blocks: gate.read.blocks.clone(), exclusions: gate.read.exclusions };
+		let write = ProductBranch { blocks: gate.write.blocks.clone(), exclusions: gate.write.exclusions };
+		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone(), Some(HyperGateBlocks { read, write }), gate.mean.to_bits()))
 	}
 	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
 	/// block projects, gates and convolves them into the stream it sits on, at
 	/// whatever width the stream has there.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
 		self.push(Operation::Ple(table.block()))
+	}
+	pub fn ple_math(&self, math: PleMath) -> Self {
+		self.edit(|model| match &mut model.blocks.last_mut().expect("ple_math needs a preceding ple block").operation {
+			Operation::Ple(ple) => ple.math = Some(math),
+			_ => panic!("ple_math needs a preceding ple block"),
+		})
 	}
 	/// Normalizes the preceding block's output. Leading a model, it normalizes
 	/// the model input before the first block, which is the pre-normalization
@@ -13035,7 +13166,7 @@ impl Model {
 			for block in &mut model.blocks {
 				let (parts, plain) = match &mut block.operation {
 					Operation::Residual(parts) => (parts, true),
-					Operation::Hyper(_, _, parts) => (parts, false),
+					Operation::Hyper(_, _, parts, _, _) => (parts, false),
 					_ => continue,
 				};
 				let attends = mixes(parts);
@@ -13094,13 +13225,13 @@ impl Model {
 			Operation::Residual(parts) => format!("res([{}])", Self::describe_parts(parts)),
 			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
 			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared})", activation.name())
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
 			}
 			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
 			Operation::Perceptron(width) => format!("perc({width})"),
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
-			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
+			Operation::Hyper(lanes, _, parts, gate, _) => format!("{}({lanes},[{}])", if gate.is_some() { "hyper_gate" } else { "hyper" }, Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
@@ -14592,7 +14723,7 @@ impl Operation {
 			Self::Residual(parts) | Self::MoeBlocks(_, parts) => weighted_parts(parts),
 			Self::Product(left, right) => weighted_parts(&left.blocks) || weighted_parts(&right.blocks),
 			Self::Identity => false,
-			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
+			Self::Hyper(_, rank, blocks, _, _) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			_ => true,
 		}
 	}
@@ -15375,19 +15506,143 @@ impl RopeSelector for RopePairs {
 /// `token_embd`, `output_norm` and `output` names, so a row adds no path of
 /// its own.
 struct Architecture {
-	names: &'static [&'static str],
+	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
 }
-const ARCHITECTURES: &[Architecture] = &[
-	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
-	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
-	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
-];
+#[derive(Clone, Copy)]
+enum PleGateChoice { SignedRootSigmoid }
+#[derive(Default)]
+struct ArchitectureDraft {
+	name: String,
+	rope: Option<RopePairs>,
+	convolution: Option<Activation>,
+	output: Option<Activation>,
+	delta_decay: Option<DeltaDecay>,
+	delta_write: Option<DeltaWrite>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
+	ple_key_norm: Option<BlockNormalization>,
+	ple_query_norm: Option<BlockNormalization>,
+	ple_output_norm: Option<BlockNormalization>,
+	ple_convolution: Option<Activation>,
+	ple_gate: Option<PleGateChoice>,
+	ple_floor: Option<u64>,
+	ple_width_scaled: Option<bool>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
+}
+impl ArchitectureDraft {
+	fn finish(self) -> Result<Architecture> {
+		let rope = self.rope.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no rope pairing", self.name)))?;
+		require(self.convolution.is_some() == self.output.is_some(), format!("architecture {:?} names only one delta activation", self.name))?;
+		require(self.delta_decay.is_some() == self.delta_write.is_some() && self.delta_decay.is_some() == self.convolution.is_some(), format!("architecture {:?} has an incomplete delta gate profile", self.name))?;
+		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
+		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
+		require(self.expert_scoring.is_some() == self.expert_renormalize.is_some(), format!("architecture {:?} has an incomplete expert routing profile", self.name))?;
+		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
+		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
+		let ple_math = if ple_fields[0] {
+			Some(PleMath {
+				key_norm: self.ple_key_norm.unwrap(), query_norm: self.ple_query_norm.unwrap(), output_norm: self.ple_output_norm.unwrap(),
+				convolution: self.ple_convolution.unwrap(),
+				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
+			})
+		} else { None };
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale })
+	}
+}
+fn delta_decay_code(value: &str) -> Result<DeltaDecay> {
+	match value {
+		"1" => Ok(DeltaDecay::Softplus),
+		_ => Err(RecipeError::new(format!("saved delta decay gate {value:?} is not known"))),
+	}
+}
+fn delta_write_code(value: &str) -> Result<DeltaWrite> {
+	match value {
+		"1" => Ok(DeltaWrite::Sigmoid),
+		_ => Err(RecipeError::new(format!("saved delta write gate {value:?} is not known"))),
+	}
+}
+fn architecture_activation(value: &str) -> Result<Activation> {
+	match value {
+		"linear" => Ok(Activation::Linear),
+		"relu" => Ok(Activation::Relu),
+		"silu" => Ok(Activation::Silu),
+		"sigmoid" => Ok(Activation::Sigmoid),
+		"tanh" => Ok(Activation::Tanh),
+		"gelu" => Ok(Activation::Gelu),
+		"elu" => Ok(Activation::Elu),
+		"selu" => Ok(Activation::Selu),
+		_ => Err(RecipeError::new(format!("architecture activation {value:?} is not supported"))),
+	}
+}
+fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
+	match value {
+		"rms" => Ok(BlockNormalization::Rms),
+		"l2" => Ok(BlockNormalization::L2),
+		"layer" => Ok(BlockNormalization::Layer),
+		"batch" => Ok(BlockNormalization::Batch),
+		_ => Err(RecipeError::new(format!("architecture normalization {value:?} is not supported"))),
+	}
+}
+fn architectures() -> Result<Vec<Architecture>> {
+	let (mut rows, mut current) = (Vec::new(), None::<ArchitectureDraft>);
+	for raw in include_str!("Cargo.toml").lines() {
+		let line = raw.split('#').next().unwrap_or("").trim();
+		if line.starts_with('[') {
+			if let Some(previous) = current.take() { rows.push(previous.finish()?); }
+			current = line.strip_prefix("[architecture.").and_then(|value| value.strip_suffix(']')).map(|name| ArchitectureDraft { name: name.to_owned(), ..Default::default() });
+			continue;
+		}
+		let Some(current) = current.as_mut() else { continue };
+		if line.is_empty() { continue; }
+		let (key, value) = line.split_once('=').ok_or_else(|| RecipeError::new(format!("architecture {:?} contains an invalid field", current.name)))?;
+		let value = value.trim().strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| RecipeError::new(format!("architecture {:?} field {key:?} is not a string", current.name)))?;
+		match key.trim() {
+			"rope-pairs" => current.rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid rope pairing {value:?}", current.name))) }),
+			"delta-convolution" => current.convolution = Some(architecture_activation(value)?),
+			"delta-output" => current.output = Some(architecture_activation(value)?),
+			"delta-decay" => current.delta_decay = Some(match value { "softplus" => DeltaDecay::Softplus, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta decay {value:?}", current.name))) }),
+			"delta-write" => current.delta_write = Some(match value { "sigmoid" => DeltaWrite::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta write {value:?}", current.name))) }),
+			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
+			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
+			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
+			"expert-activation" => current.expert_activation = Some(architecture_activation(value)?),
+			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
+			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
+			"expert-scale" => current.expert_scale = Some(value.parse().map_err(|_| RecipeError::new(format!("architecture {:?} has invalid expert weights scale {value:?}", current.name)))?),
+			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
+			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
+			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
+			"ple-convolution" => current.ple_convolution = Some(architecture_activation(value)?),
+			"ple-gate" => current.ple_gate = Some(match value { "signed-root-sigmoid" => PleGateChoice::SignedRootSigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding gate {value:?}", current.name))) }),
+			"ple-floor" => {
+				let floor = value.parse::<f64>().map_err(|error| RecipeError::new(format!("architecture {:?} has invalid per-layer embedding floor: {error}", current.name)))?;
+				require(floor.is_finite() && floor > 0.0, "per-layer embedding floor must be positive and finite")?;
+				current.ple_floor = Some(floor.to_bits());
+			},
+			"ple-width-scaled" => current.ple_width_scaled = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding width scaling {value:?}", current.name))) }),
+			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
+		}
+	}
+	if let Some(previous) = current { rows.push(previous.finish()?); }
+	require(!rows.is_empty(), "Cargo.toml names no model architectures")?;
+	let mut seen = BTreeSet::new();
+	for row in &rows { require(seen.insert(row.name.clone()), format!("architecture {:?} is duplicated", row.name))?; }
+	Ok(rows)
+}
 /// A model built from a GGUF file: the blocks its architecture metadata declares
 /// and the plan that binds every weighted node to the file's tensors by name.
 pub struct Bound {
@@ -15479,6 +15734,14 @@ struct Builder<'a> {
 	architecture: &'a str,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
+	feed_forward_activation: Option<Activation>,
+	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15515,15 +15778,17 @@ struct ExpertDims {
 	hidden: usize,
 	scoring: Scoring,
 	renormalize: bool,
+	scale: f64,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
-		let row = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).ok_or_else(|| {
-			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
+		let rows = architectures()?;
+		let row = rows.iter().find(|row| row.name == architecture).ok_or_else(|| {
+			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15552,7 +15817,8 @@ impl<'a> Builder<'a> {
 		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
 		for layer in 0..blocks {
 			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
-				model = model.ple(ple);
+				let math = builder.ple_math.ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} names no per-layer embedding math")))?;
+				model = model.ple(ple).ple_math(math);
 				builder.ple(layer, ple, &dimensions)?;
 			}
 			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
@@ -15681,21 +15947,36 @@ impl<'a> Builder<'a> {
 		};
 		let experts = match self.integer_or("expert_count", 0)? {
 			0 => None,
-			count => Some(ExpertDims {
-				count,
-				used: self.integer("expert_used_count")?,
-				hidden: self.integer("expert_feed_forward_length")?,
-				scoring: match self.integer_or("expert_gating_func", 1)? {
-					1 => Scoring::Softmax,
-					2 => Scoring::Sigmoid,
-					other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))),
-				},
-				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
-					Some(GgufValue::Bool(value)) => *value,
-					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
-					None => true,
-				},
-			}),
+			count => {
+				// The gating function, when the file names one, selects the scoring. Value 3 is top-k
+				// before softmax, whose kept scores always renormalize.
+				let gating = match self.file.value(&self.key("expert_gating_func")) {
+					Some(_) => Some(self.integer("expert_gating_func")?),
+					None => None,
+				};
+				Some(ExpertDims {
+					count,
+					used: self.integer("expert_used_count")?,
+					hidden: self.integer("expert_feed_forward_length")?,
+					scoring: match gating {
+						Some(1) => Scoring::Softmax,
+						Some(2) => Scoring::Sigmoid,
+						Some(3) => Scoring::Softmax,
+						Some(other) => return Err(RecipeError::new(format!("expert_gating_func {other} is unknown; the file names 1 (softmax), 2 (sigmoid), or 3 (top-k softmax)"))),
+						None => self.expert_scoring.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert scoring", self.architecture)))?,
+					},
+					renormalize: match (gating, self.file.value(&self.key("expert_weights_norm"))) {
+						(Some(3), _) => true,
+						(_, Some(GgufValue::Bool(value))) => *value,
+						(_, Some(_)) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
+						(_, None) => self.expert_renormalize.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert renormalization", self.architecture)))?,
+					},
+					scale: match self.file.value(&self.key("expert_weights_scale")) {
+						Some(value) => value.float().filter(|scale| scale.is_finite()).ok_or_else(|| RecipeError::new("expert_weights_scale is not a finite float"))?,
+						None => self.expert_scale.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert weights scale", self.architecture)))?,
+					},
+				})
+			}
 		};
 		let feed_forward = if self.present("feed_forward_length") { Some(self.integer("feed_forward_length")?) } else { None };
 		require(experts.is_some() || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
@@ -15835,8 +16116,10 @@ impl<'a> Builder<'a> {
 	fn delta(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
-		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation };
+		let (conv_activation, output_activation) = self.delta_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta activations", self.architecture)))?;
+		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
+		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
 		self.delta_planes(layer, &delta, dimensions.width)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
@@ -15891,22 +16174,32 @@ impl<'a> Builder<'a> {
 			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
-		Ok(branch.glu(hidden, Activation::Silu))
+		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
+		Ok(branch.glu(hidden, activation))
 	}
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
+		let ExpertDims { count, used, hidden, scoring, renormalize, scale } = *experts;
 		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
-		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
-		Ok(branch.gguf_moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
+		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
+		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
+		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, selection_bias: bool, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
 		self.mapped(vec![router]);
+		if selection_bias {
+			// The routing node reads this span right after the router scores.
+			let bias_role = format!("block {layer} expert selection bias");
+			let tensor = self.tensor(&name("exp_probs_b.bias"), &bias_role)?;
+			require(tensor.elements() == count, format!("{} holds {} values; {bias_role} takes {count}", tensor.name, tensor.elements()))?;
+			self.mapped(vec![tensor]);
+		}
 		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
 			let table = self.tensor(&name(suffix), &role)?;
 			require(
@@ -16007,10 +16300,17 @@ impl<'a> Builder<'a> {
 	/// one ungated lane, the plain residual, otherwise.
 	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
 		match dimensions.hyper {
-			Some((lanes, rank)) => model.hyper(lanes, rank, &branch),
+			Some((lanes, 0)) => model.hyper(lanes, &branch, 1.0 / lanes as f64),
+			Some((lanes, rank)) => model.hyper_gate(lanes, &branch, hyper_gate_model(lanes, rank, dimensions.width)),
 			None => model.push(Operation::Residual(branch.blocks.clone())),
 		}
 	}
+}
+fn hyper_gate_model(lanes: usize, rank: usize, width: usize) -> HyperGate {
+	let scale = 1.0 / lanes as f64;
+	let read = recipe.model().no(bias).norm(rms).layer(rank).scale(scale).silu().layer(lanes * width).sigmoid();
+	let write = recipe.model().no(bias).norm(rms).layer(lanes).scale(scale).sigmoid().scale(2.0);
+	HyperGate { read, write, mean: scale }
 }
 /// The GGUF a model file opens through `recipe.data`, whose metadata the
 /// identifiers below and `recipe.model()` read. One process describes one
@@ -16113,13 +16413,26 @@ impl ArchitectureKeys {
 			None => Vec::new(),
 			_ => panic!("attention.compress_ratios must be an array"),
 		};
+		let policy = architectures().unwrap_or_else(|error| panic!("{error}")).into_iter().find(|row| row.name == prefix);
+		let expert_count = count("expert_count");
+		let expert_gating_func = match file.value(&format!("{prefix}.expert_gating_func")) {
+			Some(value) => value.integer().and_then(|value| usize::try_from(value).ok()).expect("expert_gating_func is invalid"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_scoring).map_or(0, |scoring| match scoring { Scoring::Softmax => 1, Scoring::Sigmoid => 2 }),
+			None => match policy.as_ref().and_then(|row| row.expert_scoring).expect("expert scoring is absent from GGUF and architecture profile") { Scoring::Softmax => 1, Scoring::Sigmoid => 2 },
+		};
+		let expert_weights_norm = match file.value(&format!("{prefix}.expert_weights_norm")) {
+			Some(GgufValue::Bool(value)) => *value,
+			Some(_) => panic!("expert_weights_norm must be a boolean"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_renormalize).unwrap_or(false),
+			None => policy.as_ref().and_then(|row| row.expert_renormalize).expect("expert renormalization is absent from GGUF and architecture profile"),
+		};
 		Self {
-			expert_count: count("expert_count"),
+			expert_count,
 			expert_used_count: count("expert_used_count"),
 			expert_feed_forward_length: count("expert_feed_forward_length"),
 			expert_shared_feed_forward_length: count("expert_shared_feed_forward_length"),
-			expert_gating_func: file.value(&format!("{prefix}.expert_gating_func")).and_then(GgufValue::integer).unwrap_or(1) as usize,
-			expert_weights_norm: match file.value(&format!("{prefix}.expert_weights_norm")) { Some(GgufValue::Bool(value)) => *value, None => true, _ => panic!("expert_weights_norm must be a boolean") },
+			expert_gating_func,
+			expert_weights_norm,
 			full_attention_interval: count("full_attention_interval"),
 			hyper_connection: HyperKeys { count: count("hyper_connection.count"), low_rank: count("hyper_connection.low_rank") },
 			ssm: SsmKeys {
@@ -16176,7 +16489,7 @@ impl std::ops::Deref for Namespace {
 	}
 }
 macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 qwen4exp phi3 deepseek2 glm4 granite }
+namespaces! { gemma3 gemma4 llama lfm2 qwen2 qwen3 qwen2moe qwen3moe qwen35 qwen3next qwen4exp phi3 deepseek2 glm4 granite }
 /// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
 /// ids and the chat template sit beside it.
 pub struct TokenizerKeys {
@@ -16619,8 +16932,8 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
+	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -16689,15 +17002,17 @@ impl Builder<'_> {
 				}
 				Operation::Ple(formula) => {
 					let table = Ngram::new(self.file)?;
-					require(*formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+				let mut expected = table.block();
+				expected.math = formula.math;
+				require(*formula == expected, "per-layer embedding definition differs from the GGUF table metadata")?;
 					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
-				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
+				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _, _) => {
 					let attends = mixes(parts);
 					if attends { layers += 1; }
 					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
 					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
-					if let Operation::Hyper(count, bottleneck, _) = block.operation {
+					if let Operation::Hyper(count, bottleneck, _, _, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
 						self.mixer_planes(layer, part, lanes, rank, width)?;
@@ -16759,8 +17074,8 @@ impl Builder<'_> {
 					self.delta_planes(layer, delta, width)?;
 					weighted = true;
 				}
-				Operation::Moe(count, _, hidden_width, _, _, _, shared) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, width)?;
+				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
+					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width)?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
@@ -17945,6 +18260,8 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		programs: graph.programs.clone(),
 		lanes: graph.lanes,
 		rank: graph.rank,
+		hyper_gate: graph.hyper_gate.clone(),
+		hyper_mean: graph.hyper_mean,
 		stored: graph.stored[start..end].to_vec(),
 		requantize: graph.requantize[start..end].to_vec(),
 		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
@@ -18546,6 +18863,9 @@ struct Graph {
 	block_kind: &'static str,
 	lanes: usize,
 	rank: usize,
+	hyper_gate: Option<HyperGateBlocks>,
+	/// The lane mean the active hyper-connection scales its read by.
+	hyper_mean: f64,
 	block_frozen: bool,
 	/// The precision the block being lowered named for its other ops, if any.
 	block_precision: Option<Compute>,
@@ -18587,6 +18907,8 @@ impl Graph {
 			source: -1,
 			lanes: 0,
 			rank: 0,
+			hyper_gate: None,
+			hyper_mean: 0.0,
 			state: TrainingState::default(),
 			block_index: 0,
 			block_kind: "",
@@ -18667,7 +18989,7 @@ fn sequential_operation(operation: &Operation) -> bool {
 		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) | Operation::Last | Operation::Recur(..) => true,
 		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) => parts.iter().any(|part| sequential_operation(&part.operation)),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).any(|part| sequential_operation(&part.operation)),
-		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		Operation::Hyper(_, _, blocks, _, _) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
 	}
 }
@@ -18894,8 +19216,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
-		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
-		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, f64::from_bits(*scale_bits), *selection_bias, config)?,
+		Operation::Hyper(lanes, rank, blocks, gate, mean) => lower_hyper(graph, *lanes, *rank, blocks, gate.as_ref(), f64::from_bits(*mean), total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -19447,6 +19769,7 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
+	let math = ple.math.ok_or_else(|| RecipeError::new("ple names no normalization, gate, or convolution math; call ple_math"))?;
 	let (stream, shape) = (graph.source, graph.output);
 	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
 	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
@@ -19471,20 +19794,21 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	}
 	let rows = graph.source;
 	lower_project(graph, shape.channels)?;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.key_norm, channels, shape.channels)?;
 	let key = graph.source;
 	reset(graph, stream, shape);
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.query_norm, channels, shape.channels)?;
 	let query = graph.source;
 	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
 	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
-	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
+	// gate = sigmoid(sign(s) * sqrt(max(|s|, floor))) for s the scaled dot product, with the floor and width scale the block declares.
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
-	let scale = program.constant(1.0 / (channels as f64).sqrt());
+	let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+	let scale = program.constant(if width_scaled { 1.0 / (channels as f64).sqrt() } else { 1.0 });
 	let s = program.op(ScalarOpcode::Multiply, x, scale);
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let magnitude = program.unary(ScalarOpcode::Absolute, s);
-	let floor = program.constant(1e-6);
+	let floor = program.constant(f64::from_bits(floor_bits));
 	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
 	let clamped = program.choose(above, magnitude, floor);
 	let root = program.unary(ScalarOpcode::SquareRoot, clamped);
@@ -19502,9 +19826,9 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	lower_project(graph, channels)?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
 	let gated = graph.source;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.output_norm, channels, shape.channels)?;
 	lower_dconv(graph, ple.kernel, ple.dilation)?;
-	lower_activation(graph, Activation::Silu, config)?;
+	lower_activation(graph, math.convolution, config)?;
 	let convolved = graph.source;
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
@@ -19556,10 +19880,16 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
-/// recurrence reads one value per head. The queries and keys take a per-head unit
-/// length, the output a per-head root mean square and the gate built from a third
-/// projection, and the output projection closes the block.
+/// recurrence reads one value per head. The queries and keys take the normalization
+/// the block names, the values take their own, and the output gate uses the output
+/// activation the block names. The output projection closes the block.
 fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
+	let conv_activation = delta.conv_activation.ok_or_else(|| RecipeError::new("delta names no convolution activation; call delta_activations"))?;
+	let output_activation = delta.output_activation.ok_or_else(|| RecipeError::new("delta names no output activation; call delta_activations"))?;
+	let decay = delta.decay_gate.ok_or_else(|| RecipeError::new("delta names no decay gate; call delta_gates"))?;
+	let write = delta.write_gate.ok_or_else(|| RecipeError::new("delta names no write gate; call delta_gates"))?;
+	let qk_norm = delta.qk_norm.ok_or_else(|| RecipeError::new("delta names no query/key normalization; call delta_norms"))?;
+	let value_norm = delta.value_norm.ok_or_else(|| RecipeError::new("delta names no value normalization; call delta_norms"))?;
 	let (source, input) = (graph.source, graph.output);
 	let (heads, kernel) = (delta.heads, delta.kernel);
 	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
@@ -19574,23 +19904,22 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
-	if delta.conv_activation != Activation::Linear {
-		// Qwen's gated delta recurrence applies SiLU to the causal convolution
-		// before splitting the query, key, and value planes.
-		lower_activation(graph, delta.conv_activation, config)?;
+	if conv_activation != Activation::Linear {
+		// The convolution activation applies before the query, key, and value planes split.
+		lower_activation(graph, conv_activation, config)?;
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	lower_normalize(graph, qk_norm, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, decay.code() as f64, write.code() as f64, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
 	// The recurrent read uses the same inverse-root key-width scale as attention.
 	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
-	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
+	lower_normalize(graph, value_norm, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
@@ -19957,15 +20286,20 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
+	require(scale.is_finite(), "moe routed scale must be finite")?;
 	let (source, input) = (graph.source, graph.output);
 	// One router scores every expert per position. The top-k weights name the
 	// experts whose gated feed-forward runs, so a position costs top-k of them.
 	lower_project(graph, experts)?;
-	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let selection = if selection_bias { experts } else { 0 };
+	push_node(graph, Primitive::TopK, graph.output, selection, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	if scale != 1.0 {
+		lower_scale(graph, scale)?;
+	}
 	let routing = graph.source;
 	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
 	if !shared {
@@ -20120,7 +20454,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 fn estimator_count(block: &Block) -> usize {
 	match &block.operation {
 		Operation::Estimator(_) => 1,
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().map(estimator_count).sum(),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts, _, _) => parts.iter().map(estimator_count).sum(),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).map(estimator_count).sum(),
 		_ => 0,
 	}
@@ -20128,7 +20462,7 @@ fn estimator_count(block: &Block) -> usize {
 fn first_estimator(block: &Block) -> Option<&Estimator> {
 	match &block.operation {
 		Operation::Estimator(estimator) => Some(estimator),
-		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts) => parts.iter().find_map(first_estimator),
+		Operation::Residual(parts) | Operation::Ensemble(parts) | Operation::MoeBlocks(_, parts) | Operation::Hyper(_, _, parts, _, _) => parts.iter().find_map(first_estimator),
 		Operation::Product(left, right) => left.blocks.iter().chain(&right.blocks).find_map(first_estimator),
 		_ => None,
 	}
@@ -20222,7 +20556,7 @@ fn lower_product(graph: &mut Graph, left: &ProductBranch, right: &ProductBranch,
 	require(graph.output == shape, format!("product branches produce {}x{} and {}x{}, and an elementwise product takes one shape", shape.channels, shape.length, graph.output.channels, graph.output.length))?;
 	binary(graph, left_source, graph.source, shape, ScalarOpcode::Multiply).map(drop)
 }
-fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], gate: Option<&HyperGateBlocks>, mean: f64, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
 	if graph.lanes == 0 {
 		let shape = graph.output;
@@ -20231,11 +20565,14 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	}
 	require(graph.lanes == lanes, format!("hyper-connections with {lanes} lanes follow a stream of {}", graph.lanes))?;
 	graph.rank = rank;
+	graph.hyper_gate = gate.cloned();
+	graph.hyper_mean = mean;
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	let (source, read, write) = lower_gates(graph, lanes, gate, true, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	lower_scale(graph, mean)?;
 	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	let (outer_frozen, outer_kind) = (graph.block_frozen, graph.block_kind);
 	graph.lanes = 0;
@@ -20255,36 +20592,64 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	push_program(graph, stream, &[], program)?;
 	graph.observe("hc_combine", TENSOR_HYPER)
 }
-/// The mixer gates from the stream: per-lane RMS statistics under one trainable
-/// scale over the whole stream give `xn`; the read gate is
-/// `sigmoid(W_up · silu(W_down · xn / lanes))` over the stream, and the write
-/// gate is `2 sigmoid(W_inject · xn / lanes)` per lane, so a zero injection is
-/// the plain residual. No projection carries a bias. Returns the node the read
-/// consumes, the read gate, and the write gate. With `rank` zero no node is
-/// added, every gate is one, and the read takes the raw stream.
-fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config: Config) -> Result<(i32, i32, i32)> {
-	let (stream, shape) = (graph.source, graph.output);
-	if rank == 0 {
-		return Ok((stream, -2, -2));
+/// Lower one explicit gate step. Its own precision and activation travel with
+/// the block; the leading shared RMS is handled by `lower_gates`.
+fn lower_gate_step(graph: &mut Graph, block: &Block, config: Config) -> Result<()> {
+	let outer = (graph.block_kind, graph.block_precision, graph.block_blck_precision);
+	graph.block_kind = block.operation.name();
+	graph.block_precision = block.precision;
+	graph.block_blck_precision = block.blck_precision;
+	match block.operation {
+		Operation::Layer(width) => lower_project(graph, width)?,
+		Operation::Identity => {},
+		_ => return Err(RecipeError::new(format!("{} is not a hyper gate step; use norm, layer, and scalar activations", block.operation.name()))),
 	}
+	for step in &block.maps {
+		let precision = graph.block_precision;
+		graph.block_precision = step.precision.or(precision);
+		match step.map {
+			ActivationMap::Scalar(Activation::Linear) => {},
+			ActivationMap::Scalar(activation) => lower_activation(graph, activation, config)?,
+			ActivationMap::Normalize(normalization) => {
+				let channels = graph.output.channels;
+				lower_normalize(graph, normalization, channels, channels)?;
+			}
+		}
+		graph.block_precision = precision;
+	}
+	(graph.block_kind, graph.block_precision, graph.block_blck_precision) = outer;
+	Ok(())
+}
+/// The two gate lists share their leading per-lane RMS node and its scale.
+/// The read list supplies the stream-wide gate; the write list supplies one
+/// gate per lane. A static connection names no gate and reads the raw stream.
+fn lower_gates(graph: &mut Graph, lanes: usize, gate: Option<&HyperGateBlocks>, write: bool, config: Config) -> Result<(i32, i32, i32)> {
+	let (stream, shape) = (graph.source, graph.output);
+	let Some(gate) = gate else { return Ok((stream, -2, -2)); };
+	require(lanes != 0 && shape.channels % lanes == 0, "hyper gate stream does not split into lanes")?;
+	let leading_rms = |blocks: &[Block]| blocks.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && matches!(block.maps.as_slice(), [step] if step.normalization() == Some(BlockNormalization::Rms)));
+	require(leading_rms(&gate.read.blocks) && leading_rms(&gate.write.blocks), "hyper read and write gates must begin with per-lane rms")?;
+	let outer = (graph.bias, graph.lanes, graph.block_kind, graph.block_precision);
+	graph.bias = outer.0 && gate.read.exclusions & bias.mask() == 0;
+	graph.lanes = 0;
+	graph.block_precision = gate.read.blocks[0].maps[0].precision.or(outer.3);
 	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
 	let normalized = graph.source;
-	lower_contraction(graph, rank, false)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Silu, config)?;
-	lower_contraction(graph, shape.channels, false)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
+	for block in &gate.read.blocks[1..] { lower_gate_step(graph, block, config)?; }
+	require(graph.output == shape, "hyper read gate must cover every stream channel")?;
 	let read = graph.source;
-	if !write {
-		return Ok((normalized, read, -2));
+	if write {
+		reset(graph, normalized, shape);
+		graph.bias = outer.0 && gate.write.exclusions & bias.mask() == 0;
+		for (index, block) in gate.write.blocks[1..].iter().enumerate() {
+			lower_gate_step(graph, block, config)?;
+			if index == 0 { graph.observe("hc_inject", TENSOR_HYPER)?; }
+		}
+		require(graph.output.channels == lanes && graph.output.length == shape.length, "hyper write gate must produce one value per lane")?;
 	}
-	reset(graph, normalized, shape);
-	lower_contraction(graph, lanes, false)?;
-	graph.observe("hc_inject", TENSOR_HYPER)?;
-	lower_scale(graph, 1.0 / lanes as f64)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	lower_scale(graph, 2.0)?;
-	Ok((normalized, read, graph.source))
+	let written = if write { graph.source } else { -2 };
+	(graph.bias, graph.lanes, graph.block_kind, graph.block_precision) = outer;
+	Ok((normalized, read, written))
 }
 /// Multiplies the graph output by `factor`.
 fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
@@ -20296,10 +20661,13 @@ fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 /// The head read: the stream collapses to the mean of its lanes under its own
 /// read gate.
 fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
-	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
-	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
+	let (lanes, shape) = (graph.lanes, graph.output);
+	let gate = graph.hyper_gate.clone();
+	let (source, read, _) = lower_gates(graph, lanes, gate.as_ref(), false, config)?;
 	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
+	let mean = graph.hyper_mean;
+	lower_scale(graph, mean)?;
 	graph.observe("hc_mixed", TENSOR_HYPER)?;
 	graph.lanes = 0;
 	Ok(())
