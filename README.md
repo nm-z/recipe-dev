@@ -66,12 +66,19 @@ attn(heads).int(8)
 ```rust
 let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
+	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
+	.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
 	.norm(rms);
+let gate = HyperGate {
+	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),
+	write: recipe.model().no(bias).norm(rms).layer(4).scale(0.25).sigmoid().scale(2.0),
+	mean: 0.25,
+};
 let model = recipe.model()
 	.e(qwen35.attention.layer_norm_rms_epsilon)
 	.embed(tokenizer.ggml.tokens, qwen35.embedding_length)
-	.hyper(4, 320, &attention);
+	.hyper_gate(4, &attention, gate);
 ```
 
 ```rust
@@ -84,11 +91,17 @@ let model = recipe.model()
 	delta(heads, kernel)
 		.keys(count, width)
 		.values(width)
+		.delta_norms(l2, rms)
 		.out(width)
 		.delta_activations(convolution, output)
+		.delta_gates(decay, write)
 	perc(width)
 	glu(hidden, activation)
-	ple(&ngram)
+	ple(&ngram).ple_math(PleMath {
+		key_norm: BlockNormalization::Rms, query_norm: BlockNormalization::Rms,
+		output_norm: BlockNormalization::Rms,
+		gate: PleGate::signed_root_sigmoid(1e-6, true), convolution: Activation::Silu,
+	})
 	estimators:
 		svm()
 		bayes()
@@ -98,6 +111,7 @@ let model = recipe.model()
 		lgbm(trees)
 	attention:
 		attn(heads)
+		attn_heads(heads) // head plane for a block product before the output layer
 			.width(d)
 			.head(width)
 			.kv(heads).fp(...)
@@ -106,7 +120,6 @@ let model = recipe.model()
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
-			.gate()
 atvn:
 	relu()
 	leak()
@@ -150,7 +163,8 @@ prec:
 	.recur([blocks]])
 	.ensemble([blocks])
 	.moe(topk, [blocks])
-	.hyper(lanes, rank, [blocks])
+	.hyper(lanes, &branch, mean)
+	.hyper_gate(lanes, &branch, HyperGate { read, write, mean })
 ```
 
 ```rust
@@ -247,6 +261,8 @@ recipe stats model.gguf
 recipe keys model.gguf
 ```
 
+GGUF tensor pairing, feed-forward and expert activations, expert routing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Models with feed-forward or expert blocks name `feed-forward-activation` or `expert-activation`. An expert model also names `expert-scoring` (`softmax` or `sigmoid`) and `expert-renormalize`; declared GGUF metadata overrides those two manifest choices. Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
+
 ## Precision and reference checks
 
 ```toml
@@ -292,6 +308,19 @@ println!("{}", model.memory(&data, 32768));
 ```
 
 ```rust
+let report = recipe.infer()
+	.log([log::metadata, log::tensors, log::ngram])
+	.chat([infer::time, infer::metadata, infer::tensors, infer::ngram])
+	.run(&model, &data);
+println!("GGUF metadata {}", report.gguf.metadata.len());
+println!("GGUF tensors {}", report.gguf.tensors.len());
+if let Some(table) = &report.gguf.ngram {
+	println!("{} {:?}", table.table.name, table.table.shape);
+	println!("head offsets {:?}", table.head_offsets);
+}
+```
+
+```rust
 report.*
 	tensors[].*
 		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
@@ -313,6 +342,10 @@ train().run().*
 	tile()[]
 	rows
 infer().run().*
+	gguf.*
+		metadata[] (key, value)
+		tensors[].(name|shape|kind|offset|bytes)
+		ngram?.(table|ngram_size|heads_per_ngram|layer|kernel|head_offsets|head_vocab_sizes)
 	(pp|tg)()
 	time.seconds()
 	prediction
@@ -357,21 +390,20 @@ model.memory(&data, positions).*|place().memory()[].*
 delta(heads, kernel)
 	.keys(count, width, tiled)                                  // .keys(count, width)
 	.qk(l2|rms)
-	.decay(softplus|sigmoid)
+	.delta_gates(softplus, sigmoid)
 
-attn(heads)
-	.gate(sigmoid|silu|tanh)                                    // .gate()
+let attention = recipe.model().attn_heads(heads).kv(kv).head(head);
+let gate = recipe.model().no(bias).layer(heads * head).sigmoid();
+let model = recipe.model().block(attention * gate).layer(width);
 
-hyper(lanes, [blocks])                                          // hyper(lanes, rank, &branch)
-hyper(lanes, [blocks], [blocks])
+hyper(lanes, &branch, mean)
+hyper_gate(lanes, &branch, HyperGate { read, write, mean })
 
 moe(topk, [experts])                                            // moe(topk, [blocks])
 	.route(softmax|sigmoid)
 	.renorm()
 
-ple(&ngram)                                                     // ple(&ngram)
-	.norm(rms)
-	.gate(sigmoid|silu)
+ple(&ngram).ple_math(PleMath { key_norm, query_norm, output_norm, gate, convolution })
 	.silu()
 
 mtp([blocks])                                                   // .mtp(path)
