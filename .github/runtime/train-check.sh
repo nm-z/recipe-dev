@@ -76,6 +76,7 @@ check_run() {
 	fi
 	local first=${values[0]} final=${values[$count]}
 	echo "$name: first-epoch loss $first, final loss $final"
+	awk '/^(bound [0-9]+ weighted|target projection) /' "$log.err"
 	if ! awk -v final="$final" -v first="$first" 'BEGIN { exit !(final + 0 < first + 0) }'; then
 		echo "$name: final loss $final is not below first-epoch loss $first" >&2
 		return 1

@@ -21946,6 +21946,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
 		// The projection onto the targets is not in the file, so it takes random weights even when the file binds every model node.
+		eprintln!("target projection {} -> {} takes fresh weights; the file has none for it", graph.output.channels, data.target_width);
 		let plan = graph.bound.take();
 		lower_conv(&mut graph, data.target_width, length)?;
 		graph.bound = plan;
@@ -36887,7 +36888,12 @@ impl Train {
 		}
 		// A GGUF file in the data binds the model's weights; its rows still come from the table sources.
 		let bound = match &data.file {
-			Some(file) => Some(file.bound(&conventional_plan(file, &model.for_file(file))?)?),
+			Some(file) => {
+				let plan = conventional_plan(file, &model.for_file(file))?;
+				let head = plan.nodes.last().map_or_else(String::new, |planes| planes.iter().map(Plane::name).collect::<Vec<_>>().join(", "));
+				eprintln!("bound {} weighted nodes from {} tensors; the output head reads {head}", plan.nodes(), plan.tensors());
+				Some(file.bound(&plan)?)
+			}
 			None => None,
 		};
 		let owned;
