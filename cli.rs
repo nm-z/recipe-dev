@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [-p <text>] [--submit] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe --runtime";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -146,17 +146,33 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	std::process::exit(code);
 }
 
+fn submit(source: &Path, device: Option<&str>) {
+	let code = recipe::runtime_submit(source, device).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
+	std::process::exit(code);
+}
+
 fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut device, mut config) = (None::<String>, None::<String>, None::<String>);
 	let mut run_seen = false;
 	let mut export_seen = false;
+	let mut submit_seen = false;
 	let mut settings = Vec::new();
 	let mut script_args = Vec::new();
 	while let Some(argument) = arguments.next() {
 		if !script_args.is_empty() { script_args.push(argument); continue; }
 		if argument == "--" && run_seen && source.is_some() { script_args.extend(arguments); break; }
 		if matches!(argument.as_str(), "--help" | "-h") { println!("{USAGE}"); return; }
+		if argument == "--runtime" {
+			recipe::runtime_daemon();
+		}
+		if argument == "--status" {
+			match recipe::runtime_status() {
+				Ok(text) => { println!("{text}"); return; }
+				Err(error) => invalid(&error.to_string()),
+			}
+		}
+		if argument == "--submit" { submit_seen = true; continue; }
 		if matches!(argument.as_str(), "--ctx" | "-p") {
 			let value = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			let key = if argument == "--ctx" { "RECIPE_CONTEXT" } else { "RECIPE_MESSAGE" };
@@ -216,5 +232,5 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	if export_seen && devices.as_ref().is_some_and(|names| names.len() != 1) { invalid("export requires one device"); }
-	if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
+	if submit_seen { submit(source, device) } else if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
 }

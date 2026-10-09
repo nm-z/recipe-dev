@@ -15,6 +15,11 @@ path = "cli.rs"
 
 [package.metadata.recipe] # backend trash, and perf tuners
 dependency-allowlist = []
+runtime-socket = "/tmp/recipe-runtime.sock"
+runtime-lock = "/tmp/recipe-runtime.lock"
+runtime-idle-seconds = 60
+runtime-frame-bytes = 67108864
+runtime-stream-bytes = 65536
 multi-device = "auto"
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
