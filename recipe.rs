@@ -16648,6 +16648,9 @@ impl Builder<'_> {
 				Operation::Identity => {}
 				Operation::Attention(attention) => {
 					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					if !attention.project {
+						hidden = attention.heads * if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
+					}
 					weighted = true;
 				}
 				Operation::Delta(delta) => {
@@ -16661,18 +16664,23 @@ impl Builder<'_> {
 				Operation::Product(left, right) => {
 					if part == "attn" {
 						require(left.blocks.len() == 1 && right.blocks.len() == 1, "an attention product needs one block in each branch")?;
-						let attention = match &left.blocks[0].operation {
+						let attention_left = matches!(&left.blocks[0].operation, Operation::Attention(attention) if !attention.project);
+						let (attention_branch, gate_branch) = if attention_left { (left, right) } else { (right, left) };
+						let attention = match &attention_branch.blocks[0].operation {
 							Operation::Attention(attention) if !attention.project => attention,
-							_ => return Err(RecipeError::new("an attention product starts with attn_heads")),
+							_ => return Err(RecipeError::new("an attention product needs attn_heads in one branch")),
 						};
 						let head = if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 						hidden = attention.heads * head;
-						require(matches!(right.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden)
-							&& right.blocks[0].maps.iter().any(|step| matches!(step.map, ActivationMap::Scalar(Activation::Sigmoid)))
-							&& right.exclusions & bias.mask() != 0,
-							"an attention product's gate is a bias-free layer over its head plane with sigmoid")?;
-						self.attention_planes(layer, attention, left.blocks[0].qk.is_some(), width)?;
-						self.attention_gate_planes(layer, attention.heads, head)?;
+						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden) && gate_branch.exclusions & bias.mask() != 0, "an attention product's gate is a bias-free layer over its head plane")?;
+						let normalized = attention_branch.blocks[0].qk.is_some();
+						if attention_left {
+							self.attention_planes(layer, attention, normalized, width)?;
+							self.attention_gate_planes(layer, attention.heads, head)?;
+						} else {
+							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_planes(layer, attention, normalized, width)?;
+						}
 						weighted = true;
 					} else {
 						// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
@@ -16763,7 +16771,6 @@ impl Builder<'_> {
 			outputs if outputs == 2 * heads * head => true,
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
-		require(!gated || !attention.project, format!("{} holds a gate plane; use attn_heads in a block product before the output projection", query.name))?;
 		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
 		let value = match self.optional(&name("attn_v.weight")) {
 			Some(value) => {
