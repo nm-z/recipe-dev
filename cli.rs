@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>";
+const USAGE: &str = "usage: recipe [run] <source.rs> [--device <[node:]device[.device...]>] [--cfg <precision table>] [--ctx <positions>] [--ttl <minutes>] [-p <text>] [export]\n\trecipe stats|keys <file.gguf>\n\trecipe schema probe <dataset>\n\trecipe schema finalize <proposal.json> <answers.json> <schema.json>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -176,6 +176,28 @@ fn main() {
 			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if arguments.next().is_some() { invalid(USAGE); }
 			(if argument == "stats" { recipe::stats(&path) } else { recipe::keys(&path) }).unwrap_or_else(|error| invalid(&error.to_string()));
+			return;
+		}
+		if source.is_none() && argument == "schema" {
+			let action = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			match action.as_str() {
+				"probe" if arguments.next().is_none() => {
+					let packet = recipe::propose_data_schema(&path).unwrap_or_else(|error| invalid(&error.to_string()));
+					print!("{packet}");
+				}
+				"finalize" => {
+					let answers = arguments.next().unwrap_or_else(|| invalid(USAGE));
+					let output = arguments.next().unwrap_or_else(|| invalid(USAGE));
+					if arguments.next().is_some() {
+						invalid(USAGE);
+					}
+					let (schema, decisions) = recipe::finalize_data_schema(&path, &answers).unwrap_or_else(|error| invalid(&error.to_string()));
+					fs::write(&output, schema).unwrap_or_else(|error| invalid(&format!("cannot write {output}: {error}")));
+					print!("{decisions}");
+				}
+				_ => invalid(USAGE),
+			}
 			return;
 		}
 		if argument == "--device" {
