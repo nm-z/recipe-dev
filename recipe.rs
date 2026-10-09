@@ -43,6 +43,11 @@ mod program_ir {
 		/// The left operand rounded through fp16 and back.
 		Half = 17,
 		SquareRoot = 18,
+		/// The channel of the element the program runs on, as a state value.
+		Channel = 19,
+		/// A trainable parameter at `left + channel mod right`, so one span of
+		/// `right` values gives every channel its own value.
+		ChannelParameter = 20,
 	}
 
 	impl ScalarOpcode {
@@ -66,6 +71,8 @@ mod program_ir {
 				16 => Ok(Self::FusedAdd),
 				17 => Ok(Self::Half),
 				18 => Ok(Self::SquareRoot),
+				19 => Ok(Self::Channel),
+				20 => Ok(Self::ChannelParameter),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -159,6 +166,8 @@ mod program_ir {
 		pub decode: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
+		/// The i32 name of the element's channel, when the program reads one.
+		pub channel: Option<&'a str>,
 	}
 
 	pub struct ScalarForward {
@@ -171,6 +180,8 @@ mod program_ir {
 		pub first_adjoint: String,
 		pub second_adjoint: String,
 		pub parameter_adjoint: BTreeMap<usize, String>,
+		/// The i32 parameter column and state adjoint of each channel parameter.
+		pub channel_adjoint: Vec<(String, String)>,
 	}
 
 	struct ScalarInstruction {
@@ -179,7 +190,18 @@ mod program_ir {
 		right: f64,
 	}
 
-	fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
+	/// The base index and period of a channel parameter, both nonnegative integers
+/// with a positive period.
+fn channel_span(instruction: &ScalarInstruction) -> Result<(i32, i32), EmitError> {
+	let base = integer(instruction.left, "scalar channel base")?;
+	let period = integer(instruction.right, "scalar channel period")?;
+	if base < 0 || period <= 0 {
+		return Err(EmitError::InvalidOperand { kind: "scalar channel parameter", value: instruction.right });
+	}
+	Ok((base, period))
+}
+
+fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
 		if !value.is_finite() || value.fract() != 0.0 || value < i32::MIN as f64 || value > i32::MAX as f64 {
 			return Err(EmitError::InvalidOperand { kind, value });
 		}
@@ -303,6 +325,28 @@ mod program_ir {
 					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
 					name
 				}
+				ScalarOpcode::Channel => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let _ = writeln!(output, "{name} = uitofp i32 {channel} to {ty}");
+					name
+				}
+				ScalarOpcode::ChannelParameter => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let (base, period) = channel_span(instruction)?;
+					let column = format!("{name}.column");
+					let _ = writeln!(output, "{column}.rem = urem i32 {channel}, {period}");
+					let _ = writeln!(output, "{column}.index = add i32 {column}.rem, {base}");
+					let _ = writeln!(output, "{column}.wide = zext i32 {column}.index to i64");
+					if context.decode == 0 {
+						let pointer = format!("{name}.ptr");
+						let _ = writeln!(output, "{pointer} = getelementptr inbounds {model}, {ptrty} {weights}, i64 {column}.wide", model = context.value_type, ptrty = context.pointer_type, weights = context.weights);
+						let _ = writeln!(output, "{name}.model = load {model}, {ptrty} {pointer}, align {align}", model = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = context.alignment);
+					} else {
+						let _ = writeln!(output, "{name}.model = call {model} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {column}.wide, i32 {decode})", model = context.value_type, ptrty = context.pointer_type, weights = context.weights, decode = context.decode);
+					}
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
+					name
+				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &first, &second)?,
 				ScalarOpcode::Select => {
 					let condition = scalar_operand(instruction.left, &values, &first, &second)?;
@@ -406,6 +450,7 @@ mod program_ir {
 		let incoming = incoming_state.as_str();
 		let mut values = Vec::with_capacity(instructions.len());
 		let mut parameter_for = vec![None; instructions.len()];
+		let mut channel_columns: Vec<Option<String>> = vec![None; instructions.len()];
 		for (index, instruction) in instructions.iter().enumerate() {
 			let value = match instruction.opcode {
 				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
@@ -415,6 +460,11 @@ mod program_ir {
 						return Err(EmitError::InvalidOperand { kind: "scalar parameter", value: instruction.left });
 					}
 					parameter_for[index] = Some(parameter as usize);
+					format!("%{}.scalar.{index}", context.prefix)
+				}
+				ScalarOpcode::Channel => format!("%{}.scalar.{index}", context.prefix),
+				ScalarOpcode::ChannelParameter => {
+					channel_columns[index] = Some(format!("%{}.scalar.{index}.column.index", context.prefix));
 					format!("%{}.scalar.{index}", context.prefix)
 				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &entry_first, &entry_second)?,
@@ -441,6 +491,7 @@ mod program_ir {
 		let mut first = state_zero.clone();
 		let mut second = state_zero.clone();
 		let mut parameters = BTreeMap::new();
+		let mut channel_adjoints = Vec::new();
 		let mut sequence = 0;
 		if let Some(last) = adjoints.last_mut() {
 			*last = incoming.to_owned();
@@ -462,7 +513,11 @@ mod program_ir {
 		};
 		for (index, instruction) in instructions.iter().enumerate().rev() {
 			let adjoint = adjoints[index].clone();
-			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::FusedAdd) { String::new() } else { operand(instruction.left, &values)? };
+			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel | ScalarOpcode::ChannelParameter | ScalarOpcode::FusedAdd) {
+				String::new()
+			} else {
+				operand(instruction.left, &values)?
+			};
 			let right = if matches!(
 				instruction.opcode,
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough
@@ -603,7 +658,11 @@ mod program_ir {
 					// A rounding passes its adjoint straight through.
 					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
-				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
+				ScalarOpcode::ChannelParameter => {
+					let column = channel_columns[index].clone().ok_or(EmitError::InvalidReference { kind: "scalar channel", index: index as i32 })?;
+					channel_adjoints.push((column, adjoint.clone()));
+				}
+				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel => {}
 			}
 		}
 		for (index, parameter) in parameter_for.into_iter().enumerate() {
@@ -628,7 +687,7 @@ mod program_ir {
 		let first = encode("first", &first);
 		let second = encode("second", &second);
 		let parameters = parameters.into_iter().map(|(index, value)| (index, encode(&format!("parameter{index}"), &value))).collect();
-		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters })
+		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters, channel_adjoint: channel_adjoints })
 	}
 
 	#[derive(Clone, Copy)]
@@ -4353,6 +4412,8 @@ impl NativeModelIr {
 					let ty = self.node_precision(node).model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -4376,10 +4437,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
+					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, p, wide| {
+					if let Some(channel) = channel {
+						emit_channel(ir, channel, p, node.output);
+					}
 						let output_pointer = format!("%{prefix}.output.ptr");
 						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
@@ -4762,6 +4827,9 @@ impl NativeModelIr {
 					let st = self.node_precision(node).state_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar.reverse");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
+					let dynamic_parameters = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel_parameter);
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -4785,6 +4853,7 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
@@ -4804,13 +4873,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 						&incoming,
 						true,
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
-					let scalar_body = |ir: &mut String, _p: &str, wide: &str| {
+					let scalar_body = |ir: &mut String, p: &str, wide: &str, row: &str| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let incoming_pointer = format!("%{prefix}.incoming.ptr");
 						let first_adjoint_pointer = format!("%{prefix}.first.adjoint.ptr");
@@ -4835,8 +4905,18 @@ impl NativeModelIr {
 							state_align = alignment(st),
 							wide = wide
 						));
+						if let Some(channel) = channel {
+							emit_channel(ir, channel, p, node.output);
+						}
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
+						for (column_index, (column, value)) in reverse.channel_adjoint.iter().enumerate() {
+							ir.push_str(&format!(
+								"%{prefix}.channel.index.{column_index} = add i32 {row}, {column}\n%{prefix}.channel.ptr.{column_index} = getelementptr inbounds {st}, {pointer} {scratch}, i32 %{prefix}.channel.index.{column_index}\n%{prefix}.channel.old.{column_index} = load {st}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n%{prefix}.channel.new.{column_index} = call {st} @recipe.state.add{v}({st} %{prefix}.channel.old.{column_index}, {st} {value})\nstore {st} %{prefix}.channel.new.{column_index}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n",
+								scratch = pointers.context,
+								align = alignment(st)
+							));
+						}
 						ir.push_str(&format!(
 							"{first_adjoint_pointer} = getelementptr inbounds {st}, {pointer} {source_adjoint}, i64 {wide}\n",
 							source_adjoint = pointers.source_adjoint,
@@ -4861,8 +4941,8 @@ impl NativeModelIr {
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, st, pointer, v, &format!("{prefix}.combined.owned")));
 						}
 					};
-					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide))?;
+					if gradients.is_empty() && !dynamic_parameters {
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide, ""))?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -4885,12 +4965,12 @@ impl NativeModelIr {
 								pointer_type: pointer,
 								scratch: &pointers.context,
 								zero: &literal(0.0, st),
-								gradients: &gradients,
+								gradients: &gradients, dynamic: dynamic_parameters,
 							},
-							|ir, p| {
+							|ir, p, row| {
 								let wide = format!("%{prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
-								scalar_body(ir, p, &wide)
+								scalar_body(ir, p, &wide, row)
 							},
 						)?;
 						ir.push_str(barrier(backend));
@@ -5044,8 +5124,8 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
-							|ir, p| {
+							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, dynamic: false, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							|ir, p, _row| {
 								let wide = format!("%{weight_prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
 								let source_pointer = format!("%{weight_prefix}.source.ptr");
@@ -5345,7 +5425,7 @@ impl NativeModelIr {
 					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
 					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal, channel: None }).map_err(|error| RecipeError::new(error.to_string()))?;
 					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
 					writeln!(ir, "br label %{name}.p.loop")?;
 					writeln!(ir, "{name}.p.loop:")?;
@@ -5826,7 +5906,7 @@ impl NativeModelIr {
 						self.emit_converted_load(&mut ir, pointer, &format!("%recur{index}.reverse{node_index}.second.ptr"), second_node, node, &second_value);
 					}
 					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
-					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
+					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal, channel: None };
 					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&forward.code);
 					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming"), false).map_err(|error| RecipeError::new(error.to_string()))?;
@@ -7564,6 +7644,8 @@ struct PartitionedLoop<'a> {
 	count: usize,
 	partitions: usize,
 	columns: usize,
+	/// Whether the body adds channel parameter adjoints into the row at runtime.
+	dynamic: bool,
 	value_type: &'a str,
 	/// The template variant suffix of the node's arithmetic.
 	suffix: &'a str,
@@ -7578,11 +7660,11 @@ struct PartitionedLoop<'a> {
 /// `[t * q + min(t, r), (t + 1) * q + min(t + 1, r))` for the quotient `q` and
 /// remainder `r` of the element count over the partition count, so both the
 /// boundaries and the number of rows are fixed by the program.
-fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	// The body owns the `n{index}.{name}` namespace, so every value this function
 	// introduces sits under a suffix of its own.
 	let prefix = format!("n{index}.{name}.partition");
-	let PartitionedLoop { suffix: v, count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	let PartitionedLoop { suffix: v, count, partitions, columns, dynamic, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
 	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
 	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
 	let (whole, extra) = (narrow(count / partitions, "native partition span")?, narrow(count % partitions, "native partition remainder")?);
@@ -7595,7 +7677,8 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
 	// A body with no fixed sums accumulates into its partition's scratch row at
 	// `%{prefix}.row`, so the row starts at zero and keeps what the body left.
-	let entry = if gradients.is_empty() {
+	let zeroed = gradients.is_empty() || dynamic;
+	let entry = if zeroed {
 		ir.push_str(&format!("br label %{prefix}.zero\n{prefix}.zero:\n%{prefix}.zero.c = phi i32 [ 0, %{prefix}.body ], [ %{prefix}.zero.next, %{prefix}.zero.step ]\n%{prefix}.zero.more = icmp ult i32 %{prefix}.zero.c, {columns}\nbr i1 %{prefix}.zero.more, label %{prefix}.zero.step, label %{prefix}.zeroed\n{prefix}.zero.step:\n%{prefix}.zero.index = add i32 %{prefix}.row, %{prefix}.zero.c\n%{prefix}.zero.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.zero.index\nstore {ty} {zero}, {pointer} %{prefix}.zero.ptr, align {align}\n%{prefix}.zero.next = add i32 %{prefix}.zero.c, 1\nbr label %{prefix}.zero\n{prefix}.zeroed:\n"));
 		"zeroed"
 	} else {
@@ -7606,7 +7689,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.{entry} ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
 	}
 	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
-	body(ir, &format!("%{prefix}.p"));
+	body(ir, &format!("%{prefix}.p"), &format!("%{prefix}.row"));
 	ir.push_str(&format!("br label %{prefix}.fold\n{prefix}.fold:\n"));
 	for (parameter, value) in gradients {
 		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.state.add{v}({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
@@ -7616,10 +7699,33 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	// never touches, so the fold below never reads an uninitialised slot.
 	for column in 0..if gradients.is_empty() { 0 } else { columns } {
 		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
-		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\n"));
+		if dynamic {
+			// Channel adjoints already sit in the row, so the static sum joins them.
+			ir.push_str(&format!("%{prefix}.old.{column} = load {ty}, {pointer} %{prefix}.column.{column}, align {align}\n%{prefix}.total.{column} = call {ty} @recipe.state.add{v}({ty} %{prefix}.old.{column}, {ty} {stored})\nstore {ty} %{prefix}.total.{column}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		} else {
+			ir.push_str(&format!("store {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		}
 	}
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.advance = add i32 %{prefix}.t, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
+}
+
+/// Whether a scalar program reads its element's channel.
+fn scalar_uses_channel(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| matches!(instruction[0] as i32, 19 | 20))
+}
+
+/// Whether a scalar program reads a channel parameter, which gives its
+/// gradient a runtime column.
+fn scalar_uses_channel_parameter(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| instruction[0] as i32 == 20)
+}
+
+/// Defines the channel of the element at `element`, the row-relative or
+/// global index, in a shape of `shape.channels` by `shape.length` per row.
+fn emit_channel(ir: &mut String, name: &str, element: &str, shape: Shape) {
+	ir.push_str(&format!("{name}.within = urem i32 {element}, {}\n{name} = udiv i32 {name}.within, {}\n", shape.channels * shape.length, shape.length));
 }
 
 /// Walk the elements of one window of output positions. The positions of a
@@ -10917,6 +11023,7 @@ mod bundle {
 				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
 			},
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
+			Operation::ChannelScale(period, values) => format!("channel_scale,{period}{}", values.iter().map(|bits| format!(",{bits}")).collect::<String>()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
@@ -11111,6 +11218,12 @@ mod bundle {
 				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
+			"channel_scale" => {
+					let period: usize = value_at(fields.next(), "channel scale period")?;
+					let values = (0..period).map(|_| value_at::<u64>(fields.next(), "channel scale value")).collect::<Result<Vec<_>>>()?;
+					require(fields.next().is_none(), "channel scale record has extra fields")?;
+					Ok(Operation::ChannelScale(period, values))
+				}
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -12395,6 +12508,8 @@ enum Operation {
 	Ple(PleBlock),
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
+	/// Multiplies channel `c` by its trainable value `c mod period`; the values are their bit patterns.
+	ChannelScale(usize, Vec<u64>),
 	/// Computes nothing. It carries a step that is only an activation or only
 	/// a normalization, so those need no operation of their own.
 	Identity,
@@ -13145,6 +13260,13 @@ impl Model {
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Self {
 		self.push(Operation::Glu(hidden, activation))
 	}
+	/// Multiplies each channel by a trainable value, where channel `c` takes
+	/// `values[c % values.len()]`. Each value is one parameter, so a per-head gain
+	/// takes one value per head.
+	pub fn channel_scale(&self, values: &[f64]) -> Self {
+		assert!(!values.is_empty() && values.iter().all(|value| value.is_finite()), "channel scale needs finite values");
+		self.push(Operation::ChannelScale(values.len(), values.iter().map(|value| value.to_bits()).collect()))
+	}
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
 	pub fn qk(&self, normalization: impl NormalizationSelector) -> Self {
@@ -13249,6 +13371,7 @@ impl Model {
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
 			Operation::Hyper(lanes, _, parts, gate, _) => format!("{}({lanes},[{}])", if gate.is_some() { "hyper_gate" } else { "hyper" }, Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
+			Operation::ChannelScale(period, _) => format!("channel_scale({period})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
 			Operation::Identity => String::new(),
@@ -14728,6 +14851,7 @@ impl Operation {
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Glu(..) => "glu",
+			Self::ChannelScale(..) => "channel_scale",
 		}
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
@@ -19318,6 +19442,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
+		Operation::ChannelScale(period, values) => lower_channel_scale(graph, *period, values)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
@@ -19572,6 +19697,12 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	Ok(())
 }
 fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: ScalarProgram) -> Result<()> {
+	for instruction in program.0.chunks_exact(3) {
+		if instruction[0] as i32 == 20 {
+			let (base, period) = (instruction[1], instruction[2]);
+			require(base.fract() == 0.0 && period.fract() == 0.0 && base >= 0.0 && period >= 1.0 && base + period <= initial.len() as f64, "channel parameter span exceeds the node's parameters")?;
+		}
+	}
 	let (program_offset, program_count) = (graph.programs.len(), program.0.len() / 3);
 	graph.programs.extend(program.0);
 	let arguments = arguments(0.0, 0.0);
@@ -19881,6 +20012,16 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
+/// Multiplies each channel by its trainable value at `channel mod period`.
+fn lower_channel_scale(graph: &mut Graph, period: usize, values: &[u64]) -> Result<()> {
+	require(period != 0 && values.len() == period, "channel scale needs one value per period slot")?;
+	let initial = values.iter().map(|bits| f64::from_bits(*bits)).collect::<Vec<_>>();
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let scale = program.op(ScalarOpcode::ChannelParameter, 0.0, period as f64);
+	program.op(ScalarOpcode::Multiply, x, scale);
+	push_program(graph, -2, &initial, program)
+}
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let math = ple.math.ok_or_else(|| RecipeError::new("ple names no normalization, gate, or convolution math; call ple_math"))?;
 	let (stream, shape) = (graph.source, graph.output);

@@ -144,6 +144,26 @@ exact-cpu = false
 tolerance = 0.05
 step = 32
 
+[precision.check64]
+sum = "int8"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp64"
+norm = "fp64"
+res = "fp64"
+acc = "fp64"
+train = "fp64"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.001
+step = 32
+
 [precision.llamacpp]
 fp8 = "e4m3"
 train = "fp32"
