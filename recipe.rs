@@ -24895,7 +24895,7 @@ fn load_amd(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let mut gpu = HsaGpuQuery { info, found: Vec::new() };
 		check(iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
 		check(iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent")?;
-		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?;
+		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent; AMD APUs and integrated GPUs are unsupported")?;
 		gpu.found
 			.into_iter()
 			.enumerate()
