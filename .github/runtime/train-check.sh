@@ -72,8 +72,6 @@ check_run() {
 		echo "$name: expected $epochs epoch losses, found $count" >&2
 		head -c 1500 "$log.out" >&2
 		tail -c 1200 "$log.err" >&2
-		head -c 1500 "$log.out" >&2
-		tail -c 800 "$log.err" >&2
 		return 1
 	fi
 	local first=${values[0]} final=${values[$count]}
