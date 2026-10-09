@@ -5820,7 +5820,7 @@ impl NativeModelIr {
 								width: normalize_width(node),
 								span: normalize_span(node),
 								weight,
-								shift: node.parameters == 2 * normalize_span(node),
+								shift: mode == program_ir::NormalizeMode::Layer && node.parameters == 2 * normalize_span(node),
 								mode,
 								prefix: &prefix,
 							},
@@ -5973,6 +5973,14 @@ impl NativeModelIr {
 								};
 								ir.push_str(&format!("%{weight_prefix}.normalized.state = call {st} @recipe.state.from.model{v}({ty} {})\n", fragment.value));
 								ir.push_str(&format!("%{weight_prefix}.product = call {st} @recipe.state.mul{v}({st} {delta_value}, {st} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {st} %{weight_prefix}.product, {st} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i64 %{weight_prefix}.normalize.channel, i64 0\n%{weight_prefix}.partition.row.wide = zext i32 {row} to i64\n%{weight_prefix}.column = add i64 %{weight_prefix}.partition.row.wide, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {st}, {pointer} {scratch}, i64 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {st}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {st} @recipe.state.add{v}({st} %{weight_prefix}.column.value, {st} %{weight_prefix}.contribution)\nstore {st} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = format!("%{weight_prefix}.normalized.state"), align = alignment(st), row = row));
+								if mode == program_ir::NormalizeMode::Layer && node.parameters == 2 * normalize_span(node) {
+									// The shift gradient is the delta itself, summed per channel into the columns after the scales.
+									ir.push_str(&format!(
+										"%{weight_prefix}.shift.contribution = select i1 %{weight_prefix}.live, {st} {delta_value}, {st} {zero}\n%{weight_prefix}.shift.column = add i64 %{weight_prefix}.column, {span}\n%{weight_prefix}.shift.ptr = getelementptr inbounds {st}, {pointer} {scratch}, i64 %{weight_prefix}.shift.column\n%{weight_prefix}.shift.value = load {st}, {pointer} %{weight_prefix}.shift.ptr, align {align}\n%{weight_prefix}.shift.next = call {st} @recipe.state.add{v}({st} %{weight_prefix}.shift.value, {st} %{weight_prefix}.shift.contribution)\nstore {st} %{weight_prefix}.shift.next, {pointer} %{weight_prefix}.shift.ptr, align {align}\n",
+										span = normalize_span(node),
+										align = alignment(st)
+									));
+								}
 							},
 						)?;
 						ir.push_str(barrier(backend));
@@ -14190,7 +14198,7 @@ impl Block {
 	}
 	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
 	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
-		let normalizations = self.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).count();
+		let normalizations = self.maps.iter().filter(|step| matches!(step.normalization(), Some(BlockNormalization::Rms | BlockNormalization::Layer))).count();
 		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
 		self.scale_tensors.push(name.into());
 		self
@@ -17755,8 +17763,8 @@ impl<'a> Builder<'a> {
 		let vocabulary = embedding.shape[1] as usize;
 		let format = gguf::embedding_format(&embedding)?;
 		let mut model = recipe.model();
-		if builder.present("attention.layer_norm_rms_epsilon") {
-			model = model.e(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
+		if let Some(key) = ["attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon"].into_iter().find(|key| builder.present(key)) {
+			model = model.e(file.float_at(&builder.key(key))?);
 		}
 		model = model.embed(vocabulary, dimensions.width);
 		if matches!(architecture, "gemma3" | "gemma4") {
@@ -18361,10 +18369,10 @@ fn open_script_file(path: &Path) -> Gguf {
 	file.clone()
 }
 impl Gguf {
-	/// The `<architecture>.attention.layer_norm_rms_epsilon` the file declares.
+	/// The `<architecture>.attention.layer_norm_rms_epsilon` the file declares, or its `layer_norm_epsilon`.
 	fn rms_epsilon(&self) -> Option<f64> {
 		let architecture = self.value("general.architecture").and_then(GgufValue::text)?;
-		self.value(&format!("{architecture}.attention.layer_norm_rms_epsilon")).and_then(GgufValue::float)
+		["layer_norm_rms_epsilon", "layer_norm_epsilon"].into_iter().find_map(|key| self.value(&format!("{architecture}.attention.{key}")).and_then(GgufValue::float))
 	}
 }
 /// The standard `<architecture>.*` keys a GGUF file sizes its blocks with, as
@@ -19095,13 +19103,13 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for (index, _) in block.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+			for (index, mode) in block.maps.iter().filter_map(|step| step.normalization().filter(|mode| matches!(mode, BlockNormalization::Rms | BlockNormalization::Layer))).enumerate() {
 				let name = match block.scale_tensors.get(index) {
 					Some(spelled) => spelled.as_str(),
 					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
 					None => "token_embd_norm.weight",
 				};
-				self.norm_scale(name, width)?;
+				self.norm_parameters(mode, name, width)?;
 			}
 		}
 		if lanes != 0 { self.head_planes(lanes, rank, width, head_spelled.as_ref())?; }
@@ -19205,9 +19213,9 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for (index, _) in step.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+			for (index, mode) in step.maps.iter().filter_map(|step| step.normalization().filter(|mode| matches!(mode, BlockNormalization::Rms | BlockNormalization::Layer))).enumerate() {
 				if let Some(spelled) = step.scale_tensors.get(index) {
-					self.norm_scale(spelled, width)?;
+					self.norm_parameters(mode, spelled, width)?;
 					continue;
 				}
 				let suffix = match (part, weighted) {
@@ -19217,7 +19225,7 @@ impl Builder<'_> {
 					(_, false) => "ffn_norm.weight",
 					(_, true) => "post_ffw_norm.weight",
 				};
-				self.norm_scale(&name(suffix), width)?;
+				self.norm_parameters(mode, &name(suffix), width)?;
 			}
 		}
 		Ok(())
@@ -19245,6 +19253,26 @@ impl Builder<'_> {
 		Ok(())
 	}
 	/// One normalization scale of `width` values.
+	/// One normalization's parameters: an rms scale, or a layer normalization's scale
+	/// followed by its shift, which the file stores beside the scale as `<stem>.bias`.
+	fn norm_parameters(&mut self, mode: BlockNormalization, name: &str, width: usize) -> Result<()> {
+		if mode != BlockNormalization::Layer {
+			return self.norm_scale(name, width);
+		}
+		let shift_name = format!("{}.bias", name.strip_suffix(".weight").unwrap_or(name));
+		let mut planes = Vec::new();
+		for (tensor_name, kind, fill) in [(name, "ones", 1.0), (shift_name.as_str(), "zeros", 0.0)] {
+			planes.push(match self.optional(tensor_name).filter(|tensor| tensor.elements() == width) {
+				Some(tensor) => Plane::Mapped(tensor),
+				None => {
+					self.default_note(tensor_name, kind, &format!("{width} elements"));
+					Plane::Owned { name: format!("{tensor_name} unbound"), values: vec![fill; width] }
+				}
+			});
+		}
+		self.slot(planes);
+		Ok(())
+	}
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
 			Some(tensor) => Plane::Mapped(tensor),
@@ -23025,24 +23053,32 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
-	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	let parameters = match normalization {
+		BlockNormalization::Rms => span,
+		BlockNormalization::Layer => 2 * span,
+		BlockNormalization::Batch | BlockNormalization::L2 => 0,
+	};
 	lower_normalize_parameters(graph, normalization, width, span, parameters)
 }
 /// Pushes a normalization whose trainable scale may include deferred columns.
 /// The ordinary forward path only applies the first `span` columns; an indexer
 /// uses the trailing columns as key scales after raw key pooling in its kernel.
 fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize, parameters: usize) -> Result<()> {
-	if normalization == BlockNormalization::Rms {
-		require(parameters >= span, "normalization scale is narrower than its span")?;
-	} else {
-		require(parameters == 0, "non-RMS normalization cannot carry a scale")?;
+	match normalization {
+		BlockNormalization::Rms => require(parameters >= span, "normalization scale is narrower than its span")?,
+		BlockNormalization::Layer => require(parameters == 2 * span, "layer normalization carries one scale and one shift per normalized channel")?,
+		BlockNormalization::Batch | BlockNormalization::L2 => require(parameters == 0, "batch and l2 normalization cannot carry a scale")?,
 	}
 	let epsilon = graph.epsilon;
 	// RMS carries one trainable scale per normalized channel, starting at identity.
+	// Layer normalization adds a trainable shift per channel after the scales, starting at zero.
 	let output = graph.output;
 	push_node(graph, Primitive::Normalize, output, parameters, [normalization.mode(), epsilon, width as f64, span as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	let offset = graph.parameters.len() - parameters;
 	graph.parameters[offset..].fill(1.0);
+	if normalization == BlockNormalization::Layer {
+		graph.parameters[offset + span..].fill(0.0);
+	}
 	Ok(())
 }
 /// Key blocks the indexer scores for a sequence of `length` positions.
