@@ -16909,7 +16909,7 @@ pub struct InferenceReport {
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
-	/// Each tape's weight arena: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
+	/// Each tape's weight buffer: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
 	pub residency: Vec<WeightResidency>,
 	pub context: usize,
 	pub requests: usize,
@@ -23155,9 +23155,9 @@ struct Buffer {
 	runtime: &'static Gpu,
 	pointer: u64,
 	bytes: usize,
-	/// A retained arena mapped from a shared file rather than allocated by the runtime.
+	/// A retained weight buffer mapped from a shared file rather than allocated by the runtime.
 	mapped: bool,
-	/// A retained arena a tape reads; writes fail once it is sealed.
+	/// A retained weight buffer a tape reads; writes fail once it is sealed.
 	sealed: bool,
 }
 /// The largest host buffer a zero fill stages at once, so an arena of any size
@@ -23223,8 +23223,8 @@ impl Buffer {
 		let fill = buffer.fill_weights(graph, &offsets, inference)?;
 		Ok((buffer, fill))
 	}
-	/// Writes every weight node into the arena. Returns the bytes read from the
-	/// stored source, the bytes converted on the host, and the bytes uploaded.
+	/// Writes every weight node into the weight buffer. Returns the bytes read from the
+	/// stored source, the bytes converted on the CPU, and the bytes uploaded.
 	fn fill_weights(&self, graph: &Graph, offsets: &[usize], inference: bool) -> Result<(usize, usize, usize)> {
 		let (mut read, mut converted, mut uploaded) = (0, 0, 0);
 		for (index, node) in graph.nodes.iter().enumerate() {
@@ -23305,7 +23305,7 @@ impl Drop for Buffer {
 }
 
 impl Buffer {
-	/// A weight arena mapped at a retained address, filled and sealed by its tape.
+	/// A weight buffer mapped at a retained address, filled and sealed by its tape.
 	fn retained(runtime: &'static Gpu, pointer: u64, bytes: usize) -> Self {
 		Self { runtime, pointer, bytes, mapped: true, sealed: false }
 	}
@@ -23313,7 +23313,7 @@ impl Buffer {
 		self.sealed = true;
 	}
 }
-/// Weight arenas retained across invocations on the CPU. Each arena is a shared
+/// Weight buffers retained across invocations on the CPU. Each weight buffer is a shared
 /// file mapped at an address recorded in its lease, so a later process maps the
 /// same bytes at the addresses its compiled kernels already name.
 const RETAINED_ROOT: &str = "recipe-retained-v1";
@@ -23517,7 +23517,7 @@ fn holder_alive(holder: Option<&String>) -> bool {
 fn remove_retained(lease: &Path) {
 	fs::remove_file(lease).ok();
 	fs::remove_file(lease.with_extension("loading")).ok();
-	fs::remove_file(lease.with_extension("arena")).ok();
+	fs::remove_file(lease.with_extension("weight buffer")).ok();
 }
 /// Releases expired leases and recovers loads whose holder has exited.
 fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
@@ -23540,7 +23540,7 @@ fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
 	}
 	(released, recovered)
 }
-/// Removes retained arenas of this source whose content no longer matches.
+/// Removes retained weight buffers of this source whose content no longer matches.
 fn invalidate_sources(root: &Path, owner: u32, source: &str, digest: &str) -> usize {
 	let Ok(entries) = fs::read_dir(root) else { return 0 };
 	let mut removed = 0;
@@ -23571,13 +23571,13 @@ unsafe extern "C" {
 	#[link_name = "munmap"]
 	fn retained_unmap(address: *mut std::ffi::c_void, length: usize) -> i32;
 }
-/// Maps the arena file at `address` when that range is free.
-fn map_retained(arena: &fs::File, bytes: usize, address: usize) -> Option<u64> {
+/// Maps the weight file at `address` when that range is free.
+fn map_retained(file: &fs::File, bytes: usize, address: usize) -> Option<u64> {
 	use std::os::fd::AsRawFd as _;
 	const READ_WRITE: i32 = 0x1 | 0x2;
 	const SHARED_FIXED_NOREPLACE: i32 = 0x01 | 0x10_0000;
 	let length = retained_length(bytes);
-	let pointer = unsafe { retained_map(address as *mut _, length, READ_WRITE, SHARED_FIXED_NOREPLACE, arena.as_raw_fd(), 0) };
+	let pointer = unsafe { retained_map(address as *mut _, length, READ_WRITE, SHARED_FIXED_NOREPLACE, file.as_raw_fd(), 0) };
 	if pointer as isize == -1 {
 		return None;
 	}
@@ -23607,7 +23607,7 @@ fn retained_source(file: &Gguf) -> Result<Option<RetainedSource>> {
 	let ttl = minutes.checked_mul(60).ok_or_else(|| RecipeError::new("--ttl is too large"))?;
 	Ok(Some(RetainedSource { digest: source_digest(&file.paths, &root)?, path, ttl }))
 }
-/// Whether a tape's weights came from a retained arena, and what that arena cost.
+/// Whether a tape's weights came from a retained weight buffer, and what that weight buffer cost.
 #[derive(Clone, Debug, Default)]
 pub struct WeightResidency {
 	pub device: String,
@@ -23616,23 +23616,23 @@ pub struct WeightResidency {
 	pub reason: String,
 	/// The first 16 hex digits of the retained-allocation identity.
 	pub identity: String,
-	/// The address of the retained arena, or zero when the arena is private.
+	/// The address of the retained weight buffer, or zero when the weight buffer is private.
 	pub address: usize,
 	pub bytes: usize,
-	/// Stored source bytes staged for the arena, read in this invocation.
+	/// Stored source bytes staged for the weight buffer, read in this invocation.
 	pub read_bytes: usize,
-	/// Parameter bytes encoded on the host in this invocation.
+	/// Parameter bytes encoded on the CPU in this invocation.
 	pub converted_bytes: usize,
-	/// Bytes copied into the arena in this invocation.
+	/// Bytes copied into the weight buffer in this invocation.
 	pub uploaded_bytes: usize,
-	/// Unix seconds when the retained arena expires, or zero when it is private.
+	/// Unix seconds when the retained weight buffer expires, or zero when it is private.
 	pub expires: u64,
-	/// Expired or superseded arenas removed by this invocation.
+	/// Expired or superseded weight buffers removed by this invocation.
 	pub released: usize,
 	/// Interrupted loads recovered by this invocation.
 	pub recovered: usize,
 }
-/// Keeps a retained arena's lease alive for its TTL after the tape is dropped.
+/// Keeps a retained weight buffer's lease alive for its TTL after the tape is dropped.
 pub(crate) struct RetainedHold {
 	lease: PathBuf,
 	ttl: u64,
@@ -23643,7 +23643,7 @@ impl Drop for RetainedHold {
 		renew_retained(&self.lease, self.owner, self.ttl);
 	}
 }
-/// A retained arena being created. Its lease is written once the weights and
+/// A retained weight buffer being created. Its lease is written once the weights and
 /// model-load kernel have finished; an earlier exit leaves a loading record
 /// that the next invocation recovers.
 struct RetainedLoad {
@@ -23664,7 +23664,7 @@ impl RetainedLoad {
 		Ok(RetainedHold { lease: self.lease, ttl: self.ttl, owner: self.owner })
 	}
 }
-/// One tape's weight arena and the residency decision that produced it.
+/// One tape's weight buffer and the residency decision that produced it.
 struct Acquired {
 	weights: Buffer,
 	residency: WeightResidency,
@@ -23685,9 +23685,9 @@ fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	};
 	Ok(Acquired { weights, residency, load: None, hold: None })
 }
-/// The buffer interface of the weight arena: offsets, sizes, precisions, and
+/// The buffer interface of the weight buffer: offsets, sizes, precisions, and
 /// stored representations of every weighted node. Node operations and indices
-/// are excluded, so a kernel-only change keeps a compatible arena.
+/// are excluded, so a kernel-only change keeps a compatible weight buffer.
 fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
 	let mut text = format!("bytes {bytes}\n");
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -23715,8 +23715,8 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	let owner = fs::metadata(&root).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", root.display())))?.uid();
 	let now = unix_now();
 	let (released, recovered) = sweep_retained(&root, owner, now);
-	let (offsets, arena) = native_weight_arena(graph, precision, inference)?;
-	let bytes = arena.max(1);
+	let (offsets, weight_total) = native_weight_arena(graph, precision, inference)?;
+	let bytes = weight_total.max(1);
 	let digest = hex(&source.digest);
 	let interface = weight_interface(graph, &offsets, bytes);
 	let identity = format!(
@@ -23730,12 +23730,12 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	let invalidated = invalidate_sources(&root, owner, &source.path, &digest);
 	let lease = root.join(format!("{key}.lease"));
 	let loading = root.join(format!("{key}.loading"));
-	let arena_path = root.join(format!("{key}.arena"));
+	let weights_path = root.join(format!("{key}.weights"));
 	let mut residency = WeightResidency { device: gpu.name.clone(), outcome: "created", identity: key[..16].to_owned(), bytes, released: released + invalidated, recovered, ..Default::default() };
 	if let Some(fields) = read_fields(&lease, owner) {
 		let current = field_number(&fields, "expires").is_some_and(|expires| expires > now) && field_number(&fields, "bytes") == Some(bytes as u64);
 		if current {
-			let mapped = fs::OpenOptions::new().read(true).write(true).open(&arena_path).ok().zip(field_address(&fields, "address")).and_then(|(file, address)| map_retained(&file, bytes, address));
+			let mapped = fs::OpenOptions::new().read(true).write(true).open(&weights_path).ok().zip(field_address(&fields, "address")).and_then(|(file, address)| map_retained(&file, bytes, address));
 			let Some(pointer) = mapped else {
 				return private_weights(gpu, graph, precision, inference, "retained address is unavailable");
 			};
@@ -23774,12 +23774,12 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	if !claimed {
 		return private_weights(gpu, graph, precision, inference, "another process is loading these weights");
 	}
-	let arena_file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&arena_path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", arena_path.display())))?;
-	arena_file.set_len(retained_length(bytes) as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", arena_path.display())))?;
+	let weight_file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&weights_path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", weights_path.display())))?;
+	weight_file.set_len(retained_length(bytes) as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", weights_path.display())))?;
 	let slot = u64::from_str_radix(&key[..16], 16).unwrap_or(0) % RETAINED_SLOTS;
 	let mapped = (0..64).find_map(|attempt| {
 		let address = RETAINED_BASE + ((slot + attempt) % RETAINED_SLOTS) as usize * RETAINED_SLOT;
-		map_retained(&arena_file, bytes, address)
+		map_retained(&weight_file, bytes, address)
 	});
 	let Some(pointer) = mapped else {
 		remove_retained(&lease);
