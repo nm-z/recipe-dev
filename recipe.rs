@@ -16454,7 +16454,7 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 	}
 	if plain {
 		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
-		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.normalization.is_some());
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity | Operation::Norm) && block.normalization.is_some());
 		if !normalized && file.tensor(&name(pre)).is_some() {
 			let mut scale = Block::of(Operation::Identity);
 			scale.normalization = Some(BlockNormalization::Rms);
