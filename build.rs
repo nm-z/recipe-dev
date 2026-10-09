@@ -2096,8 +2096,39 @@ fn main() -> BuildResult<()> {
 		println!("cargo:rustc-cfg=nvidia");
 		compile_nvidia(&manifest, &out, &os, schedule)?;
 	}
+	runtime_configuration(&manifest)?;
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=build.rs");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
+	Ok(())
+}
+
+/// The authoritative runtime configuration: one typed TOML definition names the
+/// runtime socket, timing, and frame limits for the shared job scheduler.
+fn runtime_configuration(manifest: &str) -> BuildResult<()> {
+	let socket = text(manifest, "runtime-socket")?;
+	// Unix socket paths must be absolute. On Windows, the runtime is
+	// unavailable, so the path is recorded but not enforced.
+	let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+	if os != "windows" && !std::path::Path::new(socket).is_absolute() {
+		return Err(io::Error::other("runtime-socket must be an absolute path").into());
+	}
+	println!("cargo:rustc-env=RECIPE_RUNTIME_SOCKET={socket}");
+	let lock = text(manifest, "runtime-lock")?;
+	if os != "windows" && !std::path::Path::new(lock).is_absolute() {
+		return Err(io::Error::other("runtime-lock must be an absolute path").into());
+	}
+	println!("cargo:rustc-env=RECIPE_RUNTIME_LOCK={lock}");
+	for (key, env_name) in [
+		("runtime-idle-seconds", "RECIPE_RUNTIME_IDLE_SECONDS"),
+		("runtime-frame-bytes", "RECIPE_RUNTIME_FRAME_BYTES"),
+		("runtime-stream-bytes", "RECIPE_RUNTIME_STREAM_BYTES"),
+	] {
+		let value = number(manifest, key)?;
+		if value.parse::<u64>().ok().filter(|v| *v != 0).is_none() {
+			return Err(io::Error::other(format!("{key} must be a positive integer")).into());
+		}
+		println!("cargo:rustc-env={env_name}={value}");
+	}
 	Ok(())
 }
