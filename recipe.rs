@@ -10755,7 +10755,9 @@ mod bundle {
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
 				"delta,{},{},{},{},{},{},{},{}",
-					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
+				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string())
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Norm => "norm".to_owned(),
@@ -10919,10 +10921,8 @@ mod bundle {
 				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
 				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
 				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				// Older bundles always used a linear convolution and sigmoid output gate.
-				// Keep those defaults when the optional activation selectors are absent.
-				let conv_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Linear);
-				let output_activation = fields.next().map(activation).transpose()?.unwrap_or(Activation::Sigmoid);
+				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
 			}
 			"ple" => {
@@ -12103,17 +12103,14 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
-	/// Activation applied after the causal convolution. Existing hand-built
-	/// models default to linear for compatibility; GGUF Qwen delta blocks set
-	/// this to SiLU from their architecture row.
-	conv_activation: Activation,
-	/// Activation applied to the output gate. Existing hand-built models
-	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
-	output_activation: Activation,
+	/// Activation applied after the causal convolution, named by the model.
+	conv_activation: Option<Activation>,
+	/// Activation applied to the output gate, named by the model.
+	output_activation: Option<Activation>,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -12820,7 +12817,7 @@ impl Model {
 	}
 	/// Activations of the preceding delta block's convolution and output gate.
 	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
-		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (convolution, output))
+		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (Some(convolution), Some(output)))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
@@ -15763,8 +15760,8 @@ impl<'a> Builder<'a> {
 	fn delta(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
-		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation, output_activation };
+		let (conv_activation, output_activation) = self.delta_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta activations", self.architecture)))?;
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation) };
 		self.delta_planes(layer, &delta, dimensions.width)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
@@ -19282,6 +19279,8 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 /// length, the output a per-head root mean square and the gate built from a third
 /// projection, and the output projection closes the block.
 fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
+	let conv_activation = delta.conv_activation.ok_or_else(|| RecipeError::new("delta names no convolution activation; call delta_activations"))?;
+	let output_activation = delta.output_activation.ok_or_else(|| RecipeError::new("delta names no output activation; call delta_activations"))?;
 	let (source, input) = (graph.source, graph.output);
 	let (heads, kernel) = (delta.heads, delta.kernel);
 	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
@@ -19296,10 +19295,10 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
-	if delta.conv_activation != Activation::Linear {
+	if conv_activation != Activation::Linear {
 		// Qwen's gated delta recurrence applies SiLU to the causal convolution
 		// before splitting the query, key, and value planes.
-		lower_activation(graph, delta.conv_activation, config)?;
+		lower_activation(graph, conv_activation, config)?;
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
@@ -19312,7 +19311,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
