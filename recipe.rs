@@ -6900,11 +6900,21 @@ impl NativeModelIr {
 			}
 		} else {
 			// The values the block's decoder would give, in the node's own type.
+			ir.push_str(&format!("%{p}.scale.unpack.h = fptrunc float %{p}.scale to half\n%{p}.scale.unpack = fpext half %{p}.scale.unpack.h to float\n"));
+			if quantizer == DeviceQuantizer::Q4_1 {
+				ir.push_str(&format!("%{p}.min.unpack.h = fptrunc float %{p}.mn32 to half\n%{p}.min.unpack = fpext half %{p}.min.unpack.h to float\n"));
+			}
 			for i in 0..32 {
+				let code = if quantizer == DeviceQuantizer::Iq4Nl { format!("%{p}.l{i}") } else if quantizer == DeviceQuantizer::Q4_0 { format!("%{p}.cm{i}") } else { format!("%{p}.cf{i}") };
+				ir.push_str(&format!("%{p}.w{i}.scaled = fmul float %{p}.scale.unpack, {code}\n"));
+				if quantizer == DeviceQuantizer::Q4_1 {
+					ir.push_str(&format!("%{p}.w{i}.rounded = fadd float %{p}.w{i}.scaled, %{p}.min.unpack\n"));
+				}
+				let decoded = if quantizer == DeviceQuantizer::Q4_1 { format!("%{p}.w{i}.rounded") } else { format!("%{p}.w{i}.scaled") };
 				if state == "double" {
-					ir.push_str(&format!("%{p}.w{i}.st = fpext float %{p}.x{i} to double\n"));
+					ir.push_str(&format!("%{p}.w{i}.st = fpext float {decoded} to double\n"));
 				} else {
-					ir.push_str(&format!("%{p}.w{i}.st = fadd float %{p}.x{i}, {}\n", lit(0.0)));
+					ir.push_str(&format!("%{p}.w{i}.st = fadd float {decoded}, {}\n", lit(0.0)));
 				}
 				ir.push_str(&format!("%{p}.w{i}.m = call {ty} @recipe.model.from.state{v}({state} %{p}.w{i}.st)\n%{p}.w{i}.ptr = getelementptr {ty}, {pointer} %{p}.target, i64 %{p}.i{i}\nbr i1 %{p}.in{i}, label %{p}.w{i}.store, label %{p}.w{i}.next\n{p}.w{i}.store:\nstore {ty} %{p}.w{i}.m, {pointer} %{p}.w{i}.ptr, align {align}\nbr label %{p}.w{i}.next\n{p}.w{i}.next:\n", align = alignment(ty)));
 			}
