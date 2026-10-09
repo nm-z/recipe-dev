@@ -50,5 +50,9 @@ fn main() {
 		.tanh().fp(16)
 		.scale(gemma3.final_logit_softcapping).fp(16);
 
-	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+	let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+	for timing in &report.timings {
+		let predicted = timing.predicted_seconds.map_or_else(|| "n/a".to_owned(), |seconds| format!("{seconds:.6} s"));
+		println!("node {} {} block {} operations {:.3e} bytes {:.3e} predicted {predicted} measured {:.6} s forwards {}", timing.node, timing.kind, timing.block, timing.operations, timing.bytes, timing.measured_seconds, timing.forwards);
+	}
 }

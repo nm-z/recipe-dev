@@ -33,6 +33,8 @@ delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 134217728
 cpu-worker-threads = 0
+cpu-peak-gflops = 160
+cpu-peak-gbps = 60
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 cpu-linker = { linux = "/usr/bin/ld", macos = "/usr/bin/ld", windows = "$ProgramFiles/LLVM/bin/lld-link.exe" }
