@@ -31650,7 +31650,6 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 
 const RUNTIME_SUBMIT: u8 = 1;
 const RUNTIME_QUEUED: u8 = 2;
-const RUNTIME_PREPARING: u8 = 3;
 const RUNTIME_RUNNING: u8 = 4;
 const RUNTIME_STDOUT: u8 = 5;
 const RUNTIME_STDERR: u8 = 6;
@@ -31709,15 +31708,7 @@ fn runtime_recv(stream: &mut UnixStream, limit: usize) -> Result<(u8, Vec<u8>)> 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RuntimeJobState {
 	Queued,
-	Preparing,
 	Running,
-	Completed,
-	Failed,
-}
-
-#[cfg(unix)]
-impl RuntimeJobState {
-	fn terminal(self) -> bool { matches!(self, Self::Completed | Self::Failed) }
 }
 
 #[cfg(unix)]
@@ -31729,7 +31720,6 @@ struct RuntimeJob {
 	cwd: String,
 	request: String,
 	device: Option<usize>,
-	status: Option<i32>,
 	output: Option<SyncSender<RuntimeOutput>>,
 }
 
@@ -31758,7 +31748,6 @@ struct RuntimeBackend {
 enum RuntimeOutput {
 	Bytes(u8, Vec<u8>),
 	Finished(i32),
-	Disconnected,
 }
 
 #[cfg(unix)]
@@ -31767,25 +31756,30 @@ fn runtime_discover_devices() -> Result<Vec<RuntimeDevice>> {
 	let mut result = Vec::new();
 	let selection = device_selection()?;
 	#[cfg(amd)]
-	match load_amd(selection.as_deref()) {
-		Ok(gpus) => {
-			for gpu in &gpus {
-				result.push(RuntimeDevice { name: format!("{host}:{}", gpu.name), exclusive: true, owner: None });
-			}
+	if runtime_selects_accelerator(selection.as_deref()) {
+		for gpu in load_amd(selection.as_deref()).unwrap_or_default() {
+			result.push(RuntimeDevice { name: format!("{host}:{}", gpu.name), exclusive: true, owner: None });
 		}
-		Err(_) => {}
 	}
 	#[cfg(nvidia)]
-	match load_nvidia(selection.as_deref()) {
-		Ok(gpus) => {
-			for gpu in &gpus {
-				result.push(RuntimeDevice { name: format!("{host}:{}", gpu.name), exclusive: true, owner: None });
-			}
+	if runtime_selects_accelerator(selection.as_deref()) {
+		for gpu in load_nvidia(selection.as_deref()).unwrap_or_default() {
+			result.push(RuntimeDevice { name: format!("{host}:{}", gpu.name), exclusive: true, owner: None });
 		}
-		Err(_) => {}
 	}
 	result.push(RuntimeDevice { name: format!("{host}:cpu"), exclusive: false, owner: None });
 	Ok(result)
+}
+
+/// A selection that names only the CPU must not initialize accelerator runtimes.
+#[cfg(all(unix, any(amd, nvidia)))]
+fn runtime_selects_accelerator(selection: Option<&[String]>) -> bool {
+	selection.is_none_or(|names| names.iter().any(|name| name.as_str() != "cpu"))
+}
+
+#[cfg(unix)]
+fn runtime_device_matches(device: &RuntimeDevice, request: &str) -> bool {
+	device.name == request || device.name.ends_with(&format!(":{request}"))
 }
 
 #[cfg(unix)]
@@ -31796,22 +31790,15 @@ fn runtime_schedule(backend: &Arc<RuntimeBackend>) {
 		let job_count = state.jobs.len();
 		for i in 0..job_count {
 			if state.jobs[i].state != RuntimeJobState::Queued { continue; }
-			let has_exclusive = state.devices.iter().any(|d| d.exclusive);
 			let request = state.jobs[i].request.clone();
-			let eligible = state.devices.iter().enumerate().find(|(_, device)| {
-				if !device.exclusive && has_exclusive && request.is_empty() {
-					return false;
-				}
-				if device.exclusive && device.owner.is_some() {
-					return false;
-				}
-				if !request.is_empty() {
-					return device.name == request || device.name.ends_with(&format!(":{request}"));
-				}
-				device.exclusive || !has_exclusive
-			}).map(|(index, _)| index);
+			// An empty request takes a free accelerator first, then the shared CPU pool.
+			let eligible = if request.is_empty() {
+				state.devices.iter().position(|d| d.exclusive && d.owner.is_none()).or_else(|| state.devices.iter().position(|d| !d.exclusive))
+			} else {
+				state.devices.iter().position(|d| runtime_device_matches(d, &request) && (!d.exclusive || d.owner.is_none()))
+			};
 			if let Some(device_index) = eligible {
-				state.jobs[i].state = RuntimeJobState::Preparing;
+				state.jobs[i].state = RuntimeJobState::Running;
 				state.jobs[i].device = Some(device_index);
 				let job_id = state.jobs[i].id;
 				if state.devices[device_index].exclusive {
@@ -31831,138 +31818,105 @@ fn runtime_schedule(backend: &Arc<RuntimeBackend>) {
 
 #[cfg(unix)]
 fn runtime_dispatch(backend: &Arc<RuntimeBackend>, job_id: u64) {
-	let (_name, source, cwd, device_name) = {
-		let state = backend.state.lock().unwrap();
-		let job = state.jobs.iter().find(|j| j.id == job_id).unwrap();
-		let device = &state.devices[job.device.unwrap()];
-		(job.name.clone(), job.source.clone(), job.cwd.clone(), device.name.clone())
-	};
-
-	// Write source to a temporary file.
-	let source_path = format!("/tmp/recipe-job-{job_id}.rs");
-	if fs::write(&source_path, &source).is_err() {
-		runtime_finish(backend, job_id, 1);
-		return;
-	}
-
-	// Determine the device's local name (strip host: prefix).
-	let local_device = device_name.rsplit_once(':').map(|(_, d)| d).unwrap_or(&device_name);
-
-	// Find our own binary.
-	let binary = match std::env::current_exe() {
-		Ok(path) => path,
-		Err(_) => {
-			runtime_finish(backend, job_id, 1);
-			return;
-		}
-	};
-
-	// Update state to running.
-	{
+	let (source, cwd, device_name, output) = {
 		let mut state = backend.state.lock().unwrap();
-		if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
-			job.state = RuntimeJobState::Running;
-		}
-		backend.changed.notify_all();
-	}
-
-	// Notify the client of the running state.
-	{
-		let state = backend.state.lock().unwrap();
-		if let Some(job) = state.jobs.iter().find(|j| j.id == job_id) {
-			if let Some(output) = &job.output {
-				output.send(RuntimeOutput::Bytes(RUNTIME_RUNNING, device_name.as_bytes().to_vec())).ok();
-			}
-		}
-	}
-
-	let mut command = Command::new(&binary);
-	command.arg("run").arg(&source_path).arg("--device").arg(local_device);
-	command.current_dir(&cwd);
-	command.stdout(Stdio::piped());
-	command.stderr(Stdio::piped());
-	// Do not inherit the RECIPE_DEVICE from the daemon's environment.
-	command.env_remove("RECIPE_DEVICE");
-
-	let mut child = match command.spawn() {
-		Ok(child) => child,
-		Err(_) => {
-			fs::remove_file(&source_path).ok();
-			runtime_finish(backend, job_id, 1);
-			return;
-		}
+		let index = state.jobs.iter().position(|job| job.id == job_id).unwrap();
+		let device_name = state.devices[state.jobs[index].device.unwrap()].name.clone();
+		let output = state.jobs[index].output.take();
+		let job = &state.jobs[index];
+		(job.source.clone(), job.cwd.clone(), device_name, output)
 	};
+	let source_path = std::env::temp_dir().join(format!("recipe-job-{}-{job_id}.rs", std::process::id()));
+	let result = runtime_run_job(&source, &source_path, &cwd, &device_name, output.as_ref());
+	fs::remove_file(&source_path).ok();
+	match result {
+		Ok(status) => runtime_finish(backend, job_id, output, status),
+		Err(message) => runtime_abort(backend, job_id, output, &message),
+	}
+}
 
-	let stdout = child.stdout.take().unwrap();
-	let stderr = child.stderr.take().unwrap();
-
-	// Forward stdout.
-	let (tx, rx) = sync_channel::<RuntimeOutput>(64);
-	let tx_out = tx.clone();
+/// Runs one job as a child `recipe run` process. Output is forwarded while the
+/// child runs, so a large output cannot block the child on a full pipe.
+#[cfg(unix)]
+fn runtime_run_job(source: &[u8], source_path: &Path, cwd: &str, device_name: &str, output: Option<&SyncSender<RuntimeOutput>>) -> std::result::Result<i32, String> {
+	fs::write(source_path, source).map_err(|e| format!("cannot write job source: {e}"))?;
+	let binary = std::env::current_exe().map_err(|e| format!("cannot locate recipe: {e}"))?;
+	let local_device = device_name.rsplit_once(':').map_or(device_name, |(_, device)| device);
+	let mut child = Command::new(&binary)
+		.arg("run")
+		.arg(source_path)
+		.arg("--device")
+		.arg(local_device)
+		.current_dir(cwd)
+		.env_remove("RECIPE_DEVICE")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|e| format!("cannot start recipe run: {e}"))?;
+	if let Some(output) = output {
+		output.send(RuntimeOutput::Bytes(RUNTIME_RUNNING, device_name.as_bytes().to_vec())).ok();
+	}
 	let stream_limit = runtime_stream_limit();
-	std::thread::spawn(move || {
-		let mut reader = std::io::BufReader::new(stdout);
-		loop {
-			let mut buf = vec![0_u8; stream_limit];
-			match reader.read(&mut buf) {
-				Ok(0) => break,
-				Ok(n) => { buf.truncate(n); tx_out.send(RuntimeOutput::Bytes(RUNTIME_STDOUT, buf)).ok(); }
-				Err(_) => break,
-			}
-		}
-	});
-
-	// Forward stderr.
-	let tx_err = tx.clone();
-	std::thread::spawn(move || {
-		let mut reader = std::io::BufReader::new(stderr);
-		loop {
-			let mut buf = vec![0_u8; stream_limit];
-			match reader.read(&mut buf) {
-				Ok(0) => break,
-				Ok(n) => { buf.truncate(n); tx_err.send(RuntimeOutput::Bytes(RUNTIME_STDERR, buf)).ok(); }
-				Err(_) => break,
-			}
-		}
-	});
-
-	// Wait for the process.
-	let status = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-	tx.send(RuntimeOutput::Finished(status)).ok();
-
-	// Drain the output channel to the client.
-	{
-		let state = backend.state.lock().unwrap();
-		let client = state.jobs.iter().find(|j| j.id == job_id).and_then(|j| j.output.clone());
-		drop(state);
-		if let Some(client) = client {
-			while let Ok(msg) = rx.recv() {
-				let terminal = matches!(msg, RuntimeOutput::Finished(_));
-				client.send(msg).ok();
-				if terminal { break; }
-			}
+	let (tx, rx) = sync_channel::<RuntimeOutput>(64);
+	let stdout = child.stdout.take().ok_or("cannot capture job stdout")?;
+	let stderr = child.stderr.take().ok_or("cannot capture job stderr")?;
+	let readers = [runtime_pipe(stdout, RUNTIME_STDOUT, stream_limit, tx.clone()), runtime_pipe(stderr, RUNTIME_STDERR, stream_limit, tx.clone())];
+	drop(tx);
+	// The loop ends when both pipes reach end of file, which happens when the child exits.
+	for message in rx {
+		if let Some(output) = output {
+			output.send(message).ok();
 		}
 	}
-
-	fs::remove_file(&source_path).ok();
-	runtime_finish(backend, job_id, status);
+	for reader in readers {
+		reader.join().ok();
+	}
+	let status = child.wait().map_err(|e| format!("cannot wait for recipe run: {e}"))?;
+	Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(unix)]
-fn runtime_finish(backend: &Arc<RuntimeBackend>, job_id: u64, status: i32) {
-	let mut state = backend.state.lock().unwrap();
-	if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
-		job.state = if status == 0 { RuntimeJobState::Completed } else { RuntimeJobState::Failed };
-		job.status = Some(status);
-		if let Some(device_index) = job.device {
+fn runtime_pipe<R: Read + Send + 'static>(mut pipe: R, verb: u8, limit: usize, tx: SyncSender<RuntimeOutput>) -> std::thread::JoinHandle<()> {
+	std::thread::spawn(move || {
+		let mut buffer = vec![0_u8; limit];
+		loop {
+			match pipe.read(&mut buffer) {
+				Ok(0) | Err(_) => break,
+				Ok(n) => {
+					if tx.send(RuntimeOutput::Bytes(verb, buffer[..n].to_vec())).is_err() {
+						break;
+					}
+				}
+			}
+		}
+	})
+}
+
+/// Reports a failure before the job ran, then releases its device.
+#[cfg(unix)]
+fn runtime_abort(backend: &Arc<RuntimeBackend>, job_id: u64, output: Option<SyncSender<RuntimeOutput>>, message: &str) {
+	if let Some(output) = &output {
+		output.send(RuntimeOutput::Bytes(RUNTIME_STDERR, format!("{message}\n").into_bytes())).ok();
+	}
+	runtime_finish(backend, job_id, output, 1);
+}
+
+#[cfg(unix)]
+fn runtime_finish(backend: &Arc<RuntimeBackend>, job_id: u64, output: Option<SyncSender<RuntimeOutput>>, status: i32) {
+	{
+		let mut state = backend.state.lock().unwrap();
+		let index = state.jobs.iter().position(|job| job.id == job_id);
+		if let Some(device_index) = index.and_then(|i| state.jobs.remove(i)).and_then(|job| job.device) {
 			if state.devices[device_index].owner == Some(job_id) {
 				state.devices[device_index].owner = None;
 			}
 		}
+		backend.changed.notify_all();
 	}
-	backend.changed.notify_all();
-	drop(state);
-	// Re-schedule: a freed device may admit a queued job.
+	// Release the device before reporting, so an immediate resubmission can take it.
+	if let Some(output) = output {
+		output.send(RuntimeOutput::Finished(status)).ok();
+	}
 	runtime_schedule(backend);
 }
 
@@ -32019,6 +31973,21 @@ fn runtime_serve_client(backend: &Arc<RuntimeBackend>, mut stream: UnixStream) {
 		Err(_) => return,
 	};
 
+	// Reject a request that cannot be scheduled, rather than queue it forever.
+	if !request.is_empty() {
+		let message = if request.contains(['.', ',']) {
+			Some(format!("A runtime job names one device, not {request:?}"))
+		} else {
+			let state = backend.state.lock().unwrap();
+			(!state.devices.iter().any(|device| runtime_device_matches(device, &request))).then(|| format!("No runtime device matches {request:?}"))
+		};
+		if let Some(message) = message {
+			runtime_send(&mut stream, RUNTIME_STDERR, message.as_bytes()).ok();
+			runtime_send(&mut stream, RUNTIME_FAILED, &2_i32.to_le_bytes()).ok();
+			return;
+		}
+	}
+
 	// Create a channel for output forwarding.
 	let (tx, rx) = sync_channel::<RuntimeOutput>(64);
 
@@ -32035,7 +32004,6 @@ fn runtime_serve_client(backend: &Arc<RuntimeBackend>, mut stream: UnixStream) {
 			cwd,
 			request,
 			device: None,
-			status: None,
 			output: Some(tx),
 		});
 		backend.changed.notify_all();
@@ -32066,35 +32034,19 @@ fn runtime_serve_client(backend: &Arc<RuntimeBackend>, mut stream: UnixStream) {
 				runtime_send(&mut stream, verb, &status.to_le_bytes()).ok();
 				break;
 			}
-			Ok(RuntimeOutput::Disconnected) | Err(_) => {
+			Err(_) => {
 				runtime_send(&mut stream, RUNTIME_FAILED, &1_i32.to_le_bytes()).ok();
 				break;
 			}
 		}
-	}
-
-	// Clean up the completed job from the queue after a short delay.
-	{
-		let mut state = backend.state.lock().unwrap();
-		state.jobs.retain(|j| j.id != job_id || !j.state.terminal());
 	}
 }
 
 #[cfg(unix)]
 fn runtime_cancel(backend: &Arc<RuntimeBackend>, job_id: u64) {
 	let mut state = backend.state.lock().unwrap();
-	if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
-		if !job.state.terminal() {
-			job.state = RuntimeJobState::Failed;
-			job.status = Some(1);
-			job.output = None;
-			if let Some(device_index) = job.device {
-				if state.devices[device_index].owner == Some(job_id) {
-					state.devices[device_index].owner = None;
-				}
-			}
-		}
-	}
+	// A running job keeps its device until its child exits. Only a queued job can be withdrawn.
+	state.jobs.retain(|job| job.id != job_id || job.state != RuntimeJobState::Queued);
 	backend.changed.notify_all();
 }
 
@@ -32130,7 +32082,8 @@ pub fn runtime_daemon() -> ! {
 		std::process::exit(1);
 	});
 	// Allow any local user (same-machine scheduling).
-	fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777)).ok();
+	// Jobs run as the daemon's user, so only that user may connect.
+	fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).ok();
 
 	let devices = runtime_discover_devices().unwrap_or_else(|e| {
 		eprintln!("recipe runtime: device discovery failed: {e}");
@@ -32168,11 +32121,11 @@ pub fn runtime_daemon() -> ! {
 			Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
 				std::thread::sleep(Duration::from_millis(100));
 				let clients = backend.clients.load(Ordering::Acquire);
-				let has_active = {
-					let state = backend.state.lock().unwrap();
-					state.jobs.iter().any(|j| !j.state.terminal())
-				};
-				if clients == 0 && !has_active && last_activity.elapsed() > Duration::from_secs(idle_seconds) {
+				let has_active = !backend.state.lock().unwrap().jobs.is_empty();
+				// The idle period starts when the last client or job finishes, not when it was accepted.
+				if clients > 0 || has_active {
+					last_activity = Instant::now();
+				} else if last_activity.elapsed() > Duration::from_secs(idle_seconds) {
 					eprintln!("recipe runtime idle, exiting");
 					fs::remove_file(&socket_path).ok();
 					std::process::exit(0);
@@ -32249,7 +32202,6 @@ pub fn runtime_submit(source: &Path, device: Option<&str>) -> Result<i32> {
 					eprintln!("queued job {id}");
 				}
 			}
-			RUNTIME_PREPARING => {}
 			RUNTIME_RUNNING => {
 				let device = String::from_utf8_lossy(&payload);
 				eprintln!("running on {device}");

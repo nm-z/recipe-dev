@@ -243,5 +243,8 @@ fn main() {
 		invalid("recipe requires a Rust source")
 	}
 	if export_seen && devices.as_ref().is_some_and(|names| names.len() != 1) { invalid("export requires one device"); }
+	if submit_seen && (export_seen || config.is_some() || !settings.is_empty() || !script_args.is_empty()) {
+		invalid("--submit accepts only a source and --device")
+	}
 	if submit_seen { submit(source, device) } else if export_seen { export(source, device) } else { run(source, device, config.as_deref(), &settings, &script_args) }
 }

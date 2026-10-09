@@ -2102,6 +2102,7 @@ fn main() -> BuildResult<()> {
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
 	Ok(())
 }
+
 /// The authoritative runtime configuration: one typed TOML definition names the
 /// runtime socket, timing, and frame limits for the shared job scheduler.
 fn runtime_configuration(manifest: &str) -> BuildResult<()> {
