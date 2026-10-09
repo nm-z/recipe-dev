@@ -58,23 +58,53 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
+fn child_status(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+	#[cfg(target_os = "linux")]
+	{
+		use std::os::unix::process::CommandExt;
+		const PR_SET_PDEATHSIG: i32 = 1;
+		const SIGKILL: std::ffi::c_ulong = 9;
+		unsafe extern "C" {
+			fn prctl(option: i32, ...) -> i32;
+			fn getppid() -> i32;
+			fn _exit(status: i32) -> !;
+		}
+		let parent = std::process::id() as i32;
+		unsafe {
+			command.pre_exec(move || {
+				// Direct children must stop when their CLI exits, even if they ignore SIGTERM.
+				if prctl(PR_SET_PDEATHSIG, SIGKILL, 0 as std::ffi::c_ulong, 0 as std::ffi::c_ulong, 0 as std::ffi::c_ulong) == -1 {
+					return Err(std::io::Error::last_os_error());
+				}
+				// The parent can exit between fork and binding the death signal. Do not exec in that case.
+				if getppid() != parent {
+					_exit(1);
+				}
+				Ok(())
+			});
+		}
+	}
+	command.status()
+}
+
 fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(String, String)], arguments: &[String]) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	let output = directory.join(format!("recipe-script-{}{}", std::process::id(), std::env::consts::EXE_SUFFIX));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
-	let status = Command::new("rustc")
-		.arg("--edition=2024")
-		.arg(source)
-		.arg("--extern")
-		.arg(format!("recipe={}", library.display()))
-		.arg("-L")
-		.arg(format!("dependency={}", dependencies.display()))
-		.arg("-o")
-		.arg(&output)
-		.status()
-		.expect("cannot execute rustc");
+	let status = child_status(
+		Command::new("rustc")
+			.arg("--edition=2024")
+			.arg(source)
+			.arg("--extern")
+			.arg(format!("recipe={}", library.display()))
+			.arg("-L")
+			.arg(format!("dependency={}", dependencies.display()))
+			.arg("-o")
+			.arg(&output),
+	)
+	.expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
@@ -106,7 +136,7 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 		unsafe extern "C" { fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }
 		unsafe { signal(2, wait_for_script); }
 	}
-	let status = command.status();
+	let status = child_status(&mut command);
 	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	#[cfg(unix)]
