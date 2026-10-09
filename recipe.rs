@@ -17529,6 +17529,12 @@ impl<'a> Builder<'a> {
 		}
 		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
 	}
+	/// The values of an attention projection bias row, or zeros when the file holds none.
+	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
+		let Some(tensor) = tensor else { return Ok(vec![0.0; outputs]) };
+		require(tensor.shape == [outputs as u64], format!("{} has shape {:?}; {role} adds one bias per {outputs} outputs", tensor.name, tensor.shape))?;
+		file.values(&tensor)
+	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -17554,7 +17560,8 @@ impl<'a> Builder<'a> {
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
 		self.attention_planes(layer, attention, normalized, width)?;
 		if gated {
-			self.attention_gate_planes(layer, heads, head)?;
+			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
+			self.attention_gate_planes(layer, heads, head, gate_biased)?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -17562,7 +17569,7 @@ impl<'a> Builder<'a> {
 				let gate = Block::of(Operation::Layer(heads * head)).sigmoid();
 				model.blocks.push(Block::of(Operation::Product(
 					ProductBranch { blocks: vec![attention], exclusions: 0 },
-					ProductBranch { blocks: vec![gate], exclusions: bias.mask() },
+					ProductBranch { blocks: vec![gate], exclusions: if gate_biased { 0 } else { bias.mask() } },
 				)));
 			});
 			block = block.layer(width);
@@ -18609,13 +18616,14 @@ impl Builder<'_> {
 						};
 						let head = if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 						hidden = attention.heads * head;
-						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden) && gate_branch.exclusions & bias.mask() != 0, "an attention product's gate is a bias-free layer over its head plane")?;
+						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
 						let normalized = attention_branch.blocks[0].qk.is_some();
+						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
 						if attention_left {
 							self.attention_planes(layer, attention, normalized, width)?;
-							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
 						} else {
-							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
 							self.attention_planes(layer, attention, normalized, width)?;
 						}
 						weighted = true;
@@ -18726,7 +18734,24 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&key, index * head, &order)?);
 		}
 		planes.push(value);
-		self.mapped(planes);
+		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		let (query_bias, key_bias, value_bias) = (self.optional(&name("attn_q.bias")), self.optional(&name("attn_k.bias")), self.optional(&name("attn_v.bias")));
+		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
+			// The bias row follows the matrix rows, in the order the planes read them.
+			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
+			let key_values = Self::bias_values(self.file, key_bias, kv * head, &role)?;
+			let value_values = Self::bias_values(self.file, value_bias, kv * head, &role)?;
+			let mut row = Vec::with_capacity(query_values.len() + 2 * kv * head);
+			for index in 0..heads {
+				row.extend(order.iter().map(|channel| query_values[index * stride + channel]));
+			}
+			for index in 0..kv {
+				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
+			}
+			row.extend(value_values);
+			slot.push(Plane::Owned { name: name("attn_qkv.bias"), values: row });
+		}
+		self.slot(slot);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
@@ -18746,13 +18771,20 @@ impl Builder<'_> {
 		}
 		Ok(())
 	}
-	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize) -> Result<()> {
+	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool) -> Result<()> {
 		let name = format!("blk.{layer}.attn_q.weight");
 		let query = self.tensor(&name, "the attention gate")?;
 		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
 		let mut rows = Vec::with_capacity(heads);
 		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
-		self.mapped(rows);
+		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		if biased && let Some(tensor) = self.optional(&format!("blk.{layer}.attn_q.bias")) {
+			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
+			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
+			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
+		}
+		self.slot(planes);
 		Ok(())
 	}
 }
