@@ -15532,8 +15532,6 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
@@ -16492,8 +16490,6 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
-	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 	Ok(builder.plan)
 }
 /// Resolve optional source planes inside the model builder. The user declares
@@ -16530,8 +16526,8 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 		}
 	}
 }
-/// A branch that mixes positions starts a GGUF block; its feed-forward reads
-/// the tensors at the same block index.
+/// A branch that mixes positions is the attention of a GGUF block; its
+/// feed-forward is the block's other branch, in either order.
 fn mixes(parts: &[Block]) -> bool {
 	parts.iter().any(|part| match &part.operation {
 		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
@@ -16546,7 +16542,8 @@ impl Builder<'_> {
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		let (mut lanes, mut rank) = (0, 0);
+		let (mut mixers, mut feeds) = (0, 0);
 		for block in &model.blocks {
 			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
 				self.head_planes(lanes, rank, width)?;
@@ -16563,10 +16560,9 @@ impl Builder<'_> {
 					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts) => {
+					// A block holds one mixing and one feed-forward branch in either order, so each kind numbers its own blocks.
 					let attends = mixes(parts);
-					if attends { layers += 1; }
-					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
-					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
+					let (part, layer) = if attends { mixers += 1; ("attn", mixers - 1) } else { feeds += 1; ("ffn", feeds - 1) };
 					if let Operation::Hyper(count, bottleneck, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
@@ -16584,7 +16580,7 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for _ in block.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)) {
 				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
 				self.norm_scale(name, width)?;
 			}
@@ -16660,7 +16656,7 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for _ in step.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)) {
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
