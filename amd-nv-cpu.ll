@@ -2681,12 +2681,17 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narro
 %adjoint.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %adjoint, i64 %p %prior = load RECIPE_STATE, ptr addrspace(1) %adjoint.ptr, align RECIPE_STATE_ALIGN
 %total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %prior, RECIPE_STATE %sum) store RECIPE_STATE %total, ptr addrspace(1) %adjoint.ptr, align RECIPE_STATE_ALIGN ret void }
 ; Output element %p of the narrow batch is the gate-weighted mean of its lanes: the sum in lane order times 1 / lanes; without a gate every lane weighs one.
-define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated, i32 %pick ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %narrow %within = urem i64 %p, %narrow
-%lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value)
-%row.base = mul i64 %row, %per.row %base = add i64 %row.base, %within br label %loop loop:
-%lane = phi i64 [ 0, %entry ], [ %lane.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ] %more = icmp ult i64 %lane, %lanes.wide
+%row.base = mul i64 %row, %per.row %base = add i64 %row.base, %within
+%picked = icmp ne i32 %pick, 0 br i1 %picked, label %pick.lane, label %init
+pick.lane: %pick.index = sub i32 %pick, 1 %pick.wide = zext i32 %pick.index to i64
+%pick.offset = mul i64 %pick.wide, %narrow %pick.at = add i64 %base, %pick.offset
+%pick.ptr = getelementptr inbounds double, ptr addrspace(1) %stream, i64 %pick.at %pick.value = load double, ptr addrspace(1) %pick.ptr, align 8
+%pick.output = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %pick.value, ptr addrspace(1) %pick.output, align 8 ret void
+init: %lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value) br label %loop
+loop: %lane = phi i64 [ 0, %init ], [ %lane.next, %step ] %sum = phi double [ 0.0, %init ], [ %sum.next, %step ] %more = icmp ult i64 %lane, %lanes.wide
 br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narrow %index = add i64 %base, %lane.offset
 %stream.ptr = getelementptr inbounds double, ptr addrspace(1) %stream, i64 %index %value = load double, ptr addrspace(1) %stream.ptr, align 8
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %index %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
@@ -2713,7 +2718,7 @@ br i1 %gated, label %gate.pass, label %exit gate.pass:
 %gate.adjoint.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %gate.adjoint, i64 %p %gate.prior = load RECIPE_STATE, ptr addrspace(1) %gate.adjoint.ptr, align RECIPE_STATE_ALIGN
 %gate.sum = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %gate.prior, RECIPE_STATE %gate.term) store RECIPE_STATE %gate.sum, ptr addrspace(1) %gate.adjoint.ptr, align RECIPE_STATE_ALIGN br label %exit exit: ret void }
 ; Output element %p of the widened batch is its lane's write gate times the branch output channel.
-define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
+define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated, i32 %pick ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %per.row %within = urem i64 %p, %per.row
 %lane.channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide %channel = urem i64 %lane.channel, %channels.wide %lane = udiv i64 %lane.channel, %channels.wide
@@ -2721,7 +2726,9 @@ define internal void @outer_forward_body( ptr addrspace(1) %branch, ptr addrspac
 %gate.row = mul i64 %row, %lanes.wide %gate.lane = add i64 %gate.row, %lane %gate.lane.base = mul i64 %gate.lane, %length.wide %g = add i64 %gate.lane.base, %position
 %branch.ptr = getelementptr inbounds double, ptr addrspace(1) %branch, i64 %y %value = load double, ptr addrspace(1) %branch.ptr, align 8
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %g %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
-%weight = select i1 %gated, double %gate.loaded, double 1.0 %product = call double @recipe.mul(double %weight, double %value)
+%base.weight = select i1 %gated, double %gate.loaded, double 1.0
+%pick.index = sub i32 %pick, 1 %pick.wide = zext i32 %pick.index to i64 %pick.lane = icmp eq i64 %lane, %pick.wide %all.lanes = icmp eq i32 %pick, 0 %selected = or i1 %all.lanes, %pick.lane
+%weight = select i1 %selected, double %base.weight, double 0.0 %product = call double @recipe.mul(double %weight, double %value)
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %product, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; Branch element %p sums gate * adjoint over its lanes in lane order.
 define internal void @outer_reverse_branch_body( ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
@@ -2774,17 +2781,47 @@ define internal void @fold_reverse_body( ptr addrspace(1) %delta, ptr addrspace(
 ; Causal depthwise convolution. Output element %p of a [rows][channels][length]
 ; batch sums %kernel positions of its own channel, tap j reading position
 ; t - (kernel - 1 - j) * dilation, with positions before the start reading zero.
-define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation, i32 %decode ) #1 { entry:
+define internal void @dconv_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i64 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation, i32 %decode, i32 %origin, i32 %history ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %kernel.wide = zext i32 %kernel to i64 %dilation.wide = zext i32 %dilation to i64
 %narrow = mul i64 %channels.wide, %length.wide %row = udiv i64 %p, %narrow %within = urem i64 %p, %narrow %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %row.base = mul i64 %row, %narrow %channel.base = mul i64 %channel, %length.wide %base = add i64 %row.base, %channel.base %tap.base = mul i64 %channel, %kernel.wide
+%origin.wide = zext i32 %origin to i64
+%history.enabled = icmp ne i32 %history, 0
+%history.safe = select i1 %history.enabled, i32 %history, i32 1
+%history.wide = zext i32 %history.safe to i64
+%history.row = mul i64 %row, %channels.wide
+%history.channel = add i64 %history.row, %channel
+%history.base = mul i64 %history.channel, %history.wide
 %reach = sub i64 %kernel.wide, 1 br label %loop loop: %tap = phi i64 [ 0, %entry ], [ %tap.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
 %more = icmp ult i64 %tap, %kernel.wide br i1 %more, label %step, label %done step: %back = sub i64 %reach, %tap %back.scaled = mul i64 %back, %dilation.wide %source = sub i64 %position, %back.scaled
-%valid = icmp sge i64 %source, 0 %source.clamped = select i1 %valid, i64 %source, i64 0 %index = add i64 %base, %source.clamped
-%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %index %loaded = load double, ptr addrspace(1) %input.ptr, align 8 %value = select i1 %valid, double %loaded, double 0.0
+%global.source = add i64 %origin.wide, %source
+%valid = icmp sge i64 %global.source, 0
+%local = icmp sge i64 %source, 0
+%source.clamped = select i1 %local, i64 %source, i64 0
+%index = add i64 %base, %source.clamped
+%input.ptr = getelementptr double, ptr addrspace(1) %input, i64 %index
+%global.clamped = select i1 %valid, i64 %global.source, i64 0
+%history.slot = urem i64 %global.clamped, %history.wide
+%history.index = add i64 %history.base, %history.slot
+%history.ptr = getelementptr double, ptr addrspace(1) %context, i64 %history.index
+%read.ptr = select i1 %local, ptr addrspace(1) %input.ptr, ptr addrspace(1) %history.ptr
+%valid.ptr = select i1 %valid, ptr addrspace(1) %read.ptr, ptr addrspace(1) %input.ptr
+%loaded = load double, ptr addrspace(1) %valid.ptr, align 8
+%value = select i1 %valid, double %loaded, double 0.0
 %tap.index = add i64 %tap.base, %tap %weight = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %tap.index, i32 %decode)
 %product = call double @recipe.mul(double %weight, double %value) %sum.next = call double @recipe.add(double %sum, double %product) %tap.next = add i64 %tap, 1 br label %loop
-done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
+done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %sum, ptr addrspace(1) %output.ptr, align 8
+br i1 %history.enabled, label %history.save, label %exit
+history.save:
+%global.position = add i64 %origin.wide, %position
+%save.slot = urem i64 %global.position, %history.wide
+%save.index = add i64 %history.base, %save.slot
+%save.ptr = getelementptr double, ptr addrspace(1) %context, i64 %save.index
+%current.ptr = getelementptr double, ptr addrspace(1) %input, i64 %p
+%current = load double, ptr addrspace(1) %current.ptr, align 8
+store double %current, ptr addrspace(1) %save.ptr, align 8
+br label %exit
+exit: ret void }
 ; Input element %p receives tap j times the adjoint at position t + (kernel - 1 - j) * dilation while that position exists.
 define internal void @dconv_reverse_input_body( ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i64 %p, i32 %channels, i32 %length, i32 %kernel, i32 %dilation ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %kernel.wide = zext i32 %kernel to i64 %dilation.wide = zext i32 %dilation to i64
@@ -2813,84 +2850,161 @@ define internal void @dconv_reverse_weight_body( ptr addrspace(1) %input, ptr ad
 %product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %incoming) %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product) %step.next = add i64 %step.index, 1 br label %loop
 done: %gradient.index = add i64 %offset.wide, %p %gradient.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %gradient, i64 %gradient.index store RECIPE_STATE %sum, ptr addrspace(1) %gradient.ptr, align RECIPE_STATE_ALIGN ret void }
 ; log(1 + exp(x)) taken on the negative side so a large x cannot overflow.
-define internal double @softplus(double %x) #1 { entry: %magnitude = call double @recipe.abs(double %x)
-%negative = call double @recipe.neg(double %magnitude) %exponential = call double @recipe.exp(double %negative)
-%shifted = call double @recipe.add(double 1.0, double %exponential) %tail = call double @recipe.log(double %shifted)
-%softplus.zero = call double @recipe.from.u1(i1 false) %positive = call i1 @recipe.ogt(double %x, double %softplus.zero) %linear = select i1 %positive, double %x, double %softplus.zero
-%value = call double @recipe.add(double %linear, double %tail) ret double %value }
-; One position of the gated delta rule for one head. The state at %work.base is
-; read and written in place: S <- decay * S + write * k' (v - k S), and the
-; output o = q S is stored when %store is set. Every sum walks the head in
-; ascending order, so the position update never depends on the chunk it sits in.
-define internal void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i64 %q.base, i64 %k.base, i64 %v.base, i64 %o.base, i64 %a.base, i64 %b.base, i64 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 %store ) #3 { entry:
-%time.wide = zext i32 %time to i64 %kwidth.wide = zext i32 %kwidth to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64
+define internal RECIPE_STATE @delta_softplus(RECIPE_STATE %x) #1 { entry:
+%state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%magnitude = call RECIPE_STATE @recipe.state.abs(RECIPE_STATE %x)
+%negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %magnitude) %exponential = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %negative)
+%shifted = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %state.one, RECIPE_STATE %exponential) %tail = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %shifted)
+%softplus.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %positive = call i1 @recipe.state.ogt(RECIPE_STATE %x, RECIPE_STATE %softplus.zero) %linear = select i1 %positive, RECIPE_STATE %x, RECIPE_STATE %softplus.zero
+%value = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %linear, RECIPE_STATE %tail) ret RECIPE_STATE %value }
+; Prepare the scalars shared by all value columns of one head and position.
+define internal <3 x RECIPE_STATE> @delta_parameters(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %time, RECIPE_STATE %decay.scale) #1 { entry:
+%state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+
+%query.width = call RECIPE_STATE @recipe.state.from.u32(i32 %kwidth)
+%query.root = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %query.width)
+%query.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %state.one, RECIPE_STATE %query.root)
+%time.wide = zext i32 %time to i64
 %decay.index = add i64 %a.base, %time.wide
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i64 %decay.index
-%decay.input = load double, ptr addrspace(1) %decay.pointer, align 8 %softplus = call double @softplus(double %decay.input)
-%exponent = call double @recipe.mul(double %softplus, double %decay.scale) %negated = call double @recipe.neg(double %exponent)
-%decay = call double @recipe.exp(double %negated) %write.index = add i64 %b.base, %time.wide
+%decay.input.model = load double, ptr addrspace(1) %decay.pointer, align 8
+%decay.input = call RECIPE_STATE @recipe.decode(double %decay.input.model) %softplus = call RECIPE_STATE @delta_softplus(RECIPE_STATE %decay.input)
+%exponent = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %softplus, RECIPE_STATE %decay.scale) %negated = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent)
+%decay = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %negated) %write.index = add i64 %b.base, %time.wide
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i64 %write.index
-%write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
+%write.input.model = load double, ptr addrspace(1) %write.pointer, align 8
+%write.input = call RECIPE_STATE @recipe.decode(double %write.input.model) %write = call RECIPE_STATE @recipe.state.sigmoid(RECIPE_STATE %write.input)
+%result.q = insertelement <3 x RECIPE_STATE> poison, RECIPE_STATE %query.scale, i32 0
+%result.d = insertelement <3 x RECIPE_STATE> %result.q, RECIPE_STATE %decay, i32 1
+%result.w = insertelement <3 x RECIPE_STATE> %result.d, RECIPE_STATE %write, i32 2
+ret <3 x RECIPE_STATE> %result.w }
+; One head prepares its gates once for the live window. Columns read these
+; scalars after the existing compiled unit's grid barrier.
+define internal void @delta_prepare_body(ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %prepared,
+i64 %p, i32 %heads, i32 %kwidth, i32 %length, i32 %begin, i32 %end, i32 %decode) #3 { entry:
+%heads.wide = zext i32 %heads to i64 %length.wide = zext i32 %length to i64
+%row = udiv i64 %p, %heads.wide %head = urem i64 %p, %heads.wide
+%stream = mul i64 %heads.wide, %length.wide %row.stream = mul i64 %row, %stream %row.base = mul i64 %row.stream, 2
+%head.base = mul i64 %head, %length.wide %a.base = add i64 %row.base, %head.base %b.base = add i64 %a.base, %stream
+%decay.parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %head, i32 %decode)
+%decay.parameter.wide = call RECIPE_STATE @recipe.decode(double %decay.parameter)
+%decay.scale = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %decay.parameter.wide)
+%pair.base = mul i64 %p, %length.wide
+br label %loop
+loop: %time = phi i32 [ %begin, %entry ], [ %next, %step ]
+%more = icmp ult i32 %time, %end br i1 %more, label %step, label %exit
+step:
+%parameters = call <3 x RECIPE_STATE> @delta_parameters(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %time, RECIPE_STATE %decay.scale)
+%q = extractelement <3 x RECIPE_STATE> %parameters, i32 0
+%d = extractelement <3 x RECIPE_STATE> %parameters, i32 1
+%w = extractelement <3 x RECIPE_STATE> %parameters, i32 2
+%time.wide = zext i32 %time to i64 %position = add i64 %pair.base, %time.wide %base = mul i64 %position, 3
+%q.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %prepared, i64 %base
+%d.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %q.ptr, i64 1
+%w.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %q.ptr, i64 2
+store RECIPE_STATE %q, ptr addrspace(1) %q.ptr, align RECIPE_STATE_ALIGN
+store RECIPE_STATE %d, ptr addrspace(1) %d.ptr, align RECIPE_STATE_ALIGN
+store RECIPE_STATE %w, ptr addrspace(1) %w.ptr, align RECIPE_STATE_ALIGN
+%next = add i32 %time, 1 br label %loop
+exit: ret void }
+; Each column owns its state cells, preserving the serial key-reduction order.
+define internal void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
+i64 %q.base, i64 %k.base, i64 %v.base, i64 %o.base, i64 %a.base, i64 %b.base, i64 %work.base,
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, RECIPE_STATE %decay.scale, i1 %store,
+i32 %column.begin, i32 %column.stride, ptr addrspace(1) %prepared ) #3 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%time.wide = zext i32 %time to i64 %kwidth.wide = zext i32 %kwidth to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64
+%cached = icmp ne ptr addrspace(1) %prepared, null
+br i1 %cached, label %load, label %compute
+compute:
+%parameters = call <3 x RECIPE_STATE> @delta_parameters(ptr addrspace(1) %gates, i64 %a.base, i64 %b.base, i32 %kwidth, i32 %time, RECIPE_STATE %decay.scale)
+%computed.q = extractelement <3 x RECIPE_STATE> %parameters, i32 0
+%computed.d = extractelement <3 x RECIPE_STATE> %parameters, i32 1
+%computed.w = extractelement <3 x RECIPE_STATE> %parameters, i32 2
+br label %columns
+load:
+%base = mul i64 %time.wide, 3
+%q.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %prepared, i64 %base
+%d.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %q.ptr, i64 1
+%w.ptr = getelementptr RECIPE_STATE, ptr addrspace(1) %q.ptr, i64 2
+%loaded.q = load RECIPE_STATE, ptr addrspace(1) %q.ptr, align RECIPE_STATE_ALIGN
+%loaded.d = load RECIPE_STATE, ptr addrspace(1) %d.ptr, align RECIPE_STATE_ALIGN
+%loaded.w = load RECIPE_STATE, ptr addrspace(1) %w.ptr, align RECIPE_STATE_ALIGN
+br label %columns
+columns:
+%query.scale = phi RECIPE_STATE [ %computed.q, %compute ], [ %loaded.q, %load ]
+%decay = phi RECIPE_STATE [ %computed.d, %compute ], [ %loaded.d, %load ]
+%write = phi RECIPE_STATE [ %computed.w, %compute ], [ %loaded.w, %load ]
 br label %column.loop
-column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.wide = zext i32 %column to i64 %column.more = icmp ult i32 %column, %vwidth
+column.loop: %column = phi i32 [ %column.begin, %columns ], [ %column.next, %column.done ] %column.wide = zext i32 %column to i64 %column.more = icmp ult i32 %column, %vwidth
 br i1 %column.more, label %read.loop, label %exit
 read.loop: %read.i = phi i32 [ 0, %column.loop ], [ %read.next, %read.step ]
-%read.sum = phi double [ 0.0, %column.loop ], [ %read.sum.next, %read.step ]
+%read.sum = phi RECIPE_STATE [ %state.zero, %column.loop ], [ %read.sum.next, %read.step ]
 %read.more = icmp ult i32 %read.i, %kwidth br i1 %read.more, label %read.step, label %read.done
 read.step: %read.i.wide = zext i32 %read.i to i64 %read.row = mul i64 %read.i.wide, %vwidth.wide %read.cell = add i64 %read.row, %column.wide %read.index = add i64 %work.base, %read.cell
-%read.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %read.index
-%read.state = load double, ptr addrspace(1) %read.pointer, align 8
+%read.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %read.index
+%read.state = load RECIPE_STATE, ptr addrspace(1) %read.pointer, align RECIPE_STATE_ALIGN
 ; Decay the old state before predicting the value removed by the delta update.
-%read.decayed = call double @recipe.mul(double %decay, double %read.state)
-store double %read.decayed, ptr addrspace(1) %read.pointer, align 8
+%read.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %read.state)
+store RECIPE_STATE %read.decayed, ptr addrspace(1) %read.pointer, align RECIPE_STATE_ALIGN
 %read.offset.row = mul i64 %read.i.wide, %length.wide %read.offset = add i64 %read.offset.row, %time.wide %read.key.index = add i64 %k.base, %read.offset
 %read.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %read.key.index
-%read.key = load double, ptr addrspace(1) %read.key.pointer, align 8
-%read.product = call double @recipe.mul(double %read.key, double %read.decayed)
-%read.sum.next = call double @recipe.add(double %read.sum, double %read.product) %read.next = add nuw i32 %read.i, 1 br label %read.loop
+%read.key.model = load double, ptr addrspace(1) %read.key.pointer, align 8
+%read.key = call RECIPE_STATE @recipe.decode(double %read.key.model)
+%read.product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %read.key, RECIPE_STATE %read.decayed)
+%read.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %read.sum, RECIPE_STATE %read.product) %read.next = add nuw i32 %read.i, 1 br label %read.loop
 read.done: %value.row = mul i64 %column.wide, %length.wide %value.offset = add i64 %value.row, %time.wide %value.index = add i64 %v.base, %value.offset
 %value.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.index
-%value = load double, ptr addrspace(1) %value.pointer, align 8
-%error = call double @recipe.sub(double %value, double %read.sum) %write.error = call double @recipe.mul(double %write, double %error)
+%value.model = load double, ptr addrspace(1) %value.pointer, align 8
+%value = call RECIPE_STATE @recipe.decode(double %value.model)
+%error = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %value, RECIPE_STATE %read.sum) %write.error = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write, RECIPE_STATE %error)
 br label %write.loop
 write.loop: %write.i = phi i32 [ 0, %read.done ], [ %write.next, %write.step ]
-%write.sum = phi double [ 0.0, %read.done ], [ %write.sum.next, %write.step ]
+%write.sum = phi RECIPE_STATE [ %state.zero, %read.done ], [ %write.sum.next, %write.step ]
 %write.more = icmp ult i32 %write.i, %kwidth br i1 %write.more, label %write.step, label %write.done
 write.step: %write.i.wide = zext i32 %write.i to i64 %write.row = mul i64 %write.i.wide, %vwidth.wide %write.cell = add i64 %write.row, %column.wide %write.cell.index = add i64 %work.base, %write.cell
-%write.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %write.cell.index
-%write.state = load double, ptr addrspace(1) %write.state.pointer, align 8
+%write.state.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %write.cell.index
+%write.state = load RECIPE_STATE, ptr addrspace(1) %write.state.pointer, align RECIPE_STATE_ALIGN
 %write.offset.row = mul i64 %write.i.wide, %length.wide %write.offset = add i64 %write.offset.row, %time.wide
 %write.key.index = add i64 %k.base, %write.offset
 %write.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %write.key.index
-%write.key = load double, ptr addrspace(1) %write.key.pointer, align 8
-%write.term = call double @recipe.mul(double %write.key, double %write.error)
-%write.state.next = call double @recipe.add(double %write.state, double %write.term)
-store double %write.state.next, ptr addrspace(1) %write.state.pointer, align 8
+%write.key.model = load double, ptr addrspace(1) %write.key.pointer, align 8
+%write.key = call RECIPE_STATE @recipe.decode(double %write.key.model)
+%write.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write.key, RECIPE_STATE %write.error)
+%write.state.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %write.state, RECIPE_STATE %write.term)
+store RECIPE_STATE %write.state.next, ptr addrspace(1) %write.state.pointer, align RECIPE_STATE_ALIGN
 %write.query.index = add i64 %q.base, %write.offset
 %write.query.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %write.query.index
-%write.query = load double, ptr addrspace(1) %write.query.pointer, align 8
-%write.output = call double @recipe.mul(double %write.query, double %write.state.next)
-%write.sum.next = call double @recipe.add(double %write.sum, double %write.output) %write.next = add nuw i32 %write.i, 1 br label %write.loop
+%write.query.model = load double, ptr addrspace(1) %write.query.pointer, align 8
+%write.query = call RECIPE_STATE @recipe.decode(double %write.query.model)
+%write.query.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write.query, RECIPE_STATE %query.scale)
+%write.output = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write.query.scaled, RECIPE_STATE %write.state.next)
+%write.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %write.sum, RECIPE_STATE %write.output) %write.next = add nuw i32 %write.i, 1 br label %write.loop
 write.done: br i1 %store, label %write.store, label %column.done
 write.store: %output.index = add i64 %o.base, %value.offset
 %output.pointer = getelementptr inbounds double, ptr addrspace(1) %output, i64 %output.index
-store double %write.sum, ptr addrspace(1) %output.pointer, align 8 br label %column.done
-column.done: %column.next = add nuw i32 %column, 1 br label %column.loop
+%output.model = call double @recipe.encode(RECIPE_STATE %write.sum)
+store double %output.model, ptr addrspace(1) %output.pointer, align 8 br label %column.done
+column.done: %column.next = add nuw i32 %column, %column.stride br label %column.loop
 exit: ret void }
 ; One row and head of the gated delta rule. The sequence walks in chunks of
 ; %chunk positions and the carried state is committed at every chunk start, so a
 ; chunk of one commits each decode step. The chunk never reaches the arithmetic.
 define internal void @delta_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %entries, i32 %decode ) #3 { entry:
+i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %tiled, i32 %entries, i32 %decode, i32 %begin, i32 %end, i32 %checkpoints, i32 %origin,
+i32 %column.begin, i32 %column.stride, ptr addrspace(1) %prepared ) #3 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+
 %kheads.wide = zext i32 %kheads to i64 %kwidth.wide = zext i32 %kwidth to i64 %vheads.wide = zext i32 %vheads to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64 %chunk.wide = zext i32 %chunk to i64 %chunks.wide = zext i32 %chunks to i64 %pairs.wide = zext i32 %pairs to i64 %entries.wide = zext i32 %entries to i64
 %row = udiv i64 %p, %vheads.wide %head = urem i64 %p, %vheads.wide %state = mul i64 %kwidth.wide, %vwidth.wide
 %state.i32 = trunc i64 %state to i32 %committing = icmp ne i32 %entries, 0 %commit.count = select i1 %committing, i32 %state.i32, i32 0
 %kchannels = mul i64 %kheads.wide, %kwidth.wide %kstream = mul i64 %kchannels, %length.wide
 %vchannels = mul i64 %vheads.wide, %vwidth.wide %stream = mul i64 %vchannels, %length.wide
 %kplanes = mul i64 %kstream, 2 %row.stride = add i64 %kplanes, %stream
-%input.row = mul i64 %row, %row.stride %khead = urem i64 %head, %kheads.wide
+%input.row = mul i64 %row, %row.stride %group = udiv i32 %vheads, %kheads %group.wide = zext i32 %group to i64
+%khead.grouped = udiv i64 %head, %group.wide %khead.tiled = urem i64 %head, %kheads.wide %is.tiled = icmp ne i32 %tiled, 0
+%khead = select i1 %is.tiled, i64 %khead.tiled, i64 %khead.grouped
 %khead.base = mul i64 %khead, %kwidth.wide %khead.offset = mul i64 %khead.base, %length.wide
 %head.base = mul i64 %head, %vwidth.wide %head.offset = mul i64 %head.base, %length.wide
 %q.base = add i64 %input.row, %khead.offset %k.base = add i64 %q.base, %kstream
@@ -2900,30 +3014,88 @@ i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %ch
 %head.length = mul i64 %head, %length.wide %a.base = add i64 %gate.pair, %head.length %b.base = add i64 %a.base, %gate.stream
 %entry.span = mul i64 %entries.wide, %state %entry.base = mul i64 %p, %entry.span
 %work.region = mul i64 %pairs.wide, %entry.span %work.offset = mul i64 %p, %state %work.base = add i64 %work.region, %work.offset
-%decay.parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %head, i32 %decode) %decay.scale = call double @recipe.exp(double %decay.parameter)
+%cached = icmp ne ptr addrspace(1) %prepared, null
+br i1 %cached, label %initialize.entry, label %scale
+scale:
+%decay.parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %head, i32 %decode) %decay.parameter.wide = call RECIPE_STATE @recipe.decode(double %decay.parameter)
+%computed.scale = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %decay.parameter.wide)
+br label %initialize.entry
+initialize.entry:
+%decay.scale = phi RECIPE_STATE [ %state.zero, %entry ], [ %computed.scale, %scale ]
+%global.begin = add i32 %origin, %begin
+%fresh = icmp eq i32 %global.begin, 0
+%checkpointing = icmp ne i32 %checkpoints, 0
+%initialize = or i1 %fresh, %checkpointing
+%zero.count = select i1 %initialize, i32 %state.i32, i32 0
+%checkpoint.divisor = select i1 %checkpointing, i32 %checkpoints, i32 1
+%previous = sub i32 %global.begin, 1
+%restore.slot = urem i32 %previous, %checkpoint.divisor
+%restore.slot.wide = zext i32 %restore.slot to i64
+%checkpoint.slots = zext i32 %checkpoints to i64
+%checkpoint.region = mul i64 %pairs.wide, %state
+%checkpoint.pair = mul i64 %p, %checkpoint.slots
+%restore.pair = add i64 %checkpoint.pair, %restore.slot.wide
+%restore.offset = mul i64 %restore.pair, %state
+%restore.base = add i64 %checkpoint.region, %restore.offset
+%first.chunk = udiv i32 %begin, %chunk
 br label %zero.loop
-zero.loop: %zero.i = phi i32 [ 0, %entry ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.i, %state.i32
+zero.loop: %zero.i = phi i32 [ %column.begin, %initialize.entry ], [ %zero.next, %zero.store ] %zero.more = icmp ult i32 %zero.i, %zero.count
 br i1 %zero.more, label %zero.step, label %chunk.loop
 zero.step: %zero.i.wide = zext i32 %zero.i to i64 %zero.index = add i64 %work.base, %zero.i.wide
-%zero.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %zero.index
-store double 0.0, ptr addrspace(1) %zero.pointer, align 8 %zero.next = add nuw i32 %zero.i, 1 br label %zero.loop
-chunk.loop: %chunk.index = phi i32 [ 0, %zero.loop ], [ %chunk.next, %chunk.done ] %chunk.more = icmp ult i32 %chunk.index, %chunks
+%zero.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %zero.index
+br i1 %fresh, label %zero.store, label %restore.load
+restore.load:
+%restore.index = add i64 %restore.base, %zero.i.wide
+%restore.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %restore.index
+%restored = load RECIPE_STATE, ptr addrspace(1) %restore.pointer, align RECIPE_STATE_ALIGN
+br label %zero.store
+zero.store:
+%initial = phi RECIPE_STATE [ %state.zero, %zero.step ], [ %restored, %restore.load ]
+store RECIPE_STATE %initial, ptr addrspace(1) %zero.pointer, align RECIPE_STATE_ALIGN %zero.next = add nuw i32 %zero.i, %column.stride br label %zero.loop
+chunk.loop: %chunk.index = phi i32 [ %first.chunk, %zero.loop ], [ %chunk.next, %chunk.done ] %chunk.exists = icmp ult i32 %chunk.index, %chunks
 %chunk.start = mul i32 %chunk.index, %chunk %chunk.index.wide = zext i32 %chunk.index to i64 %chunk.entry = mul i64 %chunk.index.wide, %state %chunk.entry.base = add i64 %entry.base, %chunk.entry
+%chunk.live = icmp ult i32 %chunk.start, %end
+%chunk.more = and i1 %chunk.exists, %chunk.live
+%chunk.partial = icmp ult i32 %chunk.start, %begin
+%chunk.skip = sub i32 %begin, %chunk.start
+%offset.start = select i1 %chunk.partial, i32 %chunk.skip, i32 0
+%entry.count = select i1 %chunk.partial, i32 0, i32 %commit.count
 br i1 %chunk.more, label %commit.loop, label %exit
-commit.loop: %commit.i = phi i32 [ 0, %chunk.loop ], [ %commit.next, %commit.step ] %commit.more = icmp ult i32 %commit.i, %commit.count
+commit.loop: %commit.i = phi i32 [ %column.begin, %chunk.loop ], [ %commit.next, %commit.step ] %commit.more = icmp ult i32 %commit.i, %entry.count
 br i1 %commit.more, label %commit.step, label %time.loop
 commit.step: %commit.i.wide = zext i32 %commit.i to i64 %commit.work = add i64 %work.base, %commit.i.wide
-%commit.work.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %commit.work
-%commit.value = load double, ptr addrspace(1) %commit.work.pointer, align 8 %commit.entry = add i64 %chunk.entry.base, %commit.i.wide
-%commit.entry.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %commit.entry
-store double %commit.value, ptr addrspace(1) %commit.entry.pointer, align 8 %commit.next = add nuw i32 %commit.i, 1 br label %commit.loop
-time.loop: %offset = phi i32 [ 0, %commit.loop ], [ %offset.next, %step.done ] %time = add i32 %chunk.start, %offset
-%offset.more = icmp ult i32 %offset, %chunk %time.more = icmp ult i32 %time, %length %step.more = and i1 %offset.more, %time.more
+%commit.work.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %commit.work
+%commit.value = load RECIPE_STATE, ptr addrspace(1) %commit.work.pointer, align RECIPE_STATE_ALIGN %commit.entry = add i64 %chunk.entry.base, %commit.i.wide
+%commit.entry.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %commit.entry
+store RECIPE_STATE %commit.value, ptr addrspace(1) %commit.entry.pointer, align RECIPE_STATE_ALIGN %commit.next = add nuw i32 %commit.i, %column.stride br label %commit.loop
+time.loop: %offset = phi i32 [ %offset.start, %commit.loop ], [ %offset.next, %step.done ] %time = add i32 %chunk.start, %offset
+%offset.more = icmp ult i32 %offset, %chunk %time.more = icmp ult i32 %time, %end %step.more = and i1 %offset.more, %time.more
 br i1 %step.more, label %step, label %chunk.done
 step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i64 %q.base, i64 %k.base, i64 %v.base, i64 %o.base, i64 %a.base, i64 %b.base, i64 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 true )
-br label %step.done
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, RECIPE_STATE %decay.scale, i1 true, i32 %column.begin, i32 %column.stride, ptr addrspace(1) %prepared )
+%global.time = add i32 %origin, %time
+%save.slot = urem i32 %global.time, %checkpoint.divisor
+%save.slot.wide = zext i32 %save.slot to i64
+%save.pair = add i64 %checkpoint.pair, %save.slot.wide
+%save.offset = mul i64 %save.pair, %state
+%save.base = add i64 %checkpoint.region, %save.offset
+%save.count = select i1 %checkpointing, i32 %state.i32, i32 0
+br label %save.loop
+save.loop:
+%save.i = phi i32 [ %column.begin, %step ], [ %save.next, %save.step ]
+%save.more = icmp ult i32 %save.i, %save.count
+br i1 %save.more, label %save.step, label %step.done
+save.step:
+%save.i.wide = zext i32 %save.i to i64
+%save.source = add i64 %work.base, %save.i.wide
+%save.source.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %save.source
+%save.value = load RECIPE_STATE, ptr addrspace(1) %save.source.pointer, align RECIPE_STATE_ALIGN
+%save.destination = add i64 %save.base, %save.i.wide
+%save.destination.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %save.destination
+store RECIPE_STATE %save.value, ptr addrspace(1) %save.destination.pointer, align RECIPE_STATE_ALIGN
+%save.next = add nuw i32 %save.i, %column.stride
+br label %save.loop
 step.done: %offset.next = add nuw i32 %offset, 1 br label %time.loop
 chunk.done: %chunk.next = add nuw i32 %chunk.index, 1 br label %chunk.loop
 exit: ret void }
@@ -2934,16 +3106,25 @@ exit: ret void }
 ; contribution to the decay scale gradient.
 define internal RECIPE_STATE @delta_back( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %backward, ptr addrspace(1) %delta,
 ptr addrspace(1) %input.adjoint, ptr addrspace(1) %gate.adjoint, i64 %q.base, i64 %k.base, i64 %v.base, i64 %o.base, i64 %a.base, i64 %b.base,
-i64 %previous, i64 %adjoint.base, i64 %vector.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale ) #3 { entry:
+i64 %previous, i64 %adjoint.base, i64 %vector.base, i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, RECIPE_STATE %decay.scale ) #3 { entry:
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%query.width = call RECIPE_STATE @recipe.state.from.u32(i32 %kwidth)
+%query.root = call RECIPE_STATE @recipe.state.sqrt(RECIPE_STATE %query.width)
+%query.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %state.one, RECIPE_STATE %query.root)
 %time.wide = zext i32 %time to i64 %kwidth.wide = zext i32 %kwidth to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64
 %decay.index = add i64 %a.base, %time.wide
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i64 %decay.index
-%decay.input = load double, ptr addrspace(1) %decay.pointer, align 8 %softplus = call double @softplus(double %decay.input)
-%exponent = call double @recipe.mul(double %softplus, double %decay.scale) %negated = call double @recipe.neg(double %exponent)
-%decay.model = call double @recipe.exp(double %negated) %decay = call RECIPE_STATE @recipe.decode(double %decay.model) %write.index = add i64 %b.base, %time.wide
+%decay.input.model = load double, ptr addrspace(1) %decay.pointer, align 8
+%decay.input = call RECIPE_STATE @recipe.decode(double %decay.input.model)
+%softplus = call RECIPE_STATE @delta_softplus(RECIPE_STATE %decay.input)
+%exponent = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %softplus, RECIPE_STATE %decay.scale)
+%negated = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent)
+%decay = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %negated)
+%write.index = add i64 %b.base, %time.wide
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i64 %write.index
-%write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write.model = call double @sigmoid(double %write.input) %write = call RECIPE_STATE @recipe.decode(double %write.model)
+%write.input.model = load double, ptr addrspace(1) %write.pointer, align 8
+%write.input = call RECIPE_STATE @recipe.decode(double %write.input.model)
+%write = call RECIPE_STATE @recipe.state.sigmoid(RECIPE_STATE %write.input)
 %weight.base = add i64 %vector.base, %vwidth.wide
 br label %seed.row
 seed.row: %seed.i = phi i32 [ 0, %entry ], [ %seed.i.next, %seed.row.done ] %seed.i.more = icmp ult i32 %seed.i, %kwidth
@@ -2956,7 +3137,8 @@ seed.step: %seed.query.pointer = getelementptr inbounds double, ptr addrspace(1)
 %seed.j.wide = zext i32 %seed.j to i64 %seed.j.row = mul i64 %seed.j.wide, %length.wide %seed.j.offset = add i64 %seed.j.row, %time.wide %seed.delta.index = add i64 %o.base, %seed.j.offset
 %seed.delta.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %delta, i64 %seed.delta.index
 %seed.delta = load RECIPE_STATE, ptr addrspace(1) %seed.delta.pointer, align RECIPE_STATE_ALIGN
-%seed.product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %seed.query, RECIPE_STATE %seed.delta)
+%seed.query.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %seed.query, RECIPE_STATE %query.scale)
+%seed.product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %seed.query.scaled, RECIPE_STATE %seed.delta)
 %seed.row.base = mul i64 %seed.i.wide, %vwidth.wide %seed.cell = add i64 %seed.row.base, %seed.j.wide %seed.index = add i64 %adjoint.base, %seed.cell
 %seed.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %backward, i64 %seed.index
 %seed.prior = load RECIPE_STATE, ptr addrspace(1) %seed.pointer, align RECIPE_STATE_ALIGN
@@ -2973,8 +3155,8 @@ column.row: %column.i = phi i32 [ 0, %column.loop ], [ %column.i.next, %column.s
 %column.i.more = icmp ult i32 %column.i, %kwidth br i1 %column.i.more, label %column.step, label %column.store
 column.step: %column.i.wide = zext i32 %column.i to i64 %column.i.row = mul i64 %column.i.wide, %vwidth.wide %column.cell = add i64 %column.i.row, %column.wide
 %column.state.index = add i64 %previous, %column.cell
-%column.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %column.state.index
-%column.state.model = load double, ptr addrspace(1) %column.state.pointer, align 8 %column.state = call RECIPE_STATE @recipe.decode(double %column.state.model)
+%column.state.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %column.state.index
+%column.state = load RECIPE_STATE, ptr addrspace(1) %column.state.pointer, align RECIPE_STATE_ALIGN
 %column.adjoint.index = add i64 %adjoint.base, %column.cell
 %column.adjoint.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %backward, i64 %column.adjoint.index
 %column.adjoint = load RECIPE_STATE, ptr addrspace(1) %column.adjoint.pointer, align RECIPE_STATE_ALIGN
@@ -2992,7 +3174,8 @@ column.store: %column.row.offset = mul i64 %column.wide, %length.wide %column.of
 %column.value.index = add i64 %v.base, %column.offset
 %column.value.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %column.value.index
 %column.value.model = load double, ptr addrspace(1) %column.value.pointer, align 8 %column.value = call RECIPE_STATE @recipe.decode(double %column.value.model)
-%error = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %column.value, RECIPE_STATE %readout)
+%readout.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %readout)
+%error = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %column.value, RECIPE_STATE %readout.decayed)
 %error.index = add i64 %vector.base, %column.wide
 %error.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %backward, i64 %error.index
 store RECIPE_STATE %error, ptr addrspace(1) %error.pointer, align RECIPE_STATE_ALIGN
@@ -3020,8 +3203,8 @@ row.column: %row.j = phi i32 [ 0, %row.loop ], [ %row.j.next, %row.step ]
 %query.part = phi RECIPE_STATE [ %state.zero, %row.loop ], [ %query.part.next, %row.step ]
 %row.j.more = icmp ult i32 %row.j, %vwidth br i1 %row.j.more, label %row.step, label %row.store
 row.step: %row.j.wide = zext i32 %row.j to i64 %row.cell = add i64 %row.i.base, %row.j.wide %row.state.index = add i64 %previous, %row.cell
-%row.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %row.state.index
-%row.state.model = load double, ptr addrspace(1) %row.state.pointer, align 8 %row.state = call RECIPE_STATE @recipe.decode(double %row.state.model)
+%row.state.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %context, i64 %row.state.index
+%row.state = load RECIPE_STATE, ptr addrspace(1) %row.state.pointer, align RECIPE_STATE_ALIGN
 %row.adjoint.index = add i64 %adjoint.base, %row.cell
 %row.adjoint.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %backward, i64 %row.adjoint.index
 %row.adjoint = load RECIPE_STATE, ptr addrspace(1) %row.adjoint.pointer, align RECIPE_STATE_ALIGN
@@ -3055,7 +3238,8 @@ row.step: %row.j.wide = zext i32 %row.j to i64 %row.cell = add i64 %row.i.base, 
 %decay.part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %decay.part, RECIPE_STATE %row.decay.term)
 store RECIPE_STATE %row.adjoint.next, ptr addrspace(1) %row.adjoint.pointer, align RECIPE_STATE_ALIGN
 %row.j.next = add nuw i32 %row.j, 1 br label %row.column
-row.store: %key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.direct, RECIPE_STATE %key.readout)
+row.store: %key.readout.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %key.readout)
+%key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.direct, RECIPE_STATE %key.readout.decayed)
 %key.gradient = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write, RECIPE_STATE %key.difference)
 %key.adjoint.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input.adjoint, i64 %row.key.index
 %key.prior = load RECIPE_STATE, ptr addrspace(1) %key.adjoint.pointer, align RECIPE_STATE_ALIGN
@@ -3063,11 +3247,12 @@ row.store: %key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %k
 store RECIPE_STATE %key.total, ptr addrspace(1) %key.adjoint.pointer, align RECIPE_STATE_ALIGN
 %query.adjoint.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input.adjoint, i64 %row.query.index
 %query.prior = load RECIPE_STATE, ptr addrspace(1) %query.adjoint.pointer, align RECIPE_STATE_ALIGN
-%query.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %query.prior, RECIPE_STATE %query.part)
+%query.gradient = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %query.part, RECIPE_STATE %query.scale)
+%query.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %query.prior, RECIPE_STATE %query.gradient)
 store RECIPE_STATE %query.total, ptr addrspace(1) %query.adjoint.pointer, align RECIPE_STATE_ALIGN
 %decay.gradient.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %decay.gradient, RECIPE_STATE %decay.part) br label %row.done
 row.done: %row.i.next = add nuw i32 %row.i, 1 br label %row.loop
-gates.entry: %decay.slope.model = call double @sigmoid(double %decay.input) %decay.slope = call RECIPE_STATE @recipe.decode(double %decay.slope.model) %decay.scale.wide = call RECIPE_STATE @recipe.decode(double %decay.scale) %decay.factor = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay.scale.wide, RECIPE_STATE %decay)
+gates.entry: %decay.slope = call RECIPE_STATE @recipe.state.sigmoid(RECIPE_STATE %decay.input) %decay.factor = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay.scale, RECIPE_STATE %decay)
 %decay.chain = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay.gradient, RECIPE_STATE %decay.factor)
 %decay.chain.negated = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %decay.chain)
 %decay.input.gradient = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay.chain.negated, RECIPE_STATE %decay.slope)
@@ -3081,7 +3266,7 @@ store RECIPE_STATE %decay.total, ptr addrspace(1) %decay.adjoint.pointer, align 
 %write.prior = load RECIPE_STATE, ptr addrspace(1) %write.adjoint.pointer, align RECIPE_STATE_ALIGN
 %write.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %write.prior, RECIPE_STATE %write.input.gradient)
 store RECIPE_STATE %write.total, ptr addrspace(1) %write.adjoint.pointer, align RECIPE_STATE_ALIGN
-%softplus.wide = call RECIPE_STATE @recipe.decode(double %softplus) %scale.chain = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %softplus.wide, RECIPE_STATE %decay.factor) %scale.negated = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %scale.chain)
+%scale.chain = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %softplus, RECIPE_STATE %decay.factor) %scale.negated = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %scale.chain)
 %scale.gradient = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay.gradient, RECIPE_STATE %scale.negated) ret RECIPE_STATE %scale.gradient }
 ; One row and head of the gated delta rule in reverse. Each chunk is replayed
 ; forward from its committed entry state so the state before every position is
@@ -3089,7 +3274,7 @@ store RECIPE_STATE %write.total, ptr addrspace(1) %write.adjoint.pointer, align 
 ; in this pair's partial for the fold below.
 define internal void @delta_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %context, ptr addrspace(1) %backward,
 ptr addrspace(1) %delta, ptr addrspace(1) %input.adjoint, ptr addrspace(1) %gate.adjoint,
-i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs ) #3 { entry:
+i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %tiled ) #3 { entry:
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %kheads.wide = zext i32 %kheads to i64 %kwidth.wide = zext i32 %kwidth to i64 %vheads.wide = zext i32 %vheads to i64 %vwidth.wide = zext i32 %vwidth to i64 %length.wide = zext i32 %length to i64 %chunk.wide = zext i32 %chunk to i64 %chunks.wide = zext i32 %chunks to i64 %pairs.wide = zext i32 %pairs to i64
 %row = udiv i64 %p, %kheads.wide %khead = urem i64 %p, %kheads.wide %state = mul i64 %kwidth.wide, %vwidth.wide %state.i32 = trunc i64 %state to i32
@@ -3117,7 +3302,9 @@ br label %head.loop
 ; head makes exactly one pass and keeps the ungrouped indexing.
 head.loop: %g = phi i32 [ 0, %entry ], [ %g.next, %head.done ] %g.more = icmp ult i32 %g, %group
 br i1 %g.more, label %head.body, label %exit
-head.body: %g.wide = zext i32 %g to i64 %head.group = mul i64 %g.wide, %kheads.wide %head = add i64 %khead, %head.group %pair = add i64 %pair.row, %head
+head.body: %g.wide = zext i32 %g to i64 %head.grouped = add i64 %khead.first, %g.wide
+%head.tile = mul i64 %g.wide, %kheads.wide %head.tiled = add i64 %head.tile, %khead %is.tiled = icmp ne i32 %tiled, 0
+%head = select i1 %is.tiled, i64 %head.tiled, i64 %head.grouped %pair = add i64 %pair.row, %head
 %head.base = mul i64 %head, %vwidth.wide %head.offset = mul i64 %head.base, %length.wide
 %v.base = add i64 %value.plane, %head.offset %o.base = add i64 %output.row, %head.offset
 %head.length = mul i64 %head, %length.wide %a.base = add i64 %gate.pair, %head.length %b.base = add i64 %a.base, %gate.stream
@@ -3161,7 +3348,7 @@ save.step: %save.i.wide = zext i32 %save.i to i64 %save.work = add i64 %work.bas
 store double %save.value, ptr addrspace(1) %save.slot.pointer, align 8 %save.next = add nuw i32 %save.i, 1 br label %replay.save
 replay.step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %context,
 i64 %q.base, i64 %k.base, i64 %v.base, i64 %o.base, i64 %a.base, i64 %b.base, i64 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %replay.time, double %decay.scale, i1 false )
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %replay.time, double %decay.scale, i1 false, i32 0, i32 1, ptr addrspace(1) null )
 %replay.i.next = add nuw i32 %replay.i, 1 br label %replay.loop
 backward.loop: %backward.i = phi i32 [ %replay.i, %replay.loop ], [ %backward.index, %backward.step ]
 %decay.sum = phi RECIPE_STATE [ %total, %replay.loop ], [ %decay.sum.next, %backward.step ]
@@ -3204,14 +3391,72 @@ define internal double @topk_score( double %score, double %maximum, i1 %sigmoid 
 ; by softmax over every expert or by sigmoid, and divided by the kept total when
 ; the block renormalizes. A plain softmax divides by every expert instead, which
 ; is the evaluate-all-then-mask reference; a plain sigmoid divides by nothing.
-define internal void @topk_forward_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize ) #1 { entry:
+define internal void @topk_forward_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, ptr addrspace(1) %selected, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize ) #1 { entry:
 %experts.wide = zext i32 %experts to i64 %length.wide = zext i32 %length to i64 %top.wide = zext i32 %top to i64
+%selected.stride = add i64 %top.wide, 1 %selected.base = mul i64 %p, %selected.stride
 %row = udiv i64 %p, %length.wide %position = urem i64 %p, %length.wide %per.row = mul i64 %experts.wide, %length.wide %row.base = mul i64 %row, %per.row %base = add i64 %row.base, %position
 %sigmoid = icmp ne i32 %scoring, 0 %renorm = icmp ne i32 %renormalize, 0 %every = xor i1 %renorm, true %plain = xor i1 %sigmoid, true %divide = or i1 %renorm, %plain
-br label %clear.loop clear.loop: %clear = phi i64 [ 0, %entry ], [ %clear.next, %clear.step ] %clear.more = icmp ult i64 %clear, %experts.wide
-br i1 %clear.more, label %clear.step, label %select.loop clear.step: %clear.offset = mul i64 %clear, %length.wide %clear.index = add i64 %base, %clear.offset
-%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %clear.index store double 0.0, ptr addrspace(1) %clear.ptr, align 8 %clear.next = add i64 %clear, 1 br label %clear.loop
-select.loop: %pick = phi i64 [ 0, %clear.loop ], [ %pick.next, %select.mark ] %pick.more = icmp ult i64 %pick, %top.wide br i1 %pick.more, label %scan.entry, label %normalize.entry
+br label %clear.loop clear.loop: %clear = phi i64 [ 0, %entry ], [ %clear.next, %clear.step ] %clear.nan = phi i1 [ false, %entry ], [ %clear.nan.next, %clear.step ] %clear.more = icmp ult i64 %clear, %experts.wide
+br i1 %clear.more, label %clear.step, label %select.entry clear.step: %clear.offset = mul i64 %clear, %length.wide %clear.index = add i64 %base, %clear.offset
+%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %clear.index store double 0.0, ptr addrspace(1) %clear.ptr, align 8
+%clear.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %clear.index %clear.score = load double, ptr addrspace(1) %clear.score.ptr, align 8
+%clear.ordered = call i1 @recipe.oeq(double %clear.score, double %clear.score) %clear.unordered = xor i1 %clear.ordered, true %clear.nan.next = or i1 %clear.nan, %clear.unordered
+%clear.next = add i64 %clear, 1 br label %clear.loop
+; Keep the best candidates in the existing selected-index storage. Most
+; candidates only compare against the current cutoff. Equal scores retain the
+; earlier expert. Unordered scores keep the original scan-order behavior.
+select.entry: br i1 %clear.nan, label %select.loop, label %rank.loop
+rank.loop:
+%rank.expert = phi i64 [ 0, %select.entry ], [ %rank.next, %rank.advance ]
+%rank.count = phi i64 [ 0, %select.entry ], [ %rank.count.next, %rank.advance ]
+%rank.cutoff.value = phi double [ 0.0, %select.entry ], [ %rank.cutoff.next, %rank.advance ]
+%rank.more = icmp ult i64 %rank.expert, %experts.wide
+br i1 %rank.more, label %rank.score, label %rank.mark.loop
+rank.score:
+%rank.offset = mul i64 %rank.expert, %length.wide %rank.index = add i64 %base, %rank.offset
+%rank.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %rank.index %rank.score.value = load double, ptr addrspace(1) %rank.score.ptr, align 8
+%rank.full = icmp eq i64 %rank.count, %top.wide
+%rank.last = sub i64 %top.wide, 1 %rank.start = select i1 %rank.full, i64 %rank.last, i64 %rank.count
+br i1 %rank.full, label %rank.cutoff, label %rank.insert
+rank.cutoff:
+%rank.admitted = call i1 @recipe.ogt(double %rank.score.value, double %rank.cutoff.value)
+br i1 %rank.admitted, label %rank.insert, label %rank.advance
+rank.insert: br label %rank.shift.loop
+rank.shift.loop:
+%rank.at = phi i64 [ %rank.start, %rank.insert ], [ %rank.prior, %rank.shift ]
+%rank.has.prior = icmp ugt i64 %rank.at, 0 br i1 %rank.has.prior, label %rank.compare, label %rank.store
+rank.compare:
+%rank.prior = sub i64 %rank.at, 1 %rank.prior.index = add i64 %selected.base, %rank.at
+%rank.prior.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %rank.prior.index %rank.prior.id = load i32, ptr addrspace(1) %rank.prior.ptr, align 4
+%rank.prior.wide = zext i32 %rank.prior.id to i64 %rank.prior.offset = mul i64 %rank.prior.wide, %length.wide %rank.prior.score.index = add i64 %base, %rank.prior.offset
+%rank.prior.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %rank.prior.score.index %rank.prior.score = load double, ptr addrspace(1) %rank.prior.score.ptr, align 8
+%rank.higher = call i1 @recipe.ogt(double %rank.score.value, double %rank.prior.score) br i1 %rank.higher, label %rank.shift, label %rank.store
+rank.shift:
+%rank.shift.local = add i64 %rank.at, 1 %rank.shift.index = add i64 %selected.base, %rank.shift.local %rank.shift.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %rank.shift.index
+store i32 %rank.prior.id, ptr addrspace(1) %rank.shift.ptr, align 4 br label %rank.shift.loop
+rank.store:
+%rank.store.local = add i64 %rank.at, 1 %rank.store.index = add i64 %selected.base, %rank.store.local %rank.store.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %rank.store.index
+%rank.id = trunc i64 %rank.expert to i32 store i32 %rank.id, ptr addrspace(1) %rank.store.ptr, align 4
+%rank.grown = add i64 %rank.count, 1 %rank.stored.count = select i1 %rank.full, i64 %rank.count, i64 %rank.grown
+; The cutoff changes only when a candidate enters the selected list.
+%rank.cutoff.index = add i64 %selected.base, %rank.stored.count %rank.cutoff.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %rank.cutoff.index
+%rank.cutoff.id = load i32, ptr addrspace(1) %rank.cutoff.ptr, align 4 %rank.cutoff.wide = zext i32 %rank.cutoff.id to i64
+%rank.cutoff.offset = mul i64 %rank.cutoff.wide, %length.wide %rank.cutoff.score.index = add i64 %base, %rank.cutoff.offset
+%rank.cutoff.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %rank.cutoff.score.index %rank.cutoff.score = load double, ptr addrspace(1) %rank.cutoff.score.ptr, align 8
+br label %rank.advance
+rank.advance:
+%rank.count.next = phi i64 [ %rank.count, %rank.cutoff ], [ %rank.stored.count, %rank.store ]
+%rank.cutoff.next = phi double [ %rank.cutoff.value, %rank.cutoff ], [ %rank.cutoff.score, %rank.store ]
+%rank.next = add i64 %rank.expert, 1 br label %rank.loop
+rank.mark.loop:
+%rank.mark = phi i64 [ 0, %rank.loop ], [ %rank.mark.next, %rank.mark.step ] %rank.mark.more = icmp ult i64 %rank.mark, %rank.count
+br i1 %rank.mark.more, label %rank.mark.step, label %normalize.entry
+rank.mark.step:
+%rank.mark.local = add i64 %rank.mark, 1 %rank.mark.index = add i64 %selected.base, %rank.mark.local %rank.mark.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %rank.mark.index
+%rank.mark.id = load i32, ptr addrspace(1) %rank.mark.ptr, align 4 %rank.mark.wide = zext i32 %rank.mark.id to i64
+%rank.mark.offset = mul i64 %rank.mark.wide, %length.wide %rank.mark.weight.index = add i64 %base, %rank.mark.offset %rank.mark.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %rank.mark.weight.index
+store double 1.0, ptr addrspace(1) %rank.mark.weight.ptr, align 8 %rank.mark.next = add i64 %rank.mark, 1 br label %rank.mark.loop
+select.loop: %pick = phi i64 [ 0, %select.entry ], [ %pick.next, %select.mark ] %pick.more = icmp ult i64 %pick, %top.wide br i1 %pick.more, label %scan.entry, label %normalize.entry
 scan.entry: br label %scan.loop
 scan.loop: %candidate = phi i64 [ 0, %scan.entry ], [ %candidate.next, %scan.step ] %best = phi i64 [ -1, %scan.entry ], [ %best.next, %scan.step ]
 %best.score = phi double [ 0.0, %scan.entry ], [ %best.score.next, %scan.step ] %scan.more = icmp ult i64 %candidate, %experts.wide br i1 %scan.more, label %scan.step, label %select.mark
@@ -3231,19 +3476,30 @@ max.step: %m.offset = mul i64 %m, %length.wide %m.index = add i64 %base, %m.offs
 %m.higher = call i1 @recipe.ogt(double %m.score, double %maximum) %m.better = or i1 %m.first, %m.higher %m.take = and i1 %m.member, %m.better
 %maximum.next = select i1 %m.take, double %m.score, double %maximum %m.first.next = select i1 %m.take, i1 false, i1 %m.first %m.next = add i64 %m, 1 br label %max.loop
 sum.entry: br label %sum.loop
-sum.loop: %s = phi i64 [ 0, %sum.entry ], [ %s.next, %sum.step ] %total = phi double [ 0.0, %sum.entry ], [ %total.next, %sum.step ] %sum.more = icmp ult i64 %s, %experts.wide br i1 %sum.more, label %sum.step, label %write.entry
+sum.loop: %s = phi i64 [ 0, %sum.entry ], [ %s.next, %sum.store ] %total = phi double [ 0.0, %sum.entry ], [ %total.next, %sum.store ] %sum.more = icmp ult i64 %s, %experts.wide br i1 %sum.more, label %sum.step, label %write.entry
 sum.step: %s.offset = mul i64 %s, %length.wide %s.index = add i64 %base, %s.offset %s.mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %s.index %s.mark = load double, ptr addrspace(1) %s.mark.ptr, align 8
 %s.marked = call i1 @recipe.oeq(double %s.mark, double 1.0) %s.member = or i1 %s.marked, %every
+br i1 %s.member, label %sum.score, label %sum.store
+sum.score:
 %s.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %s.index %s.score = load double, ptr addrspace(1) %s.score.ptr, align 8
-%s.raw = call double @topk_score(double %s.score, double %maximum, i1 %sigmoid) %s.term = select i1 %s.member, double %s.raw, double 0.0
+%s.raw = call double @topk_score(double %s.score, double %maximum, i1 %sigmoid) br label %sum.store
+sum.store: %s.term = phi double [ %s.raw, %sum.score ], [ 0.0, %sum.step ]
+%s.kept = select i1 %s.marked, double %s.term, double 0.0 store double %s.kept, ptr addrspace(1) %s.mark.ptr, align 8
 %total.next = call double @recipe.add(double %total, double %s.term) %s.next = add i64 %s, 1 br label %sum.loop
 write.entry: %denominator = select i1 %divide, double %total, double 1.0 br label %write.loop
-write.loop: %w = phi i64 [ 0, %write.entry ], [ %w.next, %write.step ] %write.more = icmp ult i64 %w, %experts.wide br i1 %write.more, label %write.step, label %exit
+write.loop: %w = phi i64 [ 0, %write.entry ], [ %w.next, %write.advance ] %kept = phi i64 [ 0, %write.entry ], [ %kept.next, %write.advance ] %write.more = icmp ult i64 %w, %experts.wide br i1 %write.more, label %write.step, label %exit
 write.step: %w.offset = mul i64 %w, %length.wide %w.index = add i64 %base, %w.offset %w.mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %w.index %w.mark = load double, ptr addrspace(1) %w.mark.ptr, align 8
-%w.marked = call i1 @recipe.oeq(double %w.mark, double 1.0) %w.score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %w.index %w.score = load double, ptr addrspace(1) %w.score.ptr, align 8
-%w.raw = call double @topk_score(double %w.score, double %maximum, i1 %sigmoid) %w.probability = call double @recipe.div(double %w.raw, double %denominator)
-%w.value = select i1 %w.marked, double %w.probability, double 0.0 store double %w.value, ptr addrspace(1) %w.mark.ptr, align 8 %w.next = add i64 %w, 1 br label %write.loop
-exit: ret void }
+%w.probability = call double @recipe.div(double %w.mark, double %denominator)
+%w.unselected = call i1 @recipe.oeq(double %w.mark, double 0.0)
+%w.value = select i1 %w.unselected, double 0.0, double %w.probability
+store double %w.value, ptr addrspace(1) %w.mark.ptr, align 8
+%w.zero = call i1 @recipe.oeq(double %w.value, double 0.0) br i1 %w.zero, label %write.advance, label %write.selected
+write.selected: %selected.local = add i64 %kept, 1 %selected.index = add i64 %selected.base, %selected.local
+%selected.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.index %selected.expert = trunc i64 %w to i32
+store i32 %selected.expert, ptr addrspace(1) %selected.ptr, align 4 %kept.grown = add i64 %kept, 1 br label %write.advance
+write.advance: %kept.next = phi i64 [ %kept, %write.step ], [ %kept.grown, %write.selected ] %w.next = add i64 %w, 1 br label %write.loop
+exit: %selected.count = trunc i64 %kept to i32 %selected.count.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.base
+store i32 %selected.count, ptr addrspace(1) %selected.count.ptr, align 4 ret void }
 ; The routing adjoint of one position. Each score receives its own slope over
 ; the divisor times its delta less the kept mean; renormalizing confines that to
 ; the kept experts, while a plain softmax also reaches the experts it dropped.
@@ -3329,32 +3585,47 @@ advance: %cursor.next = phi i32 [ %cursor.grown, %write ], [ %cursor, %step ] %i
 done: %count.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 %p store i32 %cursor, ptr addrspace(1) %count.ptr, align 4 ret void }
 ; Output element %p of a gate or up projection reads one row of the slice
 ; belonging to the (slot + 1)-th selected expert of its position.
-define internal void @expert_in_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %routing, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top, i32 %decode ) #1 { entry:
+define internal RECIPE_STATE @expert_wave_sum(RECIPE_STATE %value, i32 %lane, i32 %width) #1 { entry:
+%first = udiv i32 %width, 2 br label %reduce.loop
+reduce.loop: %offset = phi i32 [ %first, %entry ], [ %next, %reduce.step ] %sum = phi RECIPE_STATE [ %value, %entry ], [ %combined, %reduce.step ]
+%more = icmp ugt i32 %offset, 0 br i1 %more, label %reduce.step, label %done
+reduce.step: %other = xor i32 %lane, %offset %index = mul i32 %other, 4
+%partner = call RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %sum, i32 %index)
+%combined = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %partner) %next = udiv i32 %offset, 2 br label %reduce.loop
+done: ret RECIPE_STATE %sum }
+define internal void @expert_in_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %selected, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top, i32 %decode, i32 %lane, i32 %width ) #1 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%owner = icmp eq i32 %lane, 0
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %hidden.wide = zext i32 %hidden to i64 %experts.wide = zext i32 %experts to i64 %top.wide = zext i32 %top to i64
 %units = mul i64 %top.wide, %hidden.wide %narrow = mul i64 %units, %length.wide
 %row = udiv i64 %p, %narrow %local = urem i64 %p, %narrow %unit = udiv i64 %local, %length.wide %position = urem i64 %local, %length.wide
 %slot = udiv i64 %unit, %hidden.wide %f = urem i64 %unit, %hidden.wide %slot.i32 = trunc i64 %slot to i32
-%per.row = mul i64 %experts.wide, %length.wide %routing.row = mul i64 %row, %per.row %routing.base = add i64 %routing.row, %position
-br label %find.loop
-find.loop: %c = phi i32 [ 0, %entry ], [ %c.next, %find.step ] %seen = phi i32 [ 0, %entry ], [ %seen.next, %find.step ] %chosen = phi i32 [ -1, %entry ], [ %chosen.next, %find.step ]
-%find.more = icmp ult i32 %c, %experts br i1 %find.more, label %find.step, label %sum.entry
-find.step: %c.wide = zext i32 %c to i64 %c.offset = mul i64 %c.wide, %length.wide %c.index = add i64 %routing.base, %c.offset
-%c.ptr = getelementptr inbounds double, ptr addrspace(1) %routing, i64 %c.index %c.weight = load double, ptr addrspace(1) %c.ptr, align 8
-%c.zero = call i1 @recipe.oeq(double %c.weight, double 0.0) %c.taken = xor i1 %c.zero, true
-%c.match = icmp eq i32 %seen, %slot.i32 %c.unset = icmp eq i32 %chosen, -1 %c.ready = and i1 %c.match, %c.unset %c.pick = and i1 %c.taken, %c.ready
-%chosen.next = select i1 %c.pick, i32 %c, i32 %chosen %c.step = zext i1 %c.taken to i32 %seen.next = add i32 %seen, %c.step %c.next = add i32 %c, 1 br label %find.loop
-sum.entry: %found = icmp ne i32 %chosen, -1 %expert = select i1 %found, i32 %chosen, i32 0
+%selected.row = mul i64 %row, %length.wide %selected.position = add i64 %selected.row, %position %selected.stride = add i64 %top.wide, 1
+%selected.base = mul i64 %selected.position, %selected.stride %selected.count.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.base
+%selected.count = load i32, ptr addrspace(1) %selected.count.ptr, align 4 %found = icmp ult i32 %slot.i32, %selected.count
+br i1 %found, label %sum.entry, label %absent
+sum.entry: %selected.local = add i64 %slot, 1 %selected.index = add i64 %selected.base, %selected.local
+%selected.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.index %expert = load i32, ptr addrspace(1) %selected.ptr, align 4
 %plane = mul i64 %hidden.wide, %channels.wide %expert.wide = zext i32 %expert to i64 %slice = mul i64 %expert.wide, %plane %f.row = mul i64 %f, %channels.wide %weight.base = add i64 %slice, %f.row
 %input.channels = mul i64 %channels.wide, %length.wide %input.row = mul i64 %row, %input.channels %input.base = add i64 %input.row, %position
 br label %sum.loop
-sum.loop: %k = phi i32 [ 0, %sum.entry ], [ %k.next, %sum.step ] %total = phi double [ 0.0, %sum.entry ], [ %total.next, %sum.step ]
+sum.loop: %k = phi i32 [ %lane, %sum.entry ], [ %k.next, %sum.step ] %total = phi RECIPE_STATE [ %state.zero, %sum.entry ], [ %total.next, %sum.step ]
 %sum.more = icmp ult i32 %k, %channels br i1 %sum.more, label %sum.step, label %done
 sum.step: %k.wide = zext i32 %k to i64 %weight.index = add i64 %weight.base, %k.wide
 %weight = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %weight.index, i32 %decode)
 %input.offset = mul i64 %k.wide, %length.wide %input.index = add i64 %input.base, %input.offset
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %input.index %value = load double, ptr addrspace(1) %input.ptr, align 8
-%product = call double @recipe.mul(double %weight, double %value) %total.next = call double @recipe.add(double %total, double %product) %k.next = add i32 %k, 1 br label %sum.loop
-done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %total, ptr addrspace(1) %output.ptr, align 8 ret void }
+%weight.state = call RECIPE_STATE @recipe.decode(double %weight)
+%value.state = call RECIPE_STATE @recipe.decode(double %value)
+%product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.state, RECIPE_STATE %value.state)
+%total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total, RECIPE_STATE %product) %k.next = add i32 %k, %width br label %sum.loop
+done: %sum = call RECIPE_STATE @expert_wave_sum(RECIPE_STATE %total, i32 %lane, i32 %width)
+br i1 %owner, label %store, label %exit
+store: %result = call double @recipe.encode(RECIPE_STATE %sum)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %result, ptr addrspace(1) %output.ptr, align 8 br label %exit
+absent: br i1 %owner, label %clear, label %exit
+clear: %absent.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double 0.0, ptr addrspace(1) %absent.ptr, align 8 br label %exit
+exit: ret void }
 ; Input element %p of a gate or up projection collects every selected expert's
 ; column, in ascending expert order.
 define internal void @expert_in_reverse_input_body( ptr addrspace(1) %routing, ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top ) #1 { entry:
@@ -3415,31 +3686,42 @@ step: %count.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i32 %e
 done: ret i32 %base }
 ; Output element %p sums the selected experts' down projections under their
 ; routing weights, in ascending expert order.
-define internal void @expert_out_forward_body( ptr addrspace(1) %values, ptr addrspace(1) %routing, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top, i32 %decode ) #1 { entry:
+define internal void @expert_out_forward_body( ptr addrspace(1) %values, ptr addrspace(1) %routing, ptr addrspace(1) %selected, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top, i32 %decode, i32 %lane, i32 %width ) #1 { entry:
+%state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %hidden.wide = zext i32 %hidden to i64 %experts.wide = zext i32 %experts to i64 %top.wide = zext i32 %top to i64
 %narrow = mul i64 %channels.wide, %length.wide %row = udiv i64 %p, %narrow %local = urem i64 %p, %narrow %channel = udiv i64 %local, %length.wide %position = urem i64 %local, %length.wide
 %per.row = mul i64 %experts.wide, %length.wide %routing.row = mul i64 %row, %per.row %routing.base = add i64 %routing.row, %position
 %units = mul i64 %top.wide, %hidden.wide %values.narrow = mul i64 %units, %length.wide %values.row = mul i64 %row, %values.narrow %values.base = add i64 %values.row, %position
 %plane = mul i64 %channels.wide, %hidden.wide %channel.offset = mul i64 %channel, %hidden.wide
+%selected.row = mul i64 %row, %length.wide %selected.position = add i64 %selected.row, %position %selected.stride = add i64 %top.wide, 1
+%selected.base = mul i64 %selected.position, %selected.stride %selected.count.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.base
+%selected.count = load i32, ptr addrspace(1) %selected.count.ptr, align 4
 br label %expert.loop
-expert.loop: %e = phi i32 [ 0, %entry ], [ %e.next, %advance ] %slot = phi i32 [ 0, %entry ], [ %slot.next, %advance ] %total = phi double [ 0.0, %entry ], [ %total.next, %advance ]
-%expert.more = icmp ult i32 %e, %experts br i1 %expert.more, label %step, label %done
-step: %e.wide = zext i32 %e to i64 %e.offset = mul i64 %e.wide, %length.wide %e.index = add i64 %routing.base, %e.offset
+expert.loop: %slot = phi i32 [ 0, %entry ], [ %slot.next, %hidden.done ] %total = phi RECIPE_STATE [ %state.zero, %entry ], [ %total.next, %hidden.done ]
+%expert.more = icmp ult i32 %slot, %selected.count br i1 %expert.more, label %step, label %done
+step: %slot.wide = zext i32 %slot to i64 %selected.local = add i64 %slot.wide, 1 %selected.index = add i64 %selected.base, %selected.local
+%selected.ptr = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %selected.index %e = load i32, ptr addrspace(1) %selected.ptr, align 4
+%e.wide = zext i32 %e to i64 %e.offset = mul i64 %e.wide, %length.wide %e.index = add i64 %routing.base, %e.offset
 %e.ptr = getelementptr inbounds double, ptr addrspace(1) %routing, i64 %e.index %e.weight = load double, ptr addrspace(1) %e.ptr, align 8
-%e.zero = call i1 @recipe.oeq(double %e.weight, double 0.0) %e.taken = xor i1 %e.zero, true
-br i1 %e.taken, label %hidden.entry, label %advance
-hidden.entry: %slice = mul i64 %e.wide, %plane %weight.base = add i64 %slice, %channel.offset %slot.wide = zext i32 %slot to i64 %slot.offset = mul i64 %slot.wide, %hidden.wide br label %hidden.loop
-hidden.loop: %f = phi i32 [ 0, %hidden.entry ], [ %f.next, %hidden.step ] %inner = phi double [ 0.0, %hidden.entry ], [ %inner.next, %hidden.step ]
+%slice = mul i64 %e.wide, %plane %weight.base = add i64 %slice, %channel.offset %slot.offset = mul i64 %slot.wide, %hidden.wide br label %hidden.loop
+hidden.loop: %f = phi i32 [ %lane, %step ], [ %f.next, %hidden.step ] %inner = phi RECIPE_STATE [ %state.zero, %step ], [ %inner.next, %hidden.step ]
 %hidden.more = icmp ult i32 %f, %hidden br i1 %hidden.more, label %hidden.step, label %hidden.done
 hidden.step: %f.wide = zext i32 %f to i64 %weight.index = add i64 %weight.base, %f.wide
 %weight = call double @recipe.model.weight(ptr addrspace(1) %weights, i64 %weight.index, i32 %decode)
 %unit = add i64 %slot.offset, %f.wide %unit.offset = mul i64 %unit, %length.wide %value.index = add i64 %values.base, %unit.offset
 %value.ptr = getelementptr inbounds double, ptr addrspace(1) %values, i64 %value.index %value = load double, ptr addrspace(1) %value.ptr, align 8
-%product = call double @recipe.mul(double %weight, double %value) %inner.next = call double @recipe.add(double %inner, double %product) %f.next = add i32 %f, 1 br label %hidden.loop
-hidden.done: %scaled = call double @recipe.mul(double %e.weight, double %inner) %grown = call double @recipe.add(double %total, double %scaled) %slot.grown = add i32 %slot, 1 br label %advance
-advance: %total.next = phi double [ %grown, %hidden.done ], [ %total, %step ] %slot.next = phi i32 [ %slot.grown, %hidden.done ], [ %slot, %step ]
-%e.next = add i32 %e, 1 br label %expert.loop
-done: %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %total, ptr addrspace(1) %output.ptr, align 8 ret void }
+%weight.state = call RECIPE_STATE @recipe.decode(double %weight)
+%value.state = call RECIPE_STATE @recipe.decode(double %value)
+%product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.state, RECIPE_STATE %value.state)
+%inner.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %inner, RECIPE_STATE %product) %f.next = add i32 %f, %width br label %hidden.loop
+hidden.done: %sum = call RECIPE_STATE @expert_wave_sum(RECIPE_STATE %inner, i32 %lane, i32 %width)
+%routing.state = call RECIPE_STATE @recipe.decode(double %e.weight)
+%scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %routing.state, RECIPE_STATE %sum)
+%total.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %total, RECIPE_STATE %scaled) %slot.next = add i32 %slot, 1 br label %expert.loop
+done: %owner = icmp eq i32 %lane, 0 br i1 %owner, label %store, label %exit
+store: %result = call double @recipe.encode(RECIPE_STATE %total)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %result, ptr addrspace(1) %output.ptr, align 8 br label %exit
+exit: ret void }
 ; Hidden element %p of the gated product receives its own expert's column of
 ; the down table under its routing weight.
 define internal void @expert_out_reverse_values_body( ptr addrspace(1) %routing, ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %adjoint, i64 %p, i32 %channels, i32 %length, i32 %hidden, i32 %experts, i32 %top ) #1 { entry:
@@ -5087,7 +5369,8 @@ ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly 
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, ptr addrspace(1) %kv.context, i1 %carry,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %query.begin, i32 %query.span, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads,
 i32 %kv.heads, i32 %value.heads, i32 %index.heads, i32 %index.width, i32 %select.block, i1 %gate, double %epsilon,
-i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin ) #3 { entry:
+i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1 %online, i32 %buffer.length, i32 %buffer.origin, i32 %query.capacity ) #3 { entry:
+%query.capacity.wide = zext i32 %query.capacity to i64
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
@@ -5126,7 +5409,7 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %query.tiles.rounded = add i32 %query.span, %tile.m.less.one
 %query.tiles = udiv i32 %query.tiles.rounded, %tile.m
 %head.jobs = mul i32 %rows, %heads
-%statistics.plane = mul i32 %head.jobs, %length
+%statistics.plane = mul i32 %head.jobs, %query.capacity
 %representative.base = mul i32 %statistics.plane, 2
 %representative.stride = mul i32 %blocks, %index.width
 %representative.total = mul i32 %representative.stride, %rows
@@ -5136,11 +5419,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %index.query.channels.global = mul i64 %index.heads.global, %index.width.global %index.channels.global = add i64 %index.query.channels.global, %index.width.global %index.plane.global = mul i64 %index.channels.global, %length.global
 %gate.plane.global = select i1 %gate, i64 %from.global, i64 0 %index.query.base.global = add i64 %from.global, %kv.planes.global %gate.base.global = add i64 %index.query.base.global, 0 %row.stride.global = add i64 %gate.base.global, %gate.plane.global
 %blocks.numerator.global = add i64 %length.global, %block.divisor.global %blocks.less.global = sub i64 %blocks.numerator.global, 1 %blocks.full.global = udiv i64 %blocks.less.global, %block.divisor.global %blocks.selected.global = select i1 %select, i64 %blocks.full.global, i64 0
-%score.stride.global = mul i64 %blocks.selected.global, 2 %head.jobs.global = mul i64 %rows.global, %heads.global %statistics.plane.global = mul i64 %head.jobs.global, %length.global %representative.base.global = mul i64 %statistics.plane.global, 2 %representative.stride.global = mul i64 %blocks.selected.global, %index.width.global %representative.total.global = mul i64 %representative.stride.global, %rows.global %score.base.global = add i64 %representative.base.global, %representative.total.global
+%score.stride.global = mul i64 %blocks.selected.global, 2 %head.jobs.global = mul i64 %rows.global, %heads.global %statistics.plane.global = mul i64 %head.jobs.global, %query.capacity.wide %representative.base.global = mul i64 %statistics.plane.global, 2 %representative.stride.global = mul i64 %blocks.selected.global, %index.width.global %representative.total.global = mul i64 %representative.stride.global, %rows.global %score.base.global = add i64 %representative.base.global, %representative.total.global
 %score.base.wide = add i64 %score.base.global, 0
 %length.wide = add i64 %length.global, 0
 %score.stride.wide = add i64 %score.stride.global, 0
-%score.row.stride = mul i64 %length.wide, %score.stride.wide
+%score.row.stride = mul i64 %query.capacity.wide, %score.stride.wide
 %jobs = mul i32 %head.jobs, %query.tiles
 %query.values = mul i32 %tile.m, %head.width
 %key.values = mul i32 %tile.n, %head.width

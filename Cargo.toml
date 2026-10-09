@@ -31,7 +31,7 @@ contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 delta-chunk = 8
 topology-probe-bytes = 4194304
-placement-launch-reserve-bytes = 134217728
+placement-launch-reserve-bytes = 536870912
 cpu-worker-threads = 0
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
@@ -56,6 +56,10 @@ nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
 nvidia-assembler = "bin/ptxas"
+
+[package.metadata.mtp]
+tokens = 3
+probs = 0.0
 
 [package.metadata.train] # a bunch of constants in one place for refs
 epochs = 210
@@ -129,7 +133,6 @@ sum = "int8"
 embed = "fp16"
 attn = "fp16"
 rope = "fp16"
-kv = "fp16"
 atvn = "fp16"
 norm = "fp16"
 res = "fp16"
@@ -153,7 +156,6 @@ sum = "int8"
 embed = "fp32"
 attn = "fp32"
 rope = "fp32"
-kv = "fp16"
 atvn = "fp32"
 norm = "fp32"
 res = "fp32"
@@ -164,3 +166,11 @@ rope-angle = "chain"
 attn-softmax = "online"
 math = "libm"
 step = 256
+
+[storage.recipe]
+kv = "fp8"
+fp8 = "e4m3"
+
+[storage.llamacpp]
+kv = "fp16"
+fp8 = "e4m3"
