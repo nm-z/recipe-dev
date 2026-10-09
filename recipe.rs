@@ -18796,8 +18796,8 @@ impl Builder<'_> {
 						require(branch_widths[0] == branch_widths[1], format!("block {layer} feed-forward product branches differ in width"))?;
 						hidden = branch_widths[0];
 						let [gate, up] = self.gate_and_up(layer, &role, width, hidden)?;
-						self.mapped(vec![if activated(right) && !activated(left) { up } else { gate }]);
-						self.mapped(vec![if activated(right) && !activated(left) { gate } else { up }]);
+						let pair = if activated(right) && !activated(left) { [up, gate] } else { [gate, up] };
+						for tensor in pair { self.mapped(vec![tensor]); }
 						weighted = true;
 					}
 				}

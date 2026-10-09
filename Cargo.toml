@@ -257,6 +257,10 @@ feed-forward-activation = "silu"
 rope-pairs = "halves"
 feed-forward-activation = "silu"
 
+[architecture.phi3]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
 [architecture.qwen3]
 rope-pairs = "halves"
 feed-forward-activation = "silu"
