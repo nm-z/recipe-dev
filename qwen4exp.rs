@@ -27,9 +27,11 @@ pub fn model() -> Model {
 		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram).ple_math(ple_math); }
 		let attention = if (layer + 1) % qwen4exp.full_attention_interval == 0 {
 			let group = qwen4exp.attention.compress_ratios[layer].max(1);
-			recipe.model().attn(qwen4exp.attention.head_count).kv(qwen4exp.attention.head_count_kv).head(qwen4exp.attention.key_length)
+			let heads = recipe.model().attn_heads(qwen4exp.attention.head_count).kv(qwen4exp.attention.head_count_kv).head(qwen4exp.attention.key_length)
 				.rope(neox, qwen4exp.rope.dimension_count, qwen4exp.rope.freq_base)
-				.index_tokens(qwen4exp.attention.indexer.head_count, qwen4exp.attention.indexer.key_length, group, qwen4exp.attention.indexer.top_k)
+				.index_tokens(qwen4exp.attention.indexer.head_count, qwen4exp.attention.indexer.key_length, group, qwen4exp.attention.indexer.top_k);
+			let gate = recipe.model().no(bias).layer(qwen4exp.attention.head_count * qwen4exp.attention.key_length).sigmoid();
+			recipe.model().block(heads * gate).layer(width)
 		} else {
 			recipe.model().delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)

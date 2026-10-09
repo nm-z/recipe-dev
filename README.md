@@ -111,6 +111,7 @@ let model = recipe.model()
 		lgbm(trees)
 	attention:
 		attn(heads)
+		attn_heads(heads) // head plane for a block product before the output layer
 			.width(d)
 			.head(width)
 			.kv(heads).fp(...)
@@ -119,7 +120,6 @@ let model = recipe.model()
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
-			.gate()
 atvn:
 	relu()
 	leak()
@@ -392,8 +392,9 @@ delta(heads, kernel)
 	.qk(l2|rms)
 	.delta_gates(softplus, sigmoid)
 
-attn(heads)
-	.gate(sigmoid|silu|tanh)                                    // .gate()
+let attention = recipe.model().attn_heads(heads).kv(kv).head(head);
+let gate = recipe.model().no(bias).layer(heads * head).sigmoid();
+let model = recipe.model().block(attention * gate).layer(width);
 
 hyper(lanes, &branch, mean)
 hyper_gate(lanes, &branch, HyperGate { read, write, mean })
