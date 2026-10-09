@@ -18659,52 +18659,50 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
 	Ok(())
 }
-fn finish_int_sums(graph: &mut Graph, first: usize, config: Config) -> Result<()> {
+fn finish_int_sums(graph: &mut Graph, index: usize, config: Config) -> Result<()> {
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
 	// int8 inputs and scaled once per block sum. The sum's own values are what
 	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
-	for index in first..graph.nodes.len() {
-		let Compute::Int(format) = graph.nodes[index].precision else { continue };
-		let node = &graph.nodes[index];
-		let values = node.acc;
-		// int on attn names its sums; the attention itself runs in its accumulator.
-		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = values;
-			continue;
-		}
-		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
-		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
-		// kernel: a conv names fp or bf.
-		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
-		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
-		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
-		let storage = match format.bits {
-			8 | 16 | 32 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_1"),
-			_ => None,
-		}
-		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-		// nodes remain together until the load kernel can emit multiple target
-		// layouts for one node; every single noncanonical plane converts at load.
-		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
-			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
-			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-			canonical || mixed_k
-		});
-		let kept = kept.map(|weight| weight.format);
-		let node = &mut graph.nodes[index];
-		node.storage = kept.unwrap_or(storage).0;
-		node.packed = true;
-		node.int_bits = format.bits;
-		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
-		node.kv_precision = node.precision;
-		if kept.is_none() {
-			requantize_bound(graph, index, storage, config)?;
-		}
+	let Compute::Int(format) = graph.nodes[index].precision else { return Ok(()) };
+	let node = &graph.nodes[index];
+	let values = node.acc;
+	// int on attn names its sums; the attention itself runs in its accumulator.
+	if node.op == Primitive::Attention {
+		graph.nodes[index].precision = values;
+		return Ok(());
+	}
+	require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+	// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
+	// kernel: a conv names fp or bf.
+	require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
+	require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
+	require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
+	let storage = match format.bits {
+		8 | 16 | 32 => StorageFormat::named("q8_0"),
+		4 => StorageFormat::named("q4_1"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+	// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
+	// nodes remain together until the load kernel can emit multiple target
+	// layouts for one node; every single noncanonical plane converts at load.
+	let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
+		if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
+		let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
+		let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+		let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
+		canonical || mixed_k
+	});
+	let kept = kept.map(|weight| weight.format);
+	let node = &mut graph.nodes[index];
+	node.storage = kept.unwrap_or(storage).0;
+	node.packed = true;
+	node.int_bits = format.bits;
+	node.precision = if format.bits == 32 { Compute::FP32 } else { values };
+	node.kv_precision = node.precision;
+	if kept.is_none() {
+		requantize_bound(graph, index, storage, config)?;
 	}
 	Ok(())
 }
