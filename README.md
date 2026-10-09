@@ -255,7 +255,7 @@ place(path, &[blocks])
 
 ## GGUF tensors
 
-A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, and a normalization its scale.
+A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, and a normalization its scale.
 
 ```rust
 let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
@@ -279,6 +279,16 @@ model = model.res([norm(rms).scale_from("blk.3.attn_norm.weight"), Block::from(a
 ```rust
 AttentionTensors { q, k, v, q_bias, k_bias, v_bias, q_norm, k_norm, factors, out, indexer }
 IndexerTensors { q_proj, k_proj, q_norm, k_norm }
+```
+
+```rust
+let experts = recipe.model().gguf_moe(count, used, hidden, Activation::Silu, Scoring::Softmax, true, shared, 1.0, false)
+	.moe_from(MoeTensors::block(layer));
+```
+
+```rust
+MoeTensors { router, selection_bias, gate, up, down, shared }
+SharedTensors { gate_input, gate, up, down }
 ```
 
 ## Terminal chat and remote execution
