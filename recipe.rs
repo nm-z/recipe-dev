@@ -10864,10 +10864,12 @@ mod bundle {
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
 				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
 				let factors = if attention.factors { ",f=1" } else { "" };
+				let factor_context = if attention.factor_context != 0 { format!(",c={}", attention.factor_context) } else { String::new() };
+				let rope_scale = if attention.rope_scale == 1.0f64.to_bits() { String::new() } else { format!(",a={}", f64::from_bits(attention.rope_scale)) };
 				let unscaled = if attention.unscaled { ",s=1" } else { "" };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
+					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{factor_context}{rope_scale}{unscaled}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -10983,6 +10985,7 @@ mod bundle {
 				};
 				let mut values = keys;
 				let (mut window, mut factors, mut unscaled) = (0, false, false);
+				let (mut factor_context, mut rope_scale) = (0, 1.0f64.to_bits());
 				for marker in first_marker.into_iter().chain(fields) {
 					if let Some(value) = marker.strip_prefix("v=") {
 						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
@@ -10990,6 +10993,10 @@ mod bundle {
 						window = value.parse().map_err(|error| RecipeError::new(format!("invalid attention window: {error}")))?;
 					} else if marker == "f=1" {
 						factors = true;
+					} else if let Some(value) = marker.strip_prefix("c=") {
+						factor_context = value.parse().map_err(|error| RecipeError::new(format!("invalid attention factor context: {error}")))?;
+					} else if let Some(value) = marker.strip_prefix("a=") {
+						rope_scale = value.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid attention rope scale: {error}")))?.to_bits();
 					} else if marker == "s=1" {
 						unscaled = true;
 					} else {
@@ -11007,6 +11014,8 @@ mod bundle {
 					project,
 					window,
 					factors,
+					factor_context,
+					rope_scale,
 					unscaled,
 				}))
 			}
@@ -11718,6 +11727,16 @@ mod bundle {
 			assert_eq!(split_escaped(&text, '|').len(), 11);
 			assert_eq!(block(&text).unwrap(), original);
 		}
+		#[test]
+		fn rope_factors_and_scale_round_trip() {
+			let original = attn(4).kv(2).rope(neox, 4, 10000.0).rope_factors(4096).rope_scale(1.1902).fp(32);
+			let Operation::Attention(attention) = &original.operation else { panic!("attn did not build an attention block") };
+			assert!(attention.factors && attention.factor_context == 4096 && attention.rope_scale == 1.1902f64.to_bits());
+			let restored = block(&block_text(&original)).unwrap();
+			assert_eq!(restored, original);
+			assert!(std::panic::catch_unwind(|| attn(4).rope_factors(4096)).is_err());
+			assert!(std::panic::catch_unwind(|| attn(4).rope(neox, 4, 10000.0).rope_scale(0.0)).is_err());
+		}
 	}
 }
 #[cfg(unix)]
@@ -12254,12 +12273,16 @@ struct AttentionBlock {
 	window: usize,
 	/// Whether the Rope node binds one proportional-frequency factor per pair.
 	factors: bool,
+	/// Nonzero when the factors are the file's short and long tensors: a graph of more positions than this binds the long one.
+	factor_context: usize,
+	/// The magnitude scale of the rotated queries and keys, as bits, multiplied into the rope's own.
+	rope_scale: u64,
 	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
 	unscaled: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, project: true, window: 0, factors: false, unscaled: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, project: true, window: 0, factors: false, factor_context: 0, rope_scale: 1.0f64.to_bits(), unscaled: false }
 	}
 
 
@@ -12732,6 +12755,30 @@ impl Block {
 		block.suffix = Suffix::Rope;
 		block
 	}
+	/// Per-pair frequency factors for this `rope` from the file's `rope_factors_short.weight` and
+	/// `rope_factors_long.weight`. A graph of more than `context` positions reads the long one,
+	/// the short one otherwise, as llama.cpp selects them by context. Use `.fp(32)`.
+	pub fn rope_factors(self, context: usize) -> Self {
+		let mut block = self.attention("rope_factors", |attention| {
+			assert!(attention.rope.is_some(), "rope_factors requires a preceding rope");
+			assert!(context != 0, "rope_factors context must be positive");
+			attention.factors = true;
+			attention.factor_context = context;
+		});
+		block.suffix = Suffix::Rope;
+		block
+	}
+	/// A magnitude scale on the rotated queries and keys of this `rope`, which ggml calls the
+	/// attention factor and Phi-3 stores as `rope.scaling.attn_factor`.
+	pub fn rope_scale(self, scale: f64) -> Self {
+		let mut block = self.attention("rope_scale", |attention| {
+			assert!(attention.rope.is_some(), "rope_scale requires a preceding rope");
+			assert!(scale.is_finite() && scale > 0.0, "rope_scale must be finite and positive");
+			attention.rope_scale = scale.to_bits();
+		});
+		block.suffix = Suffix::Rope;
+		block
+	}
 	/// Sparse key selection on this `attn` block.
 	pub fn index(self, heads: usize, width: usize, block: usize, keep: usize) -> Self {
 		self.attention("index", |attention| attention.index = Some(Indexer { heads, width, block, keep, ..Indexer::NONE }))
@@ -13084,6 +13131,15 @@ impl Model {
 	/// YaRN frequency scaling for the preceding rotary attention block.
 	pub fn yarn(&self, factor: f64, context: usize, fast: f64, slow: f64) -> Self {
 		self.attention("yarn", |block| block.yarn(factor, context, fast, slow))
+	}
+	/// Per-pair frequency factors for the preceding rotary attention block: the file's long
+	/// `rope_factors` for a graph of more than `context` positions, the short ones otherwise.
+	pub fn rope_factors(&self, context: usize) -> Self {
+		self.attention("rope_factors", |block| block.rope_factors(context))
+	}
+	/// A magnitude scale on the rotated queries and keys of the preceding rotary attention block.
+	pub fn rope_scale(&self, scale: f64) -> Self {
+		self.attention("rope_scale", |block| block.rope_scale(scale))
 	}
 	/// Sparse key selection on the preceding `attn` block. `heads` query
 	/// projections and one key projection, each `width` wide, score every group
@@ -15350,6 +15406,8 @@ impl Gguf {
 pub struct Binding {
 	tensors: BTreeSet<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
+	/// Rotary factor groups that have a long tensor: the node index, the long tensor, and the context a graph must exceed to bind it.
+	rope_long: Vec<(usize, GgufTensor, usize)>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
 /// rewrote once from a tensor the file stores in another parametrization, which
@@ -15380,6 +15438,14 @@ impl Plane {
 	}
 }
 impl Binding {
+	/// The plan for a graph of `positions`: each factor group whose graph exceeds its context binds its long tensor.
+	fn for_positions(&self, positions: usize) -> Self {
+		let mut plan = self.clone();
+		for (node, long, context) in &self.rope_long {
+			if positions > *context { plan.nodes[*node] = vec![Plane::Mapped(long.clone())]; }
+		}
+		plan
+	}
 	/// Distinct source tensors read by this plan, including rewritten scales.
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
@@ -15478,6 +15544,7 @@ fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], c
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
 	let config = Config::load()?;
+	let plan = &plan.for_positions(shape.length);
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
@@ -16430,6 +16497,8 @@ pub struct RopeScalingKeys {
 	pub original_context_length: usize,
 	pub yarn_beta_fast: f64,
 	pub yarn_beta_slow: f64,
+	/// The magnitude scale of the rotated queries and keys, one when the file names none.
+	pub attn_factor: f64,
 }
 impl ArchitectureKeys {
 	fn load(file: &Gguf, prefix: &str) -> Self {
@@ -16501,6 +16570,7 @@ impl ArchitectureKeys {
 					original_context_length: count("rope.scaling.original_context_length"),
 					yarn_beta_fast: real("rope.scaling.yarn_beta_fast", 0.0),
 					yarn_beta_slow: real("rope.scaling.yarn_beta_slow", 0.0),
+					attn_factor: real("rope.scaling.attn_factor", 1.0),
 				},
 			},
 		}
@@ -17271,8 +17341,16 @@ impl Builder<'_> {
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
-			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			let node = self.plan.nodes.len();
+			let (factors, long) = if attention.factor_context == 0 {
+				(self.tensor("rope_freqs.weight", &role)?, None)
+			} else {
+				(self.tensor("rope_factors_short.weight", &role)?, Some(self.tensor("rope_factors_long.weight", &role)?))
+			};
+			for tensor in std::iter::once(&factors).chain(&long) {
+				require(attention.rope.is_some() && tensor.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", tensor.name, tensor.elements(), rope_dims / 2))?;
+			}
+			if let Some(long) = long { self.plan.rope_long.push((node, long, attention.factor_context)); }
 			self.mapped(vec![factors]);
 		}
 		if let Some(index) = attention.index {
@@ -20041,7 +20119,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection when selected. The input projection carries the query, key,
 /// and value planes, then any indexer planes.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, unscaled } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, rope_scale, unscaled, .. } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
@@ -20096,6 +20174,8 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
+		// A rope scale multiplies the cosine and sine, as ggml's attn_factor does.
+		let mscale = mscale * f64::from_bits(rope_scale);
 		// The seventh argument names the angle: 0 direct, 1 chained. Under the
 		// chain the second argument carries base^(-2/dims) from the host's powf
 		// (llama.cpp's theta_scale) instead of the base, so every backend chains
@@ -21451,6 +21531,23 @@ mod precision_contract_checks {
 		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
 		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
 		assert!(!widened.contains("entry: ret i32 0"));
+	}
+	#[test]
+	fn rope_scale_multiplies_the_rotary_magnitude() {
+		let lowered = |scale: f64| {
+			let mut graph = Graph::new(Shape { channels: 12, length: 2 }, 1e-5);
+			graph.profile = Config::load().unwrap().profile;
+			graph.block_precision = Some(Compute::FP32);
+			graph.block_blck_precision = Some(Compute::FP32);
+			let mut attention = AttentionBlock::new(1);
+			attention.width = 4;
+			attention.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
+			attention.rope_scale = scale.to_bits();
+			lower_attention(&mut graph, attention, None).unwrap();
+			graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().argument[4]
+		};
+		assert_eq!(lowered(1.0), 1.0);
+		assert_eq!(lowered(1.1902), 1.1902);
 	}
 	#[test]
 	fn proportional_rope_factors_match_the_analytic_rotation() {
