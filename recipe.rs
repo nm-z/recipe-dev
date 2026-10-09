@@ -8478,13 +8478,14 @@ mod gguf {
 		pub fn blocked(&self) -> bool {
 			layout(self.kind).is_ok_and(|(_, _, _, format)| format.is_some())
 		}
-		/// A contiguous mapped view of `count` output rows from `start`.
-		pub fn rows(&self, start: usize, count: usize) -> Result<Self> {
+		/// The output rows `start..start + count`, read as one mapped view with
+		/// `view` or repeated across the tensor with `every`.
+		pub fn rows(&self, start: usize, count: usize) -> Result<GgufRows<'_>> {
 			require(self.shape.len() >= 2, format!("tensor {} has {} dimensions; a row slice takes at least [k, n]", self.name, self.shape.len()))?;
 			let rows = self.elements() / self.shape[0] as usize;
 			let end = start.checked_add(count).ok_or_else(|| RecipeError::new(format!("tensor {} row slice overflows", self.name)))?;
 			require(count != 0 && end <= rows, format!("tensor {} holds {rows} rows, so rows {start}..{end} are absent", self.name))?;
-			self.slice(vec![self.shape[0], count as u64], start, count)
+			Ok(GgufRows { tensor: self, start, count })
 		}
 		/// A view of `count` rows of `self.shape[0]` elements each, `before` rows in.
 		fn slice(&self, shape: Vec<u64>, before: usize, count: usize) -> Result<Self> {
@@ -8493,6 +8494,37 @@ mod gguf {
 			let (skipped, elements) = (before * width, count * width);
 			require(skipped % block == 0 && elements % block == 0, format!("tensor {} rows of {width} do not divide its {block}-element block, so a slice would cut one", self.name))?;
 			Ok(Self { name: self.name.clone(), shape, kind: self.kind, offset: self.offset + skipped / block * stride, bytes: elements / block * stride, shard: self.shard })
+		}
+	}
+
+	/// A run of output rows from a tensor, before it is read as one view or
+	/// repeated periodically across the tensor.
+	#[derive(Clone, Copy)]
+	pub struct GgufRows<'a> {
+		tensor: &'a GgufTensor,
+		start: usize,
+		count: usize,
+	}
+
+	impl GgufRows<'_> {
+		/// The run as one mapped view.
+		pub fn view(&self) -> Result<GgufTensor> {
+			self.tensor.slice(vec![self.tensor.shape[0], self.count as u64], self.start, self.count)
+		}
+		/// The run repeated every `period` rows from its start, one mapped view per
+		/// repetition, through the last row that holds a whole run. Runs may not
+		/// overlap, so `period` is at least the run's row count.
+		pub fn every(&self, period: usize) -> Result<Vec<GgufTensor>> {
+			require(period >= self.count, format!("tensor {} repeats a {}-row run every {period} rows, so runs overlap", self.tensor.name, self.count))?;
+			let rows = self.tensor.elements() / self.tensor.shape[0] as usize;
+			let shape = vec![self.tensor.shape[0], self.count as u64];
+			let mut views = Vec::new();
+			let mut start = self.start;
+			while start + self.count <= rows {
+				views.push(self.tensor.slice(shape.clone(), start, self.count)?);
+				start = checked_add(start, period, "tensor row period")?;
+			}
+			Ok(views)
 		}
 	}
 
@@ -8896,7 +8928,7 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue};
+pub use gguf::{Gguf, GgufRows, GgufTensor, GgufValue};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
@@ -15696,9 +15728,9 @@ impl<'a> Builder<'a> {
 	/// and as one view per row otherwise.
 	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?]);
+			return Ok(vec![tensor.rows(base, order.len())?.view()?]);
 		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)).collect()
+		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
 	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
@@ -15737,9 +15769,9 @@ impl<'a> Builder<'a> {
 		let role = format!("block {layer_index} short convolution");
 		let input = self.tensor(&name("shortconv.in_proj.weight"), &role)?;
 		require(input.shape == [width as u64, (3 * width) as u64], format!("{} has shape {:?}; {role} projects three {width}-wide planes", input.name, input.shape))?;
-		let b = input.rows(0, width)?;
-		let c = input.rows(width, width)?;
-		let x = input.rows(2 * width, width)?;
+		let b = input.rows(0, width)?.view()?;
+		let c = input.rows(width, width)?.view()?;
+		let x = input.rows(2 * width, width)?.view()?;
 		let taps = self.tensor(&name("shortconv.conv.weight"), &role)?;
 		require(taps.shape == [kernel as u64, width as u64], format!("{} has shape {:?}; {role} holds {kernel} taps for {width} channels", taps.name, taps.shape))?;
 		let output = self.projection(&name("shortconv.out_proj.weight"), &role, width, width)?;
@@ -16741,7 +16773,7 @@ impl Builder<'_> {
 		planes.push(value);
 		if gated {
 			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?);
+				planes.push(query.rows(index * stride + head, head)?.view()?);
 			}
 		}
 		self.mapped(planes);
