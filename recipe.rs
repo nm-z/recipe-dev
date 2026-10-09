@@ -20119,7 +20119,10 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 			}
 			None => None,
 		};
-		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
+		// The node that ends the graph feeds nothing on a die: the host reads each
+		// die's rows in order, so those rows need no exchange.
+		let gathered = if index + 1 == graph.nodes.len() && alone.is_some_and(|run| run.period == 0) { None } else { Some(0.0) };
+		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, gathered)));
 		let Some((shard, exchange)) = plan else {
 			nodes.push(node);
 			stored.push(graph.stored[index].clone());
@@ -20542,6 +20545,10 @@ impl Placed {
 			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
 		})?;
 		self.keep_stream(tapes, begin, end)?;
+		if tapes.iter().all(|tape| tape.output_rows().is_some()) {
+			// Each die holds its rows of the output, and the dies' rows follow one another.
+			return Ok(tapes.iter().map(|tape| if last_only { tape.last_column_rows() } else { tape.predictions_rows() }).collect::<Result<Vec<_>>>()?.concat());
+		}
 		if last_only { last.last_column() } else { last.predictions() }
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
@@ -24638,11 +24645,30 @@ impl NativeTape {
 		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
+	/// The output rows this die alone computes, when the graph ends in a sum split
+	/// by rows: no exchange follows it, so the host reads each die's rows.
+	fn output_rows(&self) -> Option<Run> {
+		let last = self.nodes.last()?;
+		(last.op == Primitive::Contraction && last.shard.rows.count != 0 && last.shard.rows.period == 0).then_some(last.shard.rows)
+	}
 	/// The output channels at the last position the latest forward reached.
 	fn last_column(&self) -> Result<Vec<f64>> {
+		self.last_column_range(0, self.output.channels)
+	}
+	/// This die's rows of the last output column.
+	fn last_column_rows(&self) -> Result<Vec<f64>> {
+		let rows = self.output_rows().ok_or_else(|| RecipeError::new("this die computes no rows of the output"))?;
+		self.last_column_range(rows.first, rows.count)
+	}
+	/// This die's rows of every output position, channel by channel.
+	fn predictions_rows(&self) -> Result<Vec<f64>> {
+		let rows = self.output_rows().ok_or_else(|| RecipeError::new("this die computes no rows of the output"))?;
+		self.output(rows.first * self.output.length, rows.count * self.output.length)
+	}
+	fn last_column_range(&self, first: usize, count: usize) -> Result<Vec<f64>> {
 		let layout = &self.program.artifact.layout;
 		let column = layout.last_column.ok_or_else(|| RecipeError::new("this tape keeps no last output column"))?;
-		let values = self.contexts.download_float_bytes(column, self.output.channels, layout.output_precision)?;
+		let values = self.contexts.download_float_bytes(column + first * layout.output_precision.bytes(), count, layout.output_precision)?;
 		self.trace_values(&values)?;
 		Ok(values)
 	}
