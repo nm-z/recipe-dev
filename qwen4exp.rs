@@ -1,56 +1,34 @@
 use recipe::*;
 use recipe::infer::{cached, input, out, pp, tg, time};
 
-const GGUF: &str = "/home/nate/models-hdd-backup/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf";
-const MTP: &str = "/home/nate/models-hdd-backup/Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B-Q8_0.gguf";
+const GGUF: &str = "/mnt/sentry-nfs/unsloth/Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf";
+
+pub fn model() -> Model {
+	let (width, vocabulary) = (qwen4exp.embedding_length, tokenizer.ggml.tokens.len());
+	let mut model = recipe.model().embed(vocabulary, width);
+	for layer in 0..qwen4exp.block_count {
+		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram); }
+		let attention = if (layer + 1) % qwen4exp.full_attention_interval == 0 {
+			let group = qwen4exp.attention.compress_ratios[layer].max(1);
+			recipe.model().attn(qwen4exp.attention.head_count).kv(qwen4exp.attention.head_count_kv).head(qwen4exp.attention.key_length)
+				.rope(neox, qwen4exp.rope.dimension_count, qwen4exp.rope.freq_base)
+				.index_tokens(qwen4exp.attention.indexer.head_count, qwen4exp.attention.indexer.key_length, group, qwen4exp.attention.indexer.top_k)
+		} else {
+			recipe.model().delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
+				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
+				.delta_activations(Activation::Silu, Activation::Sigmoid)
+		};
+		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &attention);
+		let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
+		let experts = recipe.model().gguf_moe(qwen4exp.expert_count, qwen4exp.expert_used_count, qwen4exp.expert_feed_forward_length,
+			Activation::Silu, scoring, qwen4exp.expert_weights_norm, qwen4exp.expert_shared_feed_forward_length != 0);
+		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &experts);
+	}
+	model.layer(vocabulary)
+}
 
 fn main() {
-	let data = recipe.data(GGUF);
-	let file = recipe.gguf(GGUF);
-	let ngram = file.ngram();
-	let compression = match file.value("qwen4exp.attention.compress_ratios").unwrap() {
-		GgufValue::Array(values) => values.iter().map(|value| value.integer().unwrap() as usize).collect::<Vec<_>>(),
-		_ => panic!("qwen4exp.attention.compress_ratios must be an array"),
-	};
-	let mut model = recipe.model().epsilon(0.000001).embed(248320, 2560);
-
-	for block in 0..48 {
-		if block == ngram.layer() {
-			model = model.ple(&ngram);
-		}
-
-		let mut attention = if (block + 1) % 4 == 0 {
-			let mut attention = recipe.model().attn(24).kv(2).head(256);
-			if file.tensor(&format!("blk.{block}.attn_q.weight")).unwrap().shape[1] == 12288 {
-				attention = attention.gate();
-			}
-			if file.tensor(&format!("blk.{block}.attn_q_norm.weight")).is_some() {
-				attention = attention.qk(rms);
-			}
-			attention.rope(neox, 64, 10000000.0).index(4, 128, compression[block].max(1), 1).budget(2048)
-		} else {
-			recipe.model().delta(48, 4).keys(16, 128).values(128).out(2560)
-				.delta_block("activations", |delta| {
-					delta.conv_activation = Activation::Silu;
-					delta.output_activation = Activation::Sigmoid;
-				})
-		};
-		if file.tensor(&format!("blk.{block}.post_attention_norm.weight")).is_some() {
-			attention = attention.norm(rms);
-		}
-		model = model.hyper(4, 320, &attention);
-
-		let shared = file.tensor(&format!("blk.{block}.ffn_gate_shexp.weight")).is_some();
-		let mut experts = recipe.model().gguf_moe(512, 10, 640, Activation::Silu, Scoring::Softmax, true, shared);
-		if file.tensor(&format!("blk.{block}.post_ffw_norm.weight")).is_some() {
-			experts = experts.norm(rms);
-		}
-		model = model.hyper(4, 320, &experts);
-	}
-
-	if file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight")).is_some() {
-		model = model.norm(rms);
-	}
-	model = model.layer(248320);
+	let data = recipe.data(std::env::var("GGUF").unwrap_or_else(|_| GGUF.to_owned()));
+	let model = model();
 	recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
 }

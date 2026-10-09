@@ -101,7 +101,7 @@ let model = recipe.model()
 			.head(width)
 			.kv(heads).fp(...)
 			.qk(rms|l2)
-			.rope(neox, dims, base)
+			.rope(neox|sections([...])|interleaved([...]), dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
@@ -117,6 +117,7 @@ atvn:
 	elu()
 	prelu()
 	cos()
+	sqrt()
 	exp()
 	log()
 	ln()
@@ -215,7 +216,7 @@ infer()
 	.tokens(count)
 	.mtp(path)
 	.chat(text|[time, pp, tg, input, out, cached, mtp])
-	.log([chat, debug])
+	.log([chat, debug, hc_values])
 	.run(&model, &data)
 predict(path, &input)
 tokenizer.encode(text)|tokenizer.decode(&ids)|tokenizer.stop_ids()
@@ -292,6 +293,8 @@ println!("{}", model.memory(&data, 32768));
 
 ```rust
 report.*
+	tensors[].*
+		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
 	(load|compile).seconds()
 	path
 	(formats|memory|links|aot|tiles|grids)[]
@@ -318,7 +321,7 @@ infer().run().*
 	mtp.(drafted|accepted|verifications)
 	(context|requests)
 	history[].*
-		(time|prediction|input_ids|output_ids|logits|input|out|cached|reply_limit|mtp|reference|operations)
+		(time|prediction|input_ids|output_ids|logits|input|out|cached|reply_limit|mtp|reference|operations|tensors)
 	(dead_buffers|dead_bytes)
 	reference.*
 		(steps|worst)
