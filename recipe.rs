@@ -12555,7 +12555,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -14068,6 +14068,8 @@ pub struct Block {
 	delta_tensors: Option<DeltaTensors>,
 	/// Tensors a script names for the planes of an attention block.
 	attention_tensors: Option<AttentionTensors>,
+	/// Tensors a script names for the planes of a mixture-of-experts block.
+	moe_tensors: Option<MoeTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14141,7 +14143,7 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
@@ -14154,6 +14156,12 @@ impl Block {
 		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
 		attention.factors |= tensors.factors.is_some();
 		self.attention_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this mixture-of-experts block reads.
+	pub fn moe_from(mut self, tensors: MoeTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Moe(..)), "moe_from requires a gguf_moe block");
+		self.moe_tensors = Some(tensors);
 		self
 	}
 	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
@@ -14272,6 +14280,46 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors a mixture-of-experts block reads, spelled by the script: the router, the
+/// expert banks, the selection bias when the block selects with one, and the shared expert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoeTensors {
+	pub router: String,
+	pub selection_bias: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+	pub shared: Option<SharedTensors>,
+}
+impl MoeTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			router: name("ffn_gate_inp.weight"),
+			selection_bias: Some(name("exp_probs_b.bias")),
+			gate: name("ffn_gate_exps.weight"),
+			up: name("ffn_up_exps.weight"),
+			down: name("ffn_down_exps.weight"),
+			shared: Some(SharedTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors of a shared expert: its projections and, when the shared path is gated, the
+/// per-position gate vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedTensors {
+	pub gate_input: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+}
+impl SharedTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { gate_input: Some(name("ffn_gate_inp_shexp.weight")), gate: name("ffn_gate_shexp.weight"), up: name("ffn_up_shexp.weight"), down: name("ffn_down_shexp.weight") }
+	}
+}
 /// The GGUF tensors an attention block reads, spelled by the script. `q` holds the query rows,
 /// interleaved with the gate rows when the block is gated; a missing `v` reads `k` as the values;
 /// the biases, the query and key scales and the rotary factors are present only when named.
@@ -14493,6 +14541,7 @@ impl Model {
 				scale_tensors: Vec::new(),
 				delta_tensors: None,
 				attention_tensors: None,
+				moe_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14591,6 +14640,13 @@ impl Model {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
 			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
 			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding gguf_moe block reads.
+	pub fn moe_from(&self, tensors: MoeTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("moe_from requires a preceding gguf_moe block"));
+			*block = block.clone().moe_from(tensors);
 		})
 	}
 	/// Names the GGUF tensors the preceding attention block reads.
@@ -17967,25 +18023,26 @@ impl<'a> Builder<'a> {
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
 		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
 		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
-		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
+		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width, None)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
 		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize, spelled: Option<&MoeTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| MoeTensors::block(layer));
 		let role = format!("block {layer} experts");
-		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
+		let router = self.projection(&named.router, &role, width, count)?;
 		self.mapped(vec![router]);
 		if selection_bias {
 			// The routing node reads this span right after the router scores.
 			let bias_role = format!("block {layer} expert selection bias");
-			let tensor = self.tensor(&name("exp_probs_b.bias"), &bias_role)?;
+			let bias_name = named.selection_bias.as_deref().ok_or_else(|| RecipeError::new(format!("{bias_role} names no tensor")))?;
+			let tensor = self.tensor(bias_name, &bias_role)?;
 			require(tensor.elements() == count, format!("{} holds {} values; {bias_role} takes {count}", tensor.name, tensor.elements()))?;
 			self.mapped(vec![tensor]);
 		}
-		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
-			let table = self.tensor(&name(suffix), &role)?;
+		for (bank, inputs, outputs) in [(&named.gate, width, hidden), (&named.up, width, hidden), (&named.down, hidden, width)] {
+			let table = self.tensor(bank, &role)?;
 			require(
 				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
 				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
@@ -18000,14 +18057,16 @@ impl<'a> Builder<'a> {
 		if shared != SharedExpert::None {
 			let shared_role = format!("block {layer} shared expert");
 			let shared_hidden = checked_mul(shared_count, hidden, "shared expert width")?;
+			let shared_named = named.shared.clone().ok_or_else(|| RecipeError::new(format!("{shared_role} names no tensors")))?;
 			if gated {
 				// The per-position gate is the first weighted node in the shared path.
-				let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+				let gate_name = shared_named.gate_input.as_deref().ok_or_else(|| RecipeError::new(format!("{shared_role} is gated and names no gate tensor")))?;
+				let gate = self.tensor(gate_name, &shared_role)?;
 				require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
 				self.mapped(vec![gate]);
 			}
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)] {
-				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+			for (projection, inputs, outputs) in [(&shared_named.gate, width, shared_hidden), (&shared_named.up, width, shared_hidden), (&shared_named.down, shared_hidden, width)] {
+				let tensor = self.projection(projection, &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
 		}
@@ -18903,7 +18962,7 @@ impl Builder<'_> {
 					weighted = true;
 				}
 				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width)?;
+					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width, step.moe_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
