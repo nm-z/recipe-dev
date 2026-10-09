@@ -39,6 +39,13 @@ const CLOSED_FORM_TOLERANCE: f64 = 0.15;
 /// magnitude above the measured value and four below the initial loss.
 const CONVERGED_LOSS: f64 = 0.1;
 
+/// `small.csv` is `linear.csv` with both columns scaled by this factor, so the
+/// relation is `y = 3x + 7 * NARROW_SCALE`. Its gradients sit near the bottom of
+/// the fp16 range, where a narrow accumulator would round them to zero.
+const NARROW_SCALE: f64 = 1.0 / 1024.0;
+/// Worst error, in units of `y`, a narrow format may leave on `small.csv`.
+const NARROW_TOLERANCE: f64 = 1.0;
+
 struct Check {
 	name: &'static str,
 	detail: String,
@@ -102,6 +109,103 @@ fn multi_targets() -> Vec<f64> {
 		}
 	}
 	targets
+}
+
+
+fn small_targets() -> Vec<f64> {
+	linear_targets().into_iter().map(|value| value * NARROW_SCALE).collect()
+}
+
+fn gguf_text(out: &mut Vec<u8>, value: &str) {
+	out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+	out.extend_from_slice(value.as_bytes());
+}
+
+/// Writes a synthetic checkpoint: a native Q8_0 n-gram row table, a three-tap
+/// convolution dilated by the order-3 n-gram, and dense tensors for the stream
+/// around one per-layer embedding block.
+fn write_stepper_checkpoint(path: &Path) {
+	let tensors: Vec<(&str, Vec<f32>)> = vec![
+		("token_embd.weight", vec![1.0, 2.0]),
+		("blk.0.attn_q.weight", vec![0.0]),
+		("blk.0.attn_k.weight", vec![0.0]),
+		("blk.0.attn_v.weight", vec![0.0]),
+		("blk.0.attn_output.weight", vec![0.0]),
+		("blk.0.ffn_gate.weight", vec![2.0]),
+		("blk.0.ffn_up.weight", vec![3.0]),
+		("blk.0.ffn_down.weight", vec![1.0]),
+		("output.weight", vec![1.0, -1.0]),
+		("ngram.table", Vec::new()),
+		("blk.0.ple_key.weight", vec![0.01; 64]),
+		("blk.0.ple_norm_key.weight", vec![1.0]),
+		("blk.0.ple_norm_query.weight", vec![1.0]),
+		("blk.0.ple_value.weight", vec![0.02; 64]),
+		("blk.0.ple_norm_conv.weight", vec![1.0]),
+		("blk.0.ple_conv1d.weight", vec![0.6, -0.2, 0.1]),
+	];
+	let mut metadata = Vec::new();
+	for (name, value) in [("general.architecture", "llama"), ("tokenizer.ggml.model", "gpt2"), ("tokenizer.ggml.pre", "gpt-2")] {
+		gguf_text(&mut metadata, name);
+		metadata.extend_from_slice(&8u32.to_le_bytes());
+		gguf_text(&mut metadata, value);
+	}
+	for (name, value) in [("llama.context_length", 160u32), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
+		gguf_text(&mut metadata, name);
+		metadata.extend_from_slice(&4u32.to_le_bytes());
+		metadata.extend_from_slice(&value.to_le_bytes());
+	}
+	gguf_text(&mut metadata, "tokenizer.ggml.add_bos_token");
+	metadata.extend_from_slice(&7u32.to_le_bytes());
+	metadata.push(0);
+	for (name, values) in [("tokenizer.ggml.tokens", &["a", "b"][..]), ("tokenizer.ggml.merges", &[][..])] {
+		gguf_text(&mut metadata, name);
+		metadata.extend_from_slice(&9u32.to_le_bytes());
+		metadata.extend_from_slice(&8u32.to_le_bytes());
+		metadata.extend_from_slice(&(values.len() as u64).to_le_bytes());
+		for value in values {
+			gguf_text(&mut metadata, value);
+		}
+	}
+	let mut out = b"GGUF".to_vec();
+	out.extend_from_slice(&3u32.to_le_bytes());
+	out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+	out.extend_from_slice(&12u64.to_le_bytes());
+	out.extend(metadata);
+	let mut data = Vec::new();
+	for (name, values) in &tensors {
+		gguf_text(&mut out, name);
+		out.extend_from_slice(&2u32.to_le_bytes());
+		let table = *name == "ngram.table";
+		let columns: u64 = match *name {
+			"ngram.table" => 32,
+			"blk.0.ple_key.weight" | "blk.0.ple_value.weight" => 64,
+			"blk.0.ple_conv1d.weight" => 3,
+			_ => 1,
+		};
+		let rows: u64 = if table { 4 } else { values.len() as u64 / columns };
+		out.extend_from_slice(&columns.to_le_bytes());
+		out.extend_from_slice(&rows.to_le_bytes());
+		out.extend_from_slice(&(if table { 8u32 } else { 0 }).to_le_bytes());
+		out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+		if table {
+			for code in [32i8, 96, -80, 48] {
+				data.extend_from_slice(&0x2400u16.to_le_bytes());
+				data.extend_from_slice(&[code as u8; 32]);
+			}
+		} else {
+			for value in values {
+				data.extend_from_slice(&value.to_le_bytes());
+			}
+		}
+		while data.len() % 32 != 0 {
+			data.push(0);
+		}
+	}
+	while out.len() % 32 != 0 {
+		out.push(0);
+	}
+	out.extend(data);
+	std::fs::write(path, out).expect("cannot write the stepper checkpoint");
 }
 
 fn main() {
@@ -212,7 +316,59 @@ fn main() {
 	report.record("inference_closed_form", inference_worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={inference_worst:.9} tolerance={CLOSED_FORM_TOLERANCE}"));
 	report.record("inference_is_read_only", after == resumed_bytes, format!("bundle_bytes_before={} bundle_bytes_after={}", resumed_bytes.len(), after.len()));
 
-	// 7. A gated delta model trains at each precision: it is not refused, its loss is finite and falls,
+	// 7. Narrow precisions: gradients near the bottom of the fp16 range must
+	//    survive, and a saved bundle must resume from exactly the state it left,
+	//    at every precision family the bundle stores.
+	let small_source = root.join("data/small.csv");
+	let small = recipe.data(small_source.to_str().expect("small path is not UTF-8")).target("target");
+	let narrow = [
+		("narrow_fp16", recipe.model().layer(1).fp(16).loss(mse)),
+		("narrow_bf16", recipe.model().layer(1).bf(16).loss(mse)),
+	];
+	for (name, narrow_model) in &narrow {
+		let saved = work.join(format!("{name}.ogdl"));
+		let run = recipe.train().seed(SEED).lr(RATE).epochs(EPOCHS).save(&saved).run(narrow_model, &small);
+		let worst = worst_absolute(&sorted(run.predictions().iter().copied()), &sorted(small_targets())) / NARROW_SCALE;
+		let resumed = recipe.train().seed(SEED).lr(RATE).epochs(10).resume(&saved).save(&saved).run(narrow_model, &small);
+		let resumes = resumed.initial_loss().is_finite() && resumed.initial_loss() <= 2.0 * run.final_loss();
+		report.record(*name, worst <= NARROW_TOLERANCE && resumes, format!("worst_abs_err_in_y={worst:.9} tolerance={NARROW_TOLERANCE} resumes={resumes} final_loss={:.9e} resume_initial_loss={:.9e}", run.final_loss(), resumed.initial_loss()));
+	}
+
+	// 8. A per-layer embedding stepper: a whole sequence, a prefill, and a
+	//    prefill followed by single steps must produce the same logits bits.
+	let stepper = work.join("stepper.gguf");
+	write_stepper_checkpoint(&stepper);
+	let file = recipe.gguf(stepper.to_str().expect("stepper path is not UTF-8"));
+	let table = file.ngram();
+	let gate = layer(1).fp(64).silu().fp(64);
+	let up = layer(1).fp(64);
+	let embedding_math = PleMath {
+		key_norm: BlockNormalization::Rms,
+		query_norm: BlockNormalization::Rms,
+		output_norm: BlockNormalization::Rms,
+		gate: PleGate::signed_root_sigmoid(1e-6, true),
+		convolution: Activation::Silu,
+	};
+	let stream = recipe.model().no(bias).embed(2, 1).fp(64).ple(&table).ple_math(embedding_math).fp(64);
+	let stepped_model = stream.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64);
+	let placed = file.place(&stepped_model, 160, &[]);
+	let ids: Vec<u32> = (0..160).map(|index| (index % 2) as u32).collect();
+	let whole = placed.infer(&ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>());
+	let direct = placed.prefill(&ids[..13]);
+	let prefix = placed.prefill(&ids[..12]);
+	let prefix_then_step = placed.step(ids[12]);
+	let mut splits_match = prediction_bits(&direct) == prediction_bits(&prefix_then_step) && prediction_bits(&direct) != prediction_bits(&prefix);
+	for split in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+		let mut logits = placed.prefill(&ids[..split]);
+		for id in &ids[split..] {
+			logits = placed.step(*id);
+		}
+		splits_match &= prediction_bits(&logits) == prediction_bits(&whole);
+	}
+	report.record("ple_prefill_steps_match_whole", splits_match && whole.iter().all(|value| value.is_finite()), format!("positions=160 logits={}", whole.len()));
+
+
+	// 9. A gated delta model trains at each precision: it is not refused, its loss is finite and falls,
 	//    and the same seed repeats the report bits.
 	for (name, bits) in [("delta_fp32", 32_u8), ("delta_fp16", 16_u8)] {
 		let delta = recipe.model().layer(32).fp(bits).delta(1, 2).fp(bits).keys(1, 32).values(32).out(32).delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Sigmoid).delta_gates(Activation::Softplus, Activation::Sigmoid).layer(1).fp(bits).loss(mse);

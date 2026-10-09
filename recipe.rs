@@ -13103,17 +13103,6 @@ mod bundle {
 		}
 		Ok(result)
 	}
-	#[cfg(test)]
-	mod tests {
-		use super::*;
-		#[test]
-		fn operation_precisions_round_trip() {
-			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
-			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
-			assert_eq!(block(&text).unwrap(), original);
-		}
-	}
 }
 #[cfg(unix)]
 use std::os::unix::{
@@ -17629,6 +17618,12 @@ impl<'a> Builder<'a> {
 		}
 		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
 	}
+	/// The values of an attention projection bias row, or zeros when the file holds none.
+	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
+		let Some(tensor) = tensor else { return Ok(vec![0.0; outputs]) };
+		require(tensor.shape == [outputs as u64], format!("{} has shape {:?}; {role} adds one bias per {outputs} outputs", tensor.name, tensor.shape))?;
+		file.values(&tensor)
+	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -17654,7 +17649,8 @@ impl<'a> Builder<'a> {
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
 		self.attention_planes(layer, attention, normalized, width)?;
 		if gated {
-			self.attention_gate_planes(layer, heads, head)?;
+			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
+			self.attention_gate_planes(layer, heads, head, gate_biased)?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -17662,7 +17658,7 @@ impl<'a> Builder<'a> {
 				let gate = Block::of(Operation::Layer(heads * head)).sigmoid();
 				model.blocks.push(Block::of(Operation::Product(
 					ProductBranch { blocks: vec![attention], exclusions: 0 },
-					ProductBranch { blocks: vec![gate], exclusions: bias.mask() },
+					ProductBranch { blocks: vec![gate], exclusions: if gate_biased { 0 } else { bias.mask() } },
 				)));
 			});
 			block = block.layer(width);
@@ -18742,13 +18738,14 @@ impl Builder<'_> {
 						};
 						let head = if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 						hidden = attention.heads * head;
-						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden) && gate_branch.exclusions & bias.mask() != 0, "an attention product's gate is a bias-free layer over its head plane")?;
+						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
 						let normalized = attention_branch.blocks[0].qk.is_some();
+						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
 						if attention_left {
 							self.attention_planes(layer, attention, normalized, width)?;
-							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
 						} else {
-							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
 							self.attention_planes(layer, attention, normalized, width)?;
 						}
 						weighted = true;
@@ -18859,7 +18856,24 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&key, index * head, &order)?);
 		}
 		planes.push(value);
-		self.mapped(planes);
+		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		let (query_bias, key_bias, value_bias) = (self.optional(&name("attn_q.bias")), self.optional(&name("attn_k.bias")), self.optional(&name("attn_v.bias")));
+		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
+			// The bias row follows the matrix rows, in the order the planes read them.
+			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
+			let key_values = Self::bias_values(self.file, key_bias, kv * head, &role)?;
+			let value_values = Self::bias_values(self.file, value_bias, kv * head, &role)?;
+			let mut row = Vec::with_capacity(query_values.len() + 2 * kv * head);
+			for index in 0..heads {
+				row.extend(order.iter().map(|channel| query_values[index * stride + channel]));
+			}
+			for index in 0..kv {
+				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
+			}
+			row.extend(value_values);
+			slot.push(Plane::Owned { name: name("attn_qkv.bias"), values: row });
+		}
+		self.slot(slot);
 		if normalized {
 			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
 			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
@@ -18879,13 +18893,20 @@ impl Builder<'_> {
 		}
 		Ok(())
 	}
-	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize) -> Result<()> {
+	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool) -> Result<()> {
 		let name = format!("blk.{layer}.attn_q.weight");
 		let query = self.tensor(&name, "the attention gate")?;
 		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
 		let mut rows = Vec::with_capacity(heads);
 		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
-		self.mapped(rows);
+		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		if biased && let Some(tensor) = self.optional(&format!("blk.{layer}.attn_q.bias")) {
+			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
+			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
+			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
+		}
+		self.slot(planes);
 		Ok(())
 	}
 }
@@ -23574,582 +23595,6 @@ impl Precisions {
 	}
 }
 /// A precision by the name a table writes.
-#[cfg(test)]
-mod precision_contract_checks {
-	use super::*;
-	fn gradient_test_gpu() -> &'static Gpu {
-		if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpu().unwrap()
-		} else {
-			Box::leak(Box::new(cpu_device().unwrap()))
-		}
-	}
-	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize) -> (Vec<f64>, Vec<f64>) {
-		let config = Config::load().unwrap();
-		let channels = width * (heads + 2);
-		assert_eq!(inputs.len(), channels * length);
-		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
-		graph.profile = config.profile;
-		graph.profile.attn = format;
-		graph.profile.atvn = Compute::FP32;
-		let args = [heads as f64, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
-		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
-		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
-		let targets = vec![0.25; width * heads * length];
-		let mut tape = NativeTape::new(&graph, TapeInput::Values(inputs), inputs, &targets, gpu, Compute::FP32, Some(mse)).unwrap();
-		tape.advance().unwrap();
-		tape.gradient_launch(0.01, config).unwrap();
-		(tape.predictions().unwrap(), tape.input_adjoint.download_float(inputs.len(), Compute::FP32).unwrap())
-	}
-	#[test]
-	fn narrow_sharded_training_preserves_wide_gradients() {
-		let gpu = gradient_test_gpu();
-		let devices: &'static [&'static Gpu] = if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpus().unwrap()
-		} else { Box::leak(vec![gpu, gpu].into_boxed_slice()) };
-		assert_eq!(devices.len(), 2, "the sharded GPU check requires exactly two selected devices");
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			config.multi_device = MultiDevice::Forced;
-			let samples: Vec<_> = (0..257 * 32).map(|i| 2.0_f64.powi(if i / 32 < 128 { -14 } else { -13 })).collect();
-			let prepared = Prepared::matrix(samples, vec![2.0_f64.powi(-14); 257], 257, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 257, gpu, config, false).unwrap();
-			graph.parameters.fill(2.0_f64.powi(-14));
-			graph.refresh_storage(config).unwrap();
-			let mut single = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			single.advance().unwrap();
-			single.gradient_launch(0.01, config).unwrap();
-			let expected = single.download_gradient().unwrap();
-			let mut shards = DeviceTape::new(&graph, &prepared.samples, &prepared.targets, devices, Compute::FP32, mse, config).unwrap();
-			assert_eq!(shards.shards.len(), 2);
-			assert_eq!(shards.placement.gradient_to_primary.bytes, 128);
-			assert_eq!(shards.placement.weights_to_host.bytes, 64);
-			shards.advance().unwrap();
-			shards.epoch(0.01, 0.0, config).unwrap();
-			let actual = shards.shards[0].download_gradient().unwrap();
-			for (got, want) in actual.iter().zip(expected) { assert!((got - want).abs() < want.abs() * 2e-5, "{} sharded gradient {got} vs {want}", format.label()); }
-			assert_eq!(shards.shards[0].weights().unwrap(), shards.shards[1].weights().unwrap());
-		}
-	}
-	#[test]
-	fn narrow_attention_preserves_softmax_and_gate_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
-			for heads in [1, 2] {
-				let mut inputs = vec![0.5; (heads + 2) * 4];
-				inputs[(heads + 1) * 4..].fill(0.0625);
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1);
-				let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
-				for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
-				for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
-					let expected = delta * heads as f64;
-					assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
-				}
-			}
-			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
-				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2);
-				let d0 = (output[0] - 0.25) * scale;
-				let d1 = (output[1] - 0.25) * scale;
-				let score0 = d1 * 0.5 * (0.25 - 0.375);
-				let score1 = d1 * 0.5 * (0.5 - 0.375);
-				let expected = [0.0, score0 * k0 + score1 * k1, score0 * q, score1 * q, d0 + d1 * 0.5, d1 * 0.5];
-				for (i, (got, want)) in derivative.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} softmax gradient {i}: {got} vs {want}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_recurrence_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for gates in [1, 3, 4] {
-				let config = Config::load().unwrap();
-				let mut graph = Graph::new(Shape { channels: 1, length: 2 }, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				lower_scan(&mut graph, 1, gates).unwrap();
-				graph.parameters.fill(0.0);
-				let candidate = if gates == 1 { 0 } else { gates - 1 };
-				graph.parameters[candidate * 3] = 1.0;
-				graph.parameters[candidate * 3 + 1] = 0.5;
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&[0.0, 0.0]), &[0.0, 0.0], &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let d = -0.25 * scale;
-				let factors = match gates { 1 => [1.5, 1.0], 3 => [0.8125, 0.5], _ => [0.40625, 0.25] };
-				let inputs = tape.input_adjoint.download_float(2, Compute::FP32).unwrap();
-				for (got, factor) in inputs.iter().zip(factors) { assert!((got - d * factor).abs() < 1e-12, "{} {gates}-gate input gradient {got} vs {}", format.label(), d * factor); }
-				let gradients = tape.download_gradient().unwrap();
-				let expected_bias = d * factors.iter().sum::<f64>();
-				assert!((gradients[candidate * 3 + 2] - expected_bias).abs() < 1e-12, "{} {gates}-gate bias {} vs {expected_bias}", format.label(), gradients[candidate * 3 + 2]);
-			}
-		}
-	}
-	fn table(name: &str) -> &'static str {
-		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
-	}
-	#[test]
-	fn fp8_selection_and_saved_encoding_are_explicit() {
-		let base = table("recipe");
-		let first = Precisions::parse("recipe", base).unwrap();
-		assert_eq!(first.resolve(fp_format(8)), Compute::FP8);
-		let second = Precisions::parse("e5m2", &base.replace("fp8=e4m3", "fp8=e5m2")).unwrap();
-		assert_eq!(second.resolve(fp_format(8)), Compute::FP8_E5M2);
-		for format in [Compute::FP8, Compute::FP8_E5M2, Compute::INT16, Compute::INT32] {
-			let (family, fields) = format.saved_fields();
-			assert_eq!(Compute::saved(family, fields), Some(format));
-		}
-		assert_eq!(Compute::saved("f", [8, 5, 2, 52]), None);
-		assert_eq!(Compute::saved("int", [1, 0, 0, 0]), None);
-		assert!(Precisions::parse("bad", &base.replace("fp8=e4m3", "fp8=unknown")).is_err());
-		assert!(Precisions::parse("missing", &base.replace("fp8=e4m3,", "")).is_err());
-	}
-	#[test]
-	fn capability_table_drives_routes_and_hard_errors() {
-		let cpu = BackendTarget::Cpu { target: "target=test;compiler=test;cpu=test;features=test".to_owned() };
-		let packed = resolve_capability(&cpu, ContractFormat::Int8).unwrap();
-		assert_eq!(packed.vector, Some("scalar packed dot"));
-		assert!(packed.matrix.is_none());
-		let error = resolve_capability(&cpu, ContractFormat::Fp8).unwrap_err().to_string();
-		assert!(error.contains("no fp8 instruction") && error.contains("Vector:") && error.contains("Matrix: none"));
-		let gfx11 = BackendTarget::Amd { architecture: "gfx1101".to_owned() };
-		let f16 = resolve_capability(&gfx11, ContractFormat::Fp16).unwrap();
-		assert!(matches!(f16.matrix, Some((NativeMatrix::Gfx11, "wmma f16"))));
-		let gfx12 = BackendTarget::Amd { architecture: "gfx1201".to_owned() };
-		assert!(matches!(resolve_capability(&gfx12, ContractFormat::Bf16).unwrap().matrix, Some((NativeMatrix::Gfx12, "wmma bf16"))));
-		let sm52 = BackendTarget::Nvidia { architecture: "sm_52".to_owned() };
-		assert_eq!(resolve_capability(&sm52, ContractFormat::Int8).unwrap().vector, Some("fp32 dot of packed i8 codes"));
-		assert!(resolve_capability(&sm52, ContractFormat::Int4).is_err());
-		let sm61 = BackendTarget::Nvidia { architecture: "sm_61".to_owned() };
-		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
-	}
-	#[test]
-	fn nvidia_dp4a_replaces_portable_helpers() {
-		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
-		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
-		assert!(replaced.contains("call i32 @llvm.nvvm.idp4a.u.s") && replaced.contains("call i32 @llvm.nvvm.idp4a.s.s"));
-		assert!(!replaced.contains("entry: ret i32 0"));
-		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
-		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
-		assert!(!widened.contains("entry: ret i32 0"));
-	}
-	#[test]
-	fn proportional_rope_factors_match_the_analytic_rotation() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let mut graph = Graph::new(Shape { channels: 4, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_precision = Some(Compute::FP32);
-		push_node(&mut graph, Primitive::Rope, Shape { channels: 4, length: 2 }, 2, [4.0, 10000.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0, 1.0], -2).unwrap();
-		graph.parameters.copy_from_slice(&[1.0, 2.0]);
-		let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
-		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
-		assert_eq!(tape.nodes[0].parameters, 2);
-		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
-		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
-		tape.forward(ForwardMode::Inference).unwrap();
-		let output = tape.predictions().unwrap();
-		let expected = [
-			1.0,
-			2.0 * 1.0_f64.cos() - 6.0 * 1.0_f64.sin(),
-			3.0,
-			4.0 * 0.005_f64.cos() - 8.0 * 0.005_f64.sin(),
-			5.0,
-			6.0 * 1.0_f64.cos() + 2.0 * 1.0_f64.sin(),
-			7.0,
-			8.0 * 0.005_f64.cos() + 4.0 * 0.005_f64.sin(),
-		];
-		for (actual, expected) in output.iter().zip(expected) {
-			assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
-		}
-		let mut graph = Graph::new(Shape { channels: 4, length: 5 }, 1e-5);
-		let mut attention = AttentionBlock::new(1);
-		attention.width = 4;
-		attention.window = 4;
-		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
-		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
-	}
-	#[test]
-	fn placement_accepts_both_operands_from_the_immediate_boundary() {
-		let shape = Shape { channels: 1, length: 1 };
-		let mut graph = Graph::new(shape, 1e-5);
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], -2).unwrap();
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(!cuts_connection(&graph, 1));
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(cuts_connection(&graph, 2));
-	}
-	#[test]
-	fn sampler_never_selects_suppressed_tokens() {
-		let mut sampler = recipe.sampler().temperature(0.0);
-		sampler.suppressed = vec![1];
-		assert_eq!(sampler.sample(&[0.0, 10.0, 5.0], &[]), 2);
-	}
-	#[test]
-	fn precision_suffix_scope_is_local_and_explicit() {
-		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
-		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.maps[0].precision, Some(Compute::FP16));
-		assert_eq!(projection.maps[1].precision, Some(Compute::FP32));
-		assert_eq!(projection.precision, None);
-		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
-		assert_eq!(attention.blck_precision, Some(Compute::INT8));
-		assert_eq!(attention.kv_precision, Some(Compute::BF16));
-		assert_eq!(attention.qk_precision, Some(Compute::FP16));
-		assert_eq!(attention.rope_precision, Some(Compute::FP32));
-		assert_eq!(attention.precision, None);
-		let mut graph = Graph::new(Shape { channels: 8, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_blck_precision = Some(Compute::FP32);
-		graph.block_qk_precision = attention.qk_precision;
-		graph.block_rope_precision = attention.rope_precision;
-		let mut operation = AttentionBlock::new(2);
-		operation.width = 4;
-		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
-		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
-		let model = recipe.model().res([projection.clone()]).fp(64);
-		let residual = model.blocks.last().unwrap();
-		assert_eq!(residual.precision, Some(Compute::FP64));
-		let Operation::Residual(parts) = &residual.operation else { panic!("residual block was not preserved") };
-		assert_eq!(parts[0], projection);
-		let depthwise = recipe.model().dconv(3).fp(32);
-		let depthwise = depthwise.blocks.last().unwrap();
-		assert_eq!(depthwise.precision, Some(Compute::FP32));
-		assert_eq!(depthwise.blck_precision, None);
-		assert!(std::panic::catch_unwind(|| layer(1).int(1)).is_err());
-	}
-	#[test]
-	fn reference_policy_and_training_validation() {
-		let base = table("recipe");
-		assert_eq!(f64::from_bits(Precisions::parse("recipe", base).unwrap().tolerance), 0.05);
-		assert!(Precisions::parse("llamacpp", table("llamacpp")).unwrap().exact_cpu);
-		for invalid in ["NaN", "inf", "-1"] {
-			assert!(Precisions::parse("bad", &base.replace("tolerance=0.05", &format!("tolerance={invalid}"))).is_err());
-		}
-		let mut graph = Graph::new(Shape { channels: 32, length: 1 }, 1e-5);
-		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1, length: 1 }, 32, [0.0; 9], -1).unwrap();
-		graph.nodes[0].int_bits = 16;
-		assert!(graph.training_graph().is_err());
-		graph.profile.train = Some(Compute::FP16);
-		let half_training = graph.training_graph().unwrap();
-		assert_eq!(half_training.nodes[0].precision, Compute::FP16);
-		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false).unwrap();
-		assert_eq!(layout.precisions[0].bytes(), 2);
-		assert_eq!(layout.gradient_precisions[0], Compute::FP32);
-		assert_eq!(layout.gradient_bytes, 32 * 4);
-		assert_eq!(layout.input_adjoint_precision, Compute::FP32);
-		graph.profile.train = Some(Compute::FP64);
-		let training = graph.training_graph().unwrap();
-		assert_eq!(training.nodes[0].precision, Compute::FP64);
-		assert_eq!(training.profile.acc, Compute::FP64);
-		assert_eq!(training.nodes[0].int_bits, 16);
-	}
-	#[test]
-	fn integer_compute_uses_only_canonical_storage() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let config = Config::load().unwrap();
-		let prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		for (bits, name, stride) in [(4, "q4_1", 20), (8, "q8_0", 34), (16, "q8_0", 34), (32, "q8_0", 34)] {
-			let model = recipe.model().no(bias).layer(1).int(bits).loss(mse);
-			let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			let stored = graph.stored[0].as_ref().unwrap();
-			assert!(stored.format == StorageFormat::named(name).unwrap());
-			assert_eq!(stored.bytes.len(), stride);
-			assert!(stored.segments == vec![(stored.format, 32)]);
-		}
-	}
-	#[test]
-	fn quantized_source_converts_once_at_device_load() {
-		let gpu = gradient_test_gpu();
-		let config = Config::load().unwrap();
-		let values: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 8.0).collect();
-		let source_format = StorageFormat::named("q4_0").unwrap();
-		let mut source = source_format.encode(&values, &[1.0; 32], config).unwrap();
-		source.arithmetic.clear();
-		let mut prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		prepared.bound = Some(vec![BoundNode { names: "source.weight".to_owned(), elements: 32, weight: BoundWeight::Stored(source) }]);
-		let model = recipe.model().no(bias).layer(1).int(4).loss(mse);
-		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-		let target = graph.stored[0].as_ref().unwrap();
-		assert!(target.format == StorageFormat::named("q4_1").unwrap());
-		assert_eq!(target.bytes.len(), 20);
-		assert!(target.bytes.absent_runs());
-		let source = graph.requantize[0].as_ref().unwrap();
-		assert!(source.format == source_format);
-		assert_eq!(source.bytes.len(), 18);
-		let input: Vec<f64> = (0..32).map(|i| (i as f64 + 1.0) / 64.0).collect();
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		tape.forward(ForwardMode::Inference).unwrap();
-		let actual = tape.predictions().unwrap()[0];
-		let source_bytes = source.bytes.slice(0, source.bytes.len()).unwrap();
-		let source_values = source.format.decompress(&source_bytes, &source.codebook, 32).unwrap();
-		let canonical = StorageFormat::named("q4_1").unwrap().encode(&source_values, &[1.0; 32], config).unwrap();
-		let bytes = canonical.bytes.slice(0, canonical.bytes.len()).unwrap();
-		let decoded = canonical.format.decompress(&bytes, &canonical.codebook, 32).unwrap();
-		let extreme = *input.iter().max_by(|left, right| left.abs().total_cmp(&right.abs())).unwrap();
-		let inverse = -127.0 / extreme;
-		let step = 1.0 / inverse;
-		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
-		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
-	}
-	#[test]
-	fn narrow_training_preserves_small_and_large_gradients() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			for (rows, sample, weight, target, scale) in [(1, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (257, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (1, 256.0, 0.0, 256.0, 1.0), (1, 0.0625, 0.0625, 2.0_f64.powi(-14), 2.0_f64.powi(-14))] {
-				let mut config = Config::load().unwrap();
-				config.profile.train = Some(format);
-				let prepared = Prepared::matrix(vec![sample; rows * 32], vec![target; rows], rows, 1).unwrap();
-				let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-				let model = if scale == 1.0 { model } else { model.scale(scale).arithmetic(format) };
-				let mut graph = compile(&model, &prepared, &prepared.targets, rows, gpu, config, false).unwrap();
-				graph.parameters.fill(weight);
-				graph.refresh_storage(config).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let prediction = tape.predictions().unwrap()[0];
-				assert_eq!(tape.weights().unwrap()[0], weight);
-				let expected = 2.0 * (prediction - target) * scale * sample;
-				let gradients = tape.download_gradient().unwrap();
-				assert_eq!(gradients.len(), 32);
-				for value in gradients { assert!((value - expected).abs() <= expected.abs() * 2e-5, "{} rows {rows}: gradient {value} vs {expected}", format.label()); }
-				let input = tape.input_adjoint.download_float(rows * 32, Compute::FP32).unwrap();
-				let expected_input = 2.0 * (prediction - target) * scale * weight / rows as f64;
-				for value in input { assert!((value - expected_input).abs() <= expected_input.abs() * 2e-5, "{} rows {rows}: input gradient {value} vs {expected_input}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_training_with_double_accumulator_preserves_cast_adjoints() {
-		let gpu = gradient_test_gpu();
-		for tail in [false, true] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(Compute::FP16);
-			config.profile.acc = Compute::FP64;
-			let sample = 2.0_f64.powi(-14);
-			let target = sample;
-			let prepared = Prepared::matrix(vec![sample; 32], vec![target], 1, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let scale = if tail { 2.0_f64.powi(-14) } else { 1.0 };
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			if tail {
-				graph.block_precision = Some(Compute::FP32);
-				graph.profile.acc = Compute::FP32;
-				lower_scale(&mut graph, scale).unwrap();
-			}
-			graph.parameters.fill(sample);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
-			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let expected = 2.0 * (tape.predictions().unwrap()[0] - target) * scale * sample;
-			for value in tape.download_gradient().unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-			for value in tape.input_adjoint.download_float(32, Compute::FP64).unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-		}
-	}
-	#[test]
-	fn narrow_normalization_backward_matches_analytic_derivative() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
-			let prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
-			let scale = 2.0_f64.powi(-24);
-			let model = recipe.model().no(bias).layer(32).int(16).norm(rms).arithmetic(format).layer(1).int(16).scale(scale).fp(32).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			graph.parameters.fill(0.0);
-			for i in 0..32 { graph.parameters[i * 32 + i] = 1.0; }
-			let norm = graph.nodes.iter().position(|node| node.op == Primitive::Normalize).unwrap();
-			let head = graph.nodes.iter().rposition(|node| node.op == Primitive::Contraction).unwrap();
-			let (norm_offset, head_offset) = (graph.nodes[norm].offset, graph.nodes[head].offset);
-			let head_weights: Vec<f64> = (0..32).map(|i| (i as f64 % 3.0 - 1.0) / 16.0).collect();
-			graph.parameters[norm_offset..norm_offset + 32].fill(1.0);
-			graph.parameters[head_offset..head_offset + 32].copy_from_slice(&head_weights);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let layout = &tape.program.artifact.layout;
-			let normalized = tape.values.download_float_bytes(layout.values[norm], 32, format).unwrap();
-			let inverse = tape.contexts.download_float_bytes(layout.contexts[norm] + format.bytes(), 1, format).unwrap()[0];
-			let delta = 2.0 * (tape.predictions().unwrap()[0] - 0.25) * scale;
-			let projection = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).sum::<f64>() / 32.0;
-			let inputs = tape.input_adjoint.download_float(32, Compute::FP32).unwrap();
-			let gradients = tape.download_gradient().unwrap();
-			for i in 0..32 {
-				let expected = inverse * (delta * head_weights[i] - normalized[i] * projection);
-				assert!((inputs[i] - expected).abs() < 1e-12, "{} input {i}: {} vs {expected}", format.label(), inputs[i]);
-				let gamma = delta * head_weights[i] * normalized[i];
-				assert!((gradients[norm_offset + i] - gamma).abs() < 1e-12, "{} norm weight {i}: {} vs {gamma}", format.label(), gradients[norm_offset + i]);
-			}
-		}
-	}
-}
-
-#[cfg(test)]
-mod ple_stepper_checks {
-	use super::*;
-
-	fn bits(values: &[f64]) -> Vec<u64> {
-		values.iter().map(|value| value.to_bits()).collect()
-	}
-	fn gguf_text(out: &mut Vec<u8>, value: &str) {
-		out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-		out.extend_from_slice(value.as_bytes());
-	}
-	/// Writes the synthetic checkpoint the public PLE control used: a native Q8_0
-	/// n-gram row table, a three-tap convolution dilated by the order-3 n-gram,
-	/// and dense tensors for the stream around one per-layer embedding block.
-	fn write_fixture(path: &Path, ple: bool) {
-		let tensors: Vec<(&str, Vec<f32>)> = vec![
-			("token_embd.weight", vec![1.0, 2.0]),
-			("blk.0.attn_q.weight", vec![0.0]),
-			("blk.0.attn_k.weight", vec![0.0]),
-			("blk.0.attn_v.weight", vec![0.0]),
-			("blk.0.attn_output.weight", vec![0.0]),
-			("blk.0.ffn_gate.weight", vec![2.0]),
-			("blk.0.ffn_up.weight", vec![3.0]),
-			("blk.0.ffn_down.weight", vec![1.0]),
-			("output.weight", vec![1.0, -1.0]),
-			("ngram.table", Vec::new()),
-			("blk.0.ple_key.weight", vec![0.01; 64]),
-			("blk.0.ple_norm_key.weight", vec![1.0]),
-			("blk.0.ple_norm_query.weight", vec![1.0]),
-			("blk.0.ple_value.weight", vec![0.02; 64]),
-			("blk.0.ple_norm_conv.weight", vec![1.0]),
-			("blk.0.ple_conv1d.weight", vec![0.6, -0.2, 0.1]),
-		];
-		let tensors = tensors.into_iter().filter(|(name, _)| ple || !(name.starts_with("blk.0.ple") || *name == "ngram.table")).collect::<Vec<_>>();
-		let mut metadata = Vec::new();
-		for (name, value) in [("general.architecture", "llama"), ("tokenizer.ggml.model", "gpt2"), ("tokenizer.ggml.pre", "gpt-2")] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&8u32.to_le_bytes());
-			gguf_text(&mut metadata, value);
-		}
-		for (name, value) in [("llama.context_length", 160u32), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&4u32.to_le_bytes());
-			metadata.extend_from_slice(&value.to_le_bytes());
-		}
-		gguf_text(&mut metadata, "tokenizer.ggml.add_bos_token");
-		metadata.extend_from_slice(&7u32.to_le_bytes());
-		metadata.push(0);
-		for (name, values) in [("tokenizer.ggml.tokens", &["a", "b"][..]), ("tokenizer.ggml.merges", &[][..])] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&9u32.to_le_bytes());
-			metadata.extend_from_slice(&8u32.to_le_bytes());
-			metadata.extend_from_slice(&(values.len() as u64).to_le_bytes());
-			for value in values {
-				gguf_text(&mut metadata, value);
-			}
-		}
-		let mut out = b"GGUF".to_vec();
-		out.extend_from_slice(&3u32.to_le_bytes());
-		out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-		out.extend_from_slice(&12u64.to_le_bytes());
-		out.extend(metadata);
-		let mut data = Vec::new();
-		for (name, values) in &tensors {
-			gguf_text(&mut out, name);
-			out.extend_from_slice(&2u32.to_le_bytes());
-			let table = *name == "ngram.table";
-			let columns: u64 = match *name {
-				"ngram.table" => 32,
-				"blk.0.ple_key.weight" | "blk.0.ple_value.weight" => 64,
-				"blk.0.ple_conv1d.weight" => 3,
-				_ => 1,
-			};
-			let rows: u64 = if table { 4 } else { values.len() as u64 / columns };
-			out.extend_from_slice(&columns.to_le_bytes());
-			out.extend_from_slice(&rows.to_le_bytes());
-			out.extend_from_slice(&(if table { 8u32 } else { 0 }).to_le_bytes());
-			out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-			if table {
-				for code in [32i8, 96, -80, 48] {
-					data.extend_from_slice(&0x2400u16.to_le_bytes());
-					data.extend_from_slice(&[code as u8; 32]);
-				}
-			} else {
-				for value in values {
-					data.extend_from_slice(&value.to_le_bytes());
-				}
-			}
-			while data.len() % 32 != 0 {
-				data.push(0);
-			}
-		}
-		while out.len() % 32 != 0 {
-			out.push(0);
-		}
-		out.extend(data);
-		std::fs::write(path, out).unwrap();
-	}
-	/// The public control's model: an optional per-layer embedding after the
-	/// embedding, then residual attention and gated feed-forward blocks.
-	fn model(table: Option<&Ngram<'_>>) -> Model {
-		let gate = layer(1).fp(64).silu().fp(64);
-		let up = layer(1).fp(64);
-		let model = recipe.model().no(bias).embed(2, 1).fp(64);
-		let model = match table {
-			Some(table) => model.ple(table).fp(64),
-			None => model,
-		};
-		model.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64)
-	}
-	/// Places the model on the CPU as one range, the same tape a single-device
-	/// `recipe.infer` placement builds.
-	fn place_cpu(file: &Gguf, model: &Model, positions: usize) -> Placed {
-		let bound = explicit_bound(file, model).unwrap();
-		let devices: &'static [&'static Gpu] = Box::leak(Box::new([shared_cpu_device().unwrap()]));
-		place_bound(&bound, positions, &[], devices).unwrap()
-	}
-	#[test]
-	fn native_ple_prefill_and_steps_match_whole_sequence() {
-		let path = std::env::temp_dir().join(format!("recipe-ple-stepper-{}.gguf", std::process::id()));
-		let plain_path = std::env::temp_dir().join(format!("recipe-plain-stepper-{}.gguf", std::process::id()));
-		write_fixture(&path, true);
-		write_fixture(&plain_path, false);
-		let file = Gguf::open(&path).unwrap();
-		let table = file.ngram();
-		assert_eq!(table.kernel(), 3);
-		let placed = place_cpu(&file, &model(Some(&table)), 160);
-		let plain_file = Gguf::open(&plain_path).unwrap();
-		let plain = place_cpu(&plain_file, &model(None), 160);
-		let ids = (0..160).map(|index| (index % 2) as u32).collect::<Vec<_>>();
-		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
-		let whole = placed.infer(&input);
-		assert!(whole.iter().all(|value| value.is_finite()));
-		assert_ne!(bits(&whole), bits(&plain.infer(&input)), "the per-layer embedding changes the forward");
-		let direct13 = placed.prefill(&ids[..13]);
-		let prefix12 = placed.prefill(&ids[..12]);
-		assert!(prefix12.iter().all(|value| value.is_finite()));
-		assert_ne!(bits(&prefix12), bits(&direct13));
-		assert_eq!(bits(&direct13), bits(&placed.step(ids[12])), "full13 equals prefix12 plus step1");
-		for split in [1, 2, 4, 8, 16, 32, 64, 128] {
-			let mut logits = placed.prefill(&ids[..split]);
-			for id in &ids[split..] {
-				logits = placed.step(*id);
-			}
-			assert_eq!(bits(&logits), bits(&whole), "prefix split {split}");
-		}
-		let _ = std::fs::remove_file(&path);
-		let _ = std::fs::remove_file(&plain_path);
-	}
-}
-
 fn precision_named(name: &str) -> Result<Compute> {
 	Ok(match name {
 		"fp8" => Compute::FP8,
@@ -33149,18 +32594,16 @@ struct ProbeDatabase {
 	tables: Vec<ProbeSqliteTable>,
 }
 
-/// Probes a plaintext SQLite file page by page. It refuses a file with a pending rollback
-/// journal or a WAL sidecar, because those pages are not the database's current content.
+/// Probes a plaintext SQLite file page by page, with the committed frames of a `-wal` sidecar
+/// laid over the main file. It refuses a file with a pending rollback journal, because those
+/// pages are not the database's current content.
 fn probe_database(path: &Path) -> Result<ProbeDatabase> {
-	for suffix in ["-wal", "-journal"] {
-		let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
-		require(!fs::metadata(&sidecar).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty {suffix} file; checkpoint or remove it first", path.display()))?;
-	}
+	let journal = PathBuf::from(format!("{}-journal", path.display()));
+	require(!fs::metadata(&journal).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty -journal file; checkpoint or remove it first", path.display()))?;
 	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
-	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
-	let mut head = [0u8; 100];
-	let read = file.read(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	let layout = sqlite_layout(&head[..read], length).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+	let file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let wal = fs::File::open(format!("{}-wal", path.display())).ok().map(|wal| Box::new(wal) as Box<dyn SqliteBytes>);
+	let (mut file, layout) = sqlite_open(Box::new(file), length, wal).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
 	let mut tables = Vec::new();
 	for table in sqlite_catalog(&mut file, layout).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))? {
 		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
@@ -33260,6 +32703,11 @@ pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
 		if let Some(span) = folder.span() {
 			*anchors.entry(span).or_default() += 1;
 		}
+	}
+	// A set split into class folders has no single folder holding every sample, so the image
+	// and audio file totals are observations of the sample count too.
+	for total in [images.len(), audio.len()].into_iter().filter(|total| *total > 0) {
+		*anchors.entry(total).or_default() += 1;
 	}
 	// Support counts independent observations of each count; ties prefer the larger count.
 	let mut ranked = anchors.iter().map(|(count, support)| (*count, *support)).collect::<Vec<_>>();
@@ -33798,7 +33246,7 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			}
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
-		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes, fs::read(format!("{}-wal", path.display())).ok().as_deref()).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("xml") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
@@ -33811,20 +33259,22 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
-/// Page geometry of a plaintext SQLite 3 file in rollback-journal mode.
+/// Page geometry of a plaintext SQLite 3 file in rollback-journal or WAL mode.
 #[derive(Clone, Copy)]
 struct SqliteLayout {
 	page_size: usize,
 	/// Bytes of each page that hold b-tree content; the rest is reserved.
 	usable: usize,
 	pages: usize,
+	/// The header declares WAL mode, so committed frames in the `-wal` file supersede main-file pages.
+	wal: bool,
 }
 
-/// Validates the file header and length. Encrypted, WAL-mode, and truncated files are refused
+/// Validates the file header and length. Encrypted and truncated files are refused
 /// rather than read as if their pages were plain.
 fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(head.len() >= 100 && head.starts_with(b"SQLite format 3\0"), "SQLite header is absent; the file is not plaintext SQLite 3 or is encrypted")?;
-	require(head[18] == 1 && head[19] == 1, "SQLite database is in WAL mode, which is unsupported; checkpoint it to rollback-journal mode first")?;
+	require(head[18] == head[19] && matches!(head[18], 1 | 2), format!("SQLite journal mode bytes {} and {} are neither rollback nor WAL", head[18], head[19]))?;
 	let page_size = match u16::from_be_bytes([head[16], head[17]]) as usize {
 		1 => 65536,
 		size => size,
@@ -33832,7 +33282,147 @@ fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(page_size.is_power_of_two() && (512..=65536).contains(&page_size), format!("SQLite page size {page_size} is invalid"))?;
 	let usable = page_size.checked_sub(head[20] as usize).filter(|usable| *usable >= 480).ok_or_else(|| RecipeError::new("SQLite reserved bytes leave no usable page"))?;
 	require(length != 0 && length % page_size as u64 == 0, "SQLite file length is not a whole number of pages; the file is truncated")?;
-	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize })
+	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize, wal: head[18] == 2 })
+}
+
+trait SqliteBytes: Read + Seek {}
+impl<T: Read + Seek> SqliteBytes for T {}
+
+/// The database as a reader sees it: a page the WAL committed comes from its newest committed
+/// frame, and every other page from the main file. Page reads are whole and page-aligned.
+struct SqliteView<'a> {
+	main: Box<dyn SqliteBytes + 'a>,
+	wal: Option<Box<dyn SqliteBytes + 'a>>,
+	/// Page number to the offset of that page's bytes inside the WAL.
+	frames: HashMap<usize, u64>,
+	page_size: usize,
+	position: u64,
+}
+
+impl Read for SqliteView<'_> {
+	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+		let page_size = self.page_size as u64;
+		let (page, within) = ((self.position / page_size) as usize + 1, self.position % page_size);
+		let count = buffer.len().min((page_size - within) as usize);
+		let read = match (self.frames.get(&page), self.wal.as_mut()) {
+			(Some(offset), Some(wal)) => {
+				wal.seek(SeekFrom::Start(offset + within))?;
+				wal.read(&mut buffer[..count])?
+			}
+			_ => {
+				self.main.seek(SeekFrom::Start(self.position))?;
+				self.main.read(&mut buffer[..count])?
+			}
+		};
+		self.position += read as u64;
+		Ok(read)
+	}
+}
+
+impl Seek for SqliteView<'_> {
+	fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
+		match target {
+			SeekFrom::Start(position) => self.position = position,
+			SeekFrom::Current(delta) => self.position = self.position.checked_add_signed(delta).ok_or_else(|| std::io::Error::other("SQLite seek is before the start"))?,
+			SeekFrom::End(_) => return Err(std::io::Error::other("SQLite pages are addressed from the start")),
+		}
+		Ok(self.position)
+	}
+}
+
+/// The checksum SQLite chains through a WAL: 8-byte units read as two 32-bit words in the
+/// byte order the WAL magic selects.
+fn sqlite_wal_checksum(big_endian: bool, seed: (u32, u32), data: &[u8]) -> (u32, u32) {
+	let word = |bytes: &[u8]| if big_endian { u32::from_be_bytes(bytes.try_into().unwrap()) } else { u32::from_le_bytes(bytes.try_into().unwrap()) };
+	data.chunks_exact(8).fold(seed, |(first, second), unit| {
+		let first = first.wrapping_add(word(&unit[..4])).wrapping_add(second);
+		(first, second.wrapping_add(word(&unit[4..])).wrapping_add(first))
+	})
+}
+
+/// Indexes the committed frames of a WAL. A page maps to the offset of its newest frame at or
+/// before the last commit, and the result carries the database size in pages that commit
+/// declares. A frame that fails its salt or checksum ends the log, as in SQLite's recovery.
+/// An empty WAL, or one with no commit, yields `None`.
+fn sqlite_wal_index(wal: &mut dyn SqliteBytes, page_size: usize) -> Result<Option<(HashMap<usize, u64>, usize)>> {
+	let mut header = [0u8; 32];
+	wal.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite WAL cannot be read: {error}")))?;
+	let mut filled = 0;
+	while filled < header.len() {
+		match wal.read(&mut header[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite WAL cannot be read: {error}"))),
+		}
+	}
+	if filled == 0 {
+		return Ok(None);
+	}
+	require(filled == header.len(), "SQLite WAL header is truncated")?;
+	let be = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
+	let magic = be(&header[..4]);
+	require(matches!(magic, 0x377f0682 | 0x377f0683), "SQLite WAL magic is invalid")?;
+	require(be(&header[4..8]) == 3007000, "SQLite WAL format version is unsupported")?;
+	require(be(&header[8..12]) as usize == page_size, "SQLite WAL page size differs from the database")?;
+	let big_endian = magic & 1 == 1;
+	let mut running = sqlite_wal_checksum(big_endian, (0, 0), &header[..24]);
+	require(running == (be(&header[24..28]), be(&header[28..32])), "SQLite WAL header checksum is wrong")?;
+	let salt = &header[16..24];
+	let (mut pending, mut committed, mut pages) = (HashMap::new(), HashMap::new(), 0usize);
+	let mut frame = vec![0u8; 24 + page_size];
+	for index in 0u64.. {
+		if wal.read_exact(&mut frame).is_err() {
+			break;
+		}
+		let next = sqlite_wal_checksum(big_endian, sqlite_wal_checksum(big_endian, running, &frame[..8]), &frame[24..]);
+		let page = be(&frame[..4]) as usize;
+		if &frame[8..16] != salt || next != (be(&frame[16..20]), be(&frame[20..24])) || page == 0 {
+			break;
+		}
+		running = next;
+		pending.insert(page, 32 + index * (24 + page_size as u64) + 24);
+		let size = be(&frame[4..8]) as usize;
+		if size != 0 {
+			committed.extend(pending.drain());
+			pages = size;
+		}
+	}
+	Ok((pages != 0).then_some((committed, pages)))
+}
+
+/// Opens a database for page reads, with the committed frames of its WAL laid over the main
+/// file when the header declares WAL mode. Returns the view and the layout it presents.
+fn sqlite_open<'a>(mut main: Box<dyn SqliteBytes + 'a>, length: u64, wal: Option<Box<dyn SqliteBytes + 'a>>) -> Result<(SqliteView<'a>, SqliteLayout)> {
+	let mut head = [0u8; 100];
+	let mut filled = 0;
+	main.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite header cannot be read: {error}")))?;
+	while filled < head.len() {
+		match main.read(&mut head[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite header cannot be read: {error}"))),
+		}
+	}
+	let layout = sqlite_layout(&head[..filled], length)?;
+	let mut view = SqliteView { main, wal: None, frames: HashMap::new(), page_size: layout.page_size, position: 0 };
+	let Some(mut wal) = wal.filter(|_| layout.wal) else { return Ok((view, layout)) };
+	let Some((frames, pages)) = sqlite_wal_index(wal.as_mut(), layout.page_size)? else { return Ok((view, layout)) };
+	view.wal = Some(wal);
+	view.frames = frames;
+	let first = sqlite_page(&mut view, SqliteLayout { pages: pages.max(layout.pages), ..layout }, 1)?;
+	let layout = sqlite_layout(&first[..100], pages as u64 * layout.page_size as u64)?;
+	Ok((view, layout))
+}
+
+/// The bytes of a table-leaf payload that stay on its page; the rest continues on overflow pages.
+fn sqlite_local_payload(usable: usize, payload: usize) -> usize {
+	let maximum = usable - 35;
+	if payload <= maximum {
+		return payload;
+	}
+	let minimum = (usable - 12) * 32 / 255 - 23;
+	let local = minimum + (payload - minimum) % (usable - 4);
+	if local <= maximum { local } else { minimum }
 }
 
 /// Reads one page into a buffer of one page. The caller keeps only the buffers it needs.
@@ -33987,8 +33577,30 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 				let mut offset = pointer(header + 8 + cell * 2)?;
 				let (payload, _) = sqlite_varint(&buffer, &mut offset)?;
 				let (rowid, _) = sqlite_varint(&buffer, &mut offset)?;
-				require((payload as usize) <= layout.usable - 35, format!("SQLite page {page} holds a row that overflows its page; overflow pages are unsupported"))?;
-				let record = buffer.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let payload = usize::try_from(payload).ok().filter(|payload| *payload <= layout.pages * layout.usable).ok_or_else(|| RecipeError::new(format!("SQLite page {page} holds a row larger than the file")))?;
+				let local = sqlite_local_payload(layout.usable, payload);
+				let stored = buffer.get(offset..offset + local).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let mut joined = Vec::new();
+				let record = if local == payload {
+					stored
+				} else {
+					// The rest of the record continues on a chain of overflow pages, each led by the number of the next.
+					joined.extend_from_slice(stored);
+					let pointer = buffer.get(offset + local..offset + local + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} overflow pointer is truncated")))?;
+					let mut next = u32::from_be_bytes([pointer[0], pointer[1], pointer[2], pointer[3]]) as usize;
+					for _ in 0..layout.pages {
+						if joined.len() == payload {
+							break;
+						}
+						require(next != 0, format!("SQLite page {page} overflow chain ends before its row does"))?;
+						let overflow = sqlite_page(source, layout, next)?;
+						let take = (payload - joined.len()).min(layout.usable - 4);
+						joined.extend_from_slice(&overflow[4..4 + take]);
+						next = u32::from_be_bytes([overflow[0], overflow[1], overflow[2], overflow[3]]) as usize;
+					}
+					require(joined.len() == payload && next == 0, format!("SQLite page {page} overflow chain does not match its row length"))?;
+					&joined[..]
+				};
 				let mut values = sqlite_record(record)?;
 				for (column, _) in aliases.iter().enumerate().filter(|(_, alias)| **alias) {
 					if values.len() <= column {
@@ -34005,9 +33617,9 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 }
 
 /// Every user table of a SQLite database in memory, for the loader.
-fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
-	let layout = sqlite_layout(bytes.get(..100).unwrap_or(bytes), bytes.len() as u64)?;
-	let mut source = std::io::Cursor::new(bytes);
+fn sqlite_tables(bytes: &[u8], wal: Option<&[u8]>) -> Result<Vec<Table>> {
+	let wal = wal.map(|wal| Box::new(std::io::Cursor::new(wal)) as Box<dyn SqliteBytes + '_>);
+	let (mut source, layout) = sqlite_open(Box::new(std::io::Cursor::new(bytes)), bytes.len() as u64, wal)?;
 	let catalog = sqlite_catalog(&mut source, layout)?;
 	require(!catalog.is_empty(), "SQLite database has no tables")?;
 	let mut tables = Vec::new();

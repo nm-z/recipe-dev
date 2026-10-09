@@ -287,6 +287,8 @@ A SQLite file uses the `sqlite_table` parse path. The answers name one table and
 {"id":"sqlite_table","choice":"samples"}
 ```
 
+A SQLite file in WAL mode is read with the committed frames of its `-wal` file laid over the main file, and a row longer than its page is read through its overflow pages.
+
 The probe records each WAV file's sample rate and frame count, and an `envelope`: 16 hexadecimal digits, one per span of the samples, ranked by mean amplitude from `0` (quietest) to `f` (loudest).
 
 ```rust
