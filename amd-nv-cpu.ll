@@ -3200,15 +3200,34 @@ store RECIPE_STATE %sum, ptr addrspace(1) %gradient.pointer, align RECIPE_STATE_
 define internal double @topk_score( double %score, double %maximum, i1 %sigmoid ) #1 { entry:
 %shifted = call double @recipe.sub(double %score, double %maximum) %exponential = call double @recipe.exp(double %shifted)
 %logistic = call double @sigmoid(double %score) %result = select i1 %sigmoid, double %logistic, double %exponential ret double %result }
+; The selection key of one expert: its routing probability over every expert, plus
+; the expert's selection bias when the block carries one. Without a bias the raw
+; score orders the experts, which ranks them the same as their probability.
+define internal double @topk_key( double %score, double %maximum, double %total, i1 %sigmoid, i1 %biased, ptr addrspace(1) %selection, i64 %expert ) #1 { entry:
+%raw = call double @topk_score( double %score, double %maximum, i1 %sigmoid ) %share = call double @recipe.div( double %raw, double %total ) %probability = select i1 %sigmoid, double %raw, double %share br i1 %biased, label %biased.add, label %plain
+plain: ret double %score
+biased.add: %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %selection, i64 %expert %bias = load double, ptr addrspace(1) %bias.ptr, align 8 %keyed = call double @recipe.add(double %probability, double %bias) ret double %keyed }
 ; The routing weights of one position. The top scores are kept by rank, scored
 ; by softmax over every expert or by sigmoid, and divided by the kept total when
 ; the block renormalizes. A plain softmax divides by every expert instead, which
 ; is the evaluate-all-then-mask reference; a plain sigmoid divides by nothing.
-define internal void @topk_forward_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize ) #1 { entry:
+; With %biased set, the top scores are chosen by probability plus the per-expert bias at %selection,
+; while the weights still come from the unbiased scores.
+define internal void @topk_forward_body( ptr addrspace(1) %scores, ptr addrspace(1) %weights, ptr addrspace(1) %selection, i64 %p, i32 %experts, i32 %length, i32 %top, i32 %scoring, i32 %renormalize, i32 %biased ) #1 { entry:
 %experts.wide = zext i32 %experts to i64 %length.wide = zext i32 %length to i64 %top.wide = zext i32 %top to i64
 %row = udiv i64 %p, %length.wide %position = urem i64 %p, %length.wide %per.row = mul i64 %experts.wide, %length.wide %row.base = mul i64 %row, %per.row %base = add i64 %row.base, %position
 %sigmoid = icmp ne i32 %scoring, 0 %renorm = icmp ne i32 %renormalize, 0 %every = xor i1 %renorm, true %plain = xor i1 %sigmoid, true %divide = or i1 %renorm, %plain
-br label %clear.loop clear.loop: %clear = phi i64 [ 0, %entry ], [ %clear.next, %clear.step ] %clear.more = icmp ult i64 %clear, %experts.wide
+%biased.on = icmp ne i32 %biased, 0 br label %allmax.loop
+allmax.loop: %am = phi i64 [ 0, %entry ], [ %am.next, %allmax.step ] %all.max = phi double [ 0.0, %entry ], [ %am.max.next, %allmax.step ] %am.first = phi i1 [ true, %entry ], [ false, %allmax.step ]
+%am.more = icmp ult i64 %am, %experts.wide br i1 %am.more, label %allmax.step, label %allsum.entry
+allmax.step: %am.offset = mul i64 %am, %length.wide %am.index = add i64 %base, %am.offset %am.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %am.index %am.score = load double, ptr addrspace(1) %am.ptr, align 8
+%am.higher = call i1 @recipe.ogt(double %am.score, double %all.max) %am.take = or i1 %am.first, %am.higher %am.max.next = select i1 %am.take, double %am.score, double %all.max %am.next = add i64 %am, 1 br label %allmax.loop
+allsum.entry: br label %allsum.loop
+allsum.loop: %as = phi i64 [ 0, %allsum.entry ], [ %as.next, %allsum.step ] %all.total = phi double [ 0.0, %allsum.entry ], [ %all.total.next, %allsum.step ] %as.more = icmp ult i64 %as, %experts.wide br i1 %as.more, label %allsum.step, label %allsum.exit
+allsum.step: %as.offset = mul i64 %as, %length.wide %as.index = add i64 %base, %as.offset %as.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %as.index %as.score = load double, ptr addrspace(1) %as.ptr, align 8
+%as.raw = call double @topk_score(double %as.score, double %all.max, i1 %sigmoid) %all.total.next = call double @recipe.add(double %all.total, double %as.raw) %as.next = add i64 %as, 1 br label %allsum.loop
+allsum.exit: br label %clear.loop
+clear.loop: %clear = phi i64 [ 0, %allsum.exit ], [ %clear.next, %clear.step ] %clear.more = icmp ult i64 %clear, %experts.wide
 br i1 %clear.more, label %clear.step, label %select.loop clear.step: %clear.offset = mul i64 %clear, %length.wide %clear.index = add i64 %base, %clear.offset
 %clear.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %clear.index store double 0.0, ptr addrspace(1) %clear.ptr, align 8 %clear.next = add i64 %clear, 1 br label %clear.loop
 select.loop: %pick = phi i64 [ 0, %clear.loop ], [ %pick.next, %select.mark ] %pick.more = icmp ult i64 %pick, %top.wide br i1 %pick.more, label %scan.entry, label %normalize.entry
@@ -3218,8 +3237,9 @@ scan.loop: %candidate = phi i64 [ 0, %scan.entry ], [ %candidate.next, %scan.ste
 scan.step: %candidate.offset = mul i64 %candidate, %length.wide %candidate.index = add i64 %base, %candidate.offset
 %mark.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %candidate.index %mark = load double, ptr addrspace(1) %mark.ptr, align 8 %unmarked = call i1 @recipe.oeq(double %mark, double 0.0)
 %score.ptr = getelementptr inbounds double, ptr addrspace(1) %scores, i64 %candidate.index %score = load double, ptr addrspace(1) %score.ptr, align 8
-%none = icmp eq i64 %best, -1 %higher = call i1 @recipe.ogt(double %score, double %best.score) %better = or i1 %none, %higher %take = and i1 %unmarked, %better
-%best.next = select i1 %take, i64 %candidate, i64 %best %best.score.next = select i1 %take, double %score, double %best.score %candidate.next = add i64 %candidate, 1 br label %scan.loop
+%key = call double @topk_key(double %score, double %all.max, double %all.total, i1 %sigmoid, i1 %biased.on, ptr addrspace(1) %selection, i64 %candidate)
+%none = icmp eq i64 %best, -1 %higher = call i1 @recipe.ogt(double %key, double %best.score) %better = or i1 %none, %higher %take = and i1 %unmarked, %better
+%best.next = select i1 %take, i64 %candidate, i64 %best %best.score.next = select i1 %take, double %key, double %best.score %candidate.next = add i64 %candidate, 1 br label %scan.loop
 select.mark: %best.offset = mul i64 %best, %length.wide %best.index = add i64 %base, %best.offset %best.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %best.index
 store double 1.0, ptr addrspace(1) %best.ptr, align 8 %pick.next = add i64 %pick, 1 br label %select.loop
 normalize.entry: br label %max.loop

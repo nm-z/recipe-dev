@@ -4017,10 +4017,12 @@ impl NativeModelIr {
 					let positions = Shape { channels: 1, length: node.output.length };
 					emit_runtime_window_loop(&mut ir, index, "topk", positions, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_forward_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {selection}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 {biased} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
+							selection = if node.parameters != 0 { &pointers.weights } else { &pointers.source },
+							biased = u8::from(node.parameters != 0),
 							experts = node.output.channels,
 							length = node.output.length,
 							top = node.argument[0],
@@ -10825,8 +10827,8 @@ mod bundle {
 			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared))
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				format!("moe,{experts},{top_k},{hidden},{},{},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared), f64::from_bits(*scale_bits), u8::from(*selection_bias))
 			}
 			Operation::Hyper(lanes, rank, blocks, gate) => {
 				let branch = blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";");
@@ -10966,7 +10968,7 @@ mod bundle {
 			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				if fields.len() >= 7 {
+				if fields.len() >= 9 {
 					Ok(Operation::Moe(
 						value_at(fields.first().copied(), "MoE experts")?,
 						value_at(fields.get(1).copied(), "MoE top-k")?,
@@ -10975,6 +10977,8 @@ mod bundle {
 						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
 						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
 						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
+						value_at::<f64>(fields.get(7).copied(), "MoE routed scale")?.to_bits(),
+						bool_value(fields.get(8).copied().unwrap_or(""), "MoE selection bias")?,
 					))
 				} else {
 					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
@@ -12281,7 +12285,8 @@ enum Operation {
 	Residual(Vec<Block>),
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
+	/// The routed scale is kept as its bits, so the operation stays `Eq`.
+	Moe(usize, usize, usize, Activation, Scoring, bool, bool, u64, bool),
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
@@ -12880,8 +12885,10 @@ impl Model {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
 	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool) -> Self {
-		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared))
+	/// `scale` multiplies every routing weight. `selection_bias` adds a per-expert bias to the
+	/// scores that choose the top-k experts; the weights themselves stay unbiased.
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool) -> Self {
+		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale.to_bits(), selection_bias))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
 	/// and a standalone `attn(...)` block share one configuration path.
@@ -13121,8 +13128,8 @@ impl Model {
 			Operation::Residual(parts) => format!("res([{}])", Self::describe_parts(parts)),
 			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
 			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
-			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
-				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared})", activation.name())
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
 			}
 			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
 			Operation::Perceptron(width) => format!("perc({width})"),
@@ -15402,6 +15409,7 @@ struct Architecture {
 	expert_activation: Option<Activation>,
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
 }
 #[derive(Clone, Copy)]
 enum PleGateChoice { SignedRootSigmoid }
@@ -15424,6 +15432,7 @@ struct ArchitectureDraft {
 	expert_activation: Option<Activation>,
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -15441,7 +15450,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -15489,6 +15498,7 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"expert-activation" => current.expert_activation = Some(architecture_activation(value)?),
 			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
 			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
+			"expert-scale" => current.expert_scale = Some(value.parse().map_err(|_| RecipeError::new(format!("architecture {:?} has invalid expert weights scale {value:?}", current.name)))?),
 			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
 			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
 			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
@@ -15604,6 +15614,7 @@ struct Builder<'a> {
 	expert_activation: Option<Activation>,
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
+	expert_scale: Option<f64>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15640,6 +15651,7 @@ struct ExpertDims {
 	hidden: usize,
 	scoring: Scoring,
 	renormalize: bool,
+	scale: f64,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
@@ -15649,7 +15661,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15808,20 +15820,36 @@ impl<'a> Builder<'a> {
 		};
 		let experts = match self.integer_or("expert_count", 0)? {
 			0 => None,
-			count => Some(ExpertDims {
-				count,
-				used: self.integer("expert_used_count")?,
-				hidden: self.integer("expert_feed_forward_length")?,
-				scoring: match self.file.value(&self.key("expert_gating_func")) {
-					Some(_) => match self.integer("expert_gating_func")? { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))) },
-					None => self.expert_scoring.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert scoring", self.architecture)))?,
-				},
-				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
-					Some(GgufValue::Bool(value)) => *value,
-					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
-					None => self.expert_renormalize.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert renormalization", self.architecture)))?,
-				},
-			}),
+			count => {
+				// The gating function, when the file names one, selects the scoring. Value 3 is top-k
+				// before softmax, whose kept scores always renormalize.
+				let gating = match self.file.value(&self.key("expert_gating_func")) {
+					Some(_) => Some(self.integer("expert_gating_func")?),
+					None => None,
+				};
+				Some(ExpertDims {
+					count,
+					used: self.integer("expert_used_count")?,
+					hidden: self.integer("expert_feed_forward_length")?,
+					scoring: match gating {
+						Some(1) => Scoring::Softmax,
+						Some(2) => Scoring::Sigmoid,
+						Some(3) => Scoring::Softmax,
+						Some(other) => return Err(RecipeError::new(format!("expert_gating_func {other} is unknown; the file names 1 (softmax), 2 (sigmoid), or 3 (top-k softmax)"))),
+						None => self.expert_scoring.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert scoring", self.architecture)))?,
+					},
+					renormalize: match (gating, self.file.value(&self.key("expert_weights_norm"))) {
+						(Some(3), _) => true,
+						(_, Some(GgufValue::Bool(value))) => *value,
+						(_, Some(_)) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
+						(_, None) => self.expert_renormalize.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert renormalization", self.architecture)))?,
+					},
+					scale: match self.file.value(&self.key("expert_weights_scale")) {
+						Some(value) => value.float().filter(|scale| scale.is_finite()).ok_or_else(|| RecipeError::new("expert_weights_scale is not a finite float"))?,
+						None => self.expert_scale.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert weights scale", self.architecture)))?,
+					},
+				})
+			}
 		};
 		let feed_forward = if self.present("feed_forward_length") { Some(self.integer("feed_forward_length")?) } else { None };
 		require(experts.is_some() || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
@@ -16024,18 +16052,26 @@ impl<'a> Builder<'a> {
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
+		let ExpertDims { count, used, hidden, scoring, renormalize, scale } = *experts;
 		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
-		self.expert_planes(layer, count, hidden, shared, dimensions.width)?;
+		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
+		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
-		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared))
+		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, width: usize) -> Result<()> {
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, selection_bias: bool, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
 		self.mapped(vec![router]);
+		if selection_bias {
+			// The routing node reads this span right after the router scores.
+			let bias_role = format!("block {layer} expert selection bias");
+			let tensor = self.tensor(&name("exp_probs_b.bias"), &bias_role)?;
+			require(tensor.elements() == count, format!("{} holds {} values; {bias_role} takes {count}", tensor.name, tensor.elements()))?;
+			self.mapped(vec![tensor]);
+		}
 		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
 			let table = self.tensor(&name(suffix), &role)?;
 			require(
@@ -16709,7 +16745,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -16850,8 +16886,8 @@ impl Builder<'_> {
 					self.delta_planes(layer, delta, width)?;
 					weighted = true;
 				}
-				Operation::Moe(count, _, hidden_width, _, _, _, shared) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, width)?;
+				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
+					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width)?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
@@ -18829,7 +18865,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Ensemble(members) => lower_ensemble(graph, members, total, data, targets, rows, gpu, config)?,
 		Operation::Product(left, right) => lower_product(graph, left, right, total, data, targets, rows, gpu, config)?,
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
-		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
+		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, f64::from_bits(*scale_bits), *selection_bias, config)?,
 		Operation::Hyper(lanes, rank, blocks, gate) => lower_hyper(graph, *lanes, *rank, blocks, gate.as_ref(), total, data, targets, rows, gpu, config)?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
@@ -19891,15 +19927,20 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
+	require(scale.is_finite(), "moe routed scale must be finite")?;
 	let (source, input) = (graph.source, graph.output);
 	// One router scores every expert per position. The top-k weights name the
 	// experts whose gated feed-forward runs, so a position costs top-k of them.
 	lower_project(graph, experts)?;
-	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let selection = if selection_bias { experts } else { 0 };
+	push_node(graph, Primitive::TopK, graph.output, selection, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	if scale != 1.0 {
+		lower_scale(graph, scale)?;
+	}
 	let routing = graph.source;
 	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
 	if !shared {
@@ -21218,7 +21259,7 @@ fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		Primitive::Contraction => PrecisionKind::Sum,
 		_ => PrecisionKind::Atvn,
 	}
 }
