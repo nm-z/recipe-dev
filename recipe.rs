@@ -19097,6 +19097,8 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
 	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
+	// The recurrent read uses the same inverse-root key-width scale as attention.
+	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
 	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);

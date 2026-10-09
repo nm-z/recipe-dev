@@ -1226,14 +1226,18 @@ ret void
 define internal void @contraction_forward_gemv_wave_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %out.begin, i32 %out.span, i32 %kernel,
 i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads, i64 %weight.base, i32 %decode ) #1 { entry:
+%exact.partials = alloca [32 x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %lid = call i32 @recipe.local.id.x()
 %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x()
 %groups = udiv i32 %threads, %block
 %width = call i32 @recipe.wavefront.width()
+%exact.serial = icmp eq i32 %width, 1
 %waves = udiv i32 %block, %width
 %wave = udiv i32 %lid, %width
 %lane = urem i32 %lid, %width
+%exact.active = icmp ult i32 %lane, 32
+%exact.first = select i1 %exact.active, i32 %lane, i32 32
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %terms = add i32 %in.channels, 0
 %terms.wide = zext i32 %terms to i64
@@ -1286,7 +1290,9 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %tile.capacity = udiv i32 %tile.bytes, RECIPE_MODEL_BYTES
 %tile.blocks = udiv i32 %tile.capacity, 256
 %tile.chunk = mul i32 %tile.blocks, 256
-%chunk.span = select i1 %stage.available, i32 %tile.chunk, i32 %terms
+; Floating packed sums use whole 256-value blocks and 32 logical partials
+; on every backend, independently of staging capacity and physical wave width.
+%chunk.span = select i1 %stage.available, i32 256, i32 %terms
 %stage.tile = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
 %q8.shared = getelementptr i8, ptr addrspace(3) @contraction_tile, i64 0
 %q8.blocks = udiv i32 %terms, 32
@@ -1536,7 +1542,10 @@ job.step:
 ; per block in block order, the minimums on their own chain, subtracted last.
 %q8.is256 = icmp eq i32 %q8.span, 8
 %row.q4.block = and i1 %row.q4.on, %q8.is256
-br i1 %exact, label %exact.q4.check, label %q4.check
+br i1 %exact, label %exact.partition, label %q4.check
+exact.partition:
+%exact.lane = phi i32 [ %exact.first, %job.step ], [ %exact.lane.next, %exact.serial.store ]
+br label %exact.q4.check
 q4.check:
 br i1 %row.q4.block, label %q4b.loop, label %q4.check.slices
 q4.check.slices:
@@ -1720,7 +1729,7 @@ br label %sum.done
 exact.q4.check:
 br i1 %row.q4.on, label %exact.q4.loop, label %exact.q6.check
 exact.q4.loop:
-%exact.q4.slice = phi i32 [ %lane, %exact.q4.check ], [ %exact.q4.slice.next, %exact.q4.step ]
+%exact.q4.slice = phi i32 [ %exact.lane, %exact.q4.check ], [ %exact.q4.slice.next, %exact.q4.step ]
 %exact.q4.sum = phi RECIPE_STATE [ %state.zero, %exact.q4.check ], [ %exact.q4.sum.next, %exact.q4.step ]
 %exact.q4.slices = udiv i32 %chunk.terms, 16
 %exact.q4.more = icmp ult i32 %exact.q4.slice, %exact.q4.slices
@@ -1735,14 +1744,14 @@ exact.q4.step:
 %exact.q4.loaded = call RECIPE_STATE @recipe.q4k.exact(ptr addrspace(1) %weights, i64 %exact.q4.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q4.slice, i32 %chunk.pitch, i32 %exact.q4.slice.local)
 %exact.q4.value = select i1 %channel.active, RECIPE_STATE %exact.q4.loaded, RECIPE_STATE %state.zero
 %exact.q4.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q4.sum, RECIPE_STATE %exact.q4.value)
-%exact.q4.slice.next = add i32 %exact.q4.slice, %width
+%exact.q4.slice.next = add i32 %exact.q4.slice, 32
 br label %exact.q4.loop
 exact.q4.done:
 br label %sum.done
 exact.q6.check:
 br i1 %row.q6.on, label %exact.q6.loop, label %exact.b32.check
 exact.q6.loop:
-%exact.q6.slice = phi i32 [ %lane, %exact.q6.check ], [ %exact.q6.slice.next, %exact.q6.step ]
+%exact.q6.slice = phi i32 [ %exact.lane, %exact.q6.check ], [ %exact.q6.slice.next, %exact.q6.step ]
 %exact.q6.sum = phi RECIPE_STATE [ %state.zero, %exact.q6.check ], [ %exact.q6.sum.next, %exact.q6.step ]
 %exact.q6.slices = udiv i32 %chunk.terms, 16
 %exact.q6.more = icmp ult i32 %exact.q6.slice, %exact.q6.slices
@@ -1757,14 +1766,14 @@ exact.q6.step:
 %exact.q6.loaded = call RECIPE_STATE @recipe.q6k.exact(ptr addrspace(1) %weights, i64 %exact.q6.byte.offset, ptr addrspace(3) %stage.tile, i32 %exact.q6.slice, i32 %chunk.pitch, i32 %exact.q6.slice.local)
 %exact.q6.value = select i1 %channel.active, RECIPE_STATE %exact.q6.loaded, RECIPE_STATE %state.zero
 %exact.q6.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.q6.sum, RECIPE_STATE %exact.q6.value)
-%exact.q6.slice.next = add i32 %exact.q6.slice, %width
+%exact.q6.slice.next = add i32 %exact.q6.slice, 32
 br label %exact.q6.loop
 exact.q6.done:
 br label %sum.done
 exact.b32.check:
 br i1 %b32.available, label %exact.b32.loop, label %sum.loop
 exact.b32.loop:
-%exact.b32.slice = phi i32 [ %lane, %exact.b32.check ], [ %exact.b32.slice.next, %exact.b32.loaded.done ]
+%exact.b32.slice = phi i32 [ %exact.lane, %exact.b32.check ], [ %exact.b32.slice.next, %exact.b32.loaded.done ]
 %exact.b32.sum = phi RECIPE_STATE [ %state.zero, %exact.b32.check ], [ %exact.b32.sum.next, %exact.b32.loaded.done ]
 %exact.b32.slice.width = select i1 %int32, i32 32, i32 16
 %exact.b32.slices = udiv i32 %chunk.terms, %exact.b32.slice.width
@@ -1792,7 +1801,7 @@ exact.b32.loaded.done:
 %exact.b32.loaded = phi RECIPE_STATE [ %exact.b32.value32, %exact.b32.load32 ], [ %exact.b32.value16, %exact.b32.load16 ]
 %exact.b32.value = select i1 %channel.active, RECIPE_STATE %exact.b32.loaded, RECIPE_STATE %state.zero
 %exact.b32.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.b32.sum, RECIPE_STATE %exact.b32.value)
-%exact.b32.slice.next = add i32 %exact.b32.slice, %width
+%exact.b32.slice.next = add i32 %exact.b32.slice, 32
 br label %exact.b32.loop
 exact.b32.done:
 br label %sum.done
@@ -2110,11 +2119,46 @@ weight.ready:
 br label %sum.loop
 sum.done:
 %sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4b.result, %q4b.exit ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %q6b.result, %q6b.exit ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
-%reduce.offset.initial = udiv i32 %width, 2
+%sum.partition = phi i32 [ 0, %sum.loop ], [ 0, %q4b.exit ], [ 0, %q4.sum.done ], [ 0, %q6.sum.done ], [ 0, %q6b.exit ], [ 0, %b32.sum.done ], [ %exact.lane, %exact.q4.done ], [ %exact.lane, %exact.q6.done ], [ %exact.lane, %exact.b32.done ]
+%exact.cpu = and i1 %stage.available, %exact.serial
+br i1 %exact.cpu, label %exact.serial.store, label %reduce.begin
+exact.serial.store:
+%exact.partial.ptr = getelementptr [32 x RECIPE_STATE], ptr addrspace(5) %exact.partials, i32 0, i32 %sum.partition
+store RECIPE_STATE %sum.final, ptr addrspace(5) %exact.partial.ptr, align RECIPE_STATE_ALIGN
+%exact.lane.next = add i32 %sum.partition, 1
+%exact.lane.more = icmp ult i32 %exact.lane.next, 32
+br i1 %exact.lane.more, label %exact.partition, label %exact.tree
+exact.tree:
+%exact.offset = phi i32 [ 16, %exact.serial.store ], [ %exact.offset.next, %exact.tree.done ]
+br label %exact.tree.loop
+exact.tree.loop:
+%exact.index = phi i32 [ 0, %exact.tree ], [ %exact.index.next, %exact.tree.step ]
+%exact.more = icmp ult i32 %exact.index, %exact.offset
+br i1 %exact.more, label %exact.tree.step, label %exact.tree.done
+exact.tree.step:
+%exact.partner = add i32 %exact.index, %exact.offset
+%exact.left.ptr = getelementptr [32 x RECIPE_STATE], ptr addrspace(5) %exact.partials, i32 0, i32 %exact.index
+%exact.right.ptr = getelementptr [32 x RECIPE_STATE], ptr addrspace(5) %exact.partials, i32 0, i32 %exact.partner
+%exact.left = load RECIPE_STATE, ptr addrspace(5) %exact.left.ptr, align RECIPE_STATE_ALIGN
+%exact.right = load RECIPE_STATE, ptr addrspace(5) %exact.right.ptr, align RECIPE_STATE_ALIGN
+%exact.added = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %exact.left, RECIPE_STATE %exact.right)
+store RECIPE_STATE %exact.added, ptr addrspace(5) %exact.left.ptr, align RECIPE_STATE_ALIGN
+%exact.index.next = add i32 %exact.index, 1
+br label %exact.tree.loop
+exact.tree.done:
+%exact.offset.next = udiv i32 %exact.offset, 2
+%exact.tree.more = icmp ugt i32 %exact.offset.next, 0
+br i1 %exact.tree.more, label %exact.tree, label %exact.result
+exact.result:
+%exact.total = load RECIPE_STATE, ptr addrspace(5) %exact.partials, align RECIPE_STATE_ALIGN
+br label %reduce.done
+reduce.begin:
+%reduce.physical = udiv i32 %width, 2
+%reduce.offset.initial = select i1 %stage.available, i32 16, i32 %reduce.physical
 br label %reduce.loop
 reduce.loop:
-%reduce.offset = phi i32 [ %reduce.offset.initial, %sum.done ], [ %reduce.offset.next, %reduce.step ]
-%reduced = phi RECIPE_STATE [ %sum.final, %sum.done ], [ %reduced.next, %reduce.step ]
+%reduce.offset = phi i32 [ %reduce.offset.initial, %reduce.begin ], [ %reduce.offset.next, %reduce.step ]
+%reduced = phi RECIPE_STATE [ %sum.final, %reduce.begin ], [ %reduced.next, %reduce.step ]
 %reduce.more = icmp ugt i32 %reduce.offset, 0
 br i1 %reduce.more, label %reduce.step, label %reduce.done
 reduce.step:
@@ -2125,6 +2169,7 @@ reduce.step:
 %reduce.offset.next = udiv i32 %reduce.offset, 2
 br label %reduce.loop
 reduce.done:
+%sum.reduced = phi RECIPE_STATE [ %reduced, %reduce.loop ], [ %exact.total, %exact.result ]
 %owner = icmp eq i32 %lane, 0
 %store = and i1 %owner, %channel.active
 br i1 %store, label %bias.select, label %job.done
@@ -2150,9 +2195,9 @@ br label %bias.ready
 bias.ready:
 %bias.model = phi double [ %bias.dense.model, %bias.dense.load ], [ %bias.packed.model, %bias.packed.load ], [ %bias.zero.model, %bias.zero ]
 %bias.wide = call RECIPE_STATE @recipe.decode(double %bias.model)
-%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %reduced, RECIPE_STATE %bias.wide)
+%sum.bias = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum.reduced, RECIPE_STATE %bias.wide)
 %bias.now = and i1 %has.bias, %chunk.first
-%sum.value = select i1 %bias.now, RECIPE_STATE %sum.bias, RECIPE_STATE %reduced
+%sum.value = select i1 %bias.now, RECIPE_STATE %sum.bias, RECIPE_STATE %sum.reduced
 %output.channel = zext i32 %channel to i64
 %out.length.wide = zext i32 %out.length to i64
 %output.channel.base = mul i64 %output.channel, %out.length.wide
@@ -2797,10 +2842,13 @@ read.loop: %read.i = phi i32 [ 0, %column.loop ], [ %read.next, %read.step ]
 read.step: %read.i.wide = zext i32 %read.i to i64 %read.row = mul i64 %read.i.wide, %vwidth.wide %read.cell = add i64 %read.row, %column.wide %read.index = add i64 %work.base, %read.cell
 %read.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %read.index
 %read.state = load double, ptr addrspace(1) %read.pointer, align 8
+; Decay the old state before predicting the value removed by the delta update.
+%read.decayed = call double @recipe.mul(double %decay, double %read.state)
+store double %read.decayed, ptr addrspace(1) %read.pointer, align 8
 %read.offset.row = mul i64 %read.i.wide, %length.wide %read.offset = add i64 %read.offset.row, %time.wide %read.key.index = add i64 %k.base, %read.offset
 %read.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %read.key.index
 %read.key = load double, ptr addrspace(1) %read.key.pointer, align 8
-%read.product = call double @recipe.mul(double %read.key, double %read.state)
+%read.product = call double @recipe.mul(double %read.key, double %read.decayed)
 %read.sum.next = call double @recipe.add(double %read.sum, double %read.product) %read.next = add nuw i32 %read.i, 1 br label %read.loop
 read.done: %value.row = mul i64 %column.wide, %length.wide %value.offset = add i64 %value.row, %time.wide %value.index = add i64 %v.base, %value.offset
 %value.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.index
@@ -2813,13 +2861,12 @@ write.loop: %write.i = phi i32 [ 0, %read.done ], [ %write.next, %write.step ]
 write.step: %write.i.wide = zext i32 %write.i to i64 %write.row = mul i64 %write.i.wide, %vwidth.wide %write.cell = add i64 %write.row, %column.wide %write.cell.index = add i64 %work.base, %write.cell
 %write.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %write.cell.index
 %write.state = load double, ptr addrspace(1) %write.state.pointer, align 8
-%write.decayed = call double @recipe.mul(double %decay, double %write.state)
 %write.offset.row = mul i64 %write.i.wide, %length.wide %write.offset = add i64 %write.offset.row, %time.wide
 %write.key.index = add i64 %k.base, %write.offset
 %write.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %write.key.index
 %write.key = load double, ptr addrspace(1) %write.key.pointer, align 8
 %write.term = call double @recipe.mul(double %write.key, double %write.error)
-%write.state.next = call double @recipe.add(double %write.decayed, double %write.term)
+%write.state.next = call double @recipe.add(double %write.state, double %write.term)
 store double %write.state.next, ptr addrspace(1) %write.state.pointer, align 8
 %write.query.index = add i64 %q.base, %write.offset
 %write.query.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %write.query.index
@@ -2843,7 +2890,7 @@ i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %ch
 %kchannels = mul i64 %kheads.wide, %kwidth.wide %kstream = mul i64 %kchannels, %length.wide
 %vchannels = mul i64 %vheads.wide, %vwidth.wide %stream = mul i64 %vchannels, %length.wide
 %kplanes = mul i64 %kstream, 2 %row.stride = add i64 %kplanes, %stream
-%input.row = mul i64 %row, %row.stride %group = udiv i32 %vheads, %kheads %group.wide = zext i32 %group to i64 %khead = udiv i64 %head, %group.wide
+%input.row = mul i64 %row, %row.stride %khead = urem i64 %head, %kheads.wide
 %khead.base = mul i64 %khead, %kwidth.wide %khead.offset = mul i64 %khead.base, %length.wide
 %head.base = mul i64 %head, %vwidth.wide %head.offset = mul i64 %head.base, %length.wide
 %q.base = add i64 %input.row, %khead.offset %k.base = add i64 %q.base, %kstream
@@ -2935,7 +2982,8 @@ column.step: %column.i.wide = zext i32 %column.i to i64 %column.i.row = mul i64 
 %column.key.index = add i64 %k.base, %column.i.offset
 %column.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %column.key.index
 %column.key.model = load double, ptr addrspace(1) %column.key.pointer, align 8 %column.key = call RECIPE_STATE @recipe.decode(double %column.key.model)
-%column.readout = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %column.key, RECIPE_STATE %column.state)
+%column.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %column.state)
+%column.readout = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %column.key, RECIPE_STATE %column.decayed)
 %readout.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %readout, RECIPE_STATE %column.readout)
 %column.weight = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %column.key, RECIPE_STATE %column.adjoint)
 %weight.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %weight, RECIPE_STATE %column.weight)
@@ -2985,13 +3033,11 @@ row.step: %row.j.wide = zext i32 %row.j to i64 %row.cell = add i64 %row.i.base, 
 %row.weight = load RECIPE_STATE, ptr addrspace(1) %row.weight.pointer, align RECIPE_STATE_ALIGN
 %row.key.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %row.key.index
 %row.key.model = load double, ptr addrspace(1) %row.key.pointer, align 8 %row.key = call RECIPE_STATE @recipe.decode(double %row.key.model)
-%row.decay.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.state, RECIPE_STATE %row.adjoint)
-%decay.part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %decay.part, RECIPE_STATE %row.decay.term)
 %row.direct.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.error, RECIPE_STATE %row.adjoint)
 %key.direct.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %key.direct, RECIPE_STATE %row.direct.term)
-%row.readout.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.weight, RECIPE_STATE %row.state)
-%key.readout.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %key.readout, RECIPE_STATE %row.readout.term)
 %row.state.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %row.state)
+%row.readout.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.weight, RECIPE_STATE %row.state.decayed)
+%key.readout.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %key.readout, RECIPE_STATE %row.readout.term)
 %row.write.error = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write, RECIPE_STATE %row.error)
 %row.state.written = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.key, RECIPE_STATE %row.write.error)
 %row.state.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %row.state.decayed, RECIPE_STATE %row.state.written)
@@ -3001,10 +3047,12 @@ row.step: %row.j.wide = zext i32 %row.j to i64 %row.cell = add i64 %row.i.base, 
 %row.delta = load RECIPE_STATE, ptr addrspace(1) %row.delta.pointer, align RECIPE_STATE_ALIGN
 %row.query.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.delta, RECIPE_STATE %row.state.next)
 %query.part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %query.part, RECIPE_STATE %row.query.term)
-%row.adjoint.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %row.adjoint)
 %row.write.weight = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write, RECIPE_STATE %row.weight)
 %row.adjoint.written = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.key, RECIPE_STATE %row.write.weight)
-%row.adjoint.next = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %row.adjoint.decayed, RECIPE_STATE %row.adjoint.written)
+%row.decayed.adjoint = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %row.adjoint, RECIPE_STATE %row.adjoint.written)
+%row.adjoint.next = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %row.decayed.adjoint)
+%row.decay.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %row.state, RECIPE_STATE %row.decayed.adjoint)
+%decay.part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %decay.part, RECIPE_STATE %row.decay.term)
 store RECIPE_STATE %row.adjoint.next, ptr addrspace(1) %row.adjoint.pointer, align RECIPE_STATE_ALIGN
 %row.j.next = add nuw i32 %row.j, 1 br label %row.column
 row.store: %key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.direct, RECIPE_STATE %key.readout)
@@ -3062,14 +3110,14 @@ i64 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %ch
 %vector.region = add i64 %adjoint.region, %pair.states
 %vector.span = mul i64 %vwidth.wide, 2
 %vector.total = mul i64 %pairs.wide, %vector.span %partial.region = add i64 %vector.region, %vector.total
-%khead.first = mul i64 %khead, %group.wide %pair.row = mul i64 %row, %vheads.wide
+%pair.row = mul i64 %row, %vheads.wide
 br label %head.loop
-; Every value head sharing this key head walks in turn, so one thread owns the
+; Value heads cycle across key heads. Each sharing head walks in turn, so one thread owns the
 ; query and key adjoint elements of the head they share. One value head per key
 ; head makes exactly one pass and keeps the ungrouped indexing.
 head.loop: %g = phi i32 [ 0, %entry ], [ %g.next, %head.done ] %g.more = icmp ult i32 %g, %group
 br i1 %g.more, label %head.body, label %exit
-head.body: %g.wide = zext i32 %g to i64 %head = add i64 %khead.first, %g.wide %pair = add i64 %pair.row, %head
+head.body: %g.wide = zext i32 %g to i64 %head.group = mul i64 %g.wide, %kheads.wide %head = add i64 %khead, %head.group %pair = add i64 %pair.row, %head
 %head.base = mul i64 %head, %vwidth.wide %head.offset = mul i64 %head.base, %length.wide
 %v.base = add i64 %value.plane, %head.offset %o.base = add i64 %output.row, %head.offset
 %head.length = mul i64 %head, %length.wide %a.base = add i64 %gate.pair, %head.length %b.base = add i64 %a.base, %gate.stream
