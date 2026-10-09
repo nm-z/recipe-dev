@@ -1975,6 +1975,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
+	ir.push('\n');
 	ir.push_str(&CPU_PARALLEL.replace("RECIPE_CPU_ENTRY_LINKAGE", &platform(manifest, "cpu-entry-linkage", os)?));
 	let clang = platform(manifest, "cpu-compiler", os)?;
 	for (key, tool) in [("cpu-compiler", &clang), ("cpu-linker", &platform(manifest, "cpu-linker", os)?)] {
