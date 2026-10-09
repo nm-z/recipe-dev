@@ -1,4 +1,4 @@
-//! Recipe executes one 			*block = block.clone().scale_from(name);l graph after automatically probing a compiled device backend.
+//! Recipe executes one model graph after automatically probing a compiled device backend.
 //! Attention uses learned Q/K/V and output projections.
 #![allow(non_upper_case_globals)]
 // Compile the same numeric definitions as the template generator, without separate source files.
@@ -14537,9 +14537,7 @@ impl Model {
 		let name = name.into();
 		self.suffix().edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("scale_from requires a preceding normalization"));
-			let normalizations = block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).count();
-			assert!(block.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
-			block.scale_tensors.push(name);
+			*block = block.clone().scale_from(name);
 		})
 	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
