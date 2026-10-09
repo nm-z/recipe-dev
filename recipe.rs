@@ -19790,9 +19790,22 @@ fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Comp
 		}
 	}
 	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest, devices)?;
-	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
+	// A die with no exchange has no exchange symbols to bind.
+	graphs.iter().zip(&tapes).filter(|(part, _)| part.nodes.iter().any(|node| node.op == Primitive::Exchange)).try_for_each(|(_, tape)| tape.bind_exchange(&buffer))?;
 	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
 	Ok((tapes, buffer, resident))
+}
+/// What `read` takes of the output from the dies of a placement, in channel
+/// order: each die's rows when a tensor split cut the output node by rows, which
+/// the dies' consecutive shares make whole, else the last die's whole output.
+fn die_output(tapes: &[NativeTape], read: impl Fn(&NativeTape, std::ops::Range<usize>) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
+	let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
+	let shares = if last.output_rows() == (0..last.output.channels) { std::slice::from_ref(last) } else { tapes };
+	let mut values = Vec::new();
+	for tape in shares {
+		values.extend(read(tape, tape.output_rows())?);
+	}
+	Ok(values)
 }
 /// The saved statistics a batch normalization carries into inference, as the
 /// node index and the values it holds, out of what every node declares.
@@ -20283,8 +20296,10 @@ fn apportion(count: usize, exact: &[f64]) -> Vec<usize> {
 /// `plan` gives it of every split item. Each split region runs apart: its first sums keep this die's share
 /// of their rows, the ops after them keep channels apart, and the last sum adds
 /// this die's share of its inputs, which one exchange then sums over the dies.
-/// A large sum outside any region keeps a share of its rows, gathered after it;
-/// every other node runs whole on every die.
+/// A large sum outside any region keeps a share of its rows, gathered after it,
+/// unless it is the output node: nothing on a die reads that, so each die keeps
+/// its rows and the machine reads the dies' shares in order. Every other node
+/// runs whole on every die.
 fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
 	// Die `die`'s first unit and unit count of the item keyed `key`.
 	let part = |key: usize| {
@@ -20294,6 +20309,10 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 	if tracing() && die == 0 {
 		for region in &regions {
 			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
+		}
+		let last = graph.nodes.len() - 1;
+		if lone_split(graph, last, dies).is_some() && plan.contains_key(&last) {
+			trace(&format!("split output node {last} rows per die {:?}", plan[&last]))?;
 		}
 	}
 	// The rows and inputs each region node splits, and whether a sum follows.
@@ -20328,7 +20347,8 @@ fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: 
 			}
 			None => None,
 		};
-		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
+		let gather = (index + 1 != graph.nodes.len()).then_some(0.0);
+		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, gather)));
 		let Some((shard, exchange)) = plan else {
 			nodes.push(node);
 			stored.push(graph.stored[index].clone());
@@ -20735,7 +20755,6 @@ impl Placed {
 	/// A window through every die of a tensor split at once: each takes the
 	/// whole input and launches its step, and the dies meet at their exchanges.
 	fn forward_dies(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
-		let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
 		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 		for tape in tapes {
 			if begin == 0 {
@@ -20763,7 +20782,7 @@ impl Placed {
 				.collect::<Vec<_>>();
 			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
 		})?;
-		if last_only { last.last_column() } else { last.predictions() }
+		if last_only { die_output(tapes, |tape, rows| tape.last_column_rows(rows)) } else { die_output(tapes, |tape, rows| tape.output(rows.start * tape.output.length, rows.len() * tape.output.length)) }
 	}
 	fn output_shape(&self) -> Result<Shape> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
@@ -25013,25 +25032,41 @@ impl NativeTape {
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.rows as usize * self.output.elements())
 	}
+	/// The output channels this tape computes: all of them, or the rows a tensor
+	/// split gave this die of an output node it splits without an exchange.
+	fn output_rows(&self) -> std::ops::Range<usize> {
+		match self.nodes.last() {
+			Some(node) if node.op == Primitive::Contraction && node.shard.rows.count != 0 => node.shard.rows.first..node.shard.rows.first + node.shard.rows.count,
+			_ => 0..self.output.channels,
+		}
+	}
 	/// Positions `begin..end` of every output channel, channel by channel.
 	fn output_window_values(&self, begin: u32, end: u32) -> Result<Vec<f64>> {
+		self.output_window_rows(begin, end, 0..self.output.channels)
+	}
+	/// Positions `begin..end` of output channels `rows`, channel by channel.
+	fn output_window_rows(&self, begin: u32, end: u32, rows: std::ops::Range<usize>) -> Result<Vec<f64>> {
 		let layout = &self.program.artifact.layout;
 		let arena = *layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
 		let (precision, bytes) = (layout.output_precision, layout.output_precision.bytes());
 		// A buffer that holds one window keeps its first position at slot zero.
 		let length = window_shape(self.output, self.input.length, layout.window_positions).length;
 		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) } else { 0 };
-		let offset = checked_add(arena, checked_mul((begin - origin) as usize, bytes, "window offset")?, "window offset")?;
-		let encoded = self.values.download_strided_bytes(offset, checked_mul(length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
+		let offset = checked_add(arena, checked_mul(checked_add(checked_mul(rows.start, length, "window rows")?, (begin - origin) as usize, "window offset")?, bytes, "window offset")?, "window offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, rows.len())?;
 		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
 		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	/// The output channels at the last position the latest forward reached.
 	fn last_column(&self) -> Result<Vec<f64>> {
+		self.last_column_rows(0..self.output.channels)
+	}
+	/// Output channels `rows` at the last position the latest forward reached.
+	fn last_column_rows(&self, rows: std::ops::Range<usize>) -> Result<Vec<f64>> {
 		let layout = &self.program.artifact.layout;
 		let column = layout.last_column.ok_or_else(|| RecipeError::new("this tape keeps no last output column"))?;
-		let values = self.contexts.download_float_bytes(column, self.output.channels, layout.output_precision)?;
+		let values = self.contexts.download_float_bytes(checked_add(column, checked_mul(rows.start, layout.output_precision.bytes(), "last column offset")?, "last column offset")?, rows.len(), layout.output_precision)?;
 		self.trace_values(&values)?;
 		Ok(values)
 	}
