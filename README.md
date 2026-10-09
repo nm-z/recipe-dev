@@ -111,6 +111,7 @@ let model = recipe.model()
 		lgbm(trees)
 	attention:
 		attn(heads)
+		attn_heads(heads) // head plane for a block product before the output layer
 			.width(d)
 			.head(width)
 			.kv(heads).fp(...)
@@ -119,7 +120,6 @@ let model = recipe.model()
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
-			.gate()
 atvn:
 	relu()
 	leak()
@@ -263,6 +263,31 @@ recipe keys model.gguf
 
 GGUF tensor pairing, feed-forward and expert activations, expert routing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Models with feed-forward or expert blocks name `feed-forward-activation` or `expert-activation`. An expert model also names `expert-scoring` (`softmax` or `sigmoid`) and `expert-renormalize`; declared GGUF metadata overrides those two manifest choices. Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
 
+## Dataset schema
+
+```bash
+recipe schema probe measurements/ > proposal.json
+recipe schema finalize proposal.json answers.json schema.json
+```
+
+The answers file names one choice for each question on the active branch:
+
+```json
+{"schema_version":1,"status":"ok","answers":[{"id":"parse","choice":"table","probability":0.99}]}
+```
+
+A SQLite file uses the `sqlite_table` parse path. The answers name one table and its feature types:
+
+```json
+{"id":"sqlite_table","choice":"samples"}
+```
+
+The probe records each WAV file's sample rate and frame count, and an `envelope`: 16 hexadecimal digits, one per span of the samples, ranked by mean amplitude from `0` (quietest) to `f` (loudest).
+
+```rust
+let data = recipe.data("measurements/").schema("schema.json").target(["temperature"]);
+```
+
 ## Precision and reference checks
 
 ```toml
@@ -392,8 +417,9 @@ delta(heads, kernel)
 	.qk(l2|rms)
 	.delta_gates(softplus, sigmoid)
 
-attn(heads)
-	.gate(sigmoid|silu|tanh)                                    // .gate()
+let attention = recipe.model().attn_heads(heads).kv(kv).head(head);
+let gate = recipe.model().no(bias).layer(heads * head).sigmoid();
+let model = recipe.model().block(attention * gate).layer(width);
 
 hyper(lanes, &branch, mean)
 hyper_gate(lanes, &branch, HyperGate { read, write, mean })
