@@ -12239,9 +12239,10 @@ mod bundle {
 				let window = (attention.window != 0).then(|| format!(",w={}", attention.window)).unwrap_or_default();
 				let factors = if attention.factors { ",f=1" } else { "" };
 				let unscaled = if attention.unscaled { ",s=1" } else { "" };
+				let attn_factor = if attention.attn_factor == 1.0f64.to_bits() { String::new() } else { format!(",a={}", attention.attn_factor) };
 				let yarn = attention.yarn.map_or_else(String::new, |(factor, context, fast, slow)| format!(",{},{},{},{}", f64::from_bits(factor), context, f64::from_bits(fast), f64::from_bits(slow)));
 				format!(
-					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}",
+					"attn,v3,{},{},{dims},{base},{},{},{},{},{},{},{},{score_dims},{layout}{yarn}{values}{window}{factors}{unscaled}{attn_factor}",
 					attention.heads,
 					attention.keys,
 					index.heads,
@@ -12363,6 +12364,7 @@ mod bundle {
 				};
 				let mut values = keys;
 				let (mut window, mut factors, mut unscaled) = (0, false, false);
+				let mut attn_factor = 1.0f64.to_bits();
 				for marker in first_marker.into_iter().chain(fields) {
 					if let Some(value) = marker.strip_prefix("v=") {
 						values = value.parse().map_err(|error| RecipeError::new(format!("invalid attention value heads: {error}")))?;
@@ -12372,6 +12374,8 @@ mod bundle {
 						factors = true;
 					} else if marker == "s=1" {
 						unscaled = true;
+					} else if let Some(value) = marker.strip_prefix("a=") {
+						attn_factor = value.parse().map_err(|error| RecipeError::new(format!("invalid attention scale: {error}")))?;
 					} else {
 						return Err(RecipeError::new("attention record has extra fields"));
 					}
@@ -12388,6 +12392,7 @@ mod bundle {
 					window,
 					factors,
 					unscaled,
+					attn_factor,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -13725,10 +13730,12 @@ struct AttentionBlock {
 	factors: bool,
 	/// Whether attention uses the raw QK dot instead of dividing by sqrt(width).
 	unscaled: bool,
+	/// The scale the file names for rotary embedding, as float bits; 1.0 when it names none.
+	attn_factor: u64,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, project: true, window: 0, factors: false, unscaled: false }
+		Self { heads, keys: heads, values: heads, width: 0, rope: None, yarn: None, index: None, project: true, window: 0, factors: false, unscaled: false, attn_factor: 1.0f64.to_bits() }
 	}
 
 
@@ -16893,6 +16900,8 @@ impl Gguf {
 pub struct Binding {
 	tensors: BTreeSet<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
+	/// Rotary factor groups with a long tensor: the group index, the long tensor, and the original context its graph must exceed.
+	rope_long: Vec<(usize, GgufTensor, usize)>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
 /// rewrote once from a tensor the file stores in another parametrization, which
@@ -16927,6 +16936,14 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// The plan for a graph of `positions`. Factor groups whose graph exceeds the original context bind the long tensor.
+	fn for_positions(&self, positions: usize) -> Self {
+		let mut plan = self.clone();
+		for (group, long, original) in &self.rope_long {
+			if positions > *original { plan.nodes[*group] = vec![Plane::Mapped(long.clone())]; }
+		}
+		plan
+	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
@@ -17017,9 +17034,14 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 	let graph = bound_graph_on(model, blocks, plan, input, channels, device)?;
 	Ok((graph, device))
 }
+/// The attention scale the file names for rotary embedding, as float bits. A file that names none keeps the unscaled rotation.
+fn rope_attn_factor(file: &Gguf, architecture: &str) -> u64 {
+	file.value(&format!("{architecture}.rope.scaling.attn_factor")).and_then(GgufValue::float).unwrap_or(1.0).to_bits()
+}
 fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
+	let plan = &plan.for_positions(shape.length);
 	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
@@ -17580,6 +17602,15 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![tensor]);
 		Ok(())
 	}
+	/// The gate and up projections of a feed-forward: two tensors, or one `ffn_up.weight` that stores the gate rows and then the up rows.
+	fn gate_and_up(&mut self, layer: usize, role: &str, inputs: usize, outputs: usize) -> Result<[GgufTensor; 2]> {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		if self.file.tensor(&name("ffn_gate.weight")).is_some() {
+			return Ok([self.projection(&name("ffn_gate.weight"), role, inputs, outputs)?, self.projection(&name("ffn_up.weight"), role, inputs, outputs)?]);
+		}
+		let fused = self.projection(&name("ffn_up.weight"), role, inputs, 2 * outputs)?;
+		Ok([fused.rows(0, outputs)?.view()?, fused.rows(outputs, outputs)?.view()?])
+	}
 	/// A projection `[inputs, outputs]` of the given name, checked against the
 	/// widths the node contracts over.
 	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
@@ -17630,16 +17661,19 @@ impl<'a> Builder<'a> {
 		let (width, heads) = (dimensions.width, dimensions.heads);
 		let (kv, head, rope_dims, rope_base) = (dimensions.kv[layer], dimensions.head[layer], dimensions.rope_dims[layer], dimensions.rope_base[layer]);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		let query = self.file.tensor(&name("attn_q.weight")).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
-		let gated = query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+		let fused = self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let query = self.file.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" })).ok_or_else(|| RecipeError::new(format!("tensor {} is absent; block {layer} attention reads it", name("attn_q.weight"))))?;
+		let gated = !fused && query.shape.get(1).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
 		let mut block = if gated { branch.attn_heads(heads) } else { branch.attn(heads) }.kv(kv).head(head);
 		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
 		if normalized { block = block.qk(rms); }
 		block = block.rope(self.rope, rope_dims, rope_base);
+		let (short, attn_factor) = (self.file.tensor("rope_factors_short.weight").is_some(), rope_attn_factor(self.file, self.architecture));
 		block = block.edit(|model| {
 			let Operation::Attention(attention) = &mut model.blocks.last_mut().unwrap().operation else { unreachable!() };
 			attention.window = if dimensions.swa[layer] { dimensions.window } else { 0 };
-			attention.factors = !dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some();
+			attention.factors = short || (!dimensions.swa[layer] && self.file.tensor("rope_freqs.weight").is_some());
+			attention.attn_factor = attn_factor;
 		});
 		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
 			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
@@ -17758,10 +17792,9 @@ impl<'a> Builder<'a> {
 		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} feed-forward");
-		for (suffix, inputs, outputs) in [("ffn_gate.weight", width, hidden), ("ffn_up.weight", width, hidden), ("ffn_down.weight", hidden, width)] {
-			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
-			self.mapped(vec![tensor]);
-		}
+		for tensor in self.gate_and_up(layer, &role, width, hidden)? { self.mapped(vec![tensor]); }
+		let down = self.projection(&name("ffn_down.weight"), &role, hidden, width)?;
+		self.mapped(vec![down]);
 		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
 		Ok(branch.glu(hidden, activation))
 	}
@@ -18594,10 +18627,12 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 /// normalization scales and rotary factors.
 fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, plain: bool) {
 	let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	for block in parts.iter_mut() {
 		if let Operation::Attention(attention) = &mut block.operation {
 			if block.qk.is_none() && (file.tensor(&name("attn_q_norm.weight")).is_some() || file.tensor(&name("attn_k_norm.weight")).is_some()) { block.qk = Some(BlockNormalization::Rms); }
-			attention.factors |= attention.rope.is_some() && attention.window == 0 && file.tensor("rope_freqs.weight").is_some();
+			attention.factors |= attention.rope.is_some() && (file.tensor("rope_factors_short.weight").is_some() || (attention.window == 0 && file.tensor("rope_freqs.weight").is_some()));
+			attention.attn_factor = rope_attn_factor(file, architecture);
 			if let Some(index) = &mut attention.index {
 				if index.score.is_none() && (file.tensor(&name("indexer.q_norm.weight")).is_some() || file.tensor(&name("indexer.k_norm.weight")).is_some()) {
 					index.score = Some((BlockNormalization::Rms, attention.rope.map_or(0, |(_, dims, _)| dims)));
@@ -18752,22 +18787,24 @@ impl Builder<'_> {
 					} else {
 						// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
 						let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.has_scalar_map());
-						let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
-						for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
+						let mut branch_widths = Vec::new();
+						for branch in [left, right] {
 							let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
 							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
-							hidden = widths[0];
-							let tensor = self.projection(&name(suffix), &role, width, hidden)?;
-							self.mapped(vec![tensor]);
+							branch_widths.push(widths[0]);
 						}
+						require(branch_widths[0] == branch_widths[1], format!("block {layer} feed-forward product branches differ in width"))?;
+						hidden = branch_widths[0];
+						let [gate, up] = self.gate_and_up(layer, &role, width, hidden)?;
+						self.mapped(vec![if activated(right) && !activated(left) { up } else { gate }]);
+						self.mapped(vec![if activated(right) && !activated(left) { gate } else { up }]);
 						weighted = true;
 					}
 				}
 				Operation::Glu(inner, _) => {
-					for (suffix, inputs, outputs) in [("ffn_gate.weight", width, *inner), ("ffn_up.weight", width, *inner), ("ffn_down.weight", *inner, width)] {
-						let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
-						self.mapped(vec![tensor]);
-					}
+					for tensor in self.gate_and_up(layer, &role, width, *inner)? { self.mapped(vec![tensor]); }
+					let down = self.projection(&name("ffn_down.weight"), &role, *inner, width)?;
+					self.mapped(vec![down]);
 					weighted = true;
 				}
 				Operation::Layer(outputs) => {
@@ -18831,20 +18868,32 @@ impl Builder<'_> {
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		let fused = self.file.tensor(&name("attn_q.weight")).is_none();
+		let query = self.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" }), &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
-		let gated = match query.shape[1] as usize {
-			outputs if outputs == heads * head => false,
-			outputs if outputs == 2 * heads * head => true,
-			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
+		// A fused tensor stores the query, key and value heads as consecutive rows.
+		let (gated, key_base) = if fused {
+			require(query.shape[1] as usize == (heads + 2 * kv) * head, format!("{} projects {} outputs; {role} splits them into {heads} query and {kv} key and value heads of {head}", query.name, query.shape[1]))?;
+			(false, heads * head)
+		} else {
+			let gated = match query.shape[1] as usize {
+				outputs if outputs == heads * head => false,
+				outputs if outputs == 2 * heads * head => true,
+				outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
+			};
+			(gated, 0)
 		};
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
-			Some(value) => {
-				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-				value
+		let key = if fused { query.clone() } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
+		let value = if fused {
+			query.rows(key_base + kv * head, kv * head)?.view()?
+		} else {
+			match self.optional(&name("attn_v.weight")) {
+				Some(value) => {
+					require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
+					value
+				}
+				None => key.clone(),
 			}
-			None => key.clone(),
 		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
@@ -18853,7 +18902,7 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&query, index * stride, &order)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.extend(Self::head_rows(&key, key_base + index * head, &order)?);
 		}
 		planes.push(value);
 		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
@@ -18880,9 +18929,18 @@ impl Builder<'_> {
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
-			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			let (factors, long) = if self.file.tensor("rope_freqs.weight").is_some() {
+				(self.tensor("rope_freqs.weight", &role)?, None)
+			} else {
+				let original = self.integer_or("rope.scaling.original_context_length", self.integer_or("context_length", 0)?)?;
+				require(original != 0, format!("{role} selects short or long rotary factors by context, but the file names no context length"))?;
+				(self.tensor("rope_factors_short.weight", &role)?, Some((self.tensor("rope_factors_long.weight", &role)?, original)))
+			};
+			let fits = |tensor: &GgufTensor| attention.rope.is_some() && tensor.elements() == rope_dims / 2;
+			require(fits(&factors) && long.as_ref().map_or(true, |(long, _)| fits(long)), format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
+			let group = self.plan.nodes.len();
 			self.mapped(vec![factors]);
+			if let Some((long, original)) = long { self.plan.rope_long.push((group, long, original)); }
 		}
 		if let Some(index) = attention.index {
 			self.indexer_planes(layer, width, index)?;
@@ -22385,7 +22443,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 /// projection when selected. The input projection carries the query, key,
 /// and value planes, then any indexer planes.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, unscaled } = attention;
+	let AttentionBlock { mut heads, width, mut keys, mut values, rope, yarn, index, project, window, factors, unscaled, attn_factor } = attention;
 	let ordinary_precision = graph.block_precision;
 	require(window == 0 || graph.output.length <= window, format!("attention sliding window is {window}, but this graph has {} positions; contexts beyond the window need the sliding mask", graph.output.length))?;
 	require(window == 0 || index.is_none(), "sliding attention and sparse indexing cannot share one block")?;
@@ -22440,6 +22498,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 				(mscale, factor, context as f64 / std::f64::consts::TAU, low, high)
 			}
 		};
+		let mscale = mscale * f64::from_bits(attn_factor);
 		// The seventh argument names the angle: 0 direct, 1 chained. Under the
 		// chain the second argument carries base^(-2/dims) from the host's powf
 		// (llama.cpp's theta_scale) instead of the base, so every backend chains
