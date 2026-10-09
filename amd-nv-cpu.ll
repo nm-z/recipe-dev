@@ -727,18 +727,26 @@ entry:
 br i1 %local, label %local.owner.check, label %shared.chunk.loop
 local.owner.check:
 br i1 %local.owner.active, label %local.k.begin, label %exit
+; Use the same chunk boundaries and fold as the shared path, even when
+; one lane computes every chunk. The schedule must not change rounding.
 local.k.begin:
-%local.sums.initial = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
-%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 0, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
-%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 0, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
+br label %local.chunk.loop
+local.chunk.loop:
+%local.chunk.first = phi i32 [ 0, %local.k.begin ], [ %local.chunk.limit, %local.store ]
+%local.chunk.end = add i32 %local.chunk.first, RECIPE_CHUNK_K
+%local.chunk.over = icmp ugt i32 %local.chunk.end, %k.count
+%local.chunk.limit = select i1 %local.chunk.over, i32 %k.count, i32 %local.chunk.end
+%local.sums.prior = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.chunk.first, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
+%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.chunk.first, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 br label %local.k.loop
 local.k.loop:
-%local.k = phi i32 [ 0, %local.k.begin ], [ %local.k.next, %local.product.done ]
-%local.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %local.sums.initial, %local.k.begin ], [ %local.sums.current, %local.product.done ]
-%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.k.begin ], [ %local.a.next, %local.product.done ]
-%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.k.begin ], [ %local.b.next, %local.product.done ]
+%local.k = phi i32 [ %local.chunk.first, %local.chunk.loop ], [ %local.k.next, %local.product.done ]
+%local.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ zeroinitializer, %local.chunk.loop ], [ %local.sums.current, %local.product.done ]
+%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.chunk.loop ], [ %local.a.next, %local.product.done ]
+%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.chunk.loop ], [ %local.b.next, %local.product.done ]
 %local.k.next = add i32 %local.k, 1
-%local.k.more = icmp ult i32 %local.k.next, %k.count
+%local.k.more = icmp ult i32 %local.k.next, %local.chunk.limit
 %local.k.prefetch = select i1 %local.k.more, i32 %local.k.next, i32 %local.k
 %local.a.next = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.k.prefetch, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
 %local.b.next = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.k.prefetch, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
@@ -763,8 +771,10 @@ br label %local.product.loop, !llvm.loop !0
 local.product.done:
 br i1 %local.k.more, label %local.k.loop, label %local.store
 local.store:
-store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
-br label %exit
+%local.folded = fadd <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.prior, %local.sums.current
+store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.folded, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+%local.chunk.more = icmp ult i32 %local.chunk.limit, %k.count
+br i1 %local.chunk.more, label %local.chunk.loop, label %exit
 shared.chunk.loop:
 %chunk = phi i32 [ %chunk.first, %entry ], [ %chunk.next, %chunk.finish ]
 %slot = phi i32 [ 0, %entry ], [ %slot.next, %chunk.finish ]
@@ -1124,7 +1134,7 @@ job.step:
 br i1 %lane.active, label %sum.loop, label %job.done
 sum.loop:
 %k = phi i32 [ 0, %job.step ], [ %k.next, %weight.ready ]
-%sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %sum.next, %weight.ready ]
+%partials = phi <32 x RECIPE_STATE> [ zeroinitializer, %job.step ], [ %partials.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
 sum.step:
@@ -1152,10 +1162,25 @@ weight.ready:
 %weight.wide = call RECIPE_STATE @recipe.decode(double %weight.model)
 %input.wide = call RECIPE_STATE @recipe.decode(double %input.model)
 %product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
-%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
+%partial.lane = and i32 %k, 31
+%partial = extractelement <32 x RECIPE_STATE> %partials, i32 %partial.lane
+%partial.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %partial, RECIPE_STATE %product)
+%partials.next = insertelement <32 x RECIPE_STATE> %partials, RECIPE_STATE %partial.next, i32 %partial.lane
 %k.next = add i32 %k, 1
 br label %sum.loop
 sum.done:
+; Match the 32-lane dot reduction without depending on physical wave width.
+%partial.partners.16 = shufflevector <32 x RECIPE_STATE> %partials, <32 x RECIPE_STATE> poison, <32 x i32> <i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+%partial.sums.16 = fadd <32 x RECIPE_STATE> %partials, %partial.partners.16
+%partial.partners.8 = shufflevector <32 x RECIPE_STATE> %partial.sums.16, <32 x RECIPE_STATE> poison, <32 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23>
+%partial.sums.8 = fadd <32 x RECIPE_STATE> %partial.sums.16, %partial.partners.8
+%partial.partners.4 = shufflevector <32 x RECIPE_STATE> %partial.sums.8, <32 x RECIPE_STATE> poison, <32 x i32> <i32 4, i32 5, i32 6, i32 7, i32 0, i32 1, i32 2, i32 3, i32 12, i32 13, i32 14, i32 15, i32 8, i32 9, i32 10, i32 11, i32 20, i32 21, i32 22, i32 23, i32 16, i32 17, i32 18, i32 19, i32 28, i32 29, i32 30, i32 31, i32 24, i32 25, i32 26, i32 27>
+%partial.sums.4 = fadd <32 x RECIPE_STATE> %partial.sums.8, %partial.partners.4
+%partial.partners.2 = shufflevector <32 x RECIPE_STATE> %partial.sums.4, <32 x RECIPE_STATE> poison, <32 x i32> <i32 2, i32 3, i32 0, i32 1, i32 6, i32 7, i32 4, i32 5, i32 10, i32 11, i32 8, i32 9, i32 14, i32 15, i32 12, i32 13, i32 18, i32 19, i32 16, i32 17, i32 22, i32 23, i32 20, i32 21, i32 26, i32 27, i32 24, i32 25, i32 30, i32 31, i32 28, i32 29>
+%partial.sums.2 = fadd <32 x RECIPE_STATE> %partial.sums.4, %partial.partners.2
+%partial.partners.1 = shufflevector <32 x RECIPE_STATE> %partial.sums.2, <32 x RECIPE_STATE> poison, <32 x i32> <i32 1, i32 0, i32 3, i32 2, i32 5, i32 4, i32 7, i32 6, i32 9, i32 8, i32 11, i32 10, i32 13, i32 12, i32 15, i32 14, i32 17, i32 16, i32 19, i32 18, i32 21, i32 20, i32 23, i32 22, i32 25, i32 24, i32 27, i32 26, i32 29, i32 28, i32 31, i32 30>
+%partial.sums.1 = fadd <32 x RECIPE_STATE> %partial.sums.2, %partial.partners.1
+%sum = extractelement <32 x RECIPE_STATE> %partial.sums.1, i32 0
 %bias.base = mul i32 %out.channels, %terms
 %bias.index = add i32 %bias.base, %channel
 %bias.wide.index = zext i32 %bias.index to i64
@@ -1284,6 +1309,10 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %int.levels = select i1 %int16, i32 32767, i32 127
 %int.minimum = select i1 %int16, i32 -32768, i32 -128
 %q8.levels = call RECIPE_STATE @recipe.state.from.u32(i32 %int.levels)
+%dense.width.wide = icmp ugt i32 %width, 32
+%dense.width = select i1 %dense.width.wide, i32 32, i32 %width
+%dense.lane.active = icmp ult i32 %lane, %dense.width
+%dense.first = select i1 %dense.lane.active, i32 %lane, i32 %terms
 br label %position.loop
 position.loop:
 %position.index = phi i32 [ %out.begin, %entry ], [ %position.next, %position.done ]
@@ -2048,7 +2077,7 @@ br label %b32.sum.loop
 b32.sum.done:
 br label %sum.done
 sum.loop:
-%k = phi i32 [ %lane, %b32.check ], [ %lane, %exact.b32.check ], [ %k.next, %weight.ready ]
+%k = phi i32 [ %dense.first, %b32.check ], [ %dense.first, %exact.b32.check ], [ %k.next, %weight.ready ]
 %sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %state.zero, %exact.b32.check ], [ %sum.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
@@ -2077,7 +2106,7 @@ weight.ready:
 %product.raw = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
 %product = select i1 %channel.active, RECIPE_STATE %product.raw, RECIPE_STATE %state.zero
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
-%k.next = add i32 %k, %width
+%k.next = add i32 %k, %dense.width
 br label %sum.loop
 sum.done:
 %sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4b.result, %q4b.exit ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %q6b.result, %q6b.exit ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
@@ -2387,7 +2416,122 @@ ret void }
 ; each head the channel pairs (i, i + dims/2) below %dims rotate by
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
 ; into %output, which makes the same body the adjoint pass.
-define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
+define internal i32 @rope_position(ptr addrspace(1) %context, i1 %sectioned, i64 %p, i64 %per.row, i64 %length.wide, i64 %position, i32 %index.i32, i32 %position.origin) #1 {
+entry:
+%position.local = trunc i64 %position to i32 %position.i32 = add i32 %position.local, %position.origin
+br i1 %sectioned, label %axis.pick, label %plain
+plain:
+ret i32 %position.i32
+axis.pick:
+%axes.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 0 %axes = load i32, ptr addrspace(1) %axes.ptr, align 4
+%interleave.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 1 %interleave.word = load i32, ptr addrspace(1) %interleave.ptr, align 4 %interleave = icmp ne i32 %interleave.word, 0
+%size.0.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 2 %size.0 = load i32, ptr addrspace(1) %size.0.ptr, align 4
+%size.1.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 3 %size.1 = load i32, ptr addrspace(1) %size.1.ptr, align 4
+%size.2.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 4 %size.2 = load i32, ptr addrspace(1) %size.2.ptr, align 4
+%size.3.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 5 %size.3 = load i32, ptr addrspace(1) %size.3.ptr, align 4
+%bound.1 = add i32 %size.0, %size.1 %bound.2 = add i32 %bound.1, %size.2 %total = add i32 %bound.2, %size.3
+%total.empty = icmp eq i32 %total, 0 %total.safe = select i1 %total.empty, i32 1, i32 %total
+%sector = urem i32 %index.i32, %total.safe
+%last.axis = sub i32 %axes, 1
+%blocked.in.0 = icmp ult i32 %sector, %size.0 %blocked.in.1 = icmp ult i32 %sector, %bound.1 %blocked.in.2 = icmp ult i32 %sector, %bound.2
+%blocked.from.2 = select i1 %blocked.in.2, i32 2, i32 3 %blocked.from.1 = select i1 %blocked.in.1, i32 1, i32 %blocked.from.2 %blocked.raw = select i1 %blocked.in.0, i32 0, i32 %blocked.from.1
+%blocked.over = icmp ugt i32 %blocked.raw, %last.axis %blocked.axis = select i1 %blocked.over, i32 %last.axis, i32 %blocked.raw
+%turn = urem i32 %sector, %axes
+%turn.is.0 = icmp eq i32 %turn, 0 %turn.is.1 = icmp eq i32 %turn, 1 %turn.is.2 = icmp eq i32 %turn, 2
+%turn.size.high = select i1 %turn.is.2, i32 %size.2, i32 %size.3 %turn.size.low = select i1 %turn.is.0, i32 %size.0, i32 %size.1 %turn.size = select i1 %turn.is.1, i32 %size.1, i32 %turn.size.high
+%turn.size.pick = select i1 %turn.is.0, i32 %turn.size.low, i32 %turn.size
+%turn.limit = mul i32 %axes, %turn.size.pick %turn.inside = icmp ult i32 %sector, %turn.limit %interleaved.axis = select i1 %turn.inside, i32 %turn, i32 %last.axis
+%axis = select i1 %interleave, i32 %interleaved.axis, i32 %blocked.axis
+%row = udiv i64 %p, %per.row %axes.wide = zext i32 %axes to i64 %axis.wide = zext i32 %axis to i64
+%row.axes = mul i64 %row, %axes.wide %row.axis = add i64 %row.axes, %axis.wide %row.axis.base = mul i64 %row.axis, %length.wide %origin.wide = zext i32 %position.origin to i64 %column = add i64 %position, %origin.wide %table.local = add i64 %row.axis.base, %column
+%table.index = add i64 %table.local, 6 %table.ptr = getelementptr inbounds i32, ptr addrspace(1) %context, i64 %table.index %axis.position = load i32, ptr addrspace(1) %table.ptr, align 4
+ret i32 %axis.position
+}
+; Canonical scalar pair arithmetic shared by rotary tensors and pooled keys.
+; The base argument holds a direct base or theta scale according to chain.on.
+define internal RECIPE_STATE @rope_pair(RECIPE_STATE %value, RECIPE_STATE %other, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide,
+RECIPE_STATE %factor.wide, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, RECIPE_STATE %frequency.factor,
+i64 %index, i32 %dims, i32 %position.i32, i1 %upper, i1 %reverse, i1 %chain.on) #1 {
+entry:
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%one = call RECIPE_STATE @recipe.state.from.u1(i1 true)
+%two.index = mul i64 %index, 2
+%two.index.i32 = trunc i64 %two.index to i32
+%index.i32 = trunc i64 %index to i32
+%two.index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %two.index.i32)
+%index.value = call RECIPE_STATE @recipe.state.from.u32(i32 %index.i32)
+%dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
+%log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
+%exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
+%frequency.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %frequency.factor)
+%yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
+%ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
+%ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
+%ramp.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %ramp.offset, RECIPE_STATE %ramp.span)
+%ramp.low = call i1 @recipe.state.ogt(RECIPE_STATE %zero, RECIPE_STATE %ramp.raw)
+%ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
+%ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
+%ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
+%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.extrap, RECIPE_STATE %factor.wide)
+%ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
+%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.extrap)
+%interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
+%blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
+%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
+%position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
+%cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
+%sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
+%sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
+%cos.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %cos) %sin.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %sin.term)
+%rotated.raw = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.part)
+%rotated.direct = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %rotated.raw, RECIPE_STATE %mscale.wide)
+; The chain angle, llama.cpp's rope: the pair's angle is the position times
+; base^(-2/dims) taken one product at a time in the state, the yarn blend
+; falls on the angle, the cosine and sine each carry the magnitude scale, and
+; the rotation is two fused multiply-adds against the libm trig of the CPU.
+; Under the chain the base argument already holds base^(-2/dims), taken on
+; the machine with the CPU's powf so every backend chains the same bits.
+br i1 %chain.on, label %chain, label %finish.direct
+chain:
+%chain.scale = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %base.wide, RECIPE_STATE %zero)
+br label %chain.loop
+chain.loop:
+%chain.i = phi i64 [ 0, %chain ], [ %chain.i.next, %chain.step ]
+%chain.theta = phi RECIPE_STATE [ %position.value, %chain ], [ %chain.theta.next, %chain.step ]
+%chain.more = icmp ult i64 %chain.i, %index
+br i1 %chain.more, label %chain.step, label %chain.done
+chain.step:
+%chain.theta.next = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta, RECIPE_STATE %chain.scale)
+%chain.i.next = add i64 %chain.i, 1
+br label %chain.loop
+chain.done:
+%chain.theta.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.theta, RECIPE_STATE %frequency.factor)
+%chain.freq.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %factor.wide)
+%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta.extrap)
+%chain.mix = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
+%chain.mix.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %chain.mix)
+%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta.extrap, RECIPE_STATE %chain.mix)
+%chain.angle.yarn = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.extrap.part, RECIPE_STATE %chain.interp, RECIPE_STATE %chain.mix.inverse)
+%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta.extrap
+%chain.cos.raw = call RECIPE_STATE @recipe.libm.cos(RECIPE_STATE %chain.angle)
+%chain.sin.raw = call RECIPE_STATE @recipe.libm.sin(RECIPE_STATE %chain.angle)
+%chain.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.cos.raw, RECIPE_STATE %mscale.wide)
+%chain.sin = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.sin.raw, RECIPE_STATE %mscale.wide)
+%chain.sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin)
+%chain.sin.signed = select i1 %reverse, RECIPE_STATE %chain.sin.negative, RECIPE_STATE %chain.sin
+%chain.sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin.signed)
+%chain.sin.term = select i1 %upper, RECIPE_STATE %chain.sin.signed, RECIPE_STATE %chain.sin.signed.negative
+%chain.other.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %chain.sin.term)
+%chain.lower = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.other.part, RECIPE_STATE %value, RECIPE_STATE %chain.cos)
+%chain.upper.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %chain.cos)
+%chain.upper = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.upper.cos, RECIPE_STATE %other, RECIPE_STATE %chain.sin.signed)
+%rotated.chain = select i1 %upper, RECIPE_STATE %chain.upper, RECIPE_STATE %chain.lower
+br label %finish.direct
+finish.direct:
+%rotated.value = phi RECIPE_STATE [ %rotated.direct, %entry ], [ %rotated.chain, %chain.done ]
+ret RECIPE_STATE %rotated.value
+}
+define internal void @rope_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i1 %sectioned, i64 %p, i32 %channels, i32 %length,
 	i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse, i32 %position.origin ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
@@ -2416,77 +2560,12 @@ factor.one:
 br label %factor.ready
 factor.ready:
 %frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
-%dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
-%log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
-%exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
-%frequency.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %frequency.factor)
-%yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
-%ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
-%ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
-%ramp.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %ramp.offset, RECIPE_STATE %ramp.span)
-%ramp.low = call i1 @recipe.state.ogt(RECIPE_STATE %zero, RECIPE_STATE %ramp.raw)
-%ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
-%ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
-%ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
-%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.extrap, RECIPE_STATE %factor.wide)
-%ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.extrap)
-%interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
-%blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
-%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
-%position.local = trunc i64 %position to i32 %position.i32 = add i32 %position.local, %position.origin %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
-%cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
-%sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
-%sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
-%cos.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %cos) %sin.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %sin.term)
-%rotated.raw = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.part)
-%rotated.direct = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %rotated.raw, RECIPE_STATE %mscale.wide)
-; The chain angle, llama.cpp's rope: the pair's angle is the position times
-; base^(-2/dims) taken one product at a time in the state, the yarn blend
-; falls on the angle, the cosine and sine each carry the magnitude scale, and
-; the rotation is two fused multiply-adds against the libm trig of the CPU.
-; Under the chain the base argument already holds base^(-2/dims), taken on
-; the host with the CPU's powf so every backend chains the same bits.
+%position.i32 = call i32 @rope_position(ptr addrspace(1) %context, i1 %sectioned, i64 %p, i64 %per.row, i64 %length.wide, i64 %position, i32 %index.i32, i32 %position.origin)
 %chain.zero = call double @recipe.from.u32(i32 0)
 %chain.on = call i1 @recipe.ogt(double %angle.chain, double %chain.zero)
-br i1 %chain.on, label %chain, label %finish.direct
-chain:
-%chain.scale = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %base.wide, RECIPE_STATE %zero)
-br label %chain.loop
-chain.loop:
-%chain.i = phi i64 [ 0, %chain ], [ %chain.i.next, %chain.step ]
-%chain.theta = phi RECIPE_STATE [ %position.value, %chain ], [ %chain.theta.next, %chain.step ]
-%chain.more = icmp ult i64 %chain.i, %index
-br i1 %chain.more, label %chain.step, label %chain.done
-chain.step:
-%chain.theta.next = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta, RECIPE_STATE %chain.scale)
-%chain.i.next = add i64 %chain.i, 1
-br label %chain.loop
-chain.done:
-%chain.theta.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.theta, RECIPE_STATE %frequency.factor)
-%chain.freq.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %factor.wide)
-%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta.extrap)
-%chain.mix = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%chain.mix.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %chain.mix)
-%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta.extrap, RECIPE_STATE %chain.mix)
-%chain.angle.yarn = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.extrap.part, RECIPE_STATE %chain.interp, RECIPE_STATE %chain.mix.inverse)
-%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta.extrap
-%chain.cos.raw = call RECIPE_STATE @recipe.libm.cos(RECIPE_STATE %chain.angle)
-%chain.sin.raw = call RECIPE_STATE @recipe.libm.sin(RECIPE_STATE %chain.angle)
-%chain.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.cos.raw, RECIPE_STATE %mscale.wide)
-%chain.sin = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.sin.raw, RECIPE_STATE %mscale.wide)
-%chain.sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin)
-%chain.sin.signed = select i1 %reverse, RECIPE_STATE %chain.sin.negative, RECIPE_STATE %chain.sin
-%chain.sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin.signed)
-%chain.sin.term = select i1 %upper, RECIPE_STATE %chain.sin.signed, RECIPE_STATE %chain.sin.signed.negative
-%chain.other.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %chain.sin.term)
-%chain.lower = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.other.part, RECIPE_STATE %value, RECIPE_STATE %chain.cos)
-%chain.upper.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %chain.cos)
-%chain.upper = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.upper.cos, RECIPE_STATE %other, RECIPE_STATE %chain.sin.signed)
-%rotated.chain = select i1 %upper, RECIPE_STATE %chain.upper, RECIPE_STATE %chain.lower
+%rotated.value = call RECIPE_STATE @rope_pair(RECIPE_STATE %value, RECIPE_STATE %other, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, RECIPE_STATE %frequency.factor, i64 %index, i32 %dims, i32 %position.i32, i1 %upper, i1 %reverse, i1 %chain.on)
 br label %finish.direct
 finish.direct:
-%rotated.value = phi RECIPE_STATE [ %rotated.direct, %factor.ready ], [ %rotated.chain, %chain.done ]
 %rotated.model = call double @recipe.encode(RECIPE_STATE %rotated.value) br label %finish finish:
 %result = phi double [ %unrotated.model, %entry ], [ %rotated.model, %finish.direct ]
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
@@ -2495,7 +2574,7 @@ br i1 %reverse, label %accumulate, label %assign accumulate: %prior.model = load
 assign: store double %result, ptr addrspace(1) %output.ptr, align 8 ret void }
 ; The adjoint twin: the same angles and coefficients, read from a state-typed delta
 ; and added into a state-typed previous, so nothing on the adjoint side is rounded.
-define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length,
+define internal void @rope_body_adjoint( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i1 %sectioned, i64 %p, i32 %channels, i32 %length,
  i32 %head.width, i32 %dims, i32 %rotated, double %base, double %yarn.mscale, double %yarn.factor, double %angle.chain, double %yarn.low, double %yarn.high, i1 %has.factors, i1 %reverse ) #1 { entry: %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %head.width.wide = zext i32 %head.width to i64 %dims.wide = zext i32 %dims to i64 %rotated.wide = zext i32 %rotated to i64 %per.row = mul i64 %channels.wide, %length.wide
 %within = urem i64 %p, %per.row %channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide
 %local = urem i64 %channel, %head.width.wide %half = udiv i64 %dims.wide, 2
@@ -2521,77 +2600,12 @@ factor.one:
 br label %factor.ready
 factor.ready:
 %frequency.factor = phi RECIPE_STATE [ %factor.loaded, %factor.load ], [ %one, %factor.one ]
-%dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims) %ratio = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %two.index.value, RECIPE_STATE %dims.value)
-%log.base = call RECIPE_STATE @recipe.state.log(RECIPE_STATE %base.wide) %exponent.positive = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ratio, RECIPE_STATE %log.base)
-%exponent = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %exponent.positive) %frequency.raw = call RECIPE_STATE @recipe.state.exp(RECIPE_STATE %exponent)
-%frequency.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.raw, RECIPE_STATE %frequency.factor)
-%yarn.on = call i1 @recipe.state.ogt(RECIPE_STATE %factor.wide, RECIPE_STATE %one)
-%ramp.span = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %high.wide, RECIPE_STATE %low.wide)
-%ramp.offset = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %index.value, RECIPE_STATE %low.wide)
-%ramp.raw = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %ramp.offset, RECIPE_STATE %ramp.span)
-%ramp.low = call i1 @recipe.state.ogt(RECIPE_STATE %zero, RECIPE_STATE %ramp.raw)
-%ramp.clamped.low = select i1 %ramp.low, RECIPE_STATE %zero, RECIPE_STATE %ramp.raw
-%ramp.high = call i1 @recipe.state.ogt(RECIPE_STATE %ramp.clamped.low, RECIPE_STATE %one)
-%ramp = select i1 %ramp.high, RECIPE_STATE %one, RECIPE_STATE %ramp.clamped.low
-%interpolated = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %frequency.extrap, RECIPE_STATE %factor.wide)
-%ramp.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%extrapolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp.inverse, RECIPE_STATE %frequency.extrap)
-%interpolated.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %ramp, RECIPE_STATE %interpolated)
-%blended = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %extrapolated.part, RECIPE_STATE %interpolated.part)
-%frequency = select i1 %yarn.on, RECIPE_STATE %blended, RECIPE_STATE %frequency.extrap
-%position.i32 = trunc i64 %position to i32 %position.value = call RECIPE_STATE @recipe.state.from.u32(i32 %position.i32) %angle = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %position.value, RECIPE_STATE %frequency)
-%cos = call RECIPE_STATE @recipe.state.cos(RECIPE_STATE %angle) %sin = call RECIPE_STATE @recipe.state.sin(RECIPE_STATE %angle) %sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin)
-%sin.signed = select i1 %reverse, RECIPE_STATE %sin.negative, RECIPE_STATE %sin %sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %sin.signed)
-%sin.term = select i1 %upper, RECIPE_STATE %sin.signed, RECIPE_STATE %sin.signed.negative
-%cos.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %cos) %sin.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %sin.term)
-%rotated.raw = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %cos.part, RECIPE_STATE %sin.part)
-%rotated.direct = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %rotated.raw, RECIPE_STATE %mscale.wide)
-; The chain angle, llama.cpp's rope: the pair's angle is the position times
-; base^(-2/dims) taken one product at a time in the state, the yarn blend
-; falls on the angle, the cosine and sine each carry the magnitude scale, and
-; the rotation is two fused multiply-adds against the libm trig of the CPU.
-; Under the chain the base argument already holds base^(-2/dims), taken on
-; the host with the CPU's powf so every backend chains the same bits.
+%position.i32 = call i32 @rope_position(ptr addrspace(1) %context, i1 %sectioned, i64 %p, i64 %per.row, i64 %length.wide, i64 %position, i32 %index.i32, i32 0)
 %chain.zero = call double @recipe.from.u32(i32 0)
 %chain.on = call i1 @recipe.ogt(double %angle.chain, double %chain.zero)
-br i1 %chain.on, label %chain, label %finish.direct
-chain:
-%chain.scale = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %base.wide, RECIPE_STATE %zero)
-br label %chain.loop
-chain.loop:
-%chain.i = phi i64 [ 0, %chain ], [ %chain.i.next, %chain.step ]
-%chain.theta = phi RECIPE_STATE [ %position.value, %chain ], [ %chain.theta.next, %chain.step ]
-%chain.more = icmp ult i64 %chain.i, %index
-br i1 %chain.more, label %chain.step, label %chain.done
-chain.step:
-%chain.theta.next = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta, RECIPE_STATE %chain.scale)
-%chain.i.next = add i64 %chain.i, 1
-br label %chain.loop
-chain.done:
-%chain.theta.extrap = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %chain.theta, RECIPE_STATE %frequency.factor)
-%chain.freq.scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %one, RECIPE_STATE %factor.wide)
-%chain.interp = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.freq.scale, RECIPE_STATE %chain.theta.extrap)
-%chain.mix = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %ramp)
-%chain.mix.inverse = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %one, RECIPE_STATE %chain.mix)
-%chain.extrap.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.theta.extrap, RECIPE_STATE %chain.mix)
-%chain.angle.yarn = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.extrap.part, RECIPE_STATE %chain.interp, RECIPE_STATE %chain.mix.inverse)
-%chain.angle = select i1 %yarn.on, RECIPE_STATE %chain.angle.yarn, RECIPE_STATE %chain.theta.extrap
-%chain.cos.raw = call RECIPE_STATE @recipe.libm.cos(RECIPE_STATE %chain.angle)
-%chain.sin.raw = call RECIPE_STATE @recipe.libm.sin(RECIPE_STATE %chain.angle)
-%chain.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.cos.raw, RECIPE_STATE %mscale.wide)
-%chain.sin = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %chain.sin.raw, RECIPE_STATE %mscale.wide)
-%chain.sin.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin)
-%chain.sin.signed = select i1 %reverse, RECIPE_STATE %chain.sin.negative, RECIPE_STATE %chain.sin
-%chain.sin.signed.negative = call RECIPE_STATE @recipe.state.neg(RECIPE_STATE %chain.sin.signed)
-%chain.sin.term = select i1 %upper, RECIPE_STATE %chain.sin.signed, RECIPE_STATE %chain.sin.signed.negative
-%chain.other.part = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %other, RECIPE_STATE %chain.sin.term)
-%chain.lower = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.other.part, RECIPE_STATE %value, RECIPE_STATE %chain.cos)
-%chain.upper.cos = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %value, RECIPE_STATE %chain.cos)
-%chain.upper = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %chain.upper.cos, RECIPE_STATE %other, RECIPE_STATE %chain.sin.signed)
-%rotated.chain = select i1 %upper, RECIPE_STATE %chain.upper, RECIPE_STATE %chain.lower
+%rotated.value = call RECIPE_STATE @rope_pair(RECIPE_STATE %value, RECIPE_STATE %other, RECIPE_STATE %base.wide, RECIPE_STATE %mscale.wide, RECIPE_STATE %factor.wide, RECIPE_STATE %low.wide, RECIPE_STATE %high.wide, RECIPE_STATE %frequency.factor, i64 %index, i32 %dims, i32 %position.i32, i1 %upper, i1 %reverse, i1 %chain.on)
 br label %finish.direct
 finish.direct:
-%rotated.value = phi RECIPE_STATE [ %rotated.direct, %factor.ready ], [ %rotated.chain, %chain.done ]
 br label %finish finish:
 %result = phi RECIPE_STATE [ %value, %entry ], [ %rotated.value, %finish.direct ]
 %output.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %output, i64 %p
@@ -5083,7 +5097,6 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %accumulator.base.shared = add i32 %probability.base.shared, %score.values
 %maximum.base.shared = add i32 %accumulator.base.shared, %query.values
 %denominator.base.shared = add i32 %maximum.base.shared, %tile.m
-%rescale.base.shared = add i32 %denominator.base.shared, %tile.m
 %online.global = mul i32 %group, %block
 %online.id = add i32 %online.global, %lid
 %online.cache.channels = add i32 %kv.channels, %value.channels
@@ -5377,40 +5390,17 @@ maximum.load:
 %maximum.index = add i32 %maximum.base.shared, %softmax.query
 %maximum.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %maximum.index
 %maximum.old = load double, ptr addrspace(3) %maximum.ptr, align 8
-br label %maximum.loop
-maximum.loop:
-%maximum.key = phi i32 [ 0, %maximum.load ], [ %maximum.key.next, %maximum.step ]
-%maximum.value = phi double [ %maximum.old, %maximum.load ], [ %maximum.next, %maximum.step ]
-%maximum.more = icmp ult i32 %maximum.key, %key.count
-br i1 %maximum.more, label %maximum.step, label %probability.prepare
-maximum.step:
-%maximum.score.row = mul i32 %softmax.query, %tile.n
-%maximum.score.local = add i32 %maximum.score.row, %maximum.key
-%maximum.score.index = add i32 %score.base.shared, %maximum.score.local
-%maximum.score.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %maximum.score.index
-%maximum.score = load double, ptr addrspace(3) %maximum.score.ptr, align 8
-%maximum.larger = call i1 @recipe.ogt(double %maximum.score, double %maximum.value)
-%maximum.next = select i1 %maximum.larger, double %maximum.score, double %maximum.value
-%maximum.key.next = add i32 %maximum.key, 1
-br label %maximum.loop
-probability.prepare:
 %denominator.index = add i32 %denominator.base.shared, %softmax.query
 %denominator.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %denominator.index
 %denominator.old = load double, ptr addrspace(3) %denominator.ptr, align 8
-; A query whose admitted keys all lie in later tiles has no score yet, so its
-; maximum is still the initial negative infinity. Centering on zero instead
-; keeps its rescale and probabilities at zero rather than exp(-inf - -inf).
-%maximum.scored = call i1 @recipe.ogt(double %maximum.value, double 0xFFF0000000000000)
-%maximum.safe = select i1 %maximum.scored, double %maximum.value, double 0.0
-%maximum.old.centered = call double @recipe.sub(double %maximum.old, double %maximum.safe)
-%old.rescale = call double @recipe.exp(double %maximum.old.centered)
-%denominator.old.wide = call RECIPE_STATE @recipe.decode(double %denominator.old)
-%old.rescale.wide = call RECIPE_STATE @recipe.decode(double %old.rescale)
-%denominator.rescaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %denominator.old.wide, RECIPE_STATE %old.rescale.wide)
+; Fold keys in sequence order, including each rescale and storage rounding.
+; Physical tile boundaries only determine staging, not arithmetic grouping.
+; Once consumed, a score slot carries that key's rescale for the value fold.
 br label %probability.loop
 probability.loop:
-%probability.key = phi i32 [ 0, %probability.prepare ], [ %probability.key.next, %probability.step ]
-%denominator.value = phi RECIPE_STATE [ %denominator.rescaled, %probability.prepare ], [ %denominator.next, %probability.step ]
+%probability.key = phi i32 [ 0, %maximum.load ], [ %probability.key.next, %probability.step ]
+%maximum.value = phi double [ %maximum.old, %maximum.load ], [ %maximum.next, %probability.step ]
+%denominator.value = phi double [ %denominator.old, %maximum.load ], [ %denominator.next.model, %probability.step ]
 %probability.more = icmp ult i32 %probability.key, %key.count
 br i1 %probability.more, label %probability.step, label %softmax.store
 probability.step:
@@ -5419,22 +5409,29 @@ probability.step:
 %probability.score.index = add i32 %score.base.shared, %probability.local
 %probability.score.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.score.index
 %probability.score = load double, ptr addrspace(3) %probability.score.ptr, align 8
+%maximum.larger = call i1 @recipe.ogt(double %probability.score, double %maximum.value)
+%maximum.next = select i1 %maximum.larger, double %probability.score, double %maximum.value
+%maximum.scored = call i1 @recipe.ogt(double %maximum.next, double 0xFFF0000000000000)
+%maximum.safe = select i1 %maximum.scored, double %maximum.next, double 0.0
+%maximum.old.centered = call double @recipe.sub(double %maximum.value, double %maximum.safe)
+%old.rescale = call double @recipe.exp(double %maximum.old.centered)
+store double %old.rescale, ptr addrspace(3) %probability.score.ptr, align 8
 %probability.centered = call double @recipe.sub(double %probability.score, double %maximum.safe)
 %probability.value = call double @recipe.exp(double %probability.centered)
 %probability.index = add i32 %probability.base.shared, %probability.local
 %probability.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.index
 store double %probability.value, ptr addrspace(3) %probability.ptr, align 8
+%denominator.old.wide = call RECIPE_STATE @recipe.decode(double %denominator.value)
+%old.rescale.wide = call RECIPE_STATE @recipe.decode(double %old.rescale)
+%denominator.rescaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %denominator.old.wide, RECIPE_STATE %old.rescale.wide)
 %probability.wide = call RECIPE_STATE @recipe.decode(double %probability.value)
-%denominator.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.value, RECIPE_STATE %probability.wide)
+%denominator.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.rescaled, RECIPE_STATE %probability.wide)
+%denominator.next.model = call double @recipe.encode(RECIPE_STATE %denominator.next)
 %probability.key.next = add i32 %probability.key, 1
 br label %probability.loop
 softmax.store:
-%denominator.model = call double @recipe.encode(RECIPE_STATE %denominator.value)
 store double %maximum.value, ptr addrspace(3) %maximum.ptr, align 8
-store double %denominator.model, ptr addrspace(3) %denominator.ptr, align 8
-%rescale.index = add i32 %rescale.base.shared, %softmax.query
-%rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %rescale.index
-store double %old.rescale, ptr addrspace(3) %rescale.ptr, align 8
+store double %denominator.value, ptr addrspace(3) %denominator.ptr, align 8
 %softmax.query.next = add i32 %softmax.query, %block
 br label %softmax.loop
 softmax.done:
@@ -5450,14 +5447,10 @@ accumulate.prepare:
 %accumulate.index = add i32 %accumulator.base.shared, %accumulate.p
 %accumulate.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.index
 %accumulate.old = load double, ptr addrspace(3) %accumulate.ptr, align 8
-%accumulate.rescale.index = add i32 %rescale.base.shared, %accumulate.query
-%accumulate.rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.rescale.index
-%accumulate.rescale = load double, ptr addrspace(3) %accumulate.rescale.ptr, align 8
-%accumulate.initial = call double @recipe.mul(double %accumulate.old, double %accumulate.rescale)
 br label %accumulate.key.loop
 accumulate.key.loop:
 %accumulate.key = phi i32 [ 0, %accumulate.prepare ], [ %accumulate.key.next, %accumulate.key.step ]
-%accumulate.value = phi double [ %accumulate.initial, %accumulate.prepare ], [ %accumulate.next, %accumulate.key.step ]
+%accumulate.value = phi double [ %accumulate.old, %accumulate.prepare ], [ %accumulate.next, %accumulate.key.step ]
 %accumulate.key.more = icmp ult i32 %accumulate.key, %key.count
 br i1 %accumulate.key.more, label %accumulate.key.step, label %accumulate.store
 accumulate.key.step:
@@ -5472,7 +5465,11 @@ accumulate.key.step:
 %accumulate.value.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.value.index
 %accumulate.v = load double, ptr addrspace(3) %accumulate.value.ptr, align 8
 %accumulate.weighted = call double @recipe.mul(double %accumulate.probability, double %accumulate.v)
-%accumulate.next = call double @recipe.add(double %accumulate.value, double %accumulate.weighted)
+%accumulate.rescale.index = add i32 %score.base.shared, %accumulate.probability.local
+%accumulate.rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.rescale.index
+%accumulate.rescale = load double, ptr addrspace(3) %accumulate.rescale.ptr, align 8
+%accumulate.rescaled = call double @recipe.mul(double %accumulate.value, double %accumulate.rescale)
+%accumulate.next = call double @recipe.add(double %accumulate.rescaled, double %accumulate.weighted)
 %accumulate.key.next = add i32 %accumulate.key, 1
 br label %accumulate.key.loop
 accumulate.store:
