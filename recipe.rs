@@ -9351,12 +9351,18 @@ mod tokenizer {
 		/// when the model asks for them. Added tokens written out in the text are
 		/// matched whole, longest first, before the pre-tokenizer sees the rest.
 		pub fn encode(&self, text: &str) -> Vec<u32> {
-			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			self.encode_words(text).into_iter().flatten().collect()
+		}
+		/// `encode` with the ids grouped by word. The beginning- and end-of-sequence
+		/// ids and each added token form a group of their own, and each pre-tokenizer
+		/// word of the plain text forms one group.
+		pub fn encode_words(&self, text: &str) -> Vec<Vec<u32>> {
+			let mut output = self.bos.filter(|_| self.add_bos).map(|id| vec![id]).into_iter().collect::<Vec<_>>();
 			let (mut start, mut at) = (0, 0);
 			while at < text.len() {
 				if let Some((added, id)) = self.added.iter().find(|(added, _)| text[at..].starts_with(added.as_str())) {
 					self.encode_plain(&text[start..at], &mut output);
-					output.push(*id);
+					output.push(vec![*id]);
 					at += added.len();
 					start = at;
 				} else {
@@ -9364,7 +9370,7 @@ mod tokenizer {
 				}
 			}
 			self.encode_plain(&text[start..], &mut output);
-			output.extend(self.eos.filter(|_| self.add_eos));
+			output.extend(self.eos.filter(|_| self.add_eos).map(|id| vec![id]));
 			output
 		}
 		/// The rank and id of the piece that joins `left` to `right`, the lowest
@@ -9379,7 +9385,7 @@ mod tokenizer {
 			};
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
-		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
 			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
@@ -9397,7 +9403,7 @@ mod tokenizer {
 				if self.family == Family::Llama3
 					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
 				{
-					output.push(*id);
+					output.push(vec![*id]);
 					continue;
 				}
 				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
@@ -9408,7 +9414,9 @@ mod tokenizer {
 					symbols[index] = merged;
 					symbols.remove(index + 1);
 				}
-				output.extend(symbols);
+				if !symbols.is_empty() {
+					output.push(symbols);
+				}
 			}
 		}
 		fn byte_of_token(&self, byte: u8) -> char {
@@ -15331,8 +15339,10 @@ pub struct Bound {
 	vocabulary: usize,
 }
 /// Resolve an explicit user declaration before assigning checkpoint planes.
-fn explicit_bound(file: &Gguf, model: &Model) -> Result<Bound> {
-	let model = with_last_projection(model).for_file(file);
+/// Binds `model` to `file`. A scored pass keeps the projection over every
+/// position, so `last_position` is false there.
+fn explicit_bound(file: &Gguf, model: &Model, last_position: bool) -> Result<Bound> {
+	let model = if last_position { with_last_projection(model) } else { model.clone() }.for_file(file);
 	let plan = conventional_plan(file, &model)?;
 	Ok(Bound { file: file.clone(), blocks: model.blocks.len(), tensors: plan.tensors.len(), vocabulary: 0, model, plan })
 }
@@ -16208,6 +16218,7 @@ pub struct Infer {
 	tokens: Option<usize>,
 	chat: Option<Vec<ChatMetric>>,
 	positions: Option<Vec<u32>>,
+	score: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -16236,7 +16247,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None, positions: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false }
 	}
 }
 impl Infer {
@@ -16245,13 +16256,20 @@ impl Infer {
 	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
 		let result = (|| -> Result<Placed> {
 			let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference placement requires GGUF data"))?;
-			let bound = explicit_bound(file, model)?;
+			let bound = explicit_bound(file, model, true)?;
 			selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices))
 		})();
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Supplies each prompt token's rotary axes. Generated tokens continue after the largest preceding axis.
 	pub fn positions(mut self, positions: impl AsRef<[u32]>) -> Self { self.positions = Some(positions.as_ref().to_vec()); self }
+	/// Scores the input text in one teacher-forced pass and reports its token and
+	/// word log probabilities in `InferenceReport::score`, instead of generating a
+	/// reply. The text is tokenized as written, without the chat template.
+	pub fn score(mut self) -> Self {
+		self.score = true;
+		self
+	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -16276,7 +16294,7 @@ impl Infer {
 		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		let bound = explicit_bound(&file, model)?;
+		let bound = explicit_bound(&file, model, !self.score)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -16288,8 +16306,17 @@ impl Infer {
 		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
 		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
+		let scored = if self.score {
+			let text = supplied.as_deref().or(message.as_deref()).ok_or_else(|| RecipeError::new("scoring needs a text: pass -p <text> or set RNJ_PROMPT_FILE"))?;
+			Some(coder.encode_words(text))
+		} else {
+			None
+		};
+		// A scored text needs only its own positions, so its output stays as small as the text.
+		let scored_positions = scored.as_ref().map_or(0, |groups| groups.iter().map(Vec::len).sum::<usize>());
 		let sequence = match requested {
 			Some(context) => context,
+			None if scored.is_some() => scored_positions,
 			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
@@ -16301,7 +16328,12 @@ impl Infer {
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history = Vec::new();
+		let mut score = None;
 		loop {
+			if let Some(groups) = &scored {
+				score = Some(score_groups(&placed, &coder, groups, sequence)?);
+				break;
+			}
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
 			};
@@ -16393,8 +16425,18 @@ impl Infer {
 			requests: request_history.len(),
 			last: request_history.last().cloned().unwrap_or_default(),
 			history: request_history,
+			score,
 		})
 	}
+}
+/// Runs `groups` once with no generation and scores every id after the first
+/// from the logits of the position before it.
+fn score_groups(placed: &Placed, coder: &Tokenizer, groups: &[Vec<u32>], sequence: usize) -> Result<TextScore> {
+	let ids = groups.concat();
+	require(ids.len() <= sequence, format!("{} scored tokens exceed the {sequence} context positions", ids.len()))?;
+	let generation = placed.decode_observed(&ids, &mut recipe.sampler().temperature(0.0), &[], 0, None, |_| Ok(()))?;
+	let output = placed.output_shape()?;
+	TextScore::from_logits(&generation.logits, output.channels, output.length, groups, |ids| coder.decode(ids))
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
 /// template closes an assistant turn with.
@@ -16908,6 +16950,8 @@ pub struct InferenceReport {
 	pub requests: usize,
 	/// Completed requests in execution order, retained across `/clear`.
 	pub history: Vec<Arc<InferenceRequest>>,
+	/// Teacher-forced log probabilities of the scored text, set by `Infer::score`.
+	pub score: Option<TextScore>,
 	last: Arc<InferenceRequest>,
 }
 impl std::ops::Deref for InferenceReport {
@@ -16934,6 +16978,75 @@ pub struct InferenceRequest {
 impl InferenceRequest {
 	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.input.saturating_sub(self.cached) as f64 / self.pp_seconds } }
 	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
+}
+/// Teacher-forced log probabilities of one text, from `InferenceReport::score`.
+pub struct TextScore {
+	/// One entry per token after the first, in text order.
+	pub tokens: Vec<TokenScore>,
+	/// One entry per word that holds a scored token, in text order.
+	pub words: Vec<WordScore>,
+	/// Sum of the scored tokens' log probabilities.
+	pub logprob: f64,
+	/// `exp` of the negative mean of the scored tokens' log probabilities.
+	pub perplexity: f64,
+}
+/// One scored token of a text.
+pub struct TokenScore {
+	pub id: u32,
+	/// The token's text, decoded on its own.
+	pub piece: String,
+	/// Natural log of the token's probability given every earlier token.
+	pub logprob: f64,
+	/// One plus the number of vocabulary entries whose logit is strictly higher.
+	pub rank: usize,
+}
+/// The scored tokens of one tokenizer word.
+pub struct WordScore {
+	pub text: String,
+	/// Scored tokens in the word. The first token of a text has no score.
+	pub tokens: usize,
+	/// Sum of the word's scored token log probabilities.
+	pub logprob: f64,
+}
+impl TextScore {
+	/// Scores `groups` from teacher-forced `logits`, stored channel-major with
+	/// `positions` entries per channel. Position `p` predicts the id after it.
+	pub fn from_logits(logits: &[f64], channels: usize, positions: usize, groups: &[Vec<u32>], text: impl Fn(&[u32]) -> String) -> Result<Self> {
+		let ids = groups.concat();
+		require(ids.len() >= 2, "scoring needs at least two tokens")?;
+		require(ids.len() <= positions, format!("{} scored tokens exceed {positions} output positions", ids.len()))?;
+		require(logits.len() >= channels * positions, format!("native output has {} values, expected at least {}", logits.len(), channels * positions))?;
+		let mut tokens = Vec::with_capacity(ids.len() - 1);
+		for position in 0..ids.len() - 1 {
+			let id = ids[position + 1];
+			require((id as usize) < channels, format!("token id {id} is outside the {channels} output channels"))?;
+			let column = (0..channels).map(|channel| logits[channel * positions + position]).collect::<Vec<_>>();
+			require(column.iter().all(|value| value.is_finite()), format!("nonfinite logit at position {position}"))?;
+			let max = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+			let sum = column.iter().map(|value| (value - max).exp()).sum::<f64>();
+			let target = column[id as usize];
+			tokens.push(TokenScore {
+				id,
+				piece: text(&ids[position + 1..position + 2]),
+				logprob: target - (max + sum.ln()),
+				rank: 1 + column.iter().filter(|value| **value > target).count(),
+			});
+		}
+		let mut words = Vec::new();
+		let mut start = 0;
+		for group in groups {
+			let end = start + group.len();
+			let first = start.max(1);
+			if end > first {
+				let logprob = tokens[first - 1..end - 1].iter().map(|token| token.logprob).sum();
+				words.push(WordScore { text: text(group), tokens: end - first, logprob });
+			}
+			start = end;
+		}
+		let logprob = tokens.iter().map(|token| token.logprob).sum::<f64>();
+		let perplexity = (-logprob / tokens.len() as f64).exp();
+		Ok(Self { tokens, words, logprob, perplexity })
+	}
 }
 /// Measured inference state passed to the model script's live formatter.
 #[derive(Clone, Default)]
@@ -18009,6 +18122,10 @@ impl Placed {
 		});
 		if result.is_err() { *state = DecodeState::default(); }
 		result
+	}
+	fn output_shape(&self) -> Result<Shape> {
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		Ok(tape.output)
 	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
