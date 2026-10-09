@@ -12555,7 +12555,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -14070,6 +14070,12 @@ pub struct Block {
 	attention_tensors: Option<AttentionTensors>,
 	/// Tensors a script names for the planes of a mixture-of-experts block.
 	moe_tensors: Option<MoeTensors>,
+	/// Tensors a script names for the gate planes of a hyper-connection block, and for the head
+	/// mixer that collapses its lanes.
+	hyper_tensors: Option<HyperTensors>,
+	hyper_head: Option<HyperTensors>,
+	/// Tensors a script names for the planes of a per-layer embedding block.
+	ple_tensors: Option<PleTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14143,7 +14149,7 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
@@ -14156,6 +14162,24 @@ impl Block {
 		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
 		attention.factors |= tensors.factors.is_some();
 		self.attention_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of this hyper-connection block's gates.
+	pub fn hyper_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_from requires a hyper-connection block");
+		self.hyper_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of the head mixer that collapses this hyper-connection block's lanes.
+	pub fn hyper_head_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_head_from requires a hyper-connection block");
+		self.hyper_head = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this per-layer embedding block reads.
+	pub fn ple_from(mut self, tensors: PleTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Ple(..)), "ple_from requires a per-layer embedding block");
+		self.ple_tensors = Some(tensors);
 		self
 	}
 	/// Names the GGUF tensors this mixture-of-experts block reads.
@@ -14280,6 +14304,45 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors of a hyper-connection mixer, spelled by the script: the scale of the gate
+/// normalization, the read gate's down and up projections and the write gate's `inject`
+/// projection. The head mixer that collapses the lanes has no write gate, so its `inject` is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyperTensors {
+	pub norm: String,
+	pub down: String,
+	pub up: String,
+	pub inject: Option<String>,
+}
+impl HyperTensors {
+	/// The mixer of block `layer`'s `part` (`"attn"` or `"ffn"`) under the names GGUF files give it.
+	pub fn mixer(layer: usize, part: &str) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		Self { norm: name("norm"), down: name("down"), up: name("up"), inject: Some(name("inject")) }
+	}
+	/// The head mixer under the names GGUF files give it.
+	pub fn head() -> Self {
+		Self { norm: "output_hc_norm.weight".to_owned(), down: "output_hc_down.weight".to_owned(), up: "output_hc_up.weight".to_owned(), inject: None }
+	}
+}
+/// The GGUF tensors a per-layer embedding block reads besides its n-gram table, which the file's
+/// metadata names: the key and value projections, the three scales and the convolution taps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PleTensors {
+	pub key: String,
+	pub norm_key: String,
+	pub norm_query: String,
+	pub value: String,
+	pub norm_conv: String,
+	pub conv: String,
+}
+impl PleTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { key: name("ple_key.weight"), norm_key: name("ple_norm_key.weight"), norm_query: name("ple_norm_query.weight"), value: name("ple_value.weight"), norm_conv: name("ple_norm_conv.weight"), conv: name("ple_conv1d.weight") }
+	}
+}
 /// The GGUF tensors a mixture-of-experts block reads, spelled by the script: the router, the
 /// expert banks, the selection bias when the block selects with one, and the shared expert.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14542,6 +14605,9 @@ impl Model {
 				delta_tensors: None,
 				attention_tensors: None,
 				moe_tensors: None,
+				hyper_tensors: None,
+				hyper_head: None,
+				ple_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14640,6 +14706,27 @@ impl Model {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
 			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
 			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the preceding hyper-connection block's gates.
+	pub fn hyper_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the head mixer that collapses the preceding hyper-connection block's lanes.
+	pub fn hyper_head_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_head_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_head_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding per-layer embedding block reads.
+	pub fn ple_from(&self, tensors: PleTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("ple_from requires a preceding per-layer embedding block"));
+			*block = block.clone().ple_from(tensors);
 		})
 	}
 	/// Names the GGUF tensors the preceding gguf_moe block reads.
@@ -18075,24 +18162,24 @@ impl<'a> Builder<'a> {
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
 	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
-		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes))
+		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes), None)
 	}
-	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize) -> Result<()> {
+	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize, spelled: Option<&PleTensors>) -> Result<()> {
 		let role = format!("block {layer} per-layer embedding");
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| PleTensors::block(layer));
 		let (table_name, _, _) = ple.table();
 		let table = self.tensor(table_name, &role)?;
 		self.mapped(vec![table]);
 		let stream = checked_mul(lanes, width, "per-layer embedding stream")?;
 		let gathered = ple.width();
-		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
+		let key = self.projection(&named.key, &role, gathered, stream)?;
 		self.mapped(vec![key]);
-		self.whole(&name("ple_norm_key.weight"), &role)?;
-		self.whole(&name("ple_norm_query.weight"), &role)?;
-		let value = self.projection(&name("ple_value.weight"), &role, gathered, width)?;
+		self.whole(&named.norm_key, &role)?;
+		self.whole(&named.norm_query, &role)?;
+		let value = self.projection(&named.value, &role, gathered, width)?;
 		self.mapped(vec![value]);
-		self.whole(&name("ple_norm_conv.weight"), &role)?;
-		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
+		self.whole(&named.norm_conv, &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == ple.kernel() && taps.shape[1] as usize == stream,
 			format!("{} has shape {:?}; {role} convolves {stream} channels with {} taps", taps.name, taps.shape, ple.kernel()),
@@ -18871,9 +18958,10 @@ impl Builder<'_> {
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
 		let (mut lanes, mut rank) = (0, 0);
 		let (mut mixers, mut feeds) = (0, 0);
+		let mut head_spelled = None;
 		for block in &model.blocks {
 			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-				self.head_planes(lanes, rank, width)?;
+				self.head_planes(lanes, rank, width, head_spelled.as_ref())?;
 				lanes = 0;
 			}
 			match &block.operation {
@@ -18886,7 +18974,7 @@ impl Builder<'_> {
 				let mut expected = table.block();
 				expected.math = formula.math;
 				require(*formula == expected, "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
+					self.ple_planes(table.layer(), &table, width, lanes.max(1), block.ple_tensors.as_ref())?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _, _) => {
 					// A block holds one mixing and one feed-forward branch in either order, so each kind numbers its own blocks.
@@ -18895,7 +18983,8 @@ impl Builder<'_> {
 					if let Operation::Hyper(count, bottleneck, _, _, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
-						self.mixer_planes(layer, part, lanes, rank, width)?;
+						if block.hyper_head.is_some() { head_spelled = block.hyper_head.clone(); }
+						self.mixer_planes(layer, part, lanes, rank, width, block.hyper_tensors.as_ref())?;
 					}
 					self.plan_branch(parts, layer, part, width)?;
 				}
@@ -18918,26 +19007,28 @@ impl Builder<'_> {
 				self.norm_scale(name, width)?;
 			}
 		}
-		if lanes != 0 { self.head_planes(lanes, rank, width)?; }
+		if lanes != 0 { self.head_planes(lanes, rank, width, head_spelled.as_ref())?; }
 		Ok(())
 	}
-	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
 		let role = format!("block {layer} {part} mixer");
-		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		let named = spelled.cloned().unwrap_or_else(|| HyperTensors::mixer(layer, part));
+		let inject = named.inject.as_deref().ok_or_else(|| RecipeError::new(format!("{role} names no write projection")))?;
 		let stream = checked_mul(lanes, width, "hyper-connection stream")?;
-		self.norm_scale(&name("norm"), stream)?;
-		for (suffix, inputs, outputs) in [("down", stream, rank), ("up", rank, stream), ("inject", stream, lanes)] {
-			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+		self.norm_scale(&named.norm, stream)?;
+		for (tensor_name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream), (inject, stream, lanes)] {
+			let tensor = self.projection(tensor_name, &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
 		Ok(())
 	}
-	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
+		let named = spelled.cloned().unwrap_or_else(HyperTensors::head);
 		let stream = checked_mul(lanes, width, "head mixer stream")?;
-		self.norm_scale("output_hc_norm.weight", stream)?;
-		for (name, inputs, outputs) in [("output_hc_down.weight", stream, rank), ("output_hc_up.weight", rank, stream)] {
+		self.norm_scale(&named.norm, stream)?;
+		for (name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream)] {
 			let tensor = self.projection(name, "the head mixer", inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
