@@ -630,6 +630,26 @@ impl LogitComparison {
 		self.failures.is_empty()
 	}
 
+	/// The report, one line each: every metric's spread, the agreement, the error against the bound, the
+	/// change in log probability and perplexity, the growth, the positions in eight runs, and the verdict.
+	pub fn lines(&self) -> Vec<String> {
+		let mut lines = Vec::new();
+		for (name, spread) in [("kl", self.kl), ("pearson", self.pearson), ("spearman", self.spearman), ("max-abs", self.max_abs), ("max-relative", self.max_relative)] {
+			lines.push(format!("compare {name} mean {:e} median {:e} p99 {:e} min {:e} max {:e}", spread.mean, spread.median, spread.p99, spread.min, spread.max));
+		}
+		lines.push(format!("compare top1 {:.6} top5 {:.6}", self.top1, self.top5));
+		lines.push(format!("compare relative-error max {:e} p99 {:e}", self.relative_max, self.relative_p99));
+		lines.push(format!("compare logprob {:.12} reference {:.12} change {:e}", self.logprob, self.reference_logprob, self.logprob - self.reference_logprob));
+		lines.push(format!("compare perplexity {:.6} reference {:.6} change {:e}", self.perplexity, self.reference_perplexity, self.perplexity - self.reference_perplexity));
+		lines.push(format!("compare growth {:e} late-minus-early {:e} (judged from {} positions, bound {})", self.growth, self.late_minus_early, self.growth_positions, self.growth_bound));
+		for bucket in self.buckets(8) {
+			lines.push(format!("compare positions {}-{} kl {:e} pearson {:.9} max-relative {:e} top1 {:.4}", bucket.first, bucket.last, bucket.kl, bucket.pearson, bucket.max_relative, bucket.top1));
+		}
+		lines.extend(self.failures.iter().map(|failure| format!("compare FAIL {failure}")));
+		lines.push(format!("compare bound {} {}", self.bound, if self.ok() { "PASS" } else { "FAIL" }));
+		lines
+	}
+
 	/// The positions in `rows` consecutive runs, each reported by its means.
 	pub fn buckets(&self, rows: usize) -> Vec<PositionBucket> {
 		let count = self.positions.len();
