@@ -32975,18 +32975,16 @@ struct ProbeDatabase {
 	tables: Vec<ProbeSqliteTable>,
 }
 
-/// Probes a plaintext SQLite file page by page. It refuses a file with a pending rollback
-/// journal or a WAL sidecar, because those pages are not the database's current content.
+/// Probes a plaintext SQLite file page by page, with the committed frames of a `-wal` sidecar
+/// laid over the main file. It refuses a file with a pending rollback journal, because those
+/// pages are not the database's current content.
 fn probe_database(path: &Path) -> Result<ProbeDatabase> {
-	for suffix in ["-wal", "-journal"] {
-		let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
-		require(!fs::metadata(&sidecar).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty {suffix} file; checkpoint or remove it first", path.display()))?;
-	}
+	let journal = PathBuf::from(format!("{}-journal", path.display()));
+	require(!fs::metadata(&journal).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty -journal file; checkpoint or remove it first", path.display()))?;
 	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
-	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
-	let mut head = [0u8; 100];
-	let read = file.read(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	let layout = sqlite_layout(&head[..read], length).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+	let file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let wal = fs::File::open(format!("{}-wal", path.display())).ok().map(|wal| Box::new(wal) as Box<dyn SqliteBytes>);
+	let (mut file, layout) = sqlite_open(Box::new(file), length, wal).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
 	let mut tables = Vec::new();
 	for table in sqlite_catalog(&mut file, layout).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))? {
 		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
@@ -33086,6 +33084,11 @@ pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
 		if let Some(span) = folder.span() {
 			*anchors.entry(span).or_default() += 1;
 		}
+	}
+	// A set split into class folders has no single folder holding every sample, so the image
+	// and audio file totals are observations of the sample count too.
+	for total in [images.len(), audio.len()].into_iter().filter(|total| *total > 0) {
+		*anchors.entry(total).or_default() += 1;
 	}
 	// Support counts independent observations of each count; ties prefer the larger count.
 	let mut ranked = anchors.iter().map(|(count, support)| (*count, *support)).collect::<Vec<_>>();
@@ -33624,7 +33627,7 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			}
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
-		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes, fs::read(format!("{}-wal", path.display())).ok().as_deref()).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("xml") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
@@ -33637,20 +33640,22 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
-/// Page geometry of a plaintext SQLite 3 file in rollback-journal mode.
+/// Page geometry of a plaintext SQLite 3 file in rollback-journal or WAL mode.
 #[derive(Clone, Copy)]
 struct SqliteLayout {
 	page_size: usize,
 	/// Bytes of each page that hold b-tree content; the rest is reserved.
 	usable: usize,
 	pages: usize,
+	/// The header declares WAL mode, so committed frames in the `-wal` file supersede main-file pages.
+	wal: bool,
 }
 
-/// Validates the file header and length. Encrypted, WAL-mode, and truncated files are refused
+/// Validates the file header and length. Encrypted and truncated files are refused
 /// rather than read as if their pages were plain.
 fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(head.len() >= 100 && head.starts_with(b"SQLite format 3\0"), "SQLite header is absent; the file is not plaintext SQLite 3 or is encrypted")?;
-	require(head[18] == 1 && head[19] == 1, "SQLite database is in WAL mode, which is unsupported; checkpoint it to rollback-journal mode first")?;
+	require(head[18] == head[19] && matches!(head[18], 1 | 2), format!("SQLite journal mode bytes {} and {} are neither rollback nor WAL", head[18], head[19]))?;
 	let page_size = match u16::from_be_bytes([head[16], head[17]]) as usize {
 		1 => 65536,
 		size => size,
@@ -33658,7 +33663,147 @@ fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(page_size.is_power_of_two() && (512..=65536).contains(&page_size), format!("SQLite page size {page_size} is invalid"))?;
 	let usable = page_size.checked_sub(head[20] as usize).filter(|usable| *usable >= 480).ok_or_else(|| RecipeError::new("SQLite reserved bytes leave no usable page"))?;
 	require(length != 0 && length % page_size as u64 == 0, "SQLite file length is not a whole number of pages; the file is truncated")?;
-	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize })
+	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize, wal: head[18] == 2 })
+}
+
+trait SqliteBytes: Read + Seek {}
+impl<T: Read + Seek> SqliteBytes for T {}
+
+/// The database as a reader sees it: a page the WAL committed comes from its newest committed
+/// frame, and every other page from the main file. Page reads are whole and page-aligned.
+struct SqliteView<'a> {
+	main: Box<dyn SqliteBytes + 'a>,
+	wal: Option<Box<dyn SqliteBytes + 'a>>,
+	/// Page number to the offset of that page's bytes inside the WAL.
+	frames: HashMap<usize, u64>,
+	page_size: usize,
+	position: u64,
+}
+
+impl Read for SqliteView<'_> {
+	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+		let page_size = self.page_size as u64;
+		let (page, within) = ((self.position / page_size) as usize + 1, self.position % page_size);
+		let count = buffer.len().min((page_size - within) as usize);
+		let read = match (self.frames.get(&page), self.wal.as_mut()) {
+			(Some(offset), Some(wal)) => {
+				wal.seek(SeekFrom::Start(offset + within))?;
+				wal.read(&mut buffer[..count])?
+			}
+			_ => {
+				self.main.seek(SeekFrom::Start(self.position))?;
+				self.main.read(&mut buffer[..count])?
+			}
+		};
+		self.position += read as u64;
+		Ok(read)
+	}
+}
+
+impl Seek for SqliteView<'_> {
+	fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
+		match target {
+			SeekFrom::Start(position) => self.position = position,
+			SeekFrom::Current(delta) => self.position = self.position.checked_add_signed(delta).ok_or_else(|| std::io::Error::other("SQLite seek is before the start"))?,
+			SeekFrom::End(_) => return Err(std::io::Error::other("SQLite pages are addressed from the start")),
+		}
+		Ok(self.position)
+	}
+}
+
+/// The checksum SQLite chains through a WAL: 8-byte units read as two 32-bit words in the
+/// byte order the WAL magic selects.
+fn sqlite_wal_checksum(big_endian: bool, seed: (u32, u32), data: &[u8]) -> (u32, u32) {
+	let word = |bytes: &[u8]| if big_endian { u32::from_be_bytes(bytes.try_into().unwrap()) } else { u32::from_le_bytes(bytes.try_into().unwrap()) };
+	data.chunks_exact(8).fold(seed, |(first, second), unit| {
+		let first = first.wrapping_add(word(&unit[..4])).wrapping_add(second);
+		(first, second.wrapping_add(word(&unit[4..])).wrapping_add(first))
+	})
+}
+
+/// Indexes the committed frames of a WAL. A page maps to the offset of its newest frame at or
+/// before the last commit, and the result carries the database size in pages that commit
+/// declares. A frame that fails its salt or checksum ends the log, as in SQLite's recovery.
+/// An empty WAL, or one with no commit, yields `None`.
+fn sqlite_wal_index(wal: &mut dyn SqliteBytes, page_size: usize) -> Result<Option<(HashMap<usize, u64>, usize)>> {
+	let mut header = [0u8; 32];
+	wal.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite WAL cannot be read: {error}")))?;
+	let mut filled = 0;
+	while filled < header.len() {
+		match wal.read(&mut header[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite WAL cannot be read: {error}"))),
+		}
+	}
+	if filled == 0 {
+		return Ok(None);
+	}
+	require(filled == header.len(), "SQLite WAL header is truncated")?;
+	let be = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
+	let magic = be(&header[..4]);
+	require(matches!(magic, 0x377f0682 | 0x377f0683), "SQLite WAL magic is invalid")?;
+	require(be(&header[4..8]) == 3007000, "SQLite WAL format version is unsupported")?;
+	require(be(&header[8..12]) as usize == page_size, "SQLite WAL page size differs from the database")?;
+	let big_endian = magic & 1 == 1;
+	let mut running = sqlite_wal_checksum(big_endian, (0, 0), &header[..24]);
+	require(running == (be(&header[24..28]), be(&header[28..32])), "SQLite WAL header checksum is wrong")?;
+	let salt = &header[16..24];
+	let (mut pending, mut committed, mut pages) = (HashMap::new(), HashMap::new(), 0usize);
+	let mut frame = vec![0u8; 24 + page_size];
+	for index in 0u64.. {
+		if wal.read_exact(&mut frame).is_err() {
+			break;
+		}
+		let next = sqlite_wal_checksum(big_endian, sqlite_wal_checksum(big_endian, running, &frame[..8]), &frame[24..]);
+		let page = be(&frame[..4]) as usize;
+		if &frame[8..16] != salt || next != (be(&frame[16..20]), be(&frame[20..24])) || page == 0 {
+			break;
+		}
+		running = next;
+		pending.insert(page, 32 + index * (24 + page_size as u64) + 24);
+		let size = be(&frame[4..8]) as usize;
+		if size != 0 {
+			committed.extend(pending.drain());
+			pages = size;
+		}
+	}
+	Ok((pages != 0).then_some((committed, pages)))
+}
+
+/// Opens a database for page reads, with the committed frames of its WAL laid over the main
+/// file when the header declares WAL mode. Returns the view and the layout it presents.
+fn sqlite_open<'a>(mut main: Box<dyn SqliteBytes + 'a>, length: u64, wal: Option<Box<dyn SqliteBytes + 'a>>) -> Result<(SqliteView<'a>, SqliteLayout)> {
+	let mut head = [0u8; 100];
+	let mut filled = 0;
+	main.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite header cannot be read: {error}")))?;
+	while filled < head.len() {
+		match main.read(&mut head[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite header cannot be read: {error}"))),
+		}
+	}
+	let layout = sqlite_layout(&head[..filled], length)?;
+	let mut view = SqliteView { main, wal: None, frames: HashMap::new(), page_size: layout.page_size, position: 0 };
+	let Some(mut wal) = wal.filter(|_| layout.wal) else { return Ok((view, layout)) };
+	let Some((frames, pages)) = sqlite_wal_index(wal.as_mut(), layout.page_size)? else { return Ok((view, layout)) };
+	view.wal = Some(wal);
+	view.frames = frames;
+	let first = sqlite_page(&mut view, SqliteLayout { pages: pages.max(layout.pages), ..layout }, 1)?;
+	let layout = sqlite_layout(&first[..100], pages as u64 * layout.page_size as u64)?;
+	Ok((view, layout))
+}
+
+/// The bytes of a table-leaf payload that stay on its page; the rest continues on overflow pages.
+fn sqlite_local_payload(usable: usize, payload: usize) -> usize {
+	let maximum = usable - 35;
+	if payload <= maximum {
+		return payload;
+	}
+	let minimum = (usable - 12) * 32 / 255 - 23;
+	let local = minimum + (payload - minimum) % (usable - 4);
+	if local <= maximum { local } else { minimum }
 }
 
 /// Reads one page into a buffer of one page. The caller keeps only the buffers it needs.
@@ -33813,8 +33958,30 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 				let mut offset = pointer(header + 8 + cell * 2)?;
 				let (payload, _) = sqlite_varint(&buffer, &mut offset)?;
 				let (rowid, _) = sqlite_varint(&buffer, &mut offset)?;
-				require((payload as usize) <= layout.usable - 35, format!("SQLite page {page} holds a row that overflows its page; overflow pages are unsupported"))?;
-				let record = buffer.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let payload = usize::try_from(payload).ok().filter(|payload| *payload <= layout.pages * layout.usable).ok_or_else(|| RecipeError::new(format!("SQLite page {page} holds a row larger than the file")))?;
+				let local = sqlite_local_payload(layout.usable, payload);
+				let stored = buffer.get(offset..offset + local).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let mut joined = Vec::new();
+				let record = if local == payload {
+					stored
+				} else {
+					// The rest of the record continues on a chain of overflow pages, each led by the number of the next.
+					joined.extend_from_slice(stored);
+					let pointer = buffer.get(offset + local..offset + local + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} overflow pointer is truncated")))?;
+					let mut next = u32::from_be_bytes([pointer[0], pointer[1], pointer[2], pointer[3]]) as usize;
+					for _ in 0..layout.pages {
+						if joined.len() == payload {
+							break;
+						}
+						require(next != 0, format!("SQLite page {page} overflow chain ends before its row does"))?;
+						let overflow = sqlite_page(source, layout, next)?;
+						let take = (payload - joined.len()).min(layout.usable - 4);
+						joined.extend_from_slice(&overflow[4..4 + take]);
+						next = u32::from_be_bytes([overflow[0], overflow[1], overflow[2], overflow[3]]) as usize;
+					}
+					require(joined.len() == payload && next == 0, format!("SQLite page {page} overflow chain does not match its row length"))?;
+					&joined[..]
+				};
 				let mut values = sqlite_record(record)?;
 				for (column, _) in aliases.iter().enumerate().filter(|(_, alias)| **alias) {
 					if values.len() <= column {
@@ -33831,9 +33998,9 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 }
 
 /// Every user table of a SQLite database in memory, for the loader.
-fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
-	let layout = sqlite_layout(bytes.get(..100).unwrap_or(bytes), bytes.len() as u64)?;
-	let mut source = std::io::Cursor::new(bytes);
+fn sqlite_tables(bytes: &[u8], wal: Option<&[u8]>) -> Result<Vec<Table>> {
+	let wal = wal.map(|wal| Box::new(std::io::Cursor::new(wal)) as Box<dyn SqliteBytes + '_>);
+	let (mut source, layout) = sqlite_open(Box::new(std::io::Cursor::new(bytes)), bytes.len() as u64, wal)?;
 	let catalog = sqlite_catalog(&mut source, layout)?;
 	require(!catalog.is_empty(), "SQLite database has no tables")?;
 	let mut tables = Vec::new();
