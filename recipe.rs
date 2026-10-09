@@ -12555,7 +12555,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -14066,6 +14066,8 @@ pub struct Block {
 	scale_tensors: Vec<String>,
 	/// Tensors a script names for the planes of a delta block.
 	delta_tensors: Option<DeltaTensors>,
+	/// Tensors a script names for the planes of an attention block.
+	attention_tensors: Option<AttentionTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14139,12 +14141,19 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Map;
 		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+		self
+	}
+	/// Names the GGUF tensors this attention block reads, and marks its rotary factors when a tensor holds them.
+	pub fn attention_from(mut self, tensors: AttentionTensors) -> Self {
+		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
+		attention.factors |= tensors.factors.is_some();
+		self.attention_tensors = Some(tensors);
 		self
 	}
 	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
@@ -14263,6 +14272,57 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors an attention block reads, spelled by the script. `q` holds the query rows,
+/// interleaved with the gate rows when the block is gated; a missing `v` reads `k` as the values;
+/// the biases, the query and key scales and the rotary factors are present only when named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionTensors {
+	pub q: String,
+	pub k: String,
+	pub v: Option<String>,
+	pub q_bias: Option<String>,
+	pub k_bias: Option<String>,
+	pub v_bias: Option<String>,
+	pub q_norm: Option<String>,
+	pub k_norm: Option<String>,
+	pub factors: Option<String>,
+	pub out: String,
+	pub indexer: Option<IndexerTensors>,
+}
+impl AttentionTensors {
+	/// The tensors of block `layer` under the names GGUF files give them, each optional one named
+	/// and bound only when the file holds it.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			q: name("attn_q.weight"),
+			k: name("attn_k.weight"),
+			v: Some(name("attn_v.weight")),
+			q_bias: Some(name("attn_q.bias")),
+			k_bias: Some(name("attn_k.bias")),
+			v_bias: Some(name("attn_v.bias")),
+			q_norm: Some(name("attn_q_norm.weight")),
+			k_norm: Some(name("attn_k_norm.weight")),
+			factors: Some("rope_freqs.weight".to_owned()),
+			out: name("attn_output.weight"),
+			indexer: Some(IndexerTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors the token indexer of an attention block reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexerTensors {
+	pub q_proj: String,
+	pub k_proj: String,
+	pub q_norm: String,
+	pub k_norm: String,
+}
+impl IndexerTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+		Self { q_proj: name("q_proj.weight"), k_proj: name("k_proj.weight"), q_norm: name("q_norm.weight"), k_norm: name("k_norm.weight") }
+	}
+}
 /// The GGUF tensors a delta block reads, spelled by the script: the gate projection halves
 /// (`alpha` for the decay, `beta` for the write), the optional decay bias, the stored decay
 /// `-exp(A)`, the query-key-value projection, the convolution taps, the output scale, the
@@ -14432,6 +14492,7 @@ impl Model {
 				rope_precision: None,
 				scale_tensors: Vec::new(),
 				delta_tensors: None,
+				attention_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14530,6 +14591,13 @@ impl Model {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
 			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
 			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding attention block reads.
+	pub fn attention_from(&self, tensors: AttentionTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("attention_from requires a preceding attention block"));
+			*block = block.clone().attention_from(tensors);
 		})
 	}
 	/// Names the GGUF tensor that scales the next unnamed normalization of the preceding block.
@@ -17714,10 +17782,10 @@ impl<'a> Builder<'a> {
 			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
-		self.attention_planes(layer, attention, normalized, width)?;
+		self.attention_planes(layer, attention, normalized, width, None)?;
 		if gated {
 			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
-			self.attention_gate_planes(layer, heads, head, gate_biased)?;
+			self.attention_gate_planes(layer, heads, head, gate_biased, None)?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -18784,7 +18852,7 @@ impl Builder<'_> {
 			match &step.operation {
 				Operation::Identity => {}
 				Operation::Attention(attention) => {
-					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					self.attention_planes(layer, attention, step.qk.is_some(), width, step.attention_tensors.as_ref())?;
 					if !attention.project {
 						hidden = attention.heads * if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 					}
@@ -18811,13 +18879,14 @@ impl Builder<'_> {
 						hidden = attention.heads * head;
 						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
 						let normalized = attention_branch.blocks[0].qk.is_some();
+						let spelled = attention_branch.blocks[0].attention_tensors.as_ref();
 						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
 						if attention_left {
-							self.attention_planes(layer, attention, normalized, width)?;
-							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
 						} else {
-							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
-							self.attention_planes(layer, attention, normalized, width)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
 						}
 						weighted = true;
 					} else {
@@ -18869,11 +18938,10 @@ impl Builder<'_> {
 
 	/// Bind the same side projection and deferred key scales for architecture
 	/// models and script-defined resident attention.
-	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer, named: &IndexerTensors) -> Result<()> {
 		let role = format!("block {layer} indexer");
-		let query = self.projection(&name("q_proj.weight"), &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
-		let key = self.projection(&name("k_proj.weight"), &role, width, index.width)?;
+		let query = self.projection(&named.q_proj, &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
+		let key = self.projection(&named.k_proj, &role, width, index.width)?;
 		let dims = index.score.map_or(0, |(_, dims)| dims);
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
@@ -18883,8 +18951,8 @@ impl Builder<'_> {
 		planes.extend(Self::head_rows(&key, 0, &order)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
-			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
-			scales.extend(self.scale(&name("k_norm.weight"), &role, index.width, 1, &order)?);
+			let mut scales = self.scale(&named.q_norm, &role, index.width, index.heads, &order)?;
+			scales.extend(self.scale(&named.k_norm, &role, index.width, 1, &order)?);
 			self.slot(scales);
 		}
 		Ok(())
@@ -18899,22 +18967,23 @@ impl Builder<'_> {
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and its
 	/// output projection, as `attention` lays them out for a built one.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize) -> Result<()> {
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		let query = self.tensor(&named.q, &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		let gated = match query.shape[1] as usize {
 			outputs if outputs == heads * head => false,
 			outputs if outputs == 2 * heads * head => true,
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
+		let key = self.projection(&named.k, &role, width, kv * head)?;
+		let value = match named.v.as_deref().and_then(|value_name| self.optional(value_name)) {
 			Some(value) => {
 				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
 				value
@@ -18932,7 +19001,7 @@ impl Builder<'_> {
 		}
 		planes.push(value);
 		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
-		let (query_bias, key_bias, value_bias) = (self.optional(&name("attn_q.bias")), self.optional(&name("attn_k.bias")), self.optional(&name("attn_v.bias")));
+		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
 		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
 			// The bias row follows the matrix rows, in the order the planes read them.
 			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
@@ -18946,37 +19015,41 @@ impl Builder<'_> {
 				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
 			}
 			row.extend(value_values);
-			slot.push(Plane::Owned { name: name("attn_qkv.bias"), values: row });
+			slot.push(Plane::Owned { name: format!("{} (bias row)", named.q), values: row });
 		}
 		self.slot(slot);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let (q_norm, k_norm) = named.q_norm.as_deref().zip(named.k_norm.as_deref()).ok_or_else(|| RecipeError::new(format!("{role} normalizes its queries and keys, and names no scale tensors for them")))?;
+			let mut scales = self.scale(q_norm, &role, head, heads, &order)?;
+			scales.extend(self.scale(k_norm, &role, head, kv, &order)?);
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
+			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
+			let factors = self.tensor(factors_name, &role)?;
 			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
 			self.mapped(vec![factors]);
 		}
 		if let Some(index) = attention.index {
-			self.indexer_planes(layer, width, index)?;
+			let indexer = named.indexer.clone().ok_or_else(|| RecipeError::new(format!("{role} indexes tokens, and names no indexer tensors")))?;
+			self.indexer_planes(layer, width, index, &indexer)?;
 		}
 		if attention.project {
-			let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
+			let output = self.projection(&named.out, &role, heads * head, width)?;
 			self.mapped(vec![output]);
 		}
 		Ok(())
 	}
 	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
-	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool) -> Result<()> {
-		let name = format!("blk.{layer}.attn_q.weight");
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
+		let name = named.q.clone();
 		let query = self.tensor(&name, "the attention gate")?;
 		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
 		let mut rows = Vec::with_capacity(heads);
 		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
 		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
-		if biased && let Some(tensor) = self.optional(&format!("blk.{layer}.attn_q.bias")) {
+		if biased && let Some(tensor) = named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
 			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
 			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
