@@ -7794,14 +7794,16 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
 		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
-		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
+		BackendTarget::Amd { .. } => b"recipe-native-v3".as_slice(),
+		BackendTarget::Nvidia { .. } => b"recipe-native-nvidia-v4".as_slice(),
 	};
 	let requirement = match target {
 		BackendTarget::Cpu { target } => {
 			let (target, _, cpu, features) = cpu_identity(target)?;
 			format!("target={target};cpu={cpu};features={features}")
 		}
-		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => native_target_label(target).to_owned(),
+		BackendTarget::Amd { .. } => native_target_label(target).to_owned(),
+		BackendTarget::Nvidia { architecture } => format!("{architecture};ptx={}", native_nvidia_ptx_version(architecture)?),
 	};
 	let producer = match target {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
@@ -7992,8 +7994,102 @@ fn native_nvidia_device_library() -> Result<&'static str> {
 	option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))
 }
 
-fn native_nvidia_ptx_version() -> Result<&'static str> {
-	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
+fn native_nvidia_ptx_floor(architecture: &str) -> Result<u32> {
+	// LLVM's NVPTX SM floors include architecture-specific and family-specific targets.
+	Ok(match architecture {
+		"sm_20" | "sm_21" | "sm_30" | "sm_35" => 32,
+		"sm_32" | "sm_50" => 40,
+		"sm_37" | "sm_52" => 41,
+		"sm_53" => 42,
+		"sm_60" | "sm_61" | "sm_62" => 50,
+		"sm_70" => 60,
+		"sm_72" => 61,
+		"sm_75" => 63,
+		"sm_80" => 70,
+		"sm_86" => 71,
+		"sm_87" => 74,
+		"sm_89" | "sm_90" => 78,
+		"sm_90a" => 80,
+		"sm_100" | "sm_100a" | "sm_101" | "sm_101a" => 86,
+		"sm_120" | "sm_120a" => 87,
+		"sm_100f" | "sm_101f" | "sm_103" | "sm_103f" | "sm_103a" | "sm_120f" | "sm_121" | "sm_121f" | "sm_121a" => 88,
+		"sm_88" | "sm_110" | "sm_110f" | "sm_110a" => 90,
+		_ => return Err(RecipeError::new(format!("NVIDIA target {architecture:?} has no known PTX minimum"))),
+	})
+}
+
+fn native_nvidia_ptx_version(architecture: &str) -> Result<u32> {
+	let configured = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
+	let baseline = configured
+		.strip_prefix("+ptx")
+		.and_then(|value| value.parse::<u32>().ok())
+		.filter(|version| matches!(version, 32 | 40..=43 | 50 | 60..=65 | 70..=78 | 80..=88 | 90..=94))
+		.ok_or_else(|| RecipeError::new(format!("NVIDIA PTX configuration {configured:?} is not a supported PTX version")))?;
+	// Compilation can run on a different machine from the opening GPU worker.
+	Ok(baseline.max(native_nvidia_ptx_floor(architecture)?))
+}
+
+fn validate_nvidia_ptx_feature(feature: &str, diagnostic: &str) -> Result<()> {
+	require(!diagnostic.lines().any(|line| line.contains(feature) && line.contains("ignoring feature")), format!("NVIDIA LLVM compiler does not support PTX feature {feature}"))
+}
+
+#[cfg(nvidia)]
+fn validate_nvidia_ptx_driver(architecture: &str, driver: u32) -> Result<()> {
+	// NVIDIA's PTX release history maps CUDA 12.5 and 12.6 to the same PTX 8.5 ceiling.
+	let releases = [
+		(13040, 94),
+		(13030, 93),
+		(13020, 92),
+		(13010, 91),
+		(13000, 90),
+		(12090, 88),
+		(12080, 87),
+		(12070, 86),
+		(12050, 85),
+		(12040, 84),
+		(12030, 83),
+		(12020, 82),
+		(12010, 81),
+		(12000, 80),
+		(11080, 78),
+		(11070, 77),
+		(11060, 76),
+		(11050, 75),
+		(11040, 74),
+		(11030, 73),
+		(11020, 72),
+		(11010, 71),
+		(11000, 70),
+		(10020, 65),
+		(10010, 64),
+		(10000, 63),
+		(9020, 62),
+		(9010, 61),
+		(9000, 60),
+		(8000, 50),
+		(7050, 43),
+		(7000, 42),
+		(6050, 41),
+		(6000, 40),
+		(5050, 32),
+	];
+	let ceiling = releases
+		.into_iter()
+		.find_map(|(release, ptx)| (driver >= release).then_some(ptx))
+		.ok_or_else(|| RecipeError::new(format!("NVIDIA driver CUDA {}.{} has no supported PTX version", driver / 1000, driver % 1000 / 10)))?;
+	let selected = native_nvidia_ptx_version(architecture)?;
+	require(
+		selected <= ceiling,
+		format!(
+			"NVIDIA target {architecture} requires PTX {}.{} with the configured baseline; driver CUDA {}.{} supports PTX at most {}.{}",
+			selected / 10,
+			selected % 10,
+			driver / 1000,
+			driver % 1000 / 10,
+			ceiling / 10,
+			ceiling % 10,
+		),
+	)
 }
 
 fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
@@ -8067,25 +8163,26 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let compiler = native_nvidia_compiler()?;
 			let codegen = native_nvidia_codegen().ok().filter(|path| Path::new(path).is_file());
 			let device = native_nvidia_device_library()?;
-			let ptx_version = native_nvidia_ptx_version()?;
+			let ptx_feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
 			let bitcode = output.with_extension("bc");
 			let mut command = Command::new(compiler);
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.arg("-Xclang").arg("-target-feature").arg("-Xclang").arg(ptx_version);
+				.arg(format!("--cuda-feature={ptx_feature}"));
 			if codegen.is_some() {
 				command.args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(&bitcode);
 			} else {
 				command.args(["-O2", "-S", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(output);
 			}
-			native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			let diagnostic = native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			validate_nvidia_ptx_feature(&ptx_feature, &diagnostic)?;
 			if let Some(codegen) = codegen {
 				let mut command = Command::new(codegen);
-				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
+				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_feature}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
 				let generated = native_command(command, "NVIDIA PTX code generator", key);
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
-				generated?;
+				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
@@ -25114,7 +25211,9 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				check(attribute(output, kind, device), action)?;
 			}
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
-			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
+			let architecture = format!("sm_{compute_major}{compute_minor}");
+			validate_nvidia_ptx_driver(&architecture, version.max(0) as u32)?;
+			let native_target = BackendTarget::Nvidia { architecture };
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda {
 				_runtime: runtime.clone(),
