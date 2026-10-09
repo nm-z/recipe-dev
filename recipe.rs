@@ -1844,6 +1844,7 @@ pub(crate) struct NativeArtifact {
 	pub(crate) path: PathBuf,
 	pub(crate) storage: StorageImage,
 	pub(crate) training: bool,
+	step: bool,
 	llvm: LlvmNames,
 	compile_seconds: f64,
 }
@@ -6950,7 +6951,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, nvidia_dp4a: bool, nvidia_widen: bool) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>, epoch: bool, nvidia_dp4a: bool, nvidia_widen: bool) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let substitute = |template: String, element: usize| {
 			template
@@ -7036,7 +7037,7 @@ impl NativeModelIr {
 				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
-		if let Some(loss) = loss {
+		if let Some(loss) = loss.filter(|_| epoch) {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = self.layout.gradient_bytes;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.layout.input_adjoint_precision.bytes(), "native input clear bytes")?;
@@ -8106,14 +8107,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	let compile_started = Instant::now();
+	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
 	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
-	let ir = model.emit(target.backend(), matrix, loss, dp4a, widen)?;
+	let ir = model.emit(target.backend(), matrix, loss, epoch, dp4a, widen)?;
+	let step = ir.lines().any(|line| line.starts_with("define ") && line.contains("@recipe_model_step("));
 	let llvm = llvm_names(&ir);
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
@@ -8154,7 +8157,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some(), llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: epoch, step, llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20486,7 +20489,7 @@ mod precision_contract_checks {
 		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
 		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
 		assert_eq!(tape.nodes[0].parameters, 2);
-		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false).unwrap();
+		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
 		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
 		tape.forward(ForwardMode::Inference).unwrap();
 		let output = tape.predictions().unwrap();
@@ -21145,7 +21148,9 @@ impl NativeTape {
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let inference = loss.is_none();
-		let program = gpu.native_program(graph, rows, precision, loss)?;
+		// Forward-only estimator prefixes preserve training semantics without an unused epoch entry.
+		let epoch = loss.is_some() && !targets.is_empty();
+		let program = gpu.native_program(graph, rows, precision, loss, epoch)?;
 		let mut resolutions = std::collections::BTreeSet::new();
 		for node in &graph.nodes {
 			let format = ContractFormat::of(node.precision, node.int_bits)?;
@@ -23326,6 +23331,8 @@ const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
 const REMOTE_MEMORY: u8 = 8;
 const REMOTE_CLEAR: u8 = 9;
+const REMOTE_NATIVE_EPOCH: u8 = 1;
+const REMOTE_NATIVE_STEP: u8 = 2;
 struct Wire<R: Read, W: Write> {
 	input: std::io::BufReader<R>,
 	output: std::io::BufWriter<W>,
@@ -23533,7 +23540,7 @@ impl Gpu {
 			Driver::Hsa(_) => Ok(()),
 		}
 	}
-	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
@@ -23700,7 +23707,7 @@ impl Gpu {
 			contractions,
 			attention,
 		};
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
+		let artifact = compile_model(&self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
 		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
 		let required = fixed
@@ -24379,7 +24386,7 @@ impl Hsa {
 	}
 
 	unsafe fn load_native(
-		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32,
+		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_step: bool, has_storage: bool, waves: u32,
 	) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 			require(!bytes.is_empty(), "native AMD artifact is empty")?;
@@ -24391,7 +24398,7 @@ impl Hsa {
 			driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
 			let forward = self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
 			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
-			let step = (!training).then(|| self.native_dispatch(executable.handle, bytes, element, step_waves, "recipe_model_step", NATIVE_FORWARD_LAYOUT)).transpose()?;
+			let step = has_step.then(|| self.native_dispatch(executable.handle, bytes, element, step_waves, "recipe_model_step", NATIVE_FORWARD_LAYOUT)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, bytes, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 			let kernarg_size = [Some(forward), step, epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
@@ -24437,7 +24444,7 @@ impl Cuda {
 	}
 
 	unsafe fn load_native(
-		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
+		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_step: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
 	) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
@@ -24451,7 +24458,7 @@ impl Cuda {
 			// residency is asked with that buffer and not one scaled to its own block.
 			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
 			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
-			program.step = (!training).then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
+			program.step = has_step.then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
 			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
 			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 			Ok((program, forward, epoch, model_load))
@@ -24591,7 +24598,7 @@ impl NativeProgram {
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
 				let (program, forward, epoch, model_load) =
-					unsafe { driver.load_native(&artifact.artifact, element, artifact.precision.epoch_layout, artifact.training, !artifact.storage.is_empty(), waves)? };
+					unsafe { driver.load_native(&artifact.artifact, element, artifact.precision.epoch_layout, artifact.training, artifact.step, !artifact.storage.is_empty(), waves)? };
 				(NativeBackend::Amd(program), forward, epoch, model_load)
 			}
 			#[cfg(nvidia)]
@@ -24602,6 +24609,7 @@ impl NativeProgram {
 						element,
 						artifact.precision.epoch_layout,
 						artifact.training,
+						artifact.step,
 						!artifact.storage.is_empty(),
 						waves,
 						schedule.shared_values,
@@ -24619,7 +24627,7 @@ impl NativeProgram {
 				channel.write_u32(schedule.shared_values)?;
 				channel.write_u32(register_values)?;
 				channel.write_u8(element)?;
-				channel.write_u8(u8::from(artifact.training))?;
+				channel.write_u8(if artifact.training { REMOTE_NATIVE_EPOCH } else { 0 } | if artifact.step { REMOTE_NATIVE_STEP } else { 0 })?;
 				channel.write_u8(u8::try_from(artifact.precision.state.bytes()).map_err(|_| RecipeError::new("native epoch state width exceeds wire width"))?)?;
 				channel.write_u8(u8::from(!artifact.storage.is_empty()))?;
 				channel.flush()?;
@@ -25141,7 +25149,10 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let shared_values = wire.read_u32()?;
 				let register_values = wire.read_u32()?;
 				let element = wire.read_u8()?;
-				let training = wire.read_u8()? != 0;
+				let entries = wire.read_u8()?;
+				require(entries <= REMOTE_NATIVE_STEP, "remote native entry flags are invalid")?;
+				let training = entries & REMOTE_NATIVE_EPOCH != 0;
+				let has_step = entries & REMOTE_NATIVE_STEP != 0;
 				let state_bytes = usize::from(wire.read_u8()?);
 				let has_storage = wire.read_u8()? != 0;
 				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>, NativeTemporaryFiles)> = match native_epoch_layout(state_bytes) {
@@ -25157,10 +25168,10 @@ pub fn worker_serve(name: &str) -> Result<()> {
 							Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load, temporary))
 						})(),
 						#[cfg(amd)]
-						Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
+						Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_step, has_storage, waves) }
 							.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
 						#[cfg(nvidia)]
-						Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
+						Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_step, has_storage, waves, shared_values, register_values) }
 							.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load, NativeTemporaryFiles { paths: Vec::new() })),
 						Driver::Remote(_) => Err(RecipeError::new("worker device driver is not native")),
 					},
