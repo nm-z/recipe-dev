@@ -18766,14 +18766,27 @@ impl Placed {
 		}
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
+			let window = (begin, end);
+			let traced = tracing();
+			let window_started = traced.then(Instant::now);
 			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
 				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize); }
 			})?;
-			let Some(next) = tapes.get(index + 1) else { break };
+			let window_seconds = window_started.map(|started| started.elapsed().as_secs_f64());
+			let Some(next) = tapes.get(index + 1) else {
+				if let Some(window_seconds) = window_seconds {
+					trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6}", tape.device_label()?, window.0, window.1))?;
+				}
+				break;
+			};
 			(begin, end) = tape.output_window(begin, end)?;
+			let hop_started = traced.then(Instant::now);
 			for (start, count) in window_runs(tape.output, begin, end) {
 				next.write_samples(start, &tape.output(start, count)?)?;
+			}
+			if let (Some(window_seconds), Some(hop_started)) = (window_seconds, hop_started) {
+				trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6} hop_seconds={:.6}", tape.device_label()?, window.0, window.1, hop_started.elapsed().as_secs_f64()))?;
 			}
 		}
 		last.predictions()
