@@ -14983,14 +14983,14 @@ impl LossFunction {
 impl Recipe {
 	/// The data a model reads: table, image and text sources, or one GGUF model
 	/// file, whose metadata the `gemma3.*` and `tokenizer.*` identifiers then
-	/// read and whose weights `recipe.infer` binds.
+	/// read and whose weights `recipe.infer` and `recipe.train` bind. A GGUF
+	/// file may accompany table sources, which then supply the rows.
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
-		let sources = sources.into_data_sources();
-		let models = sources.iter().filter(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))).collect::<Vec<_>>();
+		let (models, sources) = sources.into_data_sources().into_iter().partition::<Vec<String>, _>(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")));
 		let file = match models[..] {
 			[] => None,
-			[path] if sources.len() == 1 => Some(open_script_file(Path::new(path))),
-			_ => panic!("a GGUF model file is the only source of its data"),
+			[ref path] => Some(open_script_file(Path::new(path))),
+			_ => panic!("a data source names at most one GGUF model file"),
 		};
 		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
 	}
@@ -18616,7 +18616,8 @@ impl Graph {
 		if !self.nodes.iter().any(|node| node.int_bits != 0) {
 			return Ok(std::borrow::Cow::Borrowed(self));
 		}
-		let float = self.profile.train.ok_or_else(|| RecipeError::new("integer checkpoint blocks require an explicit train = fp16, bf16, fp32, or fp64 in the precision table"))?;
+		// A precision table without `train =` trains integer checkpoints in fp32.
+		let float = self.profile.train.unwrap_or(Compute::FP32);
 		require(matches!(float, Compute::FP16 | Compute::BF16 | Compute::FP32 | Compute::FP64), "integer checkpoint training requires a float compute format")?;
 		let mut graph = self.clone();
 		if float == Compute::FP64 { graph.profile.acc = Compute::FP64; }
@@ -18714,15 +18715,14 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// be the wrong shape for the projection's bias.
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
+		// The projection onto the targets is not in the file, so it takes random weights even when the file binds every model node.
+		let plan = graph.bound.take();
 		lower_conv(&mut graph, data.target_width, length)?;
+		graph.bound = plan;
 		output_profile = None;
 	}
 	if let Some(left) = graph.bound.take().filter(|plan| !plan.is_empty()) {
 		return Err(RecipeError::new(format!("the plan names {} more weights than the model has parameterized nodes, starting with {}", left.len(), left[0].names)));
-	}
-	for (index, values) in std::mem::take(&mut graph.bound_values) {
-		let (offset, parameters) = (graph.nodes[index].offset, graph.nodes[index].parameters);
-		graph.parameters[offset..offset + parameters].copy_from_slice(&values);
 	}
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
@@ -18736,6 +18736,11 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 				graph.parameters[offset + channel] = mean;
 			}
 		}
+	}
+	// Bound values land after initialization, so a file's weights are never replaced by random ones.
+	for (index, values) in std::mem::take(&mut graph.bound_values) {
+		let (offset, parameters) = (graph.nodes[index].offset, graph.nodes[index].parameters);
+		graph.parameters[offset..offset + parameters].copy_from_slice(&values);
 	}
 	// A frozen block keeps its initialized weights, so the mask lands after initialization.
 	for (offset, parameters) in graph.nodes.iter().filter(|node| node.frozen).map(|node| (node.offset, node.parameters)).collect::<Vec<_>>() {
@@ -28100,8 +28105,12 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 }
 impl Data {
 	fn report_path(&self) -> Result<String> {
-		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
-		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
+		// A GGUF-only source has no table, so its report names the opened model file.
+		let path = match (self.sources.first(), self.file.as_ref().and_then(|file| file.paths.first())) {
+			(Some(source), _) => fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?,
+			(None, Some(model)) => fs::canonicalize(model).map_err(|error| RecipeError::new(format!("cannot resolve report path {}: {error}", model.display())))?,
+			(None, None) => return Err(RecipeError::new("data source path is absent")),
+		};
 		Ok(format!("{}:{}", local_host()?, path.display()))
 	}
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
@@ -32164,7 +32173,7 @@ impl Train {
 			if let Some(estimator) = model.blocks.iter().find_map(first_estimator) {
 				return Err(RecipeError::new(format!("a RAT proposer cannot contain {}: estimators fit labeled rows, and a proposal has no labels", estimator.name)));
 			}
-			if data.autoregressive && data.sources.is_empty() {
+			if data.autoregressive && data.sources.is_empty() && data.file.is_none() {
 				return self.try_run_stateful_rat(model, data, command, started);
 			}
 			let prepared = prepare_command_data(data)?;
@@ -32174,7 +32183,19 @@ impl Train {
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
 		}
-		let prepared = prepare(data)?;
+		// A GGUF file in the data binds the model's weights; its rows still come from the table sources.
+		let bound = match &data.file {
+			Some(file) => Some(file.bound(&conventional_plan(file, &model.for_file(file))?)?),
+			None => None,
+		};
+		let owned;
+		let prepared = match bound {
+			Some(bound) => {
+				owned = Prepared { bound: Some(bound), ..prepare_data(data)? };
+				&owned
+			}
+			None => prepare(data)?,
+		};
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
 		let (gpus, mut config) = (selected_gpus()?, Config::load()?);

@@ -20,6 +20,10 @@ let data = recipe.data("measurements/")
 ```
 
 ```rust
+let data = recipe.data(["model.gguf", "rows.csv"]).target("next");
+```
+
+```rust
 data("path or file"|auto)
 	.set("additional")
 	.test("test set")
@@ -174,6 +178,8 @@ recipe.train()
 	.run(&model, &data);
 ```
 
+A GGUF file in the data sources binds the model's weights, and the table sources supply the rows. The projection onto the targets starts from random weights.
+
 ---
 
 chopping block boundry welcome to sloptown:
@@ -270,6 +276,8 @@ step = 32
 kv = "fp8"|"fp16"|"bf16"|"fp32"
 fp8 = "e4m3"|"e5m2"
 ```
+
+Integer checkpoints train in fp32 when the table omits `train`.
 
 ```bash
 RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run model.rs --device archy:nv0
