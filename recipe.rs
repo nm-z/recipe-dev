@@ -25790,7 +25790,7 @@ fn native_attention_shared_values(extent: Tile, whole: bool, inference: bool) ->
 		.checked_mul(2)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
 		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| extent.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
+		.and_then(|values| extent.m.checked_mul(2).and_then(|statistics| values.checked_add(statistics)));
 	let query_gradient = queries
 		.checked_mul(3)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
@@ -25823,7 +25823,7 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 		let query_values = queries.checked_mul(width).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let forward_fixed = query_values
 			.checked_mul(2)
-			.and_then(|values| queries.checked_mul(3).and_then(|statistics| values.checked_add(statistics)))
+			.and_then(|values| queries.checked_mul(2).and_then(|statistics| values.checked_add(statistics)))
 			.ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let forward_per_key = width.checked_add(queries).and_then(|values| values.checked_mul(2)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let query_gradient_fixed = query_values.checked_mul(3).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;

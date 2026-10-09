@@ -5078,7 +5078,6 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base, i1
 %accumulator.base.shared = add i32 %probability.base.shared, %score.values
 %maximum.base.shared = add i32 %accumulator.base.shared, %query.values
 %denominator.base.shared = add i32 %maximum.base.shared, %tile.m
-%rescale.base.shared = add i32 %denominator.base.shared, %tile.m
 %online.global = mul i32 %group, %block
 %online.id = add i32 %online.global, %lid
 %online.cache.channels = add i32 %kv.channels, %value.channels
@@ -5372,40 +5371,17 @@ maximum.load:
 %maximum.index = add i32 %maximum.base.shared, %softmax.query
 %maximum.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %maximum.index
 %maximum.old = load double, ptr addrspace(3) %maximum.ptr, align 8
-br label %maximum.loop
-maximum.loop:
-%maximum.key = phi i32 [ 0, %maximum.load ], [ %maximum.key.next, %maximum.step ]
-%maximum.value = phi double [ %maximum.old, %maximum.load ], [ %maximum.next, %maximum.step ]
-%maximum.more = icmp ult i32 %maximum.key, %key.count
-br i1 %maximum.more, label %maximum.step, label %probability.prepare
-maximum.step:
-%maximum.score.row = mul i32 %softmax.query, %tile.n
-%maximum.score.local = add i32 %maximum.score.row, %maximum.key
-%maximum.score.index = add i32 %score.base.shared, %maximum.score.local
-%maximum.score.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %maximum.score.index
-%maximum.score = load double, ptr addrspace(3) %maximum.score.ptr, align 8
-%maximum.larger = call i1 @recipe.ogt(double %maximum.score, double %maximum.value)
-%maximum.next = select i1 %maximum.larger, double %maximum.score, double %maximum.value
-%maximum.key.next = add i32 %maximum.key, 1
-br label %maximum.loop
-probability.prepare:
 %denominator.index = add i32 %denominator.base.shared, %softmax.query
 %denominator.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %denominator.index
 %denominator.old = load double, ptr addrspace(3) %denominator.ptr, align 8
-; A query whose admitted keys all lie in later tiles has no score yet, so its
-; maximum is still the initial negative infinity. Centering on zero instead
-; keeps its rescale and probabilities at zero rather than exp(-inf - -inf).
-%maximum.scored = call i1 @recipe.ogt(double %maximum.value, double 0xFFF0000000000000)
-%maximum.safe = select i1 %maximum.scored, double %maximum.value, double 0.0
-%maximum.old.centered = call double @recipe.sub(double %maximum.old, double %maximum.safe)
-%old.rescale = call double @recipe.exp(double %maximum.old.centered)
-%denominator.old.wide = call RECIPE_STATE @recipe.decode(double %denominator.old)
-%old.rescale.wide = call RECIPE_STATE @recipe.decode(double %old.rescale)
-%denominator.rescaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %denominator.old.wide, RECIPE_STATE %old.rescale.wide)
+; Fold keys in sequence order, including each rescale and storage rounding.
+; Physical tile boundaries only determine staging, not arithmetic grouping.
+; Once consumed, a score slot carries that key's rescale for the value fold.
 br label %probability.loop
 probability.loop:
-%probability.key = phi i32 [ 0, %probability.prepare ], [ %probability.key.next, %probability.step ]
-%denominator.value = phi RECIPE_STATE [ %denominator.rescaled, %probability.prepare ], [ %denominator.next, %probability.step ]
+%probability.key = phi i32 [ 0, %maximum.load ], [ %probability.key.next, %probability.step ]
+%maximum.value = phi double [ %maximum.old, %maximum.load ], [ %maximum.next, %probability.step ]
+%denominator.value = phi double [ %denominator.old, %maximum.load ], [ %denominator.next.model, %probability.step ]
 %probability.more = icmp ult i32 %probability.key, %key.count
 br i1 %probability.more, label %probability.step, label %softmax.store
 probability.step:
@@ -5414,22 +5390,29 @@ probability.step:
 %probability.score.index = add i32 %score.base.shared, %probability.local
 %probability.score.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.score.index
 %probability.score = load double, ptr addrspace(3) %probability.score.ptr, align 8
+%maximum.larger = call i1 @recipe.ogt(double %probability.score, double %maximum.value)
+%maximum.next = select i1 %maximum.larger, double %probability.score, double %maximum.value
+%maximum.scored = call i1 @recipe.ogt(double %maximum.next, double 0xFFF0000000000000)
+%maximum.safe = select i1 %maximum.scored, double %maximum.next, double 0.0
+%maximum.old.centered = call double @recipe.sub(double %maximum.value, double %maximum.safe)
+%old.rescale = call double @recipe.exp(double %maximum.old.centered)
+store double %old.rescale, ptr addrspace(3) %probability.score.ptr, align 8
 %probability.centered = call double @recipe.sub(double %probability.score, double %maximum.safe)
 %probability.value = call double @recipe.exp(double %probability.centered)
 %probability.index = add i32 %probability.base.shared, %probability.local
 %probability.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %probability.index
 store double %probability.value, ptr addrspace(3) %probability.ptr, align 8
+%denominator.old.wide = call RECIPE_STATE @recipe.decode(double %denominator.value)
+%old.rescale.wide = call RECIPE_STATE @recipe.decode(double %old.rescale)
+%denominator.rescaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %denominator.old.wide, RECIPE_STATE %old.rescale.wide)
 %probability.wide = call RECIPE_STATE @recipe.decode(double %probability.value)
-%denominator.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.value, RECIPE_STATE %probability.wide)
+%denominator.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %denominator.rescaled, RECIPE_STATE %probability.wide)
+%denominator.next.model = call double @recipe.encode(RECIPE_STATE %denominator.next)
 %probability.key.next = add i32 %probability.key, 1
 br label %probability.loop
 softmax.store:
-%denominator.model = call double @recipe.encode(RECIPE_STATE %denominator.value)
 store double %maximum.value, ptr addrspace(3) %maximum.ptr, align 8
-store double %denominator.model, ptr addrspace(3) %denominator.ptr, align 8
-%rescale.index = add i32 %rescale.base.shared, %softmax.query
-%rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %rescale.index
-store double %old.rescale, ptr addrspace(3) %rescale.ptr, align 8
+store double %denominator.value, ptr addrspace(3) %denominator.ptr, align 8
 %softmax.query.next = add i32 %softmax.query, %block
 br label %softmax.loop
 softmax.done:
@@ -5445,14 +5428,10 @@ accumulate.prepare:
 %accumulate.index = add i32 %accumulator.base.shared, %accumulate.p
 %accumulate.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.index
 %accumulate.old = load double, ptr addrspace(3) %accumulate.ptr, align 8
-%accumulate.rescale.index = add i32 %rescale.base.shared, %accumulate.query
-%accumulate.rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.rescale.index
-%accumulate.rescale = load double, ptr addrspace(3) %accumulate.rescale.ptr, align 8
-%accumulate.initial = call double @recipe.mul(double %accumulate.old, double %accumulate.rescale)
 br label %accumulate.key.loop
 accumulate.key.loop:
 %accumulate.key = phi i32 [ 0, %accumulate.prepare ], [ %accumulate.key.next, %accumulate.key.step ]
-%accumulate.value = phi double [ %accumulate.initial, %accumulate.prepare ], [ %accumulate.next, %accumulate.key.step ]
+%accumulate.value = phi double [ %accumulate.old, %accumulate.prepare ], [ %accumulate.next, %accumulate.key.step ]
 %accumulate.key.more = icmp ult i32 %accumulate.key, %key.count
 br i1 %accumulate.key.more, label %accumulate.key.step, label %accumulate.store
 accumulate.key.step:
@@ -5467,7 +5446,11 @@ accumulate.key.step:
 %accumulate.value.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.value.index
 %accumulate.v = load double, ptr addrspace(3) %accumulate.value.ptr, align 8
 %accumulate.weighted = call double @recipe.mul(double %accumulate.probability, double %accumulate.v)
-%accumulate.next = call double @recipe.add(double %accumulate.value, double %accumulate.weighted)
+%accumulate.rescale.index = add i32 %score.base.shared, %accumulate.probability.local
+%accumulate.rescale.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %accumulate.rescale.index
+%accumulate.rescale = load double, ptr addrspace(3) %accumulate.rescale.ptr, align 8
+%accumulate.rescaled = call double @recipe.mul(double %accumulate.value, double %accumulate.rescale)
+%accumulate.next = call double @recipe.add(double %accumulate.rescaled, double %accumulate.weighted)
 %accumulate.key.next = add i32 %accumulate.key, 1
 br label %accumulate.key.loop
 accumulate.store:
