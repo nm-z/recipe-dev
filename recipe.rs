@@ -17023,6 +17023,10 @@ impl Gguf {
 #[derive(Clone, Default)]
 pub struct Binding {
 	tensors: BTreeSet<String>,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`.
+	defaulted: Vec<String>,
+	/// Tensors of the file that no node reads.
+	unread: Vec<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
@@ -17032,6 +17036,11 @@ pub struct Binding {
 pub(crate) enum Plane {
 	Mapped(GgufTensor),
 	Owned { name: String, values: Vec<f64> },
+}
+impl From<GgufTensor> for Plane {
+	fn from(tensor: GgufTensor) -> Self {
+		Self::Mapped(tensor)
+	}
 }
 impl Plane {
 	fn elements(&self) -> usize {
@@ -17058,6 +17067,13 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// Tensors bound as zeros or ones, as `zeros: name (why)`.
+	pub fn defaulted(&self) -> &[String] { &self.defaulted }
+	/// Tensors of the file that no node reads.
+	pub fn unread(&self) -> &[String] { &self.unread }
+	fn mark_unread(&mut self, file: &Gguf) {
+		self.unread = file.tensors().iter().filter(|tensor| !self.tensors.contains(&tensor.name)).map(|tensor| tensor.name.clone()).collect();
+	}
 	/// The plan as text, one line per node naming each plane and its element count.
 	pub fn listing(&self) -> Vec<String> {
 		self.nodes.iter().enumerate().map(|(index, planes)| format!("node {index}: {}", planes.iter().map(|plane| format!("{}[{}]", plane.name(), plane.elements())).collect::<Vec<_>>().join(" "))).collect()
@@ -17568,8 +17584,7 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+		builder.plan.mark_unread(file);
 		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
@@ -17702,9 +17717,18 @@ impl<'a> Builder<'a> {
 		self.plan.tensors.insert(name.to_owned());
 		Some(tensor)
 	}
+	/// Record a tensor that binds as `kind` values: the file lacks `name`, or stores it in another shape than `expected`.
+	fn default_note(&mut self, name: &str, kind: &str, expected: &str) {
+		let why = match self.file.tensor(name) {
+			Some(tensor) => format!("shape {:?}, expected {expected}", tensor.shape),
+			None => "absent".to_owned(),
+		};
+		let note = format!("{kind}: {name} ({why})");
+		if !self.plan.defaulted.contains(&note) { self.plan.defaulted.push(note); }
+	}
 	/// The next parameterized node, filled from mapped views.
-	fn mapped(&mut self, planes: Vec<GgufTensor>) {
-		self.slot(planes.into_iter().map(Plane::Mapped).collect());
+	fn mapped<T: Into<Plane>>(&mut self, planes: Vec<T>) {
+		self.slot(planes.into_iter().map(Into::into).collect());
 	}
 	fn slot(&mut self, planes: Vec<Plane>) {
 		self.plan.nodes.push(planes);
@@ -17715,21 +17739,25 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![tensor]);
 		Ok(())
 	}
-	/// A projection `[inputs, outputs]` of the given name, checked against the
-	/// widths the node contracts over.
-	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
-		let tensor = self.tensor(name, role)?;
-		require(
-			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
-			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
-		)?;
-		Ok(tensor)
+	/// A projection `[inputs, outputs]` of the given name. A tensor the file lacks,
+	/// or stores in another shape, binds as zeros: the node takes its default
+	/// parameters and the rest of the model still runs.
+	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<Plane> {
+		match self.optional(name).filter(|tensor| tensor.shape == [inputs as u64, outputs as u64]) {
+			Some(tensor) => Ok(Plane::Mapped(tensor)),
+			None => {
+				self.default_note(name, "zeros", &format!("[{inputs}, {outputs}]"));
+				Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] })
+			}
+		}
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
-		let tensor = self.tensor(name, role)?;
-		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
+		let Some(tensor) = self.optional(name).filter(|tensor| tensor.elements() == width) else {
+			self.default_note(name, "ones", &format!("{width} elements"));
+			return Ok(vec![Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![1.0; width] }; groups]);
+		};
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
 			return Ok(vec![Plane::Mapped(tensor); groups]);
 		}
@@ -17747,11 +17775,19 @@ impl<'a> Builder<'a> {
 	}
 	/// The rows of one head at `base`, as one view when they are read in place
 	/// and as one view per row otherwise.
-	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
+	fn head_rows(weight: &Plane, base: usize, order: &[usize], inputs: usize) -> Result<Vec<Plane>> {
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?.view()?]);
+			return Ok(vec![Self::rows_of(weight, base, order.len(), inputs)?]);
 		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
+		order.iter().map(|channel| Self::rows_of(weight, base + channel, 1, inputs)).collect()
+	}
+	/// The `count` rows from `base` of a projection that reads `inputs` values per
+	/// row. A defaulted projection holds zeros of that span.
+	fn rows_of(weight: &Plane, base: usize, count: usize, inputs: usize) -> Result<Plane> {
+		match weight {
+			Plane::Mapped(tensor) => Ok(Plane::Mapped(tensor.rows(base, count)?.view()?)),
+			Plane::Owned { name, .. } => Ok(Plane::Owned { name: name.clone(), values: vec![0.0; checked_mul(count, inputs, "projection rows")?] }),
+		}
 	}
 	/// The values of an attention projection bias row, or zeros when the file holds none.
 	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
@@ -17855,7 +17891,7 @@ impl<'a> Builder<'a> {
 		let role = format!("block {layer} delta");
 		let alpha = self.projection(&named.alpha, &role, width, heads)?;
 		let beta = self.projection(&named.beta, &role, width, heads)?;
-		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
+		let mut gates = vec![alpha, beta];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
 		if let Some(decay_bias) = named.decay_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
@@ -18444,6 +18480,8 @@ impl Infer {
 		gguf.print(self.log.iter().map(|metric| metric.0).chain(self.chat.iter().flatten().map(|metric| metric.0)))?;
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let bound = explicit_bound(&file, model, !self.score)?;
+		for note in bound.plan.defaulted() { eprintln!("bound as {note}"); }
+		for name in bound.plan.unread() { eprintln!("unread: {name}"); }
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -18582,6 +18620,8 @@ impl Infer {
 			memory: placed.memory_report()?,
 			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
 			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
+			defaulted: ReportLines::new(bound.plan.defaulted().iter().cloned()),
+			unread: ReportLines::new(bound.plan.unread().iter().cloned()),
 			links: placed.link_report()?,
 			aot: placed.aot_report()?,
 			tiles: placed.tile_report()?,
@@ -18720,8 +18760,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
 	builder.plan_model(model)?;
-	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+	builder.plan.mark_unread(file);
 	Ok(builder.plan)
 }
 /// Resolve optional source planes inside the model builder. The user declares
@@ -18754,8 +18793,8 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 		}
 	}
 }
-/// A branch that mixes positions starts a GGUF block; its feed-forward reads
-/// the tensors at the same block index.
+/// A branch that mixes positions is the attention of a GGUF block; its
+/// feed-forward is the block's other branch, in either order.
 fn mixes(parts: &[Block]) -> bool {
 	parts.iter().any(|part| match &part.operation {
 		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
@@ -18770,7 +18809,8 @@ impl Builder<'_> {
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		let (mut lanes, mut rank) = (0, 0);
+		let (mut mixers, mut feeds) = (0, 0);
 		for block in &model.blocks {
 			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
 				self.head_planes(lanes, rank, width)?;
@@ -18789,10 +18829,9 @@ impl Builder<'_> {
 					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _, _) => {
+					// A block holds one mixing and one feed-forward branch in either order, so each kind numbers its own blocks.
 					let attends = mixes(parts);
-					if attends { layers += 1; }
-					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
-					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
+					let (part, layer) = if attends { mixers += 1; ("attn", mixers - 1) } else { feeds += 1; ("ffn", feeds - 1) };
 					if let Operation::Hyper(count, bottleneck, _, _, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
@@ -18803,8 +18842,8 @@ impl Builder<'_> {
 				Operation::Layer(outputs) => {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
 					require(!block.has_normalization(), "a normalization after the vocabulary projection has no tensor name")?;
-					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
-					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
+					let output = if self.file.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+					let output = self.projection(output, "the vocabulary projection", width, vocabulary)?;
 					self.mapped(vec![output]);
 				}
 				Operation::Identity | Operation::Last => {}
@@ -18946,9 +18985,9 @@ impl Builder<'_> {
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
 		for head in 0..index.heads {
-			planes.extend(Self::head_rows(&query, head * index.width, &order)?);
+			planes.extend(Self::head_rows(&query, head * index.width, &order, width)?);
 		}
-		planes.extend(Self::head_rows(&key, 0, &order)?);
+		planes.extend(Self::head_rows(&key, 0, &order, width)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
 			let mut scales = self.scale(&named.q_norm, &role, index.width, index.heads, &order)?;
@@ -18959,9 +18998,14 @@ impl Builder<'_> {
 	}
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
-		let tensor = self.tensor(name, "a normalization")?;
-		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
+			Some(tensor) => Plane::Mapped(tensor),
+			None => {
+				self.default_note(name, "ones", &format!("{width} elements"));
+				Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] }
+			}
+		};
+		self.slot(vec![plane]);
 		Ok(())
 	}
 	/// The planes of a composed attention block: its query, key and value
@@ -18983,24 +19027,21 @@ impl Builder<'_> {
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
 		let key = self.projection(&named.k, &role, width, kv * head)?;
-		let value = match named.v.as_deref().and_then(|value_name| self.optional(value_name)) {
-			Some(value) => {
-				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-				value
-			}
-			None => key.clone(),
+		let value = match named.v.as_deref() {
+			Some(value_name) if self.file.tensor(value_name).is_some() => self.projection(value_name, &role, width, kv * head)?,
+			_ => key.clone(),
 		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.extend(Self::head_rows(&Plane::Mapped(query.clone()), index * stride, &order, width)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.extend(Self::head_rows(&key, index * head, &order, width)?);
 		}
 		planes.push(value);
-		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		let mut slot = planes;
 		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
 		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
 			// The bias row follows the matrix rows, in the order the planes read them.
@@ -19026,9 +19067,14 @@ impl Builder<'_> {
 		}
 		if attention.factors {
 			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
-			let factors = self.tensor(factors_name, &role)?;
-			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
-			self.mapped(vec![factors]);
+			let factors = match self.optional(factors_name).filter(|tensor| tensor.elements() == rope_dims / 2) {
+				Some(factors) => Plane::Mapped(factors),
+				None => {
+					self.default_note(factors_name, "ones", &format!("{} elements", rope_dims / 2));
+					Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] }
+				}
+			};
+			self.slot(vec![factors]);
 		}
 		if let Some(index) = attention.index {
 			let indexer = named.indexer.clone().ok_or_else(|| RecipeError::new(format!("{role} indexes tokens, and names no indexer tensors")))?;
@@ -19266,6 +19312,10 @@ pub struct InferenceReport {
 	pub dead_buffers: usize,
 	/// Dead storage bytes already included in the reported memory allocations.
 	pub dead_bytes: usize,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`; empty for a model the file describes.
+	pub defaulted: ReportLines,
+	/// Tensors of the file that no node reads; empty for a model the file describes.
+	pub unread: ReportLines,
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
