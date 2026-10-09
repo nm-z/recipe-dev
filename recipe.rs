@@ -4447,16 +4447,6 @@ impl NativeModelIr {
 				ir.push_str(&format!("{BLOCK_MARK}{}\n", plan.node.block_index));
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
-			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
-				let pointer = pointer_type(backend);
-				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.slot = select i1 %clk.n{index}.zero, i64 {at}, i64 {trash}\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 %clk.n{index}.slot\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\n",
-					at = clocks + index * 8,
-					// Every other thread stores to one spare slot past the nodes, so no branch
-					// parts thread 0 from its wave before a node that meets a barrier.
-					trash = clocks + self.graph.nodes.len().max(1) * 8
-				));
-			}
 			let node = &plan.node;
 			let v = self.variant(node);
 			// The run decoder a packed sum over stored weights calls, when it has one.
@@ -5944,6 +5934,16 @@ impl NativeModelIr {
 						ir.push_str(barrier(backend));
 					}
 				}
+			}
+			// Each forward primitive has completed its node-ending grid barrier.
+			// Stamp that boundary, so neighboring clock slots enclose one node's
+			// work rather than the next node's entry or the prior node's tail.
+			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
+				let pointer = pointer_type(backend);
+				ir.push_str(&format!(
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+					at = clocks + index * 8
+				));
 			}
 			if reverse {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
@@ -10661,12 +10661,18 @@ mod tokenizer {
 		/// when the model asks for them. Added tokens written out in the text are
 		/// matched whole, longest first, before the pre-tokenizer sees the rest.
 		pub fn encode(&self, text: &str) -> Vec<u32> {
-			let mut output = self.bos.filter(|_| self.add_bos).into_iter().collect::<Vec<_>>();
+			self.encode_words(text).into_iter().flatten().collect()
+		}
+		/// `encode` with the ids grouped by word. The beginning- and end-of-sequence
+		/// ids and each added token form a group of their own, and each pre-tokenizer
+		/// word of the plain text forms one group.
+		pub fn encode_words(&self, text: &str) -> Vec<Vec<u32>> {
+			let mut output = self.bos.filter(|_| self.add_bos).map(|id| vec![id]).into_iter().collect::<Vec<_>>();
 			let (mut start, mut at) = (0, 0);
 			while at < text.len() {
 				if let Some((added, id)) = self.added.iter().find(|(added, _)| text[at..].starts_with(added.as_str())) {
 					self.encode_plain(&text[start..at], &mut output);
-					output.push(*id);
+					output.push(vec![*id]);
 					at += added.len();
 					start = at;
 				} else {
@@ -10674,7 +10680,7 @@ mod tokenizer {
 				}
 			}
 			self.encode_plain(&text[start..], &mut output);
-			output.extend(self.eos.filter(|_| self.add_eos));
+			output.extend(self.eos.filter(|_| self.add_eos).map(|id| vec![id]));
 			output
 		}
 		/// The rank and id of the piece that joins `left` to `right`, the lowest
@@ -10689,7 +10695,7 @@ mod tokenizer {
 			};
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
-		fn encode_plain(&self, text: &str, output: &mut Vec<u32>) {
+		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
 			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
@@ -10707,7 +10713,7 @@ mod tokenizer {
 				if self.family == Family::Llama3
 					&& let Some(id) = self.ids.get(&word.bytes().map(|byte| self.byte_of_token(byte)).collect::<String>()).filter(|id| !self.is_added[**id as usize])
 				{
-					output.push(*id);
+					output.push(vec![*id]);
 					continue;
 				}
 				while let Some((index, merged)) = (0..symbols.len().saturating_sub(1))
@@ -10718,7 +10724,9 @@ mod tokenizer {
 					symbols[index] = merged;
 					symbols.remove(index + 1);
 				}
-				output.extend(symbols);
+				if !symbols.is_empty() {
+					output.push(symbols);
+				}
 			}
 		}
 		fn byte_of_token(&self, byte: u8) -> char {
@@ -16795,8 +16803,10 @@ pub struct Bound {
 	vocabulary: usize,
 }
 /// Resolve an explicit user declaration before assigning checkpoint planes.
-fn explicit_bound(file: &Gguf, model: &Model) -> Result<Bound> {
-	let model = with_last_projection(model).for_file(file);
+/// Binds `model` to `file`. A scored pass keeps the projection over every
+/// position, so `last_position` is false there.
+fn explicit_bound(file: &Gguf, model: &Model, last_position: bool) -> Result<Bound> {
+	let model = if last_position { with_last_projection(model) } else { model.clone() }.for_file(file);
 	let plan = conventional_plan(file, &model)?;
 	Ok(Bound { file: file.clone(), blocks: model.blocks.len(), tensors: plan.tensors.len(), vocabulary: 0, model, plan })
 }
@@ -17672,6 +17682,8 @@ pub struct Infer {
 	tokens: Option<usize>,
 	chat: Option<Vec<ChatMetric>>,
 	positions: Option<Vec<u32>>,
+	score: bool,
+	scored_ids: Option<Vec<u32>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -17700,7 +17712,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None, positions: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false, scored_ids: None }
 	}
 }
 impl Infer {
@@ -17709,13 +17721,26 @@ impl Infer {
 	pub fn place(&self, model: &Model, data: &Data, positions: usize, split: &[usize]) -> Placed {
 		let result = (|| -> Result<Placed> {
 			let file = data.file.as_ref().ok_or_else(|| RecipeError::new("inference placement requires GGUF data"))?;
-			let bound = explicit_bound(file, model)?;
+			let bound = explicit_bound(file, model, true)?;
 			selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices))
 		})();
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Supplies each prompt token's rotary axes. Generated tokens continue after the largest preceding axis.
 	pub fn positions(mut self, positions: impl AsRef<[u32]>) -> Self { self.positions = Some(positions.as_ref().to_vec()); self }
+	/// Scores the input text in one teacher-forced pass and reports its token and
+	/// word log probabilities in `InferenceReport::score`, instead of generating a
+	/// reply. The text is tokenized as written, without the chat template.
+	pub fn score(mut self) -> Self {
+		self.score = true;
+		self
+	}
+	/// Scores the given token ids in place of text. The ids must be exactly what the tokenizer produces for their decoded text, so the words match the text's word boundaries.
+	pub fn score_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
+		self.score = true;
+		self.scored_ids = Some(ids.as_ref().to_vec());
+		self
+	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -17740,7 +17765,7 @@ impl Infer {
 		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
-		let bound = explicit_bound(&file, model)?;
+		let bound = explicit_bound(&file, model, !self.score)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -17752,8 +17777,22 @@ impl Infer {
 		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
 		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
+		let scored = if self.score {
+			Some(match &self.scored_ids {
+				Some(ids) => token_groups(&coder, ids)?,
+				None => {
+					let text = supplied.as_deref().or(message.as_deref()).ok_or_else(|| RecipeError::new("scoring needs a text: pass -p <text> or set RNJ_PROMPT_FILE"))?;
+					coder.encode_words(text)
+				}
+			})
+		} else {
+			None
+		};
+		// A scored text needs only its own positions, so its output stays as small as the text.
+		let scored_positions = scored.as_ref().map_or(0, |groups| groups.iter().map(Vec::len).sum::<usize>());
 		let sequence = match requested {
 			Some(context) => context,
+			None if scored.is_some() => scored_positions,
 			None if devices.len() == 1 => fitting_context(&file, &bound.model, &bound.plan, devices[0], ceiling, tensor_observation_mask(&self.log))?,
 			None => ceiling,
 		};
@@ -17765,7 +17804,12 @@ impl Infer {
 		let device_names = memory.iter().map(|part| part.device.as_str()).collect::<Vec<_>>().join(".");
 		let mut conversation: Vec<(String, String)> = Vec::new();
 		let mut request_history = Vec::new();
+		let mut score = None;
 		loop {
+			if let Some(groups) = &scored {
+				score = Some(score_groups(&placed, &coder, groups, sequence)?);
+				break;
+			}
 			let start_progress = |started| {
 				(!metrics.is_empty()).then(|| InferenceLive::new(InferenceProgress { phase: "prompt", started: Some(started), context: sequence, devices: device_names.clone(), memory: memory.clone(), ..Default::default() }, metrics.clone()))
 			};
@@ -17857,8 +17901,27 @@ impl Infer {
 			requests: request_history.len(),
 			last: request_history.last().cloned().unwrap_or_default(),
 			history: request_history,
+			score,
 		})
 	}
+}
+/// The word groups of `ids`: the tokenizer must reproduce the ids from their
+/// decoded text, with or without the leading beginning-of-sequence id.
+fn token_groups(coder: &Tokenizer, ids: &[u32]) -> Result<Vec<Vec<u32>>> {
+	let groups = coder.encode_words(&coder.decode(ids));
+	let encoded = groups.concat();
+	let reproduced = encoded == ids || coder.bos().is_some_and(|bos| ids.first() == Some(&bos) && encoded.get(1..) == Some(ids) && encoded.first() == Some(&bos));
+	require(reproduced, "token ids do not round-trip through the tokenizer; pass the text instead")?;
+	Ok(if encoded == ids { groups } else { groups.into_iter().skip(1).collect() })
+}
+/// Runs `groups` once with no generation and scores every id after the first
+/// from the logits of the position before it.
+fn score_groups(placed: &Placed, coder: &Tokenizer, groups: &[Vec<u32>], sequence: usize) -> Result<TextScore> {
+	let ids = groups.concat();
+	require(ids.len() <= sequence, format!("{} scored tokens exceed the {sequence} context positions", ids.len()))?;
+	let generation = placed.decode_observed(&ids, &mut recipe.sampler().temperature(0.0), &[], 0, None, |_| Ok(()))?;
+	let output = placed.output_shape()?;
+	TextScore::from_logits(&generation.logits, output.channels, output.length, groups, |ids| coder.decode(ids))
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
 /// template closes an assistant turn with.
@@ -18372,6 +18435,8 @@ pub struct InferenceReport {
 	pub requests: usize,
 	/// Completed requests in execution order, retained across `/clear`.
 	pub history: Vec<Arc<InferenceRequest>>,
+	/// Teacher-forced log probabilities of the scored text, set by `Infer::score`.
+	pub score: Option<TextScore>,
 	last: Arc<InferenceRequest>,
 }
 impl std::ops::Deref for InferenceReport {
@@ -18398,6 +18463,75 @@ pub struct InferenceRequest {
 impl InferenceRequest {
 	pub fn pp(&self) -> f64 { if self.pp_seconds == 0.0 { 0.0 } else { self.input.saturating_sub(self.cached) as f64 / self.pp_seconds } }
 	pub fn tg(&self) -> f64 { if self.tg_seconds == 0.0 { 0.0 } else { self.out as f64 / self.tg_seconds } }
+}
+/// Teacher-forced log probabilities of one text, from `InferenceReport::score`.
+pub struct TextScore {
+	/// One entry per token after the first, in text order.
+	pub tokens: Vec<TokenScore>,
+	/// One entry per word that holds a scored token, in text order.
+	pub words: Vec<WordScore>,
+	/// Sum of the scored tokens' log probabilities.
+	pub logprob: f64,
+	/// `exp` of the negative mean of the scored tokens' log probabilities.
+	pub perplexity: f64,
+}
+/// One scored token of a text.
+pub struct TokenScore {
+	pub id: u32,
+	/// The token's text, decoded on its own.
+	pub piece: String,
+	/// Natural log of the token's probability given every earlier token.
+	pub logprob: f64,
+	/// One plus the number of vocabulary entries whose logit is strictly higher.
+	pub rank: usize,
+}
+/// The scored tokens of one tokenizer word.
+pub struct WordScore {
+	pub text: String,
+	/// Scored tokens in the word. The first token of a text has no score.
+	pub tokens: usize,
+	/// Sum of the word's scored token log probabilities.
+	pub logprob: f64,
+}
+impl TextScore {
+	/// Scores `groups` from teacher-forced `logits`, stored channel-major with
+	/// `positions` entries per channel. Position `p` predicts the id after it.
+	pub fn from_logits(logits: &[f64], channels: usize, positions: usize, groups: &[Vec<u32>], text: impl Fn(&[u32]) -> String) -> Result<Self> {
+		let ids = groups.concat();
+		require(ids.len() >= 2, "scoring needs at least two tokens")?;
+		require(ids.len() <= positions, format!("{} scored tokens exceed {positions} output positions", ids.len()))?;
+		require(logits.len() >= channels * positions, format!("native output has {} values, expected at least {}", logits.len(), channels * positions))?;
+		let mut tokens = Vec::with_capacity(ids.len() - 1);
+		for position in 0..ids.len() - 1 {
+			let id = ids[position + 1];
+			require((id as usize) < channels, format!("token id {id} is outside the {channels} output channels"))?;
+			let column = (0..channels).map(|channel| logits[channel * positions + position]).collect::<Vec<_>>();
+			require(column.iter().all(|value| value.is_finite()), format!("nonfinite logit at position {position}"))?;
+			let max = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+			let sum = column.iter().map(|value| (value - max).exp()).sum::<f64>();
+			let target = column[id as usize];
+			tokens.push(TokenScore {
+				id,
+				piece: text(&ids[position + 1..position + 2]),
+				logprob: target - (max + sum.ln()),
+				rank: 1 + column.iter().filter(|value| **value > target).count(),
+			});
+		}
+		let mut words = Vec::new();
+		let mut start = 0;
+		for group in groups {
+			let end = start + group.len();
+			let first = start.max(1);
+			if end > first {
+				let logprob = tokens[first - 1..end - 1].iter().map(|token| token.logprob).sum();
+				words.push(WordScore { text: text(group), tokens: end - first, logprob });
+			}
+			start = end;
+		}
+		let logprob = tokens.iter().map(|token| token.logprob).sum::<f64>();
+		let perplexity = (-logprob / tokens.len() as f64).exp();
+		Ok(Self { tokens, words, logprob, perplexity })
+	}
 }
 /// Measured inference state passed to the model script's live formatter.
 #[derive(Clone, Default)]
@@ -19330,6 +19464,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_qk_precision: None,
 		block_rope_precision: None,
 		profile: graph.profile,
+		config: graph.config,
 		bound: None,
 		bound_values: Vec::new(),
 		bias: graph.bias,
@@ -20069,6 +20204,10 @@ impl Placed {
 		})?;
 		if last_only { last.last_column() } else { last.predictions() }
 	}
+	fn output_shape(&self) -> Result<Shape> {
+		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		Ok(tape.output)
+	}
 	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		tape.last_logits(predictions, begin, end)
@@ -20390,6 +20529,8 @@ struct Graph {
 	block_rope_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
+	/// The run configuration used when a newly pushed integer sum needs storage conversion.
+	config: Option<Config>,
 	/// The weights still to bind while a graph compiles over mapped tensors:
 	/// each parameterized node takes the front entry as it is pushed.
 	bound: Option<std::collections::VecDeque<BoundNode>>,
@@ -20428,6 +20569,7 @@ impl Graph {
 			block_qk_precision: None,
 			block_rope_precision: None,
 			profile: Precisions::default(),
+			config: None,
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
@@ -20513,6 +20655,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.profile = config.profile;
+	graph.config = Some(config);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
@@ -20763,6 +20906,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let mut parameter = 0;
 		for index in first..graph.nodes.len() {
 			let node = &mut graph.nodes[index];
+			if node.int_bits != 0 { continue; }
 			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				let format = if profile { StorageFormat(quantization).tensor(role, more, false) } else { quantization };
@@ -20772,55 +20916,56 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			}
 		}
 	}
+	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
+	narrow(elements, "GPU node batch")?;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	Ok(())
+}
+fn finish_int_sums(graph: &mut Graph, index: usize, config: Config) -> Result<()> {
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
 	// int8 inputs and scaled once per block sum. The sum's own values are what
 	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
-	for index in first..graph.nodes.len() {
-		let Compute::Int(format) = graph.nodes[index].precision else { continue };
-		let node = &graph.nodes[index];
-		let values = node.acc;
-		// int on attn names its sums; the attention itself runs in its accumulator.
-		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = values;
-			continue;
-		}
-		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
-		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
-		// kernel: a conv names fp or bf.
-		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
-		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
-		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
-		let storage = match format.bits {
-			8 | 16 | 32 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_1"),
-			_ => None,
-		}
-		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-		// nodes remain together until the load kernel can emit multiple target
-		// layouts for one node; every single noncanonical plane converts at load.
-		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
-			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
-			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-			canonical || mixed_k
-		});
-		let kept = kept.map(|weight| weight.format);
-		let node = &mut graph.nodes[index];
-		node.storage = kept.unwrap_or(storage).0;
-		node.packed = true;
-		node.int_bits = format.bits;
-		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
-		node.kv_precision = node.precision;
-		if kept.is_none() {
-			requantize_bound(graph, index, storage, config)?;
-		}
+	let Compute::Int(format) = graph.nodes[index].precision else { return Ok(()) };
+	let node = &graph.nodes[index];
+	let values = node.acc;
+	// int on attn names its sums; the attention itself runs in its accumulator.
+	if node.op == Primitive::Attention {
+		graph.nodes[index].precision = values;
+		return Ok(());
 	}
-	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
-	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+	// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
+	// kernel: a conv names fp or bf.
+	require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
+	require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
+	require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
+	let storage = match format.bits {
+		8 | 16 | 32 => StorageFormat::named("q8_0"),
+		4 => StorageFormat::named("q4_1"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+	// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
+	// nodes remain together until the load kernel can emit multiple target
+	// layouts for one node; every single noncanonical plane converts at load.
+	let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
+		if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
+		let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
+		let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+		let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
+		canonical || mixed_k
+	});
+	let kept = kept.map(|weight| weight.format);
+	let node = &mut graph.nodes[index];
+	node.storage = kept.unwrap_or(storage).0;
+	node.packed = true;
+	node.int_bits = format.bits;
+	node.precision = if format.bits == 32 { Compute::FP32 } else { values };
+	node.kv_precision = node.precision;
+	if kept.is_none() {
+		requantize_bound(graph, index, storage, config)?;
+	}
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -20966,6 +21111,10 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	graph.nodes.push(node);
 	graph.stored.push(stored);
 	graph.requantize.push(None);
+	if matches!(precision, Compute::Int(_)) {
+		let config = graph.config.ok_or_else(|| RecipeError::new("integer sum graph has no run configuration"))?;
+		finish_int_sums(graph, index, config)?;
+	}
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
@@ -21922,6 +22071,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		// The body's blocks name their own precisions or take the run's table,
 		// as the outer blocks do.
 		body.profile = graph.profile;
+		body.config = Some(config);
 		for (index, block) in body_parts.iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
@@ -23193,7 +23343,7 @@ fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		Primitive::Contraction => PrecisionKind::Sum,
 		_ => PrecisionKind::Atvn,
 	}
 }
@@ -24023,15 +24173,18 @@ impl NativeTape {
 		}
 		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
 			let count = self.program.artifact.layout.precisions.len();
-			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
 			if tuning && let Some(tuner) = tuner.as_mut() {
-				tuner.observe(&ticks);
+				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
+				tuner.observe(&stamps);
 			}
 			if tracing() {
-				let unit = match self.program.backend { NativeBackend::Cpu(_) => "ns", _ => "ticks" };
+				let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
 				let mut line = format!("clocks window {begin}..{end} {unit}");
-				for index in 1..count {
-					line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+				for index in 0..count {
+					let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
+					line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
 				}
 				line.push_str(&format!(" device={}", self.device_label()?));
 				trace(&line)?;
