@@ -33,8 +33,13 @@ delta-chunk = 8
 topology-probe-bytes = 4194304
 placement-launch-reserve-bytes = 134217728
 cpu-worker-threads = 0
-cpu-peak-gflops = 160
-cpu-peak-gbps = 60
+# Measured on sentry (2x Xeon E5-2643 v4, 24 logical threads, load average near 40) with
+# rustc -O -C target-feature=+avx2,+fma -o peak peak.rs && ./peak 24 300000000
+# (source: the PR #1055 description). cpu-peak-gflops is the aggregate AVX2+FMA
+# rate, 1290.5 GFLOP/s, divided by 24 workers, floored. cpu-peak-gbps is the triad rate
+# over 24 threads, 11.0 GB/s, a lower bound under that load.
+cpu-peak-gflops = 53
+cpu-peak-gbps = 11
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 cpu-linker = { linux = "/usr/bin/ld", macos = "/usr/bin/ld", windows = "$ProgramFiles/LLVM/bin/lld-link.exe" }

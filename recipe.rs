@@ -16911,6 +16911,32 @@ pub struct InferenceReport {
 	pub history: Vec<Arc<InferenceRequest>>,
 	last: Arc<InferenceRequest>,
 }
+/// A node whose measured time exceeds its prediction by more than the margin.
+#[derive(Clone, Debug)]
+pub struct NodeGap {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub predicted_seconds: f64,
+	pub measured_seconds: f64,
+	/// Measured time divided by predicted time.
+	pub ratio: f64,
+}
+impl InferenceReport {
+	/// The nodes whose measured time is more than `margin` times their predicted
+	/// time, largest ratio first. `margin` is a ratio, so 2.0 selects nodes that
+	/// ran more than twice as long as predicted. Nodes without a prediction are omitted.
+	pub fn gaps(&self, margin: f64) -> Vec<NodeGap> {
+		let mut gaps = self.timings.iter().filter_map(|timing| {
+			let predicted = timing.predicted_seconds?;
+			let ratio = if predicted > 0.0 { timing.measured_seconds / predicted } else if timing.measured_seconds > 0.0 { f64::INFINITY } else { 0.0 };
+			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
+		}).collect::<Vec<_>>();
+		gaps.sort_by(|left, right| right.ratio.total_cmp(&left.ratio));
+		gaps
+	}
+}
 impl std::ops::Deref for InferenceReport {
 	type Target = InferenceRequest;
 	fn deref(&self) -> &Self::Target { &self.last }
