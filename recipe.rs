@@ -4055,7 +4055,9 @@ impl NativeModelIr {
 					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
-							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, {pointer} {context}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
+							context = pointers.context,
+							sectioned = node.program_count != 0,
 							position_origin = if reverse { "" } else if self.layout.window_positions < self.graph.input.length { ", i32 %begin" } else { ", i32 0" },
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
@@ -5923,6 +5925,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 	fn emit_normalize_stats(&self, backend: Backend, index: usize, node: &Node, pointers: &ModelPointers, mode: program_ir::NormalizeMode, window: &NodeWindow) -> Result<String> {
+		use std::fmt::Write as _;
 		let v = self.variant(node);
 		let pointer = pointer_type(backend);
 		let ty = self.node_precision(node).model_type;
@@ -5959,6 +5962,8 @@ impl NativeModelIr {
 		let wave_id = format!("%{prefix}.wave.id");
 		let wave_count = format!("%{prefix}.wave.count");
 		let wave_width_half = format!("%{prefix}.wave.width.half");
+		let wave_origin = format!("%{prefix}.wave.origin");
+		let wave_broadcast = format!("%{prefix}.wave.broadcast");
 		ir.push_str(&format!("%{prefix}.tid.wide = zext i32 %tid to i64\n{rows} = zext i32 %rows to i64\n{threads} = zext i32 %threads to i64\n",));
 		let per_row = mode.per_row();
 		let items = if per_row { width.to_string() } else { items };
@@ -6005,7 +6010,8 @@ impl NativeModelIr {
 			)
 		};
 		if per_row {
-			ir.push_str(&format!("{wave_width} = call i32 @recipe.wavefront.width()\n{wave_width_wide} = zext i32 {wave_width} to i64\n{wave_width_half} = udiv i64 {wave_width_wide}, 2\n{wave_lane} = urem i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_id} = udiv i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_count} = udiv i64 {threads}, {wave_width_wide}\n"));
+			let lanes = if backend == Backend::Cpu { 1 } else { 32 };
+			ir.push_str(&format!("{wave_width} = add i32 0, {lanes}\n{wave_width_wide} = zext i32 {wave_width} to i64\n{wave_width_half} = udiv i64 {wave_width_wide}, 2\n{wave_lane} = urem i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_id} = udiv i64 %{prefix}.tid.wide, {wave_width_wide}\n{wave_count} = udiv i64 {threads}, {wave_width_wide}\n%{prefix}.physical.width = call i32 @recipe.wavefront.width()\n%{prefix}.physical.width.wide = zext i32 %{prefix}.physical.width to i64\n%{prefix}.physical.lane = urem i64 %{prefix}.tid.wide, %{prefix}.physical.width.wide\n{wave_origin} = and i64 %{prefix}.physical.lane, -32\n%{prefix}.wave.broadcast.wide = mul i64 {wave_origin}, 4\n{wave_broadcast} = trunc i64 %{prefix}.wave.broadcast.wide to i32\n"));
 		}
 		let emit_index = |code: &mut String, phase: &str, p: &str| {
 			let row = format!("%{prefix}.{phase}.row");
@@ -6036,7 +6042,42 @@ impl NativeModelIr {
 		let variance_entry = if mode.per_row() { format!("%{prefix}.mean.reduce.done") } else { format!("%{prefix}.mean.loop") };
 		let zero_mean = matches!(mode, program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2);
 		let mean_broadcast = format!("%{prefix}.mean.broadcast");
+		// Per-row sums use 32 interleaved partials and a fixed tree on every
+		// backend. CPU vectors own all partials; GPUs assign each group of 32
+		// physical lanes one row, including each half of a 64-lane wave.
+		let cpu_partials = per_row && backend == Backend::Cpu;
+		let sum_phi = |phase: &str, entry: &str| {
+			if cpu_partials {
+				format!("%{prefix}.{phase}.sums = phi <32 x {state_ty}> [ zeroinitializer, {entry} ], [ %{prefix}.{phase}.sums.next, %{prefix}.{phase}.step ]\n%{prefix}.{phase}.lane = and i64 %{prefix}.{phase}.p, 31\n%{prefix}.{phase}.sum = extractelement <32 x {state_ty}> %{prefix}.{phase}.sums, i64 %{prefix}.{phase}.lane\n")
+			} else {
+				format!("%{prefix}.{phase}.sum = phi {state_ty} [ {zero}, {entry} ], [ %{prefix}.{phase}.sum.next, %{prefix}.{phase}.step ]\n")
+			}
+		};
+		let sum_update = |phase: &str| {
+			if cpu_partials {
+				format!("%{prefix}.{phase}.sums.next = insertelement <32 x {state_ty}> %{prefix}.{phase}.sums, {state_ty} %{prefix}.{phase}.sum.next, i64 %{prefix}.{phase}.lane\n")
+			} else { String::new() }
+		};
+		let mean_phi = sum_phi("mean", &mean_entry);
+		let variance_phi = sum_phi("variance", &variance_entry);
+		let mean_update = sum_update("mean");
+		let variance_update = sum_update("variance");
 		let wave_reduce = |phase: &str, source: &str, done_target: &str, tail: &str| {
+			if cpu_partials {
+				let mut code = format!("{prefix}.{phase}.reduce.loop:\n");
+				let mut partials = format!("%{prefix}.{phase}.sums");
+				for offset in [16, 8, 4, 2, 1] {
+					let mask = (0..32).map(|lane| format!("i32 {}", lane ^ offset)).collect::<Vec<_>>().join(", ");
+					let shuffled = format!("%{prefix}.{phase}.shuffle.{offset}");
+					let next = format!("%{prefix}.{phase}.reduced.{offset}");
+					let _ = writeln!(code, "{shuffled} = shufflevector <32 x {state_ty}> {partials}, <32 x {state_ty}> poison, <32 x i32> <{mask}>\n{next} = fadd <32 x {state_ty}> {partials}, {shuffled}");
+					partials = next;
+				}
+				let _ = writeln!(code, "%{prefix}.{phase}.reduced = extractelement <32 x {state_ty}> {partials}, i32 0\nbr label {done_target}");
+				if done_target.ends_with("reduce.done") { let _ = writeln!(code, "{prefix}.{phase}.reduce.done:\n{tail}"); }
+				else { code.push_str(tail); }
+				return code;
+			}
 			let (offset, reduced, partner, partner_lane, partner_index, partner_index_i32) = (
 				format!("%{prefix}.{phase}.reduce.offset"),
 				format!("%{prefix}.{phase}.reduced"),
@@ -6046,10 +6087,10 @@ impl NativeModelIr {
 				format!("%{prefix}.{phase}.partner.index.i32"),
 			);
 			let done_code = if done_target.starts_with('%') && done_target.ends_with("reduce.done") { format!("{prefix}.{phase}.reduce.done:\n{tail}") } else { tail.to_owned() };
-			format!("{prefix}.{phase}.reduce.loop:\n{offset} = phi i64 [ {wave_width_half}, %{prefix}.{phase}.loop ], [ {offset}.next, %{prefix}.{phase}.reduce.step ]\n{reduced} = phi {state_ty} [ {source}, %{prefix}.{phase}.loop ], [ {reduced}.next, %{prefix}.{phase}.reduce.step ]\n%{prefix}.{phase}.reduce.more = icmp ugt i64 {offset}, 0\nbr i1 %{prefix}.{phase}.reduce.more, label %{prefix}.{phase}.reduce.step, label {done_target}\n{prefix}.{phase}.reduce.step:\n{partner_lane} = xor i64 {wave_lane}, {offset}\n{partner_index} = mul i64 {partner_lane}, 4\n{partner_index_i32} = trunc i64 {partner_index} to i32\n{partner} = call {state_ty} @recipe.wave.partner{v}({state_ty} {reduced}, i32 {partner_index_i32})\n{reduced}.next = call {state_ty} @recipe.state.add{v}({state_ty} {reduced}, {state_ty} {partner})\n{offset}.next = udiv i64 {offset}, 2\nbr label %{prefix}.{phase}.reduce.loop\n{done_code}")
+			format!("{prefix}.{phase}.reduce.loop:\n{offset} = phi i64 [ {wave_width_half}, %{prefix}.{phase}.loop ], [ {offset}.next, %{prefix}.{phase}.reduce.step ]\n{reduced} = phi {state_ty} [ {source}, %{prefix}.{phase}.loop ], [ {reduced}.next, %{prefix}.{phase}.reduce.step ]\n%{prefix}.{phase}.reduce.more = icmp ugt i64 {offset}, 0\nbr i1 %{prefix}.{phase}.reduce.more, label %{prefix}.{phase}.reduce.step, label {done_target}\n{prefix}.{phase}.reduce.step:\n{partner_lane} = xor i64 {wave_lane}, {offset}\n{partner_lane}.physical = add i64 {partner_lane}, {wave_origin}\n{partner_index} = mul i64 {partner_lane}.physical, 4\n{partner_index_i32} = trunc i64 {partner_index} to i32\n{partner} = call {state_ty} @recipe.wave.partner{v}({state_ty} {reduced}, i32 {partner_index_i32})\n{reduced}.next = call {state_ty} @recipe.state.add{v}({state_ty} {reduced}, {state_ty} {partner})\n{offset}.next = udiv i64 {offset}, 2\nbr label %{prefix}.{phase}.reduce.loop\n{done_code}")
 		};
 		let mean_reduce_code = if mode.per_row() {
-			let tail = format!("{mean_broadcast} = call {state_ty} @recipe.wave.partner{v}({state_ty} %{prefix}.mean.reduced, i32 0)\nbr label %{prefix}.variance.loop\n");
+			let tail = format!("{mean_broadcast} = call {state_ty} @recipe.wave.partner{v}({state_ty} %{prefix}.mean.reduced, i32 {wave_broadcast})\nbr label %{prefix}.variance.loop\n");
 			wave_reduce("mean", &format!("%{prefix}.mean.sum"), &format!("%{prefix}.mean.reduce.done"), &tail)
 		} else {
 			String::new()
@@ -6067,9 +6108,9 @@ impl NativeModelIr {
 			if zero_mean { String::new() } else { format!("%{prefix}.variance.centered = call {state_ty} @recipe.state.sub{v}({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n") };
 		let mean_next = if per_row { format!("%{prefix}.mean.p.next") } else { format!("%{prefix}.mean.next") };
 		let variance_next = if per_row { format!("%{prefix}.variance.p.next") } else { format!("%{prefix}.variance.next") };
-		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {state_ty} [ {zero}, {mean_entry} ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, state_ty = state_ty, zero = zero, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
+		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group_loop}{prefix}.mean.loop:\n%{prefix}.mean.p = phi i64 [ {mean_start}, {mean_entry} ], [ {mean_next}, %{prefix}.mean.step ]\n{mean_phi}%{prefix}.mean.more = icmp ult i64 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label {mean_exit}\n{prefix}.mean.step:\n", group_loop = group_loop, mean_entry = mean_entry, items = items, mean_start = mean_start, mean_exit = mean_exit, mean_next = mean_next));
 		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, {variance_entry} ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
+		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n{mean_update}{mean_next} = add i64 %{prefix}.mean.p, {item_step}\nbr label %{prefix}.mean.loop\n{mean_reduce_code}{prefix}.variance.loop:\n%{prefix}.variance.p = phi i64 [ {variance_start}, {variance_entry} ], [ {variance_next}, %{prefix}.variance.step ]\n{variance_phi}{mean_code}%{prefix}.variance.more = icmp ult i64 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label {variance_exit}\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, items = items, align = alignment(ty), mean_reduce_code = mean_reduce_code, variance_start = variance_start, variance_entry = variance_entry, mean_code = mean_code, variance_exit = variance_exit, variance_next = variance_next));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
 		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i64 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model{v}({ty} %{prefix}.variance.model)\n{centered_code}", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, centered_code = centered_code, align = alignment(ty)));
 		let difference = if zero_mean { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
@@ -6112,7 +6153,7 @@ impl NativeModelIr {
 			format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul{v}({state_ty} {difference}, {state_ty} {difference})\n")
 		};
 		ir.push_str(&format!(
-			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
+			"{centered_model}{square_code}%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add{v}({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n{variance_update}{variance_next} = add i64 %{prefix}.variance.p, {item_step}\nbr label %{prefix}.variance.loop\n",
 			prefix = prefix,
 			state_ty = state_ty,
 			centered_model = if wide_sum_only && !zero_mean { format!("%{prefix}.variance.centered.model = call {ty} @recipe.model.from.state{v}({state_ty} %{prefix}.variance.centered)\n") } else { String::new() },
@@ -10670,7 +10711,7 @@ mod bundle {
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
 			Operation::Attention(attention) => {
-				let (layout, dims, base) = attention.rope.map_or((0, 0, 0.0), |(layout, dims, base)| (layout.code(), dims, f64::from_bits(base)));
+				let (layout, dims, base) = attention.rope.map_or(("0".to_owned(), 0, 0.0), |(layout, dims, base)| (layout.text(), dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer::NONE);
 				let (score_normalization, score_dims) = index.score.map_or((None, 0), |(normalization, dims)| (Some(normalization), dims));
 				let values = (attention.values != attention.keys).then(|| format!(",v={}", attention.values)).unwrap_or_default();
@@ -10758,10 +10799,7 @@ mod bundle {
 				let score_normalization = normalization(fields.next(), "indexer scoring normalization")?;
 				let score_dims = value_at(fields.next(), "indexer rotary dimensions")?;
 				index.score = score_normalization.map(|normalization| (normalization, score_dims));
-				let layout = match fields.next().map(|field| value_at::<u8>(Some(field), "rotary layout")).transpose()?.unwrap_or(1) {
-					0 | 1 => RopeLayout::Neox,
-					value => return Err(RecipeError::new(format!("invalid rotary layout {value}"))),
-				};
+				let layout = fields.next().map(RopeLayout::parse).transpose()?.unwrap_or(RopeLayout::Neox);
 				// The four yarn values follow the head width, all four or none. A
 				// value-head marker may appear immediately after width when YaRN is
 				// absent, so it cannot be mistaken for a yarn factor.
@@ -11750,17 +11788,124 @@ const CHAR_IDS: [char; 100] = [
 	'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
 	'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€',
 ];
+/// The most position axes a rotary layout can section its pairs over.
+pub const ROPE_AXES: usize = 4;
 /// The rotary pairing declared by an attention block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeLayout {
 	Neox,
+	/// The rotated pairs sectioned over position axes, as the multi-axis rotary
+	/// of the vision-language checkpoints: pair `i` takes its position from one
+	/// axis and its frequency from `i` as before. `Blocked` gives the first
+	/// `sizes[0]` pairs axis 0, the next `sizes[1]` axis 1, and so on;
+	/// `Interleaved` gives pair `i` axis `i % axes` while that axis has pairs
+	/// left, and the last axis after that. Both take the pair modulo the total
+	/// when the sizes cover fewer pairs than the rotated dimensions. A token's
+	/// positions default to its index on every axis, which is the plain rotary.
+	Sections {
+		sizes: [u16; ROPE_AXES],
+		axes: u8,
+		interleaved: bool,
+	},
 }
 impl RopeLayout {
-	const fn code(self) -> u8 {
+	/// The layout as the block record spells it: `1` for neox, `s`/`i` and the
+	/// axis sizes for the sectioned forms.
+	fn text(self) -> String {
 		match self {
-			Self::Neox => 1,
+			Self::Neox => "1".to_owned(),
+			Self::Sections { sizes, axes, interleaved } => {
+				let sizes = sizes[..usize::from(axes)].iter().map(|size| size.to_string()).collect::<Vec<_>>().join(".");
+				format!("{}{sizes}", if interleaved { 'i' } else { 's' })
+			}
 		}
 	}
+	fn parse(field: &str) -> Result<Self> {
+		match field {
+			"0" | "1" => Ok(Self::Neox),
+			_ => {
+				let (kind, rest) = field.split_at(1);
+				let interleaved = match kind {
+					"s" => false,
+					"i" => true,
+					_ => return Err(RecipeError::new(format!("invalid rotary layout {field}"))),
+				};
+				let listed = rest.split('.').map(|size| size.parse::<u16>().map_err(|_| RecipeError::new(format!("invalid rotary layout {field}")))).collect::<Result<Vec<_>>>()?;
+				Self::sections(&listed, interleaved)
+			}
+		}
+	}
+	fn sections(listed: &[u16], interleaved: bool) -> Result<Self> {
+		require(!listed.is_empty() && listed.len() <= ROPE_AXES, format!("rotary sections name 1 to {ROPE_AXES} axes"))?;
+		require(listed.iter().any(|size| *size != 0), "rotary sections must cover at least one pair")?;
+		let mut sizes = [0; ROPE_AXES];
+		sizes[..listed.len()].copy_from_slice(listed);
+		Ok(Self::Sections { sizes, axes: listed.len() as u8, interleaved })
+	}
+	/// How many position axes a token carries under this layout.
+	pub fn axes(self) -> usize {
+		match self {
+			Self::Neox => 1,
+			Self::Sections { axes, .. } => usize::from(axes),
+		}
+	}
+}
+/// The i32 words a sectioned rotary node's context holds: its program words,
+/// then the position of every row, axis and sequence position.
+fn rope_context_words(layout: RopeLayout, rows: usize, length: usize) -> Result<usize> {
+	checked_add(2 + ROPE_AXES, checked_mul(checked_mul(rows, layout.axes(), "rotary position axes")?, length, "rotary positions")?, "rotary context")
+}
+/// The bytes a sectioned rotary node's context holds: its words, then the
+/// position of every row, axis and sequence position, as i32. `positions` lists
+/// every token's axes in turn, `[row][position][axis]`; absent, every token
+/// sits at its index on every axis.
+fn rope_context_region(layout: RopeLayout, rows: usize, length: usize, positions: Option<&[u32]>) -> Result<Vec<u8>> {
+	let RopeLayout::Sections { sizes, axes, interleaved } = layout else { return Err(RecipeError::new("the plain rotary keeps no position table")) };
+	let axes = usize::from(axes);
+	if let Some(positions) = positions {
+		require(
+			positions.len() == rows * length * axes,
+			format!("rotary positions expected {} values ({rows} rows of {length} positions with {axes} axes), received {}", rows * length * axes, positions.len()),
+		)?;
+	}
+	let mut words = Vec::with_capacity(rope_context_words(layout, rows, length)?);
+	words.push(axes as i32);
+	words.push(i32::from(interleaved));
+	words.extend(sizes.iter().map(|size| i32::from(*size)));
+	for row in 0..rows {
+		for axis in 0..axes {
+			for position in 0..length {
+				let value = match positions {
+					Some(positions) => positions[(row * length + position) * axes + axis],
+					None => position as u32,
+				};
+				words.push(i32::try_from(value).map_err(|_| RecipeError::new(format!("rotary position {value} exceeds i32")))?);
+			}
+		}
+	}
+	Ok(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+}
+/// The program words a sectioned rotary node carries: axes, interleave flag,
+/// then the `ROPE_AXES` sizes.
+fn rope_words(sizes: [u16; ROPE_AXES], axes: u8, interleaved: bool) -> Vec<f64> {
+	let mut words = vec![f64::from(axes), f64::from(u8::from(interleaved))];
+	words.extend(sizes.iter().map(|size| f64::from(*size)));
+	words
+}
+/// The sectioned layout a rotary node declares through its program words, or
+/// `None` for the plain rotary.
+fn rope_sections(node: &Node, programs: &[f64]) -> Result<Option<RopeLayout>> {
+	if node.op != Primitive::Rope || node.program_count == 0 {
+		return Ok(None);
+	}
+	let words = programs.get(node.program_offset..node.program_offset + 2 + ROPE_AXES).ok_or_else(|| RecipeError::new("rotary section words are absent"))?;
+	let axes = integer_argument(words[0], "rotary axes")? as usize;
+	require((1..=ROPE_AXES).contains(&axes), "rotary axes are invalid")?;
+	let mut sizes = [0; ROPE_AXES];
+	for (size, word) in sizes.iter_mut().zip(&words[2..]) {
+		*size = u16::try_from(integer_argument(*word, "rotary section")?).map_err(|_| RecipeError::new("rotary section exceeds u16"))?;
+	}
+	Ok(Some(RopeLayout::Sections { sizes, axes: axes as u8, interleaved: words[1] != 0.0 }))
 }
 pub trait RopeSelector {
 	fn layout(self) -> RopeLayout;
@@ -11770,6 +11915,20 @@ pub const neox: Neox = Neox;
 impl RopeSelector for Neox {
 	fn layout(self) -> RopeLayout {
 		RopeLayout::Neox
+	}
+}
+/// A sectioned rotary layout: `sections([16, 24, 24])` blocks the pairs by axis
+/// in order, `interleaved([24, 20, 20, 0])` alternates the axes pair by pair.
+pub struct Sections(RopeLayout);
+pub fn sections<const N: usize>(sizes: [usize; N]) -> Sections {
+	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), false).unwrap_or_else(|error| panic!("{error}")))
+}
+pub fn interleaved<const N: usize>(sizes: [usize; N]) -> Sections {
+	Sections(RopeLayout::sections(&sizes.map(|size| u16::try_from(size).unwrap_or_else(|_| panic!("rotary section of {size} pairs exceeds u16"))), true).unwrap_or_else(|error| panic!("{error}")))
+}
+impl RopeSelector for Sections {
+	fn layout(self) -> RopeLayout {
+		self.0
 	}
 }
 /// A step of a model, and equally a step of a fragment inside one. `res`,
@@ -14802,7 +14961,14 @@ impl Gguf {
 	/// is an ordinary node whose weight is a view of the file, and a contraction
 	/// bound to a weight without a bias row lowers and runs without one.
 	pub fn infer(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Vec<f64> {
-		infer_gguf(self, blocks, plan, input, channels).unwrap_or_else(|error| panic!("{error}"))
+		infer_gguf(self, blocks, plan, input, channels, None).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// `infer` with every token's position on every rotary axis given by the
+	/// caller: `positions` lists each row's positions in turn, each as its axes,
+	/// so a sectioned rotary (`sections`, `interleaved`) reads a token's axis
+	/// positions instead of its index. Without it every axis is the index.
+	pub fn infer_at(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, positions: &[u32]) -> Vec<f64> {
+		infer_gguf(self, blocks, plan, input, channels, Some(positions)).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Autoregressive decode over `blocks` bound from `plan`, as `recipe.decode`
 	/// runs a saved model: one tape of `sequence` id positions holds every block's
@@ -14810,11 +14976,18 @@ impl Gguf {
 	/// the positions it reaches. The logits are the model's output after the last
 	/// forward.
 	pub fn decode(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, None, sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// `decode` with the prompt's rotary positions given by the caller, one set
+	/// of axes per prompt id. Every generated id takes the axes of the id before
+	/// it, all raised to one past their largest, the way text continues after an
+	/// image in the multi-axis checkpoints.
+	pub fn decode_at(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], positions: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		decode_gguf(self, blocks, plan, sequence, prompt, Some(positions), sampler, stop, budget, |_| {}).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Emits each sampled token while generating from bound GGUF weights.
 	pub fn decode_stream(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32)) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, None, sampler, stop, budget, emit).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Places a script-defined GGUF model once and keeps its weights and state
 	/// resident across every later decode. Standard tensor names bind the model
@@ -14896,13 +15069,32 @@ impl Binding {
 /// Compiles `blocks` over `input` with every parameterized node bound from
 /// `plan`, and runs one forward. `channels` names the input's channel axis, so
 /// the rest of its length is the sequence the blocks walk.
-fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
+fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, positions: Option<&[u32]>) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
 	let tape = NativeTape::new(&graph, TapeInput::Values(input), input, &[], device, Config::load()?.precision, None)?;
+	if let Some(positions) = positions { tape.set_rope_positions(positions)?; }
 	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
-fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32)) -> Result<Generation> {
+/// The rotary positions of every slot of a decode: the caller's for the prompt,
+/// then each later slot at one past the largest axis of the slot before it,
+/// on every axis.
+fn decode_positions(prompt_positions: &[u32], prompt: usize, sequence: usize, axes: usize) -> Result<Vec<u32>> {
+	require(
+		axes != 0 && prompt_positions.len() == prompt * axes,
+		format!("decode positions expected {} values for {prompt} prompt ids with {axes} axes, received {}", prompt * axes, prompt_positions.len()),
+	)?;
+	let mut positions = prompt_positions.to_vec();
+	for _ in prompt..sequence {
+		let last = &positions[positions.len() - axes..];
+		let next = last.iter().copied().max().unwrap_or(0).checked_add(1).ok_or_else(|| RecipeError::new("decode position overflows"))?;
+		positions.extend(std::iter::repeat_n(next, axes));
+	}
+	Ok(positions)
+}
+fn decode_gguf(
+	model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], positions: Option<&[u32]>, sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32),
+) -> Result<Generation> {
 	let load_started = std::time::Instant::now();
 	require(!prompt.is_empty(), "decode prompt is empty")?;
 	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the sequence of {sequence}", prompt.len()))?;
@@ -14912,6 +15104,10 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &[], device, Config::load()?.precision, None)?;
+	if let Some(positions) = positions {
+		let axes = tape.rope_axes()?;
+		tape.set_rope_positions(&decode_positions(positions, prompt.len(), sequence, axes)?)?;
+	}
 	let prepared = load_started.elapsed().as_secs_f64();
 	trace(&format!("model preparation {prepared} s"))?;
 	decode_steps(
@@ -15066,6 +15262,11 @@ impl Bound {
 	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
 		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
 		self.file.infer(&self.model, &self.plan, &input, 1)
+	}
+	/// `infer` with each id's position on every rotary axis, as `Gguf::infer_at`.
+	pub fn infer_at(&self, ids: &[u32], positions: &[u32]) -> Vec<f64> {
+		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+		self.file.infer_at(&self.model, &self.plan, &input, 1, positions)
 	}
 	/// Place this bound model across the selected devices for a sequence of
 	/// `positions` token ids. `split` names the Recipe blocks each device takes;
@@ -15889,6 +16090,7 @@ pub struct Infer {
 	log: Vec<Metric>,
 	tokens: Option<usize>,
 	chat: Option<Vec<ChatMetric>>,
+	positions: Option<Vec<u32>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -15917,7 +16119,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None }
 	}
 }
 impl Infer {
@@ -15931,6 +16133,8 @@ impl Infer {
 		})();
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
+	/// Supplies each prompt token's rotary axes. Generated tokens continue after the largest preceding axis.
+	pub fn positions(mut self, positions: impl AsRef<[u32]>) -> Self { self.positions = Some(positions.as_ref().to_vec()); self }
 	/// Keep the model resident and read successive messages from stdin. A supplied
 	/// RECIPE_MESSAGE or RNJ_PROMPT_FILE instead runs one measured request.
 	pub fn chat(mut self, metrics: impl IntoChatMetrics) -> Self { self.chat = Some(metrics.into_chat_metrics()); self }
@@ -15965,6 +16169,7 @@ impl Infer {
 		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
 		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
 		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
+		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
 		let sequence = match requested {
 			Some(context) => context,
@@ -16022,6 +16227,7 @@ impl Infer {
 			let framed = progress.as_ref().is_some_and(InferenceLive::renders_reply);
 			let (mut ids, mut printed) = (Vec::new(), 0);
 			if streaming && !framed { print!("~ "); std::io::stdout().flush().map_err(|error| RecipeError::new(format!("cannot print reply prefix: {error}")))?; }
+			if let Some(positions) = &self.positions { placed.set_rope_positions(positions, prompt.len(), sequence)?; }
 			let generation = placed.decode_observed(&prompt, &mut recipe.sampler().temperature(0.0), &stop, budget, progress.as_ref(), |id| {
 				if stop.contains(&id) { return Ok(()); }
 				ids.push(id);
@@ -17441,6 +17647,25 @@ impl Placed {
 			for tape in ranges { require(tape.positions as usize == sequence, format!("decode range has {} positions, expected {sequence}", tape.positions))?; }
 		}
 		Ok(sequence)
+	}
+	fn set_rope_positions(&self, prompt_positions: &[u32], prompt: usize, sequence: usize) -> Result<()> {
+		let mut state = self.decode.lock().map_err(|_| RecipeError::new("decode state is poisoned"))?;
+		let mut axes = None;
+		for tape in self.tapes.iter().flatten() {
+			for node in &tape.nodes {
+				if let Some(layout) = rope_sections(node, &tape.programs)? {
+					require(axes.is_none_or(|axes| axes == layout.axes()), "the sectioned rotary blocks disagree on their axes")?;
+					axes = Some(layout.axes());
+				}
+			}
+		}
+		let axes = axes.ok_or_else(|| RecipeError::new("explicit positions require a sectioned rotary block"))?;
+		let positions = decode_positions(prompt_positions, prompt, sequence, axes)?;
+		for tape in self.tapes.iter().flatten() {
+			if tape.nodes.iter().any(|node| node.op == Primitive::Rope && node.program_count != 0) { tape.set_rope_positions(&positions)?; }
+		}
+		*state = DecodeState::default();
+		Ok(())
 	}
 	fn llvm_report(&self) -> LlvmReport {
 		let mut report = LlvmReport::default();
@@ -18928,8 +19153,9 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		graph.block_precision = graph.block_rope_precision.or(ordinary_precision);
 		require(dims != 0 && dims % 2 == 0 && dims <= width, "rotary dimensions must be even and at most the head width")?;
 		require(f64::from_bits(base) > 1.0, "rotary base must exceed one")?;
-		match layout {
-			RopeLayout::Neox => {}
+		if let RopeLayout::Sections { sizes, axes, .. } = layout {
+			let covered = sizes[..usize::from(axes)].iter().map(|size| usize::from(*size)).sum::<usize>();
+			require(covered <= dims / 2, format!("rotary sections cover {covered} pairs, more than the {} rotated pairs", dims / 2))?;
 		}
 		let rotated = checked_mul(width, checked_add(heads, keys, "rotary head partition")?, "rotary width")?;
 		let (mscale, factor, context, low, high) = match yarn {
@@ -18949,6 +19175,13 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		let base_argument = if graph.profile.chain_angle { f64::from((f64::from_bits(base) as f32).powf(-2.0 / dims as f32)) } else { f64::from_bits(base) };
 		let parameters = if factors { dims / 2 } else { 0 };
 		push_node(graph, Primitive::Rope, graph.output, parameters, [dims as f64, base_argument, width as f64, rotated as f64, mscale, factor, chain, low, high], -2)?;
+		if let RopeLayout::Sections { sizes, axes, interleaved } = layout {
+			let (program_offset, words) = (graph.programs.len(), rope_words(sizes, axes, interleaved));
+			let program_count = words.len().div_ceil(3);
+			graph.programs.extend(words);
+			graph.programs.resize(program_offset + program_count * 3, 0.0);
+			if let Some(node) = graph.nodes.last_mut() { (node.program_offset, node.program_count) = (program_offset, program_count); }
+		}
 		if factors {
 			let precision = graph.nodes.last().unwrap().precision;
 			require(matches!(precision, Compute::FP32 | Compute::FP64), format!("proportional rope factors require fp32 or fp64, not {}", precision.label()))?;
@@ -20683,6 +20916,7 @@ struct HostLookup {
 struct NativeTape {
 	observations: u8,
 	tensor_history: Mutex<Vec<TensorObservation>>,
+	programs: Vec<f64>,
 	profile: Precisions,
 	program: NativeProgram,
 	precision: NativePrecision,
@@ -21038,6 +21272,11 @@ impl NativeTape {
 			require(checked_add(offset, region.len(), "nearest index context")? <= contexts.bytes, "nearest index exceeds its context arena")?;
 			contexts.write_bytes(offset, &region)?;
 		}
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if let Some(rope) = rope_sections(node, &graph.programs)? {
+				contexts.write_bytes(layout.contexts[index], &rope_context_region(rope, rows, node.output.length, None)?)?;
+			}
+		}
 		trace(&format!(
 			"native tape device={} mode={} rows={rows} values={} contexts={} weights={} adjoints={adjoints_bytes}",
 			gpu.name,
@@ -21088,6 +21327,7 @@ impl NativeTape {
 			input: graph.input,
 			output: graph.output,
 			nodes: graph.nodes.clone(),
+			programs: graph.programs.clone(),
 			storage,
 			capacity: rows,
 			positions: narrow(positions, "native input positions")? as u32,
@@ -21696,6 +21936,31 @@ impl NativeTape {
 			at += count;
 		}
 		Ok(())
+	}
+	/// The axes of the model's sectioned rotary blocks, which all share one count.
+	fn rope_axes(&self) -> Result<usize> {
+		let mut axes = None;
+		for node in &self.nodes {
+			if let Some(layout) = rope_sections(node, &self.programs)? {
+				require(axes.is_none_or(|axes| axes == layout.axes()), "the sectioned rotary blocks disagree on their axes")?;
+				axes = Some(layout.axes());
+			}
+		}
+		axes.ok_or_else(|| RecipeError::new("the model has no sectioned rotary block to take positions"))
+	}
+	/// The position of every token on every rotary axis, `[row][position][axis]`
+	/// over this tape's rows and the sequence, written to every sectioned rotary
+	/// node. A tape without one is an error, since the positions would be lost.
+	fn set_rope_positions(&self, positions: &[u32]) -> Result<()> {
+		let mut written = false;
+		for (index, node) in self.nodes.iter().enumerate() {
+			if let Some(layout) = rope_sections(node, &self.programs)? {
+				let region = rope_context_region(layout, self.rows as usize, node.output.length, Some(positions))?;
+				self.contexts.write_bytes(self.program.artifact.layout.contexts[index], &region)?;
+				written = true;
+			}
+		}
+		require(written, "the model has no sectioned rotary block to take positions")
 	}
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
@@ -22614,6 +22879,10 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 		}
 		Primitive::Pool if inference => Vec::new(),
 		Primitive::Pool => vec![(checked_mul(state, size_of::<u64>(), "pool context bytes")?, Retained)],
+		Primitive::Rope => match rope_sections(node, &graph.programs)? {
+			Some(layout) => vec![(checked_mul(rope_context_words(layout, rows, node.output.length)?, size_of::<i32>(), "rotary context bytes")?, ReadOnly)],
+			None => Vec::new(),
+		},
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => vec![(checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes")?, ReadOnly)],
@@ -25989,7 +26258,7 @@ fn native_attention_shared_values(extent: Tile, whole: bool, inference: bool) ->
 		.checked_mul(2)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
 		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| extent.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
+		.and_then(|values| extent.m.checked_mul(2).and_then(|statistics| values.checked_add(statistics)));
 	let query_gradient = queries
 		.checked_mul(3)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
@@ -26022,7 +26291,7 @@ fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile
 		let query_values = queries.checked_mul(width).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let forward_fixed = query_values
 			.checked_mul(2)
-			.and_then(|values| queries.checked_mul(3).and_then(|statistics| values.checked_add(statistics)))
+			.and_then(|values| queries.checked_mul(2).and_then(|statistics| values.checked_add(statistics)))
 			.ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let forward_per_key = width.checked_add(queries).and_then(|values| values.checked_mul(2)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
 		let query_gradient_fixed = query_values.checked_mul(3).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
@@ -26351,7 +26620,7 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
 		let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
 		let room = staging_k.min(partial_k);
-		// Reduction chunks are RECIPE_FRAGMENT_K elements of K, aligned to the
+		// Reduction chunks are RECIPE_CHUNK_K elements of K, aligned to the
 		// start of the walk. A multi-tile walk must therefore stage whole chunks,
 		// so the tile is rounded down to a chunk multiple; a walk that fits in one
 		// staged tile has no interior tile boundary and may keep its exact length.
