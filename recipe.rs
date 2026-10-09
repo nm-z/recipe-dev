@@ -7718,8 +7718,11 @@ impl NativeModelIr {
 				};
 				let rows = node.shard.rows;
 				let terms = node.shard.terms;
+				// Whole-axis nodes carry empty shard runs; the local counts resolve them to the
+				// rows and terms this device computes.
+				let (local_rows, local_terms) = (rows.local(node.output.channels), terms.local(node.input.channels));
 				format!(
-					" stored_formats={formats} stored_bytes={bytes} packed={} shard_rows={}:{}:{} shard_terms={}:{}:{} run_key={}",
+					" stored_formats={formats} stored_bytes={bytes} packed={} shard_rows={}:{}:{} shard_terms={}:{}:{} local_rows={} local_terms={} run_key={}",
 					plan.packed,
 					rows.first,
 					rows.count,
@@ -7727,6 +7730,8 @@ impl NativeModelIr {
 					terms.first,
 					terms.count,
 					terms.period,
+					local_rows,
+					local_terms,
 					self.run_key(index).as_deref().unwrap_or("none")
 				)
 			};
