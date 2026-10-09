@@ -17684,6 +17684,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_qk_precision: None,
 		block_rope_precision: None,
 		profile: graph.profile,
+		config: graph.config,
 		bound: None,
 		bound_values: Vec::new(),
 		bias: graph.bias,
@@ -18272,6 +18273,8 @@ struct Graph {
 	block_rope_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
+	/// The run configuration used when a newly pushed integer sum needs storage conversion.
+	config: Option<Config>,
 	/// The weights still to bind while a graph compiles over mapped tensors:
 	/// each parameterized node takes the front entry as it is pushed.
 	bound: Option<std::collections::VecDeque<BoundNode>>,
@@ -18310,6 +18313,7 @@ impl Graph {
 			block_qk_precision: None,
 			block_rope_precision: None,
 			profile: Precisions::default(),
+			config: None,
 			bound: None,
 			bound_values: Vec::new(),
 			bias: true,
@@ -18395,6 +18399,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape, model.epsilon);
 	graph.profile = config.profile;
+	graph.config = Some(config);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
@@ -18639,6 +18644,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let mut parameter = 0;
 		for index in first..graph.nodes.len() {
 			let node = &mut graph.nodes[index];
+			if node.int_bits != 0 { continue; }
 			if !matches!(node.op, Primitive::Predictor | Primitive::Normalize) && node.weights() != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				let format = if profile { StorageFormat(quantization).tensor(role, more, false) } else { quantization };
@@ -18648,55 +18654,56 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			}
 		}
 	}
+	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
+	narrow(elements, "GPU node batch")?;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	Ok(())
+}
+fn finish_int_sums(graph: &mut Graph, index: usize, config: Config) -> Result<()> {
 	// An int precision on a sum is its storage too: int8 weights as Q8_0 blocks,
 	// int4 as Q4_0, one step size per 32, multiplied as the ints they are with
 	// int8 inputs and scaled once per block sum. The sum's own values are what
 	// the int dot produces: the fp32 or fp64 accumulator selected by the table.
-	for index in first..graph.nodes.len() {
-		let Compute::Int(format) = graph.nodes[index].precision else { continue };
-		let node = &graph.nodes[index];
-		let values = node.acc;
-		// int on attn names its sums; the attention itself runs in its accumulator.
-		if node.op == Primitive::Attention {
-			graph.nodes[index].precision = values;
-			continue;
-		}
-		require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
-		// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
-		// kernel: a conv names fp or bf.
-		require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
-		require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
-		require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
-		let storage = match format.bits {
-			8 | 16 | 32 => StorageFormat::named("q8_0"),
-			4 => StorageFormat::named("q4_1"),
-			_ => None,
-		}
-		.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
-		// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
-		// nodes remain together until the load kernel can emit multiple target
-		// layouts for one node; every single noncanonical plane converts at load.
-		let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
-			if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
-			let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
-			let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
-			let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
-			canonical || mixed_k
-		});
-		let kept = kept.map(|weight| weight.format);
-		let node = &mut graph.nodes[index];
-		node.storage = kept.unwrap_or(storage).0;
-		node.packed = true;
-		node.int_bits = format.bits;
-		node.precision = if format.bits == 32 { Compute::FP32 } else { values };
-		node.kv_precision = node.precision;
-		if kept.is_none() {
-			requantize_bound(graph, index, storage, config)?;
-		}
+	let Compute::Int(format) = graph.nodes[index].precision else { return Ok(()) };
+	let node = &graph.nodes[index];
+	let values = node.acc;
+	// int on attn names its sums; the attention itself runs in its accumulator.
+	if node.op == Primitive::Attention {
+		graph.nodes[index].precision = values;
+		return Ok(());
 	}
-	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
-	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
+	require(node.op == Primitive::Contraction && node.weights() != 0, format!("{} computes in int{}, which is a precision for a layer's sum; name fp or bf on it", node.identity(index), format.bits))?;
+	// The int dot walks whole blocks of 32 inputs, and a layer's sum has no
+	// kernel: a conv names fp or bf.
+	require(node.argument[0] == 0.0, format!("{} computes in int{} over a kernel of {}; int(n) names a layer's sum, so name fp or bf on a conv", node.identity(index), format.bits, node.argument[0]))?;
+	require(node.input.channels % 32 == 0, format!("{} computes in int{} over {} inputs; an int sum walks whole blocks of 32 inputs", node.identity(index), format.bits, node.input.channels))?;
+	require(node.argument[1] == 0.0, format!("{} computes in int{} with a fused relu; the relu of an int sum is its own op", node.identity(index), format.bits))?;
+	let storage = match format.bits {
+		8 | 16 | 32 => StorageFormat::named("q8_0"),
+		4 => StorageFormat::named("q4_1"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("{} computes in int{}, which has no block storage; int8 and int4 do", node.identity(index), format.bits)))?;
+	// A Q4_K plane already is the canonical int4 inner layout. Mixed Q4_K/Q6_K
+	// nodes remain together until the load kernel can emit multiple target
+	// layouts for one node; every single noncanonical plane converts at load.
+	let kept = graph.stored.get(index).and_then(Option::as_ref).filter(|weight| {
+		if !weight.codebook.is_empty() || weight.segments.is_empty() { return false; }
+		let codecs = weight.segments.iter().filter_map(|(span, _)| span.spec().map(|spec| spec.codec)).collect::<Vec<_>>();
+		let mixed_k = format.bits == 8 && codecs.len() > 1 && codecs.contains(&StorageCodec::Q4K) && codecs.contains(&StorageCodec::Q6K) && codecs.iter().all(|codec| matches!(codec, StorageCodec::Q4K | StorageCodec::Q6K));
+		let canonical = weight.segments.iter().all(|(span, _)| *span == storage || format.bits == 8 && span.spec().is_some_and(|spec| spec.codec == StorageCodec::Q4K));
+		canonical || mixed_k
+	});
+	let kept = kept.map(|weight| weight.format);
+	let node = &mut graph.nodes[index];
+	node.storage = kept.unwrap_or(storage).0;
+	node.packed = true;
+	node.int_bits = format.bits;
+	node.precision = if format.bits == 32 { Compute::FP32 } else { values };
+	node.kv_precision = node.precision;
+	if kept.is_none() {
+		requantize_bound(graph, index, storage, config)?;
+	}
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -18837,6 +18844,10 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	graph.nodes.push(node);
 	graph.stored.push(stored);
 	graph.requantize.push(None);
+	if matches!(precision, Compute::Int(_)) {
+		let config = graph.config.ok_or_else(|| RecipeError::new("integer sum graph has no run configuration"))?;
+		finish_int_sums(graph, index, config)?;
+	}
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
@@ -19793,6 +19804,7 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		// The body's blocks name their own precisions or take the run's table,
 		// as the outer blocks do.
 		body.profile = graph.profile;
+		body.config = Some(config);
 		for (index, block) in body_parts.iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
@@ -21110,7 +21122,7 @@ fn precision_kind(op: Primitive, block_kind: &str) -> PrecisionKind {
 		Primitive::Attention => PrecisionKind::Attn,
 		Primitive::Rope => PrecisionKind::Rope,
 		Primitive::Gather | Primitive::Lookup => PrecisionKind::Embed,
-		Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut => PrecisionKind::Sum,
+		Primitive::Contraction => PrecisionKind::Sum,
 		_ => PrecisionKind::Atvn,
 	}
 }
