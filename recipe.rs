@@ -14190,7 +14190,7 @@ impl Block {
 	}
 	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
 	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
-		let normalizations = self.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).count();
+		let normalizations = self.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).count();
 		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
 		self.scale_tensors.push(name.into());
 		self
@@ -19095,7 +19095,7 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for (index, _) in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+			for (index, _) in block.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
 				let name = match block.scale_tensors.get(index) {
 					Some(spelled) => spelled.as_str(),
 					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
@@ -19205,7 +19205,7 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for (index, _) in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+			for (index, _) in step.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
 				if let Some(spelled) = step.scale_tensors.get(index) {
 					self.norm_scale(spelled, width)?;
 					continue;
