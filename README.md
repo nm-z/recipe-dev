@@ -319,6 +319,14 @@ RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run model.rs --device archy:nv
 RECIPE_REFERENCE=/path/reference.bin recipe run model.rs --device archy:nv0
 ```
 
+```bash
+recipe run model.rs --device cpu --cfg llamacpp
+```
+
+```rb
+attn(heads).kv(kv_heads).fp(32)
+```
+
 ## Reporting
 
 ```rust
