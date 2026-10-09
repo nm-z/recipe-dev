@@ -16219,6 +16219,7 @@ pub struct Infer {
 	chat: Option<Vec<ChatMetric>>,
 	positions: Option<Vec<u32>>,
 	score: bool,
+	scored_ids: Option<Vec<u32>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -16247,7 +16248,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false, scored_ids: None }
 	}
 }
 impl Infer {
@@ -16268,6 +16269,12 @@ impl Infer {
 	/// reply. The text is tokenized as written, without the chat template.
 	pub fn score(mut self) -> Self {
 		self.score = true;
+		self
+	}
+	/// Scores the given token ids in place of text. The ids must be exactly what the tokenizer produces for their decoded text, so the words match the text's word boundaries.
+	pub fn score_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
+		self.score = true;
+		self.scored_ids = Some(ids.as_ref().to_vec());
 		self
 	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
@@ -16307,8 +16314,13 @@ impl Infer {
 		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
 		let scored = if self.score {
-			let text = supplied.as_deref().or(message.as_deref()).ok_or_else(|| RecipeError::new("scoring needs a text: pass -p <text> or set RNJ_PROMPT_FILE"))?;
-			Some(coder.encode_words(text))
+			Some(match &self.scored_ids {
+				Some(ids) => token_groups(&coder, ids)?,
+				None => {
+					let text = supplied.as_deref().or(message.as_deref()).ok_or_else(|| RecipeError::new("scoring needs a text: pass -p <text> or set RNJ_PROMPT_FILE"))?;
+					coder.encode_words(text)
+				}
+			})
 		} else {
 			None
 		};
@@ -16428,6 +16440,15 @@ impl Infer {
 			score,
 		})
 	}
+}
+/// The word groups of `ids`: the tokenizer must reproduce the ids from their
+/// decoded text, with or without the leading beginning-of-sequence id.
+fn token_groups(coder: &Tokenizer, ids: &[u32]) -> Result<Vec<Vec<u32>>> {
+	let groups = coder.encode_words(&coder.decode(ids));
+	let encoded = groups.concat();
+	let reproduced = encoded == ids || coder.bos().is_some_and(|bos| ids.first() == Some(&bos) && encoded.get(1..) == Some(ids) && encoded.first() == Some(&bos));
+	require(reproduced, "token ids do not round-trip through the tokenizer; pass the text instead")?;
+	Ok(if encoded == ids { groups } else { groups.into_iter().skip(1).collect() })
 }
 /// Runs `groups` once with no generation and scores every id after the first
 /// from the logits of the position before it.
