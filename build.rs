@@ -297,6 +297,50 @@ br i1 %ready, label %acquired, label %wait acquired:
 fence syncscope("device") acquire br label %waited waited:
 call void @llvm.amdgcn.s.barrier()
 ret void }"#;
+// A traced run links this barrier in place of the one above, with one measurement added. Each
+// workgroup's leader stamps its arrival with the device clock into a running minimum and maximum.
+// The last arriver already owns the release: after its acquire fence has made every arrival's
+// stamp visible, it adds the gap between the two to the step's total, counts the barrier, and
+// clears the pair before the phase flip lets the next barrier's arrivals begin. The kernel's
+// first thread clears the total and the count as a step begins and reads them as it ends.
+const NVIDIA_TRACED_BARRIER_STATE: &str = r#"@grid.first = internal addrspace(1) global i64 -1, align 8
+@grid.last = internal addrspace(1) global i64 0, align 8
+@grid.spread = internal addrspace(1) global i64 0, align 8
+@grid.barriers = internal addrspace(1) global i64 0, align 8
+"#;
+const NVIDIA_TRACED_ARRIVAL: &str = r#"%arrived = call i64 @recipe.clock()
+%earliest = atomicrmw umin ptr addrspace(1) @grid.first, i64 %arrived monotonic
+%latest = atomicrmw umax ptr addrspace(1) @grid.last, i64 %arrived monotonic
+"#;
+const NVIDIA_TRACED_RELEASE: &str = r#"%first = load atomic i64, ptr addrspace(1) @grid.first monotonic, align 8
+%last.arrival = load atomic i64, ptr addrspace(1) @grid.last monotonic, align 8
+%gap = sub i64 %last.arrival, %first
+%spread = load atomic i64, ptr addrspace(1) @grid.spread monotonic, align 8
+%spread.next = add i64 %spread, %gap
+store atomic i64 %spread.next, ptr addrspace(1) @grid.spread monotonic, align 8
+%barriers = load atomic i64, ptr addrspace(1) @grid.barriers monotonic, align 8
+%barriers.next = add i64 %barriers, 1
+store atomic i64 %barriers.next, ptr addrspace(1) @grid.barriers monotonic, align 8
+store atomic i64 -1, ptr addrspace(1) @grid.first monotonic, align 8
+store atomic i64 0, ptr addrspace(1) @grid.last monotonic, align 8
+"#;
+/// The traced barrier as a template: its state and its definition of `grid_barrier`, which a
+/// traced run puts in place of the template's own.
+fn nvidia_traced_barrier() -> String {
+	let barrier = &NVIDIA_GRID_BARRIER[NVIDIA_GRID_BARRIER.find("define internal void @grid_barrier").expect("the NVIDIA grid barrier is absent")..];
+	let (arrive, release) = ("arrive:\n", "release:\nfence syncscope(\"device\") acquire\n");
+	let at = |anchor: &str| barrier.find(anchor).map(|index| index + anchor.len()).unwrap_or_else(|| panic!("the NVIDIA grid barrier has no {anchor:?}"));
+	let (arrive_at, release_at) = (at(arrive), at(release));
+	assert!(arrive_at < release_at, "the NVIDIA grid barrier arrives after it releases");
+	let traced = format!("{}{NVIDIA_TRACED_ARRIVAL}{}{NVIDIA_TRACED_RELEASE}{}", &barrier[..arrive_at], &barrier[arrive_at..release_at], &barrier[release_at..]);
+	nvidia_intrinsics(format!("{NVIDIA_TRACED_BARRIER_STATE}{traced}\n"))
+}
+fn nvidia_intrinsics(ir: String) -> String {
+	ir.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
+		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
+		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
+		.replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0")
+}
 // A workgroup barrier on AMD is s_barrier between two workgroup-scope
 // fences: s_barrier alone neither waits for in-flight LDS stores nor keeps
 // the compiler from moving LDS accesses across it, and two waves sharing the
@@ -1908,12 +1952,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
-	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
-		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
-		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
-		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
-		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
-		.replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0")
+	let ir = nvidia_intrinsics(parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda"))
 		.replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")
 		.replace(", addrspace(5)", "")
 		.replace(" addrspace(5)", "");
@@ -1925,6 +1964,9 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix.as_str() }, path.display()));
 	}
+	let traced = out.join("recipe-nvidia-barrier-traced.ll");
+	fs::write(&traced, nvidia_traced_barrier())?;
+	values.push(format!("barrier-traced={}", traced.display()));
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", platform(manifest, "nvidia-compiler", os)?);
 	println!("cargo:rustc-env=RECIPE_NV_CODEGEN={}", platform(manifest, "nvidia-codegen", os)?);
