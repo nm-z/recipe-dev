@@ -68,7 +68,7 @@ let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
 	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
-	.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
+	.delta_gates(Activation::Softplus, Activation::Sigmoid)
 	.norm(rms);
 let gate = HyperGate {
 	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),
@@ -177,6 +177,11 @@ let shared = expert * layer(1).sigmoid();
 let combined = routed + shared;
 ```
 
+```rust
+let experts = recipe.model().gguf_moe(256, 8, 512, Activation::Silu, Scoring::Softmax, true,
+	SharedExpert::Gated { count: 1, gate: Activation::Sigmoid }, 1.0, false);
+```
+
 ## **Train**
 
 ```rust
@@ -248,6 +253,34 @@ place(path, &[blocks])
 	.memory()[]
 ```
 
+## GGUF tensors
+
+A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, and a normalization its scale.
+
+```rust
+let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
+	.delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Silu).delta_gates(Activation::Softplus, Activation::Sigmoid)
+	.delta_from(DeltaTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.0.attn_norm.weight"), Block::from(delta).norm(rms).scale_from("blk.0.post_attention_norm.weight")]);
+```
+
+```rust
+DeltaTensors { alpha, beta, decay_bias, decay, qkv, conv, norm, gate, out }
+DeltaTensors::block(layer)
+binding.listing()
+```
+
+```rust
+let attention = recipe.model().attn_heads(heads).kv(kv).head(width).qk(rms).rope(neox, dims, base)
+	.attention_from(AttentionTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.3.attn_norm.weight"), Block::from(attention * gate), layer(width)]);
+```
+
+```rust
+AttentionTensors { q, k, v, q_bias, k_bias, v_bias, q_norm, k_norm, factors, out, indexer }
+IndexerTensors { q_proj, k_proj, q_norm, k_norm }
+```
+
 ## Terminal chat and remote execution
 
 ```bash
@@ -281,6 +314,8 @@ A SQLite file uses the `sqlite_table` parse path. The answers name one table and
 ```json
 {"id":"sqlite_table","choice":"samples"}
 ```
+
+A SQLite file in WAL mode is read with the committed frames of its `-wal` file laid over the main file, and a row longer than its page is read through its overflow pages.
 
 The probe records each WAV file's sample rate and frame count, and an `envelope`: 16 hexadecimal digits, one per span of the samples, ranked by mean amplitude from `0` (quietest) to `f` (loudest).
 

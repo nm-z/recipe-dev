@@ -43,6 +43,11 @@ mod program_ir {
 		/// The left operand rounded through fp16 and back.
 		Half = 17,
 		SquareRoot = 18,
+		/// The channel of the element the program runs on, as a state value.
+		Channel = 19,
+		/// A trainable parameter at `left + channel mod right`, so one span of
+		/// `right` values gives every channel its own value.
+		ChannelParameter = 20,
 	}
 
 	impl ScalarOpcode {
@@ -66,6 +71,8 @@ mod program_ir {
 				16 => Ok(Self::FusedAdd),
 				17 => Ok(Self::Half),
 				18 => Ok(Self::SquareRoot),
+				19 => Ok(Self::Channel),
+				20 => Ok(Self::ChannelParameter),
 				_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 			}
 		}
@@ -159,6 +166,8 @@ mod program_ir {
 		pub decode: usize,
 		pub prefix: &'a str,
 		pub literal: &'a LiteralFn<'a>,
+		/// The i32 name of the element's channel, when the program reads one.
+		pub channel: Option<&'a str>,
 	}
 
 	pub struct ScalarForward {
@@ -171,6 +180,8 @@ mod program_ir {
 		pub first_adjoint: String,
 		pub second_adjoint: String,
 		pub parameter_adjoint: BTreeMap<usize, String>,
+		/// The i32 parameter column and state adjoint of each channel parameter.
+		pub channel_adjoint: Vec<(String, String)>,
 	}
 
 	struct ScalarInstruction {
@@ -179,7 +190,18 @@ mod program_ir {
 		right: f64,
 	}
 
-	fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
+	/// The base index and period of a channel parameter, both nonnegative integers
+/// with a positive period.
+fn channel_span(instruction: &ScalarInstruction) -> Result<(i32, i32), EmitError> {
+	let base = integer(instruction.left, "scalar channel base")?;
+	let period = integer(instruction.right, "scalar channel period")?;
+	if base < 0 || period <= 0 {
+		return Err(EmitError::InvalidOperand { kind: "scalar channel parameter", value: instruction.right });
+	}
+	Ok((base, period))
+}
+
+fn integer(value: f64, kind: &'static str) -> Result<i32, EmitError> {
 		if !value.is_finite() || value.fract() != 0.0 || value < i32::MIN as f64 || value > i32::MAX as f64 {
 			return Err(EmitError::InvalidOperand { kind, value });
 		}
@@ -303,6 +325,28 @@ mod program_ir {
 					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
 					name
 				}
+				ScalarOpcode::Channel => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let _ = writeln!(output, "{name} = uitofp i32 {channel} to {ty}");
+					name
+				}
+				ScalarOpcode::ChannelParameter => {
+					let channel = context.channel.ok_or(EmitError::InvalidOperand { kind: "scalar channel", value: instruction.left })?;
+					let (base, period) = channel_span(instruction)?;
+					let column = format!("{name}.column");
+					let _ = writeln!(output, "{column}.rem = urem i32 {channel}, {period}");
+					let _ = writeln!(output, "{column}.index = add i32 {column}.rem, {base}");
+					let _ = writeln!(output, "{column}.wide = zext i32 {column}.index to i64");
+					if context.decode == 0 {
+						let pointer = format!("{name}.ptr");
+						let _ = writeln!(output, "{pointer} = getelementptr inbounds {model}, {ptrty} {weights}, i64 {column}.wide", model = context.value_type, ptrty = context.pointer_type, weights = context.weights);
+						let _ = writeln!(output, "{name}.model = load {model}, {ptrty} {pointer}, align {align}", model = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = context.alignment);
+					} else {
+						let _ = writeln!(output, "{name}.model = call {model} @recipe.model.decode{suffix}({ptrty} {weights}, i64 {column}.wide, i32 {decode})", model = context.value_type, ptrty = context.pointer_type, weights = context.weights, decode = context.decode);
+					}
+					let _ = writeln!(output, "{name} = call {ty} @recipe.state.from.model{suffix}({model} {name}.model)", model = context.value_type);
+					name
+				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &first, &second)?,
 				ScalarOpcode::Select => {
 					let condition = scalar_operand(instruction.left, &values, &first, &second)?;
@@ -406,6 +450,7 @@ mod program_ir {
 		let incoming = incoming_state.as_str();
 		let mut values = Vec::with_capacity(instructions.len());
 		let mut parameter_for = vec![None; instructions.len()];
+		let mut channel_columns: Vec<Option<String>> = vec![None; instructions.len()];
 		for (index, instruction) in instructions.iter().enumerate() {
 			let value = match instruction.opcode {
 				ScalarOpcode::Constant => (context.literal)(instruction.left, ty),
@@ -415,6 +460,11 @@ mod program_ir {
 						return Err(EmitError::InvalidOperand { kind: "scalar parameter", value: instruction.left });
 					}
 					parameter_for[index] = Some(parameter as usize);
+					format!("%{}.scalar.{index}", context.prefix)
+				}
+				ScalarOpcode::Channel => format!("%{}.scalar.{index}", context.prefix),
+				ScalarOpcode::ChannelParameter => {
+					channel_columns[index] = Some(format!("%{}.scalar.{index}.column.index", context.prefix));
 					format!("%{}.scalar.{index}", context.prefix)
 				}
 				ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, &entry_first, &entry_second)?,
@@ -441,6 +491,7 @@ mod program_ir {
 		let mut first = state_zero.clone();
 		let mut second = state_zero.clone();
 		let mut parameters = BTreeMap::new();
+		let mut channel_adjoints = Vec::new();
 		let mut sequence = 0;
 		if let Some(last) = adjoints.last_mut() {
 			*last = incoming.to_owned();
@@ -462,7 +513,11 @@ mod program_ir {
 		};
 		for (index, instruction) in instructions.iter().enumerate().rev() {
 			let adjoint = adjoints[index].clone();
-			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::FusedAdd) { String::new() } else { operand(instruction.left, &values)? };
+			let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel | ScalarOpcode::ChannelParameter | ScalarOpcode::FusedAdd) {
+				String::new()
+			} else {
+				operand(instruction.left, &values)?
+			};
 			let right = if matches!(
 				instruction.opcode,
 				ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough
@@ -603,7 +658,11 @@ mod program_ir {
 					// A rounding passes its adjoint straight through.
 					add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 				}
-				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
+				ScalarOpcode::ChannelParameter => {
+					let column = channel_columns[index].clone().ok_or(EmitError::InvalidReference { kind: "scalar channel", index: index as i32 })?;
+					channel_adjoints.push((column, adjoint.clone()));
+				}
+				ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter | ScalarOpcode::Channel => {}
 			}
 		}
 		for (index, parameter) in parameter_for.into_iter().enumerate() {
@@ -628,7 +687,7 @@ mod program_ir {
 		let first = encode("first", &first);
 		let second = encode("second", &second);
 		let parameters = parameters.into_iter().map(|(index, value)| (index, encode(&format!("parameter{index}"), &value))).collect();
-		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters })
+		Ok(ScalarReverse { code: output, first_adjoint: first, second_adjoint: second, parameter_adjoint: parameters, channel_adjoint: channel_adjoints })
 	}
 
 	#[derive(Clone, Copy)]
@@ -4898,13 +4957,12 @@ impl NativeModelIr {
 					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
 							concat!(
-								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
+								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
 								"i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, ",
-								"i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin}, i1 {sigmoid_decay}, {pointer} {kept}, i32 {slots} )\n"
+								"i32 %begin, i32 %end, i1 {tiled}, {ty} {scale}, i32 {origin}, {pointer} {kept}, i32 {slots} )\n"
 							),
 							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
 							tiled = node.argument[5] == 1.0,
-							sigmoid_decay = node.argument[7] == 1.0,
 							kept = kept,
 							slots = slots,
 							v = v,
@@ -4918,10 +4976,8 @@ impl NativeModelIr {
 							ty = self.node_precision(node).model_type,
 							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
 							pointer = pointer_type(backend),
-							decode = plan.decode(index),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							value = pointers.value,
 							context = pointers.context,
 						));
@@ -4940,20 +4996,10 @@ impl NativeModelIr {
 					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							concat!(
-								"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
-								"{pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, ",
-								"i32 {entries}, i32 {decode}, i1 {sigmoid_decay} )\n"
-							),
-							sigmoid_decay = node.argument[7] == 1.0,
-							v = v,
-							wide = wide,
-							entries = entries,
+							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries} )\n",
 							pointer = pointer_type(backend),
-							decode = plan.decode(index),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							value = pointers.value,
 							context = pointers.context,
 							arguments = shape.arguments
@@ -5091,6 +5137,8 @@ impl NativeModelIr {
 					let ty = self.node_precision(node).model_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -5114,10 +5162,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
+					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, p, wide| {
+					if let Some(channel) = channel {
+						emit_channel(ir, channel, p, node.output);
+					}
 						let output_pointer = format!("%{prefix}.output.ptr");
 						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
@@ -5463,42 +5515,21 @@ impl NativeModelIr {
 				(true, Primitive::Delta) => {
 					let shape = delta_shape(node, self.rows)?;
 					let keys = Shape { channels: shape.key_heads as usize, length: 1 };
-					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// One row and key head per element, so the value heads sharing a key head
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							concat!(
-								"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
-								"{pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, ",
-								"{pointer} {gate}, i64 {wide}, {arguments}, i1 {sigmoid_decay} )\n"
-							),
-							sigmoid_decay = node.argument[7] == 1.0,
-							v = v,
-							wide = wide,
+							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							context = pointers.context,
 							backward = pointers.backward_context,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							gate = pointers.second_adjoint,
 							arguments = shape.arguments
-						));
-					})?;
-					ir.push_str(barrier(backend));
-					// Then one decay scale per value head, folding that head's row partials.
-					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, _p, wide| {
-						ir.push_str(&format!(
-							"call void @delta_reverse_decay_body{v}( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
-							pointer = pointer_type(backend),
-							context = pointers.backward_context,
-							heads = shape.heads,
-							partials = shape.partials,
-							offset = gradient_base
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -5601,6 +5632,9 @@ impl NativeModelIr {
 					let st = self.node_precision(node).state_type;
 					let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
 					let prefix = format!("n{index}.scalar.reverse");
+					let channel_name = format!("%{prefix}.channel");
+					let channel = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel).then_some(channel_name.as_str());
+					let dynamic_parameters = self.graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).is_some_and(scalar_uses_channel_parameter);
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
@@ -5624,6 +5658,7 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
@@ -5643,13 +5678,14 @@ impl NativeModelIr {
 							decode: plan.decode(index),
 							prefix: &prefix,
 							literal: &literal,
+							channel,
 						},
 						&incoming,
 						true,
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
-					let scalar_body = |ir: &mut String, _p: &str, wide: &str| {
+					let scalar_body = |ir: &mut String, p: &str, wide: &str, row: &str| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let incoming_pointer = format!("%{prefix}.incoming.ptr");
 						let first_adjoint_pointer = format!("%{prefix}.first.adjoint.ptr");
@@ -5674,8 +5710,18 @@ impl NativeModelIr {
 							state_align = alignment(st),
 							wide = wide
 						));
+						if let Some(channel) = channel {
+							emit_channel(ir, channel, p, node.output);
+						}
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
+						for (column_index, (column, value)) in reverse.channel_adjoint.iter().enumerate() {
+							ir.push_str(&format!(
+								"%{prefix}.channel.index.{column_index} = add i32 {row}, {column}\n%{prefix}.channel.ptr.{column_index} = getelementptr inbounds {st}, {pointer} {scratch}, i32 %{prefix}.channel.index.{column_index}\n%{prefix}.channel.old.{column_index} = load {st}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n%{prefix}.channel.new.{column_index} = call {st} @recipe.state.add{v}({st} %{prefix}.channel.old.{column_index}, {st} {value})\nstore {st} %{prefix}.channel.new.{column_index}, {pointer} %{prefix}.channel.ptr.{column_index}, align {align}\n",
+								scratch = pointers.context,
+								align = alignment(st)
+							));
+						}
 						ir.push_str(&format!(
 							"{first_adjoint_pointer} = getelementptr inbounds {st}, {pointer} {source_adjoint}, i64 {wide}\n",
 							source_adjoint = pointers.source_adjoint,
@@ -5700,8 +5746,8 @@ impl NativeModelIr {
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, st, pointer, v, &format!("{prefix}.combined.owned")));
 						}
 					};
-					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide))?;
+					if gradients.is_empty() && !dynamic_parameters {
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide, ""))?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -5724,12 +5770,12 @@ impl NativeModelIr {
 								pointer_type: pointer,
 								scratch: &pointers.context,
 								zero: &literal(0.0, st),
-								gradients: &gradients,
+								gradients: &gradients, dynamic: dynamic_parameters,
 							},
-							|ir, p| {
+							|ir, p, row| {
 								let wide = format!("%{prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
-								scalar_body(ir, p, &wide)
+								scalar_body(ir, p, &wide, row)
 							},
 						)?;
 						ir.push_str(barrier(backend));
@@ -5884,8 +5930,8 @@ impl NativeModelIr {
 							&mut ir,
 							index,
 							name,
-							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
-							|ir, p| {
+							PartitionedLoop { suffix: v, count, partitions, columns: node.parameters, dynamic: false, value_type: st, pointer_type: pointer, scratch: &scratch, zero: &zero, gradients: &[] },
+							|ir, p, _row| {
 								let wide = format!("%{weight_prefix}.partitioned.p.wide");
 								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
 								let source_pointer = format!("%{weight_prefix}.source.ptr");
@@ -6186,7 +6232,7 @@ impl NativeModelIr {
 					let second_operand = if second == source { first.as_str() } else { second_value.as_str() };
 					let end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("recurrent body scalar program length overflows"))?).ok_or_else(|| RecipeError::new("recurrent body scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("recurrent body scalar program range is invalid"))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &format!("%{name}.weights"), decode: 0, prefix: &prefix, literal: &literal, channel: None }).map_err(|error| RecipeError::new(error.to_string()))?;
 					writeln!(ir, "%{name}.row.base = mul i32 %{name}.row, {source_elements}")?;
 					writeln!(ir, "br label %{name}.p.loop")?;
 					writeln!(ir, "{name}.p.loop:")?;
@@ -6667,7 +6713,7 @@ impl NativeModelIr {
 						self.emit_converted_load(&mut ir, pointer, &format!("%recur{index}.reverse{node_index}.second.ptr"), second_node, node, &second_value);
 					}
 					let reverse_weights = format!("%recur{index}.body{node_index}.weights");
-					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal };
+					let scalar_context = program_ir::ScalarContext { value_type: ty, state_type: self.node_precision(node).state_type, libm: self.graph.profile.libm, suffix: v, pointer_type: pointer, alignment: align, first: &first, second: second_operand, weights: &reverse_weights, decode: 0, prefix: &prefix, literal: &literal, channel: None };
 					let forward = program_ir::emit_scalar_forward(code, scalar_context).map_err(|error| RecipeError::new(error.to_string()))?;
 					ir.push_str(&forward.code);
 					let reverse = program_ir::emit_scalar_reverse(code, scalar_context, &format!("%recur{index}.reverse{node_index}.incoming"), false).map_err(|error| RecipeError::new(error.to_string()))?;
@@ -8740,6 +8786,8 @@ struct PartitionedLoop<'a> {
 	count: usize,
 	partitions: usize,
 	columns: usize,
+	/// Whether the body adds channel parameter adjoints into the row at runtime.
+	dynamic: bool,
 	value_type: &'a str,
 	/// The template variant suffix of the node's arithmetic.
 	suffix: &'a str,
@@ -8754,11 +8802,11 @@ struct PartitionedLoop<'a> {
 /// `[t * q + min(t, r), (t + 1) * q + min(t + 1, r))` for the quotient `q` and
 /// remainder `r` of the element count over the partition count, so both the
 /// boundaries and the number of rows are fixed by the program.
-fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	// The body owns the `n{index}.{name}` namespace, so every value this function
 	// introduces sits under a suffix of its own.
 	let prefix = format!("n{index}.{name}.partition");
-	let PartitionedLoop { suffix: v, count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	let PartitionedLoop { suffix: v, count, partitions, columns, dynamic, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
 	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
 	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
 	let (whole, extra) = (narrow(count / partitions, "native partition span")?, narrow(count % partitions, "native partition remainder")?);
@@ -8771,7 +8819,8 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\n"));
 	// A body with no fixed sums accumulates into its partition's scratch row at
 	// `%{prefix}.row`, so the row starts at zero and keeps what the body left.
-	let entry = if gradients.is_empty() {
+	let zeroed = gradients.is_empty() || dynamic;
+	let entry = if zeroed {
 		ir.push_str(&format!("br label %{prefix}.zero\n{prefix}.zero:\n%{prefix}.zero.c = phi i32 [ 0, %{prefix}.body ], [ %{prefix}.zero.next, %{prefix}.zero.step ]\n%{prefix}.zero.more = icmp ult i32 %{prefix}.zero.c, {columns}\nbr i1 %{prefix}.zero.more, label %{prefix}.zero.step, label %{prefix}.zeroed\n{prefix}.zero.step:\n%{prefix}.zero.index = add i32 %{prefix}.row, %{prefix}.zero.c\n%{prefix}.zero.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.zero.index\nstore {ty} {zero}, {pointer} %{prefix}.zero.ptr, align {align}\n%{prefix}.zero.next = add i32 %{prefix}.zero.c, 1\nbr label %{prefix}.zero\n{prefix}.zeroed:\n"));
 		"zeroed"
 	} else {
@@ -8782,7 +8831,7 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.{entry} ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
 	}
 	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
-	body(ir, &format!("%{prefix}.p"));
+	body(ir, &format!("%{prefix}.p"), &format!("%{prefix}.row"));
 	ir.push_str(&format!("br label %{prefix}.fold\n{prefix}.fold:\n"));
 	for (parameter, value) in gradients {
 		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.state.add{v}({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
@@ -8792,10 +8841,33 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 	// never touches, so the fold below never reads an uninitialised slot.
 	for column in 0..if gradients.is_empty() { 0 } else { columns } {
 		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
-		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\n"));
+		if dynamic {
+			// Channel adjoints already sit in the row, so the static sum joins them.
+			ir.push_str(&format!("%{prefix}.old.{column} = load {ty}, {pointer} %{prefix}.column.{column}, align {align}\n%{prefix}.total.{column} = call {ty} @recipe.state.add{v}({ty} %{prefix}.old.{column}, {ty} {stored})\nstore {ty} %{prefix}.total.{column}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		} else {
+			ir.push_str(&format!("store {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+		}
 	}
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.advance = add i32 %{prefix}.t, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
+}
+
+/// Whether a scalar program reads its element's channel.
+fn scalar_uses_channel(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| matches!(instruction[0] as i32, 19 | 20))
+}
+
+/// Whether a scalar program reads a channel parameter, which gives its
+/// gradient a runtime column.
+fn scalar_uses_channel_parameter(code: &[f64]) -> bool {
+	code.chunks_exact(3).any(|instruction| instruction[0] as i32 == 20)
+}
+
+/// Defines the channel of the element at `element`, the row-relative or
+/// global index, in a shape of `shape.channels` by `shape.length` per row.
+fn emit_channel(ir: &mut String, name: &str, element: &str, shape: Shape) {
+	ir.push_str(&format!("{name}.within = urem i32 {element}, {}\n{name} = udiv i32 {name}.within, {}\n", shape.channels * shape.length, shape.length));
 }
 
 /// Walk the elements of one window of output positions. The positions of a
@@ -8907,13 +8979,11 @@ fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut 
 	Ok(())
 }
 
-/// The delta rule arguments both directions share, and the context offset of the
-/// per-pair decay partials that follow every other region.
+/// The delta rule arguments both directions share.
 struct DeltaShape {
 	heads: i32,
 	key_heads: i32,
 	chunks: i32,
-	partials: i32,
 	arguments: String,
 }
 
@@ -8930,18 +9000,13 @@ fn delta_extent(node: &Node) -> Result<(i32, i32, i32, i32)> {
 fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 	let (key_heads, key_width, heads, width) = delta_extent(node)?;
 	let chunk = integer_argument(node.argument[2], "delta chunk")?;
-	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?);
+	let pairs = checked_mul(rows, heads as usize, "delta pairs")?;
 	let chunks = node.output.length.div_ceil(chunk as usize);
-	let partials = narrow(
-		checked_mul(pairs, checked_add(state, checked_mul(2, width as usize, "delta vectors")?, "delta backward pair span")?, "delta partials")?,
-		"delta partials",
-	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
 	Ok(DeltaShape {
 		heads,
 		key_heads,
 		chunks: blocks,
-		partials,
 		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}"),
 	})
 }
@@ -12153,6 +12218,7 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			17 => Ok(Activation::Sqrt),
+			18 => Ok(Activation::Softplus),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
@@ -12195,7 +12261,12 @@ mod bundle {
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared), f64::from_bits(*scale_bits), u8::from(*selection_bias))
+				let (kind, count, gate) = match shared {
+					SharedExpert::None => (0, 0, "-".to_owned()),
+					SharedExpert::Ungated { count } => (1, *count, "-".to_owned()),
+					SharedExpert::Gated { count, gate } => (2, *count, activation_text(*gate)),
+				};
+				format!("moe,v2,{experts},{top_k},{hidden},{},{},{},{},{},{kind},{count},{gate}", activation.code(), *scoring as u8, u8::from(*renormalize), f64::from_bits(*scale_bits), u8::from(*selection_bias))
 			}
 			Operation::Hyper(lanes, rank, blocks, gate, mean) => {
 				let branch = blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";");
@@ -12206,7 +12277,7 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,v3,{},{},{},{},{},{},{},{},{},{},{},{}",
+				"delta,v4,{},{},{},{},{},{},{},{},{},{},{},{}",
 				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
 				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
 				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
@@ -12225,6 +12296,7 @@ mod bundle {
 				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
 			},
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
+			Operation::ChannelScale(period, values) => format!("channel_scale,{period}{}", values.iter().map(|bits| format!(",{bits}")).collect::<String>()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
 			Operation::MoeBlocks(top_k, experts) => format!("moe_blocks,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
@@ -12337,18 +12409,27 @@ mod bundle {
 			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				if fields.len() >= 9 {
+				if fields.first() == Some(&"v2") {
+					require(fields.len() >= 12, "saved MoE record is not current format")?;
+					let shared = match value_at::<u8>(fields.get(9).copied(), "MoE shared expert kind")? {
+						0 => SharedExpert::None,
+						1 => SharedExpert::Ungated { count: value_at(fields.get(10).copied(), "MoE shared expert count")? },
+						2 => SharedExpert::Gated { count: value_at(fields.get(10).copied(), "MoE shared expert count")?, gate: activation(&fields[11..].join(","))? },
+						other => return Err(RecipeError::new(format!("MoE shared expert kind {other} is unknown"))),
+					};
 					Ok(Operation::Moe(
-						value_at(fields.first().copied(), "MoE experts")?,
-						value_at(fields.get(1).copied(), "MoE top-k")?,
-						value_at(fields.get(2).copied(), "MoE expert width")?,
-						activation(fields.get(3).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
-						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
-						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
-						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
+						value_at(fields.get(1).copied(), "MoE experts")?,
+						value_at(fields.get(2).copied(), "MoE top-k")?,
+						value_at(fields.get(3).copied(), "MoE expert width")?,
+						activation(fields.get(4).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
+						scoring(value_at(fields.get(5).copied(), "MoE scoring")?)?,
+						bool_value(fields.get(6).copied().unwrap_or(""), "MoE renormalization")?,
+						shared,
 						value_at::<f64>(fields.get(7).copied(), "MoE routed scale")?.to_bits(),
 						bool_value(fields.get(8).copied().unwrap_or(""), "MoE selection bias")?,
 					))
+				} else if fields.len() >= 9 {
+					Err(RecipeError::new("saved MoE record is not current format"))
 				} else {
 					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 					Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
@@ -12382,14 +12463,14 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
-				require(fields.next() == Some("v3"), "saved delta record is not current format")?;
+				require(fields.next() == Some("v4"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
 				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
 				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
-				let decay_gate = fields.next().filter(|value| *value != "-").map(delta_decay_code).transpose()?;
-				let write_gate = fields.next().filter(|value| *value != "-").map(delta_write_code).transpose()?;
+				let decay_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let write_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
 				let value_norm = normalization(fields.next(), "delta value normalization")?;
 				require(fields.next().is_none(), "delta record has extra fields")?;
@@ -12419,6 +12500,12 @@ mod bundle {
 				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
+			"channel_scale" => {
+					let period: usize = value_at(fields.next(), "channel scale period")?;
+					let values = (0..period).map(|_| value_at::<u64>(fields.next(), "channel scale value")).collect::<Result<Vec<_>>>()?;
+					require(fields.next().is_none(), "channel scale record has extra fields")?;
+					Ok(Operation::ChannelScale(period, values))
+				}
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -12468,7 +12555,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -13015,17 +13102,6 @@ mod bundle {
 			}
 		}
 		Ok(result)
-	}
-	#[cfg(test)]
-	mod tests {
-		use super::*;
-		#[test]
-		fn operation_precisions_round_trip() {
-			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
-			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 11);
-			assert_eq!(block(&text).unwrap(), original);
-		}
 	}
 }
 #[cfg(unix)]
@@ -13657,26 +13733,6 @@ impl AttentionBlock {
 
 
 }
-/// The decay of a delta block: each step scales the state by exp(-softplus(a) * rate), with rate from the block's ssm_a.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeltaDecay {
-	Softplus,
-}
-impl DeltaDecay {
-	const fn code(self) -> u8 {
-		match self { Self::Softplus => 1 }
-	}
-}
-/// The write strength of a delta block: sigmoid of the beta projection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeltaWrite {
-	Sigmoid,
-}
-impl DeltaWrite {
-	const fn code(self) -> u8 {
-		match self { Self::Sigmoid => 1 }
-	}
-}
 /// One gated delta rule block: value heads, the convolution kernel, and the key
 /// and value extents. A zero extent takes it from the stream, so the value heads
 /// exactly partition the block input and the keys match the values.
@@ -13693,9 +13749,9 @@ struct DeltaBlock {
 	/// Activation applied to the output gate, named by the model.
 	output_activation: Option<Activation>,
 	/// Decay gate of the recurrence, named by the model.
-	decay_gate: Option<DeltaDecay>,
+	decay_gate: Option<Activation>,
 	/// Write gate of the recurrence, named by the model.
-	write_gate: Option<DeltaWrite>,
+	write_gate: Option<Activation>,
 	qk_norm: Option<BlockNormalization>,
 	value_norm: Option<BlockNormalization>,
 }
@@ -13760,6 +13816,17 @@ impl PleBlock {
 		self.rows.saturating_mul(self.width)
 	}
 }
+/// The shared expert every position takes beside the routed experts. `count` names how many
+/// experts it merges, so its feed-forward width is `count` times the routed expert width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExpert {
+	/// No shared expert.
+	None,
+	/// The shared feed-forward sums with weight one at every position.
+	Ungated { count: usize },
+	/// The shared feed-forward scales by `gate`, applied to a `[width]` projection of each position.
+	Gated { count: usize, gate: Activation },
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
@@ -13777,7 +13844,7 @@ enum Operation {
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
 	/// The routed scale is kept as its bits, so the operation stays `Eq`.
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool, u64, bool),
+	Moe(usize, usize, usize, Activation, Scoring, bool, SharedExpert, u64, bool),
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
@@ -13788,6 +13855,8 @@ enum Operation {
 	Ple(PleBlock),
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
+	/// Multiplies channel `c` by its trainable value `c mod period`; the values are their bit patterns.
+	ChannelScale(usize, Vec<u64>),
 	/// Computes nothing. It carries a step that is only an activation or only
 	/// a normalization, so those need no operation of their own.
 	Identity,
@@ -13818,6 +13887,7 @@ pub enum Activation {
 	/// activation stays comparable. Owns no weights and preserves shape.
 	Scale(u64),
 	Sqrt,
+	Softplus,
 }
 impl Activation {
 	/// The saved code of the activation. A parameterized activation writes its
@@ -13842,6 +13912,7 @@ impl Activation {
 			Self::Prelu => 15,
 			Self::Scale(_) => 16,
 			Self::Sqrt => 17,
+			Self::Softplus => 18,
 		}
 	}
 }
@@ -13991,6 +14062,12 @@ pub struct Block {
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
 
+	/// Tensors a script names for the planes of the block's non-L2 normalizations, in order.
+	scale_tensors: Vec<String>,
+	/// Tensors a script names for the planes of a delta block.
+	delta_tensors: Option<DeltaTensors>,
+	/// Tensors a script names for the planes of an attention block.
+	attention_tensors: Option<AttentionTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14064,12 +14141,26 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Map;
 		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+		self
+	}
+	/// Names the GGUF tensors this attention block reads, and marks its rotary factors when a tensor holds them.
+	pub fn attention_from(mut self, tensors: AttentionTensors) -> Self {
+		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
+		attention.factors |= tensors.factors.is_some();
+		self.attention_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
+	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
+		let normalizations = self.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).count();
+		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
+		self.scale_tensors.push(name.into());
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -14181,6 +14272,90 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors an attention block reads, spelled by the script. `q` holds the query rows,
+/// interleaved with the gate rows when the block is gated; a missing `v` reads `k` as the values;
+/// the biases, the query and key scales and the rotary factors are present only when named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionTensors {
+	pub q: String,
+	pub k: String,
+	pub v: Option<String>,
+	pub q_bias: Option<String>,
+	pub k_bias: Option<String>,
+	pub v_bias: Option<String>,
+	pub q_norm: Option<String>,
+	pub k_norm: Option<String>,
+	pub factors: Option<String>,
+	pub out: String,
+	pub indexer: Option<IndexerTensors>,
+}
+impl AttentionTensors {
+	/// The tensors of block `layer` under the names GGUF files give them, each optional one named
+	/// and bound only when the file holds it.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			q: name("attn_q.weight"),
+			k: name("attn_k.weight"),
+			v: Some(name("attn_v.weight")),
+			q_bias: Some(name("attn_q.bias")),
+			k_bias: Some(name("attn_k.bias")),
+			v_bias: Some(name("attn_v.bias")),
+			q_norm: Some(name("attn_q_norm.weight")),
+			k_norm: Some(name("attn_k_norm.weight")),
+			factors: Some("rope_freqs.weight".to_owned()),
+			out: name("attn_output.weight"),
+			indexer: Some(IndexerTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors the token indexer of an attention block reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexerTensors {
+	pub q_proj: String,
+	pub k_proj: String,
+	pub q_norm: String,
+	pub k_norm: String,
+}
+impl IndexerTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+		Self { q_proj: name("q_proj.weight"), k_proj: name("k_proj.weight"), q_norm: name("q_norm.weight"), k_norm: name("k_norm.weight") }
+	}
+}
+/// The GGUF tensors a delta block reads, spelled by the script: the gate projection halves
+/// (`alpha` for the decay, `beta` for the write), the optional decay bias, the stored decay
+/// `-exp(A)`, the query-key-value projection, the convolution taps, the output scale, the
+/// output gate and the output projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaTensors {
+	pub alpha: String,
+	pub beta: String,
+	pub decay_bias: Option<String>,
+	pub decay: String,
+	pub qkv: String,
+	pub conv: String,
+	pub norm: String,
+	pub gate: String,
+	pub out: String,
+}
+impl DeltaTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			alpha: name("ssm_alpha.weight"),
+			beta: name("ssm_beta.weight"),
+			decay_bias: Some(name("ssm_dt.bias")),
+			decay: name("ssm_a"),
+			qkv: name("attn_qkv.weight"),
+			conv: name("ssm_conv1d.weight"),
+			norm: name("ssm_norm.weight"),
+			gate: name("attn_gate.weight"),
+			out: name("ssm_out.weight"),
+		}
+	}
+}
 #[derive(Clone)]
 pub struct HyperGate {
 	pub read: Model,
@@ -14315,6 +14490,9 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
+				scale_tensors: Vec::new(),
+				delta_tensors: None,
+				attention_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14390,10 +14568,10 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
-	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
+	/// Routed packed expert tables with the shared expert `shared` selects.
 	/// `scale` multiplies every routing weight. `selection_bias` adds a per-expert bias to the
 	/// scores that choose the top-k experts; the weights themselves stay unbiased.
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool) -> Self {
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale.to_bits(), selection_bias))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
@@ -14404,6 +14582,30 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.pop().unwrap();
 			model.blocks.push(apply(block));
+		})
+	}
+	/// Names the GGUF tensors the preceding delta block reads, in place of the names the file's
+	/// block index would give them.
+	pub fn delta_from(&self, tensors: DeltaTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
+			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
+			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding attention block reads.
+	pub fn attention_from(&self, tensors: AttentionTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("attention_from requires a preceding attention block"));
+			*block = block.clone().attention_from(tensors);
+		})
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of the preceding block.
+	pub fn scale_from(&self, name: impl Into<String>) -> Self {
+		let name = name.into();
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("scale_from requires a preceding normalization"));
+			*block = block.clone().scale_from(name);
 		})
 	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
@@ -14461,7 +14663,7 @@ impl Model {
 		self.delta_block("delta_norms", |delta| (delta.qk_norm, delta.value_norm) = (Some(query_key.normalization()), Some(value.normalization())))
 	}
 	/// Decay and write gates of the preceding delta block, named by the model.
-	pub fn delta_gates(&self, decay: DeltaDecay, write: DeltaWrite) -> Self {
+	pub fn delta_gates(&self, decay: Activation, write: Activation) -> Self {
 		self.delta_block("delta_gates", |delta| (delta.decay_gate, delta.write_gate) = (Some(decay), Some(write)))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
@@ -14537,6 +14739,13 @@ impl Model {
 	/// returning to the block input width.
 	pub fn glu(&self, hidden: usize, activation: Activation) -> Self {
 		self.push(Operation::Glu(hidden, activation))
+	}
+	/// Multiplies each channel by a trainable value, where channel `c` takes
+	/// `values[c % values.len()]`. Each value is one parameter, so a per-head gain
+	/// takes one value per head.
+	pub fn channel_scale(&self, values: &[f64]) -> Self {
+		assert!(!values.is_empty() && values.iter().all(|value| value.is_finite()), "channel scale needs finite values");
+		self.push(Operation::ChannelScale(values.len(), values.iter().map(|value| value.to_bits()).collect()))
 	}
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
@@ -14635,13 +14844,14 @@ impl Model {
 			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
 			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
-				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared:?},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
 			}
 			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
 			Operation::Perceptron(width) => format!("perc({width})"),
 			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
 			Operation::Hyper(lanes, _, parts, gate, _) => format!("{}({lanes},[{}])", if gate.is_some() { "hyper_gate" } else { "hyper" }, Self::describe_parts(parts)),
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
+			Operation::ChannelScale(period, _) => format!("channel_scale({period})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
 			Operation::Identity => String::new(),
@@ -16187,6 +16397,7 @@ impl Operation {
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
 			Self::Glu(..) => "glu",
+			Self::ChannelScale(..) => "channel_scale",
 		}
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
@@ -16224,6 +16435,7 @@ impl Activation {
 			Self::Prelu => "prelu",
 			Self::Scale(_) => "scale",
 			Self::Sqrt => "sqrt",
+			Self::Softplus => "softplus",
 		}
 	}
 }
@@ -16846,6 +17058,10 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// The plan as text, one line per node naming each plane and its element count.
+	pub fn listing(&self) -> Vec<String> {
+		self.nodes.iter().enumerate().map(|(index, planes)| format!("node {index}: {}", planes.iter().map(|plane| format!("{}[{}]", plane.name(), plane.elements())).collect::<Vec<_>>().join(" "))).collect()
+	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
@@ -16987,7 +17203,7 @@ struct Architecture {
 	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
-	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_gates: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
@@ -16995,7 +17211,11 @@ struct Architecture {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedChoice { None, Ungated, Gated }
 #[derive(Clone, Copy)]
 enum PleGateChoice { SignedRootSigmoid }
 #[derive(Default)]
@@ -17004,8 +17224,8 @@ struct ArchitectureDraft {
 	rope: Option<RopePairs>,
 	convolution: Option<Activation>,
 	output: Option<Activation>,
-	delta_decay: Option<DeltaDecay>,
-	delta_write: Option<DeltaWrite>,
+	delta_decay: Option<Activation>,
+	delta_write: Option<Activation>,
 	qk_norm: Option<BlockNormalization>,
 	value_norm: Option<BlockNormalization>,
 	ple_key_norm: Option<BlockNormalization>,
@@ -17020,6 +17240,8 @@ struct ArchitectureDraft {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -17029,6 +17251,12 @@ impl ArchitectureDraft {
 		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
 		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
 		require(self.expert_scoring.is_some() == self.expert_renormalize.is_some(), format!("architecture {:?} has an incomplete expert routing profile", self.name))?;
+		require(self.expert_shared.is_none() || self.expert_scoring.is_some(), format!("architecture {:?} names an expert-shared profile without expert routing", self.name))?;
+		match (self.expert_shared, self.expert_shared_gate) {
+			(Some(SharedChoice::Gated), None) => return Err(RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.name))),
+			(Some(choice), Some(_)) if choice != SharedChoice::Gated => return Err(RecipeError::new(format!("architecture {:?} names expert-shared-gate without a gated expert-shared profile", self.name))),
+			_ => {}
+		}
 		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
 		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
 		let ple_math = if ple_fields[0] {
@@ -17038,19 +17266,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale })
-	}
-}
-fn delta_decay_code(value: &str) -> Result<DeltaDecay> {
-	match value {
-		"1" => Ok(DeltaDecay::Softplus),
-		_ => Err(RecipeError::new(format!("saved delta decay gate {value:?} is not known"))),
-	}
-}
-fn delta_write_code(value: &str) -> Result<DeltaWrite> {
-	match value {
-		"1" => Ok(DeltaWrite::Sigmoid),
-		_ => Err(RecipeError::new(format!("saved delta write gate {value:?} is not known"))),
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -17058,6 +17274,7 @@ fn architecture_activation(value: &str) -> Result<Activation> {
 		"linear" => Ok(Activation::Linear),
 		"relu" => Ok(Activation::Relu),
 		"silu" => Ok(Activation::Silu),
+		"softplus" => Ok(Activation::Softplus),
 		"sigmoid" => Ok(Activation::Sigmoid),
 		"tanh" => Ok(Activation::Tanh),
 		"gelu" => Ok(Activation::Gelu),
@@ -17092,8 +17309,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"rope-pairs" => current.rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid rope pairing {value:?}", current.name))) }),
 			"delta-convolution" => current.convolution = Some(architecture_activation(value)?),
 			"delta-output" => current.output = Some(architecture_activation(value)?),
-			"delta-decay" => current.delta_decay = Some(match value { "softplus" => DeltaDecay::Softplus, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta decay {value:?}", current.name))) }),
-			"delta-write" => current.delta_write = Some(match value { "sigmoid" => DeltaWrite::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta write {value:?}", current.name))) }),
+			"delta-decay" => current.delta_decay = Some(architecture_activation(value)?),
+			"delta-write" => current.delta_write = Some(architecture_activation(value)?),
 			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
 			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
 			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
@@ -17101,6 +17318,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
 			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
 			"expert-scale" => current.expert_scale = Some(value.parse().map_err(|_| RecipeError::new(format!("architecture {:?} has invalid expert weights scale {value:?}", current.name)))?),
+			"expert-shared" => current.expert_shared = Some(match value { "none" => SharedChoice::None, "ungated" => SharedChoice::Ungated, "gated" => SharedChoice::Gated, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert shared expert {value:?}", current.name))) }),
+			"expert-shared-gate" => current.expert_shared_gate = Some(architecture_activation(value)?),
 			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
 			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
 			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
@@ -17212,7 +17431,7 @@ struct Builder<'a> {
 	architecture: &'a str,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
-	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_gates: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
@@ -17220,6 +17439,8 @@ struct Builder<'a> {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -17257,6 +17478,7 @@ struct ExpertDims {
 	scoring: Scoring,
 	renormalize: bool,
 	scale: f64,
+	shared: SharedExpert,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
@@ -17266,7 +17488,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -17432,10 +17654,12 @@ impl<'a> Builder<'a> {
 					Some(_) => Some(self.integer("expert_gating_func")?),
 					None => None,
 				};
+				let hidden = self.integer("expert_feed_forward_length")?;
 				Some(ExpertDims {
 					count,
 					used: self.integer("expert_used_count")?,
-					hidden: self.integer("expert_feed_forward_length")?,
+					hidden,
+					shared: self.shared_expert(hidden)?,
 					scoring: match gating {
 						Some(1) => Scoring::Softmax,
 						Some(2) => Scoring::Sigmoid,
@@ -17529,6 +17753,12 @@ impl<'a> Builder<'a> {
 		}
 		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
 	}
+	/// The values of an attention projection bias row, or zeros when the file holds none.
+	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
+		let Some(tensor) = tensor else { return Ok(vec![0.0; outputs]) };
+		require(tensor.shape == [outputs as u64], format!("{} has shape {:?}; {role} adds one bias per {outputs} outputs", tensor.name, tensor.shape))?;
+		file.values(&tensor)
+	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
 	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
@@ -17552,9 +17782,10 @@ impl<'a> Builder<'a> {
 			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
-		self.attention_planes(layer, attention, normalized, width)?;
+		self.attention_planes(layer, attention, normalized, width, None)?;
 		if gated {
-			self.attention_gate_planes(layer, heads, head)?;
+			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
+			self.attention_gate_planes(layer, heads, head, gate_biased, None)?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -17562,7 +17793,7 @@ impl<'a> Builder<'a> {
 				let gate = Block::of(Operation::Layer(heads * head)).sigmoid();
 				model.blocks.push(Block::of(Operation::Product(
 					ProductBranch { blocks: vec![attention], exclusions: 0 },
-					ProductBranch { blocks: vec![gate], exclusions: bias.mask() },
+					ProductBranch { blocks: vec![gate], exclusions: if gate_biased { 0 } else { bias.mask() } },
 				)));
 			});
 			block = block.layer(width);
@@ -17612,47 +17843,47 @@ impl<'a> Builder<'a> {
 		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
 		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
 		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
-		self.delta_planes(layer, &delta, dimensions.width)?;
+		self.delta_planes(layer, &delta, dimensions.width, None)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
 	/// Bind the planes of the declared delta block in lowering order.
-	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize) -> Result<()> {
+	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize, spelled: Option<&DeltaTensors>) -> Result<()> {
 		let (key_heads, key_width, value_width, output) = delta.extent(width)?;
 		let (heads, kernel) = (delta.heads, delta.kernel);
 		let inner = heads * value_width;
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| DeltaTensors::block(layer));
 		let role = format!("block {layer} delta");
-		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
-		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
+		let alpha = self.projection(&named.alpha, &role, width, heads)?;
+		let beta = self.projection(&named.beta, &role, width, heads)?;
 		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
-		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
+		if let Some(decay_bias) = named.decay_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			require(decay_bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", decay_bias.name, decay_bias.elements()))?;
 			gates.push(Plane::Mapped(decay_bias));
-			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
+			gates.push(Plane::Owned { name: format!("{} (zero)", named.beta), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
+		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
+		let decay = self.tensor(&named.decay, &role)?;
+		let values = self.file.values(&decay)?;
+		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
+		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let conv_width = 2 * key_heads * key_width + inner;
-		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
+		let qkv = self.projection(&named.qkv, &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
-		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == conv_width,
 			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
-		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
-		let decay = self.tensor(&name("ssm_a"), &role)?;
-		let values = self.file.values(&decay)?;
-		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
-		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let order = (0..value_width).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
+		let scales = self.scale(&named.norm, &role, value_width, heads, &order)?;
 		self.slot(scales);
-		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
+		let gate = self.projection(&named.gate, &role, width, inner)?;
 		self.mapped(vec![gate]);
-		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
+		let output = self.projection(&named.out, &role, inner, output)?;
 		self.mapped(vec![output]);
 		Ok(())
 	}
@@ -17669,18 +17900,43 @@ impl<'a> Builder<'a> {
 		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
 		Ok(branch.glu(hidden, activation))
 	}
+	/// The shared expert the architecture row selects. A gated profile names its gate
+	/// activation, and the row names no count, which comes from `expert_shared_count`.
+	fn shared_expert(&self, hidden: usize) -> Result<SharedExpert> {
+		let choice = self.expert_shared.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert-shared profile; add expert-shared to its Cargo.toml routing profile", self.architecture)))?;
+		match choice {
+			SharedChoice::None => Ok(SharedExpert::None),
+			SharedChoice::Ungated => Ok(SharedExpert::Ungated { count: self.shared_count(hidden)? }),
+			SharedChoice::Gated => {
+				let gate = self.expert_shared_gate.ok_or_else(|| RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.architecture)))?;
+				Ok(SharedExpert::Gated { count: self.shared_count(hidden)?, gate })
+			}
+		}
+	}
+	/// The shared expert count: `expert_shared_count` when the file names it, else the
+	/// shared feed-forward width in whole routed-expert widths.
+	fn shared_count(&self, hidden: usize) -> Result<usize> {
+		let count = if self.present("expert_shared_count") {
+			self.integer("expert_shared_count")?
+		} else {
+			let width = self.integer("expert_shared_feed_forward_length")?;
+			require(hidden != 0 && width % hidden == 0, format!("expert_shared_feed_forward_length {width} is not a whole number of {hidden}-wide experts, and the file names no expert_shared_count"))?;
+			width / hidden
+		};
+		require(count != 0, "the shared expert count is zero; a shared expert needs at least one")?;
+		Ok(count)
+	}
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let ExpertDims { count, used, hidden, scoring, renormalize, scale } = *experts;
-		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
+		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
 		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
 		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
 		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, selection_bias: bool, width: usize) -> Result<()> {
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
@@ -17700,13 +17956,21 @@ impl<'a> Builder<'a> {
 			)?;
 			self.mapped(vec![table]);
 		}
-		if shared {
+		let (shared_count, gated) = match shared {
+			SharedExpert::None => (0, false),
+			SharedExpert::Ungated { count } => (count, false),
+			SharedExpert::Gated { count, .. } => (count, true),
+		};
+		if shared != SharedExpert::None {
 			let shared_role = format!("block {layer} shared expert");
-			// The per-position gate is the first weighted node in the shared path.
-			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
-			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
-			self.mapped(vec![gate]);
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
+			let shared_hidden = checked_mul(shared_count, hidden, "shared expert width")?;
+			if gated {
+				// The per-position gate is the first weighted node in the shared path.
+				let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+				require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
+				self.mapped(vec![gate]);
+			}
+			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)] {
 				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
@@ -18455,7 +18719,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -18547,8 +18811,12 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
-				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
+			for (index, _) in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+				let name = match block.scale_tensors.get(index) {
+					Some(spelled) => spelled.as_str(),
+					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
+					None => "token_embd_norm.weight",
+				};
 				self.norm_scale(name, width)?;
 			}
 		}
@@ -18585,14 +18853,14 @@ impl Builder<'_> {
 			match &step.operation {
 				Operation::Identity => {}
 				Operation::Attention(attention) => {
-					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					self.attention_planes(layer, attention, step.qk.is_some(), width, step.attention_tensors.as_ref())?;
 					if !attention.project {
 						hidden = attention.heads * if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 					}
 					weighted = true;
 				}
 				Operation::Delta(delta) => {
-					self.delta_planes(layer, delta, width)?;
+					self.delta_planes(layer, delta, width, step.delta_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
@@ -18610,14 +18878,16 @@ impl Builder<'_> {
 						};
 						let head = if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 						hidden = attention.heads * head;
-						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden) && gate_branch.exclusions & bias.mask() != 0, "an attention product's gate is a bias-free layer over its head plane")?;
+						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
 						let normalized = attention_branch.blocks[0].qk.is_some();
+						let spelled = attention_branch.blocks[0].attention_tensors.as_ref();
+						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
 						if attention_left {
-							self.attention_planes(layer, attention, normalized, width)?;
-							self.attention_gate_planes(layer, attention.heads, head)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
 						} else {
-							self.attention_gate_planes(layer, attention.heads, head)?;
-							self.attention_planes(layer, attention, normalized, width)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
 						}
 						weighted = true;
 					} else {
@@ -18649,7 +18919,11 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for (index, _) in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+				if let Some(spelled) = step.scale_tensors.get(index) {
+					self.norm_scale(spelled, width)?;
+					continue;
+				}
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
@@ -18665,11 +18939,10 @@ impl Builder<'_> {
 
 	/// Bind the same side projection and deferred key scales for architecture
 	/// models and script-defined resident attention.
-	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer, named: &IndexerTensors) -> Result<()> {
 		let role = format!("block {layer} indexer");
-		let query = self.projection(&name("q_proj.weight"), &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
-		let key = self.projection(&name("k_proj.weight"), &role, width, index.width)?;
+		let query = self.projection(&named.q_proj, &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
+		let key = self.projection(&named.k_proj, &role, width, index.width)?;
 		let dims = index.score.map_or(0, |(_, dims)| dims);
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
@@ -18679,8 +18952,8 @@ impl Builder<'_> {
 		planes.extend(Self::head_rows(&key, 0, &order)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
-			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
-			scales.extend(self.scale(&name("k_norm.weight"), &role, index.width, 1, &order)?);
+			let mut scales = self.scale(&named.q_norm, &role, index.width, index.heads, &order)?;
+			scales.extend(self.scale(&named.k_norm, &role, index.width, 1, &order)?);
 			self.slot(scales);
 		}
 		Ok(())
@@ -18695,22 +18968,23 @@ impl Builder<'_> {
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and its
 	/// output projection, as `attention` lays them out for a built one.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize) -> Result<()> {
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		let query = self.tensor(&named.q, &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		let gated = match query.shape[1] as usize {
 			outputs if outputs == heads * head => false,
 			outputs if outputs == 2 * heads * head => true,
 			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
 		};
-		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
+		let key = self.projection(&named.k, &role, width, kv * head)?;
+		let value = match named.v.as_deref().and_then(|value_name| self.optional(value_name)) {
 			Some(value) => {
 				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
 				value
@@ -18727,33 +19001,61 @@ impl Builder<'_> {
 			planes.extend(Self::head_rows(&key, index * head, &order)?);
 		}
 		planes.push(value);
-		self.mapped(planes);
+		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
+		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
+			// The bias row follows the matrix rows, in the order the planes read them.
+			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
+			let key_values = Self::bias_values(self.file, key_bias, kv * head, &role)?;
+			let value_values = Self::bias_values(self.file, value_bias, kv * head, &role)?;
+			let mut row = Vec::with_capacity(query_values.len() + 2 * kv * head);
+			for index in 0..heads {
+				row.extend(order.iter().map(|channel| query_values[index * stride + channel]));
+			}
+			for index in 0..kv {
+				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
+			}
+			row.extend(value_values);
+			slot.push(Plane::Owned { name: format!("{} (bias row)", named.q), values: row });
+		}
+		self.slot(slot);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let (q_norm, k_norm) = named.q_norm.as_deref().zip(named.k_norm.as_deref()).ok_or_else(|| RecipeError::new(format!("{role} normalizes its queries and keys, and names no scale tensors for them")))?;
+			let mut scales = self.scale(q_norm, &role, head, heads, &order)?;
+			scales.extend(self.scale(k_norm, &role, head, kv, &order)?);
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
+			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
+			let factors = self.tensor(factors_name, &role)?;
 			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
 			self.mapped(vec![factors]);
 		}
 		if let Some(index) = attention.index {
-			self.indexer_planes(layer, width, index)?;
+			let indexer = named.indexer.clone().ok_or_else(|| RecipeError::new(format!("{role} indexes tokens, and names no indexer tensors")))?;
+			self.indexer_planes(layer, width, index, &indexer)?;
 		}
 		if attention.project {
-			let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
+			let output = self.projection(&named.out, &role, heads * head, width)?;
 			self.mapped(vec![output]);
 		}
 		Ok(())
 	}
-	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize) -> Result<()> {
-		let name = format!("blk.{layer}.attn_q.weight");
+	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
+		let name = named.q.clone();
 		let query = self.tensor(&name, "the attention gate")?;
 		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
 		let mut rows = Vec::with_capacity(heads);
 		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
-		self.mapped(rows);
+		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
+		if biased && let Some(tensor) = named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
+			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
+			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
+			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
+		}
+		self.slot(planes);
 		Ok(())
 	}
 }
@@ -21502,6 +21804,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel, dilation) => lower_dconv(graph, *kernel, *dilation)?,
+		Operation::ChannelScale(period, values) => lower_channel_scale(graph, *period, values)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
@@ -21761,6 +22064,12 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	Ok(())
 }
 fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: ScalarProgram) -> Result<()> {
+	for instruction in program.0.chunks_exact(3) {
+		if instruction[0] as i32 == 20 {
+			let (base, period) = (instruction[1], instruction[2]);
+			require(base.fract() == 0.0 && period.fract() == 0.0 && base >= 0.0 && period >= 1.0 && base + period <= initial.len() as f64, "channel parameter span exceeds the node's parameters")?;
+		}
+	}
 	let (program_offset, program_count) = (graph.programs.len(), program.0.len() / 3);
 	graph.programs.extend(program.0);
 	let arguments = arguments(0.0, 0.0);
@@ -21802,6 +22111,16 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		}
 	}
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
+	activation_program(&mut program, x, activation, config, graph.profile.gelu_table)?;
+	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
+	push_program(graph, -2, initial, program)
+}
+/// Appends the program of one activation applied to `x` and returns the index of its result. A
+/// linear activation returns `x` itself, so the caller's program names the source.
+fn activation_program(program: &mut ScalarProgram, x: f64, activation: Activation, config: Config, gelu_table: bool) -> Result<f64> {
+	if activation == Activation::Linear {
+		return Ok(x);
+	}
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let positive = program.op(ScalarOpcode::Greater, x, zero);
 	let constant = |program: &mut ScalarProgram, value| program.constant(value);
@@ -21809,6 +22128,17 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Cos => program.unary(ScalarOpcode::Cos, x),
 		Activation::Exp => program.unary(ScalarOpcode::Exp, x),
 		Activation::Sqrt => program.unary(ScalarOpcode::SquareRoot, x),
+		Activation::Softplus => {
+			// log(1 + exp(-|x|)) plus the positive part of x.
+			let magnitude = program.unary(ScalarOpcode::Absolute, x);
+			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
+			let exponential = program.unary(ScalarOpcode::Exp, negative);
+			let shifted = program.op(ScalarOpcode::Add, one, exponential);
+			let tail = program.unary(ScalarOpcode::Log, shifted);
+			let positive = program.op(ScalarOpcode::Greater, x, zero);
+			let linear = program.op(ScalarOpcode::Select, positive, x);
+			program.op(ScalarOpcode::Add, linear, tail)
+		}
 		Activation::Log | Activation::Ln => {
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let shifted = program.op(ScalarOpcode::Add, one, absolute);
@@ -21816,18 +22146,18 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
 			let signed = program.choose(positive, magnitude, negative);
 			if activation == Activation::Log {
-				let base = constant(&mut program, std::f64::consts::LN_10);
+				let base = constant(program, std::f64::consts::LN_10);
 				program.op(ScalarOpcode::Divide, signed, base)
 			} else {
 				signed
 			}
 		}
 		Activation::Huber => {
-			let threshold = constant(&mut program, config.activation[7]);
+			let threshold = constant(program, config.activation[7]);
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let large = program.op(ScalarOpcode::Greater, absolute, threshold);
 			let square = program.op(ScalarOpcode::Multiply, x, x);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let small = program.op(ScalarOpcode::Multiply, half, square);
 			let half_threshold = program.op(ScalarOpcode::Multiply, half, threshold);
 			let excess = program.op(ScalarOpcode::Subtract, absolute, half_threshold);
@@ -21843,7 +22173,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Leak | Activation::Elu | Activation::Selu | Activation::Prelu => {
 			let negative = match activation {
 				Activation::Leak => {
-					let slope = constant(&mut program, config.activation[0]);
+					let slope = constant(program, config.activation[0]);
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				Activation::Prelu => {
@@ -21858,20 +22188,20 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					let masked = program.select(inverse, x);
 					let exponential = program.unary(ScalarOpcode::Exp, masked);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
-					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
+					let alpha = constant(program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
 				}
 			};
 			let selected = program.choose(positive, x, negative);
 			if activation == Activation::Selu {
-				let scale = constant(&mut program, config.activation[4]);
+				let scale = constant(program, config.activation[4]);
 				program.op(ScalarOpcode::Multiply, scale, selected)
 			} else {
 				selected
 			}
 		}
 		Activation::Sigmoid | Activation::Silu => {
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			let curved = program.unary(ScalarOpcode::Tanh, half_x);
 			let shifted = program.op(ScalarOpcode::Add, curved, one);
@@ -21879,24 +22209,24 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
-		Activation::Gelu if graph.profile.gelu_table => {
+		Activation::Gelu if gelu_table => {
 			// llama.cpp's fp16 gelu table: between -10 and 10 the input rounds to
 			// fp16, the tanh form above runs in fp32 on it, and the result rounds
 			// to fp16; at 10 and above the input passes as it is, at -10 and below
 			// the result is zero.
-			let ten = constant(&mut program, 10.0);
-			let minus_ten = constant(&mut program, -10.0);
+			let ten = constant(program, 10.0);
+			let minus_ten = constant(program, -10.0);
 			let rounded = program.unary(ScalarOpcode::Half, x);
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, rounded);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, rounded);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, rounded);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, rounded);
 			let value = program.op(ScalarOpcode::Multiply, half_x, shifted);
 			let tabled = program.unary(ScalarOpcode::Half, value);
@@ -21912,30 +22242,29 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
 			// one fused step where its compiler fuses one, so an fp32 gelu prints
 			// the bits llama.cpp's does.
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, x);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, x);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, x);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
 		Activation::Scale(factor) => {
 			let factor = f64::from_bits(factor);
 			require(factor.is_finite(), "scale factor must be finite")?;
-			let factor = constant(&mut program, factor);
+			let factor = constant(program, factor);
 			program.op(ScalarOpcode::Multiply, factor, x)
 		}
 		Activation::Linear => unreachable!(),
 	};
-	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3);
-	push_program(graph, -2, initial, program)
+	Ok(result)
 }
 /// Whether the contraction the graph is about to push carries a bias row. A
 /// trained contraction does when its lowering owns one (`bias`); a gate that
@@ -22070,6 +22399,16 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
+/// Multiplies each channel by its trainable value at `channel mod period`.
+fn lower_channel_scale(graph: &mut Graph, period: usize, values: &[u64]) -> Result<()> {
+	require(period != 0 && values.len() == period, "channel scale needs one value per period slot")?;
+	let initial = values.iter().map(|bits| f64::from_bits(*bits)).collect::<Vec<_>>();
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let scale = program.op(ScalarOpcode::ChannelParameter, 0.0, period as f64);
+	program.op(ScalarOpcode::Multiply, x, scale);
+	push_program(graph, -2, &initial, program)
+}
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	let math = ple.math.ok_or_else(|| RecipeError::new("ple names no normalization, gate, or convolution math; call ple_math"))?;
 	let (stream, shape) = (graph.source, graph.output);
@@ -22179,6 +22518,31 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((f64::from(mscale), f64::from(low), f64::from(high)))
 }
+/// Lowers the delta gates as one elementwise program over the gate projection.
+/// Channels below `heads` take `-exp(rate) * decay(alpha + dt)`, the decay
+/// exponent of the state, and the rest take `write(beta)`. The rate is one
+/// trainable value per head, read through the channel parameter operand.
+fn lower_delta_gates(graph: &mut Graph, heads: usize, decay: Activation, write: Activation, config: Config) -> Result<()> {
+	require(decay != Activation::Prelu && write != Activation::Prelu, "delta gate activations take no parameters")?;
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let zero = program.constant(0.0);
+	let channel = program.op(ScalarOpcode::Channel, 0.0, 0.0);
+	let boundary = program.constant(heads as f64 - 0.5);
+	let beta = program.op(ScalarOpcode::Greater, channel, boundary);
+	let rate = program.op(ScalarOpcode::ChannelParameter, 0.0, heads as f64);
+	let scale = program.unary(ScalarOpcode::Exp, rate);
+	let decayed = activation_program(&mut program, x, decay, config, graph.profile.gelu_table)?;
+	let exponent = program.op(ScalarOpcode::Multiply, decayed, scale);
+	let negated = program.op(ScalarOpcode::Subtract, zero, exponent);
+	let written = activation_program(&mut program, x, write, config, graph.profile.gelu_table)?;
+	program.choose(beta, written, negated);
+	// The planes hold the decay exponent and the write in double, as the recurrence reads them.
+	let block = graph.block_precision.replace(Compute::FP64);
+	let pushed = push_program(graph, -2, &vec![0.0; heads], program);
+	graph.block_precision = block;
+	pushed
+}
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
@@ -22202,6 +22566,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
+	lower_delta_gates(graph, heads, decay, write, config)?;
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
@@ -22213,8 +22578,8 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, qk_norm, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, decay.code() as f64, write.code() as f64, 0.0, 0.0];
-	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	push_node(graph, Primitive::Delta, recurrent, 0, argument, gates)?;
 	// The recurrent read uses the same inverse-root key-width scale as attention.
 	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
 	lower_normalize(graph, value_norm, value_width, inner)?;
@@ -22587,7 +22952,7 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
@@ -22603,23 +22968,33 @@ fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize
 	}
 	let routing = graph.source;
 	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
-	if !shared {
-		return Ok(());
-	}
-	// The shared expert is one more expert that every position takes. Its routing
-	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
-	// so the dispatch that runs the routed experts runs it under that per-position
-	// value and its gradient reaches the gate and the input through the same adjoints.
+	let (count, gate) = match shared {
+		SharedExpert::None => return Ok(()),
+		SharedExpert::Ungated { count } => (count, None),
+		SharedExpert::Gated { count, gate } => (count, Some(gate)),
+	};
+	require(count != 0, "shared expert count must be positive")?;
+	let width = checked_mul(count, hidden, "shared expert width")?;
+	// The shared expert is one more expert that every position takes. Without a gate
+	// it runs densely at weight one. With a gate, its routing weight is the gate
+	// activation of a `[width]` projection over the position, with no bias, so the
+	// dispatch that runs the routed experts runs it under that per-position value and
+	// its gradient reaches the gate and the input through the same adjoints.
 	let dispatched = graph.source;
 	reset(graph, source, input);
-	// The gate is the `[width]` vector alone, trained or bound, so a view of it
-	// must hold exactly that many values.
-	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	let gate = graph.source;
-	lower_experts(graph, source, input, gate, 1, 1, hidden, activation, config)?;
-	let gated = graph.source;
-	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
+	match gate {
+		None => lower_glu(graph, width, activation, config)?,
+		Some(gate) => {
+			// The gate is the `[width]` vector alone, trained or bound, so a view of it
+			// must hold exactly that many values.
+			push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+			lower_activation(graph, gate, config)?;
+			let weight = graph.source;
+			lower_experts(graph, source, input, weight, 1, 1, width, activation, config)?;
+		}
+	}
+	let shared_out = graph.source;
+	binary(graph, dispatched, shared_out, input, ScalarOpcode::Add)?;
 	Ok(())
 }
 fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
@@ -23430,582 +23805,6 @@ impl Precisions {
 	}
 }
 /// A precision by the name a table writes.
-#[cfg(test)]
-mod precision_contract_checks {
-	use super::*;
-	fn gradient_test_gpu() -> &'static Gpu {
-		if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpu().unwrap()
-		} else {
-			Box::leak(Box::new(cpu_device().unwrap()))
-		}
-	}
-	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize) -> (Vec<f64>, Vec<f64>) {
-		let config = Config::load().unwrap();
-		let channels = width * (heads + 2);
-		assert_eq!(inputs.len(), channels * length);
-		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
-		graph.profile = config.profile;
-		graph.profile.attn = format;
-		graph.profile.atvn = Compute::FP32;
-		let args = [heads as f64, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
-		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
-		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
-		let targets = vec![0.25; width * heads * length];
-		let mut tape = NativeTape::new(&graph, TapeInput::Values(inputs), inputs, &targets, gpu, Compute::FP32, Some(mse)).unwrap();
-		tape.advance().unwrap();
-		tape.gradient_launch(0.01, config).unwrap();
-		(tape.predictions().unwrap(), tape.input_adjoint.download_float(inputs.len(), Compute::FP32).unwrap())
-	}
-	#[test]
-	fn narrow_sharded_training_preserves_wide_gradients() {
-		let gpu = gradient_test_gpu();
-		let devices: &'static [&'static Gpu] = if std::env::var("RECIPE_GRADIENT_CHECK_GPU").is_ok_and(|value| value == "1") {
-			selected_gpus().unwrap()
-		} else { Box::leak(vec![gpu, gpu].into_boxed_slice()) };
-		assert_eq!(devices.len(), 2, "the sharded GPU check requires exactly two selected devices");
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			config.multi_device = MultiDevice::Forced;
-			let samples: Vec<_> = (0..257 * 32).map(|i| 2.0_f64.powi(if i / 32 < 128 { -14 } else { -13 })).collect();
-			let prepared = Prepared::matrix(samples, vec![2.0_f64.powi(-14); 257], 257, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 257, gpu, config, false).unwrap();
-			graph.parameters.fill(2.0_f64.powi(-14));
-			graph.refresh_storage(config).unwrap();
-			let mut single = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			single.advance().unwrap();
-			single.gradient_launch(0.01, config).unwrap();
-			let expected = single.download_gradient().unwrap();
-			let mut shards = DeviceTape::new(&graph, &prepared.samples, &prepared.targets, devices, Compute::FP32, mse, config).unwrap();
-			assert_eq!(shards.shards.len(), 2);
-			assert_eq!(shards.placement.gradient_to_primary.bytes, 128);
-			assert_eq!(shards.placement.weights_to_host.bytes, 64);
-			shards.advance().unwrap();
-			shards.epoch(0.01, 0.0, config).unwrap();
-			let actual = shards.shards[0].download_gradient().unwrap();
-			for (got, want) in actual.iter().zip(expected) { assert!((got - want).abs() < want.abs() * 2e-5, "{} sharded gradient {got} vs {want}", format.label()); }
-			assert_eq!(shards.shards[0].weights().unwrap(), shards.shards[1].weights().unwrap());
-		}
-	}
-	#[test]
-	fn narrow_attention_preserves_softmax_and_gate_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
-			for heads in [1, 2] {
-				let mut inputs = vec![0.5; (heads + 2) * 4];
-				inputs[(heads + 1) * 4..].fill(0.0625);
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1);
-				let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
-				for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
-				for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
-					let expected = delta * heads as f64;
-					assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
-				}
-			}
-			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
-				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2);
-				let d0 = (output[0] - 0.25) * scale;
-				let d1 = (output[1] - 0.25) * scale;
-				let score0 = d1 * 0.5 * (0.25 - 0.375);
-				let score1 = d1 * 0.5 * (0.5 - 0.375);
-				let expected = [0.0, score0 * k0 + score1 * k1, score0 * q, score1 * q, d0 + d1 * 0.5, d1 * 0.5];
-				for (i, (got, want)) in derivative.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} softmax gradient {i}: {got} vs {want}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_recurrence_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for gates in [1, 3, 4] {
-				let config = Config::load().unwrap();
-				let mut graph = Graph::new(Shape { channels: 1, length: 2 }, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				lower_scan(&mut graph, 1, gates).unwrap();
-				graph.parameters.fill(0.0);
-				let candidate = if gates == 1 { 0 } else { gates - 1 };
-				graph.parameters[candidate * 3] = 1.0;
-				graph.parameters[candidate * 3 + 1] = 0.5;
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&[0.0, 0.0]), &[0.0, 0.0], &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let d = -0.25 * scale;
-				let factors = match gates { 1 => [1.5, 1.0], 3 => [0.8125, 0.5], _ => [0.40625, 0.25] };
-				let inputs = tape.input_adjoint.download_float(2, Compute::FP32).unwrap();
-				for (got, factor) in inputs.iter().zip(factors) { assert!((got - d * factor).abs() < 1e-12, "{} {gates}-gate input gradient {got} vs {}", format.label(), d * factor); }
-				let gradients = tape.download_gradient().unwrap();
-				let expected_bias = d * factors.iter().sum::<f64>();
-				assert!((gradients[candidate * 3 + 2] - expected_bias).abs() < 1e-12, "{} {gates}-gate bias {} vs {expected_bias}", format.label(), gradients[candidate * 3 + 2]);
-			}
-		}
-	}
-	fn table(name: &str) -> &'static str {
-		env!("RECIPE_PRECISION_PROFILES").split(';').find_map(|entry| entry.split_once(':').filter(|(key, _)| *key == name).map(|(_, body)| body)).unwrap()
-	}
-	#[test]
-	fn fp8_selection_and_saved_encoding_are_explicit() {
-		let base = table("recipe");
-		let first = Precisions::parse("recipe", base).unwrap();
-		assert_eq!(first.resolve(fp_format(8)), Compute::FP8);
-		let second = Precisions::parse("e5m2", &base.replace("fp8=e4m3", "fp8=e5m2")).unwrap();
-		assert_eq!(second.resolve(fp_format(8)), Compute::FP8_E5M2);
-		for format in [Compute::FP8, Compute::FP8_E5M2, Compute::INT16, Compute::INT32] {
-			let (family, fields) = format.saved_fields();
-			assert_eq!(Compute::saved(family, fields), Some(format));
-		}
-		assert_eq!(Compute::saved("f", [8, 5, 2, 52]), None);
-		assert_eq!(Compute::saved("int", [1, 0, 0, 0]), None);
-		assert!(Precisions::parse("bad", &base.replace("fp8=e4m3", "fp8=unknown")).is_err());
-		assert!(Precisions::parse("missing", &base.replace("fp8=e4m3,", "")).is_err());
-	}
-	#[test]
-	fn capability_table_drives_routes_and_hard_errors() {
-		let cpu = BackendTarget::Cpu { target: "target=test;compiler=test;cpu=test;features=test".to_owned() };
-		let packed = resolve_capability(&cpu, ContractFormat::Int8).unwrap();
-		assert_eq!(packed.vector, Some("scalar packed dot"));
-		assert!(packed.matrix.is_none());
-		let error = resolve_capability(&cpu, ContractFormat::Fp8).unwrap_err().to_string();
-		assert!(error.contains("no fp8 instruction") && error.contains("Vector:") && error.contains("Matrix: none"));
-		let gfx11 = BackendTarget::Amd { architecture: "gfx1101".to_owned() };
-		let f16 = resolve_capability(&gfx11, ContractFormat::Fp16).unwrap();
-		assert!(matches!(f16.matrix, Some((NativeMatrix::Gfx11, "wmma f16"))));
-		let gfx12 = BackendTarget::Amd { architecture: "gfx1201".to_owned() };
-		assert!(matches!(resolve_capability(&gfx12, ContractFormat::Bf16).unwrap().matrix, Some((NativeMatrix::Gfx12, "wmma bf16"))));
-		let sm52 = BackendTarget::Nvidia { architecture: "sm_52".to_owned() };
-		assert_eq!(resolve_capability(&sm52, ContractFormat::Int8).unwrap().vector, Some("fp32 dot of packed i8 codes"));
-		assert!(resolve_capability(&sm52, ContractFormat::Int4).is_err());
-		let sm61 = BackendTarget::Nvidia { architecture: "sm_61".to_owned() };
-		assert_eq!(resolve_capability(&sm61, ContractFormat::Int8).unwrap().vector, Some("dp4a"));
-	}
-	#[test]
-	fn nvidia_dp4a_replaces_portable_helpers() {
-		let portable = "define internal i32 @recipe.dot4.su(i32 %a, i32 %b) #1 { entry: ret i32 0 }\ndefine internal i32 @recipe.dot4.ss(i32 %a, i32 %b) #1 { entry: ret i32 0 }\n";
-		let replaced = nvidia_dp4a_helpers(portable.to_owned(), &[]);
-		assert!(replaced.contains("call i32 @llvm.nvvm.idp4a.u.s") && replaced.contains("call i32 @llvm.nvvm.idp4a.s.s"));
-		assert!(!replaced.contains("entry: ret i32 0"));
-		let widened = nvidia_float_dot4_helpers(portable.to_owned(), &[]);
-		assert!(widened.contains("sitofp i32") && widened.contains("fmul float") && widened.contains("fptosi float"));
-		assert!(!widened.contains("entry: ret i32 0"));
-	}
-	#[test]
-	fn proportional_rope_factors_match_the_analytic_rotation() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let mut graph = Graph::new(Shape { channels: 4, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_precision = Some(Compute::FP32);
-		push_node(&mut graph, Primitive::Rope, Shape { channels: 4, length: 2 }, 2, [4.0, 10000.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0, 1.0], -2).unwrap();
-		graph.parameters.copy_from_slice(&[1.0, 2.0]);
-		let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
-		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
-		assert_eq!(tape.nodes[0].parameters, 2);
-		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true, true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
-		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
-		tape.forward(ForwardMode::Inference).unwrap();
-		let output = tape.predictions().unwrap();
-		let expected = [
-			1.0,
-			2.0 * 1.0_f64.cos() - 6.0 * 1.0_f64.sin(),
-			3.0,
-			4.0 * 0.005_f64.cos() - 8.0 * 0.005_f64.sin(),
-			5.0,
-			6.0 * 1.0_f64.cos() + 2.0 * 1.0_f64.sin(),
-			7.0,
-			8.0 * 0.005_f64.cos() + 4.0 * 0.005_f64.sin(),
-		];
-		for (actual, expected) in output.iter().zip(expected) {
-			assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
-		}
-		let mut graph = Graph::new(Shape { channels: 4, length: 5 }, 1e-5);
-		let mut attention = AttentionBlock::new(1);
-		attention.width = 4;
-		attention.window = 4;
-		let error = lower_attention(&mut graph, attention, None).unwrap_err().to_string();
-		assert!(error.contains("sliding window is 4") && error.contains("5 positions"));
-	}
-	#[test]
-	fn placement_accepts_both_operands_from_the_immediate_boundary() {
-		let shape = Shape { channels: 1, length: 1 };
-		let mut graph = Graph::new(shape, 1e-5);
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], -2).unwrap();
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(!cuts_connection(&graph, 1));
-		push_node(&mut graph, Primitive::Elementwise, shape, 0, [0.0; 9], 0).unwrap();
-		assert!(cuts_connection(&graph, 2));
-	}
-	#[test]
-	fn sampler_never_selects_suppressed_tokens() {
-		let mut sampler = recipe.sampler().temperature(0.0);
-		sampler.suppressed = vec![1];
-		assert_eq!(sampler.sample(&[0.0, 10.0, 5.0], &[]), 2);
-	}
-	#[test]
-	fn precision_suffix_scope_is_local_and_explicit() {
-		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
-		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.maps[0].precision, Some(Compute::FP16));
-		assert_eq!(projection.maps[1].precision, Some(Compute::FP32));
-		assert_eq!(projection.precision, None);
-		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
-		assert_eq!(attention.blck_precision, Some(Compute::INT8));
-		assert_eq!(attention.kv_precision, Some(Compute::BF16));
-		assert_eq!(attention.qk_precision, Some(Compute::FP16));
-		assert_eq!(attention.rope_precision, Some(Compute::FP32));
-		assert_eq!(attention.precision, None);
-		let mut graph = Graph::new(Shape { channels: 8, length: 2 }, 1e-5);
-		graph.profile = Config::load().unwrap().profile;
-		graph.block_blck_precision = Some(Compute::FP32);
-		graph.block_qk_precision = attention.qk_precision;
-		graph.block_rope_precision = attention.rope_precision;
-		let mut operation = AttentionBlock::new(2);
-		operation.width = 4;
-		operation.rope = Some((RopeLayout::Neox, 4, 10000.0_f64.to_bits()));
-		lower_attention(&mut graph, operation, Some(BlockNormalization::Rms)).unwrap();
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Normalize).unwrap().precision, Compute::FP16);
-		assert_eq!(graph.nodes.iter().find(|node| node.op == Primitive::Rope).unwrap().precision, Compute::FP32);
-		let model = recipe.model().res([projection.clone()]).fp(64);
-		let residual = model.blocks.last().unwrap();
-		assert_eq!(residual.precision, Some(Compute::FP64));
-		let Operation::Residual(parts) = &residual.operation else { panic!("residual block was not preserved") };
-		assert_eq!(parts[0], projection);
-		let depthwise = recipe.model().dconv(3).fp(32);
-		let depthwise = depthwise.blocks.last().unwrap();
-		assert_eq!(depthwise.precision, Some(Compute::FP32));
-		assert_eq!(depthwise.blck_precision, None);
-		assert!(std::panic::catch_unwind(|| layer(1).int(1)).is_err());
-	}
-	#[test]
-	fn reference_policy_and_training_validation() {
-		let base = table("recipe");
-		assert_eq!(f64::from_bits(Precisions::parse("recipe", base).unwrap().tolerance), 0.05);
-		assert!(Precisions::parse("llamacpp", table("llamacpp")).unwrap().exact_cpu);
-		for invalid in ["NaN", "inf", "-1"] {
-			assert!(Precisions::parse("bad", &base.replace("tolerance=0.05", &format!("tolerance={invalid}"))).is_err());
-		}
-		let mut graph = Graph::new(Shape { channels: 32, length: 1 }, 1e-5);
-		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1, length: 1 }, 32, [0.0; 9], -1).unwrap();
-		graph.nodes[0].int_bits = 16;
-		assert!(graph.training_graph().is_err());
-		graph.profile.train = Some(Compute::FP16);
-		let half_training = graph.training_graph().unwrap();
-		assert_eq!(half_training.nodes[0].precision, Compute::FP16);
-		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false, false).unwrap();
-		assert_eq!(layout.precisions[0].bytes(), 2);
-		assert_eq!(layout.gradient_precisions[0], Compute::FP32);
-		assert_eq!(layout.gradient_bytes, 32 * 4);
-		assert_eq!(layout.input_adjoint_precision, Compute::FP32);
-		graph.profile.train = Some(Compute::FP64);
-		let training = graph.training_graph().unwrap();
-		assert_eq!(training.nodes[0].precision, Compute::FP64);
-		assert_eq!(training.profile.acc, Compute::FP64);
-		assert_eq!(training.nodes[0].int_bits, 16);
-	}
-	#[test]
-	fn integer_compute_uses_only_canonical_storage() {
-		let gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let config = Config::load().unwrap();
-		let prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		for (bits, name, stride) in [(4, "q4_1", 20), (8, "q8_0", 34), (16, "q8_0", 34), (32, "q8_0", 34)] {
-			let model = recipe.model().no(bias).layer(1).int(bits).loss(mse);
-			let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			let stored = graph.stored[0].as_ref().unwrap();
-			assert!(stored.format == StorageFormat::named(name).unwrap());
-			assert_eq!(stored.bytes.len(), stride);
-			assert!(stored.segments == vec![(stored.format, 32)]);
-		}
-	}
-	#[test]
-	fn quantized_source_converts_once_at_device_load() {
-		let gpu = gradient_test_gpu();
-		let config = Config::load().unwrap();
-		let values: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 8.0).collect();
-		let source_format = StorageFormat::named("q4_0").unwrap();
-		let mut source = source_format.encode(&values, &[1.0; 32], config).unwrap();
-		source.arithmetic.clear();
-		let mut prepared = Prepared::matrix(vec![0.0; 32], vec![0.0], 1, 1).unwrap();
-		prepared.bound = Some(vec![BoundNode { names: "source.weight".to_owned(), elements: 32, weight: BoundWeight::Stored(source) }]);
-		let model = recipe.model().no(bias).layer(1).int(4).loss(mse);
-		let graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-		let target = graph.stored[0].as_ref().unwrap();
-		assert!(target.format == StorageFormat::named("q4_1").unwrap());
-		assert_eq!(target.bytes.len(), 20);
-		assert!(target.bytes.absent_runs());
-		let source = graph.requantize[0].as_ref().unwrap();
-		assert!(source.format == source_format);
-		assert_eq!(source.bytes.len(), 18);
-		let input: Vec<f64> = (0..32).map(|i| (i as f64 + 1.0) / 64.0).collect();
-		let tape = NativeTape::new(&graph, TapeInput::Values(&input), &input, &[], gpu, Compute::FP32, None).unwrap();
-		tape.forward(ForwardMode::Inference).unwrap();
-		let actual = tape.predictions().unwrap()[0];
-		let source_bytes = source.bytes.slice(0, source.bytes.len()).unwrap();
-		let source_values = source.format.decompress(&source_bytes, &source.codebook, 32).unwrap();
-		let canonical = StorageFormat::named("q4_1").unwrap().encode(&source_values, &[1.0; 32], config).unwrap();
-		let bytes = canonical.bytes.slice(0, canonical.bytes.len()).unwrap();
-		let decoded = canonical.format.decompress(&bytes, &canonical.codebook, 32).unwrap();
-		let extreme = *input.iter().max_by(|left, right| left.abs().total_cmp(&right.abs())).unwrap();
-		let inverse = -127.0 / extreme;
-		let step = 1.0 / inverse;
-		let expected = input.iter().zip(decoded).map(|(x, w)| (x * inverse).round_ties_even().clamp(-128.0, 127.0) * step * w).sum::<f64>();
-		assert!((actual - expected).abs() < 1e-5, "device conversion produced {actual}, machine canonical encoding produced {expected}");
-	}
-	#[test]
-	fn narrow_training_preserves_small_and_large_gradients() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			for (rows, sample, weight, target, scale) in [(1, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (257, 2.0_f64.powi(-14), 2.0_f64.powi(-14), 2.0_f64.powi(-14), 1.0), (1, 256.0, 0.0, 256.0, 1.0), (1, 0.0625, 0.0625, 2.0_f64.powi(-14), 2.0_f64.powi(-14))] {
-				let mut config = Config::load().unwrap();
-				config.profile.train = Some(format);
-				let prepared = Prepared::matrix(vec![sample; rows * 32], vec![target; rows], rows, 1).unwrap();
-				let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-				let model = if scale == 1.0 { model } else { model.scale(scale).arithmetic(format) };
-				let mut graph = compile(&model, &prepared, &prepared.targets, rows, gpu, config, false).unwrap();
-				graph.parameters.fill(weight);
-				graph.refresh_storage(config).unwrap();
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let prediction = tape.predictions().unwrap()[0];
-				assert_eq!(tape.weights().unwrap()[0], weight);
-				let expected = 2.0 * (prediction - target) * scale * sample;
-				let gradients = tape.download_gradient().unwrap();
-				assert_eq!(gradients.len(), 32);
-				for value in gradients { assert!((value - expected).abs() <= expected.abs() * 2e-5, "{} rows {rows}: gradient {value} vs {expected}", format.label()); }
-				let input = tape.input_adjoint.download_float(rows * 32, Compute::FP32).unwrap();
-				let expected_input = 2.0 * (prediction - target) * scale * weight / rows as f64;
-				for value in input { assert!((value - expected_input).abs() <= expected_input.abs() * 2e-5, "{} rows {rows}: input gradient {value} vs {expected_input}", format.label()); }
-			}
-		}
-	}
-	#[test]
-	fn narrow_training_with_double_accumulator_preserves_cast_adjoints() {
-		let gpu = gradient_test_gpu();
-		for tail in [false, true] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(Compute::FP16);
-			config.profile.acc = Compute::FP64;
-			let sample = 2.0_f64.powi(-14);
-			let target = sample;
-			let prepared = Prepared::matrix(vec![sample; 32], vec![target], 1, 1).unwrap();
-			let model = recipe.model().no(bias).layer(1).int(16).loss(mse);
-			let scale = if tail { 2.0_f64.powi(-14) } else { 1.0 };
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			if tail {
-				graph.block_precision = Some(Compute::FP32);
-				graph.profile.acc = Compute::FP32;
-				lower_scale(&mut graph, scale).unwrap();
-			}
-			graph.parameters.fill(sample);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&prepared.samples), &prepared.samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			assert_eq!(tape.metrics.bytes, EpochMetrics::VALUES * if tail { 4 } else { 8 });
-			assert_eq!(tape.program.artifact.layout.gradient_precisions[0], Compute::FP64);
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let expected = 2.0 * (tape.predictions().unwrap()[0] - target) * scale * sample;
-			for value in tape.download_gradient().unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-			for value in tape.input_adjoint.download_float(32, Compute::FP64).unwrap() { assert!((value - expected).abs() <= expected.abs() * 1e-6); }
-		}
-	}
-	#[test]
-	fn narrow_normalization_backward_matches_analytic_derivative() {
-		let gpu = gradient_test_gpu();
-		for format in [Compute::FP16, Compute::BF16] {
-			let mut config = Config::load().unwrap();
-			config.profile.train = Some(format);
-			let samples: Vec<f64> = (0..32).map(|i| (i as f64 - 16.0) / 32.0).collect();
-			let prepared = Prepared::matrix(samples.clone(), vec![0.25], 1, 1).unwrap();
-			let scale = 2.0_f64.powi(-24);
-			let model = recipe.model().no(bias).layer(32).int(16).norm(rms).arithmetic(format).layer(1).int(16).scale(scale).fp(32).loss(mse);
-			let mut graph = compile(&model, &prepared, &prepared.targets, 1, gpu, config, false).unwrap();
-			graph.parameters.fill(0.0);
-			for i in 0..32 { graph.parameters[i * 32 + i] = 1.0; }
-			let norm = graph.nodes.iter().position(|node| node.op == Primitive::Normalize).unwrap();
-			let head = graph.nodes.iter().rposition(|node| node.op == Primitive::Contraction).unwrap();
-			let (norm_offset, head_offset) = (graph.nodes[norm].offset, graph.nodes[head].offset);
-			let head_weights: Vec<f64> = (0..32).map(|i| (i as f64 % 3.0 - 1.0) / 16.0).collect();
-			graph.parameters[norm_offset..norm_offset + 32].fill(1.0);
-			graph.parameters[head_offset..head_offset + 32].copy_from_slice(&head_weights);
-			graph.refresh_storage(config).unwrap();
-			let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &prepared.targets, gpu, Compute::FP32, Some(mse)).unwrap();
-			tape.advance().unwrap();
-			tape.gradient_launch(0.01, config).unwrap();
-			let layout = &tape.program.artifact.layout;
-			let normalized = tape.values.download_float_bytes(layout.values[norm], 32, format).unwrap();
-			let inverse = tape.contexts.download_float_bytes(layout.contexts[norm] + format.bytes(), 1, format).unwrap()[0];
-			let delta = 2.0 * (tape.predictions().unwrap()[0] - 0.25) * scale;
-			let projection = head_weights.iter().zip(&normalized).map(|(w, x)| delta * w * x).sum::<f64>() / 32.0;
-			let inputs = tape.input_adjoint.download_float(32, Compute::FP32).unwrap();
-			let gradients = tape.download_gradient().unwrap();
-			for i in 0..32 {
-				let expected = inverse * (delta * head_weights[i] - normalized[i] * projection);
-				assert!((inputs[i] - expected).abs() < 1e-12, "{} input {i}: {} vs {expected}", format.label(), inputs[i]);
-				let gamma = delta * head_weights[i] * normalized[i];
-				assert!((gradients[norm_offset + i] - gamma).abs() < 1e-12, "{} norm weight {i}: {} vs {gamma}", format.label(), gradients[norm_offset + i]);
-			}
-		}
-	}
-}
-
-#[cfg(test)]
-mod ple_stepper_checks {
-	use super::*;
-
-	fn bits(values: &[f64]) -> Vec<u64> {
-		values.iter().map(|value| value.to_bits()).collect()
-	}
-	fn gguf_text(out: &mut Vec<u8>, value: &str) {
-		out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-		out.extend_from_slice(value.as_bytes());
-	}
-	/// Writes the synthetic checkpoint the public PLE control used: a native Q8_0
-	/// n-gram row table, a three-tap convolution dilated by the order-3 n-gram,
-	/// and dense tensors for the stream around one per-layer embedding block.
-	fn write_fixture(path: &Path, ple: bool) {
-		let tensors: Vec<(&str, Vec<f32>)> = vec![
-			("token_embd.weight", vec![1.0, 2.0]),
-			("blk.0.attn_q.weight", vec![0.0]),
-			("blk.0.attn_k.weight", vec![0.0]),
-			("blk.0.attn_v.weight", vec![0.0]),
-			("blk.0.attn_output.weight", vec![0.0]),
-			("blk.0.ffn_gate.weight", vec![2.0]),
-			("blk.0.ffn_up.weight", vec![3.0]),
-			("blk.0.ffn_down.weight", vec![1.0]),
-			("output.weight", vec![1.0, -1.0]),
-			("ngram.table", Vec::new()),
-			("blk.0.ple_key.weight", vec![0.01; 64]),
-			("blk.0.ple_norm_key.weight", vec![1.0]),
-			("blk.0.ple_norm_query.weight", vec![1.0]),
-			("blk.0.ple_value.weight", vec![0.02; 64]),
-			("blk.0.ple_norm_conv.weight", vec![1.0]),
-			("blk.0.ple_conv1d.weight", vec![0.6, -0.2, 0.1]),
-		];
-		let tensors = tensors.into_iter().filter(|(name, _)| ple || !(name.starts_with("blk.0.ple") || *name == "ngram.table")).collect::<Vec<_>>();
-		let mut metadata = Vec::new();
-		for (name, value) in [("general.architecture", "llama"), ("tokenizer.ggml.model", "gpt2"), ("tokenizer.ggml.pre", "gpt-2")] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&8u32.to_le_bytes());
-			gguf_text(&mut metadata, value);
-		}
-		for (name, value) in [("llama.context_length", 160u32), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&4u32.to_le_bytes());
-			metadata.extend_from_slice(&value.to_le_bytes());
-		}
-		gguf_text(&mut metadata, "tokenizer.ggml.add_bos_token");
-		metadata.extend_from_slice(&7u32.to_le_bytes());
-		metadata.push(0);
-		for (name, values) in [("tokenizer.ggml.tokens", &["a", "b"][..]), ("tokenizer.ggml.merges", &[][..])] {
-			gguf_text(&mut metadata, name);
-			metadata.extend_from_slice(&9u32.to_le_bytes());
-			metadata.extend_from_slice(&8u32.to_le_bytes());
-			metadata.extend_from_slice(&(values.len() as u64).to_le_bytes());
-			for value in values {
-				gguf_text(&mut metadata, value);
-			}
-		}
-		let mut out = b"GGUF".to_vec();
-		out.extend_from_slice(&3u32.to_le_bytes());
-		out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-		out.extend_from_slice(&12u64.to_le_bytes());
-		out.extend(metadata);
-		let mut data = Vec::new();
-		for (name, values) in &tensors {
-			gguf_text(&mut out, name);
-			out.extend_from_slice(&2u32.to_le_bytes());
-			let table = *name == "ngram.table";
-			let columns: u64 = match *name {
-				"ngram.table" => 32,
-				"blk.0.ple_key.weight" | "blk.0.ple_value.weight" => 64,
-				"blk.0.ple_conv1d.weight" => 3,
-				_ => 1,
-			};
-			let rows: u64 = if table { 4 } else { values.len() as u64 / columns };
-			out.extend_from_slice(&columns.to_le_bytes());
-			out.extend_from_slice(&rows.to_le_bytes());
-			out.extend_from_slice(&(if table { 8u32 } else { 0 }).to_le_bytes());
-			out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-			if table {
-				for code in [32i8, 96, -80, 48] {
-					data.extend_from_slice(&0x2400u16.to_le_bytes());
-					data.extend_from_slice(&[code as u8; 32]);
-				}
-			} else {
-				for value in values {
-					data.extend_from_slice(&value.to_le_bytes());
-				}
-			}
-			while data.len() % 32 != 0 {
-				data.push(0);
-			}
-		}
-		while out.len() % 32 != 0 {
-			out.push(0);
-		}
-		out.extend(data);
-		std::fs::write(path, out).unwrap();
-	}
-	/// The public control's model: an optional per-layer embedding after the
-	/// embedding, then residual attention and gated feed-forward blocks.
-	fn model(table: Option<&Ngram<'_>>) -> Model {
-		let gate = layer(1).fp(64).silu().fp(64);
-		let up = layer(1).fp(64);
-		let model = recipe.model().no(bias).embed(2, 1).fp(64);
-		let model = match table {
-			Some(table) => model.ple(table).fp(64),
-			None => model,
-		};
-		model.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64)
-	}
-	/// Places the model on the CPU as one range, the same tape a single-device
-	/// `recipe.infer` placement builds.
-	fn place_cpu(file: &Gguf, model: &Model, positions: usize) -> Placed {
-		let bound = explicit_bound(file, model).unwrap();
-		let devices: &'static [&'static Gpu] = Box::leak(Box::new([shared_cpu_device().unwrap()]));
-		place_bound(&bound, positions, &[], devices).unwrap()
-	}
-	#[test]
-	fn native_ple_prefill_and_steps_match_whole_sequence() {
-		let path = std::env::temp_dir().join(format!("recipe-ple-stepper-{}.gguf", std::process::id()));
-		let plain_path = std::env::temp_dir().join(format!("recipe-plain-stepper-{}.gguf", std::process::id()));
-		write_fixture(&path, true);
-		write_fixture(&plain_path, false);
-		let file = Gguf::open(&path).unwrap();
-		let table = file.ngram();
-		assert_eq!(table.kernel(), 3);
-		let placed = place_cpu(&file, &model(Some(&table)), 160);
-		let plain_file = Gguf::open(&plain_path).unwrap();
-		let plain = place_cpu(&plain_file, &model(None), 160);
-		let ids = (0..160).map(|index| (index % 2) as u32).collect::<Vec<_>>();
-		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
-		let whole = placed.infer(&input);
-		assert!(whole.iter().all(|value| value.is_finite()));
-		assert_ne!(bits(&whole), bits(&plain.infer(&input)), "the per-layer embedding changes the forward");
-		let direct13 = placed.prefill(&ids[..13]);
-		let prefix12 = placed.prefill(&ids[..12]);
-		assert!(prefix12.iter().all(|value| value.is_finite()));
-		assert_ne!(bits(&prefix12), bits(&direct13));
-		assert_eq!(bits(&direct13), bits(&placed.step(ids[12])), "full13 equals prefix12 plus step1");
-		for split in [1, 2, 4, 8, 16, 32, 64, 128] {
-			let mut logits = placed.prefill(&ids[..split]);
-			for id in &ids[split..] {
-				logits = placed.step(*id);
-			}
-			assert_eq!(bits(&logits), bits(&whole), "prefix split {split}");
-		}
-		let _ = std::fs::remove_file(&path);
-		let _ = std::fs::remove_file(&plain_path);
-	}
-}
-
 fn precision_named(name: &str) -> Result<Compute> {
 	Ok(match name {
 		"fp8" => Compute::FP8,
@@ -26479,7 +26278,7 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 		Primitive::Delta => {
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta adjoint state")?;
-			let vectors = checked_add(checked_mul(2, width, "delta adjoint vectors")?, 1, "delta decay partial")?;
+			let vectors = checked_mul(2, width, "delta adjoint vectors")?;
 			checked_mul(checked_mul(rows, heads, "delta backward pairs")?, checked_add(state, vectors, "delta backward pair")?, "delta backward context")?
 		}
 		_ => return Err(RecipeError::new("this op has no separate backward context")),
@@ -26570,7 +26369,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let live = checked_mul(pair_bytes, state, "delta carried state bytes")?;
 			vec![
 				(live, Retained),
-				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+				(checked_mul(pair_bytes, checked_mul(2, width, "delta vectors")?, "delta reserved bytes")?, Unused),
 				// The live state after each of a window's first positions, to take back to.
 				(checked_mul(live, draft_positions()?, "delta kept states")?, Retained),
 			]
@@ -33260,18 +33059,16 @@ struct ProbeDatabase {
 	tables: Vec<ProbeSqliteTable>,
 }
 
-/// Probes a plaintext SQLite file page by page. It refuses a file with a pending rollback
-/// journal or a WAL sidecar, because those pages are not the database's current content.
+/// Probes a plaintext SQLite file page by page, with the committed frames of a `-wal` sidecar
+/// laid over the main file. It refuses a file with a pending rollback journal, because those
+/// pages are not the database's current content.
 fn probe_database(path: &Path) -> Result<ProbeDatabase> {
-	for suffix in ["-wal", "-journal"] {
-		let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
-		require(!fs::metadata(&sidecar).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty {suffix} file; checkpoint or remove it first", path.display()))?;
-	}
+	let journal = PathBuf::from(format!("{}-journal", path.display()));
+	require(!fs::metadata(&journal).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty -journal file; checkpoint or remove it first", path.display()))?;
 	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
-	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
-	let mut head = [0u8; 100];
-	let read = file.read(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	let layout = sqlite_layout(&head[..read], length).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+	let file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let wal = fs::File::open(format!("{}-wal", path.display())).ok().map(|wal| Box::new(wal) as Box<dyn SqliteBytes>);
+	let (mut file, layout) = sqlite_open(Box::new(file), length, wal).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
 	let mut tables = Vec::new();
 	for table in sqlite_catalog(&mut file, layout).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))? {
 		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
@@ -33371,6 +33168,11 @@ pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
 		if let Some(span) = folder.span() {
 			*anchors.entry(span).or_default() += 1;
 		}
+	}
+	// A set split into class folders has no single folder holding every sample, so the image
+	// and audio file totals are observations of the sample count too.
+	for total in [images.len(), audio.len()].into_iter().filter(|total| *total > 0) {
+		*anchors.entry(total).or_default() += 1;
 	}
 	// Support counts independent observations of each count; ties prefer the larger count.
 	let mut ranked = anchors.iter().map(|(count, support)| (*count, *support)).collect::<Vec<_>>();
@@ -33909,7 +33711,7 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			}
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
-		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes, fs::read(format!("{}-wal", path.display())).ok().as_deref()).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		Some("xml") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
 			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
@@ -33922,20 +33724,22 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
-/// Page geometry of a plaintext SQLite 3 file in rollback-journal mode.
+/// Page geometry of a plaintext SQLite 3 file in rollback-journal or WAL mode.
 #[derive(Clone, Copy)]
 struct SqliteLayout {
 	page_size: usize,
 	/// Bytes of each page that hold b-tree content; the rest is reserved.
 	usable: usize,
 	pages: usize,
+	/// The header declares WAL mode, so committed frames in the `-wal` file supersede main-file pages.
+	wal: bool,
 }
 
-/// Validates the file header and length. Encrypted, WAL-mode, and truncated files are refused
+/// Validates the file header and length. Encrypted and truncated files are refused
 /// rather than read as if their pages were plain.
 fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(head.len() >= 100 && head.starts_with(b"SQLite format 3\0"), "SQLite header is absent; the file is not plaintext SQLite 3 or is encrypted")?;
-	require(head[18] == 1 && head[19] == 1, "SQLite database is in WAL mode, which is unsupported; checkpoint it to rollback-journal mode first")?;
+	require(head[18] == head[19] && matches!(head[18], 1 | 2), format!("SQLite journal mode bytes {} and {} are neither rollback nor WAL", head[18], head[19]))?;
 	let page_size = match u16::from_be_bytes([head[16], head[17]]) as usize {
 		1 => 65536,
 		size => size,
@@ -33943,7 +33747,147 @@ fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
 	require(page_size.is_power_of_two() && (512..=65536).contains(&page_size), format!("SQLite page size {page_size} is invalid"))?;
 	let usable = page_size.checked_sub(head[20] as usize).filter(|usable| *usable >= 480).ok_or_else(|| RecipeError::new("SQLite reserved bytes leave no usable page"))?;
 	require(length != 0 && length % page_size as u64 == 0, "SQLite file length is not a whole number of pages; the file is truncated")?;
-	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize })
+	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize, wal: head[18] == 2 })
+}
+
+trait SqliteBytes: Read + Seek {}
+impl<T: Read + Seek> SqliteBytes for T {}
+
+/// The database as a reader sees it: a page the WAL committed comes from its newest committed
+/// frame, and every other page from the main file. Page reads are whole and page-aligned.
+struct SqliteView<'a> {
+	main: Box<dyn SqliteBytes + 'a>,
+	wal: Option<Box<dyn SqliteBytes + 'a>>,
+	/// Page number to the offset of that page's bytes inside the WAL.
+	frames: HashMap<usize, u64>,
+	page_size: usize,
+	position: u64,
+}
+
+impl Read for SqliteView<'_> {
+	fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+		let page_size = self.page_size as u64;
+		let (page, within) = ((self.position / page_size) as usize + 1, self.position % page_size);
+		let count = buffer.len().min((page_size - within) as usize);
+		let read = match (self.frames.get(&page), self.wal.as_mut()) {
+			(Some(offset), Some(wal)) => {
+				wal.seek(SeekFrom::Start(offset + within))?;
+				wal.read(&mut buffer[..count])?
+			}
+			_ => {
+				self.main.seek(SeekFrom::Start(self.position))?;
+				self.main.read(&mut buffer[..count])?
+			}
+		};
+		self.position += read as u64;
+		Ok(read)
+	}
+}
+
+impl Seek for SqliteView<'_> {
+	fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
+		match target {
+			SeekFrom::Start(position) => self.position = position,
+			SeekFrom::Current(delta) => self.position = self.position.checked_add_signed(delta).ok_or_else(|| std::io::Error::other("SQLite seek is before the start"))?,
+			SeekFrom::End(_) => return Err(std::io::Error::other("SQLite pages are addressed from the start")),
+		}
+		Ok(self.position)
+	}
+}
+
+/// The checksum SQLite chains through a WAL: 8-byte units read as two 32-bit words in the
+/// byte order the WAL magic selects.
+fn sqlite_wal_checksum(big_endian: bool, seed: (u32, u32), data: &[u8]) -> (u32, u32) {
+	let word = |bytes: &[u8]| if big_endian { u32::from_be_bytes(bytes.try_into().unwrap()) } else { u32::from_le_bytes(bytes.try_into().unwrap()) };
+	data.chunks_exact(8).fold(seed, |(first, second), unit| {
+		let first = first.wrapping_add(word(&unit[..4])).wrapping_add(second);
+		(first, second.wrapping_add(word(&unit[4..])).wrapping_add(first))
+	})
+}
+
+/// Indexes the committed frames of a WAL. A page maps to the offset of its newest frame at or
+/// before the last commit, and the result carries the database size in pages that commit
+/// declares. A frame that fails its salt or checksum ends the log, as in SQLite's recovery.
+/// An empty WAL, or one with no commit, yields `None`.
+fn sqlite_wal_index(wal: &mut dyn SqliteBytes, page_size: usize) -> Result<Option<(HashMap<usize, u64>, usize)>> {
+	let mut header = [0u8; 32];
+	wal.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite WAL cannot be read: {error}")))?;
+	let mut filled = 0;
+	while filled < header.len() {
+		match wal.read(&mut header[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite WAL cannot be read: {error}"))),
+		}
+	}
+	if filled == 0 {
+		return Ok(None);
+	}
+	require(filled == header.len(), "SQLite WAL header is truncated")?;
+	let be = |bytes: &[u8]| u32::from_be_bytes(bytes.try_into().unwrap());
+	let magic = be(&header[..4]);
+	require(matches!(magic, 0x377f0682 | 0x377f0683), "SQLite WAL magic is invalid")?;
+	require(be(&header[4..8]) == 3007000, "SQLite WAL format version is unsupported")?;
+	require(be(&header[8..12]) as usize == page_size, "SQLite WAL page size differs from the database")?;
+	let big_endian = magic & 1 == 1;
+	let mut running = sqlite_wal_checksum(big_endian, (0, 0), &header[..24]);
+	require(running == (be(&header[24..28]), be(&header[28..32])), "SQLite WAL header checksum is wrong")?;
+	let salt = &header[16..24];
+	let (mut pending, mut committed, mut pages) = (HashMap::new(), HashMap::new(), 0usize);
+	let mut frame = vec![0u8; 24 + page_size];
+	for index in 0u64.. {
+		if wal.read_exact(&mut frame).is_err() {
+			break;
+		}
+		let next = sqlite_wal_checksum(big_endian, sqlite_wal_checksum(big_endian, running, &frame[..8]), &frame[24..]);
+		let page = be(&frame[..4]) as usize;
+		if &frame[8..16] != salt || next != (be(&frame[16..20]), be(&frame[20..24])) || page == 0 {
+			break;
+		}
+		running = next;
+		pending.insert(page, 32 + index * (24 + page_size as u64) + 24);
+		let size = be(&frame[4..8]) as usize;
+		if size != 0 {
+			committed.extend(pending.drain());
+			pages = size;
+		}
+	}
+	Ok((pages != 0).then_some((committed, pages)))
+}
+
+/// Opens a database for page reads, with the committed frames of its WAL laid over the main
+/// file when the header declares WAL mode. Returns the view and the layout it presents.
+fn sqlite_open<'a>(mut main: Box<dyn SqliteBytes + 'a>, length: u64, wal: Option<Box<dyn SqliteBytes + 'a>>) -> Result<(SqliteView<'a>, SqliteLayout)> {
+	let mut head = [0u8; 100];
+	let mut filled = 0;
+	main.seek(SeekFrom::Start(0)).map_err(|error| RecipeError::new(format!("SQLite header cannot be read: {error}")))?;
+	while filled < head.len() {
+		match main.read(&mut head[filled..]) {
+			Ok(0) => break,
+			Ok(count) => filled += count,
+			Err(error) => return Err(RecipeError::new(format!("SQLite header cannot be read: {error}"))),
+		}
+	}
+	let layout = sqlite_layout(&head[..filled], length)?;
+	let mut view = SqliteView { main, wal: None, frames: HashMap::new(), page_size: layout.page_size, position: 0 };
+	let Some(mut wal) = wal.filter(|_| layout.wal) else { return Ok((view, layout)) };
+	let Some((frames, pages)) = sqlite_wal_index(wal.as_mut(), layout.page_size)? else { return Ok((view, layout)) };
+	view.wal = Some(wal);
+	view.frames = frames;
+	let first = sqlite_page(&mut view, SqliteLayout { pages: pages.max(layout.pages), ..layout }, 1)?;
+	let layout = sqlite_layout(&first[..100], pages as u64 * layout.page_size as u64)?;
+	Ok((view, layout))
+}
+
+/// The bytes of a table-leaf payload that stay on its page; the rest continues on overflow pages.
+fn sqlite_local_payload(usable: usize, payload: usize) -> usize {
+	let maximum = usable - 35;
+	if payload <= maximum {
+		return payload;
+	}
+	let minimum = (usable - 12) * 32 / 255 - 23;
+	let local = minimum + (payload - minimum) % (usable - 4);
+	if local <= maximum { local } else { minimum }
 }
 
 /// Reads one page into a buffer of one page. The caller keeps only the buffers it needs.
@@ -34098,8 +34042,30 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 				let mut offset = pointer(header + 8 + cell * 2)?;
 				let (payload, _) = sqlite_varint(&buffer, &mut offset)?;
 				let (rowid, _) = sqlite_varint(&buffer, &mut offset)?;
-				require((payload as usize) <= layout.usable - 35, format!("SQLite page {page} holds a row that overflows its page; overflow pages are unsupported"))?;
-				let record = buffer.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let payload = usize::try_from(payload).ok().filter(|payload| *payload <= layout.pages * layout.usable).ok_or_else(|| RecipeError::new(format!("SQLite page {page} holds a row larger than the file")))?;
+				let local = sqlite_local_payload(layout.usable, payload);
+				let stored = buffer.get(offset..offset + local).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let mut joined = Vec::new();
+				let record = if local == payload {
+					stored
+				} else {
+					// The rest of the record continues on a chain of overflow pages, each led by the number of the next.
+					joined.extend_from_slice(stored);
+					let pointer = buffer.get(offset + local..offset + local + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} overflow pointer is truncated")))?;
+					let mut next = u32::from_be_bytes([pointer[0], pointer[1], pointer[2], pointer[3]]) as usize;
+					for _ in 0..layout.pages {
+						if joined.len() == payload {
+							break;
+						}
+						require(next != 0, format!("SQLite page {page} overflow chain ends before its row does"))?;
+						let overflow = sqlite_page(source, layout, next)?;
+						let take = (payload - joined.len()).min(layout.usable - 4);
+						joined.extend_from_slice(&overflow[4..4 + take]);
+						next = u32::from_be_bytes([overflow[0], overflow[1], overflow[2], overflow[3]]) as usize;
+					}
+					require(joined.len() == payload && next == 0, format!("SQLite page {page} overflow chain does not match its row length"))?;
+					&joined[..]
+				};
 				let mut values = sqlite_record(record)?;
 				for (column, _) in aliases.iter().enumerate().filter(|(_, alias)| **alias) {
 					if values.len() <= column {
@@ -34116,9 +34082,9 @@ fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page:
 }
 
 /// Every user table of a SQLite database in memory, for the loader.
-fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
-	let layout = sqlite_layout(bytes.get(..100).unwrap_or(bytes), bytes.len() as u64)?;
-	let mut source = std::io::Cursor::new(bytes);
+fn sqlite_tables(bytes: &[u8], wal: Option<&[u8]>) -> Result<Vec<Table>> {
+	let wal = wal.map(|wal| Box::new(std::io::Cursor::new(wal)) as Box<dyn SqliteBytes + '_>);
+	let (mut source, layout) = sqlite_open(Box::new(std::io::Cursor::new(bytes)), bytes.len() as u64, wal)?;
 	let catalog = sqlite_catalog(&mut source, layout)?;
 	require(!catalog.is_empty(), "SQLite database has no tables")?;
 	let mut tables = Vec::new();
