@@ -96,7 +96,11 @@ let model = recipe.model()
 		.delta_activations(convolution, output)
 	perc(width)
 	glu(hidden, activation)
-	ple(&ngram)
+	ple(&ngram).ple_math(PleMath {
+		key_norm: BlockNormalization::Rms, query_norm: BlockNormalization::Rms,
+		output_norm: BlockNormalization::Rms,
+		gate: PleGate::signed_root_sigmoid(1e-6, true), convolution: Activation::Silu,
+	})
 	estimators:
 		svm()
 		bayes()
@@ -257,7 +261,7 @@ recipe stats model.gguf
 recipe keys model.gguf
 ```
 
-GGUF tensor pairing, delta activations, and delta normalizations come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`); gated-delta models also name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`. Unknown names fail instead of taking another architecture's defaults.
+GGUF tensor pairing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
 
 ## Precision and reference checks
 
@@ -381,9 +385,7 @@ moe(topk, [experts])                                            // moe(topk, [bl
 	.route(softmax|sigmoid)
 	.renorm()
 
-ple(&ngram)                                                     // ple(&ngram)
-	.norm(rms)
-	.gate(sigmoid|silu)
+ple(&ngram).ple_math(PleMath { key_norm, query_norm, output_norm, gate, convolution })
 	.silu()
 
 mtp([blocks])                                                   // .mtp(path)

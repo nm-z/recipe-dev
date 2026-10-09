@@ -10458,7 +10458,7 @@ mod ngram {
 		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
 		/// size, and the table's row count.
 		pub(super) fn block(&self) -> PleBlock {
-			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
+			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone(), math: None }
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -10760,7 +10760,16 @@ mod bundle {
 				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
 				normalization_text(delta.qk_norm), normalization_text(delta.value_norm)
 			),
-			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Ple(ple) => {
+				let math = match ple.math {
+					None => "-".to_owned(),
+					Some(math) => {
+						let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+						format!("v2,{},{},{},{},sr,{floor_bits},{}", normalization_text(Some(math.key_norm)), normalization_text(Some(math.query_norm)), normalization_text(Some(math.output_norm)), math.convolution.code(), u8::from(width_scaled))
+					}
+				};
+				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
+			},
 			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
@@ -10933,7 +10942,23 @@ mod bundle {
 				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
 				let hash = RowHash::parse(&mut fields)?;
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
-				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
+				let math = match fields.next() {
+					Some("-") => None,
+					Some("v2") => {
+						let key_norm = normalization(fields.next(), "per-layer embedding key normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding key normalization is absent"))?;
+						let query_norm = normalization(fields.next(), "per-layer embedding query normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding query normalization is absent"))?;
+						let output_norm = normalization(fields.next(), "per-layer embedding output normalization")?.ok_or_else(|| RecipeError::new("per-layer embedding output normalization is absent"))?;
+						let convolution = activation(fields.next().ok_or_else(|| RecipeError::new("per-layer embedding convolution activation is absent"))?)?;
+						require(fields.next() == Some("sr"), "per-layer embedding gate is not a signed-root sigmoid")?;
+						let floor_bits = value_at(fields.next(), "per-layer embedding gate floor")?;
+						let width_scaled = match value_at::<u8>(fields.next(), "per-layer embedding gate width scale")? { 0 => false, 1 => true, _ => return Err(RecipeError::new("per-layer embedding gate width scale is invalid")) };
+						require(f64::from_bits(floor_bits).is_finite() && f64::from_bits(floor_bits) > 0.0, "per-layer embedding gate floor is invalid")?;
+						Some(PleMath { key_norm, query_norm, output_norm, convolution, gate: PleGate::SignedRootSigmoid { floor_bits, width_scaled } })
+					}
+					_ => return Err(RecipeError::new("saved per-layer embedding math is not current format")),
+				};
+				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
+				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
 			"norm" => Ok(Operation::Norm),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
@@ -12145,6 +12170,27 @@ struct PleBlock {
 	kernel: usize,
 	dilation: usize,
 	hash: RowHash,
+	math: Option<PleMath>,
+}
+/// The transform applied to a per-layer embedding gate's folded score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleGate {
+	SignedRootSigmoid { floor_bits: u64, width_scaled: bool },
+}
+impl PleGate {
+	pub fn signed_root_sigmoid(floor: f64, width_scaled: bool) -> Self {
+		assert!(floor.is_finite() && floor > 0.0, "per-layer embedding gate floor must be positive and finite");
+		Self::SignedRootSigmoid { floor_bits: floor.to_bits(), width_scaled }
+	}
+}
+/// The normalization, gate, and convolution choices of a per-layer embedding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PleMath {
+	pub key_norm: BlockNormalization,
+	pub query_norm: BlockNormalization,
+	pub output_norm: BlockNormalization,
+	pub gate: PleGate,
+	pub convolution: Activation,
 }
 impl PleBlock {
 	/// Values the table holds: its rows of the head width.
@@ -12880,6 +12926,12 @@ impl Model {
 	/// whatever width the stream has there.
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
 		self.push(Operation::Ple(table.block()))
+	}
+	pub fn ple_math(&self, math: PleMath) -> Self {
+		self.edit(|model| match &mut model.blocks.last_mut().expect("ple_math needs a preceding ple block").operation {
+			Operation::Ple(ple) => ple.math = Some(math),
+			_ => panic!("ple_math needs a preceding ple block"),
+		})
 	}
 	/// Normalizes the preceding block's output. Leading a model, it normalizes
 	/// the model input before the first block, which is the pre-normalization
@@ -15277,7 +15329,10 @@ struct Architecture {
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
 }
+#[derive(Clone, Copy)]
+enum PleGateChoice { SignedRootSigmoid }
 #[derive(Default)]
 struct ArchitectureDraft {
 	name: String,
@@ -15286,6 +15341,13 @@ struct ArchitectureDraft {
 	output: Option<Activation>,
 	qk_norm: Option<BlockNormalization>,
 	value_norm: Option<BlockNormalization>,
+	ple_key_norm: Option<BlockNormalization>,
+	ple_query_norm: Option<BlockNormalization>,
+	ple_output_norm: Option<BlockNormalization>,
+	ple_convolution: Option<Activation>,
+	ple_gate: Option<PleGateChoice>,
+	ple_floor: Option<u64>,
+	ple_width_scaled: Option<bool>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -15293,7 +15355,16 @@ impl ArchitectureDraft {
 		require(self.convolution.is_some() == self.output.is_some(), format!("architecture {:?} names only one delta activation", self.name))?;
 		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
 		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm) })
+		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
+		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
+		let ple_math = if ple_fields[0] {
+			Some(PleMath {
+				key_norm: self.ple_key_norm.unwrap(), query_norm: self.ple_query_norm.unwrap(), output_norm: self.ple_output_norm.unwrap(),
+				convolution: self.ple_convolution.unwrap(),
+				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
+			})
+		} else { None };
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -15337,6 +15408,17 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"delta-output" => current.output = Some(architecture_activation(value)?),
 			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
 			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
+			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
+			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
+			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
+			"ple-convolution" => current.ple_convolution = Some(architecture_activation(value)?),
+			"ple-gate" => current.ple_gate = Some(match value { "signed-root-sigmoid" => PleGateChoice::SignedRootSigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding gate {value:?}", current.name))) }),
+			"ple-floor" => {
+				let floor = value.parse::<f64>().map_err(|error| RecipeError::new(format!("architecture {:?} has invalid per-layer embedding floor: {error}", current.name)))?;
+				require(floor.is_finite() && floor > 0.0, "per-layer embedding floor must be positive and finite")?;
+				current.ple_floor = Some(floor.to_bits());
+			},
+			"ple-width-scaled" => current.ple_width_scaled = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding width scaling {value:?}", current.name))) }),
 			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
 		}
 	}
@@ -15436,6 +15518,7 @@ struct Builder<'a> {
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+	ple_math: Option<PleMath>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15481,7 +15564,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15510,7 +15593,8 @@ impl<'a> Builder<'a> {
 		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
 		for layer in 0..blocks {
 			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
-				model = model.ple(ple);
+				let math = builder.ple_math.ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} names no per-layer embedding math")))?;
+				model = model.ple(ple).ple_math(math);
 				builder.ple(layer, ple, &dimensions)?;
 			}
 			let attends = dimensions.kv[layer] != 0 && dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
@@ -16526,7 +16610,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -16595,7 +16679,9 @@ impl Builder<'_> {
 				}
 				Operation::Ple(formula) => {
 					let table = Ngram::new(self.file)?;
-					require(*formula == table.block(), "per-layer embedding definition differs from the GGUF table metadata")?;
+				let mut expected = table.block();
+				expected.math = formula.math;
+				require(*formula == expected, "per-layer embedding definition differs from the GGUF table metadata")?;
 					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _) => {
@@ -19200,6 +19286,7 @@ fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> 
 /// dilated by the n-gram size and a SiLU form the second term, and both add into
 /// the stream, which keeps its width.
 fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
+	let math = ple.math.ok_or_else(|| RecipeError::new("ple names no normalization, gate, or convolution math; call ple_math"))?;
 	let (stream, shape) = (graph.source, graph.output);
 	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
 	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
@@ -19224,20 +19311,21 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	}
 	let rows = graph.source;
 	lower_project(graph, shape.channels)?;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.key_norm, channels, shape.channels)?;
 	let key = graph.source;
 	reset(graph, stream, shape);
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.query_norm, channels, shape.channels)?;
 	let query = graph.source;
 	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
 	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
 	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
-	let scale = program.constant(1.0 / (channels as f64).sqrt());
+	let PleGate::SignedRootSigmoid { floor_bits, width_scaled } = math.gate;
+	let scale = program.constant(if width_scaled { 1.0 / (channels as f64).sqrt() } else { 1.0 });
 	let s = program.op(ScalarOpcode::Multiply, x, scale);
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let magnitude = program.unary(ScalarOpcode::Absolute, s);
-	let floor = program.constant(1e-6);
+	let floor = program.constant(f64::from_bits(floor_bits));
 	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
 	let clamped = program.choose(above, magnitude, floor);
 	let root = program.unary(ScalarOpcode::SquareRoot, clamped);
@@ -19255,9 +19343,9 @@ fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
 	lower_project(graph, channels)?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
 	let gated = graph.source;
-	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_normalize(graph, math.output_norm, channels, shape.channels)?;
 	lower_dconv(graph, ple.kernel, ple.dilation)?;
-	lower_activation(graph, Activation::Silu, config)?;
+	lower_activation(graph, math.convolution, config)?;
 	let convolved = graph.source;
 	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
 	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)

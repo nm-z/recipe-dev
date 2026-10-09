@@ -170,9 +170,23 @@ rope-pairs = "neighbours"
 
 [architecture.gemma3]
 rope-pairs = "halves"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
 
 [architecture.gemma4]
 rope-pairs = "halves"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
 
 [architecture.lfm2]
 rope-pairs = "halves"
@@ -182,6 +196,13 @@ rope-pairs = "halves"
 
 [architecture.qwen3]
 rope-pairs = "halves"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
 
 [architecture.qwen2moe]
 rope-pairs = "halves"
@@ -209,3 +230,10 @@ delta-convolution = "silu"
 delta-output = "sigmoid"
 delta-qk-norm = "l2"
 delta-value-norm = "rms"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"

@@ -14,9 +14,16 @@ fn hyper_gate(lanes: usize, rank: usize, width: usize) -> HyperGate {
 pub fn model() -> Model {
 	let (width, vocabulary) = (qwen4exp.embedding_length, tokenizer.ggml.tokens.len());
 	let (lanes, rank) = (qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank);
+	let ple_math = PleMath {
+		key_norm: BlockNormalization::Rms,
+		query_norm: BlockNormalization::Rms,
+		output_norm: BlockNormalization::Rms,
+		gate: PleGate::signed_root_sigmoid(1e-6, true),
+		convolution: Activation::Silu,
+	};
 	let mut model = recipe.model().embed(vocabulary, width);
 	for layer in 0..qwen4exp.block_count {
-		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram); }
+		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram).ple_math(ple_math); }
 		let attention = if (layer + 1) % qwen4exp.full_attention_interval == 0 {
 			let group = qwen4exp.attention.compress_ratios[layer].max(1);
 			recipe.model().attn(qwen4exp.attention.head_count).kv(qwen4exp.attention.head_count_kv).head(qwen4exp.attention.key_length)
