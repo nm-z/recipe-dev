@@ -16918,6 +16918,7 @@ pub struct NodeGap {
 	pub node: usize,
 	pub block: usize,
 	pub kind: &'static str,
+	pub op: &'static str,
 	pub predicted_seconds: f64,
 	pub measured_seconds: f64,
 	/// Measured time divided by predicted time.
@@ -16931,7 +16932,7 @@ impl InferenceReport {
 		let mut gaps = self.timings.iter().filter_map(|timing| {
 			let predicted = timing.predicted_seconds?;
 			let ratio = if predicted > 0.0 { timing.measured_seconds / predicted } else if timing.measured_seconds > 0.0 { f64::INFINITY } else { 0.0 };
-			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
+			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, op: timing.op, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
 		}).collect::<Vec<_>>();
 		gaps.sort_by(|left, right| right.ratio.total_cmp(&left.ratio));
 		gaps
@@ -18151,6 +18152,33 @@ enum Primitive {
 	Fold = 21,
 	/// The final position reached by a forward window, collapsed to length one.
 	Last = 22,
+}
+impl Primitive {
+	/// The primitive's name, as node lines print it.
+	const fn name(self) -> &'static str {
+		match self {
+			Primitive::Contraction => "contraction",
+			Primitive::Pool => "pool",
+			Primitive::Attention => "attention",
+			Primitive::Scan => "scan",
+			Primitive::Elementwise => "elementwise",
+			Primitive::Normalize => "normalize",
+			Primitive::Predictor => "predictor",
+			Primitive::Gather => "gather",
+			Primitive::Rope => "rope",
+			Primitive::Expand => "expand",
+			Primitive::Read => "read",
+			Primitive::Outer => "outer",
+			Primitive::TopK => "topk",
+			Primitive::ExpertIn => "expert_in",
+			Primitive::Dconv => "dconv",
+			Primitive::Delta => "delta",
+			Primitive::ExpertOut => "expert_out",
+			Primitive::Lookup => "lookup",
+			Primitive::Fold => "fold",
+			Primitive::Last => "last",
+		}
+	}
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -22438,6 +22466,7 @@ pub struct NodeTiming {
 	pub node: usize,
 	pub block: usize,
 	pub kind: &'static str,
+	pub op: &'static str,
 	pub operations: f64,
 	pub bytes: f64,
 	pub predicted_seconds: Option<f64>,
@@ -22498,22 +22527,52 @@ impl TapeTiming {
 			NodeWork { op: node.op, input: node.input.channels, output: node.output.channels, width, weight_bytes, positions }
 		}).collect();
 		let totals = graph.nodes.iter().enumerate().map(|(index, node)| NodeTiming {
-			device: gpu.name.clone(), node: index, block: node.block_index, kind: node.block_kind, operations: 0.0, bytes: 0.0, predicted_seconds: peak.map(|_| 0.0), measured_seconds: 0.0, forwards: 0,
+			device: gpu.name.clone(), node: index, block: node.block_index, kind: node.block_kind, op: node.op.name(), operations: 0.0, bytes: 0.0, predicted_seconds: peak.map(|_| 0.0), measured_seconds: 0.0, forwards: 0,
 		}).collect();
 		let measured = graph.nodes.iter().enumerate().filter(|(_, node)| node.block_kind != "recur_body").map(|(index, _)| index).collect();
 		Ok(Self { work, totals, measured, peak })
 	}
 }
+/// The counter that `recipe.clock` reads, as the host reads it: the synchronized
+/// counter LLVM lowers `llvm.readcyclecounter` to on each target.
+fn read_counter() -> Option<u64> {
+	#[cfg(target_arch = "x86_64")]
+	{ Some(unsafe { std::arch::x86_64::_rdtsc() }) }
+	#[cfg(target_arch = "aarch64")]
+	{
+		let value: u64;
+		unsafe { std::arch::asm!("mrs {value}, cntvct_el0", value = out(reg) value, options(nomem, nostack, preserves_flags)) };
+		Some(value)
+	}
+	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+	{ None }
+}
+/// Seconds per counter tick, calibrated once per process against the host
+/// monotonic clock over a short host-side spin at first use. The spin runs
+/// outside any inference dispatch. It is `None` where no counter can be read.
+fn clock_seconds_per_tick() -> Option<f64> {
+	static RATE: OnceLock<Option<f64>> = OnceLock::new();
+	*RATE.get_or_init(|| {
+		let first = read_counter()?;
+		let begin = Instant::now();
+		while begin.elapsed() < Duration::from_millis(50) { std::hint::spin_loop(); }
+		let seconds = begin.elapsed().as_secs_f64();
+		let last = read_counter()?;
+		let ticks = last.wrapping_sub(first) as f64;
+		(ticks > 0.0).then(|| seconds / ticks)
+	})
+}
 /// Adds one forward window to every node's totals. A node's measured time runs
 /// from its clock to the next node's clock, and the last node runs to completion.
-/// Node clocks count nanoseconds of one monotonic clock, shared by every thread.
+/// Node clocks count ticks of the synchronized counter `recipe.clock` reads.
 fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], stop: i64) -> Result<()> {
 	let mut timing = timing.lock().map_err(|_| RecipeError::new("node timing is poisoned"))?;
 	let measured = timing.measured.clone();
 	let peak = timing.peak;
+	let per_tick = clock_seconds_per_tick().unwrap_or(0.0);
 	for (position, &index) in measured.iter().enumerate() {
 		let next = measured.get(position + 1).map_or(stop, |&next| node_ticks[next]);
-		let elapsed = (next - node_ticks[index]).max(0) as f64 * 1e-9;
+		let elapsed = (next - node_ticks[index]).max(0) as f64 * per_tick;
 		let cost = node_cost(&timing.work[index], span);
 		let total = &mut timing.totals[index];
 		total.operations += cost.operations;

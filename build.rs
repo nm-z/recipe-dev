@@ -322,8 +322,8 @@ define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyct
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
-declare i32 @clock_gettime(i32, ptr)
-define internal i64 @recipe.clock() #1 { entry: %ts = alloca [2 x i64], align 8 %status = call i32 @clock_gettime(i32 1, ptr %ts) %seconds = load i64, ptr %ts, align 8 %nanoseconds.ptr = getelementptr [2 x i64], ptr %ts, i64 0, i64 1 %nanoseconds = load i64, ptr %nanoseconds.ptr, align 8 %scaled = mul i64 %seconds, 1000000000 %now = add i64 %scaled, %nanoseconds ret i64 %now }
+declare i64 @llvm.readcyclecounter()
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
