@@ -292,6 +292,19 @@ println!("{}", model.memory(&data, 32768));
 ```
 
 ```rust
+let report = recipe.infer()
+	.log([log::metadata, log::tensors, log::ngram])
+	.chat([infer::time, infer::metadata, infer::tensors, infer::ngram])
+	.run(&model, &data);
+println!("GGUF metadata {}", report.gguf.metadata.len());
+println!("GGUF tensors {}", report.gguf.tensors.len());
+if let Some(table) = &report.gguf.ngram {
+	println!("{} {:?}", table.table.name, table.table.shape);
+	println!("head offsets {:?}", table.head_offsets);
+}
+```
+
+```rust
 report.*
 	tensors[].*
 		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
@@ -313,6 +326,10 @@ train().run().*
 	tile()[]
 	rows
 infer().run().*
+	gguf.*
+		metadata[] (key, value)
+		tensors[].(name|shape|kind|offset|bytes)
+		ngram?.(table|ngram_size|heads_per_ngram|layer|kernel|head_offsets|head_vocab_sizes)
 	(pp|tg)()
 	time.seconds()
 	prediction
