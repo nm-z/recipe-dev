@@ -71,7 +71,7 @@ const LOSSES: [&str; 6] = ["mse", "rmse", "huber", "mae", "bce", "focal"];
 const PRECISIONS: [&str; 12] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".bf(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
 const PRECISIONS_FILED: [&str; 11] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".tf(32)", ".int(8)", ".fp(8)", ".int(4)", ".int(16)", ".int(32)"];
 const PRECISIONS_T4: [&str; 8] = [".fp(32)", ".fp(32)", ".fp(32)", ".fp(16)", ".fp(64)", ".int(8)", ".int(16)", ".int(32)"];
-const ATTENTION_OPTIONS: [&str; 6] = ["", ".kv(1)", ".qk(rms)", ".qk(l2)", ".gate()", ".rope(neox, {width}, 10000.0)"];
+const ATTENTION_OPTIONS: [&str; 5] = ["", ".kv(1)", ".qk(rms)", ".qk(l2)", ".rope(neox, {width}, 10000.0)"];
 // Estimators take no activation, normalization or quantization.
 const ESTIMATORS: [&str; 7] = ["svm()", "bayes()", "cbst(8)", "xgbst(8)", "lgbm(8)", "kmeans(4)", "knn(3)"];
 
