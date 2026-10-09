@@ -10887,7 +10887,12 @@ mod bundle {
 			Operation::Ensemble(members) => format!("ensemble,{}", members.iter().map(residual_text).collect::<Vec<_>>().join(";")),
 			Operation::Product(left, right) => format!("product,{},{}", product_branch_text(left), product_branch_text(right)),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
-				format!("moe,{experts},{top_k},{hidden},{},{},{},{},{},{}", activation.code(), *scoring as u8, u8::from(*renormalize), u8::from(*shared), f64::from_bits(*scale_bits), u8::from(*selection_bias))
+				let (kind, count, gate) = match shared {
+					SharedExpert::None => (0, 0, "-".to_owned()),
+					SharedExpert::Ungated { count } => (1, *count, "-".to_owned()),
+					SharedExpert::Gated { count, gate } => (2, *count, activation_text(*gate)),
+				};
+				format!("moe,v2,{experts},{top_k},{hidden},{},{},{},{},{},{kind},{count},{gate}", activation.code(), *scoring as u8, u8::from(*renormalize), f64::from_bits(*scale_bits), u8::from(*selection_bias))
 			}
 			Operation::Hyper(lanes, rank, blocks, gate, mean) => {
 				let branch = blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";");
@@ -11029,18 +11034,27 @@ mod bundle {
 			}
 			"moe" => {
 				let fields = rest.split(',').collect::<Vec<_>>();
-				if fields.len() >= 9 {
+				if fields.first() == Some(&"v2") {
+					require(fields.len() >= 12, "saved MoE record is not current format")?;
+					let shared = match value_at::<u8>(fields.get(9).copied(), "MoE shared expert kind")? {
+						0 => SharedExpert::None,
+						1 => SharedExpert::Ungated { count: value_at(fields.get(10).copied(), "MoE shared expert count")? },
+						2 => SharedExpert::Gated { count: value_at(fields.get(10).copied(), "MoE shared expert count")?, gate: activation(&fields[11..].join(","))? },
+						other => return Err(RecipeError::new(format!("MoE shared expert kind {other} is unknown"))),
+					};
 					Ok(Operation::Moe(
-						value_at(fields.first().copied(), "MoE experts")?,
-						value_at(fields.get(1).copied(), "MoE top-k")?,
-						value_at(fields.get(2).copied(), "MoE expert width")?,
-						activation(fields.get(3).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
-						scoring(value_at(fields.get(4).copied(), "MoE scoring")?)?,
-						bool_value(fields.get(5).copied().unwrap_or(""), "MoE renormalization")?,
-						bool_value(fields.get(6).copied().unwrap_or(""), "MoE shared expert")?,
+						value_at(fields.get(1).copied(), "MoE experts")?,
+						value_at(fields.get(2).copied(), "MoE top-k")?,
+						value_at(fields.get(3).copied(), "MoE expert width")?,
+						activation(fields.get(4).copied().ok_or_else(|| RecipeError::new("MoE activation is absent"))?)?,
+						scoring(value_at(fields.get(5).copied(), "MoE scoring")?)?,
+						bool_value(fields.get(6).copied().unwrap_or(""), "MoE renormalization")?,
+						shared,
 						value_at::<f64>(fields.get(7).copied(), "MoE routed scale")?.to_bits(),
 						bool_value(fields.get(8).copied().unwrap_or(""), "MoE selection bias")?,
 					))
+				} else if fields.len() >= 9 {
+					Err(RecipeError::new("saved MoE record is not current format"))
 				} else {
 					let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
 					Ok(Operation::MoeBlocks(value_at(Some(top_k), "MoE top-k")?, split_escaped(experts, ';').iter().map(String::as_str).filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
@@ -12367,6 +12381,17 @@ impl PleBlock {
 		self.rows.saturating_mul(self.width)
 	}
 }
+/// The shared expert every position takes beside the routed experts. `count` names how many
+/// experts it merges, so its feed-forward width is `count` times the routed expert width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExpert {
+	/// No shared expert.
+	None,
+	/// The shared feed-forward sums with weight one at every position.
+	Ungated { count: usize },
+	/// The shared feed-forward scales by `gate`, applied to a `[width]` projection of each position.
+	Gated { count: usize, gate: Activation },
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
@@ -12384,7 +12409,7 @@ enum Operation {
 	Ensemble(Vec<Block>),
 	Product(ProductBranch, ProductBranch),
 	/// The routed scale is kept as its bits, so the operation stays `Eq`.
-	Moe(usize, usize, usize, Activation, Scoring, bool, bool, u64, bool),
+	Moe(usize, usize, usize, Activation, Scoring, bool, SharedExpert, u64, bool),
 	MoeBlocks(usize, Vec<Block>),
 	Perceptron(usize),
 	Embed(usize, usize),
@@ -12997,10 +13022,10 @@ impl Model {
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Block; N]) -> Self {
 		self.push(Operation::MoeBlocks(top_k, branch(experts)))
 	}
-	/// Routed packed expert tables with an optional sigmoid-gated shared expert.
+	/// Routed packed expert tables with the shared expert `shared` selects.
 	/// `scale` multiplies every routing weight. `selection_bias` adds a per-expert bias to the
 	/// scores that choose the top-k experts; the weights themselves stay unbiased.
-	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool) -> Self {
+	pub fn gguf_moe(&self, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool) -> Self {
 		self.push(Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale.to_bits(), selection_bias))
 	}
 	/// Applies one attention modifier to the preceding block, so the model chain
@@ -13242,7 +13267,7 @@ impl Model {
 			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
 			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared, scale_bits, selection_bias) => {
-				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared:?},{},{selection_bias})", activation.name(), f64::from_bits(*scale_bits))
 			}
 			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
 			Operation::Perceptron(width) => format!("perc({width})"),
@@ -15533,7 +15558,11 @@ struct Architecture {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedChoice { None, Ungated, Gated }
 #[derive(Clone, Copy)]
 enum PleGateChoice { SignedRootSigmoid }
 #[derive(Default)]
@@ -15558,6 +15587,8 @@ struct ArchitectureDraft {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -15567,6 +15598,12 @@ impl ArchitectureDraft {
 		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
 		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
 		require(self.expert_scoring.is_some() == self.expert_renormalize.is_some(), format!("architecture {:?} has an incomplete expert routing profile", self.name))?;
+		require(self.expert_shared.is_none() || self.expert_scoring.is_some(), format!("architecture {:?} names an expert-shared profile without expert routing", self.name))?;
+		match (self.expert_shared, self.expert_shared_gate) {
+			(Some(SharedChoice::Gated), None) => return Err(RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.name))),
+			(Some(choice), Some(_)) if choice != SharedChoice::Gated => return Err(RecipeError::new(format!("architecture {:?} names expert-shared-gate without a gated expert-shared profile", self.name))),
+			_ => {}
+		}
 		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
 		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
 		let ple_math = if ple_fields[0] {
@@ -15576,7 +15613,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate })
 	}
 }
 fn delta_decay_code(value: &str) -> Result<DeltaDecay> {
@@ -15639,6 +15676,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
 			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
 			"expert-scale" => current.expert_scale = Some(value.parse().map_err(|_| RecipeError::new(format!("architecture {:?} has invalid expert weights scale {value:?}", current.name)))?),
+			"expert-shared" => current.expert_shared = Some(match value { "none" => SharedChoice::None, "ungated" => SharedChoice::Ungated, "gated" => SharedChoice::Gated, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert shared expert {value:?}", current.name))) }),
+			"expert-shared-gate" => current.expert_shared_gate = Some(architecture_activation(value)?),
 			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
 			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
 			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
@@ -15758,6 +15797,8 @@ struct Builder<'a> {
 	expert_scoring: Option<Scoring>,
 	expert_renormalize: Option<bool>,
 	expert_scale: Option<f64>,
+	expert_shared: Option<SharedChoice>,
+	expert_shared_gate: Option<Activation>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15795,6 +15836,7 @@ struct ExpertDims {
 	scoring: Scoring,
 	renormalize: bool,
 	scale: f64,
+	shared: SharedExpert,
 }
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
@@ -15804,7 +15846,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_gates: row.delta_gates, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, expert_scale: row.expert_scale, expert_shared: row.expert_shared, expert_shared_gate: row.expert_shared_gate, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15970,10 +16012,12 @@ impl<'a> Builder<'a> {
 					Some(_) => Some(self.integer("expert_gating_func")?),
 					None => None,
 				};
+				let hidden = self.integer("expert_feed_forward_length")?;
 				Some(ExpertDims {
 					count,
 					used: self.integer("expert_used_count")?,
-					hidden: self.integer("expert_feed_forward_length")?,
+					hidden,
+					shared: self.shared_expert(hidden)?,
 					scoring: match gating {
 						Some(1) => Scoring::Softmax,
 						Some(2) => Scoring::Sigmoid,
@@ -16207,18 +16251,43 @@ impl<'a> Builder<'a> {
 		let activation = self.feed_forward_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no feed-forward activation", self.architecture)))?;
 		Ok(branch.glu(hidden, activation))
 	}
+	/// The shared expert the architecture row selects. A gated profile names its gate
+	/// activation, and the row names no count, which comes from `expert_shared_count`.
+	fn shared_expert(&self, hidden: usize) -> Result<SharedExpert> {
+		let choice = self.expert_shared.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert-shared profile; add expert-shared to its Cargo.toml routing profile", self.architecture)))?;
+		match choice {
+			SharedChoice::None => Ok(SharedExpert::None),
+			SharedChoice::Ungated => Ok(SharedExpert::Ungated { count: self.shared_count(hidden)? }),
+			SharedChoice::Gated => {
+				let gate = self.expert_shared_gate.ok_or_else(|| RecipeError::new(format!("architecture {:?} names a gated expert-shared profile but no expert-shared-gate", self.architecture)))?;
+				Ok(SharedExpert::Gated { count: self.shared_count(hidden)?, gate })
+			}
+		}
+	}
+	/// The shared expert count: `expert_shared_count` when the file names it, else the
+	/// shared feed-forward width in whole routed-expert widths.
+	fn shared_count(&self, hidden: usize) -> Result<usize> {
+		let count = if self.present("expert_shared_count") {
+			self.integer("expert_shared_count")?
+		} else {
+			let width = self.integer("expert_shared_feed_forward_length")?;
+			require(hidden != 0 && width % hidden == 0, format!("expert_shared_feed_forward_length {width} is not a whole number of {hidden}-wide experts, and the file names no expert_shared_count"))?;
+			width / hidden
+		};
+		require(count != 0, "the shared expert count is zero; a shared expert needs at least one")?;
+		Ok(count)
+	}
 	/// One mixture of experts and the plan of its router, its expert tables and
 	/// its shared expert.
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
-		let ExpertDims { count, used, hidden, scoring, renormalize, scale } = *experts;
-		let shared = self.file.tensor(&format!("blk.{layer}.ffn_gate_shexp.weight")).is_some();
+		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
 		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
 		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
 		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: bool, selection_bias: bool, width: usize) -> Result<()> {
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize) -> Result<()> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} experts");
 		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
@@ -16238,13 +16307,21 @@ impl<'a> Builder<'a> {
 			)?;
 			self.mapped(vec![table]);
 		}
-		if shared {
+		let (shared_count, gated) = match shared {
+			SharedExpert::None => (0, false),
+			SharedExpert::Ungated { count } => (count, false),
+			SharedExpert::Gated { count, .. } => (count, true),
+		};
+		if shared != SharedExpert::None {
 			let shared_role = format!("block {layer} shared expert");
-			// The per-position gate is the first weighted node in the shared path.
-			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
-			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
-			self.mapped(vec![gate]);
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
+			let shared_hidden = checked_mul(shared_count, hidden, "shared expert width")?;
+			if gated {
+				// The per-position gate is the first weighted node in the shared path.
+				let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+				require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
+				self.mapped(vec![gate]);
+			}
+			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)] {
 				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
@@ -16992,7 +17069,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -20398,7 +20475,7 @@ fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: C
 	reset(graph, product, wide);
 	lower_project(graph, input.channels)
 }
-fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
+fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: SharedExpert, scale: f64, selection_bias: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
 	require(hidden != 0, "moe expert width must be positive")?;
@@ -20414,23 +20491,33 @@ fn lower_gguf_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize
 	}
 	let routing = graph.source;
 	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
-	if !shared {
-		return Ok(());
-	}
-	// The shared expert is one more expert that every position takes. Its routing
-	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
-	// so the dispatch that runs the routed experts runs it under that per-position
-	// value and its gradient reaches the gate and the input through the same adjoints.
+	let (count, gate) = match shared {
+		SharedExpert::None => return Ok(()),
+		SharedExpert::Ungated { count } => (count, None),
+		SharedExpert::Gated { count, gate } => (count, Some(gate)),
+	};
+	require(count != 0, "shared expert count must be positive")?;
+	let width = checked_mul(count, hidden, "shared expert width")?;
+	// The shared expert is one more expert that every position takes. Without a gate
+	// it runs densely at weight one. With a gate, its routing weight is the gate
+	// activation of a `[width]` projection over the position, with no bias, so the
+	// dispatch that runs the routed experts runs it under that per-position value and
+	// its gradient reaches the gate and the input through the same adjoints.
 	let dispatched = graph.source;
 	reset(graph, source, input);
-	// The gate is the `[width]` vector alone, trained or bound, so a view of it
-	// must hold exactly that many values.
-	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
-	lower_activation(graph, Activation::Sigmoid, config)?;
-	let gate = graph.source;
-	lower_experts(graph, source, input, gate, 1, 1, hidden, activation, config)?;
-	let gated = graph.source;
-	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
+	match gate {
+		None => lower_glu(graph, width, activation, config)?,
+		Some(gate) => {
+			// The gate is the `[width]` vector alone, trained or bound, so a view of it
+			// must hold exactly that many values.
+			push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+			lower_activation(graph, gate, config)?;
+			let weight = graph.source;
+			lower_experts(graph, source, input, weight, 1, 1, width, activation, config)?;
+		}
+	}
+	let shared_out = graph.source;
+	binary(graph, dispatched, shared_out, input, ScalarOpcode::Add)?;
 	Ok(())
 }
 fn lower_moe_blocks(graph: &mut Graph, top_k: usize, experts: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
