@@ -17738,10 +17738,24 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 			movement[index] = part.output.channels * precision.bytes();
 			moved += movement[index];
 		}
+		let gathered = gathered_bytes(part)?;
+		movement[index] += gathered;
+		moved += gathered;
 		ranges.push(tape);
 	}
 	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
 	Ok((split, ranges, resident, movement, moved))
+}
+/// Bytes each token reads from the lookup tables of a range: every head's row of
+/// the stored table, which stays in machine RAM rather than in the resident arena.
+fn gathered_bytes(part: &Graph) -> Result<usize> {
+	part.nodes.iter().enumerate().filter(|(_, node)| node.op == Primitive::Lookup).try_fold(0, |total, (index, node)| {
+		let table = part.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?;
+		let stored = table.bytes.runs().map(|(_, bytes)| bytes.len()).sum::<usize>();
+		let rows = (node.argument[2] as usize).max(1);
+		let row = stored / rows;
+		checked_add(total, checked_mul(row, node.argument[0] as usize, "per-layer embedding row bytes")?, "per-layer embedding row bytes")
+	})
 }
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
