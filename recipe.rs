@@ -7,6 +7,7 @@
 mod native_build;
 use native_build::{encoding, fp8};
 mod reference;
+pub use reference::{LogitComparison, PositionBucket, PositionDelta, Spread};
 mod program_ir {
 	//! Compile-time lowering for the scalar, predictor, route, and normalization
 	//! pieces of a concrete model.
@@ -5010,6 +5011,8 @@ impl NativeModelIr {
 					let online_order = self.inference && self.graph.profile.online_softmax;
 					require(!online_order || node.output.channels <= 256 * heads.max(1) as usize, "online attention head width exceeds 256")?;
 					let attention = if !compact && !online_order && matrix && node.kv_precision == node.precision && extent.m as usize == node.output.length && node.argument[0] == node.argument[1] && attention_value_heads(node) == node.argument[0] as usize { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					let turboquant = turboquant_arguments(self.inference)?;
+					let attention = if turboquant.is_some() { "attention_forward_tq_body" } else { attention };
 					let geometry = self.indexer_geometry(index)?;
 					let selectors = attention_selectors(node, &self.node_precision(node), geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (from, channels) = (node.output.elements(), node.output.channels);
@@ -5046,7 +5049,9 @@ impl NativeModelIr {
 					// The matrix body scores the whole sequence at once. Its keys past
 					// the window are zero and the causal mask drops them, so it stays
 					// correct on a step but reworks the positions the window skips.
-					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
+					let carries_window = matches!(attention, "attention_forward_body" | "attention_forward_tq_body");
+					require(turboquant.is_none() || blocks == 0, "TurboQuant storage does not take a sparse-selection attention")?;
+					let extended = if carries_window { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					let attention_kv = pointers.attention_kv.as_deref().unwrap_or(&pointers.context);
 					let attention_carry = i32::from(pointers.attention_kv.is_some());
 					// The single-query step body is written in the block's own types, so
@@ -5058,10 +5063,11 @@ impl NativeModelIr {
 						&& self.node_precision(node).state.bytes() <= self.node_precision(node).model.bytes().saturating_mul(2)
 						&& self.schedule.shared_values >= extent.k.saturating_mul(2)
 						&& attention == "attention_forward_body"
+						&& turboquant.is_none()
 						&& blocks == 0
 						&& node.argument[2] == 0.0
 						&& pointers.attention_kv.is_some() && attention_value_heads(node) == node.argument[1] as usize;
-					let (tile_m, tile_n) = if self.inference && attention == "attention_forward_body" {
+					let (tile_m, tile_n) = if self.inference && carries_window {
 						let step = native_attention_tile(
 							narrow(node.output.length, "attention length")? as u32,
 							extent.k,
@@ -5075,7 +5081,7 @@ impl NativeModelIr {
 					} else {
 						(extent.m.to_string(), extent.n.to_string())
 					};
-					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if attention == "attention_forward_body" { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}") } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
+					let normal_call = format!("call void @{attention}{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i1 {attention_carry}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors}{online_flag} )\n", online_flag = if carries_window { format!(", i1 {online_order}, i32 {buffer_length}, i32 {buffer_origin}{}", turboquant.as_deref().unwrap_or("")) } else { String::new() }, pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, attention_kv = attention_kv, attention_carry = attention_carry, tile_m = tile_m, tile_n = tile_n, tile_k = extent.k);
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
@@ -18356,9 +18362,35 @@ fn token_groups(coder: &Tokenizer, ids: &[u32]) -> Result<Vec<Vec<u32>>> {
 fn score_groups(placed: &Placed, coder: &Tokenizer, groups: &[Vec<u32>], sequence: usize) -> Result<TextScore> {
 	let ids = groups.concat();
 	require(ids.len() <= sequence, format!("{} scored tokens exceed the {sequence} context positions", ids.len()))?;
+	let mut scored = reference::Scored::open(0.0, false).map_err(RecipeError::new)?;
 	let generation = placed.decode_observed(&ids, &mut recipe.sampler().temperature(0.0), &[], 0, None, |_| Ok(()))?;
 	let output = placed.output_shape()?;
-	TextScore::from_logits(&generation.logits, output.channels, output.length, groups, |ids| coder.decode(ids))
+	let mut score = TextScore::from_logits(&generation.logits, output.channels, output.length, groups, |ids| coder.decode(ids))?;
+	// Position p predicts the id after it, so the text's last id has no scored position.
+	let column = |position: usize, into: &mut Vec<f64>| into.extend((0..output.channels).map(|channel| generation.logits[channel * output.length + position]));
+	match &mut scored {
+		reference::Scored::Off => {}
+		reference::Scored::Record(record) => {
+			let mut row = Vec::with_capacity(output.channels);
+			for position in 0..ids.len() - 1 {
+				row.clear();
+				column(position, &mut row);
+				record.step(position, &row).map_err(RecipeError::new)?;
+			}
+		}
+		reference::Scored::Compare(path) => {
+			let comparison = LogitComparison::read(path, &ids[1..], logit_error("bound", env!("RECIPE_LOGIT_ERROR_BOUND"))?, logit_error("growth", env!("RECIPE_LOGIT_ERROR_GROWTH"))?, parse_natural(env!("RECIPE_LOGIT_ERROR_GROWTH_POSITIONS"), "logit error growth positions must be a positive integer"), column).map_err(RecipeError::new)?;
+			score.comparison = Some(comparison);
+		}
+	}
+	if let reference::Scored::Record(record) = scored {
+		record.finish().map_err(RecipeError::new)?;
+	}
+	Ok(score)
+}
+/// A logit comparison bound from the manifest, a share of the reference's logit range.
+fn logit_error(role: &str, text: &str) -> Result<f64> {
+	text.parse::<f64>().ok().filter(|value| value.is_finite() && *value > 0.0).ok_or_else(|| RecipeError::new(format!("logit error {role} {text} is not a positive number")))
 }
 /// The ids a reply ends with: the end-of-sequence id, and the token the chat
 /// template closes an assistant turn with.
@@ -19015,6 +19047,8 @@ pub struct TextScore {
 	pub logprob: f64,
 	/// `exp` of the negative mean of the scored tokens' log probabilities.
 	pub perplexity: f64,
+	/// The logits of every scored position against the reference run named by `RECIPE_REFERENCE`.
+	pub comparison: Option<LogitComparison>,
 }
 /// One scored token of a text.
 pub struct TokenScore {
@@ -19071,7 +19105,7 @@ impl TextScore {
 		}
 		let logprob = tokens.iter().map(|token| token.logprob).sum::<f64>();
 		let perplexity = (-logprob / tokens.len() as f64).exp();
-		Ok(Self { tokens, words, logprob, perplexity })
+		Ok(Self { tokens, words, logprob, perplexity, comparison: None })
 	}
 }
 /// Measured inference state passed to the model script's live formatter.
@@ -19535,7 +19569,8 @@ fn decode_sequence(
 	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, profile: Precisions, exact: bool, progress: Option<&InferenceLive>, state: &mut DecodeState,
 	mut emit: impl FnMut(u32) -> Result<()>, mut logits: impl FnMut(&[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
-	let mut reference = reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)?;
+	// A scoring pass has no steps to record or compare: it feeds the whole text and keeps every position, which `score_groups` handles.
+	let mut reference = if budget == 0 { reference::Reference::off() } else { reference::Reference::open(f64::from_bits(profile.tolerance), exact).map_err(RecipeError::new)? };
 	let mut cached = prompt.iter().zip(&state.ids).take_while(|(left, right)| left == right).count();
 	// A shorter prompt needs its own terminal logits. Earlier KV positions are
 	// still valid, but the last position must produce that output again.
@@ -25971,6 +26006,49 @@ fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize>
 }
 /// The inference attention carry stores only the key and value planes for every
 /// settled position. Queries remain in the ordinary source window.
+#[cfg(feature = "kv-turboquant")]
+fn attention_kv_bytes(node: &Node, rows: usize, _precision: Compute) -> Result<usize> {
+	let heads = integer_argument(node.argument[0], "attention heads")? as usize;
+	let kv = integer_argument(node.argument[1], "attention key-value heads")? as usize;
+	require(heads != 0 && kv != 0 && heads % kv == 0, "attention key-value head partition is invalid")?;
+	require(node.output.channels % heads == 0, "attention channels do not divide query heads")?;
+	let width = node.output.channels / heads;
+	let (keys, values, extra) = turboquant_format()?;
+	require(width.is_power_of_two() && (64..=256).contains(&width), format!("TurboQuant storage needs a power-of-two head width from 64 to 256, not {width}"))?;
+	let per_position = checked_add(checked_mul(kv, turboquant_bytes(width, keys, extra, true), "TurboQuant key bytes")?, checked_mul(attention_value_heads(node), turboquant_bytes(width, values, extra, false), "TurboQuant value bytes")?, "TurboQuant record bytes")?;
+	// The decoder reads one byte past the last record.
+	checked_add(checked_mul(checked_mul(rows, node.output.length, "attention K/V positions")?, per_position, "attention K/V bytes")?, 8, "attention K/V bytes")
+}
+/// The build-wide cache format of `kv-turboquant`: the code bits of a key (one fewer than the
+/// budget, because a key also keeps a sign bit per coordinate), the code bits of a value, and
+/// whether the second half of each head vector codes one more bit, for a half-bit budget.
+#[cfg(feature = "kv-turboquant")]
+fn turboquant_format() -> Result<(u32, u32, bool)> {
+	match env!("RECIPE_KV_TURBOQUANT_BITS") {
+		"3" => Ok((2, 3, false)),
+		"3.5" => Ok((2, 3, true)),
+		"4" => Ok((3, 4, false)),
+		other => Err(RecipeError::new(format!("kv-turboquant-bits {other} is not 3, 3.5 or 4"))),
+	}
+}
+/// Bytes of one head vector's record: a key holds its length, its residual length, the codes and one sign bit per coordinate; a value holds its length and the codes.
+#[cfg(feature = "kv-turboquant")]
+fn turboquant_bytes(width: usize, base: u32, extra: bool, key: bool) -> usize {
+	let bits = width * base as usize + if extra { width / 2 } else { 0 };
+	if key { 4 + bits.div_ceil(8) + width / 8 } else { 2 + bits.div_ceil(8) }
+}
+/// The trailing arguments of the TurboQuant attention body, which an inference attention takes in place of every other cache.
+#[cfg(feature = "kv-turboquant")]
+fn turboquant_arguments(inference: bool) -> Result<Option<String>> {
+	if !inference { return Ok(None); }
+	let (keys, values, extra) = turboquant_format()?;
+	Ok(Some(format!(", i32 {keys}, i32 {values}, i1 {extra}")))
+}
+#[cfg(not(feature = "kv-turboquant"))]
+fn turboquant_arguments(_inference: bool) -> Result<Option<String>> {
+	Ok(None)
+}
+#[cfg(not(feature = "kv-turboquant"))]
 fn attention_kv_bytes(node: &Node, rows: usize, precision: Compute) -> Result<usize> {
 	let heads = integer_argument(node.argument[0], "attention heads")? as usize;
 	let kv = integer_argument(node.argument[1], "attention key-value heads")? as usize;

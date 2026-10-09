@@ -64,5 +64,25 @@ fn main() {
 			println!("word {:?} {} {:.12}", word.text, word.tokens, word.logprob);
 		}
 		println!("total {:.12} tokens {} perplexity {:.6}", score.logprob, score.tokens.len(), score.perplexity);
+		if let Some(comparison) = &score.comparison {
+			for (name, spread) in [("kl", comparison.kl), ("pearson", comparison.pearson), ("spearman", comparison.spearman), ("max-abs", comparison.max_abs), ("max-relative", comparison.max_relative)] {
+				println!("compare {name} mean {:e} median {:e} p99 {:e} min {:e} max {:e}", spread.mean, spread.median, spread.p99, spread.min, spread.max);
+			}
+			println!("compare top1 {:.6} top5 {:.6}", comparison.top1, comparison.top5);
+			println!("compare relative-error max {:e} p99 {:e}", comparison.relative_max, comparison.relative_p99);
+			println!("compare logprob {:.12} reference {:.12} change {:e}", comparison.logprob, comparison.reference_logprob, comparison.logprob - comparison.reference_logprob);
+			println!("compare perplexity {:.6} reference {:.6} change {:e}", comparison.perplexity, comparison.reference_perplexity, comparison.perplexity - comparison.reference_perplexity);
+			println!("compare growth {:e} late-minus-early {:e} (judged from {} positions, bound {})", comparison.growth, comparison.late_minus_early, comparison.growth_positions, comparison.growth_bound);
+			for bucket in comparison.buckets(8) {
+				println!("compare positions {}-{} kl {:e} pearson {:.9} max-relative {:e} top1 {:.4}", bucket.first, bucket.last, bucket.kl, bucket.pearson, bucket.max_relative, bucket.top1);
+			}
+			for failure in &comparison.failures {
+				println!("compare FAIL {failure}");
+			}
+			println!("compare bound {} {}", comparison.bound, if comparison.ok() { "PASS" } else { "FAIL" });
+			if !comparison.ok() {
+				std::process::exit(1);
+			}
+		}
 	}
 }

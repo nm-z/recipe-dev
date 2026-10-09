@@ -1590,6 +1590,17 @@ fn setting<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let prefix = format!("{key} = ");
 	manifest.lines().find_map(|line| line.trim().strip_prefix(&prefix)).ok_or_else(|| io::Error::other(format!("{key} must be configured")).into())
 }
+/// The shared kernel template. The TurboQuant cache kernels are in it only when `kv-turboquant` is on.
+fn template() -> BuildResult<String> {
+	let source = fs::read_to_string("amd-nv-cpu.ll")?;
+	if env::var_os("CARGO_FEATURE_KV_TURBOQUANT").is_some() {
+		return Ok(source);
+	}
+	let (begin, end) = ("; TURBOQUANT BEGIN\n", "; TURBOQUANT END\n");
+	let first = source.find(begin).ok_or_else(|| io::Error::other("amd-nv-cpu.ll lacks the TurboQuant region"))?;
+	let last = source.find(end).ok_or_else(|| io::Error::other("amd-nv-cpu.ll lacks the end of the TurboQuant region"))? + end.len();
+	Ok(format!("{}{}", &source[..first], &source[last..]))
+}
 fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let value = setting(manifest, key)?;
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?;
@@ -1864,7 +1875,7 @@ fn backward_accumulate_variants(ir: &str) -> BuildResult<String> {
 	Ok(format!("{}{b_state}{a_state}{}", &ir[..end], &ir[end..]))
 }
 fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let source = backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?;
+	let source = backward_accumulate_variants(&template()?)?;
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER)
 		.replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers())
 		.replace("call void @llvm.amdgcn.s.barrier()", "call void @recipe.workgroup.barrier()")
@@ -1907,7 +1918,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> B
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
-	let ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let ir = wmma_source(&backward_accumulate_variants(&template()?)?).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
@@ -1937,7 +1948,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&backward_accumulate_variants(&fs::read_to_string("amd-nv-cpu.ll")?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
+	let mut ir = wmma_source(&backward_accumulate_variants(&template()?)?).replace("amdgcn-amd-amdhsa", &target).replace("; RECIPE_WAVE_HELPERS", IDENTITY_WAVE_HELPERS).replace("; RECIPE_BLOCK_HELPERS", &block_dot_helpers());
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -2041,6 +2052,10 @@ fn main() -> BuildResult<()> {
 		("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"),
 		("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"),
 		("backend-tolerance", "RECIPE_BACKEND_TOLERANCE"),
+		("kv-turboquant-bits", "RECIPE_KV_TURBOQUANT_BITS"),
+		("logit-error-bound", "RECIPE_LOGIT_ERROR_BOUND"),
+		("logit-error-growth", "RECIPE_LOGIT_ERROR_GROWTH"),
+		("logit-error-growth-positions", "RECIPE_LOGIT_ERROR_GROWTH_POSITIONS"),
 		("contraction-cpu-shared-values", "RECIPE_CONTRACTION_CPU_SHARED_VALUES"),
 		("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"),
 		("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N"),
