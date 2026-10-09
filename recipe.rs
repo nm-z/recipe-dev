@@ -15349,6 +15349,10 @@ impl Gguf {
 #[derive(Clone, Default)]
 pub struct Binding {
 	tensors: BTreeSet<String>,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`.
+	defaulted: Vec<String>,
+	/// Tensors of the file that no node reads.
+	unread: Vec<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
 }
 /// One plane of a node's weight: a view of a stored tensor, or values the host
@@ -15389,6 +15393,13 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// Tensors bound as zeros or ones, as `zeros: name (why)`.
+	pub fn defaulted(&self) -> &[String] { &self.defaulted }
+	/// Tensors of the file that no node reads.
+	pub fn unread(&self) -> &[String] { &self.unread }
+	fn mark_unread(&mut self, file: &Gguf) {
+		self.unread = file.tensors().iter().filter(|tensor| !self.tensors.contains(&tensor.name)).map(|tensor| tensor.name.clone()).collect();
+	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
@@ -15889,6 +15900,7 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
+		builder.plan.mark_unread(file);
 		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
@@ -16019,6 +16031,15 @@ impl<'a> Builder<'a> {
 		self.plan.tensors.insert(name.to_owned());
 		Some(tensor)
 	}
+	/// Record a tensor that binds as `kind` values: the file lacks `name`, or stores it in another shape than `expected`.
+	fn default_note(&mut self, name: &str, kind: &str, expected: &str) {
+		let why = match self.file.tensor(name) {
+			Some(tensor) => format!("shape {:?}, expected {expected}", tensor.shape),
+			None => "absent".to_owned(),
+		};
+		let note = format!("{kind}: {name} ({why})");
+		if !self.plan.defaulted.contains(&note) { self.plan.defaulted.push(note); }
+	}
 	/// The next parameterized node, filled from mapped views.
 	fn mapped<T: Into<Plane>>(&mut self, planes: Vec<T>) {
 		self.slot(planes.into_iter().map(Into::into).collect());
@@ -16038,13 +16059,17 @@ impl<'a> Builder<'a> {
 	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<Plane> {
 		match self.optional(name).filter(|tensor| tensor.shape == [inputs as u64, outputs as u64]) {
 			Some(tensor) => Ok(Plane::Mapped(tensor)),
-			None => Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] }),
+			None => {
+				self.default_note(name, "zeros", &format!("[{inputs}, {outputs}]"));
+				Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] })
+			}
 		}
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
 		let Some(tensor) = self.optional(name).filter(|tensor| tensor.elements() == width) else {
+			self.default_note(name, "ones", &format!("{width} elements"));
 			return Ok(vec![Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![1.0; width] }; groups]);
 		};
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
@@ -16729,6 +16754,8 @@ impl Infer {
 		gguf.print(self.log.iter().map(|metric| metric.0).chain(self.chat.iter().flatten().map(|metric| metric.0)))?;
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let bound = explicit_bound(&file, model, !self.score)?;
+		for note in bound.plan.defaulted() { eprintln!("bound as {note}"); }
+		for name in bound.plan.unread() { eprintln!("unread: {name}"); }
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -16867,6 +16894,8 @@ impl Infer {
 			memory: placed.memory_report()?,
 			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
 			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
+			defaulted: ReportLines::new(bound.plan.defaulted().iter().cloned()),
+			unread: ReportLines::new(bound.plan.unread().iter().cloned()),
 			links: placed.link_report()?,
 			aot: placed.aot_report()?,
 			tiles: placed.tile_report()?,
@@ -17005,6 +17034,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, plan: Binding::default() };
 	builder.plan_model(model)?;
+	builder.plan.mark_unread(file);
 	Ok(builder.plan)
 }
 /// Resolve optional source planes inside the model builder. The user declares
@@ -17235,7 +17265,10 @@ impl Builder<'_> {
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
 		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
 			Some(tensor) => Plane::Mapped(tensor),
-			None => Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] },
+			None => {
+				self.default_note(name, "ones", &format!("{width} elements"));
+				Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] }
+			}
 		};
 		self.slot(vec![plane]);
 		Ok(())
@@ -17278,7 +17311,10 @@ impl Builder<'_> {
 		if attention.factors {
 			let factors = match self.optional("rope_freqs.weight").filter(|tensor| tensor.elements() == rope_dims / 2) {
 				Some(factors) => Plane::Mapped(factors),
-				None => Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] },
+				None => {
+					self.default_note("rope_freqs.weight", "ones", &format!("{} elements", rope_dims / 2));
+					Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] }
+				}
 			};
 			self.slot(vec![factors]);
 		}
@@ -17509,6 +17545,10 @@ pub struct InferenceReport {
 	pub dead_buffers: usize,
 	/// Dead storage bytes already included in the reported memory allocations.
 	pub dead_bytes: usize,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`; empty for a model the file describes.
+	pub defaulted: ReportLines,
+	/// Tensors of the file that no node reads; empty for a model the file describes.
+	pub unread: ReportLines,
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
