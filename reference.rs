@@ -374,7 +374,7 @@ pub struct LogitComparison {
 	pub perplexity: f64,
 	pub reference_perplexity: f64,
 	/// The bound on `relative_max`, and the bound on the rise of the fitted per-position
-	/// error over the run, with the fewest steps that is judged for growth.
+	/// error over the run, with the run length that growth is judged over.
 	pub bound: f64,
 	pub growth_bound: f64,
 	pub growth_positions: usize,
