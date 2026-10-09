@@ -1134,7 +1134,7 @@ job.step:
 br i1 %lane.active, label %sum.loop, label %job.done
 sum.loop:
 %k = phi i32 [ 0, %job.step ], [ %k.next, %weight.ready ]
-%sum = phi RECIPE_STATE [ %state.zero, %job.step ], [ %sum.next, %weight.ready ]
+%partials = phi <32 x RECIPE_STATE> [ zeroinitializer, %job.step ], [ %partials.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
 sum.step:
@@ -1162,10 +1162,25 @@ weight.ready:
 %weight.wide = call RECIPE_STATE @recipe.decode(double %weight.model)
 %input.wide = call RECIPE_STATE @recipe.decode(double %input.model)
 %product = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
-%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
+%partial.lane = and i32 %k, 31
+%partial = extractelement <32 x RECIPE_STATE> %partials, i32 %partial.lane
+%partial.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %partial, RECIPE_STATE %product)
+%partials.next = insertelement <32 x RECIPE_STATE> %partials, RECIPE_STATE %partial.next, i32 %partial.lane
 %k.next = add i32 %k, 1
 br label %sum.loop
 sum.done:
+; Match the 32-lane dot reduction without depending on physical wave width.
+%partial.partners.16 = shufflevector <32 x RECIPE_STATE> %partials, <32 x RECIPE_STATE> poison, <32 x i32> <i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+%partial.sums.16 = fadd <32 x RECIPE_STATE> %partials, %partial.partners.16
+%partial.partners.8 = shufflevector <32 x RECIPE_STATE> %partial.sums.16, <32 x RECIPE_STATE> poison, <32 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23>
+%partial.sums.8 = fadd <32 x RECIPE_STATE> %partial.sums.16, %partial.partners.8
+%partial.partners.4 = shufflevector <32 x RECIPE_STATE> %partial.sums.8, <32 x RECIPE_STATE> poison, <32 x i32> <i32 4, i32 5, i32 6, i32 7, i32 0, i32 1, i32 2, i32 3, i32 12, i32 13, i32 14, i32 15, i32 8, i32 9, i32 10, i32 11, i32 20, i32 21, i32 22, i32 23, i32 16, i32 17, i32 18, i32 19, i32 28, i32 29, i32 30, i32 31, i32 24, i32 25, i32 26, i32 27>
+%partial.sums.4 = fadd <32 x RECIPE_STATE> %partial.sums.8, %partial.partners.4
+%partial.partners.2 = shufflevector <32 x RECIPE_STATE> %partial.sums.4, <32 x RECIPE_STATE> poison, <32 x i32> <i32 2, i32 3, i32 0, i32 1, i32 6, i32 7, i32 4, i32 5, i32 10, i32 11, i32 8, i32 9, i32 14, i32 15, i32 12, i32 13, i32 18, i32 19, i32 16, i32 17, i32 22, i32 23, i32 20, i32 21, i32 26, i32 27, i32 24, i32 25, i32 30, i32 31, i32 28, i32 29>
+%partial.sums.2 = fadd <32 x RECIPE_STATE> %partial.sums.4, %partial.partners.2
+%partial.partners.1 = shufflevector <32 x RECIPE_STATE> %partial.sums.2, <32 x RECIPE_STATE> poison, <32 x i32> <i32 1, i32 0, i32 3, i32 2, i32 5, i32 4, i32 7, i32 6, i32 9, i32 8, i32 11, i32 10, i32 13, i32 12, i32 15, i32 14, i32 17, i32 16, i32 19, i32 18, i32 21, i32 20, i32 23, i32 22, i32 25, i32 24, i32 27, i32 26, i32 29, i32 28, i32 31, i32 30>
+%partial.sums.1 = fadd <32 x RECIPE_STATE> %partial.sums.2, %partial.partners.1
+%sum = extractelement <32 x RECIPE_STATE> %partial.sums.1, i32 0
 %bias.base = mul i32 %out.channels, %terms
 %bias.index = add i32 %bias.base, %channel
 %bias.wide.index = zext i32 %bias.index to i64
@@ -1294,6 +1309,10 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %int.levels = select i1 %int16, i32 32767, i32 127
 %int.minimum = select i1 %int16, i32 -32768, i32 -128
 %q8.levels = call RECIPE_STATE @recipe.state.from.u32(i32 %int.levels)
+%dense.width.wide = icmp ugt i32 %width, 32
+%dense.width = select i1 %dense.width.wide, i32 32, i32 %width
+%dense.lane.active = icmp ult i32 %lane, %dense.width
+%dense.first = select i1 %dense.lane.active, i32 %lane, i32 %terms
 br label %position.loop
 position.loop:
 %position.index = phi i32 [ %out.begin, %entry ], [ %position.next, %position.done ]
@@ -2058,7 +2077,7 @@ br label %b32.sum.loop
 b32.sum.done:
 br label %sum.done
 sum.loop:
-%k = phi i32 [ %lane, %b32.check ], [ %lane, %exact.b32.check ], [ %k.next, %weight.ready ]
+%k = phi i32 [ %dense.first, %b32.check ], [ %dense.first, %exact.b32.check ], [ %k.next, %weight.ready ]
 %sum = phi RECIPE_STATE [ %state.zero, %b32.check ], [ %state.zero, %exact.b32.check ], [ %sum.next, %weight.ready ]
 %k.more = icmp ult i32 %k, %terms
 br i1 %k.more, label %sum.step, label %sum.done
@@ -2087,7 +2106,7 @@ weight.ready:
 %product.raw = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight.wide, RECIPE_STATE %input.wide)
 %product = select i1 %channel.active, RECIPE_STATE %product.raw, RECIPE_STATE %state.zero
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %product)
-%k.next = add i32 %k, %width
+%k.next = add i32 %k, %dense.width
 br label %sum.loop
 sum.done:
 %sum.final = phi RECIPE_STATE [ %sum, %sum.loop ], [ %q4b.result, %q4b.exit ], [ %q4.sum, %q4.sum.done ], [ %q6.sum, %q6.sum.done ], [ %q6b.result, %q6b.exit ], [ %b32.sum, %b32.sum.done ], [ %exact.q4.sum, %exact.q4.done ], [ %exact.q6.sum, %exact.q6.done ], [ %exact.b32.sum, %exact.b32.done ]
