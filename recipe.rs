@@ -1419,6 +1419,7 @@ struct ScheduleRat {
 	gpu: &'static Gpu,
 	samples: Vec<f64>,
 	seconds: Vec<f64>,
+	repeat: RepeatPenalty,
 }
 
 impl ScheduleRat {
@@ -1441,7 +1442,7 @@ impl ScheduleRat {
 		};
 		let model = recipe.model().layer(config.surrogate_width).arithmetic(config.precision).tanh().arithmetic(config.precision).layer(SCHEDULE_RAT_ACTION).arithmetic(config.precision);
 		let proposer = compile(&model, &data, &data.targets, 1, gpu, config, true)?;
-		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new() })
+		Ok(Self { proposer, gpu, samples: Vec::new(), seconds: Vec::new(), repeat: RepeatPenalty::new(config.rat_repeat_penalty, config.rat_repeat_window)? })
 	}
 
 	fn observe(&mut self, candidate: &ScheduleCandidate, seconds: f64) -> Result<()> {
@@ -1533,17 +1534,24 @@ impl ScheduleRat {
 		tape.forward(ForwardMode::Inference)?;
 		let proposals = tape.predictions()?;
 		require(proposals.len() == groups.len() * SCHEDULE_RAT_ACTION, "native RAT proposer output has the wrong shape")?;
-		Ok(groups
-			.iter()
-			.enumerate()
-			.map(|(group, value)| {
-				let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
-				value.unmeasured.iter().enumerate().min_by(|left, right| {
-					distance(proposal, &schedule_candidate_features(&value.candidates[*left.1]))
-						.total_cmp(&distance(proposal, &schedule_candidate_features(&value.candidates[*right.1])))
-				}).map(|(position, _)| position)
-			})
-			.collect())
+		// Closer to the proposal is more favorable; a candidate that repeats a recent pick is penalized.
+		let mut picks = Vec::with_capacity(groups.len());
+		for (group, value) in groups.iter().enumerate() {
+			let proposal = &proposals[group * SCHEDULE_RAT_ACTION..(group + 1) * SCHEDULE_RAT_ACTION];
+			let mut best: Option<(usize, f64)> = None;
+			for (position, candidate) in value.unmeasured.iter().enumerate() {
+				let features = schedule_candidate_features(&value.candidates[*candidate]);
+				let favor = self.repeat.favor(&features, 1.0 / (1.0 + distance(proposal, &features)));
+				if best.is_none_or(|(_, score)| favor > score) {
+					best = Some((position, favor));
+				}
+			}
+			if let Some((position, _)) = best {
+				self.repeat.push(&schedule_candidate_features(&value.candidates[value.unmeasured[position]]));
+			}
+			picks.push(best.map(|(position, _)| position));
+		}
+		Ok(picks)
 	}
 }
 struct ScheduleMeasurement {
@@ -16982,7 +16990,7 @@ impl Recipe {
 		Model::wrap(ModelData { blocks: Vec::new(), loss: mse, downstream: None, epsilon, epsilon_explicit: false, pending_frozen: false, exclusions: 0 })
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, rat: None, rat_target: None, repeat: None }
 	}
 }
 /// Infer a batch of token-id sequences with one native forward launch. Every
@@ -19421,6 +19429,46 @@ impl Builder<'_> {
 		}
 		self.slot(planes);
 		Ok(())
+	}
+}
+/// Repetition penalty shared by every RAT proposer. It applies the token sampler's
+/// rule: the favorability of a candidate that matches one of the last `window`
+/// proposals is divided by `penalty` when positive and multiplied when negative.
+/// A penalty of one changes nothing.
+#[derive(Clone)]
+struct RepeatPenalty {
+	penalty: f64,
+	window: usize,
+	recent: VecDeque<Vec<f64>>,
+}
+impl RepeatPenalty {
+	fn new(penalty: f64, window: usize) -> Result<Self> {
+		require(penalty.is_finite() && penalty >= 1.0, "RAT repeat penalty must be finite and at least one")?;
+		Ok(Self { penalty, window, recent: VecDeque::new() })
+	}
+	fn repeats(&self, key: &[f64]) -> bool {
+		self.penalty != 1.0 && self.recent.iter().any(|recent| recent == key)
+	}
+	fn favor(&self, key: &[f64], favorability: f64) -> f64 {
+		if self.repeats(key) { if favorability > 0.0 { favorability / self.penalty } else { favorability * self.penalty } } else { favorability }
+	}
+	/// A command score is better the closer it is to `target`, so the favorability
+	/// is the negated distance and a repeat moves the score away from the target.
+	fn score(&self, key: &[f64], score: f64, target: f64) -> f64 {
+		if !self.repeats(key) {
+			return score;
+		}
+		let offset = score - target;
+		target - self.favor(key, -offset.abs()) * offset.signum()
+	}
+	fn push(&mut self, key: &[f64]) {
+		if self.window == 0 {
+			return;
+		}
+		if self.recent.len() == self.window {
+			self.recent.pop_front();
+		}
+		self.recent.push_back(key.to_vec());
 	}
 }
 /// One id at a time from a model's logits: a repetition penalty over the
@@ -24232,6 +24280,8 @@ struct Config {
 	schedule_budget: usize,
 	schedule_warmups: usize,
 	schedule_minimum_improvement: f64,
+	rat_repeat_penalty: f64,
+	rat_repeat_window: usize,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -24283,6 +24333,8 @@ impl Config {
 			schedule_budget: count("schedule budget", env!("RECIPE_SCHEDULE_BUDGET"))?,
 			schedule_warmups: natural("schedule warmups", env!("RECIPE_SCHEDULE_WARMUPS"))?,
 			schedule_minimum_improvement: fraction("schedule minimum improvement", env!("RECIPE_SCHEDULE_MINIMUM_IMPROVEMENT"))?,
+			rat_repeat_penalty: number("RAT repeat penalty", env!("RECIPE_RAT_REPEAT_PENALTY"))?,
+			rat_repeat_window: count("RAT repeat window", env!("RECIPE_RAT_REPEAT_WINDOW"))?,
 			progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?,
 			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
@@ -31087,7 +31139,7 @@ fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> Strin
 		Driver::Remote(remote) => format!("remote;wave={};workers={}", remote.wave, remote.worker_threads),
 	};
 	format!(
-		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={}",
+		"schedule-v3;device={label};backend={:?};target={};memory={};shared={};driver={driver};candidates={};measurements={};warmups={};budget={};allocation={allocation};minimum_improvement={:016x};surrogate_epochs={};surrogate_width={};surrogate_rate={:016x};random_seed={};rat_repeat_penalty={:016x};rat_repeat_window={}",
 		gpu.backend,
 		native_target_label(&gpu.native_target),
 		gpu.memory,
@@ -31101,6 +31153,8 @@ fn native_device_identity(gpu: &Gpu, config: Config, allocation: usize) -> Strin
 		config.surrogate_width,
 		config.surrogate_rate.to_bits(),
 		config.random_seed,
+		config.rat_repeat_penalty.to_bits(),
+		config.rat_repeat_window,
 	)
 }
 fn native_schedule_cache_path(artifact: &NativeArtifact, identity: &str) -> Result<PathBuf> {
@@ -36386,6 +36440,7 @@ pub struct Train {
 	seed: Option<usize>,
 	rat: Option<RatCommand>,
 	rat_target: Option<f64>,
+	repeat: Option<(f64, usize)>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -36541,6 +36596,15 @@ impl Train {
 		self.rat_target = Some(value);
 		self
 	}
+	/// Command-RAT repetition penalty, the rule of `Sampler::repeat`: a proposal
+	/// that matches one of the last `window` proposals has its score moved away
+	/// from the `.target()` by `penalty` before the evaluator sees it. The
+	/// default comes from `rat-repeat-penalty` and `rat-repeat-window` in `Cargo.toml`.
+	pub fn repeat(mut self, penalty: f64, window: usize) -> Self {
+		assert!(penalty.is_finite() && penalty >= 1.0, "RAT repeat penalty must be finite and at least one");
+		self.repeat = Some((penalty, window));
+		self
+	}
 	fn print_rat(&self, model: &Model, loss: &str, run: u64, epoch: usize, epochs: usize, value: f64, r2: f64, seconds: f64, schedule: &str, score: f64, window: usize, choices: usize) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
@@ -36586,7 +36650,10 @@ impl Train {
 		composition.proposer.state.training_rows = 1;
 		let proposer_parameters = composition.proposer.parameters.len();
 		let proposer_bn = composition.proposer.nodes.iter().filter_map(|node| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some(2 * node.output.channels)).sum::<usize>();
-		let objectives = vec![self.rat_target.unwrap_or(0.0); proposal_rows];
+		let target = self.rat_target.unwrap_or(0.0);
+		let (penalty, window) = self.repeat.unwrap_or((config.rat_repeat_penalty, config.rat_repeat_window));
+		let mut repeat = RepeatPenalty::new(penalty, window)?;
+		let objectives = vec![target; proposal_rows];
 		let mut tape = NativeTape::new(&composition.graph, TapeInput::Values(samples), samples, &objectives, gpu, config.precision, Some(composition.loss))?;
 		let initial_composed = tape.metric_launch(config)?;
 		let prediction_count = checked_mul(proposal_rows, proposal_width, "RAT proposal predictions")?;
@@ -36604,7 +36671,10 @@ impl Train {
 			f64::NAN
 		} else {
 			let initial_observation = observation(samples, &initial_predictions)?;
-			replay.observe(&initial_observation, command.evaluate(&input_names, &initial_observation)?[0])?
+			let raw = command.evaluate(&input_names, &initial_observation)?[0];
+			let scored = repeat.score(&initial_predictions, raw, target);
+			repeat.push(&initial_predictions);
+			replay.observe(&initial_observation, scored)?
 		};
 		// The `Loss` field reports the evaluator model's loss. The external
 		// command score is reported separately through `Score`; it is not a
@@ -36639,7 +36709,10 @@ impl Train {
 					.collect::<Vec<_>>();
 				let scores = command.evaluate(&input_names, &observed)?;
 				for (row, value) in observed.chunks_exact(observation_width).zip(scores) {
-					replay.observe(row, value)?;
+					let key = &row[prepared.features..];
+					let scored = repeat.score(key, value, target);
+					repeat.push(key);
+					replay.observe(row, scored)?;
 				}
 			}
 			let (evaluation_samples, evaluation_targets) = replay.snapshot();
@@ -36663,7 +36736,9 @@ impl Train {
 			} else {
 				let observed = observation(sample, &predictions)?;
 				let raw_score = command.evaluate(&input_names, &observed)?[0];
-				(raw_score, replay.observe(&observed, raw_score)?)
+				let scored = repeat.score(&predictions, raw_score, target);
+				repeat.push(&predictions);
+				(raw_score, replay.observe(&observed, scored)?)
 			};
 			if iteration == 0 {
 				let before_fit = before_fit.unwrap_or(evaluated);
@@ -36696,7 +36771,10 @@ impl Train {
 				.collect::<Vec<_>>();
 			let scores = command.evaluate(&input_names, &observed)?;
 			for (row, value) in observed.chunks_exact(observation_width).zip(scores.iter().copied()) {
-				replay.observe(row, value)?;
+				let key = &row[prepared.features..];
+				let scored = repeat.score(key, value, target);
+				repeat.push(key);
+				replay.observe(row, scored)?;
 			}
 		}
 		let (evaluation_samples, evaluation_targets) = replay.snapshot();
