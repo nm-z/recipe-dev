@@ -2064,8 +2064,6 @@ fn main() -> BuildResult<()> {
 		("lane-tuning-temperature", "RECIPE_LANE_TUNING_TEMPERATURE"),
 		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
-		("cpu-peak-gflops", "RECIPE_CPU_PEAK_GFLOPS"),
-		("cpu-peak-gbps", "RECIPE_CPU_PEAK_GBPS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}

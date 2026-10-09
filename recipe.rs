@@ -2298,7 +2298,7 @@ impl NativeLayout {
 	/// regions only the reverse pass fills. Values, conversions, and workspace
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
-	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool, timed: bool) -> Result<Self> {
 		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
@@ -2410,7 +2410,7 @@ impl NativeLayout {
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
 		// The lane tuner reads the node clocks too.
 		let tuned = inference && lane_tuning();
-		let clocks = if inference || tracing() {
+		let clocks = if tracing() || tuned || (inference && timed) {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
 		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
@@ -2693,7 +2693,7 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool, timed: bool) -> Result<Self> {
 		// Integer inference stages activation codes; training uses the declared
 		// float arithmetic and keeps packed storage for checkpoint output only.
 		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
@@ -2712,7 +2712,7 @@ impl NativeModelIr {
 			require(needed <= tile_bytes, format!("{} computes in int{} over {} inputs, whose activation codes take {needed} bytes of the {tile_bytes}-byte tile; increase contraction-cpu-shared-values", node.identity(index), node.int_bits, node.input.channels))?;
 		}
 		require(rows != 0, "native model rows must be positive")?;
-		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
+		let layout = NativeLayout::for_graph(graph, rows, precision, inference, timed)?;
 		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
@@ -9504,7 +9504,7 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 	let compile_started = Instant::now();
 	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none(), target.backend() == Backend::Cpu)?;
 	if tracing() {
 		model.trace_precision_nodes(device)?;
 	}
@@ -19869,7 +19869,7 @@ impl DeviceMemory {
 }
 fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
-	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
+	let layout = NativeLayout::for_graph(part, 1, precision, true, false)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
@@ -23608,7 +23608,7 @@ mod precision_contract_checks {
 		let (offsets, _) = native_weight_arena(&graph, Compute::FP32, true).unwrap();
 		assert_eq!(tape.weights.download_float_bytes(offsets[0], 2, Compute::FP32).unwrap(), vec![1.0, 2.0]);
 		assert_eq!(tape.nodes[0].parameters, 2);
-		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
+		let emitted = NativeModelIr::from_graph(&graph, 1, Compute::FP32, tape.program.schedule.clone(), true, true).unwrap().emit(Backend::Cpu, None, None, false, false, false).unwrap();
 		assert!(emitted.lines().any(|line| line.contains("call void @rope_body(") && line.contains("i1 true, i1 false")));
 		tape.forward(ForwardMode::Inference).unwrap();
 		let output = tape.predictions().unwrap();
@@ -23698,7 +23698,7 @@ mod precision_contract_checks {
 		graph.profile.train = Some(Compute::FP16);
 		let half_training = graph.training_graph().unwrap();
 		assert_eq!(half_training.nodes[0].precision, Compute::FP16);
-		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false).unwrap();
+		let layout = NativeLayout::for_graph(&half_training, 1, Compute::FP32, false, false).unwrap();
 		assert_eq!(layout.precisions[0].bytes(), 2);
 		assert_eq!(layout.gradient_precisions[0], Compute::FP32);
 		assert_eq!(layout.gradient_bytes, 32 * 4);
@@ -24875,7 +24875,7 @@ impl NativeTape {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
-		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing() || mode == ForwardMode::Inference as i32) {
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing() || (mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu)) {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
@@ -25506,6 +25506,159 @@ fn node_cost(work: &NodeWork, span: usize) -> NodeCost {
 	};
 	NodeCost { operations, bytes: (input + output) * work.width + work.weight_bytes }
 }
+/// The CPU's peak rates as (FLOP/s over every worker, bytes/s), which node predictions divide by.
+/// `RECIPE_CPU_PEAK_GFLOPS` (per worker thread) and `RECIPE_CPU_PEAK_GBPS` (all workers together)
+/// override a rate. Otherwise the rates are measured on this machine once, in a few hundred
+/// milliseconds on the host before any inference dispatch, and cached in `~/.cache/recipe/cpu-peaks`
+/// under the CPU model and worker count.
+fn cpu_peak_rates(workers: u32) -> Result<(f64, f64)> {
+	static RATES: OnceLock<Result<(f64, f64)>> = OnceLock::new();
+	let rates = RATES.get_or_init(|| {
+		let overridden = |name: &str| -> Result<Option<f64>> {
+			let Ok(text) = std::env::var(name) else { return Ok(None) };
+			let value = text.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("{name} is not a number: {error}")))?;
+			require(value.is_finite() && value > 0.0, format!("{name} must be a positive number"))?;
+			Ok(Some(value))
+		};
+		let (gflops, gbps) = (overridden("RECIPE_CPU_PEAK_GFLOPS")?, overridden("RECIPE_CPU_PEAK_GBPS")?);
+		let (per_worker, bandwidth) = match (gflops, gbps) {
+			(Some(gflops), Some(gbps)) => (gflops, gbps),
+			_ => {
+				let (measured_gflops, measured_gbps) = cached_cpu_peaks(workers as usize);
+				(gflops.unwrap_or(measured_gflops), gbps.unwrap_or(measured_gbps))
+			}
+		};
+		Ok((per_worker * 1e9 * f64::from(workers), bandwidth * 1e9))
+	});
+	match rates {
+		Ok(rates) => Ok(*rates),
+		Err(error) => Err(RecipeError::new(error.to_string())),
+	}
+}
+/// The CPU model the peak cache is keyed by: the processor name where the machine reports one,
+/// else the architecture.
+fn cpu_model() -> String {
+	let named = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| text.lines().find(|line| line.starts_with("model name")).and_then(|line| line.split_once(':')).map(|(_, name)| name.trim().to_owned()));
+	named.or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok()).unwrap_or_else(|| std::env::consts::ARCH.to_owned())
+}
+/// (GFLOP/s per worker, GB/s over all workers) for this CPU model and worker count, from the
+/// cache file or else measured and appended to it.
+fn cached_cpu_peaks(workers: usize) -> (f64, f64) {
+	let model = cpu_model();
+	let path = home_directory().ok().map(|home| home.join(".cache").join("recipe").join("cpu-peaks"));
+	if let Some(text) = path.as_ref().and_then(|path| fs::read_to_string(path).ok()) {
+		for line in text.lines() {
+			let mut fields = line.splitn(4, '\t');
+			if let (Some(count), Some(gflops), Some(gbps), Some(name)) = (fields.next(), fields.next(), fields.next(), fields.next())
+				&& count == workers.to_string()
+				&& name == model
+				&& let (Ok(gflops), Ok(gbps)) = (gflops.parse::<f64>(), gbps.parse::<f64>())
+			{
+				return (gflops, gbps);
+			}
+		}
+	}
+	let (gflops, gbps) = measure_cpu_peaks(workers);
+	if let Some(path) = path {
+		use std::io::Write;
+		if let Some(parent) = path.parent() {
+			let _ = fs::create_dir_all(parent);
+		}
+		if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+			let _ = writeln!(file, "{workers}\t{gflops}\t{gbps}\t{model}");
+		}
+	}
+	(gflops, gbps)
+}
+/// One burst of independent fused multiply-add chains: the value and the FLOPs performed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_burst_avx2(iterations: u64) -> f32 {
+	use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_set1_ps, _mm256_storeu_ps};
+	let mut lanes = [_mm256_set1_ps(0.5); 12];
+	let (a, b) = (_mm256_set1_ps(1.000_000_1), _mm256_set1_ps(1.0e-7));
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			*lane = _mm256_fmadd_ps(*lane, a, b);
+		}
+	}
+	let mut out = [0.0_f32; 8];
+	let mut sum = 0.0_f32;
+	for lane in lanes {
+		_mm256_storeu_ps(out.as_mut_ptr(), lane);
+		sum += out.iter().sum::<f32>();
+	}
+	sum
+}
+fn fma_burst(iterations: u64) -> (f32, f64) {
+	#[cfg(target_arch = "x86_64")]
+	if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+		// 12 accumulators x 8 lanes x 2 operations per FMA.
+		return (unsafe { fma_burst_avx2(iterations) }, iterations as f64 * 12.0 * 8.0 * 2.0);
+	}
+	// Elsewhere: 64 independent lanes the compiler vectorizes to the target's baseline vector unit.
+	let mut lanes = [0.5_f32; 64];
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			#[cfg(target_arch = "aarch64")]
+			{ *lane = lane.mul_add(1.000_000_1, 1.0e-7); }
+			#[cfg(not(target_arch = "aarch64"))]
+			{ *lane = *lane * 1.000_000_1 + 1.0e-7; }
+		}
+	}
+	(lanes.iter().sum(), iterations as f64 * 64.0 * 2.0)
+}
+/// Measures (GFLOP/s per worker, GB/s over all workers): every worker runs a fused multiply-add
+/// burst and a streaming triad (`a = b + 3c` over arrays larger than the cache, each worker
+/// touching its own pages first) in lockstep passes. The best pass counts, since load only slows
+/// a pass down.
+fn measure_cpu_peaks(workers: usize) -> (f64, f64) {
+	const PASSES: usize = 5;
+	const FMA_ITERATIONS: u64 = 2_000_000;
+	const TRIAD_FLOATS: usize = 1 << 24;
+	let workers = workers.max(1);
+	let length = TRIAD_FLOATS / workers;
+	let barrier = std::sync::Barrier::new(workers);
+	let times: Vec<([f64; PASSES], [f64; PASSES], f64)> = std::thread::scope(|scope| {
+		let handles: Vec<_> = (0..workers)
+			.map(|_| {
+				scope.spawn(|| {
+					let (mut fma, mut triad, mut flops) = ([0.0; PASSES], [0.0; PASSES], 0.0);
+					for pass in &mut fma {
+						barrier.wait();
+						let started = Instant::now();
+						let (value, performed) = fma_burst(FMA_ITERATIONS);
+						std::hint::black_box(value);
+						flops = performed;
+						*pass = started.elapsed().as_secs_f64();
+					}
+					let mut a = vec![0.0_f32; length];
+					let b = vec![1.5_f32; length];
+					let c = vec![0.25_f32; length];
+					for round in 0..=PASSES {
+						barrier.wait();
+						let started = Instant::now();
+						for ((out, x), y) in a.iter_mut().zip(&b).zip(&c) {
+							*out = *x + 3.0 * *y;
+						}
+						std::hint::black_box(&a);
+						// Round 0 only faults the pages in.
+						if round > 0 {
+							triad[round - 1] = started.elapsed().as_secs_f64();
+						}
+					}
+					(fma, triad, flops)
+				})
+			})
+			.collect();
+		handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+	});
+	let slowest = |pick: fn(&([f64; PASSES], [f64; PASSES], f64)) -> &[f64; PASSES]| (0..PASSES).map(|pass| times.iter().map(|entry| pick(entry)[pass]).fold(0.0, f64::max)).fold(f64::MAX, f64::min).max(f64::EPSILON);
+	let flops = times.first().map_or(0.0, |entry| entry.2);
+	let fma_seconds = slowest(|entry| &entry.0);
+	let triad_seconds = slowest(|entry| &entry.1);
+	(flops / fma_seconds / 1e9, 12.0 * (length * workers) as f64 / triad_seconds / 1e9)
+}
 /// Per-node work and running totals for one tape. Peak rates come from the
 /// configured CPU rates; other devices have none, so their predictions stay unset.
 struct TapeTiming {
@@ -25518,11 +25671,8 @@ struct TapeTiming {
 impl TapeTiming {
 	fn new(graph: &Graph, gpu: &Gpu) -> Result<Self> {
 		let positions = graph_positions(graph);
-		// The peak is per core times the workers execution uses, so the prediction and the run share one thread count.
-		let peak = if gpu.backend == Backend::Cpu {
-			let workers = f64::from(cpu_worker_threads()?);
-			Some((parse_natural(env!("RECIPE_CPU_PEAK_GFLOPS"), "CPU peak GFLOP/s") as f64 * 1e9 * workers, parse_natural(env!("RECIPE_CPU_PEAK_GBPS"), "CPU peak GB/s") as f64 * 1e9))
-		} else { None };
+		// The peak is per worker times the workers execution uses, so the prediction and the run share one thread count.
+		let peak = if gpu.backend == Backend::Cpu { Some(cpu_peak_rates(cpu_worker_threads()?)?) } else { None };
 		let work = graph.nodes.iter().enumerate().map(|(index, node)| {
 			let width = node.precision.bytes() as f64;
 			let weight_bytes = packed_weight(graph, index, true).map_or(node.parameters as f64 * width, |weight| weight.bytes.len() as f64);

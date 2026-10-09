@@ -50,13 +50,6 @@ compile-memory-per-ir-byte = 100
 # archy nv0 has bad VRAM from ~5.9 GB up
 device-usable-bytes = { "archy:nv0" = 6186598400 }
 cpu-worker-threads = 0
-# Measured on sentry (2x Xeon E5-2643 v4, 24 logical threads, load average near 40) with
-# rustc -O -C target-feature=+avx2,+fma -o peak peak.rs && ./peak 24 300000000
-# (source: the PR #1055 description). cpu-peak-gflops is the aggregate AVX2+FMA
-# rate, 1290.5 GFLOP/s, divided by 24 workers, floored. cpu-peak-gbps is the triad rate
-# over 24 threads, 11.0 GB/s, a lower bound under that load.
-cpu-peak-gflops = 53
-cpu-peak-gbps = 11
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
 cpu-linker = { linux = "/usr/bin/ld", macos = "/usr/bin/ld", windows = "$ProgramFiles/LLVM/bin/lld-link.exe" }
