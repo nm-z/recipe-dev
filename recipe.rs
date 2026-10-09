@@ -15332,6 +15332,8 @@ struct Architecture {
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
 	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
 }
 #[derive(Clone, Copy)]
 enum PleGateChoice { SignedRootSigmoid }
@@ -15352,6 +15354,8 @@ struct ArchitectureDraft {
 	ple_width_scaled: Option<bool>,
 	feed_forward_activation: Option<Activation>,
 	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -15359,6 +15363,7 @@ impl ArchitectureDraft {
 		require(self.convolution.is_some() == self.output.is_some(), format!("architecture {:?} names only one delta activation", self.name))?;
 		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
 		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
+		require(self.expert_scoring.is_some() == self.expert_renormalize.is_some(), format!("architecture {:?} has an incomplete expert routing profile", self.name))?;
 		let ple_fields = [self.ple_key_norm.is_some(), self.ple_query_norm.is_some(), self.ple_output_norm.is_some(), self.ple_convolution.is_some(), self.ple_gate.is_some(), self.ple_floor.is_some(), self.ple_width_scaled.is_some()];
 		require(ple_fields.iter().all(|present| *present == ple_fields[0]), format!("architecture {:?} has an incomplete per-layer embedding profile", self.name))?;
 		let ple_math = if ple_fields[0] {
@@ -15368,7 +15373,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -15414,6 +15419,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
 			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
 			"expert-activation" => current.expert_activation = Some(architecture_activation(value)?),
+			"expert-scoring" => current.expert_scoring = Some(match value { "softmax" => Scoring::Softmax, "sigmoid" => Scoring::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert scoring {value:?}", current.name))) }),
+			"expert-renormalize" => current.expert_renormalize = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid expert renormalization {value:?}", current.name))) }),
 			"ple-key-norm" => current.ple_key_norm = Some(architecture_normalization(value)?),
 			"ple-query-norm" => current.ple_query_norm = Some(architecture_normalization(value)?),
 			"ple-output-norm" => current.ple_output_norm = Some(architecture_normalization(value)?),
@@ -15527,6 +15534,8 @@ struct Builder<'a> {
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
 	expert_activation: Option<Activation>,
+	expert_scoring: Option<Scoring>,
+	expert_renormalize: Option<bool>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15572,7 +15581,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, ple_math: row.ple_math, feed_forward_activation: row.feed_forward_activation, expert_activation: row.expert_activation, expert_scoring: row.expert_scoring, expert_renormalize: row.expert_renormalize, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15735,15 +15744,14 @@ impl<'a> Builder<'a> {
 				count,
 				used: self.integer("expert_used_count")?,
 				hidden: self.integer("expert_feed_forward_length")?,
-				scoring: match self.integer_or("expert_gating_func", 1)? {
-					1 => Scoring::Softmax,
-					2 => Scoring::Sigmoid,
-					other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))),
+				scoring: match self.file.value(&self.key("expert_gating_func")) {
+					Some(_) => match self.integer("expert_gating_func")? { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))) },
+					None => self.expert_scoring.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert scoring", self.architecture)))?,
 				},
 				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
 					Some(GgufValue::Bool(value)) => *value,
 					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
-					None => true,
+					None => self.expert_renormalize.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert renormalization", self.architecture)))?,
 				},
 			}),
 		};
@@ -16173,13 +16181,26 @@ impl ArchitectureKeys {
 			None => Vec::new(),
 			_ => panic!("attention.compress_ratios must be an array"),
 		};
+		let policy = architectures().unwrap_or_else(|error| panic!("{error}")).into_iter().find(|row| row.name == prefix);
+		let expert_count = count("expert_count");
+		let expert_gating_func = match file.value(&format!("{prefix}.expert_gating_func")) {
+			Some(value) => value.integer().and_then(|value| usize::try_from(value).ok()).expect("expert_gating_func is invalid"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_scoring).map_or(0, |scoring| match scoring { Scoring::Softmax => 1, Scoring::Sigmoid => 2 }),
+			None => match policy.as_ref().and_then(|row| row.expert_scoring).expect("expert scoring is absent from GGUF and architecture profile") { Scoring::Softmax => 1, Scoring::Sigmoid => 2 },
+		};
+		let expert_weights_norm = match file.value(&format!("{prefix}.expert_weights_norm")) {
+			Some(GgufValue::Bool(value)) => *value,
+			Some(_) => panic!("expert_weights_norm must be a boolean"),
+			None if expert_count == 0 => policy.as_ref().and_then(|row| row.expert_renormalize).unwrap_or(false),
+			None => policy.as_ref().and_then(|row| row.expert_renormalize).expect("expert renormalization is absent from GGUF and architecture profile"),
+		};
 		Self {
-			expert_count: count("expert_count"),
+			expert_count,
 			expert_used_count: count("expert_used_count"),
 			expert_feed_forward_length: count("expert_feed_forward_length"),
 			expert_shared_feed_forward_length: count("expert_shared_feed_forward_length"),
-			expert_gating_func: file.value(&format!("{prefix}.expert_gating_func")).and_then(GgufValue::integer).unwrap_or(1) as usize,
-			expert_weights_norm: match file.value(&format!("{prefix}.expert_weights_norm")) { Some(GgufValue::Bool(value)) => *value, None => true, _ => panic!("expert_weights_norm must be a boolean") },
+			expert_gating_func,
+			expert_weights_norm,
 			full_attention_interval: count("full_attention_interval"),
 			hyper_connection: HyperKeys { count: count("hyper_connection.count"), low_rank: count("hyper_connection.low_rank") },
 			ssm: SsmKeys {
@@ -16236,7 +16257,7 @@ impl std::ops::Deref for Namespace {
 	}
 }
 macro_rules! namespaces { ($($name:ident)+) => { $(pub static $name: Namespace = Namespace { prefix: stringify!($name), keys: OnceLock::new() };)+ }; }
-namespaces! { gemma3 llama qwen2 qwen3 qwen4exp phi3 deepseek2 glm4 granite }
+namespaces! { gemma3 gemma4 llama lfm2 qwen2 qwen3 qwen2moe qwen3moe qwen35 qwen3next qwen4exp phi3 deepseek2 glm4 granite }
 /// The `tokenizer.*` keys: `tokenizer.ggml.tokens` is the vocabulary, and the
 /// ids and the chat template sit beside it.
 pub struct TokenizerKeys {
@@ -16620,7 +16641,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
