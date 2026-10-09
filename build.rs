@@ -1455,35 +1455,17 @@ const ACC64: &str = "-acc64";
 fn state_align(state: &str) -> String {
 	if state == "double" { "8".to_owned() } else { "4".to_owned() }
 }
-/// Rewrites each plain decimal constant of the given LLVM type as that type's own exact encoding, since the IR parser rejects a decimal the type cannot spell.
-fn decimal_literals(kernel: &str, llvm: &str, literal: &dyn Fn(f64) -> String) -> String {
-	let marker = format!("{llvm} ");
-	let (mut output, mut rest) = (String::with_capacity(kernel.len()), kernel);
-	while let Some(index) = rest.find(&marker) {
-		let end = index + marker.len();
-		output.push_str(&rest[..end]);
-		let before = rest[..index].chars().next_back();
-		rest = &rest[end..];
-		if before.is_some_and(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '.' | '%' | '@')) {
-			continue;
+/// Spells each `TQ{x}` constant of the TurboQuant kernels in the encoding of the compute type, since the IR parser rejects a decimal the type cannot hold exactly.
+fn tq_constants(kernel: String, spell: &dyn Fn(f64) -> String) -> String {
+	let (mut output, mut rest) = (String::with_capacity(kernel.len()), kernel.as_str());
+	while let Some(index) = rest.find("TQ{") {
+		let close = rest[index..].find('}').map_or(rest.len(), |offset| index + offset);
+		output.push_str(&rest[..index]);
+		match rest[index + 3..close].parse::<f64>() {
+			Ok(value) => output.push_str(&spell(value)),
+			Err(_) => output.push_str(&rest[index..=close]),
 		}
-		let digits = |text: &str| text.chars().take_while(char::is_ascii_digit).count();
-		let sign = usize::from(rest.starts_with('-'));
-		let whole = digits(&rest[sign..]);
-		let tail = &rest[sign + whole..];
-		if whole == 0 || !tail.starts_with('.') {
-			continue;
-		}
-		let fraction = digits(&tail[1..]);
-		let length = sign + whole + 1 + fraction;
-		let next = rest[length..].chars().next();
-		if fraction == 0 || next.is_some_and(|value| value.is_ascii_alphanumeric() || value == '_' || value == '.') {
-			continue;
-		}
-		if let Ok(value) = rest[..length].parse::<f64>() {
-			output.push_str(&literal(value));
-			rest = &rest[length..];
-		}
+		rest = &rest[(close + 1).min(rest.len())..];
 	}
 	output.push_str(rest);
 	output
@@ -1506,10 +1488,17 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat, state: &
 			"bfloat" => format!("0xR{:04X}", format.pack(value)),
 			_ => format!("0x{:016X}", format.unpack(format.pack(value)).to_bits()),
 		};
-		kernel = decimal_literals(&kernel, llvm, &literal)
+		kernel = kernel
+			.replace(&format!("{llvm} 0.1"), &format!("{llvm} {}", literal(0.1)))
 			.replace("0x3CB0000000000000", &literal(f64::from_bits(0x3CB0000000000000)))
 			.replace("0x3FEFFFFFFFFFFFFE", &literal(f64::from_bits(0x3FEFFFFFFFFFFFFE)))
 	}
+	let kernel = tq_constants(kernel, &|value| match llvm {
+		"half" => format!("0xH{:04X}", format.pack(value)),
+		"bfloat" => format!("0xR{:04X}", format.pack(value)),
+		_ if bits < 64 => format!("0x{:016X}", format.unpack(format.pack(value)).to_bits()),
+		_ => format!("{value:?}"),
+	});
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn fp8_encoder(name: &str, format: FloatFormat) -> String {
@@ -1589,6 +1578,7 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
 		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("{}", pack(f64::from_bits(bits))))
 	}
+	let kernel = tq_constants(kernel, &|value| format!("{value:?}"));
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
@@ -1604,10 +1594,10 @@ fn half_ir(ir: String, suffix: &str, state: &str) -> BuildResult<String> {
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &format!("0xH{:04X}", FloatFormat::FP16.pack(value)))
 	}
-	kernel = decimal_literals(&kernel, "half", &|value| format!("0xH{:04X}", FloatFormat::FP16.pack(value)));
 	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
 		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("0xH{:04X}", FloatFormat::FP16.pack(f64::from_bits(bits))))
 	}
+	let kernel = tq_constants(kernel, &|value| format!("0xH{:04X}", FloatFormat::FP16.pack(value)));
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
 fn int_codec(format: IntFormat) -> String {

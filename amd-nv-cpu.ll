@@ -9330,9 +9330,9 @@ entry:
 %mirror.base = sub i32 1, %idx
 %above = sub i32 %idx, 2
 %m = select i1 %negative, i32 %mirror.base, i32 %above
-%mag.1 = select i1 true, double 1.5104176084990977, double 0.0
+%mag.1 = select i1 true, double TQ{1.5104176084990977}, double 0.0
 %is.0 = icmp eq i32 %m, 0
-%mag.0 = select i1 %is.0, double 0.45278003463649247, double %mag.1
+%mag.0 = select i1 %is.0, double TQ{0.45278003463649247}, double %mag.1
 %minus = fneg double %mag.0
 %result = select i1 %negative, double %minus, double %mag.0
 ret double %result
@@ -9343,13 +9343,13 @@ entry:
 %mirror.base = sub i32 3, %idx
 %above = sub i32 %idx, 4
 %m = select i1 %negative, i32 %mirror.base, i32 %above
-%mag.3 = select i1 true, double 2.1519457045369957, double 0.0
+%mag.3 = select i1 true, double TQ{2.1519457045369957}, double 0.0
 %is.2 = icmp eq i32 %m, 2
-%mag.2 = select i1 %is.2, double 1.3439092785050005, double %mag.3
+%mag.2 = select i1 %is.2, double TQ{1.3439092785050005}, double %mag.3
 %is.1 = icmp eq i32 %m, 1
-%mag.1 = select i1 %is.1, double 0.75600528120588, double %mag.2
+%mag.1 = select i1 %is.1, double TQ{0.75600528120588}, double %mag.2
 %is.0 = icmp eq i32 %m, 0
-%mag.0 = select i1 %is.0, double 0.24509417894422170, double %mag.1
+%mag.0 = select i1 %is.0, double TQ{0.24509417894422170}, double %mag.1
 %minus = fneg double %mag.0
 %result = select i1 %negative, double %minus, double %mag.0
 ret double %result
@@ -9360,21 +9360,21 @@ entry:
 %mirror.base = sub i32 7, %idx
 %above = sub i32 %idx, 8
 %m = select i1 %negative, i32 %mirror.base, i32 %above
-%mag.7 = select i1 true, double 2.7325895709953212, double 0.0
+%mag.7 = select i1 true, double TQ{2.7325895709953212}, double 0.0
 %is.6 = icmp eq i32 %m, 6
-%mag.6 = select i1 %is.6, double 2.06901722653136844, double %mag.7
+%mag.6 = select i1 %is.6, double TQ{2.06901722653136844}, double %mag.7
 %is.5 = icmp eq i32 %m, 5
-%mag.5 = select i1 %is.5, double 1.61804638602187645, double %mag.6
+%mag.5 = select i1 %is.5, double TQ{1.61804638602187645}, double %mag.6
 %is.4 = icmp eq i32 %m, 4
-%mag.4 = select i1 %is.4, double 1.25623119734716937, double %mag.5
+%mag.4 = select i1 %is.4, double TQ{1.25623119734716937}, double %mag.5
 %is.3 = icmp eq i32 %m, 3
-%mag.3 = select i1 %is.3, double 0.94234045648695852, double %mag.4
+%mag.3 = select i1 %is.3, double TQ{0.94234045648695852}, double %mag.4
 %is.2 = icmp eq i32 %m, 2
-%mag.2 = select i1 %is.2, double 0.65675911853246321, double %mag.3
+%mag.2 = select i1 %is.2, double TQ{0.65675911853246321}, double %mag.3
 %is.1 = icmp eq i32 %m, 1
-%mag.1 = select i1 %is.1, double 0.38804829949028946, double %mag.2
+%mag.1 = select i1 %is.1, double TQ{0.38804829949028946}, double %mag.2
 %is.0 = icmp eq i32 %m, 0
-%mag.0 = select i1 %is.0, double 0.12839502985114705, double %mag.1
+%mag.0 = select i1 %is.0, double TQ{0.12839502985114705}, double %mag.1
 %minus = fneg double %mag.0
 %result = select i1 %negative, double %minus, double %mag.0
 ret double %result
@@ -9382,7 +9382,7 @@ ret double %result
 define internal i32 @tq.index.2(double %x) #1 {
 entry:
 %a = call double @recipe.abs(double %x)
-%ge.0 = fcmp oge double %a, 0.9815988215677951
+%ge.0 = fcmp oge double %a, TQ{0.9815988215677951}
 %one.0 = zext i1 %ge.0 to i32
 %sum.0 = add i32 0, %one.0
 %positive = fcmp oge double %x, 0.0
@@ -9394,13 +9394,13 @@ ret i32 %result
 define internal i32 @tq.index.3(double %x) #1 {
 entry:
 %a = call double @recipe.abs(double %x)
-%ge.0 = fcmp oge double %a, 0.5005497300750500
+%ge.0 = fcmp oge double %a, TQ{0.5005497300750500}
 %one.0 = zext i1 %ge.0 to i32
 %sum.0 = add i32 0, %one.0
-%ge.1 = fcmp oge double %a, 1.0499572798554393
+%ge.1 = fcmp oge double %a, TQ{1.0499572798554393}
 %one.1 = zext i1 %ge.1 to i32
 %sum.1 = add i32 %sum.0, %one.1
-%ge.2 = fcmp oge double %a, 1.7479274915209988
+%ge.2 = fcmp oge double %a, TQ{1.7479274915209988}
 %one.2 = zext i1 %ge.2 to i32
 %sum.2 = add i32 %sum.1, %one.2
 %positive = fcmp oge double %x, 0.0
@@ -9412,25 +9412,25 @@ ret i32 %result
 define internal i32 @tq.index.4(double %x) #1 {
 entry:
 %a = call double @recipe.abs(double %x)
-%ge.0 = fcmp oge double %a, 0.2582216646707183
+%ge.0 = fcmp oge double %a, TQ{0.2582216646707183}
 %one.0 = zext i1 %ge.0 to i32
 %sum.0 = add i32 0, %one.0
-%ge.1 = fcmp oge double %a, 0.5224037090113763
+%ge.1 = fcmp oge double %a, TQ{0.5224037090113763}
 %one.1 = zext i1 %ge.1 to i32
 %sum.1 = add i32 %sum.0, %one.1
-%ge.2 = fcmp oge double %a, 0.7995497875097104
+%ge.2 = fcmp oge double %a, TQ{0.7995497875097104}
 %one.2 = zext i1 %ge.2 to i32
 %sum.2 = add i32 %sum.1, %one.2
-%ge.3 = fcmp oge double %a, 1.0992858269170640
+%ge.3 = fcmp oge double %a, TQ{1.0992858269170640}
 %one.3 = zext i1 %ge.3 to i32
 %sum.3 = add i32 %sum.2, %one.3
-%ge.4 = fcmp oge double %a, 1.4371387916845231
+%ge.4 = fcmp oge double %a, TQ{1.4371387916845231}
 %one.4 = zext i1 %ge.4 to i32
 %sum.4 = add i32 %sum.3, %one.4
-%ge.5 = fcmp oge double %a, 1.8435318062766172
+%ge.5 = fcmp oge double %a, TQ{1.8435318062766172}
 %one.5 = zext i1 %ge.5 to i32
 %sum.5 = add i32 %sum.4, %one.5
-%ge.6 = fcmp oge double %a, 2.4008033987633230
+%ge.6 = fcmp oge double %a, TQ{2.4008033987633230}
 %one.6 = zext i1 %ge.6 to i32
 %sum.6 = add i32 %sum.5, %one.6
 %positive = fcmp oge double %x, 0.0
@@ -9740,7 +9740,7 @@ entry:
 %inverse.root = fdiv double 1.0, %root
 %unscaled = call i1 @recipe.ogt(double 0.0, double %epsilon)
 %q.scale = select i1 %unscaled, double 1.0, double %inverse.root
-%correction = fdiv double 1.2533141373155003, %dd
+%correction = fdiv double TQ{1.2533141373155003}, %dd
 %kv.group = udiv i32 %heads, %kv.heads
 %value.group = udiv i32 %heads, %value.heads
 %kv.channels = mul i32 %kv.heads, %d
