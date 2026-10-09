@@ -68,7 +68,7 @@ let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
 	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
-	.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
+	.delta_gates(Activation::Softplus, Activation::Sigmoid)
 	.norm(rms);
 let gate = HyperGate {
 	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),
@@ -175,6 +175,11 @@ let expert = [
 let routed = moe(10, [expert; 512]);
 let shared = expert * layer(1).sigmoid();
 let combined = routed + shared;
+```
+
+```rust
+let experts = recipe.model().gguf_moe(256, 8, 512, Activation::Silu, Scoring::Softmax, true,
+	SharedExpert::Gated { count: 1, gate: Activation::Sigmoid }, 1.0, false);
 ```
 
 ## **Train**

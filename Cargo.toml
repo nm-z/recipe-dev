@@ -161,6 +161,26 @@ exact-cpu = false
 tolerance = 0.05
 step = 32
 
+[precision.check64]
+sum = "fp64"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp64"
+norm = "fp64"
+res = "fp64"
+acc = "fp64"
+train = "fp64"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.001
+step = 32
+
 [precision.llamacpp]
 fp8 = "e4m3"
 train = "fp32"
@@ -255,6 +275,8 @@ expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
 expert-scale = "1.0"
+expert-shared = "gated"
+expert-shared-gate = "sigmoid"
 
 [architecture.qwen3moe]
 rope-pairs = "halves"
@@ -263,6 +285,7 @@ expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
 expert-scale = "1.0"
+expert-shared = "none"
 
 [architecture.qwen35]
 rope-pairs = "halves"
@@ -291,6 +314,8 @@ expert-activation = "silu"
 expert-scoring = "softmax"
 expert-renormalize = "true"
 expert-scale = "1.0"
+expert-shared = "gated"
+expert-shared-gate = "sigmoid"
 delta-convolution = "silu"
 delta-output = "sigmoid"
 delta-decay = "softplus"
