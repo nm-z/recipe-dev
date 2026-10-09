@@ -317,6 +317,17 @@ RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run model.rs --device archy:nv
 RECIPE_REFERENCE=/path/reference.bin recipe run model.rs --device archy:nv0
 ```
 
+A scoring run (`infer.score()`) records or compares every scored position's full logits the same way. The comparison reports KL divergence, Pearson and top-100 Spearman correlation, the largest logit error as a share of the reference's logit range, top-1 and top-5 agreement, and the change in log probability and perplexity, with their mean, median, p99, min and max over the text and per run of positions. It fails when any logit is off by more than `logit-error-bound` of that range, or when the fitted error rises with position by more than `logit-error-growth` over a run of at least `logit-error-growth-positions` positions.
+
+```bash
+RECIPE_SCORE=1 RECIPE_REFERENCE_WRITE=/path/reference.bin recipe run rnj-1.rs --device cpu -p "$(cat text.txt)"
+RECIPE_SCORE=1 RECIPE_REFERENCE=/path/reference.bin recipe run rnj-1.rs --device cpu -p "$(cat text.txt)"
+```
+
+A reference from another program fills the same file: `RCPREF01`, a version of 1, the vocabulary size, the position count, then per position its index, the argmax and the vocabulary's logits as little-endian f64.
+
+`cargo build --release --features kv-turboquant` makes every inference key-value cache in the program a TurboQuant cache, at `kv-turboquant-bits` (3, 3.5 or 4) in `Cargo.toml`: each head vector is rotated by a randomized Hadamard transform and coded with a Gaussian Lloyd-Max codebook, and a key also keeps one residual sign bit per coordinate. Head widths are powers of two from 64 to 256.
+
 ## Reporting
 
 ```rust
