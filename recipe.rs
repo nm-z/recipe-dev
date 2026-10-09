@@ -1713,7 +1713,7 @@ pub(crate) struct NativeLayout {
 	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
 	/// Under a traced run on an NVIDIA device, the byte offset in the context
-	/// arena of two i64 values the kernel writes as a forward ends: how many grid
+	/// buffer of two i64 values the kernel writes as a forward ends: how many grid
 	/// barriers it executed and, summed over them, the nanoseconds from the first
 	/// workgroup's arrival to the last's. A traced forward reads them back.
 	pub barriers: Option<usize>,
