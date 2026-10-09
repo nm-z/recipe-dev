@@ -8,6 +8,8 @@ GPU/CPU ML training and inference in Rust.
 recipe run train.rs --cfg recipe --device amd0.cpu.archy:nv7.nv8 --ctx 4096 -p "text"
 ```
 
+The AMD backend supports discrete GPUs only and requires gfx8 or newer. AMD APUs and integrated GPUs are unsupported.
+
 ## **Data**
 
 ```rust
@@ -35,12 +37,11 @@ let model = recipe.model()
 ```
 
 ```rust
-frozen.blck.atvn.norm.prec = block
-	│      │    │    │    └─ precision it computes in
-	│      │    │    └────── normalization
-	│      │    └─────────── activation
-	│      └──────────────── ""
-	└─────────────────────── frozen qualifier
+frozen.blck.atvn.prec = block
+	│      │    │    └─ precision it computes in
+	│      │    └────── activation maps in written order
+	│      └─────────── ""
+	└────────────────── frozen qualifier
 ```
 
 ```rust
@@ -101,7 +102,7 @@ let model = recipe.model()
 			.head(width)
 			.kv(heads).fp(...)
 			.qk(rms|l2)
-			.rope(neox, dims, base)
+			.rope(neox|sections([...])|interleaved([...]), dims, base)
 			.yarn(factor, og_ctx, b_fast, b_slow)
 			.index(heads, width, block, keep)
 				.score(rms|l2, dims)
@@ -117,6 +118,7 @@ atvn:
 	elu()
 	prelu()
 	cos()
+	sqrt()
 	exp()
 	log()
 	ln()
@@ -124,12 +126,11 @@ atvn:
 	tan()
 	scale(factor)
 	e(value)
+	norm(batch|layer|rms|l2)
 feature reduction:
 	pool(size)
 	kmeans(clusters)
 	knn(neighbors)
-norm:
-	.norm(batch|layer|rms|l2)
 loss:
 	.loss(mse|rmse|huber|mae|bce|ce|focal)
 exclude:
@@ -215,7 +216,7 @@ infer()
 	.tokens(count)
 	.mtp(path)
 	.chat(text|[time, pp, tg, input, out, cached, mtp])
-	.log([chat, debug])
+	.log([chat, debug, hc_values])
 	.run(&model, &data)
 predict(path, &input)
 tokenizer.encode(text)|tokenizer.decode(&ids)|tokenizer.stop_ids()
@@ -292,6 +293,8 @@ println!("{}", model.memory(&data, 32768));
 
 ```rust
 report.*
+	tensors[].*
+		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
 	(load|compile).seconds()
 	path
 	(formats|memory|links|aot|tiles|grids)[]
@@ -318,7 +321,7 @@ infer().run().*
 	mtp.(drafted|accepted|verifications)
 	(context|requests)
 	history[].*
-		(time|prediction|input_ids|output_ids|logits|input|out|cached|reply_limit|mtp|reference|operations)
+		(time|prediction|input_ids|output_ids|logits|input|out|cached|reply_limit|mtp|reference|operations|tensors)
 	(dead_buffers|dead_bytes)
 	reference.*
 		(steps|worst)
