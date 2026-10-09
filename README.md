@@ -353,6 +353,7 @@ report.*
 	path
 	(formats|memory|links|aot|tiles|grids|barriers)[]
 	llvm.(instructions|intrinsics)[]
+	llvm.(fused_nodes|barriers)
 train().run().*
 	(itl|fnl).*
 		(loss|r2)
