@@ -24,6 +24,9 @@ const SEED: usize = 17;
 const RATE: f64 = 0.5;
 const EPOCHS: usize = 400;
 const PRECISION_BITS: u8 = 32;
+/// The gated delta model trains for a few epochs at a small rate, which is enough for its loss to fall.
+const DELTA_RATE: f64 = 0.01;
+const DELTA_EPOCHS: usize = 20;
 
 /// A converged fit of an exact linear relationship. The measured worst case on
 /// a reference CPU run is 0.064 absolute over the sorted predictions and 0.044
@@ -208,6 +211,17 @@ fn main() {
 	let after = std::fs::read(&bundle).expect("inference removed the bundle");
 	report.record("inference_closed_form", inference_worst <= CLOSED_FORM_TOLERANCE, format!("worst_abs_err={inference_worst:.9} tolerance={CLOSED_FORM_TOLERANCE}"));
 	report.record("inference_is_read_only", after == resumed_bytes, format!("bundle_bytes_before={} bundle_bytes_after={}", resumed_bytes.len(), after.len()));
+
+	// 7. A gated delta model trains at each precision: it is not refused, its loss is finite and falls,
+	//    and the same seed repeats the report bits.
+	for (name, bits) in [("delta_fp32", 32_u8), ("delta_fp16", 16_u8)] {
+		let delta = recipe.model().layer(32).fp(bits).delta(1, 2).fp(bits).keys(1, 32).values(32).out(32).delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Sigmoid).delta_gates(Activation::Softplus, Activation::Sigmoid).layer(1).fp(bits).loss(mse);
+		let first = recipe.train().seed(SEED).lr(DELTA_RATE).epochs(DELTA_EPOCHS).run(&delta, &multi);
+		let second = recipe.train().seed(SEED).lr(DELTA_RATE).epochs(DELTA_EPOCHS).run(&delta, &multi);
+		let falls = first.initial_loss().is_finite() && first.final_loss().is_finite() && first.final_loss() < first.initial_loss();
+		let repeats = first.initial_loss().to_bits() == second.initial_loss().to_bits() && first.final_loss().to_bits() == second.final_loss().to_bits() && prediction_bits(first.predictions()) == prediction_bits(second.predictions());
+		report.record(name, falls && repeats, format!("initial_loss={:.9} final_loss={:.9} final_bits={:016x} repeats={repeats}", first.initial_loss(), first.final_loss(), first.final_loss().to_bits()));
+	}
 
 	let failed: Vec<&str> = report.checks.iter().filter(|check| !check.passed).map(|check| check.name).collect();
 	let body = report

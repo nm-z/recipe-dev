@@ -4096,8 +4096,7 @@ store double %read.decayed, ptr addrspace(1) %read.pointer, align 8
 read.done: %value.row = mul i64 %column.wide, %length.wide %value.offset = add i64 %value.row, %time.wide %value.index = add i64 %v.base, %value.offset
 %value.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %value.index
 %value = load double, ptr addrspace(1) %value.pointer, align 8
-%read.decayed = call double @recipe.mul(double %decay, double %read.sum)
-%error = call double @recipe.sub(double %value, double %read.decayed) %write.error = call double @recipe.mul(double %write, double %error)
+%error = call double @recipe.sub(double %value, double %read.sum) %write.error = call double @recipe.mul(double %write, double %error)
 br label %write.loop
 write.loop: %write.i = phi i32 [ 0, %read.done ], [ %write.next, %write.step ]
 %write.sum = phi double [ 0.0, %read.done ], [ %write.sum.next, %write.step ]
@@ -4310,8 +4309,7 @@ column.store: %column.row.offset = mul i64 %column.wide, %length.wide %column.of
 %column.value.index = add i64 %v.base, %column.offset
 %column.value.pointer = getelementptr inbounds double, ptr addrspace(1) %input, i64 %column.value.index
 %column.value.model = load double, ptr addrspace(1) %column.value.pointer, align 8 %column.value = call RECIPE_STATE @recipe.decode(double %column.value.model)
-%readout.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %readout)
-%error = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %column.value, RECIPE_STATE %readout.decayed)
+%error = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %column.value, RECIPE_STATE %readout)
 %error.index = add i64 %vector.base, %column.wide
 %error.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %backward, i64 %error.index
 store RECIPE_STATE %error, ptr addrspace(1) %error.pointer, align RECIPE_STATE_ALIGN
@@ -4374,8 +4372,7 @@ row.step: %row.j.wide = zext i32 %row.j to i64 %row.cell = add i64 %row.i.base, 
 %decay.part.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %decay.part, RECIPE_STATE %row.decay.term)
 store RECIPE_STATE %row.adjoint.next, ptr addrspace(1) %row.adjoint.pointer, align RECIPE_STATE_ALIGN
 %row.j.next = add nuw i32 %row.j, 1 br label %row.column
-row.store: %key.readout.decayed = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %decay, RECIPE_STATE %key.readout)
-%key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.direct, RECIPE_STATE %key.readout.decayed)
+row.store: %key.difference = call RECIPE_STATE @recipe.state.sub(RECIPE_STATE %key.direct, RECIPE_STATE %key.readout)
 %key.gradient = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %write, RECIPE_STATE %key.difference)
 %key.adjoint.pointer = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %input.adjoint, i64 %row.key.index
 %key.prior = load RECIPE_STATE, ptr addrspace(1) %key.adjoint.pointer, align RECIPE_STATE_ALIGN
