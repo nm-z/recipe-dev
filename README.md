@@ -255,7 +255,7 @@ place(path, &[blocks])
 
 ## GGUF tensors
 
-A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, and a normalization its scale.
+A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.
 
 ```rust
 let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
@@ -289,6 +289,17 @@ let experts = recipe.model().gguf_moe(count, used, hidden, Activation::Silu, Sco
 ```rust
 MoeTensors { router, selection_bias, gate, up, down, shared }
 SharedTensors { gate_input, gate, up, down }
+```
+
+```rust
+model = model.hyper_gate(lanes, &branch, gate).hyper_from(HyperTensors::mixer(layer, "attn"));
+model = model.hyper_head_from(HyperTensors::head()).layer(vocabulary);
+model = model.ple(&table).ple_math(math).ple_from(PleTensors::block(layer));
+```
+
+```rust
+HyperTensors { norm, down, up, inject }
+PleTensors { key, norm_key, norm_query, value, norm_conv, conv }
 ```
 
 ## Terminal chat and remote execution
