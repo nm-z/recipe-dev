@@ -12937,32 +12937,78 @@ impl Model {
 		})
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
-		let selected = metrics.iter().any(|metric| metric.0 == blck.0);
-		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
-		self.blocks
-			.iter()
-			.take(self.blocks.len() - output)
-			.filter_map(|block| {
-				let mut names = Vec::new();
-				if selected {
-					names.push(block.operation.name().to_owned());
-					if block.activation != Activation::Linear {
-						names.push(block.activation.name().to_owned())
-					}
-					if let Some(name) = block.qk.map(BlockNormalization::name) {
-						names.push(format!("qk-{name}"))
-					}
-					if let Some(name) = block.normalization.map(BlockNormalization::name) {
-						names.push(name.to_owned())
-					}
-					if block.quantization != 0 {
-						names.push(quantization(block.quantization))
-					}
-				}
-				(!names.is_empty()).then(|| names.join("."))
-			})
-			.collect::<Vec<_>>()
-			.join("/")
+		if !metrics.iter().any(|metric| metric.0 == blck.0) {
+			return String::new();
+		}
+		self.blocks.iter().map(Self::describe_block).collect::<Vec<_>>().join("/")
+	}
+	fn describe_parts(parts: &[Block]) -> String {
+		parts.iter().map(Self::describe_block).collect::<Vec<_>>().join(",")
+	}
+	fn describe_block(block: &Block) -> String {
+		let mut text = match &block.operation {
+			Operation::Layer(width) => format!("layer({width})"),
+			Operation::Conv(filters, kernel) => format!("conv({filters},{kernel})"),
+			Operation::Pool(size) => format!("pool({size})"),
+			Operation::Estimator(estimator) if estimator.param == 0 => format!("{}()", estimator.name()),
+			Operation::Estimator(estimator) => format!("{}({})", estimator.name(), estimator.param),
+			Operation::Attention(attention) => format!("attn({})", attention.heads),
+			Operation::Rnn(width) => format!("rnn({width})"),
+			Operation::Gru(width) => format!("gru({width})"),
+			Operation::Lstm(width) => format!("lstm({width})"),
+			Operation::Recur(parts) => format!("recur([{}])", Self::describe_parts(parts)),
+			Operation::Residual(parts) => format!("res([{}])", Self::describe_parts(parts)),
+			Operation::Ensemble(parts) => format!("ensemble([{}])", Self::describe_parts(parts)),
+			Operation::Product(left, right) => format!("({} * {})", Self::describe_parts(&left.blocks), Self::describe_parts(&right.blocks)),
+			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
+				format!("gguf_moe({experts},{top_k},{hidden},{},{scoring:?},{renormalize},{shared})", activation.name())
+			}
+			Operation::MoeBlocks(top_k, parts) => format!("moe({top_k},[{}])", Self::describe_parts(parts)),
+			Operation::Perceptron(width) => format!("perc({width})"),
+			Operation::Embed(rows, width) => format!("embed({rows},{width})"),
+			Operation::Hyper(lanes, rank, parts) => format!("hyper({lanes},{rank},[{}])", Self::describe_parts(parts)),
+			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
+			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
+			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
+			Operation::Norm | Operation::Identity => String::new(),
+			Operation::Last => "last()".to_owned(),
+			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
+		};
+		if block.frozen {
+			text.insert_str(0, "frozen.");
+		}
+		if block.activation != Activation::Linear {
+			let activation = match block.activation {
+				Activation::Scale(bits) => format!("scale({})", f64::from_bits(bits)),
+				activation => format!("{}()", activation.name()),
+			};
+			if !text.is_empty() { text.push('.'); }
+			text.push_str(&activation);
+		}
+		let normalization = |value| match value {
+			BlockNormalization::Batch => "batch",
+			BlockNormalization::Layer => "layer",
+			BlockNormalization::Rms => "rms",
+			BlockNormalization::L2 => "l2",
+		};
+		if let Some(value) = block.qk {
+			if !text.is_empty() { text.push('.'); }
+			text.push_str(&format!("qk({})", normalization(value)));
+		}
+		if let Some(value) = block.normalization {
+			if text.is_empty() {
+				text = format!("norm({})", normalization(value));
+			} else {
+				text.push_str(&format!(".norm({})", normalization(value)));
+			}
+		}
+		if block.quantization != 0 {
+			text.push_str(&format!(".{}", quantization(block.quantization)));
+		}
+		if text.is_empty() {
+			text = "identity()".to_owned();
+		}
+		text
 	}
 	/// Resolve every weighted node against GGUF data before selecting devices.
 	pub fn binding(&self, data: &Data) -> Result<Binding> {
