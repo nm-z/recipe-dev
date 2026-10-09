@@ -20936,6 +20936,157 @@ mod precision_contract_checks {
 	}
 }
 
+#[cfg(test)]
+mod ple_stepper_checks {
+	use super::*;
+
+	fn bits(values: &[f64]) -> Vec<u64> {
+		values.iter().map(|value| value.to_bits()).collect()
+	}
+	fn gguf_text(out: &mut Vec<u8>, value: &str) {
+		out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+		out.extend_from_slice(value.as_bytes());
+	}
+	/// Writes the synthetic checkpoint the public PLE control used: a native Q8_0
+	/// n-gram row table, a three-tap convolution dilated by the order-3 n-gram,
+	/// and dense tensors for the stream around one per-layer embedding block.
+	fn write_fixture(path: &Path, ple: bool) {
+		let tensors: Vec<(&str, Vec<f32>)> = vec![
+			("token_embd.weight", vec![1.0, 2.0]),
+			("blk.0.attn_q.weight", vec![0.0]),
+			("blk.0.attn_k.weight", vec![0.0]),
+			("blk.0.attn_v.weight", vec![0.0]),
+			("blk.0.attn_output.weight", vec![0.0]),
+			("blk.0.ffn_gate.weight", vec![2.0]),
+			("blk.0.ffn_up.weight", vec![3.0]),
+			("blk.0.ffn_down.weight", vec![1.0]),
+			("output.weight", vec![1.0, -1.0]),
+			("ngram.table", Vec::new()),
+			("blk.0.ple_key.weight", vec![0.01; 64]),
+			("blk.0.ple_norm_key.weight", vec![1.0]),
+			("blk.0.ple_norm_query.weight", vec![1.0]),
+			("blk.0.ple_value.weight", vec![0.02; 64]),
+			("blk.0.ple_norm_conv.weight", vec![1.0]),
+			("blk.0.ple_conv1d.weight", vec![0.6, -0.2, 0.1]),
+		];
+		let tensors = tensors.into_iter().filter(|(name, _)| ple || !(name.starts_with("blk.0.ple") || *name == "ngram.table")).collect::<Vec<_>>();
+		let mut metadata = Vec::new();
+		for (name, value) in [("general.architecture", "llama"), ("tokenizer.ggml.model", "gpt2"), ("tokenizer.ggml.pre", "gpt-2")] {
+			gguf_text(&mut metadata, name);
+			metadata.extend_from_slice(&8u32.to_le_bytes());
+			gguf_text(&mut metadata, value);
+		}
+		for (name, value) in [("llama.context_length", 160u32), ("tokenizer.ggml.bos_token_id", 0), ("tokenizer.ggml.eos_token_id", 1), ("ngram.heads", 1), ("ngram.kernel", 3), ("ngram.layer", 0)] {
+			gguf_text(&mut metadata, name);
+			metadata.extend_from_slice(&4u32.to_le_bytes());
+			metadata.extend_from_slice(&value.to_le_bytes());
+		}
+		gguf_text(&mut metadata, "tokenizer.ggml.add_bos_token");
+		metadata.extend_from_slice(&7u32.to_le_bytes());
+		metadata.push(0);
+		for (name, values) in [("tokenizer.ggml.tokens", &["a", "b"][..]), ("tokenizer.ggml.merges", &[][..])] {
+			gguf_text(&mut metadata, name);
+			metadata.extend_from_slice(&9u32.to_le_bytes());
+			metadata.extend_from_slice(&8u32.to_le_bytes());
+			metadata.extend_from_slice(&(values.len() as u64).to_le_bytes());
+			for value in values {
+				gguf_text(&mut metadata, value);
+			}
+		}
+		let mut out = b"GGUF".to_vec();
+		out.extend_from_slice(&3u32.to_le_bytes());
+		out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+		out.extend_from_slice(&12u64.to_le_bytes());
+		out.extend(metadata);
+		let mut data = Vec::new();
+		for (name, values) in &tensors {
+			gguf_text(&mut out, name);
+			out.extend_from_slice(&2u32.to_le_bytes());
+			let table = *name == "ngram.table";
+			let columns: u64 = match *name {
+				"ngram.table" => 32,
+				"blk.0.ple_key.weight" | "blk.0.ple_value.weight" => 64,
+				"blk.0.ple_conv1d.weight" => 3,
+				_ => 1,
+			};
+			let rows: u64 = if table { 4 } else { values.len() as u64 / columns };
+			out.extend_from_slice(&columns.to_le_bytes());
+			out.extend_from_slice(&rows.to_le_bytes());
+			out.extend_from_slice(&(if table { 8u32 } else { 0 }).to_le_bytes());
+			out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+			if table {
+				for code in [32i8, 96, -80, 48] {
+					data.extend_from_slice(&0x2400u16.to_le_bytes());
+					data.extend_from_slice(&[code as u8; 32]);
+				}
+			} else {
+				for value in values {
+					data.extend_from_slice(&value.to_le_bytes());
+				}
+			}
+			while data.len() % 32 != 0 {
+				data.push(0);
+			}
+		}
+		while out.len() % 32 != 0 {
+			out.push(0);
+		}
+		out.extend(data);
+		std::fs::write(path, out).unwrap();
+	}
+	/// The public control's model: an optional per-layer embedding after the
+	/// embedding, then residual attention and gated feed-forward blocks.
+	fn model(table: Option<&Ngram<'_>>) -> Model {
+		let gate = layer(1).fp(64).silu().fp(64);
+		let up = layer(1).fp(64);
+		let model = recipe.model().no(bias).embed(2, 1).fp(64);
+		let model = match table {
+			Some(table) => model.ple(table).fp(64),
+			None => model,
+		};
+		model.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64)
+	}
+	/// Places the model on the CPU as one range, the same tape a single-device
+	/// `recipe.infer` placement builds.
+	fn place_cpu(file: &Gguf, model: &Model, positions: usize) -> Placed {
+		let bound = explicit_bound(file, model).unwrap();
+		let devices: &'static [&'static Gpu] = Box::leak(Box::new([shared_cpu_device().unwrap()]));
+		place_bound(&bound, positions, &[], devices).unwrap()
+	}
+	#[test]
+	fn native_ple_prefill_and_steps_match_whole_sequence() {
+		let path = std::env::temp_dir().join(format!("recipe-ple-stepper-{}.gguf", std::process::id()));
+		let plain_path = std::env::temp_dir().join(format!("recipe-plain-stepper-{}.gguf", std::process::id()));
+		write_fixture(&path, true);
+		write_fixture(&plain_path, false);
+		let file = Gguf::open(&path).unwrap();
+		let table = file.ngram();
+		assert_eq!(table.kernel(), 3);
+		let placed = place_cpu(&file, &model(Some(&table)), 160);
+		let plain_file = Gguf::open(&plain_path).unwrap();
+		let plain = place_cpu(&plain_file, &model(None), 160);
+		let ids = (0..160).map(|index| (index % 2) as u32).collect::<Vec<_>>();
+		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+		let whole = placed.infer(&input);
+		assert!(whole.iter().all(|value| value.is_finite()));
+		assert_ne!(bits(&whole), bits(&plain.infer(&input)), "the per-layer embedding changes the forward");
+		let direct13 = placed.prefill(&ids[..13]);
+		let prefix12 = placed.prefill(&ids[..12]);
+		assert!(prefix12.iter().all(|value| value.is_finite()));
+		assert_ne!(bits(&prefix12), bits(&direct13));
+		assert_eq!(bits(&direct13), bits(&placed.step(ids[12])), "full13 equals prefix12 plus step1");
+		for split in [1, 2, 4, 8, 16, 32, 64, 128] {
+			let mut logits = placed.prefill(&ids[..split]);
+			for id in &ids[split..] {
+				logits = placed.step(*id);
+			}
+			assert_eq!(bits(&logits), bits(&whole), "prefix split {split}");
+		}
+		let _ = std::fs::remove_file(&path);
+		let _ = std::fs::remove_file(&plain_path);
+	}
+}
+
 fn precision_named(name: &str) -> Result<Compute> {
 	Ok(match name {
 		"fp8" => Compute::FP8,
