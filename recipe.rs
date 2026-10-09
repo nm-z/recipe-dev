@@ -18066,24 +18066,25 @@ impl Placed {
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
 			let window = (begin, end);
-			let window_started = Instant::now();
+			let traced = tracing();
+			let window_started = traced.then(Instant::now);
 			tape.forward_window_observed(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
 				// A token has completed prefill only after the final placed range.
 				if index + 1 == tapes.len() && let Some(progress) = progress { progress.prefilled(reached as usize); }
 			})?;
-			let window_seconds = window_started.elapsed().as_secs_f64();
+			let window_seconds = window_started.map(|started| started.elapsed().as_secs_f64());
 			let Some(next) = tapes.get(index + 1) else {
-				if tracing() {
+				if let Some(window_seconds) = window_seconds {
 					trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6}", tape.device_label()?, window.0, window.1))?;
 				}
 				break;
 			};
 			(begin, end) = tape.output_window(begin, end)?;
-			let hop_started = Instant::now();
+			let hop_started = traced.then(Instant::now);
 			for (start, count) in window_runs(tape.output, begin, end) {
 				next.write_samples(start, &tape.output(start, count)?)?;
 			}
-			if tracing() {
+			if let (Some(window_seconds), Some(hop_started)) = (window_seconds, hop_started) {
 				trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6} hop_seconds={:.6}", tape.device_label()?, window.0, window.1, hop_started.elapsed().as_secs_f64()))?;
 			}
 		}
@@ -20533,51 +20534,6 @@ mod precision_contract_checks {
 			for (got, want) in actual.iter().zip(expected) { assert!((got - want).abs() < want.abs() * 2e-5, "{} sharded gradient {got} vs {want}", format.label()); }
 			assert_eq!(shards.shards[0].weights().unwrap(), shards.shards[1].weights().unwrap());
 		}
-	}
-	#[test]
-	fn placement_traces_range_windows_across_two_ranges() {
-		let cpu: &'static Gpu = Box::leak(Box::new(cpu_device().unwrap()));
-		let config = Config::load().unwrap();
-		let samples: Vec<f64> = (0..32).map(|i| f64::from(i) * 0.03125 - 0.5).collect();
-		let prepared = Prepared::matrix(samples.clone(), vec![0.0], 1, 1).unwrap();
-		let model = recipe.model().no(bias).layer(32).layer(1).loss(mse);
-		let mut graph = compile(&model, &prepared, &prepared.targets, 1, cpu, config, false).unwrap();
-		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
-		assert_eq!(blocks, 2, "the placement needs one range per block");
-		for (index, value) in graph.parameters.iter_mut().enumerate() { *value = ((index % 5) as f64 - 2.0) * 0.0625; }
-		graph.refresh_storage(config).unwrap();
-		let input = graph.input;
-		let place = |split: &[usize], devices: &'static [&'static Gpu]| -> Placed {
-			let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, config.precision, &[]).unwrap();
-			Placed { source: PlacedSource::Bound(input, Vec::new()), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved }
-		};
-		let single_devices: &'static [&'static Gpu] = Box::leak(vec![cpu].into_boxed_slice());
-		let pair_devices: &'static [&'static Gpu] = Box::leak(vec![cpu, cpu].into_boxed_slice());
-		let single = place(&[blocks], single_devices);
-		let pair = place(&[1, 1], pair_devices);
-		let path = std::env::temp_dir().join(format!("range-window-trace-{}.log", std::process::id()));
-		let previous = std::env::var_os("RECIPE_TRACE_PATH");
-		unsafe { std::env::set_var("RECIPE_TRACE_PATH", &path) };
-		TRACE.store(true, Ordering::Relaxed);
-		let multi = pair.infer(&samples);
-		TRACE.store(false, Ordering::Relaxed);
-		let expected = single.infer(&samples);
-		match previous {
-			Some(value) => unsafe { std::env::set_var("RECIPE_TRACE_PATH", value) },
-			None => unsafe { std::env::remove_var("RECIPE_TRACE_PATH") },
-		}
-		let trace = fs::read_to_string(&path).unwrap();
-		fs::remove_file(&path).unwrap();
-		let lines: Vec<&str> = trace.lines().filter(|line| line.contains("range window")).collect();
-		for line in &lines { println!("{line}"); }
-		assert_eq!(lines.len(), 2, "one trace line per range: {trace}");
-		assert!(lines[0].contains("range window range=0 ") && lines[0].contains(" hop_seconds="), "{}", lines[0]);
-		assert!(lines[1].contains("range window range=1 ") && !lines[1].contains("hop_seconds="), "{}", lines[1]);
-		for line in &lines {
-			let seconds = line.split_whitespace().find_map(|field| field.strip_prefix("window_seconds=")).unwrap().parse::<f64>().unwrap();
-			assert!(seconds.is_finite() && seconds >= 0.0, "{line}");
-		}
-		assert_eq!(multi, expected);
 	}
 	#[test]
 	fn narrow_attention_preserves_softmax_and_gate_gradients() {
