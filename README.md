@@ -351,7 +351,7 @@ report.*
 		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
 	(load|compile).seconds()
 	path
-	(formats|memory|links|aot|tiles|grids)[]
+	(formats|memory|links|aot|tiles|grids|barriers)[]
 	llvm.(instructions|intrinsics)[]
 train().run().*
 	(itl|fnl).*
