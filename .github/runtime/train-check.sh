@@ -31,8 +31,7 @@ fn main() {
 	let table = std::env::var("RECIPE_TRAIN_TABLE").expect("RECIPE_TRAIN_TABLE names the CSV dataset");
 	let data = recipe.data(gguf).set(table).target("next");
 	let mut model = recipe.model().embed(tokenizer.ggml.tokens, qwen3.embedding_length);
-	// Two blocks keep host weights, gradients and optimizer state inside a 9 GiB session; every block repeats this body.
-	for _ in 0..2 {
+	for _ in 0..qwen3.block_count {
 		model = model
 			.res([
 				norm(rms),
