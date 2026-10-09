@@ -23469,11 +23469,13 @@ struct Cuda {
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
 	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
+	function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32>,
 	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
 	block_lds: u32,
+	optin_lds: u32,
 	sm_lds: u32,
 	registers: u32,
 	threads: u32,
@@ -24622,7 +24624,11 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
+	const MAX_DYNAMIC_SHARED: i32 = 8;
+
+	fn shared_limit(&self) -> u32 { self.block_lds.max(self.optin_lds).min(self.sm_lds) }
+
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 			let mut object = 0;
@@ -24636,17 +24642,38 @@ impl Cuda {
 			require((self.registers / register_wave).min(self.threads / self.wave) != 0, "NVIDIA native symbol has no resident wave")?;
 			let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
 			// The schedule sized every tile and the reduction buffer for its own workgroup, so the dispatch must use that width and not the wider one the register budget would allow.
-			let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, waves, resources)?;
+			let geometry = nvidia(self.cus, self.wave, self.workgroup, self.shared_limit(), self.sm_lds, waves, resources)?;
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+		}
+	}
+
+	/// Set the loaded function's dynamic limit before asking occupancy about the
+	/// exact buffer every launch uses. The device opt-in budget already describes
+	/// available per-block storage; its fixed function storage shares that budget.
+	unsafe fn native_shared(&self, name: &str, dispatch: Dispatch, values: u32) -> Result<()> {
+		unsafe {
+			let object = dispatch.kernel.object as usize;
+			let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+			let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+			require(shared <= self.shared_limit(), format!("NVIDIA native symbol {name} needs {shared} bytes of shared memory, the device limit is {}", self.shared_limit()))?;
+			if shared > self.block_lds {
+				let set = self.function_attribute_set.ok_or_else(|| RecipeError::new("NVIDIA dynamic shared-memory opt-in is unavailable"))?;
+				require(self.optin_lds > self.block_lds, "NVIDIA dynamic shared-memory opt-in is unavailable")?;
+				let requested = i32::try_from(dynamic).map_err(|_| RecipeError::new("NVIDIA dynamic shared memory exceeds i32"))?;
+				driver_status(Backend::Nvidia, set(object, Self::MAX_DYNAMIC_SHARED, requested), "native dynamic shared-memory opt-in")?;
+				let mut maximum = 0;
+				driver_status(Backend::Nvidia, (self.function_attribute)(&mut maximum, Self::MAX_DYNAMIC_SHARED, object), "native dynamic shared-memory limit query")?;
+				require(maximum >= requested, "NVIDIA native dynamic shared-memory limit is below the requested size")?;
+				trace(&format!("NVIDIA shared-memory symbol={name} fixed={} dynamic={dynamic} maximum={maximum}", dispatch.kernel.shared))?;
+			}
 			let mut active = 0;
 			// The grid is one workgroup per SM and the barrier only completes once every one of them
 			// is resident, so the occupancy question has to be asked about the launch this dispatch
 			// really makes. With no dynamic shared memory it answers a question nobody goes on to ask.
-			let values = shared_values.max(geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
-			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
-			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
+			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, dispatch.geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
 			// One workgroup per SM leaves every block room to reach the grid barrier.
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+			Ok(())
 		}
 	}
 
@@ -24658,16 +24685,21 @@ impl Cuda {
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
-			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
+			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves)).transpose()?;
+			let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
+			let values = shared_values.max(block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
 			// The single-position step fills every SM with as many warps as the
 			// kernel allows, as the AMD step does; the forward keeps the schedule
-			// width. Its launch carries the forward's reduction buffer, so its
+			// width. Its launch carries the forward/epoch reduction buffer, so its
 			// residency is asked with that buffer and not one scaled to its own block.
 			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
-			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
-			program.step = has_step.then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
-			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
-			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
+			program.step = has_step.then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves)).transpose()?;
+			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves)).transpose()?;
+			self.native_shared(NATIVE_FORWARD_SYMBOL, forward, values)?;
+			if let Some(dispatch) = epoch { self.native_shared(NATIVE_EPOCH_SYMBOL, dispatch, values)?; }
+			if let Some(dispatch) = program.step { self.native_shared("recipe_model_step", dispatch, values)?; }
+			if let Some(dispatch) = model_load { self.native_shared(NATIVE_MODEL_LOAD_SYMBOL, dispatch, 0)?; }
 			Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -25168,6 +25200,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		const CUS: i32 = 16;
 		const THREADS_PER_SM: i32 = 39;
 		const SM_LDS: i32 = 81;
+		const BLOCK_LDS_OPTIN: i32 = 97;
 		const REGISTERS_PER_SM: i32 = 82;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
@@ -25182,6 +25215,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let unload: unsafe extern "C" fn(Ptr) -> i32 = runtime.function(b"cuModuleUnload\0")?;
 		let function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32 = runtime.function(b"cuModuleGetFunction\0")?;
 		let function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32 = runtime.function(b"cuFuncGetAttribute\0")?;
+		let function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32> = runtime.function(b"cuFuncSetAttribute\0").ok();
 		let occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32 = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
 		let driver_version: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDriverGetVersion\0")?;
 		let check = |s, a| driver_status(Backend::Nvidia, s, a);
@@ -25211,8 +25245,16 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				check(attribute(output, kind, device), action)?;
 			}
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
+			require(block_lds > 0 && sm_lds > 0, "Nvidia shared-memory limits are invalid")?;
 			let architecture = format!("sm_{compute_major}{compute_minor}");
 			validate_nvidia_ptx_driver(&architecture, version.max(0) as u32)?;
+			// Older devices and drivers retain their ordinary limit. Attribute 97
+			// advertises the larger budget only when this runtime can opt into it.
+			let mut optin_lds = 0;
+			if compute_major >= 7 && function_attribute_set.is_some() {
+				let mut reported = 0;
+				if attribute(&mut reported, BLOCK_LDS_OPTIN, device) == 0 && reported > block_lds { optin_lds = reported as u32; }
+			}
 			let native_target = BackendTarget::Nvidia { architecture };
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda {
@@ -25231,22 +25273,25 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				unload,
 				function,
 				function_attribute,
+				function_attribute_set,
 				occupancy,
 				cus: cus as u32,
 				wave: wave as u32,
 				workgroup: workgroup as u32,
 				block_lds: block_lds as u32,
+				optin_lds,
 				sm_lds: sm_lds as u32,
 				registers: registers as u32,
 				threads: threads as u32,
 			};
+			let shared_limit = cuda.shared_limit();
 			Ok(Gpu {
 				name: format!("nv{index}"),
 				backend: Backend::Nvidia,
 				native_target,
 				driver: Driver::Cuda(cuda),
 				memory: memory as u64,
-				shared_limit: (block_lds as u32).min(sm_lds as u32),
+				shared_limit,
 				dispatch: Mutex::new(()),
 			})
 		};
