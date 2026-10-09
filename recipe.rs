@@ -15214,7 +15214,7 @@ impl Gguf {
 	/// resident across every later decode. Standard tensor names bind the model
 	/// through the same checked plan used by `recipe.infer()`.
 	pub fn place(&self, blocks: &Model, positions: usize, split: &[usize]) -> Placed {
-		let model = with_last_projection(blocks);
+		let model = with_last_projection(blocks).for_file(self);
 		let plan = conventional_plan(self, &model).unwrap_or_else(|error| panic!("{error}"));
 		let bound = Bound { file: self.clone(), blocks: model.blocks.len(), tensors: plan.tensors(), vocabulary: 0, model, plan };
 		selected_gpus().and_then(|devices| place_bound(&bound, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
