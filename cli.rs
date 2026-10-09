@@ -146,9 +146,14 @@ fn run(source: &Path, device: Option<&str>, config: Option<&str>, settings: &[(S
 	std::process::exit(code);
 }
 
+#[cfg(unix)]
 fn submit(source: &Path, device: Option<&str>) {
 	let code = recipe::runtime_submit(source, device).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
 	std::process::exit(code);
+}
+#[cfg(not(unix))]
+fn submit(_source: &Path, _device: Option<&str>) {
+	invalid("the runtime scheduler requires Unix")
 }
 
 fn main() {
@@ -171,13 +176,19 @@ fn main() {
 			continue;
 		}
 		if argument == "--runtime" {
+			#[cfg(unix)]
 			recipe::runtime_daemon();
+			#[cfg(not(unix))]
+			invalid("the runtime scheduler requires Unix");
 		}
 		if argument == "--status" {
+			#[cfg(unix)]
 			match recipe::runtime_status() {
 				Ok(text) => { println!("{text}"); return; }
 				Err(error) => invalid(&error.to_string()),
 			}
+			#[cfg(not(unix))]
+			invalid("the runtime scheduler requires Unix");
 		}
 		if argument == "--submit" { submit_seen = true; continue; }
 		if matches!(argument.as_str(), "--ctx" | "-p") {
