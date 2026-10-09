@@ -16,6 +16,7 @@ path = "cli.rs"
 [package.metadata.recipe] # backend trash, and perf tuners
 dependency-allowlist = []
 multi-device = "auto"
+device-split = "auto"
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
 contraction-register-n = 8
@@ -30,8 +31,24 @@ contraction-resident-waves-per-workgroup = 2
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 delta-chunk = 8
+# window positions whose carried state a decode keeps, so it takes back rejected drafts without running again
+draft-positions = 4
 topology-probe-bytes = 4194304
+# weight bytes a position must read of a split region to pay for its exchange
+tensor-split-region-bytes = 8388608
+# scattered lookup-table rows a window reads at once
+lookup-readers = 16
 placement-launch-reserve-bytes = 134217728
+nvidia-step-registers = 128
+# The lane tuner: while a model decodes, each packed sum's team width is chosen
+# from its own recent node clocks, a softmax over each candidate's mean.
+lane-tuning = 1
+lane-tuning-window = 16
+lane-tuning-temperature = 0.03
+# relocatable ptxas held ~60 bytes of RAM per byte of Flash Next IR (2026-09-26)
+compile-memory-per-ir-byte = 100
+# archy nv0 has bad VRAM from ~5.9 GB up
+device-usable-bytes = { "archy:nv0" = 6186598400 }
 cpu-worker-threads = 0
 null-device = { linux = "/dev/null", macos = "/dev/null", windows = "NUL" }
 cpu-compiler = { linux = "/usr/bin/clang", macos = "/usr/bin/clang", windows = "$ProgramFiles/LLVM/bin/clang.exe" }
@@ -55,7 +72,7 @@ nvidia-codegen = { linux = "/usr/bin/llc", windows = "$ProgramFiles/LLVM/bin/llc
 nvidia-runtime = { linux = "libcuda.so.1", windows = "nvcuda.dll" }
 nvidia-toolkit = { linux = "/opt/cuda", windows = "$CUDA_PATH" }
 nvidia-device-library = "nvvm/libdevice/libdevice.10.bc"
-nvidia-assembler = "bin/ptxas"
+nvidia-assembler = "bin/ptxas;/opt/cuda-11.4/bin/ptxas"
 
 [package.metadata.train] # a bunch of constants in one place for refs
 epochs = 210
@@ -144,6 +161,26 @@ exact-cpu = false
 tolerance = 0.05
 step = 32
 
+[precision.check64]
+sum = "fp64"
+embed = "fp16"
+attn = "fp16"
+rope = "fp16"
+kv = "fp16"
+atvn = "fp64"
+norm = "fp64"
+res = "fp64"
+acc = "fp64"
+train = "fp64"
+fp8 = "e4m3"
+rope-angle = "direct"
+attn-softmax = "full"
+math = "portable"
+gelu-table = "none"
+exact-cpu = false
+tolerance = 0.001
+step = 32
+
 [precision.llamacpp]
 fp8 = "e4m3"
 train = "fp32"
@@ -164,3 +201,303 @@ rope-angle = "chain"
 attn-softmax = "online"
 math = "libm"
 step = 256
+
+[precision.stored]
+fp8 = "e4m3"
+train = "fp32"
+tolerance = 0.05
+exact-cpu = true
+sum = "fp32"
+embed = "fp32"
+attn = "fp32"
+rope = "fp32"
+kv = "fp16"
+atvn = "fp32"
+norm = "fp32"
+res = "fp32"
+acc = "fp32"
+gelu-table = "fp16"
+norm-acc = "fp64"
+rope-angle = "chain"
+attn-softmax = "full"
+math = "libm"
+step = 256
+
+[architecture.llama]
+attention-gate = "none"
+qk-norm = "none"
+rope-factors = "optional"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "optional"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "neighbours"
+feed-forward-activation = "silu"
+
+[architecture.phi3]
+attention-gate = "-"
+qk-norm = "-"
+rope-factors = "-"
+attention-bias = "-"
+values-from-keys = "-"
+attn-pre-norm = "-"
+attn-post-norm = "-"
+ffn-pre-norm = "-"
+ffn-post-norm = "-"
+output = "untied"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
+[architecture.gemma3]
+attention-gate = "none"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "true"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "true"
+output = "tied"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.gemma4]
+attention-gate = "none"
+qk-norm = "rms"
+rope-factors = "tensor"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "true"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "true"
+output = "tied"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.lfm2]
+attention-gate = "none"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "tied"
+output-norm = "token_embd_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
+[architecture.qwen2]
+attention-gate = "none"
+qk-norm = "none"
+rope-factors = "none"
+attention-bias = "qkv"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "optional"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
+[architecture.qwen3]
+attention-gate = "none"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "optional"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.qwen2moe]
+attention-gate = "none"
+qk-norm = "none"
+rope-factors = "none"
+attention-bias = "qkv"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "untied"
+output-norm = "output_norm"
+selection-bias = "false"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+expert-shared = "gated"
+expert-shared-gate = "sigmoid"
+
+[architecture.qwen3moe]
+attention-gate = "none"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "false"
+ffn-pre-norm = "ffn_norm"
+ffn-post-norm = "false"
+output = "untied"
+output-norm = "output_norm"
+selection-bias = "false"
+decay-bias = "-"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+expert-shared = "none"
+
+[architecture.qwen35]
+attention-gate = "interleaved"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "true"
+ffn-pre-norm = "post_attention_norm"
+ffn-post-norm = "false"
+output = "optional"
+output-norm = "output_norm"
+selection-bias = "-"
+decay-bias = "true"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+delta-convolution = "silu"
+delta-output = "silu"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+
+[architecture.qwen3next]
+attention-gate = "interleaved"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "true"
+attn-post-norm = "true"
+ffn-pre-norm = "post_attention_norm"
+ffn-post-norm = "false"
+output = "optional"
+output-norm = "output_norm"
+selection-bias = "false"
+decay-bias = "true"
+indexer-score-norm = "-"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+delta-convolution = "silu"
+delta-output = "silu"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+
+[architecture.qwen4exp]
+attention-gate = "interleaved"
+qk-norm = "rms"
+rope-factors = "none"
+attention-bias = "none"
+values-from-keys = "false"
+attn-pre-norm = "false"
+attn-post-norm = "false"
+ffn-pre-norm = "none"
+ffn-post-norm = "false"
+output = "untied"
+output-norm = "none"
+selection-bias = "false"
+decay-bias = "true"
+indexer-score-norm = "rms"
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+expert-shared = "gated"
+expert-shared-gate = "sigmoid"
+delta-convolution = "silu"
+delta-output = "sigmoid"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"

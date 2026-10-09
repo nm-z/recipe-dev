@@ -65,4 +65,11 @@ fn main() {
 		}
 		println!("total {:.12} tokens {} perplexity {:.6}", score.logprob, score.tokens.len(), score.perplexity);
 	}
+	for timing in &report.timings {
+		let predicted = timing.predicted_seconds.map_or_else(|| "n/a".to_owned(), |seconds| format!("{seconds:.6} s"));
+		println!("node {} {} {} block {} operations {:.3e} bytes {:.3e} predicted {predicted} measured {:.6} s forwards {}", timing.node, timing.kind, timing.op, timing.block, timing.operations, timing.bytes, timing.measured_seconds, timing.forwards);
+	}
+	for gap in report.gaps(2.0) {
+		println!("gap node {} kind {} op {} predicted {:.6} s measured {:.6} s ratio {:.2}", gap.node, gap.kind, gap.op, gap.predicted_seconds, gap.measured_seconds, gap.ratio);
+	}
 }

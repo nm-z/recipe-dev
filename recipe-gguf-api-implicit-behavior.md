@@ -49,27 +49,17 @@ Items 1, 3, 4, 5, 6, 7, 8, 11, 14 and 15 share one cause: the builder reads the 
 
 ## Items
 
-1. **Attention gate: Inferred from query width, and hidden inside `.gate()`.** The builder treats a query tensor with `2 × heads × head` outputs as gated. The gate rows are interleaved per head (`[q₀, g₀, q₁, g₁, …]`, stride `2 × head`), split out, passed through a sigmoid, and multiplied into the attention result before the output projection. `.gate()` names none of this. [Loader](/home/nate/Desktop/recipe-dev/recipe.rs:15022), [lowering](/home/nate/Desktop/recipe-dev/recipe.rs:18248), [kernel](/home/nate/Desktop/recipe-dev/amd-nv-cpu.ll:5532).
+1. **Attention gate: The query tensor interleaves query and gate rows.** A query tensor with `2 × heads × head` outputs holds `[q₀, g₀, q₁, g₁, …]`, with stride `2 × head`. The binder gives the query rows to `attn_heads` and the gate rows to a bias-free sigmoid layer. Their product precedes the output projection.
 
 	```rust
-	let block = attn(heads).gate();
+	let attention = recipe.model().attn_heads(heads).head(head);
+	let gate = recipe.model().no(bias).layer(heads * head).sigmoid();
+	let model = recipe.model().block(attention * gate).layer(width);
 	```
 
-	A contiguous `split(2)` of `attn_q` would be wrong for this file: it would return heads 0–11's queries and gates mixed together. The gate is either declared on the query, so the binder reads the per-head layout and checks the width:
+	A contiguous `split(2)` of `attn_q` would be wrong for this file: it would return heads 0–11's queries and gates mixed together. The binder must read the per-head rows and check the width.
 
-	```rust
-	attn(qwen4exp.attention.head.count)
-		.q(blk.a.attn.q.weight).gate(sigmoid)
-	```
-
-	or, where a file stores the gate as its own tensor, written as the product it is (rule 9):
-
-	```rust
-	(attn(heads)… * layer(blk.a.attn.gate.weight).sigmoid())
-		.layer(blk.a.attn.output.weight)
-	```
-
-	Exists today: `.gate()` with sigmoid fixed. Proposed: `.gate(sigmoid|silu|tanh)` (README Proposed), `.q(tensor)`, `layer(tensor)`.
+	A separately named gate tensor needs its own binding convention. This binder currently covers the interleaved query-and-gate layout.
 
 2. **Key paths: Hard-coded.** A script reads only the architecture keys Recipe hard-codes, such as `gemma3.embedding_length`. Any other key has to be found with `recipe keys` and copied into the script as a literal. [Namespaces](/home/nate/Desktop/recipe-dev/recipe.rs:15409).
 
@@ -149,10 +139,10 @@ Items 1, 3, 4, 5, 6, 7, 8, 11, 14 and 15 share one cause: the builder reads the 
 	```
 
 	```rust
-	attn(qwen4exp.attention.head.count)
+	let attention = attn_heads(qwen4exp.attention.head.count)
 		.kv(qwen4exp.attention.head.count.kv)
 		.head(qwen4exp.attention.key.length)
-		.q(blk.a.attn.q.weight).gate(sigmoid)
+		.q(blk.a.attn.q.weight)
 		.k(blk.a.attn.k.weight)
 		.v(blk.a.attn.v.weight)
 		.qk(rms, blk.a.attn.q.norm.weight, blk.a.attn.k.norm.weight)
@@ -160,8 +150,9 @@ Items 1, 3, 4, 5, 6, 7, 8, 11, 14 and 15 share one cause: the builder reads the 
 		.index(qwen4exp.attention.indexer.head.count, qwen4exp.attention.indexer.key.length,
 			qwen4exp.attention.compress.ratios.a, qwen4exp.attention.indexer.top.k)
 			.q(blk.a.indexer.q.proj.weight).k(blk.a.indexer.k.proj.weight)
-			.score(rms, qwen4exp.rope.dimension.count)
-		.out(blk.a.attn.output.weight)
+			.score(rms, qwen4exp.rope.dimension.count);
+	(attention * layer(blk.a.attn.gate.weight).sigmoid())
+		.layer(blk.a.attn.output.weight)
 	```
 
 	- `.kv(n)` is the key/value head count: 24 query heads share 2 K/V heads, 12 per group. `.head(n)` is each head's width.
