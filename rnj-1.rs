@@ -50,7 +50,21 @@ fn main() {
 		.tanh().fp(16)
 		.scale(gemma3.final_logit_softcapping).fp(16);
 
-	let report = recipe.infer().chat([time, pp, tg, input, out, cached]).run(&model, &data);
+	let infer = recipe.infer();
+	let report = if std::env::var_os("RECIPE_SCORE").is_some() {
+		infer.score().run(&model, &data)
+	} else {
+		infer.chat([time, pp, tg, input, out, cached]).run(&model, &data)
+	};
+	if let Some(score) = &report.score {
+		for token in &score.tokens {
+			println!("token {} {:?} {:.12} {}", token.id, token.piece, token.logprob, token.rank);
+		}
+		for word in &score.words {
+			println!("word {:?} {} {:.12}", word.text, word.tokens, word.logprob);
+		}
+		println!("total {:.12} tokens {} perplexity {:.6}", score.logprob, score.tokens.len(), score.perplexity);
+	}
 	for timing in &report.timings {
 		let predicted = timing.predicted_seconds.map_or_else(|| "n/a".to_owned(), |seconds| format!("{seconds:.6} s"));
 		println!("node {} {} {} block {} operations {:.3e} bytes {:.3e} predicted {predicted} measured {:.6} s forwards {}", timing.node, timing.kind, timing.op, timing.block, timing.operations, timing.bytes, timing.measured_seconds, timing.forwards);
