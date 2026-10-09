@@ -253,6 +253,55 @@ place(path, &[blocks])
 	.memory()[]
 ```
 
+## GGUF tensors
+
+A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, a mixture-of-experts block its router, expert banks, selection bias and shared expert, a hyper-connection block its gate projections and head mixer, a per-layer embedding block its projections, scales and taps, and a normalization its scale.
+
+```rust
+let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
+	.delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Silu).delta_gates(Activation::Softplus, Activation::Sigmoid)
+	.delta_from(DeltaTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.0.attn_norm.weight"), Block::from(delta).norm(rms).scale_from("blk.0.post_attention_norm.weight")]);
+```
+
+```rust
+DeltaTensors { alpha, beta, decay_bias, decay, qkv, conv, norm, gate, out }
+DeltaTensors::block(layer)
+binding.listing()
+```
+
+```rust
+let attention = recipe.model().attn_heads(heads).kv(kv).head(width).qk(rms).rope(neox, dims, base)
+	.attention_from(AttentionTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.3.attn_norm.weight"), Block::from(attention * gate), layer(width)]);
+```
+
+```rust
+AttentionTensors { q, k, v, q_bias, k_bias, v_bias, q_norm, k_norm, factors, out, indexer }
+IndexerTensors { q_proj, k_proj, q_norm, k_norm }
+```
+
+```rust
+let experts = recipe.model().gguf_moe(count, used, hidden, Activation::Silu, Scoring::Softmax, true, shared, 1.0, false)
+	.moe_from(MoeTensors::block(layer));
+```
+
+```rust
+MoeTensors { router, selection_bias, gate, up, down, shared }
+SharedTensors { gate_input, gate, up, down }
+```
+
+```rust
+model = model.hyper_gate(lanes, &branch, gate).hyper_from(HyperTensors::mixer(layer, "attn"));
+model = model.hyper_head_from(HyperTensors::head()).layer(vocabulary);
+model = model.ple(&table).ple_math(math).ple_from(PleTensors::block(layer));
+```
+
+```rust
+HyperTensors { norm, down, up, inject }
+PleTensors { key, norm_key, norm_query, value, norm_conv, conv }
+```
+
 ## Terminal chat and remote execution
 
 ```bash
@@ -264,9 +313,12 @@ recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 ```bash
 recipe stats model.gguf
 recipe keys model.gguf
+recipe conventions model.gguf
 ```
 
 GGUF tensor pairing, feed-forward and expert activations, expert routing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Models with feed-forward or expert blocks name `feed-forward-activation` or `expert-activation`. An expert model also names `expert-scoring` (`softmax` or `sigmoid`) and `expert-renormalize`; declared GGUF metadata overrides those two manifest choices. Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
+
+A row also declares the tensor conventions of its blocks: `attention-gate`, `qk-norm`, `rope-factors`, `attention-bias`, `values-from-keys`, `attn-pre-norm`, `attn-post-norm`, `ffn-pre-norm`, `ffn-post-norm`, `output`, `output-norm`, `selection-bias`, `decay-bias` and `indexer-score-norm`. `-` means the architecture has no such block, and `optional` (for `rope-factors` and `output`) means files of the architecture differ, as llama.cpp's optional tensors do. `recipe conventions model.gguf` prints each declaration beside what the file's tensors say, and exits 1 when any differ.
 
 ## Dataset schema
 

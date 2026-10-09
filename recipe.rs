@@ -2357,7 +2357,7 @@ impl NativeLayout {
 	/// regions only the reverse pass fills. Values, conversions, and workspace
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
-	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool, timed: bool) -> Result<Self> {
 		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
@@ -2469,7 +2469,7 @@ impl NativeLayout {
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
 		// The lane tuner reads the node clocks too.
 		let tuned = inference && lane_tuning();
-		let clocks = if tracing() || tuned {
+		let clocks = if tracing() || tuned || (inference && timed) {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
 		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
@@ -2752,7 +2752,7 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool, timed: bool) -> Result<Self> {
 		// Integer inference stages activation codes; training uses the declared
 		// float arithmetic and keeps packed storage for checkpoint output only.
 		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
@@ -2771,7 +2771,7 @@ impl NativeModelIr {
 			require(needed <= tile_bytes, format!("{} computes in int{} over {} inputs, whose activation codes take {needed} bytes of the {tile_bytes}-byte tile; increase contraction-cpu-shared-values", node.identity(index), node.int_bits, node.input.channels))?;
 		}
 		require(rows != 0, "native model rows must be positive")?;
-		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
+		let layout = NativeLayout::for_graph(graph, rows, precision, inference, timed)?;
 		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
@@ -5125,7 +5125,7 @@ impl NativeModelIr {
 					if fast_attention {
 						let prefix = format!("n{index}.attention.step");
 						let kv_heads = integer_argument(node.argument[1], "attention key-value heads")?;
-						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
+						let fast_call = format!("call void @attention_forward_step_body{v}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {attention_kv}, i32 {from}, i32 {heads}, i32 {channels}, i32 {begin}, i32 {kv_heads}, i32 %threads, i32 {buffer_length}, i32 {buffer_origin}, i32 0, i32 0 )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, attention_kv = attention_kv, from = from, heads = heads, channels = channels, begin = begin, kv_heads = kv_heads);
 						ir.push_str(&format!("br i1 %{prefix}.one, label %{prefix}.fast, label %{prefix}.generic\n{prefix}.fast:\n{fast_call}br label %{prefix}.done\n{prefix}.generic:\n{normal_call}br label %{prefix}.done\n{prefix}.done:\n"));
 					} else {
 						ir.push_str(&normal_call);
@@ -9569,7 +9569,7 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 	let compile_started = Instant::now();
 	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none(), target.backend() == Backend::Cpu)?;
 	if tracing() {
 		model.trace_precision_nodes(device)?;
 	}
@@ -12560,7 +12560,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -14069,6 +14069,20 @@ pub struct Block {
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
 
+	/// Tensors a script names for the planes of the block's non-L2 normalizations, in order.
+	scale_tensors: Vec<String>,
+	/// Tensors a script names for the planes of a delta block.
+	delta_tensors: Option<DeltaTensors>,
+	/// Tensors a script names for the planes of an attention block.
+	attention_tensors: Option<AttentionTensors>,
+	/// Tensors a script names for the planes of a mixture-of-experts block.
+	moe_tensors: Option<MoeTensors>,
+	/// Tensors a script names for the gate planes of a hyper-connection block, and for the head
+	/// mixer that collapses its lanes.
+	hyper_tensors: Option<HyperTensors>,
+	hyper_head: Option<HyperTensors>,
+	/// Tensors a script names for the planes of a per-layer embedding block.
+	ple_tensors: Option<PleTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14142,12 +14156,50 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, attention_tensors: None, moe_tensors: None, hyper_tensors: None, hyper_head: None, ple_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Map;
 		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+		self
+	}
+	/// Names the GGUF tensors this attention block reads, and marks its rotary factors when a tensor holds them.
+	pub fn attention_from(mut self, tensors: AttentionTensors) -> Self {
+		let Operation::Attention(attention) = &mut self.operation else { panic!("attention_from requires an attention block") };
+		attention.factors |= tensors.factors.is_some();
+		self.attention_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of this hyper-connection block's gates.
+	pub fn hyper_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_from requires a hyper-connection block");
+		self.hyper_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors of the head mixer that collapses this hyper-connection block's lanes.
+	pub fn hyper_head_from(mut self, tensors: HyperTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Hyper(..)), "hyper_head_from requires a hyper-connection block");
+		self.hyper_head = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this per-layer embedding block reads.
+	pub fn ple_from(mut self, tensors: PleTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Ple(..)), "ple_from requires a per-layer embedding block");
+		self.ple_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensors this mixture-of-experts block reads.
+	pub fn moe_from(mut self, tensors: MoeTensors) -> Self {
+		assert!(matches!(self.operation, Operation::Moe(..)), "moe_from requires a gguf_moe block");
+		self.moe_tensors = Some(tensors);
+		self
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
+	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
+		let normalizations = self.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).count();
+		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
+		self.scale_tensors.push(name.into());
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -14259,6 +14311,169 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors of a hyper-connection mixer, spelled by the script: the scale of the gate
+/// normalization, the read gate's down and up projections and the write gate's `inject`
+/// projection. The head mixer that collapses the lanes has no write gate, so its `inject` is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyperTensors {
+	pub norm: String,
+	pub down: String,
+	pub up: String,
+	pub inject: Option<String>,
+}
+impl HyperTensors {
+	/// The mixer of block `layer`'s `part` (`"attn"` or `"ffn"`) under the names GGUF files give it.
+	pub fn mixer(layer: usize, part: &str) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		Self { norm: name("norm"), down: name("down"), up: name("up"), inject: Some(name("inject")) }
+	}
+	/// The head mixer under the names GGUF files give it.
+	pub fn head() -> Self {
+		Self { norm: "output_hc_norm.weight".to_owned(), down: "output_hc_down.weight".to_owned(), up: "output_hc_up.weight".to_owned(), inject: None }
+	}
+}
+/// The GGUF tensors a per-layer embedding block reads besides its n-gram table, which the file's
+/// metadata names: the key and value projections, the three scales and the convolution taps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PleTensors {
+	pub key: String,
+	pub norm_key: String,
+	pub norm_query: String,
+	pub value: String,
+	pub norm_conv: String,
+	pub conv: String,
+}
+impl PleTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { key: name("ple_key.weight"), norm_key: name("ple_norm_key.weight"), norm_query: name("ple_norm_query.weight"), value: name("ple_value.weight"), norm_conv: name("ple_norm_conv.weight"), conv: name("ple_conv1d.weight") }
+	}
+}
+/// The GGUF tensors a mixture-of-experts block reads, spelled by the script: the router, the
+/// expert banks, the selection bias when the block selects with one, and the shared expert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoeTensors {
+	pub router: String,
+	pub selection_bias: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+	pub shared: Option<SharedTensors>,
+}
+impl MoeTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			router: name("ffn_gate_inp.weight"),
+			selection_bias: Some(name("exp_probs_b.bias")),
+			gate: name("ffn_gate_exps.weight"),
+			up: name("ffn_up_exps.weight"),
+			down: name("ffn_down_exps.weight"),
+			shared: Some(SharedTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors of a shared expert: its projections and, when the shared path is gated, the
+/// per-position gate vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedTensors {
+	pub gate_input: Option<String>,
+	pub gate: String,
+	pub up: String,
+	pub down: String,
+}
+impl SharedTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self { gate_input: Some(name("ffn_gate_inp_shexp.weight")), gate: name("ffn_gate_shexp.weight"), up: name("ffn_up_shexp.weight"), down: name("ffn_down_shexp.weight") }
+	}
+}
+/// The GGUF tensors an attention block reads, spelled by the script. `q` holds the query rows,
+/// interleaved with the gate rows when the block is gated; a missing `v` reads `k` as the values;
+/// the biases, the query and key scales and the rotary factors are present only when named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionTensors {
+	pub q: String,
+	pub k: String,
+	pub v: Option<String>,
+	pub q_bias: Option<String>,
+	pub k_bias: Option<String>,
+	pub v_bias: Option<String>,
+	pub q_norm: Option<String>,
+	pub k_norm: Option<String>,
+	pub factors: Option<String>,
+	pub out: String,
+	pub indexer: Option<IndexerTensors>,
+}
+impl AttentionTensors {
+	/// The tensors of block `layer` under the names GGUF files give them, each optional one named
+	/// and bound only when the file holds it.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			q: name("attn_q.weight"),
+			k: name("attn_k.weight"),
+			v: Some(name("attn_v.weight")),
+			q_bias: Some(name("attn_q.bias")),
+			k_bias: Some(name("attn_k.bias")),
+			v_bias: Some(name("attn_v.bias")),
+			q_norm: Some(name("attn_q_norm.weight")),
+			k_norm: Some(name("attn_k_norm.weight")),
+			factors: Some("rope_freqs.weight".to_owned()),
+			out: name("attn_output.weight"),
+			indexer: Some(IndexerTensors::block(layer)),
+		}
+	}
+}
+/// The GGUF tensors the token indexer of an attention block reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexerTensors {
+	pub q_proj: String,
+	pub k_proj: String,
+	pub q_norm: String,
+	pub k_norm: String,
+}
+impl IndexerTensors {
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+		Self { q_proj: name("q_proj.weight"), k_proj: name("k_proj.weight"), q_norm: name("q_norm.weight"), k_norm: name("k_norm.weight") }
+	}
+}
+/// The GGUF tensors a delta block reads, spelled by the script: the gate projection halves
+/// (`alpha` for the decay, `beta` for the write), the optional decay bias, the stored decay
+/// `-exp(A)`, the query-key-value projection, the convolution taps, the output scale, the
+/// output gate and the output projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaTensors {
+	pub alpha: String,
+	pub beta: String,
+	pub decay_bias: Option<String>,
+	pub decay: String,
+	pub qkv: String,
+	pub conv: String,
+	pub norm: String,
+	pub gate: String,
+	pub out: String,
+}
+impl DeltaTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			alpha: name("ssm_alpha.weight"),
+			beta: name("ssm_beta.weight"),
+			decay_bias: Some(name("ssm_dt.bias")),
+			decay: name("ssm_a"),
+			qkv: name("attn_qkv.weight"),
+			conv: name("ssm_conv1d.weight"),
+			norm: name("ssm_norm.weight"),
+			gate: name("attn_gate.weight"),
+			out: name("ssm_out.weight"),
+		}
+	}
+}
 #[derive(Clone)]
 pub struct HyperGate {
 	pub read: Model,
@@ -14393,6 +14608,13 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
+				scale_tensors: Vec::new(),
+				delta_tensors: None,
+				attention_tensors: None,
+				moe_tensors: None,
+				hyper_tensors: None,
+				hyper_head: None,
+				ple_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14482,6 +14704,58 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.pop().unwrap();
 			model.blocks.push(apply(block));
+		})
+	}
+	/// Names the GGUF tensors the preceding delta block reads, in place of the names the file's
+	/// block index would give them.
+	pub fn delta_from(&self, tensors: DeltaTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
+			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
+			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the preceding hyper-connection block's gates.
+	pub fn hyper_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors of the head mixer that collapses the preceding hyper-connection block's lanes.
+	pub fn hyper_head_from(&self, tensors: HyperTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("hyper_head_from requires a preceding hyper-connection block"));
+			*block = block.clone().hyper_head_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding per-layer embedding block reads.
+	pub fn ple_from(&self, tensors: PleTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("ple_from requires a preceding per-layer embedding block"));
+			*block = block.clone().ple_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding gguf_moe block reads.
+	pub fn moe_from(&self, tensors: MoeTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("moe_from requires a preceding gguf_moe block"));
+			*block = block.clone().moe_from(tensors);
+		})
+	}
+	/// Names the GGUF tensors the preceding attention block reads.
+	pub fn attention_from(&self, tensors: AttentionTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("attention_from requires a preceding attention block"));
+			*block = block.clone().attention_from(tensors);
+		})
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of the preceding block.
+	pub fn scale_from(&self, name: impl Into<String>) -> Self {
+		let name = name.into();
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("scale_from requires a preceding normalization"));
+			*block = block.clone().scale_from(name);
 		})
 	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
@@ -16899,6 +17173,10 @@ impl Gguf {
 #[derive(Clone, Default)]
 pub struct Binding {
 	tensors: BTreeSet<String>,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`.
+	defaulted: Vec<String>,
+	/// Tensors of the file that no node reads.
+	unread: Vec<String>,
 	pub(crate) nodes: Vec<Vec<Plane>>,
 	/// Rotary factor groups with a long tensor: the group index, the long tensor, and the original context its graph must exceed.
 	rope_long: Vec<(usize, GgufTensor, usize)>,
@@ -16910,6 +17188,11 @@ pub struct Binding {
 pub(crate) enum Plane {
 	Mapped(GgufTensor),
 	Owned { name: String, values: Vec<f64> },
+}
+impl From<GgufTensor> for Plane {
+	fn from(tensor: GgufTensor) -> Self {
+		Self::Mapped(tensor)
+	}
 }
 impl Plane {
 	fn elements(&self) -> usize {
@@ -16943,6 +17226,17 @@ impl Binding {
 			if positions > *original { plan.nodes[*group] = vec![Plane::Mapped(long.clone())]; }
 		}
 		plan
+	}
+	/// Tensors bound as zeros or ones, as `zeros: name (why)`.
+	pub fn defaulted(&self) -> &[String] { &self.defaulted }
+	/// Tensors of the file that no node reads.
+	pub fn unread(&self) -> &[String] { &self.unread }
+	fn mark_unread(&mut self, file: &Gguf) {
+		self.unread = file.tensors().iter().filter(|tensor| !self.tensors.contains(&tensor.name)).map(|tensor| tensor.name.clone()).collect();
+	}
+	/// The plan as text, one line per node naming each plane and its element count.
+	pub fn listing(&self) -> Vec<String> {
+		self.nodes.iter().enumerate().map(|(index, planes)| format!("node {index}: {}", planes.iter().map(|plane| format!("{}[{}]", plane.name(), plane.elements())).collect::<Vec<_>>().join(" "))).collect()
 	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
@@ -17100,6 +17394,8 @@ struct Architecture {
 	expert_scale: Option<f64>,
 	expert_shared: Option<SharedChoice>,
 	expert_shared_gate: Option<Activation>,
+	/// The tensor conventions the row declares, by key of `CONVENTIONS`.
+	conventions: BTreeMap<String, String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedChoice { None, Ungated, Gated }
@@ -17129,6 +17425,7 @@ struct ArchitectureDraft {
 	expert_scale: Option<f64>,
 	expert_shared: Option<SharedChoice>,
 	expert_shared_gate: Option<Activation>,
+	conventions: BTreeMap<String, String>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -17153,7 +17450,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate, conventions: self.conventions })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -17178,6 +17475,95 @@ fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
 		"batch" => Ok(BlockNormalization::Batch),
 		_ => Err(RecipeError::new(format!("architecture normalization {value:?} is not supported"))),
 	}
+}
+/// The tensor conventions an architecture row declares and a file's tensors can be read for, each
+/// with the values it takes. `-` means the architecture has no such block. A row states them so a
+/// definition builds from the row, not from which tensors a file happens to hold.
+const CONVENTIONS: [(&str, &[&str]); 14] = [
+	("attention-gate", &["-", "none", "interleaved"]),
+	("qk-norm", &["-", "none", "rms"]),
+	("rope-factors", &["-", "none", "tensor", "optional"]),
+	("attention-bias", &["-", "none", "qkv"]),
+	("values-from-keys", &["-", "false", "true"]),
+	("attn-pre-norm", &["-", "false", "true"]),
+	("attn-post-norm", &["-", "false", "true"]),
+	("ffn-pre-norm", &["-", "none", "ffn_norm", "post_attention_norm"]),
+	("ffn-post-norm", &["-", "false", "true"]),
+	("output", &["tied", "untied", "optional"]),
+	("output-norm", &["none", "output_norm", "token_embd_norm"]),
+	("selection-bias", &["-", "false", "true"]),
+	("decay-bias", &["-", "false", "true"]),
+	("indexer-score-norm", &["-", "none", "rms"]),
+];
+/// What a file's tensors say each convention is, by the rules `Gguf::model` guesses with. A
+/// convention that differs between layers reads `mixed(a, b)`.
+fn guessed_conventions(file: &Gguf) -> Result<BTreeMap<&'static str, String>> {
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let key = |suffix: &str| format!("{architecture}.{suffix}");
+	let layers = file.integer_at(&key("block_count"))?;
+	let width = file.integer_at(&key("embedding_length"))?;
+	let heads = file.integer_at(&key("attention.head_count")).unwrap_or(1).max(1);
+	let head = if file.value(&key("attention.key_length")).is_some() { file.integer_at(&key("attention.key_length"))? } else { width / heads };
+	let has = |name: &str| file.tensor(name).is_some();
+	let mut seen: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+	let mut note = |name: &'static str, value: String| { seen.entry(name).or_default().insert(value); };
+	let flag = |value: bool| if value { "true" } else { "false" }.to_owned();
+	for layer in 0..layers {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let (attention, delta) = (has(&name("attn_q.weight")), has(&name("ssm_a")));
+		if attention {
+			let gated = file.tensor(&name("attn_q.weight")).and_then(|query| query.shape.get(1)).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+			note("attention-gate", if gated { "interleaved" } else { "none" }.to_owned());
+			note("qk-norm", if has(&name("attn_q_norm.weight")) { "rms" } else { "none" }.to_owned());
+			note("rope-factors", if has("rope_freqs.weight") { "tensor" } else { "none" }.to_owned());
+			note("attention-bias", if has(&name("attn_q.bias")) || has(&name("attn_k.bias")) || has(&name("attn_v.bias")) { "qkv" } else { "none" }.to_owned());
+			note("values-from-keys", flag(!has(&name("attn_v.weight"))));
+			if has(&name("indexer.q_proj.weight")) {
+				note("indexer-score-norm", if has(&name("indexer.q_norm.weight")) || has(&name("indexer.k_norm.weight")) { "rms" } else { "none" }.to_owned());
+			}
+		}
+		if delta {
+			note("decay-bias", flag(has(&name("ssm_dt.bias"))));
+		}
+		if attention || delta {
+			note("attn-pre-norm", flag(has(&name("attn_norm.weight"))));
+			note("attn-post-norm", flag(has(&name("post_attention_norm.weight"))));
+		}
+		if has(&name("ffn_gate.weight")) || has(&name("ffn_gate_inp.weight")) || has(&name("ffn_gate_exps.weight")) {
+			note("ffn-pre-norm", if has(&name("ffn_norm.weight")) { "ffn_norm" } else if has(&name("post_attention_norm.weight")) { "post_attention_norm" } else { "none" }.to_owned());
+			note("ffn-post-norm", flag(has(&name("post_ffw_norm.weight"))));
+		}
+		if has(&name("ffn_gate_inp.weight")) {
+			note("selection-bias", flag(has(&name("exp_probs_b.bias"))));
+		}
+	}
+	note("output", if has("output.weight") { "untied" } else { "tied" }.to_owned());
+	note("output-norm", if has("output_norm.weight") { "output_norm" } else if has("token_embd_norm.weight") { "token_embd_norm" } else { "none" }.to_owned());
+	Ok(CONVENTIONS.iter().map(|(name, _)| {
+		let value = match seen.get(name) {
+			None => "-".to_owned(),
+			Some(values) if values.len() == 1 => values.iter().next().unwrap().clone(),
+			Some(values) => format!("mixed({})", values.iter().cloned().collect::<Vec<_>>().join(", ")),
+		};
+		(*name, value)
+	}).collect())
+}
+/// Compares the conventions a file's architecture row declares with what the file's tensors say,
+/// one line per convention, and counts the disagreements. Reads only the header.
+pub fn conventions(path: impl AsRef<Path>) -> Result<(String, usize)> {
+	let file = Gguf::open(&resolve_path(path)?)?;
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let row = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?;
+	let guessed = guessed_conventions(&file)?;
+	let (mut text, mut mismatches) = (format!("architecture {architecture}\n"), 0);
+	for (name, _) in CONVENTIONS {
+		let declared = row.conventions.get(name).map_or("(undeclared)", String::as_str);
+		let found = guessed[name].as_str();
+		let agree = declared == found || declared == "optional" && matches!(found, "none" | "tensor" | "tied" | "untied");
+		mismatches += usize::from(!agree);
+		text.push_str(&format!("{} {name}: declared {declared}, file {found}\n", if agree { "ok      " } else { "MISMATCH" }));
+	}
+	Ok((text, mismatches))
 }
 fn architectures() -> Result<Vec<Architecture>> {
 	let (mut rows, mut current) = (Vec::new(), None::<ArchitectureDraft>);
@@ -17218,6 +17604,11 @@ fn architectures() -> Result<Vec<Architecture>> {
 				current.ple_floor = Some(floor.to_bits());
 			},
 			"ple-width-scaled" => current.ple_width_scaled = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding width scaling {value:?}", current.name))) }),
+			key if CONVENTIONS.iter().any(|(name, _)| *name == key) => {
+				let (name, values) = CONVENTIONS.iter().find(|(name, _)| *name == key).unwrap();
+				require(values.contains(&value), format!("architecture {:?} has invalid {name} {value:?}; it takes {}", current.name, values.join(", ")))?;
+				current.conventions.insert(key.to_owned(), value.to_owned());
+			}
 			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
 		}
 	}
@@ -17455,8 +17846,7 @@ impl<'a> Builder<'a> {
 			require(cap.is_finite() && cap > 0.0, "final logit softcap must be finite and positive")?;
 			model = model.scale(1.0 / cap).tanh().scale(cap);
 		}
-		let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+		builder.plan.mark_unread(file);
 		let tensors = builder.plan.tensors.len();
 		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
 	}
@@ -17589,9 +17979,18 @@ impl<'a> Builder<'a> {
 		self.plan.tensors.insert(name.to_owned());
 		Some(tensor)
 	}
+	/// Record a tensor that binds as `kind` values: the file lacks `name`, or stores it in another shape than `expected`.
+	fn default_note(&mut self, name: &str, kind: &str, expected: &str) {
+		let why = match self.file.tensor(name) {
+			Some(tensor) => format!("shape {:?}, expected {expected}", tensor.shape),
+			None => "absent".to_owned(),
+		};
+		let note = format!("{kind}: {name} ({why})");
+		if !self.plan.defaulted.contains(&note) { self.plan.defaulted.push(note); }
+	}
 	/// The next parameterized node, filled from mapped views.
-	fn mapped(&mut self, planes: Vec<GgufTensor>) {
-		self.slot(planes.into_iter().map(Plane::Mapped).collect());
+	fn mapped<T: Into<Plane>>(&mut self, planes: Vec<T>) {
+		self.slot(planes.into_iter().map(Into::into).collect());
 	}
 	fn slot(&mut self, planes: Vec<Plane>) {
 		self.plan.nodes.push(planes);
@@ -17603,29 +18002,33 @@ impl<'a> Builder<'a> {
 		Ok(())
 	}
 	/// The gate and up projections of a feed-forward: two tensors, or one `ffn_up.weight` that stores the gate rows and then the up rows.
-	fn gate_and_up(&mut self, layer: usize, role: &str, inputs: usize, outputs: usize) -> Result<[GgufTensor; 2]> {
+	fn gate_and_up(&mut self, layer: usize, role: &str, inputs: usize, outputs: usize) -> Result<[Plane; 2]> {
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
-		if self.file.tensor(&name("ffn_gate.weight")).is_some() {
-			return Ok([self.projection(&name("ffn_gate.weight"), role, inputs, outputs)?, self.projection(&name("ffn_up.weight"), role, inputs, outputs)?]);
+		if self.file.tensor(&name("ffn_gate.weight")).is_none() && self.file.tensor(&name("ffn_up.weight")).is_some_and(|tensor| tensor.shape == [inputs as u64, 2 * outputs as u64]) {
+			let fused = self.tensor(&name("ffn_up.weight"), role)?;
+			return Ok([Plane::Mapped(fused.rows(0, outputs)?.view()?), Plane::Mapped(fused.rows(outputs, outputs)?.view()?)]);
 		}
-		let fused = self.projection(&name("ffn_up.weight"), role, inputs, 2 * outputs)?;
-		Ok([fused.rows(0, outputs)?.view()?, fused.rows(outputs, outputs)?.view()?])
+		Ok([self.projection(&name("ffn_gate.weight"), role, inputs, outputs)?, self.projection(&name("ffn_up.weight"), role, inputs, outputs)?])
 	}
-	/// A projection `[inputs, outputs]` of the given name, checked against the
-	/// widths the node contracts over.
-	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
-		let tensor = self.tensor(name, role)?;
-		require(
-			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
-			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
-		)?;
-		Ok(tensor)
+	/// A projection `[inputs, outputs]` of the given name. A tensor the file lacks,
+	/// or stores in another shape, binds as zeros: the node takes its default
+	/// parameters and the rest of the model still runs.
+	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<Plane> {
+		match self.optional(name).filter(|tensor| tensor.shape == [inputs as u64, outputs as u64]) {
+			Some(tensor) => Ok(Plane::Mapped(tensor)),
+			None => {
+				self.default_note(name, "zeros", &format!("[{inputs}, {outputs}]"));
+				Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] })
+			}
+		}
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
-		let tensor = self.tensor(name, role)?;
-		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
+		let Some(tensor) = self.optional(name).filter(|tensor| tensor.elements() == width) else {
+			self.default_note(name, "ones", &format!("{width} elements"));
+			return Ok(vec![Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![1.0; width] }; groups]);
+		};
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
 			return Ok(vec![Plane::Mapped(tensor); groups]);
 		}
@@ -17643,11 +18046,19 @@ impl<'a> Builder<'a> {
 	}
 	/// The rows of one head at `base`, as one view when they are read in place
 	/// and as one view per row otherwise.
-	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
+	fn head_rows(weight: &Plane, base: usize, order: &[usize], inputs: usize) -> Result<Vec<Plane>> {
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?.view()?]);
+			return Ok(vec![Self::rows_of(weight, base, order.len(), inputs)?]);
 		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
+		order.iter().map(|channel| Self::rows_of(weight, base + channel, 1, inputs)).collect()
+	}
+	/// The `count` rows from `base` of a projection that reads `inputs` values per
+	/// row. A defaulted projection holds zeros of that span.
+	fn rows_of(weight: &Plane, base: usize, count: usize, inputs: usize) -> Result<Plane> {
+		match weight {
+			Plane::Mapped(tensor) => Ok(Plane::Mapped(tensor.rows(base, count)?.view()?)),
+			Plane::Owned { name, .. } => Ok(Plane::Owned { name: name.clone(), values: vec![0.0; checked_mul(count, inputs, "projection rows")?] }),
+		}
 	}
 	/// The values of an attention projection bias row, or zeros when the file holds none.
 	fn bias_values(file: &Gguf, tensor: Option<GgufTensor>, outputs: usize, role: &str) -> Result<Vec<f64>> {
@@ -17681,10 +18092,10 @@ impl<'a> Builder<'a> {
 			if self.file.tensor(&name("indexer.q_norm.weight")).is_some() || self.file.tensor(&name("indexer.k_norm.weight")).is_some() { block = block.score(rms, rope_dims); }
 		}
 		let Operation::Attention(attention) = &block.blocks.last().unwrap().operation else { unreachable!() };
-		self.attention_planes(layer, attention, normalized, width)?;
+		self.attention_planes(layer, attention, normalized, width, None)?;
 		if gated {
 			let gate_biased = self.file.tensor(&name("attn_q.bias")).is_some();
-			self.attention_gate_planes(layer, heads, head, gate_biased)?;
+			self.attention_gate_planes(layer, heads, head, gate_biased, None)?;
 			let output = self.projection(&name("attn_output.weight"), "the attention output", heads * head, width)?;
 			self.mapped(vec![output]);
 			block = block.edit(|model| {
@@ -17742,47 +18153,47 @@ impl<'a> Builder<'a> {
 		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
 		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
 		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
-		self.delta_planes(layer, &delta, dimensions.width)?;
+		self.delta_planes(layer, &delta, dimensions.width, None)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
 	/// Bind the planes of the declared delta block in lowering order.
-	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize) -> Result<()> {
+	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize, spelled: Option<&DeltaTensors>) -> Result<()> {
 		let (key_heads, key_width, value_width, output) = delta.extent(width)?;
 		let (heads, kernel) = (delta.heads, delta.kernel);
 		let inner = heads * value_width;
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| DeltaTensors::block(layer));
 		let role = format!("block {layer} delta");
-		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
-		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
-		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
+		let alpha = self.projection(&named.alpha, &role, width, heads)?;
+		let beta = self.projection(&named.beta, &role, width, heads)?;
+		let mut gates = vec![alpha, beta];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
-		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
+		if let Some(decay_bias) = named.decay_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			require(decay_bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", decay_bias.name, decay_bias.elements()))?;
 			gates.push(Plane::Mapped(decay_bias));
-			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
+			gates.push(Plane::Owned { name: format!("{} (zero)", named.beta), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
 		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
-		let decay = self.tensor(&name("ssm_a"), &role)?;
+		let decay = self.tensor(&named.decay, &role)?;
 		let values = self.file.values(&decay)?;
 		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
 		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let conv_width = 2 * key_heads * key_width + inner;
-		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
+		let qkv = self.projection(&named.qkv, &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
-		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == conv_width,
 			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
 		let order = (0..value_width).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
+		let scales = self.scale(&named.norm, &role, value_width, heads, &order)?;
 		self.slot(scales);
-		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
+		let gate = self.projection(&named.gate, &role, width, inner)?;
 		self.mapped(vec![gate]);
-		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
+		let output = self.projection(&named.out, &role, inner, output)?;
 		self.mapped(vec![output]);
 		Ok(())
 	}
@@ -17829,25 +18240,26 @@ impl<'a> Builder<'a> {
 	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
 		let ExpertDims { count, used, hidden, scoring, renormalize, scale, shared } = *experts;
 		let selection_bias = self.file.tensor(&format!("blk.{layer}.exp_probs_b.bias")).is_some();
-		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width)?;
+		self.expert_planes(layer, count, hidden, shared, selection_bias, dimensions.width, None)?;
 		let activation = self.expert_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no expert activation", self.architecture)))?;
 		Ok(branch.gguf_moe(count, used, hidden, activation, scoring, renormalize, shared, scale, selection_bias))
 	}
 	/// Bind the router, packed expert tables, and optional shared expert.
-	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+	fn expert_planes(&mut self, layer: usize, count: usize, hidden: usize, shared: SharedExpert, selection_bias: bool, width: usize, spelled: Option<&MoeTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| MoeTensors::block(layer));
 		let role = format!("block {layer} experts");
-		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
+		let router = self.projection(&named.router, &role, width, count)?;
 		self.mapped(vec![router]);
 		if selection_bias {
 			// The routing node reads this span right after the router scores.
 			let bias_role = format!("block {layer} expert selection bias");
-			let tensor = self.tensor(&name("exp_probs_b.bias"), &bias_role)?;
+			let bias_name = named.selection_bias.as_deref().ok_or_else(|| RecipeError::new(format!("{bias_role} names no tensor")))?;
+			let tensor = self.tensor(bias_name, &bias_role)?;
 			require(tensor.elements() == count, format!("{} holds {} values; {bias_role} takes {count}", tensor.name, tensor.elements()))?;
 			self.mapped(vec![tensor]);
 		}
-		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
-			let table = self.tensor(&name(suffix), &role)?;
+		for (bank, inputs, outputs) in [(&named.gate, width, hidden), (&named.up, width, hidden), (&named.down, hidden, width)] {
+			let table = self.tensor(bank, &role)?;
 			require(
 				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
 				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
@@ -17862,14 +18274,16 @@ impl<'a> Builder<'a> {
 		if shared != SharedExpert::None {
 			let shared_role = format!("block {layer} shared expert");
 			let shared_hidden = checked_mul(shared_count, hidden, "shared expert width")?;
+			let shared_named = named.shared.clone().ok_or_else(|| RecipeError::new(format!("{shared_role} names no tensors")))?;
 			if gated {
 				// The per-position gate is the first weighted node in the shared path.
-				let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+				let gate_name = shared_named.gate_input.as_deref().ok_or_else(|| RecipeError::new(format!("{shared_role} is gated and names no gate tensor")))?;
+				let gate = self.tensor(gate_name, &shared_role)?;
 				require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
 				self.mapped(vec![gate]);
 			}
-			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, shared_hidden), ("ffn_up_shexp.weight", width, shared_hidden), ("ffn_down_shexp.weight", shared_hidden, width)] {
-				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+			for (projection, inputs, outputs) in [(&shared_named.gate, width, shared_hidden), (&shared_named.up, width, shared_hidden), (&shared_named.down, shared_hidden, width)] {
+				let tensor = self.projection(projection, &shared_role, inputs, outputs)?;
 				self.mapped(vec![tensor]);
 			}
 		}
@@ -17878,24 +18292,24 @@ impl<'a> Builder<'a> {
 	/// One per-layer embedding and the plan of its host table, key and value
 	/// projections, grouped normalization scales, and dilated depthwise taps.
 	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
-		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes))
+		self.ple_planes(layer, ple, dimensions.width, dimensions.hyper.map_or(1, |(lanes, _)| lanes), None)
 	}
-	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize) -> Result<()> {
+	fn ple_planes(&mut self, layer: usize, ple: &Ngram<'_>, width: usize, lanes: usize, spelled: Option<&PleTensors>) -> Result<()> {
 		let role = format!("block {layer} per-layer embedding");
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| PleTensors::block(layer));
 		let (table_name, _, _) = ple.table();
 		let table = self.tensor(table_name, &role)?;
 		self.mapped(vec![table]);
 		let stream = checked_mul(lanes, width, "per-layer embedding stream")?;
 		let gathered = ple.width();
-		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
+		let key = self.projection(&named.key, &role, gathered, stream)?;
 		self.mapped(vec![key]);
-		self.whole(&name("ple_norm_key.weight"), &role)?;
-		self.whole(&name("ple_norm_query.weight"), &role)?;
-		let value = self.projection(&name("ple_value.weight"), &role, gathered, width)?;
+		self.whole(&named.norm_key, &role)?;
+		self.whole(&named.norm_query, &role)?;
+		let value = self.projection(&named.value, &role, gathered, width)?;
 		self.mapped(vec![value]);
-		self.whole(&name("ple_norm_conv.weight"), &role)?;
-		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
+		self.whole(&named.norm_conv, &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == ple.kernel() && taps.shape[1] as usize == stream,
 			format!("{} has shape {:?}; {role} convolves {stream} channels with {} taps", taps.name, taps.shape, ple.kernel()),
@@ -18342,6 +18756,8 @@ impl Infer {
 		gguf.print(self.log.iter().map(|metric| metric.0).chain(self.chat.iter().flatten().map(|metric| metric.0)))?;
 		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let bound = explicit_bound(&file, model, !self.score)?;
+		for note in bound.plan.defaulted() { eprintln!("bound as {note}"); }
+		for name in bound.plan.unread() { eprintln!("unread: {name}"); }
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
 		let ceiling = file.value(&format!("{architecture}.context_length")).and_then(GgufValue::integer).map_or(4096, |value| value as usize);
@@ -18480,12 +18896,15 @@ impl Infer {
 			memory: placed.memory_report()?,
 			dead_buffers: memory.iter().map(|memory| memory.dead_buffers).sum(),
 			dead_bytes: memory.iter().map(|memory| memory.dead).sum(),
+			defaulted: ReportLines::new(bound.plan.defaulted().iter().cloned()),
+			unread: ReportLines::new(bound.plan.unread().iter().cloned()),
 			links: placed.link_report()?,
 			aot: placed.aot_report()?,
 			tiles: placed.tile_report()?,
 			grids: placed.grid_report()?,
 			load: DurationReport(load_seconds),
 			compile: DurationReport(placed.compile_seconds()),
+			timings: placed.timings(),
 			residency: placed.residency(),
 			context: sequence,
 			requests: request_history.len(),
@@ -18618,8 +19037,7 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_gates: None, delta_norms: None, ple_math: None, feed_forward_activation: None, expert_activation: None, expert_scoring: None, expert_renormalize: None, expert_scale: None, expert_shared: None, expert_shared_gate: None, plan: Binding::default() };
 	builder.plan_model(model)?;
-	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
-	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+	builder.plan.mark_unread(file);
 	Ok(builder.plan)
 }
 /// Resolve optional source planes inside the model builder. The user declares
@@ -18654,8 +19072,8 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 		}
 	}
 }
-/// A branch that mixes positions starts a GGUF block; its feed-forward reads
-/// the tensors at the same block index.
+/// A branch that mixes positions is the attention of a GGUF block; its
+/// feed-forward is the block's other branch, in either order.
 fn mixes(parts: &[Block]) -> bool {
 	parts.iter().any(|part| match &part.operation {
 		Operation::Attention(_) | Operation::Delta(_) | Operation::Dconv(..) => true,
@@ -18670,10 +19088,12 @@ impl Builder<'_> {
 		let embedding = self.tensor("token_embd.weight", "the embedding")?;
 		require(embedding.shape.len() == 2, format!("token_embd.weight has shape {:?}, not [width, vocabulary]", embedding.shape))?;
 		let (width, vocabulary) = (embedding.shape[0] as usize, embedding.shape[1] as usize);
-		let (mut layers, mut lanes, mut rank) = (0, 0, 0);
+		let (mut lanes, mut rank) = (0, 0);
+		let (mut mixers, mut feeds) = (0, 0);
+		let mut head_spelled = None;
 		for block in &model.blocks {
 			if lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-				self.head_planes(lanes, rank, width)?;
+				self.head_planes(lanes, rank, width, head_spelled.as_ref())?;
 				lanes = 0;
 			}
 			match &block.operation {
@@ -18686,55 +19106,61 @@ impl Builder<'_> {
 				let mut expected = table.block();
 				expected.math = formula.math;
 				require(*formula == expected, "per-layer embedding definition differs from the GGUF table metadata")?;
-					self.ple_planes(table.layer(), &table, width, lanes.max(1))?;
+					self.ple_planes(table.layer(), &table, width, lanes.max(1), block.ple_tensors.as_ref())?;
 				}
 				Operation::Residual(parts) | Operation::Hyper(_, _, parts, _, _) => {
+					// A block holds one mixing and one feed-forward branch in either order, so each kind numbers its own blocks.
 					let attends = mixes(parts);
-					if attends { layers += 1; }
-					require(layers != 0, "a feed-forward branch comes before any mixing branch, so no block index names its tensors")?;
-					let (part, layer) = (if attends { "attn" } else { "ffn" }, layers - 1);
+					let (part, layer) = if attends { mixers += 1; ("attn", mixers - 1) } else { feeds += 1; ("ffn", feeds - 1) };
 					if let Operation::Hyper(count, bottleneck, _, _, _) = block.operation {
 						require(lanes == 0 || lanes == count, format!("hyper-connections with {count} lanes follow a stream of {lanes}"))?;
 						(lanes, rank) = (count, bottleneck);
-						self.mixer_planes(layer, part, lanes, rank, width)?;
+						if block.hyper_head.is_some() { head_spelled = block.hyper_head.clone(); }
+						self.mixer_planes(layer, part, lanes, rank, width, block.hyper_tensors.as_ref())?;
 					}
 					self.plan_branch(parts, layer, part, width)?;
 				}
 				Operation::Layer(outputs) => {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
 					require(!block.has_normalization(), "a normalization after the vocabulary projection has no tensor name")?;
-					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
-					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
+					let output = if self.file.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+					let output = self.projection(output, "the vocabulary projection", width, vocabulary)?;
 					self.mapped(vec![output]);
 				}
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
-				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
+			for (index, _) in block.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+				let name = match block.scale_tensors.get(index) {
+					Some(spelled) => spelled.as_str(),
+					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
+					None => "token_embd_norm.weight",
+				};
 				self.norm_scale(name, width)?;
 			}
 		}
-		if lanes != 0 { self.head_planes(lanes, rank, width)?; }
+		if lanes != 0 { self.head_planes(lanes, rank, width, head_spelled.as_ref())?; }
 		Ok(())
 	}
-	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn mixer_planes(&mut self, layer: usize, part: &str, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
 		let role = format!("block {layer} {part} mixer");
-		let name = |suffix: &str| format!("blk.{layer}.hc_{part}_{suffix}.weight");
+		let named = spelled.cloned().unwrap_or_else(|| HyperTensors::mixer(layer, part));
+		let inject = named.inject.as_deref().ok_or_else(|| RecipeError::new(format!("{role} names no write projection")))?;
 		let stream = checked_mul(lanes, width, "hyper-connection stream")?;
-		self.norm_scale(&name("norm"), stream)?;
-		for (suffix, inputs, outputs) in [("down", stream, rank), ("up", rank, stream), ("inject", stream, lanes)] {
-			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+		self.norm_scale(&named.norm, stream)?;
+		for (tensor_name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream), (inject, stream, lanes)] {
+			let tensor = self.projection(tensor_name, &role, inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
 		Ok(())
 	}
-	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize) -> Result<()> {
+	fn head_planes(&mut self, lanes: usize, rank: usize, width: usize, spelled: Option<&HyperTensors>) -> Result<()> {
 		if rank == 0 { return Ok(()); }
+		let named = spelled.cloned().unwrap_or_else(HyperTensors::head);
 		let stream = checked_mul(lanes, width, "head mixer stream")?;
-		self.norm_scale("output_hc_norm.weight", stream)?;
-		for (name, inputs, outputs) in [("output_hc_down.weight", stream, rank), ("output_hc_up.weight", rank, stream)] {
+		self.norm_scale(&named.norm, stream)?;
+		for (name, inputs, outputs) in [(named.down.as_str(), stream, rank), (named.up.as_str(), rank, stream)] {
 			let tensor = self.projection(name, "the head mixer", inputs, outputs)?;
 			self.mapped(vec![tensor]);
 		}
@@ -18748,18 +19174,18 @@ impl Builder<'_> {
 			match &step.operation {
 				Operation::Identity => {}
 				Operation::Attention(attention) => {
-					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
+					self.attention_planes(layer, attention, step.qk.is_some(), width, step.attention_tensors.as_ref())?;
 					if !attention.project {
 						hidden = attention.heads * if attention.width == 0 { width.div_ceil(attention.heads) } else { attention.width };
 					}
 					weighted = true;
 				}
 				Operation::Delta(delta) => {
-					self.delta_planes(layer, delta, width)?;
+					self.delta_planes(layer, delta, width, step.delta_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
-					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width)?;
+					self.expert_planes(layer, *count, *hidden_width, *shared, *selection_bias, width, step.moe_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Product(left, right) => {
@@ -18775,13 +19201,14 @@ impl Builder<'_> {
 						hidden = attention.heads * head;
 						require(matches!(gate_branch.blocks[0].operation, Operation::Layer(outputs) if outputs == hidden), "an attention product's gate is a layer over its head plane")?;
 						let normalized = attention_branch.blocks[0].qk.is_some();
+						let spelled = attention_branch.blocks[0].attention_tensors.as_ref();
 						let gate_biased = gate_branch.exclusions & bias.mask() == 0;
 						if attention_left {
-							self.attention_planes(layer, attention, normalized, width)?;
-							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
 						} else {
-							self.attention_gate_planes(layer, attention.heads, head, gate_biased)?;
-							self.attention_planes(layer, attention, normalized, width)?;
+							self.attention_gate_planes(layer, attention.heads, head, gate_biased, spelled)?;
+							self.attention_planes(layer, attention, normalized, width, spelled)?;
 						}
 						weighted = true;
 					} else {
@@ -18815,7 +19242,11 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for (index, _) in step.maps.iter().filter(|step| step.normalization() == Some(BlockNormalization::Rms)).enumerate() {
+				if let Some(spelled) = step.scale_tensors.get(index) {
+					self.norm_scale(spelled, width)?;
+					continue;
+				}
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
@@ -18831,45 +19262,50 @@ impl Builder<'_> {
 
 	/// Bind the same side projection and deferred key scales for architecture
 	/// models and script-defined resident attention.
-	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer) -> Result<()> {
-		let name = |suffix: &str| format!("blk.{layer}.indexer.{suffix}");
+	fn indexer_planes(&mut self, layer: usize, width: usize, index: Indexer, named: &IndexerTensors) -> Result<()> {
 		let role = format!("block {layer} indexer");
-		let query = self.projection(&name("q_proj.weight"), &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
-		let key = self.projection(&name("k_proj.weight"), &role, width, index.width)?;
+		let query = self.projection(&named.q_proj, &role, width, checked_mul(index.heads, index.width, "indexer query width")?)?;
+		let key = self.projection(&named.k_proj, &role, width, index.width)?;
 		let dims = index.score.map_or(0, |(_, dims)| dims);
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
 		for head in 0..index.heads {
-			planes.extend(Self::head_rows(&query, head * index.width, &order)?);
+			planes.extend(Self::head_rows(&query, head * index.width, &order, width)?);
 		}
-		planes.extend(Self::head_rows(&key, 0, &order)?);
+		planes.extend(Self::head_rows(&key, 0, &order, width)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
-			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
-			scales.extend(self.scale(&name("k_norm.weight"), &role, index.width, 1, &order)?);
+			let mut scales = self.scale(&named.q_norm, &role, index.width, index.heads, &order)?;
+			scales.extend(self.scale(&named.k_norm, &role, index.width, 1, &order)?);
 			self.slot(scales);
 		}
 		Ok(())
 	}
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
-		let tensor = self.tensor(name, "a normalization")?;
-		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
+			Some(tensor) => Plane::Mapped(tensor),
+			None => {
+				self.default_note(name, "ones", &format!("{width} elements"));
+				Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] }
+			}
+		};
+		self.slot(vec![plane]);
 		Ok(())
 	}
 	/// The planes of a composed attention block: its query, key and value
 	/// projection, its query and key scales when it normalizes them, and its
 	/// output projection, as `attention` lays them out for a built one.
-	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize) -> Result<()> {
+	fn attention_planes(&mut self, layer: usize, attention: &AttentionBlock, normalized: bool, width: usize, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
 		let (heads, kv) = (attention.heads, attention.keys);
 		require(attention.values == kv, format!("block {layer} attention binds one attn_v tensor, so its value heads match its {kv} key heads"))?;
 		let head = if attention.width == 0 { width.div_ceil(heads.max(1)) } else { attention.width };
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let fused = self.file.tensor(&name("attn_q.weight")).is_none();
-		let query = self.tensor(&name(if fused { "attn_qkv.weight" } else { "attn_q.weight" }), &role)?;
+		let fused = spelled.is_none() && self.file.tensor(&named.q).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some();
+		let query = self.tensor(&if fused { name("attn_qkv.weight") } else { named.q.clone() }, &role)?;
 		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
 		// A fused tensor stores the query, key and value heads as consecutive rows.
 		let (gated, key_base) = if fused {
@@ -18883,30 +19319,27 @@ impl Builder<'_> {
 			};
 			(gated, 0)
 		};
-		let key = if fused { query.clone() } else { self.projection(&name("attn_k.weight"), &role, width, kv * head)? };
+		let key = if fused { Plane::Mapped(query.clone()) } else { self.projection(&named.k, &role, width, kv * head)? };
 		let value = if fused {
-			query.rows(key_base + kv * head, kv * head)?.view()?
+			Plane::Mapped(query.rows(key_base + kv * head, kv * head)?.view()?)
 		} else {
-			match self.optional(&name("attn_v.weight")) {
-				Some(value) => {
-					require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-					value
-				}
-				None => key.clone(),
+			match named.v.as_deref() {
+				Some(value_name) if self.file.tensor(value_name).is_some() => self.projection(value_name, &role, width, kv * head)?,
+				_ => key.clone(),
 			}
 		};
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.extend(Self::head_rows(&Plane::Mapped(query.clone()), index * stride, &order, width)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, key_base + index * head, &order)?);
+			planes.extend(Self::head_rows(&key, key_base + index * head, &order, width)?);
 		}
 		planes.push(value);
-		let mut slot = planes.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
-		let (query_bias, key_bias, value_bias) = (self.optional(&name("attn_q.bias")), self.optional(&name("attn_k.bias")), self.optional(&name("attn_v.bias")));
+		let mut slot = planes;
+		let (query_bias, key_bias, value_bias) = (named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.k_bias.as_deref().and_then(|bias_name| self.optional(bias_name)), named.v_bias.as_deref().and_then(|bias_name| self.optional(bias_name)));
 		if query_bias.is_some() || key_bias.is_some() || value_bias.is_some() {
 			// The bias row follows the matrix rows, in the order the planes read them.
 			let query_values = Self::bias_values(self.file, query_bias, query.shape[1] as usize, &role)?;
@@ -18920,46 +19353,57 @@ impl Builder<'_> {
 				row.extend(order.iter().map(|channel| key_values[index * head + channel]));
 			}
 			row.extend(value_values);
-			slot.push(Plane::Owned { name: name("attn_qkv.bias"), values: row });
+			slot.push(Plane::Owned { name: format!("{} (bias row)", named.q), values: row });
 		}
 		self.slot(slot);
 		if normalized {
-			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
-			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			let (q_norm, k_norm) = named.q_norm.as_deref().zip(named.k_norm.as_deref()).ok_or_else(|| RecipeError::new(format!("{role} normalizes its queries and keys, and names no scale tensors for them")))?;
+			let mut scales = self.scale(q_norm, &role, head, heads, &order)?;
+			scales.extend(self.scale(k_norm, &role, head, kv, &order)?);
 			self.slot(scales);
 		}
 		if attention.factors {
-			let (factors, long) = if self.file.tensor("rope_freqs.weight").is_some() {
-				(self.tensor("rope_freqs.weight", &role)?, None)
-			} else {
+			let factors_name = named.factors.as_deref().unwrap_or("rope_freqs.weight");
+			if self.file.tensor(factors_name).is_none() && self.file.tensor("rope_factors_short.weight").is_some() {
 				let original = self.integer_or("rope.scaling.original_context_length", self.integer_or("context_length", 0)?)?;
 				require(original != 0, format!("{role} selects short or long rotary factors by context, but the file names no context length"))?;
-				(self.tensor("rope_factors_short.weight", &role)?, Some((self.tensor("rope_factors_long.weight", &role)?, original)))
-			};
-			let fits = |tensor: &GgufTensor| attention.rope.is_some() && tensor.elements() == rope_dims / 2;
-			require(fits(&factors) && long.as_ref().map_or(true, |(long, _)| fits(long)), format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
-			let group = self.plan.nodes.len();
-			self.mapped(vec![factors]);
-			if let Some((long, original)) = long { self.plan.rope_long.push((group, long, original)); }
+				let (short, long) = (self.tensor("rope_factors_short.weight", &role)?, self.tensor("rope_factors_long.weight", &role)?);
+				let fits = |tensor: &GgufTensor| attention.rope.is_some() && tensor.elements() == rope_dims / 2;
+				require(fits(&short) && fits(&long), format!("{} holds {} values; {role} rotates {} channel pairs", short.name, short.elements(), rope_dims / 2))?;
+				let group = self.plan.nodes.len();
+				self.slot(vec![Plane::Mapped(short)]);
+				self.plan.rope_long.push((group, long, original));
+			} else {
+				let factors = match self.optional(factors_name).filter(|tensor| tensor.elements() == rope_dims / 2) {
+					Some(factors) => Plane::Mapped(factors),
+					None => {
+						self.default_note(factors_name, "ones", &format!("{} elements", rope_dims / 2));
+						Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] }
+					}
+				};
+				self.slot(vec![factors]);
+			}
 		}
 		if let Some(index) = attention.index {
-			self.indexer_planes(layer, width, index)?;
+			let indexer = named.indexer.clone().ok_or_else(|| RecipeError::new(format!("{role} indexes tokens, and names no indexer tensors")))?;
+			self.indexer_planes(layer, width, index, &indexer)?;
 		}
 		if attention.project {
-			let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
+			let output = self.projection(&named.out, &role, heads * head, width)?;
 			self.mapped(vec![output]);
 		}
 		Ok(())
 	}
 	/// The gate layer's rows, and its bias row when the layer takes a bias and the file holds `attn_q.bias`.
-	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool) -> Result<()> {
-		let name = format!("blk.{layer}.attn_q.weight");
+	fn attention_gate_planes(&mut self, layer: usize, heads: usize, head: usize, biased: bool, spelled: Option<&AttentionTensors>) -> Result<()> {
+		let named = spelled.cloned().unwrap_or_else(|| AttentionTensors::block(layer));
+		let name = named.q.clone();
 		let query = self.tensor(&name, "the attention gate")?;
 		require(query.shape.len() == 2 && query.shape[1] as usize == 2 * heads * head, format!("{name} has no separate gate rows"))?;
 		let mut rows = Vec::with_capacity(heads);
 		for index in 0..heads { rows.push(query.rows(index * 2 * head + head, head)?.view()?); }
 		let mut planes = rows.into_iter().map(Plane::Mapped).collect::<Vec<_>>();
-		if biased && let Some(tensor) = self.optional(&format!("blk.{layer}.attn_q.bias")) {
+		if biased && let Some(tensor) = named.q_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			let values = Self::bias_values(self.file, Some(tensor), 2 * heads * head, "the attention gate")?;
 			let row = (0..heads).flat_map(|index| values[index * 2 * head + head..(index + 1) * 2 * head].iter().copied()).collect();
 			planes.push(Plane::Owned { name: format!("blk.{layer}.attn_gate.bias"), values: row });
@@ -19176,12 +19620,18 @@ pub struct InferenceReport {
 	pub dead_buffers: usize,
 	/// Dead storage bytes already included in the reported memory allocations.
 	pub dead_bytes: usize,
+	/// Tensors bound as zeros or ones because the file lacks them or stores them in another shape, as `zeros: name (why)`; empty for a model the file describes.
+	pub defaulted: ReportLines,
+	/// Tensors of the file that no node reads; empty for a model the file describes.
+	pub unread: ReportLines,
 	pub links: ReportLines,
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
+	/// Predicted and measured time per node, summed over the run's forward windows.
+	pub timings: Vec<NodeTiming>,
 	/// Each tape's weight buffer: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
 	pub residency: Vec<WeightResidency>,
 	pub context: usize,
@@ -19191,6 +19641,33 @@ pub struct InferenceReport {
 	/// Teacher-forced log probabilities of the scored text, set by `Infer::score`.
 	pub score: Option<TextScore>,
 	last: Arc<InferenceRequest>,
+}
+/// A node whose measured time exceeds its prediction by more than the margin.
+#[derive(Clone, Debug)]
+pub struct NodeGap {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub predicted_seconds: f64,
+	pub measured_seconds: f64,
+	/// Measured time divided by predicted time.
+	pub ratio: f64,
+}
+impl InferenceReport {
+	/// The nodes whose measured time is more than `margin` times their predicted
+	/// time, largest ratio first. `margin` is a ratio, so 2.0 selects nodes that
+	/// ran more than twice as long as predicted. Nodes without a prediction are omitted.
+	pub fn gaps(&self, margin: f64) -> Vec<NodeGap> {
+		let mut gaps = self.timings.iter().filter_map(|timing| {
+			let predicted = timing.predicted_seconds?;
+			let ratio = if predicted > 0.0 { timing.measured_seconds / predicted } else if timing.measured_seconds > 0.0 { f64::INFINITY } else { 0.0 };
+			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, op: timing.op, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
+		}).collect::<Vec<_>>();
+		gaps.sort_by(|left, right| right.ratio.total_cmp(&left.ratio));
+		gaps
+	}
 }
 impl std::ops::Deref for InferenceReport {
 	type Target = InferenceRequest;
@@ -20051,7 +20528,7 @@ impl DeviceMemory {
 }
 fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
-	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
+	let layout = NativeLayout::for_graph(part, 1, precision, true, false)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
@@ -20717,6 +21194,10 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
 }
 impl Placed {
+	/// Predicted and measured time for every node that ran, across all tapes.
+	pub fn timings(&self) -> Vec<NodeTiming> {
+		self.tapes.iter().flatten().flat_map(|tape| tape.timing.lock().map(|timing| timing.totals.iter().filter(|total| total.forwards != 0).cloned().collect::<Vec<_>>()).unwrap_or_default()).collect()
+	}
 	pub fn residency(&self) -> Vec<WeightResidency> {
 		self.tapes.iter().flatten().map(|tape| tape.residency.clone()).collect()
 	}
@@ -21131,6 +21612,34 @@ enum Primitive {
 	/// Values the dies of a tensor split share: each die's rows gathered into
 	/// every die (argument 0 = 0), or every die's partial sums added (= 1).
 	Exchange = 23,
+}
+impl Primitive {
+	/// The primitive's name, as node lines print it.
+	const fn name(self) -> &'static str {
+		match self {
+			Primitive::Contraction => "contraction",
+			Primitive::Pool => "pool",
+			Primitive::Attention => "attention",
+			Primitive::Scan => "scan",
+			Primitive::Elementwise => "elementwise",
+			Primitive::Normalize => "normalize",
+			Primitive::Predictor => "predictor",
+			Primitive::Gather => "gather",
+			Primitive::Rope => "rope",
+			Primitive::Expand => "expand",
+			Primitive::Read => "read",
+			Primitive::Outer => "outer",
+			Primitive::TopK => "topk",
+			Primitive::ExpertIn => "expert_in",
+			Primitive::Dconv => "dconv",
+			Primitive::Delta => "delta",
+			Primitive::ExpertOut => "expert_out",
+			Primitive::Lookup => "lookup",
+			Primitive::Fold => "fold",
+			Primitive::Last => "last",
+			Primitive::Exchange => "exchange",
+		}
+	}
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -23856,6 +24365,7 @@ struct NativeTape {
 	targets: Buffer,
 	weights: Buffer,
 	frozen: Buffer,
+	timing: Mutex<TapeTiming>,
 	residency: WeightResidency,
 	#[allow(dead_code)]
 	hold: Option<RetainedHold>,
@@ -24260,6 +24770,7 @@ impl NativeTape {
 			targets: Buffer::upload_float(gpu, &target_buffer, layout.output_precision)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen_mask)?,
+			timing: Mutex::new(TapeTiming::new(graph, gpu)?),
 			residency,
 			hold,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
@@ -24521,10 +25032,13 @@ impl NativeTape {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
-		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing() || (mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu)) {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			if mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu {
+				record_node_timing(&self.timing, (end - begin) as usize, &node_ticks, ticks[0])?;
+			}
 			if tuning && let Some(tuner) = tuner.as_mut() {
 				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
 				tuner.observe(&stamps);
@@ -25102,6 +25616,256 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
+}
+/// Work and time for one node, summed over every forward window a run executed.
+/// `predicted_seconds` is `None` where no device rates are configured.
+#[derive(Clone, Debug)]
+pub struct NodeTiming {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub operations: f64,
+	pub bytes: f64,
+	pub predicted_seconds: Option<f64>,
+	pub measured_seconds: f64,
+	pub forwards: usize,
+}
+/// What the plan says one node does per position: its primitive, channel
+/// counts, activation width, weight bytes, and the model's context length.
+#[derive(Clone, Copy)]
+struct NodeWork {
+	op: Primitive,
+	input: usize,
+	output: usize,
+	width: f64,
+	weight_bytes: f64,
+	positions: usize,
+}
+struct NodeCost {
+	operations: f64,
+	bytes: f64,
+}
+/// The arithmetic and traffic one node performs over `span` positions. A
+/// contraction costs two operations per weight element and position, attention
+/// costs its score and value products over the context, and every other
+/// primitive costs a fixed count per output element by its class.
+fn node_cost(work: &NodeWork, span: usize) -> NodeCost {
+	let span = span as f64;
+	let (input, output) = (work.input as f64 * span, work.output as f64 * span);
+	let operations = match work.op {
+		Primitive::Contraction => 2.0 * work.input as f64 * work.output as f64 * span,
+		Primitive::Attention => 4.0 * output * work.positions as f64,
+		Primitive::Normalize => 5.0 * output,
+		Primitive::Rope | Primitive::Delta | Primitive::Scan => 6.0 * output,
+		_ => 2.0 * output,
+	};
+	NodeCost { operations, bytes: (input + output) * work.width + work.weight_bytes }
+}
+/// The CPU's peak rates as (FLOP/s over every worker, bytes/s), which node predictions divide by.
+/// `RECIPE_CPU_PEAK_GFLOPS` (per worker thread) and `RECIPE_CPU_PEAK_GBPS` (all workers together)
+/// override a rate. Otherwise the rates are measured on this machine once, in a few hundred
+/// milliseconds on the host before any inference dispatch, and cached in `~/.cache/recipe/cpu-peaks`
+/// under the CPU model and worker count.
+fn cpu_peak_rates(workers: u32) -> Result<(f64, f64)> {
+	static RATES: OnceLock<Result<(f64, f64)>> = OnceLock::new();
+	let rates = RATES.get_or_init(|| {
+		let overridden = |name: &str| -> Result<Option<f64>> {
+			let Ok(text) = std::env::var(name) else { return Ok(None) };
+			let value = text.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("{name} is not a number: {error}")))?;
+			require(value.is_finite() && value > 0.0, format!("{name} must be a positive number"))?;
+			Ok(Some(value))
+		};
+		let (gflops, gbps) = (overridden("RECIPE_CPU_PEAK_GFLOPS")?, overridden("RECIPE_CPU_PEAK_GBPS")?);
+		let (per_worker, bandwidth) = match (gflops, gbps) {
+			(Some(gflops), Some(gbps)) => (gflops, gbps),
+			_ => {
+				let (measured_gflops, measured_gbps) = cached_cpu_peaks(workers as usize);
+				(gflops.unwrap_or(measured_gflops), gbps.unwrap_or(measured_gbps))
+			}
+		};
+		Ok((per_worker * 1e9 * f64::from(workers), bandwidth * 1e9))
+	});
+	match rates {
+		Ok(rates) => Ok(*rates),
+		Err(error) => Err(RecipeError::new(error.to_string())),
+	}
+}
+/// The CPU model the peak cache is keyed by: the processor name where the machine reports one,
+/// else the architecture.
+fn cpu_model() -> String {
+	let named = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| text.lines().find(|line| line.starts_with("model name")).and_then(|line| line.split_once(':')).map(|(_, name)| name.trim().to_owned()));
+	named.or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok()).unwrap_or_else(|| std::env::consts::ARCH.to_owned())
+}
+/// (GFLOP/s per worker, GB/s over all workers) for this CPU model and worker count, from the
+/// cache file or else measured and appended to it.
+fn cached_cpu_peaks(workers: usize) -> (f64, f64) {
+	let model = cpu_model();
+	let path = home_directory().ok().map(|home| home.join(".cache").join("recipe").join("cpu-peaks"));
+	if let Some(text) = path.as_ref().and_then(|path| fs::read_to_string(path).ok()) {
+		for line in text.lines() {
+			let mut fields = line.splitn(4, '\t');
+			if let (Some(count), Some(gflops), Some(gbps), Some(name)) = (fields.next(), fields.next(), fields.next(), fields.next())
+				&& count == workers.to_string()
+				&& name == model
+				&& let (Ok(gflops), Ok(gbps)) = (gflops.parse::<f64>(), gbps.parse::<f64>())
+			{
+				return (gflops, gbps);
+			}
+		}
+	}
+	let (gflops, gbps) = measure_cpu_peaks(workers);
+	if let Some(path) = path {
+		use std::io::Write;
+		if let Some(parent) = path.parent() {
+			let _ = fs::create_dir_all(parent);
+		}
+		if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+			let _ = writeln!(file, "{workers}\t{gflops}\t{gbps}\t{model}");
+		}
+	}
+	(gflops, gbps)
+}
+/// One burst of independent fused multiply-add chains: the value and the FLOPs performed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_burst_avx2(iterations: u64) -> f32 {
+	use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_set1_ps, _mm256_storeu_ps};
+	let mut lanes = [_mm256_set1_ps(0.5); 12];
+	let (a, b) = (_mm256_set1_ps(1.000_000_1), _mm256_set1_ps(1.0e-7));
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			*lane = _mm256_fmadd_ps(*lane, a, b);
+		}
+	}
+	let mut out = [0.0_f32; 8];
+	let mut sum = 0.0_f32;
+	for lane in lanes {
+		_mm256_storeu_ps(out.as_mut_ptr(), lane);
+		sum += out.iter().sum::<f32>();
+	}
+	sum
+}
+fn fma_burst(iterations: u64) -> (f32, f64) {
+	#[cfg(target_arch = "x86_64")]
+	if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+		// 12 accumulators x 8 lanes x 2 operations per FMA.
+		return (unsafe { fma_burst_avx2(iterations) }, iterations as f64 * 12.0 * 8.0 * 2.0);
+	}
+	// Elsewhere: 64 independent lanes the compiler vectorizes to the target's baseline vector unit.
+	let mut lanes = [0.5_f32; 64];
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			#[cfg(target_arch = "aarch64")]
+			{ *lane = lane.mul_add(1.000_000_1, 1.0e-7); }
+			#[cfg(not(target_arch = "aarch64"))]
+			{ *lane = *lane * 1.000_000_1 + 1.0e-7; }
+		}
+	}
+	(lanes.iter().sum(), iterations as f64 * 64.0 * 2.0)
+}
+/// Measures (GFLOP/s per worker, GB/s over all workers): every worker runs a fused multiply-add
+/// burst and a streaming triad (`a = b + 3c` over arrays larger than the cache, each worker
+/// touching its own pages first) in lockstep passes. The best pass counts, since load only slows
+/// a pass down.
+fn measure_cpu_peaks(workers: usize) -> (f64, f64) {
+	const PASSES: usize = 5;
+	const FMA_ITERATIONS: u64 = 2_000_000;
+	const TRIAD_FLOATS: usize = 1 << 24;
+	let workers = workers.max(1);
+	let length = TRIAD_FLOATS / workers;
+	let barrier = std::sync::Barrier::new(workers);
+	let times: Vec<([f64; PASSES], [f64; PASSES], f64)> = std::thread::scope(|scope| {
+		let handles: Vec<_> = (0..workers)
+			.map(|_| {
+				scope.spawn(|| {
+					let (mut fma, mut triad, mut flops) = ([0.0; PASSES], [0.0; PASSES], 0.0);
+					for pass in &mut fma {
+						barrier.wait();
+						let started = Instant::now();
+						let (value, performed) = fma_burst(FMA_ITERATIONS);
+						std::hint::black_box(value);
+						flops = performed;
+						*pass = started.elapsed().as_secs_f64();
+					}
+					let mut a = vec![0.0_f32; length];
+					let b = vec![1.5_f32; length];
+					let c = vec![0.25_f32; length];
+					for round in 0..=PASSES {
+						barrier.wait();
+						let started = Instant::now();
+						for ((out, x), y) in a.iter_mut().zip(&b).zip(&c) {
+							*out = *x + 3.0 * *y;
+						}
+						std::hint::black_box(&a);
+						// Round 0 only faults the pages in.
+						if round > 0 {
+							triad[round - 1] = started.elapsed().as_secs_f64();
+						}
+					}
+					(fma, triad, flops)
+				})
+			})
+			.collect();
+		handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+	});
+	let slowest = |pick: fn(&([f64; PASSES], [f64; PASSES], f64)) -> &[f64; PASSES]| (0..PASSES).map(|pass| times.iter().map(|entry| pick(entry)[pass]).fold(0.0, f64::max)).fold(f64::MAX, f64::min).max(f64::EPSILON);
+	let flops = times.first().map_or(0.0, |entry| entry.2);
+	let fma_seconds = slowest(|entry| &entry.0);
+	let triad_seconds = slowest(|entry| &entry.1);
+	(flops / fma_seconds / 1e9, 12.0 * (length * workers) as f64 / triad_seconds / 1e9)
+}
+/// Per-node work and running totals for one tape. Peak rates come from the
+/// configured CPU rates; other devices have none, so their predictions stay unset.
+struct TapeTiming {
+	work: Vec<NodeWork>,
+	totals: Vec<NodeTiming>,
+	/// Nodes whose clock the kernel writes. Recurrent body nodes run inside their scan.
+	measured: Vec<usize>,
+	peak: Option<(f64, f64)>,
+}
+impl TapeTiming {
+	fn new(graph: &Graph, gpu: &Gpu) -> Result<Self> {
+		let positions = graph_positions(graph);
+		// The peak is per worker times the workers execution uses, so the prediction and the run share one thread count.
+		let peak = if gpu.backend == Backend::Cpu { Some(cpu_peak_rates(cpu_worker_threads()?)?) } else { None };
+		let work = graph.nodes.iter().enumerate().map(|(index, node)| {
+			let width = node.precision.bytes() as f64;
+			let weight_bytes = packed_weight(graph, index, true).map_or(node.parameters as f64 * width, |weight| weight.bytes.len() as f64);
+			NodeWork { op: node.op, input: node.input.channels, output: node.output.channels, width, weight_bytes, positions }
+		}).collect();
+		let totals = graph.nodes.iter().enumerate().map(|(index, node)| NodeTiming {
+			device: gpu.name.clone(), node: index, block: node.block_index, kind: node.block_kind, op: node.op.name(), operations: 0.0, bytes: 0.0, predicted_seconds: peak.map(|_| 0.0), measured_seconds: 0.0, forwards: 0,
+		}).collect();
+		let measured = graph.nodes.iter().enumerate().filter(|(_, node)| node.block_kind != "recur_body").map(|(index, _)| index).collect();
+		Ok(Self { work, totals, measured, peak })
+	}
+}
+/// Adds one forward window to every node's totals. A node's clock is stamped after
+/// its node-ending grid barrier, so a node runs from the previous node's clock (the
+/// forward's entry clock for the first) to its own.
+/// Node clocks count nanoseconds of the CPU kernels' `recipe.clock`.
+fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], start: i64) -> Result<()> {
+	let mut timing = timing.lock().map_err(|_| RecipeError::new("node timing is poisoned"))?;
+	let measured = timing.measured.clone();
+	let peak = timing.peak;
+	let per_tick = 1e-9;
+	let mut prior = start;
+	for &index in &measured {
+		let elapsed = (node_ticks[index] - prior).max(0) as f64 * per_tick;
+		prior = node_ticks[index];
+		let cost = node_cost(&timing.work[index], span);
+		let total = &mut timing.totals[index];
+		total.operations += cost.operations;
+		total.bytes += cost.bytes;
+		total.measured_seconds += elapsed;
+		total.forwards += 1;
+		if let (Some(predicted), Some((flops, bandwidth))) = (total.predicted_seconds.as_mut(), peak) {
+			*predicted += (cost.operations / flops).max(cost.bytes / bandwidth);
+		}
+	}
+	Ok(())
 }
 /// The measured behavior of one device: the two transfer directions between it and the coordinating
 /// machine, the gradient work it retires each second, and the fixed cost of one dispatch on it.
