@@ -253,6 +253,23 @@ place(path, &[blocks])
 	.memory()[]
 ```
 
+## GGUF tensors
+
+A script names the file tensors a block reads. A delta block names its nine; a normalization names its scale.
+
+```rust
+let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
+	.delta_norms(l2, rms).delta_activations(Activation::Silu, Activation::Silu).delta_gates(Activation::Softplus, Activation::Sigmoid)
+	.delta_from(DeltaTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.0.attn_norm.weight"), Block::from(delta).norm(rms).scale_from("blk.0.post_attention_norm.weight")]);
+```
+
+```rust
+DeltaTensors { alpha, beta, decay_bias, decay, qkv, conv, norm, gate, out }
+DeltaTensors::block(layer)
+binding.listing()
+```
+
 ## Terminal chat and remote execution
 
 ```bash

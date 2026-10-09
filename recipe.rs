@@ -12555,7 +12555,7 @@ mod bundle {
 			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
 			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
 			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
-			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, scale_tensors: Vec::new(), delta_tensors: None, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -14062,6 +14062,10 @@ pub struct Block {
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
 
+	/// Tensors a script names for the planes of the block's non-L2 normalizations, in order.
+	scale_tensors: Vec<String>,
+	/// Tensors a script names for the planes of a delta block.
+	delta_tensors: Option<DeltaTensors>,
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -14135,12 +14139,19 @@ impl Block {
 	const fn of(operation: Operation) -> Self {
 		Self {
 			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
-			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, scale_tensors: Vec::new(), delta_tensors: None, suffix: Suffix::Fresh,
 		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
 		self.suffix = Suffix::Map;
 		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+		self
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of this block.
+	pub fn scale_from(mut self, name: impl Into<String>) -> Self {
+		let normalizations = self.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).count();
+		assert!(self.scale_tensors.len() < normalizations, "scale_from requires a preceding normalization with a scale");
+		self.scale_tensors.push(name.into());
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -14252,6 +14263,39 @@ pub struct Model {
 	pub frozen: Frozen,
 }
 /// Separate read and write paths of a learned hyper-connection gate.
+/// The GGUF tensors a delta block reads, spelled by the script: the gate projection halves
+/// (`alpha` for the decay, `beta` for the write), the optional decay bias, the stored decay
+/// `-exp(A)`, the query-key-value projection, the convolution taps, the output scale, the
+/// output gate and the output projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaTensors {
+	pub alpha: String,
+	pub beta: String,
+	pub decay_bias: Option<String>,
+	pub decay: String,
+	pub qkv: String,
+	pub conv: String,
+	pub norm: String,
+	pub gate: String,
+	pub out: String,
+}
+impl DeltaTensors {
+	/// The tensors of block `layer` under the names GGUF files give them.
+	pub fn block(layer: usize) -> Self {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		Self {
+			alpha: name("ssm_alpha.weight"),
+			beta: name("ssm_beta.weight"),
+			decay_bias: Some(name("ssm_dt.bias")),
+			decay: name("ssm_a"),
+			qkv: name("attn_qkv.weight"),
+			conv: name("ssm_conv1d.weight"),
+			norm: name("ssm_norm.weight"),
+			gate: name("attn_gate.weight"),
+			out: name("ssm_out.weight"),
+		}
+	}
+}
 #[derive(Clone)]
 pub struct HyperGate {
 	pub read: Model,
@@ -14386,6 +14430,8 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
+				scale_tensors: Vec::new(),
+				delta_tensors: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -14475,6 +14521,23 @@ impl Model {
 		model.edit(|model| {
 			let block = model.blocks.pop().unwrap();
 			model.blocks.push(apply(block));
+		})
+	}
+	/// Names the GGUF tensors the preceding delta block reads, in place of the names the file's
+	/// block index would give them.
+	pub fn delta_from(&self, tensors: DeltaTensors) -> Self {
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("delta_from requires a preceding delta block"));
+			assert!(matches!(block.operation, Operation::Delta(_)), "delta_from requires a preceding delta block");
+			block.delta_tensors = Some(tensors);
+		})
+	}
+	/// Names the GGUF tensor that scales the next unnamed normalization of the preceding block.
+	pub fn scale_from(&self, name: impl Into<String>) -> Self {
+		let name = name.into();
+		self.suffix().edit(|model| {
+			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("scale_from requires a preceding normalization"));
+			*block = block.clone().scale_from(name);
 		})
 	}
 	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
@@ -16927,6 +16990,10 @@ impl Binding {
 	pub fn tensors(&self) -> usize { self.tensors.len() }
 	/// Weighted nodes filled by the plan in lowering order.
 	pub fn nodes(&self) -> usize { self.nodes.len() }
+	/// The plan as text, one line per node naming each plane and its element count.
+	pub fn listing(&self) -> Vec<String> {
+		self.nodes.iter().enumerate().map(|(index, planes)| format!("node {index}: {}", planes.iter().map(|plane| format!("{}[{}]", plane.name(), plane.elements())).collect::<Vec<_>>().join(" "))).collect()
+	}
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
@@ -17708,47 +17775,47 @@ impl<'a> Builder<'a> {
 		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
 		let (decay_gate, write_gate) = self.delta_gates.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta gates", self.architecture)))?;
 		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), decay_gate: Some(decay_gate), write_gate: Some(write_gate), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
-		self.delta_planes(layer, &delta, dimensions.width)?;
+		self.delta_planes(layer, &delta, dimensions.width, None)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
 	/// Bind the planes of the declared delta block in lowering order.
-	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize) -> Result<()> {
+	fn delta_planes(&mut self, layer: usize, delta: &DeltaBlock, width: usize, spelled: Option<&DeltaTensors>) -> Result<()> {
 		let (key_heads, key_width, value_width, output) = delta.extent(width)?;
 		let (heads, kernel) = (delta.heads, delta.kernel);
 		let inner = heads * value_width;
-		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let named = spelled.cloned().unwrap_or_else(|| DeltaTensors::block(layer));
 		let role = format!("block {layer} delta");
-		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
-		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
+		let alpha = self.projection(&named.alpha, &role, width, heads)?;
+		let beta = self.projection(&named.beta, &role, width, heads)?;
 		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
-		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
+		if let Some(decay_bias) = named.decay_bias.as_deref().and_then(|bias_name| self.optional(bias_name)) {
 			require(decay_bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", decay_bias.name, decay_bias.elements()))?;
 			gates.push(Plane::Mapped(decay_bias));
-			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
+			gates.push(Plane::Owned { name: format!("{} (zero)", named.beta), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
 		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
-		let decay = self.tensor(&name("ssm_a"), &role)?;
+		let decay = self.tensor(&named.decay, &role)?;
 		let values = self.file.values(&decay)?;
 		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
 		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let conv_width = 2 * key_heads * key_width + inner;
-		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
+		let qkv = self.projection(&named.qkv, &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
-		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
+		let taps = self.tensor(&named.conv, &role)?;
 		require(
 			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == conv_width,
 			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
 		let order = (0..value_width).collect::<Vec<_>>();
-		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
+		let scales = self.scale(&named.norm, &role, value_width, heads, &order)?;
 		self.slot(scales);
-		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
+		let gate = self.projection(&named.gate, &role, width, inner)?;
 		self.mapped(vec![gate]);
-		let output = self.projection(&name("ssm_out.weight"), &role, inner, output)?;
+		let output = self.projection(&named.out, &role, inner, output)?;
 		self.mapped(vec![output]);
 		Ok(())
 	}
@@ -18675,8 +18742,12 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
-				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
+			for (index, _) in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+				let name = match block.scale_tensors.get(index) {
+					Some(spelled) => spelled.as_str(),
+					None if self.file.tensor("output_norm.weight").is_some() => "output_norm.weight",
+					None => "token_embd_norm.weight",
+				};
 				self.norm_scale(name, width)?;
 			}
 		}
@@ -18720,7 +18791,7 @@ impl Builder<'_> {
 					weighted = true;
 				}
 				Operation::Delta(delta) => {
-					self.delta_planes(layer, delta, width)?;
+					self.delta_planes(layer, delta, width, step.delta_tensors.as_ref())?;
 					weighted = true;
 				}
 				Operation::Moe(count, _, hidden_width, _, _, _, shared, _, selection_bias) => {
@@ -18778,7 +18849,11 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
+			for (index, _) in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)).enumerate() {
+				if let Some(spelled) = step.scale_tensors.get(index) {
+					self.norm_scale(spelled, width)?;
+					continue;
+				}
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
