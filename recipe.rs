@@ -21825,7 +21825,7 @@ mod ple_stepper_checks {
 	/// Places the model on the CPU as one range, the same tape a single-device
 	/// `recipe.infer` placement builds.
 	fn place_cpu(file: &Gguf, model: &Model, positions: usize) -> Placed {
-		let bound = explicit_bound(file, model).unwrap();
+		let bound = explicit_bound(file, model, false).unwrap();
 		let devices: &'static [&'static Gpu] = Box::leak(Box::new([shared_cpu_device().unwrap()]));
 		place_bound(&bound, positions, &[], devices).unwrap()
 	}

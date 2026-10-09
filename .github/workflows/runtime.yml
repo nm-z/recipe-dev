@@ -283,6 +283,12 @@ jobs:
           cargo build --release --lib --bin recipe
           file target/release/recipe
 
+      - name: Compile the library tests
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/candidate"
+          cargo test --lib --no-run
+
       - name: Execute the runtime suite on the CPU backend
         run: |
           set -euo pipefail
