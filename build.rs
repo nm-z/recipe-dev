@@ -273,7 +273,8 @@ define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_g
 // follows a divergent spin (bar.sync is per warp before sm_70 and would count the
 // leader's warp as arrived on the lanes that skipped the spin) and only one lane in
 // thirty-two loads the phase while the grid drains. The acquire fence is the spinner's
-// alone: before sm_70 a fence is membar.sys, and one per thread cost a millisecond a node;
+// alone: before sm_70 a system fence is membar.sys, and one per thread cost a millisecond a
+// node; the fences are device scope (membar.gl), as every block of the grid shares the device;
 // the warp's other lanes issue their loads after the spinner's fence by program order.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
@@ -281,21 +282,20 @@ declare void @llvm.nvvm.bar.warp.sync(i32)
 define internal void @grid_barrier(i32 %threads) #1 { entry:
 %phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
 call void @llvm.amdgcn.s.barrier() %tid = call i32 @llvm.amdgcn.workitem.id.x()
-%lane = and i32 %tid, 31 %spinner = icmp eq i32 %lane, 0
 %leader = icmp eq i32 %tid, 0 br i1 %leader, label %arrive, label %check arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
-fence release
+fence syncscope("device") release
 %prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
 %last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
-fence acquire
+fence syncscope("device") acquire
 store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
-fence release
+fence syncscope("device") release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %wait check:
-br i1 %spinner, label %wait, label %waited wait:
+br label %waited wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %acquired, label %wait acquired:
-fence acquire br label %waited waited:
-call void @llvm.nvvm.bar.warp.sync(i32 -1)
+fence syncscope("device") acquire br label %waited waited:
+call void @llvm.amdgcn.s.barrier()
 ret void }"#;
 // A workgroup barrier on AMD is s_barrier between two workgroup-scope
 // fences: s_barrier alone neither waits for in-flight LDS stores nor keeps
@@ -322,8 +322,7 @@ define internal i64 @recipe.clock() #1 { entry: %now = call i64 @__ockl_steadyct
 define internal double @recipe.wave.partner(double %value, i32 %index) #1 { entry: %bits = bitcast double %value to i64 %low.bits = trunc i64 %bits to i32 %high.shift = lshr i64 %bits, 32 %high.bits = trunc i64 %high.shift to i32 %partner.low = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %low.bits) %partner.high = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %high.bits) %partner.high.wide = zext i32 %partner.high to i64 %partner.high.shift = shl i64 %partner.high.wide, 32 %partner.low.wide = zext i32 %partner.low to i64 %partner.bits = or i64 %partner.high.shift, %partner.low.wide %partner = bitcast i64 %partner.bits to double ret double %partner }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: %bits = bitcast float %value to i32 %partner.bits = call i32 @llvm.amdgcn.ds.bpermute(i32 %index, i32 %bits) %partner = bitcast i32 %partner.bits to float ret float %partner }"#;
 const IDENTITY_WAVE_HELPERS: &str = r#"define internal i32 @recipe.wavefront.width() #1 { entry: ret i32 1 }
-declare i64 @llvm.readcyclecounter()
-define internal i64 @recipe.clock() #1 { entry: %now = call i64 @llvm.readcyclecounter() ret i64 %now }
+define internal i64 @recipe.clock() #1 { entry: %now = call i64 @recipe.cpu.clock() ret i64 %now }
 define internal RECIPE_STATE @recipe.wave.partner(RECIPE_STATE %value, i32 %index) #1 { entry: ret RECIPE_STATE %value }
 define internal float @recipe.wave.partner.f32(float %value, i32 %index) #1 { entry: ret float %value }"#;
 /// The CPU's int8 dots, per state: the generic byte arithmetic under a float
@@ -1673,13 +1672,13 @@ fn platform(manifest: &str, key: &str, os: &str) -> BuildResult<String> {
 }
 struct NvidiaToolkit {
 	device_library: PathBuf,
-	assembler: PathBuf,
+	assemblers: Vec<PathBuf>,
 	required: bool,
 }
 fn nvidia_toolkit(manifest: &str, os: &str) -> BuildResult<Option<NvidiaToolkit>> {
 	let Some(entry) = configured_entry(manifest, "nvidia-toolkit", os)? else { return Ok(None) };
 	let Some(root) = configured(manifest, "nvidia-toolkit", os)?.map(PathBuf::from) else { return Ok(None) };
-	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assembler: root.join(text(manifest, "nvidia-assembler")?), required: entry.starts_with('$') }))
+	Ok(Some(NvidiaToolkit { device_library: root.join(text(manifest, "nvidia-device-library")?), assemblers: text(manifest, "nvidia-assembler")?.split(';').map(|path| root.join(path)).collect(), required: entry.starts_with('$') }))
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	(
@@ -1702,9 +1701,11 @@ const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global i32 0, align 4
 @recipe.cpu.barrier.context = internal thread_local global ptr null, align 8
 @recipe.cpu.barrier.wait = internal thread_local global ptr null, align 8
-define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
+@recipe.cpu.clock.read = internal thread_local global ptr null, align 8
+define RECIPE_CPU_ENTRY_LINKAGE void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait, ptr %clock) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 store ptr %clock, ptr @recipe.cpu.clock.read, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
-define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
+define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }
+define internal i64 @recipe.cpu.clock() #1 { entry: %read = load ptr, ptr @recipe.cpu.clock.read, align 8 %now = call i64 %read() ret i64 %now }"#;
 /// Contraction shape. Reverse K partitions use `split_span`, capped at
 /// `partitions`, for a fixed summation order across devices.
 #[derive(Clone, Copy)]
@@ -1930,7 +1931,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, os: &str, schedule: Schedule) -
 	println!("cargo:rustc-env=RECIPE_NV_RUNTIME={}", platform(manifest, "nvidia-runtime", os)?);
 	let toolkit = nvidia_toolkit(manifest, os)?.ok_or_else(|| io::Error::other(format!("nvidia-toolkit is not configured for {os}")))?;
 	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", toolkit.device_library.display());
-	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assembler.display());
+	println!("cargo:rustc-env=RECIPE_NV_ASSEMBLER={}", toolkit.assemblers.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
 	Ok(())
 }
@@ -2049,15 +2050,32 @@ fn main() -> BuildResult<()> {
 		("contraction-matrix-split-span", "RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"),
 		("contraction-chunk-k", "RECIPE_CONTRACTION_CHUNK_K"),
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
+		("lookup-readers", "RECIPE_LOOKUP_READERS"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("delta-chunk", "RECIPE_DELTA_CHUNK"),
+		("draft-positions", "RECIPE_DRAFT_POSITIONS"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
+		("tensor-split-region-bytes", "RECIPE_TENSOR_SPLIT_REGION_BYTES"),
 		("placement-launch-reserve-bytes", "RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"),
+		("nvidia-step-registers", "RECIPE_NVIDIA_STEP_REGISTERS"),
+		("lane-tuning", "RECIPE_LANE_TUNING"),
+		("lane-tuning-window", "RECIPE_LANE_TUNING_WINDOW"),
+		("lane-tuning-temperature", "RECIPE_LANE_TUNING_TEMPERATURE"),
+		("compile-memory-per-ir-byte", "RECIPE_COMPILE_MEMORY_PER_IR_BYTE"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
+	// Devices whose memory above a bound must not be used: `node:device = bytes`.
+	let usable = setting(&manifest, "device-usable-bytes")?.trim().strip_prefix('{').and_then(|value| value.strip_suffix('}')).ok_or_else(|| io::Error::other("device-usable-bytes must be a table"))?;
+	let usable = usable.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(|entry| {
+		let (device, bytes) = entry.split_once('=').ok_or_else(|| io::Error::other(format!("device-usable-bytes entry {entry} must be \"node:device\" = bytes")))?;
+		let (device, bytes) = (device.trim().trim_matches('"'), bytes.trim());
+		bytes.parse::<u64>().map_err(|error| io::Error::other(format!("device-usable-bytes for {device} must be a byte count: {error}")))?;
+		Ok(format!("{device}={bytes}"))
+	}).collect::<BuildResult<Vec<_>>>()?.join(";");
+	println!("cargo:rustc-env=RECIPE_DEVICE_USABLE_BYTES={usable}");
 	let (default_config, profiles) = precision_profiles(&manifest)?;
 	println!("cargo:rustc-env=RECIPE_DEFAULT_CONFIG={default_config}");
 	println!("cargo:rustc-env=RECIPE_PRECISION_PROFILES={profiles}");
@@ -2070,6 +2088,14 @@ fn main() -> BuildResult<()> {
 			value => return Err(io::Error::other(format!("multi-device must be false, true, or \"auto\", not {value}")).into()),
 		}
 	);
+	// How a model placed on several devices divides: by layers, every layer over
+	// every device (a tensor split), or a tensor split whenever every die reaches
+	// the first peer to peer (auto).
+	let split = setting(&manifest, "device-split")?.trim_matches('"');
+	if !matches!(split, "layer" | "tensor" | "auto") {
+		return Err(io::Error::other(format!("device-split must be \"layer\", \"tensor\", or \"auto\", not {split}")).into());
+	}
+	println!("cargo:rustc-env=RECIPE_DEVICE_SPLIT={split}");
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");

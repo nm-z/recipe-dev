@@ -993,6 +993,8 @@ mod program_ir {
 		pub span: usize,
 		/// The per-channel scale applied after normalization, when the node carries one.
 		pub weight: Option<&'a str>,
+		/// Whether a per-channel shift follows the scale, stored after it.
+		pub shift: bool,
 		pub mode: NormalizeMode,
 		pub prefix: &'a str,
 	}
@@ -1128,7 +1130,19 @@ mod program_ir {
 				let _ =
 					writeln!(output, "{weight_value} = load {ty}, {ptrty} {weight_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 				let _ = writeln!(output, "{scaled} = call {ty} @recipe.mul{suffix}({ty} {value}, {ty} {weight_value})", ty = context.value_type);
-				scaled
+				if context.shift {
+					let shift_column = format!("%{prefix}.shift.column");
+					let shift_pointer = format!("%{prefix}.shift.ptr");
+					let shift_value = format!("%{prefix}.shift");
+					let shifted = format!("%{prefix}.shifted");
+					let _ = writeln!(output, "{shift_column} = add i64 {column}, {span}", span = context.span);
+					let _ = writeln!(output, "{shift_pointer} = getelementptr inbounds {ty}, {ptrty} {weight}, i64 {shift_column}", ty = context.value_type, ptrty = context.pointer_type);
+					let _ = writeln!(output, "{shift_value} = load {ty}, {ptrty} {shift_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+					let _ = writeln!(output, "{shifted} = call {ty} @recipe.add{suffix}({ty} {scaled}, {ty} {shift_value})", ty = context.value_type);
+					shifted
+				} else {
+					scaled
+				}
 			}
 		};
 		let Some(inside) = &index.inside else { return NormalizeFragment { code: output, value } };
@@ -1203,7 +1217,7 @@ mod program_ir {
 			let normalized = emit_normalize(NormalizeContext {
 				value_type: mt, suffix, pointer_type: ptr, alignment: context.alignment,
 				source_value: &source, context: context.context, rows: context.rows, channels: context.channels,
-				length: context.length, width: context.width, span: context.span, weight: None, mode: context.mode, prefix: &replay_prefix,
+				length: context.length, width: context.width, span: context.span, weight: None, shift: false, mode: context.mode, prefix: &replay_prefix,
 			}, element);
 			code.push_str(&normalized.code);
 			normalized.value
@@ -1698,6 +1712,16 @@ pub(crate) struct NativeLayout {
 	/// device clock per node, written by thread 0 as each node begins; a
 	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
+	/// At inference, the byte offset in the context arena of the output node's
+	/// values at the last position a forward reached, one per output channel,
+	/// gathered on the device so a decode reads one column and not the tensor.
+	pub last_column: Option<usize>,
+	/// At inference, the byte offset in the context arena of the parts a packed
+	/// sum with too few rows for the device leaves before it adds them up.
+	pub split_scratch: Option<usize>,
+	/// At inference, the byte offset in the context arena of one i32 hardware
+	/// knob per node that the lane tuner writes between steps.
+	pub knobs: Option<usize>,
 	/// The arithmetic each node computes in, so the host converts what it
 	/// writes to or reads from a node's arena in that node's type.
 	pub precisions: Vec<Compute>,
@@ -1721,6 +1745,10 @@ pub(crate) struct NativeLayout {
 	/// The adjoint slot each such operand's contribution is written to in this
 	/// state type before it is converted and added to the operand's adjoint.
 	pub cast_adjoints: Vec<[Option<usize>; 2]>,
+	/// Each node whose carried state a window changes in place: the context
+	/// offset of that state, of the copies of it after each of the window's first
+	/// positions, and its bytes.
+	pub kept: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2024,7 +2052,7 @@ fn native_weight_arena(graph: &Graph, precision: Compute, inference: bool) -> Re
 		// read sixteen bytes at a time by the block dots.
 		let offset = align(bytes, element.max(16))?;
 		let span = match packed_weight(graph, index, inference) {
-			Some(weight) => weight.bytes.len(),
+			Some(weight) => interleaved_span(weight),
 			None => checked_mul(graph.nodes[index].parameters, element, "native weight arena")?,
 		};
 		offsets.push(offset);
@@ -2125,16 +2153,20 @@ fn last_uses(graph: &Graph) -> Vec<usize> {
 fn inference_window(graph: &Graph, rows: usize, inference: bool) -> usize {
 	const POSITIONS: usize = 128;
 	let length = graph.input.length;
-	let bounded = inference && rows == 1 && graph.input.channels == 1 && graph.output.length == 1
-		&& graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather)
+	// Token ids stay whole and are read at the window's first position; a part
+	// that continues another part's stream holds one window of it.
+	let ids = graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather);
+	let bounded = inference && rows == 1 && (!ids || graph.input.channels == 1)
 		&& graph.nodes.iter().enumerate().all(|(index, node)| {
 			(node.input.length == length || node.input.length == 1) && (node.output.length == length || node.output.length == 1)
-				&& (index == 0 || node.source >= 0) && node.second != -1
+				&& (index == 0 || node.source >= 0 || !ids || (node.source == -2 && node.op == Primitive::Lookup)) && (node.second != -1 || !ids)
 				&& match node.op {
-					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last => true,
+					// Each position on its own, or a state carried from the window's
+					// first position that the op reads at the window's origin.
+					Primitive::Gather | Primitive::Elementwise | Primitive::Rope | Primitive::Last | Primitive::Expand | Primitive::Read | Primitive::Outer | Primitive::Fold | Primitive::TopK
+					| Primitive::ExpertIn | Primitive::ExpertOut | Primitive::Exchange | Primitive::Lookup | Primitive::Delta | Primitive::Dconv | Primitive::Attention => true,
 					Primitive::Contraction => node.argument[0] <= 1.0,
 					Primitive::Normalize => normalize_mode(node.argument[0]).is_ok_and(|mode| mode.per_row()),
-					Primitive::Attention => attention_blocks(node) == 0,
 					_ => false,
 				}
 		});
@@ -2276,6 +2308,7 @@ impl NativeLayout {
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
+		let mut kept = Vec::new();
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
 		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
@@ -2337,7 +2370,12 @@ impl NativeLayout {
 			let regions = node_context(graph, &context_node, rows, node.precision, inference, step)?;
 			let temporary = inference && regions.iter().all(|(_, lifetime)| matches!(lifetime, BufferLifetime::Until(_) | BufferLifetime::Unused));
 			let plan = if temporary { &mut value_plan } else { &mut context_plan };
-			contexts.push(plan.allocate(&regions, unit, step, inference)?);
+			let offset = plan.allocate(&regions, unit, step, inference)?;
+			if inference && matches!(node.op, Primitive::Delta | Primitive::Dconv) && let [(live, _), .., _] = regions[..] {
+				let before = regions[..regions.len() - 1].iter().map(|(bytes, _)| bytes).sum::<usize>();
+				kept.push((offset, checked_add(offset, before, "kept state offset")?, live));
+			}
+			contexts.push(offset);
 			contexts_in_values.push(temporary);
 			let kv = if inference && node.op == Primitive::Attention {
 				let offset = context_plan.allocate(&[(attention_kv_bytes(node, rows, node.kv_precision)?, BufferLifetime::Retained)], unit, step, false)?;
@@ -2370,11 +2408,21 @@ impl NativeLayout {
 		let output_precision = graph.nodes.last().map_or(precision, |node| node.precision);
 		let output_adjoint_precision = gradient_precisions.last().copied().unwrap_or(Compute::FP32);
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
-		let clocks = if tracing() {
-			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1), 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
+		// The lane tuner reads the node clocks too.
+		let tuned = inference && lane_tuning();
+		let clocks = if tracing() || tuned {
+			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
+		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
+		let last_column = match graph.nodes.last().filter(|_| inference) {
+			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
+			None => None,
+		};
+		// One part per 32 inputs of every row: the most segments a row splits into.
+		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
+		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -2860,6 +2908,8 @@ fn link_variant(module: &str, text: &str, suffix: &str) -> String {
 		}
 	}
 	names.push("recipe.model.decode".to_owned());
+	names.push("recipe.model.dot.run".to_owned());
+	names.push("recipe.model.dot.run4".to_owned());
 	names.sort();
 	names.dedup();
 	// Backend plumbing has no arithmetic in it and, on the CPU, owns the
@@ -2942,6 +2992,163 @@ fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option
 	Ok(ir)
 }
 
+/// A packed node's one stored format when the run dot reads it: the format,
+/// its decoder, and its block's values and bytes.
+fn dot_run_format(plan: &NodePlan) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	// Dense weights in the arena are values of the node's own float type.
+	if !plan.packed && plan.stored.is_none() && plan.node.parameters != 0 {
+		let name = match plan.node.precision { Compute::FP32 => "f32", Compute::FP16 => "f16", _ => return None };
+		let spec = StorageFormat::named(name)?.spec()?;
+		return Some((spec.codec.quantization(), spec.codec.quantization().native, spec.block, spec.stride));
+	}
+	let stored = plan.stored.as_ref().filter(|_| plan.packed)?;
+	// A bias after the matrix is read through the node's element decoder, so the
+	// runs take the matrix's format.
+	let segment = match stored.format_segments()[..] {
+		[(segment, _)] => segment,
+		[(segment, _), _] if bias_tail(stored).is_some_and(|(_, count, _)| count == plan.node.shard.rows.local(plan.node.output.channels)) => segment,
+		_ => return None,
+	};
+	run_segment_format(segment)
+}
+/// A run format a packed weight's segment can take: its quantization, decoder,
+/// block and stride.
+fn run_segment_format(format: StorageFormat) -> Option<(&'static Quantization, NativeDequant, usize, usize)> {
+	let spec = format.spec()?;
+	let quantization = spec.codec.quantization();
+	if matches!(quantization.native, NativeDequant::Nf4) || spec.stride == 0 || !(spec.block % 32 == 0 || 32 % spec.block == 0) {
+		return None;
+	}
+	Some((quantization, quantization.native, spec.block, spec.stride))
+}
+/// One format's rows of a packed sum whose weight joins several formats, such
+/// as a query, key and value projection quantized apart: its decoder, its first
+/// row and row count, where its bytes start, and the id its runs dispatch on.
+#[derive(Clone)]
+struct RowSegment {
+	format: &'static Quantization,
+	native: NativeDequant,
+	block: usize,
+	stride: usize,
+	row: usize,
+	rows: usize,
+	bytes: usize,
+	id: usize,
+}
+/// The row segments of every packed sum whose weight joins formats a row at a
+/// time, by node; each segment's id follows the nodes' own ids.
+fn row_segments(plans: &[NodePlan], inference: bool, rows: usize) -> Vec<Option<Vec<RowSegment>>> {
+	let mut next = plans.len() + 1;
+	plans
+		.iter()
+		.map(|plan| {
+			let node = &plan.node;
+			let stored = plan.stored.as_ref().filter(|_| plan.packed && inference && rows == 1)?;
+			let segments = stored.format_segments();
+			let whole = node.shard.rows.count == 0 && node.shard.terms.count == 0 && node.parameters == node.input.channels * node.output.channels;
+			if segments.len() < 2 || !whole || node.op != Primitive::Contraction || node.int_bits != 0 || node.argument[0] > 1.0 || node.argument[2] == 0.0 {
+				return None;
+			}
+			let terms = node.input.channels;
+			let (mut row, mut bytes, mut parts) = (0, 0, Vec::new());
+			for (format, count) in segments {
+				let (format, native, block, stride) = run_segment_format(format)?;
+				if count % terms != 0 || terms % dot_run(block) != 0 || count % block != 0 {
+					return None;
+				}
+				parts.push(RowSegment { format, native, block, stride, row, rows: count / terms, bytes, id: 0 });
+				row += count / terms;
+				bytes += count / block * stride;
+			}
+			for part in &mut parts {
+				part.id = next;
+				next += 1;
+			}
+			Some(parts)
+		})
+		.collect()
+}
+/// The rows of stored weight `index` that interleave four bytes at a time, so
+/// the lanes of a wave, each on its own row, read one run of memory per word:
+/// the device's `lanes` for a weight only the run-decoder bodies read, and one
+/// (rows one after another) for every other weight.
+fn interleaved_lanes(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> u32 {
+	row_interleave(graph, index, inference, rows, lanes).map_or(1, |(lanes, ..)| lanes)
+}
+/// The bytes one block takes in interleaved rows. A lane's run over a large
+/// block is one straight body per place of the block within a word, so such
+/// blocks start on a word and the run has one body; small blocks stay packed.
+fn interleaved_stride(block: usize, stride: usize) -> usize {
+	if block >= 256 { stride.next_multiple_of(4) } else { stride }
+}
+/// The bytes a packed weight takes in the weight arena: room for its blocks at
+/// their interleaved stride, which the rows take when they interleave.
+fn interleaved_span(weight: &StoredWeight) -> usize {
+	let bytes = weight.bytes.len();
+	match weight.format_segments()[..] {
+		[(segment, _)] => segment.spec().filter(|spec| spec.stride != 0 && bytes % spec.stride == 0).map_or(bytes, |spec| bytes / spec.stride * interleaved_stride(spec.block, spec.stride)),
+		_ => bytes,
+	}
+}
+/// The lanes, row bytes and interleaved row bytes of stored weight `index`
+/// when its rows interleave.
+fn row_interleave(graph: &Graph, index: usize, inference: bool, rows: usize, lanes: u32) -> Option<(u32, usize, usize)> {
+	let node = &graph.nodes[index];
+	let stored = graph.stored.get(index).and_then(Option::as_ref)?;
+	if lanes <= 1 || !inference || rows != 1 || !node.packed || node.int_bits != 0 || graph.requantize.get(index).is_some_and(Option::is_some) || stored.bytes.absent_runs() {
+		return None;
+	}
+	let [(segment, _)] = stored.format_segments()[..] else { return None };
+	let spec = segment.spec()?;
+	// Blocks of a whole run, or small word-sized blocks a run holds whole (a float a value).
+	let whole_blocks = spec.block >= 32 && spec.block % 32 == 0;
+	let word_blocks = spec.block < 32 && 32 % spec.block == 0 && spec.stride % 4 == 0;
+	if matches!(spec.codec.quantization().native, NativeDequant::Nf4) || spec.stride == 0 || !(whole_blocks || word_blocks) {
+		return None;
+	}
+	let unit = dot_run(spec.block);
+	let (rows_local, terms_local) = (node.shard.rows.local(node.output.channels), node.shard.terms.local(node.input.channels));
+	let expert_width = |count: usize| if count != 0 { count } else { node.argument[2] as usize };
+	// The rows of the stored table, and the values in each row.
+	let (table_rows, row_values) = match node.op {
+		Primitive::Contraction if node.argument[0] <= 1.0 && node.argument[2] != 0.0 && node.input.channels % unit == 0 => (rows_local, terms_local),
+		Primitive::ExpertIn if node.input.channels % unit == 0 => (node.argument[0] as usize * expert_width(node.shard.rows.count), terms_local),
+		Primitive::ExpertOut if node.input.channels % unit == 0 && (node.argument[2] as usize) % unit == 0 => (node.argument[0] as usize * rows_local, expert_width(node.shard.terms.count)),
+		_ => return None,
+	};
+	let row_bytes = row_values / spec.block * spec.stride;
+	// Interleaved rows take whole words at the interleaved stride.
+	let padded_row = row_values / spec.block * interleaved_stride(spec.block, spec.stride);
+	let whole = row_values % spec.block == 0 && padded_row % 4 == 0 && table_rows % lanes as usize == 0 && stored.bytes.len() == table_rows * row_bytes;
+	whole.then_some((lanes, row_bytes, padded_row))
+}
+/// `bytes` of `rows` rows of `row_bytes` each, every block of `stride` bytes
+/// widened to `padded` with zeros, and the rows of every group of `lanes`
+/// interleaved four bytes at a time: word `w` of the group's row `l` sits at
+/// word `w * lanes + l` of the group.
+fn interleave_rows(bytes: &[u8], rows: usize, row_bytes: usize, lanes: usize, stride: usize, padded: usize) -> Vec<u8> {
+	let padded_row = row_bytes / stride * padded;
+	let (words, group_bytes) = (padded_row / 4, padded_row * lanes);
+	let mut interleaved = vec![0_u8; rows * padded_row];
+	let mut row_padded = vec![0_u8; padded_row];
+	for row in 0..rows {
+		for (block, source) in bytes[row * row_bytes..(row + 1) * row_bytes].chunks_exact(stride).enumerate() {
+			row_padded[block * padded..block * padded + stride].copy_from_slice(source);
+		}
+		let (group, lane) = (row / lanes, row % lanes);
+		for word in 0..words {
+			let to = group * group_bytes + (word * lanes + lane) * 4;
+			interleaved[to..to + 4].copy_from_slice(&row_padded[word * 4..word * 4 + 4]);
+		}
+	}
+	interleaved
+}
+/// The adjacent stored weights one lane decodes and dots at a time in a packed
+/// matrix-vector product: a whole block, so the lane reads each block once with
+/// wide loads, or 32 values of smaller blocks.
+fn dot_run(block: usize) -> usize {
+	if block >= 32 { block } else { 32 }
+}
 fn pointer_type(backend: Backend) -> &'static str {
 	if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" }
 }
@@ -3084,8 +3291,8 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "call void @recipe.cpu.barrier()",
-		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
+		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
+		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)\n",
 	}
 }
 
@@ -3135,6 +3342,9 @@ mod quantized {
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int;
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value;
+		/// One 64-bit word of a table built at emission, such as a grid entry's
+		/// levels packed a byte each: the values that share an entry share its load.
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int;
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value;
 		fn literal(&self, value: f64) -> Self::Value;
 		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value;
@@ -3178,6 +3388,8 @@ mod quantized {
 		pub(super) packing: IqPacking,
 		pub(super) table_name: &'static str,
 		pub(super) table: &'static [u16],
+		/// The value of each grid level: ggml's grid bytes, which are not evenly spaced.
+		pub(super) levels: &'static [u16],
 	}
 
 	#[derive(Clone, Copy)]
@@ -3308,12 +3520,14 @@ mod quantized {
 			}
 			_ => unreachable!(),
 		};
-		let table_word = quant.table(layout.table_name, layout.table, grid);
-		let man_shift = quant_int(quant, QuantIntOp::Multiply, table_lane, layout.man as u64);
-		let man_code = quant_bits(quant, table_word, man_shift, layout.man);
-		let man_code = quant_int(quant, QuantIntOp::Multiply, man_code, 2);
-		let man_code = quant_int(quant, QuantIntOp::Add, man_code, 1);
-		let mantissa = quant.number(man_code, false);
+		// Every grid entry's levels, a byte each in one word: the values of one
+		// entry share one load, and each takes its byte.
+		let lanes = if layout.man == 2 { 8 } else { 4 };
+		let packed = layout.table.iter().map(|word| (0..lanes).fold(0_u64, |packed, lane| packed | u64::from(layout.levels[(word >> (lane * layout.man as usize)) as usize & ((1 << layout.man) - 1)]) << (8 * lane))).collect::<Vec<_>>();
+		let entry = quant.word_table(&format!("{}_levels", layout.table_name), &packed, grid);
+		let shift = quant_int(quant, QuantIntOp::Multiply, table_lane, 8);
+		let level = quant_bits(quant, entry, shift, 8);
+		let mantissa = quant.number(level, false);
 		let exponent = if odd_factor {
 			let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
 			let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
@@ -3743,6 +3957,9 @@ mod quantized {
 		fn signed_table(&mut self, _name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
 			values[index as usize] as i64 as u64
 		}
+		fn word_table(&mut self, _name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			values[index as usize]
+		}
 		fn value_table(&mut self, _name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			values[index as usize]
 		}
@@ -3858,26 +4075,57 @@ mod quantized {
 			self.instruction(format!("call {state} @recipe.state.from.f16{}(half {half})", self.suffix))
 		}
 		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i16, ptr {address}, align 2"));
+			// Up to eight byte entries fit one constant: the entry is a shift away.
+			if values.len() <= 8 && values.iter().all(|value| *value < 256) {
+				let packed = values.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value) << (8 * at));
+				let shift = self.instruction(format!("shl i64 {index}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {packed}, {shift}"));
+				return self.instruction(format!("and i64 {shifted}, 255"));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i16, ptr addrspace(1) {address}, align 2, !invariant.load !{{}}"));
 			self.instruction(format!("zext i16 {loaded} to i64"))
 		}
 		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
-			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			let loaded = self.instruction(format!("load i8, ptr {address}, align 1"));
+			// Up to sixteen byte entries fit two constants: the entry is a select and a
+			// shift away, with no load.
+			if values.len() <= 16 {
+				let pack = |part: &[i8]| part.iter().enumerate().fold(0_u64, |packed, (at, value)| packed | u64::from(*value as u8) << (8 * at)) as i64;
+				let (low, high) = (pack(&values[..values.len().min(8)]), pack(values.get(8..).unwrap_or(&[])));
+				let upper = self.instruction(format!("icmp uge i64 {index}, 8"));
+				let word = self.instruction(format!("select i1 {upper}, i64 {high}, i64 {low}"));
+				let lane = self.instruction(format!("and i64 {index}, 7"));
+				let shift = self.instruction(format!("shl i64 {lane}, 3"));
+				let shifted = self.instruction(format!("lshr i64 {word}, {shift}"));
+				let byte = self.instruction(format!("trunc i64 {shifted} to i8"));
+				return self.instruction(format!("sext i8 {byte} to i64"));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			let loaded = self.instruction(format!("load i8, ptr addrspace(1) {address}, align 1, !invariant.load !{{}}"));
 			self.instruction(format!("sext i8 {loaded} to i64"))
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+				self.globals.push_str(&format!(
+					"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i64] [{}]\n",
+					values.len(),
+					values.iter().map(|value| format!("i64 {}", *value as i64)).collect::<Vec<_>>().join(", ")
+				));
+			}
+			let address = self.instruction(format!("getelementptr inbounds [{} x i64], ptr addrspace(1) @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load i64, ptr addrspace(1) {address}, align 8, !invariant.load !{{}}"))
 		}
 		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
 			let ty = self.precision.state_type;
-			if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+			if !self.globals.contains(&format!("@recipe_model_{name}_{ty} =")) {
 				self.globals.push_str(&format!(
-					"@recipe_model_{name} = private unnamed_addr constant [{} x {ty}] [{}]\n",
+					"@recipe_model_{name}_{ty} = private unnamed_addr addrspace(1) constant [{} x {ty}] [{}]\n",
 					values.len(),
 					values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.state, ty, *value))).collect::<Vec<_>>().join(", ")
 				));
 			}
-			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
-			self.instruction(format!("load {ty}, ptr {address}, align {}", super::alignment(ty)))
+			let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr addrspace(1) @recipe_model_{name}_{ty}, i32 0, i64 {index}", values.len()));
+			self.instruction(format!("load {ty}, ptr addrspace(1) {address}, align {}, !invariant.load !{{}}", super::alignment(ty)))
 		}
 		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
 			let ty = self.precision.state_type;
@@ -3908,8 +4156,245 @@ mod quantized {
 			self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}"))
 		}
 	}
+
+	/// An integer of a run decoder: known when the generator can compute it, IR otherwise.
+	#[derive(Clone)]
+	pub(super) enum RunInt {
+		Known(u64),
+		Ir(String),
+	}
+	impl RunInt {
+		fn text(&self) -> String {
+			match self {
+				Self::Known(value) => value.to_string(),
+				Self::Ir(name) => name.clone(),
+			}
+		}
+	}
+
+	/// Decodes one value of a block whose place in the block is known when the IR
+	/// is generated. Every integer the format derives from that place folds to a
+	/// constant, so its byte offsets are constants too, and the bytes come from
+	/// aligned words loaded once per block and shared by every value decoded
+	/// through the same `RunQuantOps`.
+	pub(super) struct RunQuantOps<'a> {
+		pub(super) inner: &'a mut NativeQuantOps,
+		/// The value's place in its block.
+		pub(super) local: u64,
+		/// The block's byte address and the alignment it is known to have.
+		pub(super) block: String,
+		pub(super) align: u64,
+		pub(super) words: &'a mut std::collections::HashMap<(String, u64), String>,
+		/// The bytes before the block's first byte from `block`, the aligned
+		/// address the words are read from.
+		pub(super) skew: u64,
+		/// The bytes from one word of the block to the next: the word itself, or
+		/// a word of every lane's row where rows interleave.
+		pub(super) pitch: u64,
+	}
+	impl RunQuantOps<'_> {
+		fn word_bytes(&self) -> u64 {
+			self.align.min(4)
+		}
+		fn word(&mut self, word: u64) -> String {
+			let key = (self.block.clone(), word);
+			if let Some(name) = self.words.get(&key) {
+				return name.clone();
+			}
+			let (bytes, pointer) = (self.word_bytes(), pointer_type(self.inner.backend));
+			let offset = word * self.pitch;
+			let align = if offset == 0 { self.align } else { self.align.min(1 << offset.trailing_zeros()) };
+			let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {offset}", self.block));
+			let loaded = self.inner.instruction(format!("load i{}, {pointer} {address}, align {align}, !invariant.load !{{}}", bytes * 8));
+			let wide = self.inner.instruction(format!("zext i{} {loaded} to i64", bytes * 8));
+			self.words.insert(key, wide.clone());
+			wide
+		}
+		/// The little-endian integer of `bits` bits at byte `offset`, assembled from words.
+		fn bytes(&mut self, offset: u64, bits: u8) -> String {
+			let per = self.word_bytes();
+			let mut value = "0".to_owned();
+			for byte in 0..u64::from(bits / 8) {
+				let at = self.skew + offset + byte;
+				let word = self.word(at / per);
+				let shifted = self.inner.instruction(format!("lshr i64 {word}, {}", (at % per) * 8));
+				let masked = self.inner.instruction(format!("and i64 {shifted}, 255"));
+				let placed = self.inner.instruction(format!("shl i64 {masked}, {}", byte * 8));
+				value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+			}
+			value
+		}
+	}
+	impl QuantOps for RunQuantOps<'_> {
+		type Int = RunInt;
+		type Value = String;
+		fn index(&self) -> Self::Int {
+			RunInt::Known(self.local)
+		}
+		fn integer(&self, value: u64) -> Self::Int {
+			RunInt::Known(value)
+		}
+		fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int {
+			if let (RunInt::Known(left), RunInt::Known(right)) = (&left, &right) {
+				let (left, right) = (*left, *right);
+				let folded = match operation {
+					QuantIntOp::Add => Some(left.wrapping_add(right)),
+					QuantIntOp::Subtract => Some(left.wrapping_sub(right)),
+					QuantIntOp::Multiply => Some(left.wrapping_mul(right)),
+					QuantIntOp::Divide => left.checked_div(right),
+					QuantIntOp::Remainder => left.checked_rem(right),
+					QuantIntOp::ShiftLeft => (right < 64).then(|| left << right),
+					QuantIntOp::ShiftRight => (right < 64).then(|| left >> right),
+					QuantIntOp::And => Some(left & right),
+					QuantIntOp::Or => Some(left | right),
+					QuantIntOp::Xor => Some(left ^ right),
+				};
+				if let Some(value) = folded {
+					return RunInt::Known(value);
+				}
+			}
+			RunInt::Ir(self.inner.int(operation, left.text(), right.text()))
+		}
+		fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left == right)),
+				_ => RunInt::Ir(self.inner.equal(left.text(), right.text())),
+			}
+		}
+		fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int {
+			match (&left, &right) {
+				(RunInt::Known(left), RunInt::Known(right)) => RunInt::Known(u64::from(left < right)),
+				_ => RunInt::Ir(self.inner.less(left.text(), right.text())),
+			}
+		}
+		fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => RunInt::Ir(self.inner.select_int(condition, yes.text(), no.text())),
+			}
+		}
+		fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int {
+			match value {
+				RunInt::Known(value) => {
+					let shift = 64 - u32::from(bits);
+					RunInt::Known((((value << shift) as i64) >> shift) as u64)
+				}
+				RunInt::Ir(value) => RunInt::Ir(self.inner.sign_extend(value, bits)),
+			}
+		}
+		fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
+			match offset {
+				RunInt::Known(offset) => RunInt::Ir(self.bytes(offset, bits)),
+				// A byte at a runtime offset of interleaved rows lies in its word's
+				// place of the lane's row: the value assembles a byte at a time.
+				RunInt::Ir(offset) if self.pitch != self.word_bytes() => {
+					let offset = self.inner.int(QuantIntOp::Add, offset, self.skew.to_string());
+					let pointer = pointer_type(self.inner.backend);
+					let mut value = "0".to_owned();
+					for byte in 0..u64::from(bits / 8) {
+						let at = self.inner.int(QuantIntOp::Add, offset.clone(), byte.to_string());
+						let word = self.inner.int(QuantIntOp::Divide, at.clone(), "4".to_owned());
+						let within = self.inner.int(QuantIntOp::Remainder, at, "4".to_owned());
+						let spaced = self.inner.int(QuantIntOp::Multiply, word, self.pitch.to_string());
+						let place = self.inner.int(QuantIntOp::Add, spaced, within);
+						let address = self.inner.instruction(format!("getelementptr inbounds i8, {pointer} {}, i64 {place}", self.block));
+						let loaded = self.inner.instruction(format!("load i8, {pointer} {address}, align 1, !invariant.load !{{}}"));
+						let wide = self.inner.instruction(format!("zext i8 {loaded} to i64"));
+						let placed = self.inner.instruction(format!("shl i64 {wide}, {}", byte * 8));
+						value = self.inner.instruction(format!("or i64 {value}, {placed}"));
+					}
+					RunInt::Ir(value)
+				}
+				RunInt::Ir(offset) => {
+					let offset = if self.skew == 0 { offset } else { self.inner.int(QuantIntOp::Add, offset, self.skew.to_string()) };
+					let address = self.inner.instruction(format!("getelementptr inbounds i8, {} {}, i64 {offset}", pointer_type(self.inner.backend), self.block));
+					let loaded = self.inner.instruction(format!("load i{bits}, {} {address}, align 1, !invariant.load !{{}}", pointer_type(self.inner.backend)));
+					RunInt::Ir(if bits == 64 { loaded } else { self.inner.instruction(format!("zext i{bits} {loaded} to i64")) })
+				}
+			}
+		}
+		fn half(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(16, offset);
+			self.half_bits(bits)
+		}
+		fn float(&mut self, offset: Self::Int) -> Self::Value {
+			let bits = self.load(32, offset).text();
+			let state = self.inner.precision.state_type;
+			let narrow = self.inner.instruction(format!("trunc i64 {bits} to i32"));
+			let float = self.inner.instruction(format!("bitcast i32 {narrow} to float"));
+			self.inner.instruction(format!("call {state} @recipe.state.from.f32{}(float {float})", self.inner.suffix))
+		}
+		fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
+			self.inner.half_bits(bits.text())
+		}
+		fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(u64::from(values[index as usize])),
+				// Values of one grid point share its entry: the run reads it once.
+				RunInt::Ir(index) => {
+					let key = (format!("table {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
+			}
+		}
+		fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(i64::from(values[index as usize]) as u64),
+				RunInt::Ir(index) => RunInt::Ir(self.inner.signed_table(name, values, index)),
+			}
+		}
+		fn word_table(&mut self, name: &str, values: &[u64], index: Self::Int) -> Self::Int {
+			match index {
+				RunInt::Known(index) => RunInt::Known(values[index as usize]),
+				RunInt::Ir(index) => {
+					let key = (format!("words {name} {index}"), 0);
+					if let Some(entry) = self.words.get(&key) {
+						return RunInt::Ir(entry.clone());
+					}
+					let entry = self.inner.word_table(name, values, index);
+					self.words.insert(key, entry.clone());
+					RunInt::Ir(entry)
+				}
+			}
+		}
+		fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
+			match index {
+				RunInt::Known(index) => self.inner.literal(values[index as usize]),
+				RunInt::Ir(index) => self.inner.value_table(name, values, index),
+			}
+		}
+		fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
+			match value {
+				RunInt::Known(value) => self.inner.literal(if signed { value as i64 as f64 } else { value as f64 }),
+				RunInt::Ir(value) => self.inner.number(value, signed),
+			}
+		}
+		fn literal(&self, value: f64) -> Self::Value {
+			self.inner.literal(value)
+		}
+		fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value {
+			self.inner.value(operation, left, right)
+		}
+		fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value {
+			match condition {
+				RunInt::Known(condition) => if condition != 0 { yes } else { no },
+				RunInt::Ir(condition) => self.inner.select_value(condition, yes, no),
+			}
+		}
+		fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value {
+			match sign {
+				RunInt::Known(0) => magnitude,
+				sign => self.inner.signed(magnitude, sign.text()),
+			}
+		}
+	}
 }
-use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
+use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, RunQuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
 	/// Emits loads of a runtime schedule slot from the context arena. Keeping
@@ -3938,6 +4423,12 @@ impl NativeModelIr {
 
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		// An inference pass computes every node's window first, then marks where
+		// each block's nodes begin, so the caller can give each block a function.
+		let blocked = !reverse && !training;
+		let mut windows = String::new();
+		let mut block = None;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
@@ -3951,17 +4442,99 @@ impl NativeModelIr {
 			if plan.node.block_kind == "recur_body" {
 				continue;
 			}
+			if blocked && block != Some(plan.node.block_index) {
+				block = Some(plan.node.block_index);
+				ir.push_str(&format!("{BLOCK_MARK}{}\n", plan.node.block_index));
+			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
 			let v = self.variant(node);
+			// The run decoder a packed sum over stored weights calls, when it has one.
+			let key = self.run_key(index).unwrap_or_default();
 			let matrix = matrix && matrix_capable(self.node_precision(node));
 			let gradient_base = self.gradient_base(plan)?;
 			// The reverse pass differentiates the whole sequence at once.
-			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, &mut ir)? };
+			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, if blocked { &mut windows } else { &mut ir })? };
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
+				// A float sum over a stored format, one row at a time: the packed body.
+				// A weight that joins formats a row at a time takes it once per format.
+				(false, Primitive::Contraction)
+					if self.inference
+						&& self.rows == 1 && node.int_bits == 0
+						&& node.argument[0] <= 1.0
+						&& (dot_run_format(plan).is_some_and(|(_, _, block, _)| node.input.channels % dot_run(block) == 0) || segments[index].is_some()) =>
+				{
+					let rows = node.shard.rows.local(node.output.channels);
+					// Each part: its decoder key, dispatch id, first row, rows, and first byte.
+					let parts = match &segments[index] {
+						Some(segments) => segments.iter().map(|segment| (segment.format.name.to_owned(), segment.id, segment.row, segment.rows, segment.bytes)).collect::<Vec<_>>(),
+						None => vec![(key.clone(), index + 1, 0, rows, 0)],
+					};
+					let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+					let scratch = self.split_scratch_name(backend, index);
+					ir.push_str(&self.split_scratch_gep(backend, index));
+					for (part, (key, id, first_row, rows, bytes)) in parts.iter().enumerate() {
+						let p = format!("n{index}.p{part}");
+						// A later part's split scratch is free only once the part before is summed.
+						if part > 0 {
+							ir.push_str(barrier(backend));
+						}
+						let weights = if *bytes == 0 { pointers.weights.clone() } else {
+							ir.push_str(&format!("%{p}.weights = getelementptr inbounds i8, {pointer} {}, i64 {bytes}\n", pointers.weights));
+							format!("%{p}.weights")
+						};
+						let value = if *first_row == 0 { pointers.value.clone() } else {
+							ir.push_str(&format!("%{p}.value = getelementptr inbounds {ty}, {pointer} {}, i64 {}\n", pointers.value, first_row * node.output.length));
+							format!("%{p}.value")
+						};
+						// A window of two positions or more takes the four-position lane body;
+						// a one-position step takes the lane body, and the row body takes what
+						// the lane bodies cannot.
+						ir.push_str(&format!("br label %{p}.pre\n{p}.pre:\n"));
+						ir.push_str(&format!(
+							"%{p}.tiling = icmp uge i32 {span}, 2\nbr i1 %{p}.tiling, label %{p}.tile, label %{p}.untiled\n{p}.tile:\n%{p}.tiled.count = call i32 @packed_lanes4_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %{p}.untiled\n{p}.untiled:\n%{p}.tiled = phi i32 [ 0, %{p}.pre ], [ %{p}.tiled.count, %{p}.tile ]\n%{p}.rest.begin = add i32 {begin}, %{p}.tiled\n%{p}.rest.span = sub i32 {span}, %{p}.tiled\n%{p}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.rest.begin, i32 %{p}.rest.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%{p}.last.begin = add i32 %{p}.rest.begin, %{p}.laned\n%{p}.last.span = sub i32 %{p}.rest.span, %{p}.laned\n",
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+							decode = plan.decode(index),
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+						));
+						ir.push_str(&format!("%{p}.rows.some = icmp ne i32 %{p}.last.span, 0\nbr i1 %{p}.rows.some, label %{p}.rows, label %{p}.rows.done\n{p}.rows:\n"));
+						ir.push_str(&format!(
+							"call void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %{p}.last.begin, i32 %{p}.last.span, i1 {bias}, i1 {relu}, i32 %threads, i64 0, i32 {decode}, i32 {id}, i32 0, i32 0, i32 0, i32 0, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_share}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n",
+							row_first = node.shard.rows.first,
+							row_period = node.shard.rows.period,
+							row_share = node.shard.rows.count,
+							in_first = node.shard.terms.first,
+							in_period = node.shard.terms.period,
+							in_share = node.shard.terms.count,
+							decode = plan.decode(index),
+							source = pointers.source,
+							terms = node.shard.terms.local(node.input.channels),
+							in_length = node.input.length,
+							out_length = node.output.length,
+							bias = node.argument[2] == 0.0,
+							relu = node.argument[1] == 1.0,
+						));
+						ir.push_str(&format!("br label %{p}.rows.done\n{p}.rows.done:\n"));
+					}
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Contraction) => {
+					if self.inference && tracing() {
+						let segments = plan.stored.as_ref().map(|stored| stored.format_segments().iter().map(|(format, count)| format!("{}x{count}", quantization(format.0))).collect::<Vec<_>>().join("+"));
+						trace(&format!("contraction node {index} takes the general body: packed {} segments {segments:?} int {} kernel {} inputs {}", plan.packed, node.int_bits, node.argument[0], node.input.channels))?;
+					}
 					let tiles = self.emit_schedule_words(backend, index, &format!("n{index}.schedule"), 0, 3, &mut ir)?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
@@ -4003,6 +4576,25 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::TopK) if self.inference && self.rows == 1 && backend != Backend::Cpu && node.output.channels <= 64 * 32 => {
+					// A lane keeps its experts' picks in 64 bits, so a 32-lane wave takes up to 2048 experts.
+					// One wave per position: the lanes pick the top experts together.
+					let prefix = format!("n{index}.topk");
+					ir.push_str(&format!(
+						"%{prefix}.width = call i32 @recipe.wavefront.width()\n%{prefix}.wave = udiv i32 %tid, %{prefix}.width\n%{prefix}.lane = urem i32 %tid, %{prefix}.width\n%{prefix}.waves = udiv i32 %threads, %{prefix}.width\n%{prefix}.end = add i32 {begin}, {span}\n%{prefix}.first = add i32 {begin}, %{prefix}.wave\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.position = phi i32 [ %{prefix}.first, %{prefix}.entry ], [ %{prefix}.position.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.position, %{prefix}.end\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.p = zext i32 %{prefix}.position to i64\ncall void @topk_forward_wave_body{v}( {pointer} {source}, {pointer} {value}, i64 %{prefix}.p, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize}, i32 %{prefix}.lane, i32 %{prefix}.width )\n%{prefix}.position.next = add i32 %{prefix}.position, %{prefix}.waves\nbr label %{prefix}.loop\n{prefix}.done:\n",
+						pointer = pointer_type(backend),
+						begin = window.begin,
+						span = window.span,
+						source = pointers.source,
+						value = pointers.value,
+						experts = node.output.channels,
+						length = node.output.length,
+						top = node.argument[0],
+						scoring = node.argument[1],
+						renormalize = node.argument[2]
+					));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::TopK) => {
@@ -4048,7 +4640,7 @@ impl NativeModelIr {
 					let factor = native_literal(self.node_precision(node).model, ty, node.argument[5]);
 					let chain = native_literal(self.node_precision(node).model, ty, node.argument[6]);
 					let fast = native_literal(self.node_precision(node).model, ty, node.argument[7]);
-					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8]);
+					let slow = native_literal(self.node_precision(node).model, ty, node.argument[8].abs());
 					let mut emit = |ir: &mut String, _p: &str, wide: &str| {
 						ir.push_str(&format!(
 							"call void @{body}{v}( {pointer} {input}, {pointer} {weights}, {pointer} {output}, {pointer} {context}, i1 {sectioned}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, {ty} {mscale}, {ty} {factor}, {ty} {chain}, {ty} {fast}, {ty} {slow}, i1 {has_factors}, i1 {reverse}{position_origin} )\n",
@@ -4058,6 +4650,19 @@ impl NativeModelIr {
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							has_factors = node.parameters != 0,
+							body = body,
+							v = v,
+							input = input,
+							output = output,
+							wide = wide,
+							ty = ty,
+							base = base,
+							mscale = mscale,
+							factor = factor,
+							chain = chain,
+							fast = fast,
+							slow = slow,
+							reverse = reverse,
 							channels = node.output.channels,
 							length = node.output.length,
 							head_width = node.argument[2],
@@ -4070,6 +4675,53 @@ impl NativeModelIr {
 					} else {
 						emit_runtime_window_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, node.output, &window, &mut emit)?;
 					}
+					ir.push_str(barrier(backend));
+				}
+				// An expert table in a stored format with a run dot is a contraction
+				// whose rows or inputs the position's routed experts select.
+				(false, Primitive::ExpertIn | Primitive::ExpertOut)
+					if self.inference && self.rows == 1 && node.int_bits == 0 && dot_run_format(plan).is_some_and(|(_, _, block, _)| {
+						let unit = dot_run(block);
+						node.input.channels % unit == 0 && (node.op == Primitive::ExpertIn || (node.argument[2] as usize) % unit == 0)
+					}) =>
+				{
+					// The lane body takes the window, a row per lane; the row body takes
+					// what the lane body cannot.
+					ir.push_str(&format!(
+						"{scratch_gep}%n{index}.laned = call i32 @packed_lanes_body{v}.{key}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 {begin}, i32 {span}, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\n%n{index}.last.begin = add i32 {begin}, %n{index}.laned\n%n{index}.last.span = sub i32 {span}, %n{index}.laned\n%n{index}.rows.some = icmp ne i32 %n{index}.last.span, 0\nbr i1 %n{index}.rows.some, label %n{index}.rows, label %n{index}.rows.done\nn{index}.rows:\ncall void @packed_rows_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, i32 {rows}, i32 {terms}, i32 {in_length}, i32 {out_length}, i32 %n{index}.last.begin, i32 %n{index}.last.span, i1 false, i1 false, i32 %threads, i64 0, i32 {decode}, i32 {node}, i32 {mode}, i32 {hidden}, i32 {experts}, i32 {top}, {pointer} {scratch}, i32 {row_first}, i32 {row_period}, i32 {row_local}, i32 {in_first}, i32 {in_period}, i32 {in_share} )\nbr label %n{index}.rows.done\nn{index}.rows.done:\n",
+						// A split expert table holds a share of every expert: the gate and
+						// up tables its hidden rows (placed within each expert's period),
+						// the down table its output rows.
+						row_first = node.shard.rows.first,
+						row_period = node.shard.rows.period,
+						row_local = node.shard.rows.count,
+						in_first = node.shard.terms.first,
+						in_period = node.shard.terms.period,
+						in_share = node.shard.terms.count,
+						node = index + 1,
+						scratch_gep = self.split_scratch_gep(backend, index),
+						scratch = self.split_scratch_name(backend, index),
+						pointer = pointer_type(backend),
+						decode = plan.decode(index),
+						source = pointers.source,
+						routing = pointers.second,
+						weights = pointers.weights,
+						value = pointers.value,
+						rows = node.shard.rows.local(node.output.channels),
+						terms = node.shard.terms.local(node.input.channels),
+						in_length = node.input.length,
+						out_length = node.output.length,
+						mode = if node.op == Primitive::ExpertIn { 1 } else { 2 },
+						// A die holding a share of every expert's hidden rows or inputs
+						// sees that share as the expert's hidden width.
+						hidden = match (node.op, node.shard.rows.count, node.shard.terms.count) {
+							(Primitive::ExpertIn, count, _) if count != 0 => count as f64,
+							(Primitive::ExpertOut, _, count) if count != 0 => count as f64,
+							_ => node.argument[2],
+						},
+						experts = node.argument[0],
+						top = node.argument[1]
+					));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertIn) => {
@@ -4094,7 +4746,8 @@ impl NativeModelIr {
 				(false, Primitive::Read) => {
 					emit_runtime_window_loop(&mut ir, index, "read", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @read_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4103,6 +4756,39 @@ impl NativeModelIr {
 							length = node.output.length,
 							lanes = node.argument[0],
 							gated = node.second >= 0
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Dconv) if self.inference && self.rows == 1 && self.layout.window_positions < self.graph.input.length => {
+					// The window's buffer holds its positions alone; the taps behind it
+					// read the channel history this node keeps in its context.
+					let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")?, integer_argument(node.argument[1], "depthwise dilation")?.max(1));
+					let tail = (kernel - 1) * dilation;
+					ir.push_str(&format!("%n{index}.dconv.fresh = icmp eq i32 %begin, 0\n"));
+					emit_runtime_window_loop(&mut ir, index, "dconv", node.output, &window, |ir, _p, wide| {
+						ir.push_str(&format!(
+							"call void @dconv_window_body{v}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), decode = plan.decode(index), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context,
+							channels = node.output.channels, length = node.output.length
+						));
+					})?;
+					ir.push_str(barrier(backend));
+					let channels = Shape { channels: node.output.channels, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
+					let kept_bytes = self.layout.kept.iter().find(|(live, ..)| *live == self.layout.contexts[index]).map_or(0, |(.., bytes)| *bytes);
+					emit_runtime_window_loop(&mut ir, index, "dconv.history", channels, &whole, |ir, _p, wide| {
+						// The history after each of the window's first positions but its
+						// last is kept before the live history moves past them.
+						let p = format!("n{index}.dconv.keep");
+						ir.push_str(&format!(
+							"br label %{p}.entry\n{p}.entry:\nbr label %{p}.loop\n{p}.loop:\n%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.next, %{p}.step ]\n%{p}.more = icmp ult i32 %{p}.j, {slots}\n%{p}.last = sub i32 {span}, 1\n%{p}.inner = icmp ult i32 %{p}.j, %{p}.last\n%{p}.go = and i1 %{p}.more, %{p}.inner\nbr i1 %{p}.go, label %{p}.step, label %{p}.done\n{p}.step:\n%{p}.span = add i32 %{p}.j, 1\n%{p}.j.wide = zext i32 %{p}.j to i64\n%{p}.at = mul i64 %{p}.j.wide, {kept_bytes}\n%{p}.target = getelementptr i8, {pointer} {kept}, i64 %{p}.at\ncall void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} %{p}.target, i64 {wide}, i32 {length}, i32 %{p}.span, i32 {tail}, i1 %n{index}.dconv.fresh )\n%{p}.next = add i32 %{p}.j, 1\nbr label %{p}.loop\n{p}.done:\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
+						));
+						ir.push_str(&format!(
+							"call void @dconv_history_body{v}( {pointer} {source}, {pointer} {context}, {pointer} {context}, i64 {wide}, i32 {length}, i32 {span}, i32 {tail}, i1 %n{index}.dconv.fresh )\n",
+							pointer = pointer_type(backend), source = pointers.source, context = pointers.context, length = node.output.length, span = window.span
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -4186,7 +4872,8 @@ impl NativeModelIr {
 				(false, Primitive::Outer) => {
 					emit_runtime_window_loop(&mut ir, index, "outer", node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @outer_forward_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated}, i32 {pick} )\n",
+							pick = node.argument[1],
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -4199,7 +4886,50 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(false, Primitive::Delta) if self.inference => {
+					// One row, head and value column per element: columns of the state
+					// never read each other, and the live state walks only the window.
+					let (key_heads, key_width, heads, width) = delta_extent(node)?;
+					let pairs = checked_mul(self.rows, heads as usize, "delta pairs")?;
+					let columns = Shape { channels: checked_mul(pairs, width as usize, "delta columns")?, length: 1 };
+					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					let length = narrow(node.output.length, "delta length")?;
+					let (kept, slots) = self.kept_states(backend, index, &pointers.context, &mut ir)?;
+					emit_runtime_window_loop(&mut ir, index, "delta", columns, &whole, |ir, _p, wide| {
+						ir.push_str(&format!(
+							concat!(
+								"call void @delta_live_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, ",
+								"i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {pairs}, ",
+								"i32 %begin, i32 %end, i32 {decode}, i1 {tiled}, {ty} {scale}, i32 {origin}, i1 {sigmoid_decay}, {pointer} {kept}, i32 {slots} )\n"
+							),
+							origin = if self.layout.window_positions < self.graph.input.length { "%begin" } else { "0" },
+							tiled = node.argument[5] == 1.0,
+							sigmoid_decay = node.argument[7] == 1.0,
+							kept = kept,
+							slots = slots,
+							v = v,
+							wide = wide,
+							pairs = pairs,
+							key_heads = key_heads,
+							key_width = key_width,
+							heads = heads,
+							width = width,
+							length = length,
+							ty = self.node_precision(node).model_type,
+							scale = native_literal(self.node_precision(node).model, self.node_precision(node).model_type, if node.argument[6] == 0.0 { 1.0 } else { node.argument[6] }),
+							pointer = pointer_type(backend),
+							decode = plan.decode(index),
+							source = pointers.source,
+							second = pointers.second,
+							weights = pointers.weights,
+							value = pointers.value,
+							context = pointers.context,
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
 				(false, Primitive::Delta) => {
+					require(node.argument[5] == 0.0 && (node.argument[6] == 0.0 || node.argument[6] == 1.0), "a delta block with tiled key heads or a scaled output runs at inference only")?;
 					// One row and head per element: a `[heads, 1]` shape walked whole.
 					let shape = delta_shape(node, self.rows)?;
 					let pairs = Shape { channels: shape.heads as usize, length: 1 };
@@ -4210,7 +4940,15 @@ impl NativeModelIr {
 					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries}, i32 {decode} )\n",
+							concat!(
+								"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
+								"{pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, ",
+								"i32 {entries}, i32 {decode}, i1 {sigmoid_decay} )\n"
+							),
+							sigmoid_decay = node.argument[7] == 1.0,
+							v = v,
+							wide = wide,
+							entries = entries,
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -4537,6 +5275,98 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
+				(true, Primitive::Exchange) => return Err(RecipeError::new("a tensor-split exchange has no reverse pass")),
+				(false, Primitive::Exchange) => {
+					require(backend == Backend::Nvidia, "a tensor-split exchange runs on NVIDIA devices")?;
+					require(self.rows == 1, "a tensor-split exchange moves one row")?;
+					let pointer = pointer_type(backend);
+					let precision = self.node_precision(node);
+					let (ty, state) = (precision.model_type, precision.state_type);
+					let sum = node.argument[0] != 0.0;
+					let die = integer_argument(node.argument[1], "exchange die")?;
+					let dies = integer_argument(node.argument[2], "exchange dies")?;
+					let (first, last) = (node.shard.rows.first, node.shard.rows.first + node.shard.rows.count);
+					let plane = node.output.elements();
+					// Every exchange alternates between the same two halves, each as large
+					// as the largest exchange, so consecutive exchanges never overlap.
+					let mut half = 0;
+					for plan in self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange) {
+						let planes = if plan.node.argument[0] != 0.0 { dies as usize } else { 1 };
+						half = half.max(checked_mul(checked_mul(plan.node.output.elements(), planes, "exchange planes")?, self.node_precision(&plan.node).model.bytes(), "exchange bytes")?);
+					}
+					let prefix = format!("n{index}.exchange");
+					let exchanges = self.plans.iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
+					let ordinal = self.plans[..index].iter().filter(|plan| plan.node.op == Primitive::Exchange).count();
+					// Another die's values reach machine RAM past this device's caches: a
+					// read treats any cached line of it as stale and fetches it again.
+					let (fresh, constraint) = match ty {
+						"float" => ("ld.global.cv.f32 $0, [$1];", "=f"),
+						"double" => ("ld.global.cv.f64 $0, [$1];", "=d"),
+						_ => return Err(RecipeError::new(format!("a tensor-split exchange moves float or double values, not {ty}"))),
+					};
+					// The buffer holds a flag per die, then two halves of planes the
+					// exchanges alternate between: a die writes exchange e + 1 only
+					// after every die posted e, so nobody still reads that half.
+					ir.push_str(&format!(
+						"%{prefix}.host.bits = load volatile i64, ptr addrspace(1) @recipe_exchange_host, align 8\n%{prefix}.host = inttoptr i64 %{prefix}.host.bits to {pointer}\n%{prefix}.base = load volatile i32, ptr addrspace(1) @recipe_exchange_epoch, align 4\n%{prefix}.epoch = add i32 %{prefix}.base, {ordinal}\n%{prefix}.next = add i32 %{prefix}.epoch, 1\n%{prefix}.parity = and i32 %{prefix}.epoch, 1\n%{prefix}.parity.wide = zext i32 %{prefix}.parity to i64\n%{prefix}.half = mul i64 %{prefix}.parity.wide, {half}\n%{prefix}.offset = add i64 %{prefix}.half, {EXCHANGE_FLAG_BYTES}\n%{prefix}.data = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.offset\n"
+					));
+					emit_runtime_window_loop(&mut ir, index, "exchange.post", node.output, &window, |ir, _p, wide| {
+						let channel = format!("%n{index}.exchange.post.at.channel");
+						let own = if sum { "true".to_owned() } else { format!("%{prefix}.post.own") };
+						if !sum {
+							// With a period, the share recurs: the channel's place within its period decides.
+							let period = node.shard.rows.period;
+							let place = if period != 0 { format!("%{prefix}.post.place") } else { channel.clone() };
+							if period != 0 {
+								ir.push_str(&format!("%{prefix}.post.place = urem i64 {channel}, {period}\n"));
+							}
+							ir.push_str(&format!("%{prefix}.post.low = icmp uge i64 {place}, {first}\n%{prefix}.post.high = icmp ult i64 {place}, {last}\n%{prefix}.post.own = and i1 %{prefix}.post.low, %{prefix}.post.high\n"));
+						}
+						// Machine RAM holds the window alone, packed: a step's values are
+						// contiguous, so a warp's reads and writes cross the bus together.
+						let packed = format!("%n{index}.exchange.post.at.q");
+						let slot = if sum { format!("%{prefix}.post.slot") } else { packed.clone() };
+						if sum {
+							ir.push_str(&format!("%{prefix}.post.slot = add i64 {packed}, {}\n", die as usize * plane));
+						}
+						ir.push_str(&format!(
+							"br i1 {own}, label %{prefix}.post.write, label %{prefix}.post.skip\n{prefix}.post.write:\n%{prefix}.post.from = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n%{prefix}.post.value = load {ty}, {pointer} %{prefix}.post.from, align {align}\n%{prefix}.post.to = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 {slot}\nstore volatile {ty} %{prefix}.post.value, {pointer} %{prefix}.post.to, align {align}\nbr label %{prefix}.post.skip\n{prefix}.post.skip:\n",
+							source = pointers.source,
+							align = alignment(ty)
+						));
+					})?;
+					// The grid barrier gathers every thread's writes; the leader's system
+					// fence then orders them all before its flag, as one fence per thread
+					// would at a thousand times the cost.
+					ir.push_str(barrier(backend));
+					ir.push_str(&format!(
+						"%{prefix}.leader = icmp eq i32 %tid, 0\nbr i1 %{prefix}.leader, label %{prefix}.signal, label %{prefix}.posted\n{prefix}.signal:\nfence seq_cst\n%{prefix}.own.flag.offset = mul i64 {die}, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.own.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.own.flag.offset\nstore volatile i32 %{prefix}.next, {pointer} %{prefix}.own.flag, align 4\nfence seq_cst\nbr label %{prefix}.posted\n{prefix}.posted:\nbr i1 %{prefix}.leader, label %{prefix}.wait, label %{prefix}.signaled\n{prefix}.wait:\n%{prefix}.wait.die = phi i32 [ 0, %{prefix}.posted ], [ %{prefix}.wait.die, %{prefix}.wait.spin ], [ %{prefix}.wait.die.next, %{prefix}.wait.ready ]\n%{prefix}.wait.more = icmp ult i32 %{prefix}.wait.die, {dies}\nbr i1 %{prefix}.wait.more, label %{prefix}.wait.spin, label %{prefix}.waited\n{prefix}.wait.spin:\n%{prefix}.wait.wide = zext i32 %{prefix}.wait.die to i64\n%{prefix}.wait.offset = mul i64 %{prefix}.wait.wide, {EXCHANGE_FLAG_STRIDE}\n%{prefix}.wait.flag = getelementptr i8, {pointer} %{prefix}.host, i64 %{prefix}.wait.offset\n%{prefix}.wait.seen = call i32 asm sideeffect \"ld.global.cv.u32 $0, [$1];\", \"=r,l\"({pointer} %{prefix}.wait.flag)\n%{prefix}.wait.gap = sub i32 %{prefix}.wait.seen, %{prefix}.next\n%{prefix}.wait.done = icmp sge i32 %{prefix}.wait.gap, 0\nbr i1 %{prefix}.wait.done, label %{prefix}.wait.ready, label %{prefix}.wait\n{prefix}.wait.ready:\n%{prefix}.wait.die.next = add i32 %{prefix}.wait.die, 1\nbr label %{prefix}.wait\n{prefix}.waited:\nfence seq_cst\nbr label %{prefix}.signaled\n{prefix}.signaled:\n"
+					));
+					ir.push_str(barrier(backend));
+					ir.push_str("fence acquire\n");
+					emit_runtime_window_loop(&mut ir, index, "exchange.take", node.output, &window, |ir, _p, wide| {
+						if sum {
+							let mut total = String::new();
+							for other in 0..dies as usize {
+								ir.push_str(&format!("%{prefix}.take.slot{other} = add i64 %n{index}.exchange.take.at.q, {}\n%{prefix}.take.at{other} = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %{prefix}.take.slot{other}\n%{prefix}.take.raw{other} = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at{other})\n%{prefix}.take.part{other} = call {state} @recipe.decode{v}({ty} %{prefix}.take.raw{other})\n", other * plane, fresh = fresh, constraint = constraint));
+								total = if other == 0 { format!("%{prefix}.take.part0") } else {
+									ir.push_str(&format!("%{prefix}.take.sum{other} = call {state} @recipe.state.add{v}({state} {total}, {state} %{prefix}.take.part{other})\n"));
+									format!("%{prefix}.take.sum{other}")
+								};
+							}
+							ir.push_str(&format!("%{prefix}.take.value = call {ty} @recipe.encode{v}({state} {total})\n"));
+						} else {
+							ir.push_str(&format!("%{prefix}.take.at = getelementptr inbounds {ty}, {pointer} %{prefix}.data, i64 %n{index}.exchange.take.at.q\n%{prefix}.take.value = call {ty} asm sideeffect \"{fresh}\", \"{constraint},l\"({pointer} %{prefix}.take.at)\n", fresh = fresh, constraint = constraint));
+						}
+						ir.push_str(&format!("%{prefix}.take.to = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.take.value, {pointer} %{prefix}.take.to, align {align}\n", value = pointers.value, align = alignment(ty)));
+					})?;
+					ir.push_str(barrier(backend));
+					// Every exchange of a launch reads the launch's base epoch and adds its
+					// place among them; the last one leaves the next launch its base.
+					if ordinal + 1 == exchanges {
+						ir.push_str(&format!("br i1 %{prefix}.leader, label %{prefix}.advance, label %{prefix}.advanced\n{prefix}.advance:\n%{prefix}.following = add i32 %{prefix}.base, {exchanges}\nstore volatile i32 %{prefix}.following, ptr addrspace(1) @recipe_exchange_epoch, align 4\nbr label %{prefix}.advanced\n{prefix}.advanced:\n"));
+					}
+				}
 				(true, Primitive::Last) => {
 					let pointer = pointer_type(backend);
 					let ty = self.node_precision(node).state_type;
@@ -4590,12 +5420,14 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Read) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!("call void @read_reverse_body{v}( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Outer) => {
+					require(node.argument[1] == 0.0, format!("{} picks a lane, which the reverse pass does not differentiate", node.identity(index)))?;
 					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
 							"call void @outer_reverse_branch_body{v}( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
@@ -4637,7 +5469,14 @@ impl NativeModelIr {
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
+							concat!(
+								"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, ",
+								"{pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, ",
+								"{pointer} {gate}, i64 {wide}, {arguments}, i1 {sigmoid_decay} )\n"
+							),
+							sigmoid_decay = node.argument[7] == 1.0,
+							v = v,
+							wide = wide,
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
@@ -4935,6 +5774,7 @@ impl NativeModelIr {
 								width: normalize_width(node),
 								span: normalize_span(node),
 								weight,
+								shift: node.parameters == 2 * normalize_span(node),
 								mode,
 								prefix: &prefix,
 							},
@@ -5068,6 +5908,7 @@ impl NativeModelIr {
 										width: normalize_width(node),
 										span: normalize_span(node),
 										weight: None,
+										shift: false,
 										mode,
 										prefix: &weight_prefix,
 									},
@@ -5110,7 +5951,7 @@ impl NativeModelIr {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
 			}
 		}
-		Ok(ir)
+		Ok(if blocked { windows + &ir } else { ir })
 	}
 
 	// Group statistics are reductions over the batch, like the loss, so they
@@ -6396,7 +7237,7 @@ impl NativeModelIr {
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
 		let prefix = format!("n{index}");
 		let source = if plan.node.source >= 0 { format!("%{prefix}.source") }
-		else if self.layout.window_positions < self.graph.input.length {
+		else if self.layout.window_positions < self.graph.input.length && self.graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) {
 			ir.push_str(&format!("%{prefix}.input.begin = zext i32 %begin to i64\n%{prefix}.input = getelementptr i32, {} %samples, i64 %{prefix}.input.begin\n", pointer_type(backend)));
 			format!("%{prefix}.input")
 		} else { "%samples".to_owned() };
@@ -6516,7 +7357,7 @@ impl NativeModelIr {
 				if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) {
 					continue;
 				}
-				if let Some(table) = native.table() {
+				for table in native.tables() {
 					if !tables.contains(&table.name()) {
 						emitted.push_str(&table.definition());
 						tables.push(table.name());
@@ -6711,6 +7552,310 @@ impl NativeModelIr {
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		self.emit_decode_switch(backend, "recipe.model.decode", |plan| plan.stored.as_ref().filter(|_| plan.packed))
 	}
+	/// The dot of one run of `dot_run(block)` adjacent weights of each packed node in one
+	/// format, and the switch that says which nodes have it. The run's values go
+	/// through the node's own decoder with constant offsets, so the inliner shares
+	/// the block fields every value of a run reads.
+	/// The pointer to the split scratch a packed sum hands its body, defined before its call.
+	/// The pointer to node `index`'s kept states and how many window positions
+	/// they hold.
+	fn kept_states(&self, backend: Backend, index: usize, context: &str, ir: &mut String) -> Result<(String, usize)> {
+		let live = self.layout.contexts[index];
+		let &(_, kept, _) = self.layout.kept.iter().find(|(offset, ..)| *offset == live).ok_or_else(|| RecipeError::new(format!("node {index} keeps no carried state")))?;
+		let name = format!("%n{index}.kept");
+		ir.push_str(&format!("{name} = getelementptr i8, {} {context}, i64 {}\n", pointer_type(backend), kept - live));
+		Ok((name, draft_positions()?))
+	}
+	fn split_scratch_gep(&self, backend: Backend, index: usize) -> String {
+		self.layout.split_scratch.map_or(String::new(), |offset| ptr_gep(backend, "contexts", offset, &format!("n{index}.split")))
+	}
+	fn split_scratch_name(&self, backend: Backend, index: usize) -> String {
+		let _ = backend;
+		if self.layout.split_scratch.is_some() { format!("%n{index}.split") } else { "null".to_owned() }
+	}
+	/// Copies the output node's values at the last position this forward reached
+	/// into the layout's last column, one value per channel.
+	fn emit_last_column(&self, backend: Backend) -> Result<String> {
+		let (Some(column), Some(last)) = (self.layout.last_column, self.graph.nodes.len().checked_sub(1)) else { return Ok(String::new()) };
+		let node = &self.graph.nodes[last];
+		let (pointer, ty) = (pointer_type(backend), self.node_precision(node).model_type);
+		// A buffer that holds one window has the window as its pitch.
+		let (channels, length) = (node.output.channels, window_shape(node.output, self.graph.input.length, self.layout.window_positions).length);
+		let mut ir = String::new();
+		ir.push_str(&ptr_gep(backend, "values", self.layout.values[last], "lc.values"));
+		ir.push_str(&ptr_gep(backend, "contexts", column, "lc.column"));
+		ir.push_str(&format!(
+			"%lc.position = sub i32 %n{last}.end, 1\n%lc.position.wide = zext i32 %lc.position to i64\nbr label %lc.entry\nlc.entry:\nbr label %lc.loop\nlc.loop:\n%lc.c = phi i32 [ %tid, %lc.entry ], [ %lc.c.next, %lc.step ]\n%lc.more = icmp ult i32 %lc.c, {channels}\nbr i1 %lc.more, label %lc.step, label %lc.done\nlc.step:\n%lc.c.wide = zext i32 %lc.c to i64\n%lc.row = mul i64 %lc.c.wide, {length}\n%lc.index = add i64 %lc.row, %lc.position.wide\n%lc.from = getelementptr inbounds {ty}, {pointer} %lc.values, i64 %lc.index\n%lc.value = load {ty}, {pointer} %lc.from\n%lc.to = getelementptr inbounds {ty}, {pointer} %lc.column, i64 %lc.c.wide\nstore {ty} %lc.value, {pointer} %lc.to\n%lc.c.next = add i32 %lc.c, %threads\nbr label %lc.loop\nlc.done:\n"
+		));
+		Ok(ir)
+	}
+	fn emit_dot_run(&self, backend: Backend) -> Result<String> {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let eligible = dot_run_format;
+		let mut ir = String::new();
+		let (mut available, mut cases) = (String::new(), String::new());
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		for (index, plan) in self.plans.iter().enumerate() {
+			if let Some((_, _, block, _)) = eligible(plan) {
+				available.push_str(&format!("i32 {}, label %yes\n", index + 1));
+				cases.push_str(&format!("i32 {}, label %c{}\n", index + 1, dot_run(block)));
+			}
+			for segment in segments[index].iter().flatten() {
+				available.push_str(&format!("i32 {}, label %yes\n", segment.id));
+				cases.push_str(&format!("i32 {}, label %c{}\n", segment.id, dot_run(segment.block)));
+			}
+		}
+		ir.push_str(&format!("define internal i1 @recipe.model.dot.run.available(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %no [\n{available}]\nyes:\nret i1 true\nno:\nret i1 false\n}}\n"));
+		// The runs a block holds: the places a run can start at inside one block.
+		let counts = (1..=256).filter(|count| cases.contains(&format!("label %c{count}\n"))).map(|count| format!("c{count}:\nret i32 {count}\n")).collect::<String>();
+		ir.push_str(&format!("define internal i32 @recipe.model.dot.run.length(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %c0 [\n{cases}]\n{counts}c0:\nret i32 32\n}}\n"));
+		// How many waves share a packed sum's row group is a hardware knob the lane
+		// tuner writes for each node while the model runs; zero keeps the body's
+		// own choice. The runtime points @recipe_knobs at the table.
+		if self.layout.knobs.is_some() && backend == Backend::Nvidia {
+			let mut lane_cases = String::new();
+			let mut lane_returns = String::new();
+			for (index, parts) in segments.iter().enumerate() {
+				if let Some(parts) = parts {
+					for part in parts {
+						lane_cases.push_str(&format!("i32 {}, label %n{index}\n", part.id));
+					}
+					lane_returns.push_str(&format!("n{index}:\nret i32 {}\n", index + 1));
+				}
+			}
+			ir.push_str(&format!("define internal i32 @recipe.model.lane.node(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %native [\n{lane_cases}]\n{lane_returns}native:\nret i32 %node\n}}\n"));
+			ir.push_str("@recipe_knobs = addrspace(1) externally_initialized global i64 0, align 8\ndefine internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\n%bits = load volatile i64, ptr addrspace(1) @recipe_knobs, align 8\n%bound = icmp ne i64 %bits, 0\nbr i1 %bound, label %read, label %none\nread:\n%base = inttoptr i64 %bits to ptr addrspace(1)\n%owner = call i32 @recipe.model.lane.node(i32 %node)\n%slot = getelementptr i32, ptr addrspace(1) %base, i32 %owner\n%value = load volatile i32, ptr addrspace(1) %slot, align 4\nret i32 %value\nnone:\nret i32 0\n}\n");
+		} else {
+			ir.push_str("define internal i32 @recipe.model.lane.team(i32 %node) #1 {\nentry:\nret i32 0\n}\n");
+		}
+		for (precision, suffix) in self.precisions() {
+			let (ty, state) = (precision.model_type, precision.state_type);
+			let (mut arms, mut bodies, mut formats) = (String::new(), String::new(), Vec::<(String, NativeDequant, usize, usize, u32)>::new());
+			for (index, plan) in self.plans.iter().enumerate() {
+				if self.variant(&plan.node) != suffix {
+					continue;
+				}
+				for segment in segments[index].iter().flatten() {
+					let name = segment.format.name.to_owned();
+					arms.push_str(&format!("i32 {}, label %{name}\n", segment.id));
+					if !formats.iter().any(|(known, ..)| *known == name) {
+						bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+						formats.push((name, segment.native, segment.block, segment.stride, 1));
+					}
+				}
+				let Some((_, native, block, stride)) = eligible(plan) else { continue };
+				// Nodes of one format and row layout share one call, so its decoder is
+				// inlined once.
+				let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+				let name = self.run_key(index).ok_or_else(|| RecipeError::new("a run decoder's node has no run format"))?;
+				arms.push_str(&format!("i32 {}, label %{name}\n", index + 1));
+				if !formats.iter().any(|(known, ..)| *known == name) {
+					bodies.push_str(&format!("{name}:\n%{name}.sum = call {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length)\nret {state} %{name}.sum\n"));
+					formats.push((name, native, block, stride, lanes));
+				}
+			}
+			for (name, native, block, stride, lanes) in &formats {
+				let stride = if *lanes > 1 { interleaved_stride(*block, *stride) } else { *stride };
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 1, *lanes));
+				ir.push_str(&self.emit_run_decoder(backend, precision, &suffix, name, *native, *block, stride, 4, *lanes));
+			}
+			ir.push_str(&format!("define internal {state} @recipe.model.dot.run{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies}absent:\nunreachable\n}}\n"));
+			// The same formats over four positions at once.
+			let bodies4 = formats.iter().map(|(name, ..)| format!("{name}:\n%{name}.sums = call <4 x {state}> @recipe_model_run4_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length)\nret <4 x {state}> %{name}.sums\n")).collect::<String>();
+			ir.push_str(&format!("define internal <4 x {state}> @recipe.model.dot.run4{suffix}({pointer} %matrix, i64 %row, i64 %k, i32 %node, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\nswitch i32 %node, label %absent [\n{arms}]\n{bodies4}absent:\nunreachable\n}}\n"));
+			let _ = ty;
+		}
+		Ok(ir)
+	}
+	/// The name of node `index`'s run decoder: its stored format, and the lanes
+	/// its rows interleave when they do.
+	fn run_key(&self, index: usize) -> Option<String> {
+		let (format, ..) = dot_run_format(&self.plans[index])?;
+		let lanes = interleaved_lanes(&self.graph, index, self.inference, self.rows, self.schedule.lanes);
+		Some(if lanes > 1 { format!("{}_lanes{lanes}", format.name) } else { format.name.to_owned() })
+	}
+	fn trace_precision_nodes(&self, device: &str) -> Result<()> {
+		for (index, plan) in self.plans.iter().enumerate() {
+			let node = &self.graph.nodes[index];
+			let detail = if node.weights() == 0 {
+				String::new()
+			} else {
+				let formats = if node.table() || plan.packed {
+					plan.stored.as_ref().map(|stored| stored.format_segments().into_iter().map(|(format, count)| {
+						let name = format.spec().map_or_else(|| if format.0 == 0 { node.precision.label().to_owned() } else { quantization(format.0).to_ascii_lowercase() }, |spec| spec.codec.quantization().name.to_owned());
+						format!("{name}:{count}")
+					}).collect::<Vec<_>>().join("+"))
+						.unwrap_or_else(|| format!("{}:{}", node.precision.label(), node.weights()))
+				} else {
+					format!("{}:{}", node.precision.label(), node.parameters)
+				};
+				let bytes = if node.table() {
+					0
+				} else if plan.packed {
+					plan.stored.as_ref().map_or(0, interleaved_span)
+				} else {
+					checked_mul(node.parameters, node.precision.bytes(), "trace stored weight bytes")?
+				};
+				let rows = node.shard.rows;
+				let terms = node.shard.terms;
+				// Whole-axis nodes carry empty shard runs; the local counts resolve them to the
+				// rows and terms this device computes.
+				let (local_rows, local_terms) = (rows.local(node.output.channels), terms.local(node.input.channels));
+				format!(
+					" stored_formats={formats} stored_bytes={bytes} packed={} shard_rows={}:{}:{} shard_terms={}:{}:{} local_rows={} local_terms={} run_key={}",
+					plan.packed,
+					rows.first,
+					rows.count,
+					rows.period,
+					terms.first,
+					terms.count,
+					terms.period,
+					local_rows,
+					local_terms,
+					self.run_key(index).as_deref().unwrap_or("none")
+				)
+			};
+			trace(&format!("precision node {index} {} {} kv {} device={device}{detail}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
+		}
+		Ok(())
+	}
+	/// Copies of the lane bodies that call one run decoder directly. The shared
+	/// bodies reach every format's decoder through one switch and so hold every
+	/// decoder's registers, spilling them at each call; a copy holds one.
+	fn specialize_lane_bodies(&self, mut ir: String) -> Result<String> {
+		let mut done = std::collections::BTreeSet::new();
+		let segments = row_segments(&self.plans, self.inference, self.rows);
+		let keys = (0..self.plans.len()).flat_map(|index| self.run_key(index).into_iter().chain(segments[index].iter().flatten().map(|segment| segment.format.name.to_owned())).map(move |key| (index, key))).collect::<Vec<_>>();
+		for (index, key) in keys {
+			let v = self.variant(&self.plans[index].node);
+			if !done.insert((v, key.clone())) {
+				continue;
+			}
+			for (body, generic, direct) in [("packed_lanes_body", "recipe.model.dot.run", "recipe_model_run_"), ("packed_lanes4_body", "recipe.model.dot.run4", "recipe_model_run4_")] {
+				let name = format!("{body}{v}");
+				let Some((start, end)) = definition_span(&ir, &name) else { continue };
+				let mut copy = ir[start..end].replacen(&format!("@{name}("), &format!("@{name}.{key}("), 1);
+				// Each call through the switch drops the node it switched on.
+				let call = format!("@{generic}{v}(");
+				let mut direct_calls = String::with_capacity(copy.len());
+				while let Some(at) = copy.find(&call) {
+					let after = at + call.len();
+					let node = copy[after..].find(" i32 %node,").ok_or_else(|| RecipeError::new(format!("{name} calls the run switch without a node")))?;
+					direct_calls.push_str(&copy[..at]);
+					direct_calls.push_str(&format!("@{direct}{key}{v}("));
+					direct_calls.push_str(&copy[after..after + node]);
+					copy = copy[after + node + " i32 %node,".len()..].to_owned();
+				}
+				direct_calls.push_str(&copy);
+				ir.push('\n');
+				ir.push_str(&direct_calls);
+				ir.push('\n');
+			}
+		}
+		Ok(ir)
+	}
+	/// One format's dot of a run of `dot_run(block)` adjacent weights from `%index`
+	/// (a multiple of the run) with activations `%stride` apart. A run is a whole
+	/// block, or several smaller blocks, so the
+	/// place of every value is known here and its block fields fold into
+	/// constant offsets; a run over several smaller blocks steps block by block.
+	/// With `positions` of 4 the run adds each weight into four staged positions
+	/// `%pitch` apart and returns the four sums; its format's tables come with the
+	/// one-position run.
+	fn emit_run_decoder(&self, backend: Backend, precision: NativePrecision, suffix: &str, name: &str, native: NativeDequant, block: usize, stride: usize, positions: usize, lanes: u32) -> String {
+		let (pointer, shared) = (pointer_type(backend), if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(3)" });
+		let (ty, state) = (precision.model_type, precision.state_type);
+		let align = {
+			let (mut a, mut b) = (stride as u64, 16_u64);
+			while b != 0 {
+				(a, b) = (b, a % b);
+			}
+			a
+		};
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision, suffix: suffix.to_owned(), next: 0 };
+		let run = dot_run(block);
+		// Blocks aligned to less than a four-byte word are read as aligned words:
+		// the run's place within its word selects one of a body per place, each
+		// with that place folded into its byte offsets.
+		let skews = if align >= 4 { vec![0] } else { (0..4).step_by(align as usize).collect::<Vec<u64>>() };
+		let interleaved = lanes > 1;
+		if interleaved {
+			// Rows of `%length` values interleave in groups of `lanes` a word at a
+			// time: word w of the group's row l is word `w * lanes + l` of the group.
+			operations.ir.push_str(&format!(
+				"%run.row = add i64 %row, 0\n%run.k = add i64 %k, 0\n%run.blocks = udiv i64 %length, {block}\n%run.row.bytes = mul i64 %run.blocks, {stride}\n%run.group = udiv i64 %run.row, {lanes}\n%run.lane = urem i64 %run.row, {lanes}\n%run.group.bytes = mul i64 %run.row.bytes, {lanes}\n%run.group.at = mul i64 %run.group, %run.group.bytes\n%run.lane.at = mul i64 %run.lane, 4\n%run.k.block = udiv i64 %run.k, {block}\n%run.k.bytes = mul i64 %run.k.block, {stride}\n%run.word = udiv i64 %run.k.bytes, 4\n%run.word.at = mul i64 %run.word, {pitch}\n%run.lane.base = add i64 %run.group.at, %run.lane.at\n%run.at = add i64 %run.lane.base, %run.word.at\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.at\n%run.place = and i64 %run.k.bytes, 3\n",
+				pitch = 4 * lanes
+			));
+		} else {
+			operations.ir.push_str(&format!("%run.row.start = mul i64 %row, %length\n%index = add i64 %run.row.start, %k\n%run.block = udiv i64 %index, {block}\n%run.offset = mul i64 %run.block, {stride}\n%run.base = getelementptr inbounds i8, {pointer} %matrix, i64 %run.offset\n"));
+		}
+		let zero = operations.instruction(format!("call {state} @recipe.state.from.u1{suffix}(i1 false)"));
+		let columns = (0..positions).map(|position| if position == 0 { "%x".to_owned() } else {
+			let offset = operations.instruction(format!("mul i32 %pitch, {position}"));
+			operations.instruction(format!("getelementptr {ty}, {shared} %x, i32 {offset}"))
+		}).collect::<Vec<_>>();
+		if skews.len() > 1 {
+			let arms = skews.iter().skip(1).map(|skew| format!("i64 {skew}, label %run.skew{skew}")).collect::<Vec<_>>().join(" ");
+			if !interleaved {
+				operations.ir.push_str(&format!("%run.address = ptrtoint {pointer} %run.base to i64\n%run.place = and i64 %run.address, 3\n"));
+			}
+			operations.ir.push_str(&format!("switch i64 %run.place, label %run.skew0 [ {arms} ]\n"));
+		}
+		for skew in skews.iter().copied() {
+			let (base, word_align) = if interleaved {
+				if skews.len() > 1 {
+					operations.ir.push_str(&format!("run.skew{skew}:\n"));
+				}
+				("%run.base".to_owned(), 4)
+			} else if skews.len() > 1 {
+				operations.ir.push_str(&format!("run.skew{skew}:\n%run.aligned{skew} = getelementptr inbounds i8, {pointer} %run.base, i64 -{skew}\n"));
+				(format!("%run.aligned{skew}"), 4)
+			} else {
+				("%run.base".to_owned(), align)
+			};
+			let pitch = if interleaved { 4 * u64::from(lanes) } else { word_align.min(4) };
+			let mut words = std::collections::HashMap::new();
+			let mut sums = vec![zero.clone(); positions];
+			for j in 0..run {
+				let (relative, local) = if block >= run { (0, j) } else { (j / block, j % block) };
+				// A later block of the run starts `relative * stride` bytes on: its own
+				// place within a word follows from the run's.
+				let start = skew + (relative * stride) as u64;
+				let (whole, place) = if skews.len() > 1 { (start / 4 * 4, start % 4) } else { (start, 0) };
+				// Interleaved rows put word w of a lane's row w pitches on.
+				let whole = if interleaved { whole / 4 * pitch } else { whole };
+				let block_base = if whole == 0 { base.clone() } else { operations.instruction(format!("getelementptr inbounds i8, {pointer} {base}, i64 {whole}")) };
+				let value = {
+					let mut run = RunQuantOps { inner: &mut operations, local: local as u64, block: block_base, align: word_align, words: &mut words, skew: place, pitch };
+					native.decode(&mut run)
+				};
+				// The weight rounds to the model type as the per-value decoder does.
+				let model = operations.instruction(format!("call {ty} @recipe.model.from.state{suffix}({state} {value})"));
+				let weight = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {model})"));
+				let offset = operations.instruction(format!("mul i32 %stride, {j}"));
+				for (column, sum) in columns.iter().zip(sums.iter_mut()) {
+					let address = operations.instruction(format!("getelementptr {ty}, {shared} {column}, i32 {offset}"));
+					let input = operations.instruction(format!("load {ty}, {shared} {address}"));
+					let input = operations.instruction(format!("call {state} @recipe.decode{suffix}({ty} {input})"));
+					*sum = operations.instruction(format!("call {state} @recipe.state.madd{suffix}({state} {sum}, {state} {weight}, {state} {input})"));
+				}
+			}
+			if positions == 1 {
+				operations.ir.push_str(&format!("ret {state} {}\n", sums[0]));
+			} else {
+				let mut vector = "poison".to_owned();
+				for (position, sum) in sums.iter().enumerate() {
+					vector = operations.instruction(format!("insertelement <{positions} x {state}> {vector}, {state} {sum}, i32 {position}"));
+				}
+				operations.ir.push_str(&format!("ret <{positions} x {state}> {vector}\n"));
+			}
+		}
+		if positions == 1 {
+			format!("{}define internal {state} @recipe_model_run_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i64 %length) #1 {{\nentry:\n{}}}\n", operations.globals, operations.ir)
+		} else {
+			format!("define internal <{positions} x {state}> @recipe_model_run{positions}_{name}{suffix}({pointer} %matrix, i64 %row, i64 %k, {shared} %x, i32 %stride, i32 %pitch, i64 %length) #1 {{\nentry:\n{}}}\n", operations.ir)
+		}
+	}
 	/// Selects the decoder of the bytes the load kernel reads for one node: a
 	/// requantized node's file bytes, or the stored weight an unpacked node
 	/// expands, each plane in its own format.
@@ -6848,14 +7993,14 @@ impl NativeModelIr {
 		};
 		match quantizer {
 			DeviceQuantizer::Iq4Nl => {
-				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).table().map(NativeQuantTable::name).unwrap_or("iq4");
+				let table = NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 }).tables().first().map(|table| table.name()).unwrap_or("iq4");
 				ir.push_str(&format!("%{p}.tiny = fcmp olt float %{p}.ext, {tiny}\n%{p}.inv.raw = fdiv float {first}, %{p}.e32\n%{p}.inv = select i1 %{p}.tiny, float {zero}, float %{p}.inv.raw\n%{p}.num0 = fadd float {zero}, {zero}\n%{p}.den0 = fadd float {zero}, {zero}\n", tiny = lit(1.0e-15), first = lit(f32::from(IQ4[0])), zero = lit(0.0)));
 				for i in 0..32 {
 					ir.push_str(&format!("%{p}.q{i} = fmul float %{p}.v{i}, %{p}.inv\n%{p}.c{i}.0 = add i32 0, 0\n"));
 					for (k, mid) in IQ4_MID.iter().enumerate() {
 						ir.push_str(&format!("%{p}.c{i}.k{k} = fcmp ogt float %{p}.q{i}, {mid}\n%{p}.c{i}.z{k} = zext i1 %{p}.c{i}.k{k} to i32\n%{p}.c{i}.{next} = add i32 %{p}.c{i}.{k}, %{p}.c{i}.z{k}\n", mid = lit(*mid), next = k + 1));
 					}
-					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr %{p}.l{i}.ptr, align 1\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
+					ir.push_str(&format!("%{p}.c{i} = select i1 %{p}.tiny, i32 0, i32 %{p}.c{i}.15\n%{p}.l{i}.ptr = getelementptr inbounds [16 x i8], ptr addrspace(1) @recipe_model_{table}, i32 0, i32 %{p}.c{i}\n%{p}.l{i}.byte = load i8, ptr addrspace(1) %{p}.l{i}.ptr, align 1, !invariant.load !{{}}\n%{p}.l{i}.int = sext i8 %{p}.l{i}.byte to i32\n%{p}.l{i} = sitofp i32 %{p}.l{i}.int to float\n%{p}.vv{i} = fmul float %{p}.v{i}, %{p}.v{i}\n%{p}.vvv{i} = fmul float %{p}.vv{i}, %{p}.v{i}\n%{p}.n{i} = fmul float %{p}.vvv{i}, %{p}.l{i}\n%{p}.vvl{i} = fmul float %{p}.vv{i}, %{p}.l{i}\n%{p}.d{i} = fmul float %{p}.vvl{i}, %{p}.l{i}\n%{p}.num{next} = fadd float %{p}.num{i}, %{p}.n{i}\n%{p}.den{next} = fadd float %{p}.den{i}, %{p}.d{i}\n", next = i + 1));
 				}
 				ir.push_str(&format!("%{p}.den.pos = fcmp ogt float %{p}.den32, {zero}\n%{p}.scale.raw = fdiv float %{p}.num32, %{p}.den32\n%{p}.scale.fit = select i1 %{p}.den.pos, float %{p}.scale.raw, float {zero}\n%{p}.scale = select i1 %{p}.tiny, float {zero}, float %{p}.scale.fit\n", zero = lit(0.0)));
 				for i in 0..32 {
@@ -6967,6 +8112,7 @@ impl NativeModelIr {
 				.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
 				.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
 				.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
+				
 				.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
 				.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 				.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
@@ -6975,11 +8121,15 @@ impl NativeModelIr {
 		};
 		let mut ir = substitute(backend_template(backend, self.precision, matrix, None)?, self.precision.state.bytes());
 		ir = strip_definition(ir, "recipe.model.decode");
+		ir = strip_definition(ir, "recipe.model.dot.run");
+		ir = strip_definition(ir, "recipe.model.dot.run4");
 		// A block that names another arithmetic calls that template's bodies, linked
 		// beside the run's under its own suffix.
 		for variant in &self.variants {
 			// The matrix-core template exists only for the arithmetics the cores take.
 			let template = strip_definition(substitute(backend_template(backend, variant.precision, matrix.filter(|_| matrix_capable(variant.precision) && variant.kv == variant.precision.model), Some(variant.kv))?, variant.precision.state.bytes()), "recipe.model.decode");
+			let template = strip_definition(template, "recipe.model.dot.run");
+			let template = strip_definition(template, "recipe.model.dot.run4");
 			let linked = link_variant(&ir, &template, &variant.suffix);
 			ir.push_str(&linked);
 		}
@@ -7000,10 +8150,16 @@ impl NativeModelIr {
 		ir.push_str(&self.emit_recurrent_body_functions(backend)?);
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&weight_decode);
+		ir.push_str(&self.emit_dot_run(backend)?);
 		ir.push_str(&source_decode);
 		ir.push_str(&q4k_support);
 		ir.push_str(&int_activation_support);
 		ir.push_str(&self.emit_tile_bytes());
+		if self.graph.nodes.iter().any(|node| node.op == Primitive::Exchange) {
+			// The mapped machine RAM the dies of a tensor split exchange through,
+			// and how many exchanges this die has finished.
+			ir.push_str("@recipe_exchange_host = addrspace(1) externally_initialized global i64 0, align 8\n@recipe_exchange_epoch = addrspace(1) externally_initialized global i32 0, align 4\n");
+		}
 		ir.push_str(&self.emit_plane_support(backend));
 		ir.push_str(&q6k_support);
 		ir.push_str(&block32_support);
@@ -7016,9 +8172,13 @@ impl NativeModelIr {
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
+		let (prelude, blocks) = block_functions(&inference_forward, &forward_args)?;
+		body.push_str(&blocks.definitions);
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
-		body.push_str(&inference_forward);
+		body.push_str(&prelude);
+		body.push_str(&blocks.calls);
+		body.push_str(&self.emit_last_column(backend)?);
 		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
@@ -7031,7 +8191,14 @@ impl NativeModelIr {
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
 		if loss.is_none() && matches!(backend, Backend::Amd | Backend::Nvidia) {
-			let step_attributes = if backend == Backend::Amd { "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }" } else { "{ nounwind }" };
+			// An NVIDIA step may cap its registers so more warps stay resident to hide the
+			// latency of its weight reads; 0 leaves the choice to the compiler.
+			let registers = natural("nvidia step registers", env!("RECIPE_NVIDIA_STEP_REGISTERS")).unwrap_or(0);
+			let step_attributes = match backend {
+				Backend::Amd => "{ nounwind \"amdgpu-flat-work-group-size\"=\"32,512\" }".to_owned(),
+				Backend::Nvidia if registers != 0 => format!("{{ nounwind \"nvvm.maxnreg\"=\"{registers}\" }}"),
+				_ => "{ nounwind }".to_owned(),
+			};
 			ir.push_str(&format!("declare void @llvm.assume(i1)\nattributes #4 = {step_attributes}\n"));
 			let step_args = forward_args.replace("i32 %end", "i32 %step.end");
 			body.push_str(&format!("define {kernel} void @recipe_model_step({forward_entry_args}) #4 {{\nentry:\n%step.valid = icmp ult i32 %begin, {positions}\ncall void @llvm.assume(i1 %step.valid)\n%rows.valid = icmp ule i32 %rows, {rows}\n%rows.nonzero = icmp ne i32 %rows, 0\n%rows.bounded = and i1 %rows.valid, %rows.nonzero\ncall void @llvm.assume(i1 %rows.bounded)\n%step.end = add nuw i32 %begin, 1\ncall void @recipe_model_inference_forward_body({step_args})\nret void\n}}\n", positions = graph_positions(&self.graph), rows = self.rows));
@@ -7039,8 +8206,10 @@ impl NativeModelIr {
 		if loss.is_some() {
 			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
+			// An inference window runs as wide as the step, so it takes the step's register budget.
+			let attributes = if matches!(backend, Backend::Amd | Backend::Nvidia) { "#4" } else { "#0" };
 			body.push_str(&format!(
-				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) {attributes} {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss.filter(|_| epoch) {
@@ -7074,6 +8243,10 @@ impl NativeModelIr {
 			body.push_str("ret void\n}\n");
 		}
 		ir.push_str(&body);
+		let ir = self.specialize_lane_bodies(ir)?;
+		// A value table several decoders read is defined once.
+		let mut defined = BTreeSet::new();
+		let ir = ir.split_inclusive('\n').filter(|line| !(line.starts_with("@recipe_model_") && line.contains(" constant [") && !defined.insert(line.to_owned()))).collect::<String>();
 		let mut ir = prune_internal_definitions(ir);
 		if matches!(backend, Backend::Cpu) {
 			ir.push_str(native_cpu_setting("module-suffix")?);
@@ -7142,7 +8315,11 @@ impl NativeModelIr {
 		let mut previous = "optimizer.entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let node = &plan.node;
-			if node.parameters == 0 || plan.packed || plan.stored.is_some() {
+			// A weight bound to file bytes owns no parameter span, so no optimizer
+			// state sits at its offset. Training gives an int block no stored plan,
+			// bound or not, so the binding itself decides.
+			let bound = self.graph.stored.get(index).and_then(Option::as_ref).is_some_and(|weight| weight.arithmetic.is_empty());
+			if node.parameters == 0 || plan.packed || plan.stored.is_some() || bound {
 				continue;
 			}
 			let precision = self.node_precision(node);
@@ -7319,13 +8496,12 @@ fn attention_value_heads(node: &Node) -> usize { if node.argument[8] == 0.0 { no
 fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
 	let block = if node.argument[3] > 0.0 { integer_argument(node.argument[3], "indexer block")? } else { 0 };
 	Ok(format!(
-		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
+		"i32 {kv}, i32 {values}, i32 {index_heads}, i32 {index_width}, i32 {block}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		values = attention_value_heads(node),
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
 		block = block,
-		gate = node.argument[2] != 0.0,
 		model_ty = precision.model_type,
 		state_ty = precision.state_type,
 		epsilon = native_literal(precision.model, precision.model_type, node.argument[7]),
@@ -7646,6 +8822,60 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 /// launch, while the position window remains a runtime value for autoregressive
 /// decode. This is used by rotary and indexed-attention helpers, whose compiled
 /// artifacts are shared by training and holdout launches.
+/// The line an inference pass puts before each block's nodes.
+const BLOCK_MARK: &str = "; recipe.block ";
+struct BlockFunctions {
+	definitions: String,
+	calls: String,
+}
+/// Every block of an inference pass as its own function, so a deep model
+/// compiles in time linear in its blocks rather than as one function whose
+/// optimization grows faster than its length. The windows before the first
+/// block stay in the caller; each block takes the ones it reads.
+fn block_functions(pass: &str, forward_args: &str) -> Result<(String, BlockFunctions)> {
+	let mut parts = pass.split(BLOCK_MARK);
+	let prelude = parts.next().unwrap_or_default().to_owned();
+	// The type each prelude value is defined with.
+	let mut types = HashMap::new();
+	for line in prelude.lines() {
+		let Some((name, rest)) = line.split_once(" = ") else { continue };
+		let words = rest.split_whitespace().collect::<Vec<_>>();
+		let ty = match words.first().copied() {
+			Some("icmp") => "i1",
+			Some("select") => words.get(3).copied().unwrap_or("i32"),
+			Some("zext" | "sext" | "trunc") => words.iter().position(|word| *word == "to").and_then(|at| words.get(at + 1)).copied().unwrap_or("i32"),
+			Some(_) => words.get(1).copied().unwrap_or("i32"),
+			None => continue,
+		};
+		types.insert(name.trim().to_owned(), ty.trim_end_matches(',').to_owned());
+	}
+	let base = ["%samples", "%weights", "%values", "%contexts", "%rows", "%threads", "%begin", "%end", "%tid"];
+	let (mut definitions, mut calls) = (String::new(), String::new());
+	for part in parts {
+		let (block, code) = part.split_once('\n').unwrap_or((part, ""));
+		// Values the block defines, and its labels, which branches name with a %.
+		let mut defined = code.lines().filter_map(|line| line.split_once(" = ").map(|(name, _)| name.trim().to_owned())).collect::<std::collections::HashSet<_>>();
+		defined.extend(code.lines().filter_map(|line| line.strip_suffix(':').filter(|label| !label.contains(' ')).map(|label| format!("%{label}"))));
+		let mut taken = Vec::new();
+		for word in code.split(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '%' | '.' | '_'))) {
+			let name = word.trim_end_matches('.');
+			if !name.starts_with('%') || base.contains(&name) || defined.contains(name) || taken.iter().any(|(taken, _): &(String, String)| taken == name) {
+				continue;
+			}
+			let ty = types.get(name).ok_or_else(|| RecipeError::new(format!("block {block} reads {name} from another block")))?;
+			taken.push((name.to_owned(), ty.clone()));
+		}
+		let parameters = taken.iter().map(|(name, ty)| format!(", {ty} {name}")).collect::<String>();
+		definitions.push_str(&format!("define internal void @recipe_model_block{block}({forward_args}, i32 %tid{parameters}) #3 {{\nentry:\n{code}ret void\n}}\n"));
+		// The caller holds the same typed names, so its arguments read as the parameters.
+		calls.push_str(&format!("call void @recipe_model_block{block}({forward_args}, i32 %tid{parameters})\n"));
+	}
+	Ok((prelude, BlockFunctions { definitions, calls }))
+}
+/// The bytes before a tensor split's exchange planes: one flag per die, each
+/// on its own line.
+const EXCHANGE_FLAG_STRIDE: usize = 128;
+const EXCHANGE_FLAG_BYTES: usize = 8192;
 fn emit_runtime_window_loop(ir: &mut String, index: usize, name: &str, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let elements = i64::try_from(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?)
@@ -7962,13 +9192,13 @@ fn native_nvidia_codegen() -> Result<&'static str> {
 /// reports it (11040 for 11.4); zero until a device is opened in this process.
 static NVIDIA_DRIVER_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The toolkit assembler that turns the PTX into the device object at
-/// compile time, so a run never waits on the driver to assemble it. A driver
-/// loads only objects from an assembler no newer than itself, so an assembler
-/// past the driver is left alone and the PTX goes to the driver as before.
+/// compile time, so ranges assemble in parallel instead of waiting on the
+/// driver, which assembles one module at a time. A driver loads only objects
+/// from an assembler no newer than itself, so this is the newest configured
+/// assembler at or below the driver; without one the PTX goes to the driver.
 fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
-	static RELEASE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-	static TARGETS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-	let path = option_env!("RECIPE_NV_ASSEMBLER").filter(|path| Path::new(path).is_file())?;
+	static RELEASES: OnceLock<Vec<(u32, &'static str)>> = OnceLock::new();
+	static TARGETS: OnceLock<Mutex<HashMap<String, Option<&'static str>>>> = OnceLock::new();
 	fn release_of(path: &str) -> Option<u32> {
 		let output = Command::new(path).arg("--version").output().ok()?;
 		let text = String::from_utf8_lossy(&output.stdout);
@@ -7977,12 +9207,18 @@ fn native_nvidia_assembler(architecture: &str) -> Option<&'static str> {
 		let (major, minor) = (parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?);
 		Some(major * 1000 + minor * 10)
 	}
-	let release = (*RELEASE.get_or_init(|| release_of(path)))?;
 	let driver = NVIDIA_DRIVER_VERSION.load(Ordering::Relaxed);
-	if driver == 0 || release > driver { return None; }
+	if driver == 0 { return None; }
+	let releases = RELEASES.get_or_init(|| {
+		let paths = option_env!("RECIPE_NV_ASSEMBLER").unwrap_or("").split('\x3b').filter(|path| Path::new(path).is_file());
+		let mut releases = paths.filter_map(|path| Some((release_of(path)?, path))).collect::<Vec<_>>();
+		releases.sort_by(|left, right| right.0.cmp(&left.0));
+		releases
+	});
 	let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
-	let supported = *targets.entry(architecture.to_owned()).or_insert_with(|| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()));
-	supported.then_some(path)
+	*targets.entry(architecture.to_owned()).or_insert_with(|| {
+		releases.iter().filter(|(release, _)| *release <= driver).map(|(_, path)| *path).find(|path| Command::new(path).arg(format!("-arch={architecture}")).arg("--version").output().is_ok_and(|output| output.status.success()))
+	})
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
@@ -8106,7 +9342,41 @@ fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
 		.or_else(|| diagnostic.lines().any(ignored).then(|| "unknown remote CPU feature".to_owned()))
 }
 
+/// Machine RAM the compiles running at once may claim: each claims its IR's
+/// size times the configured factor, so parallel compiles of a deep model
+/// queue instead of exhausting memory. One compile always runs.
+struct CompileBudget {
+	claimed: Mutex<(u64, usize)>,
+	freed: std::sync::Condvar,
+}
+static COMPILE_BUDGET: CompileBudget = CompileBudget { claimed: Mutex::new((0, 0)), freed: std::sync::Condvar::new() };
+/// The machine's available RAM as the kernel reports it; unbounded where it cannot be read.
+fn machine_available_bytes() -> u64 {
+	fs::read_to_string("/proc/meminfo")
+		.ok()
+		.and_then(|text| text.lines().find(|line| line.starts_with("MemAvailable:")).and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok()))
+		.map_or(u64::MAX, |kilobytes| kilobytes.saturating_mul(1024))
+}
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
+	let factor = natural("compile memory per IR byte", env!("RECIPE_COMPILE_MEMORY_PER_IR_BYTE"))? as u64;
+	let claim = fs::metadata(source).map_or(0, |metadata| metadata.len()).saturating_mul(factor);
+	{
+		let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		// A running compile grows into its claim, so every claim counts against what is available now.
+		while claimed.1 != 0 && claimed.0.saturating_add(claim) > machine_available_bytes() {
+			claimed = COMPILE_BUDGET.freed.wait(claimed).map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+		}
+		claimed.0 += claim;
+		claimed.1 += 1;
+	}
+	let result = compile_native_artifact_within(target, source, output, key);
+	let mut claimed = COMPILE_BUDGET.claimed.lock().map_err(|_| RecipeError::new("compile budget is poisoned"))?;
+	claimed.0 -= claim;
+	claimed.1 -= 1;
+	COMPILE_BUDGET.freed.notify_all();
+	result
+}
+fn compile_native_artifact_within(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -8192,11 +9462,31 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
 				fs::rename(output, &ptx).map_err(|error| RecipeError::new(format!("cannot stage native PTX: {error}")))?;
-				let mut command = Command::new(assembler);
-				command.arg(format!("-arch={architecture}")).args(["-O3", "-o"]).arg(output).arg(&ptx);
-				let assembled = native_command(command, "NVIDIA PTX assembler", key);
+				// Whole-program assembly specializes every shared body for each call
+				// site, which on a deep model runs for many minutes in tens of GB.
+				// Each function assembles once as relocatable code instead, and the
+				// linker beside the assembler joins them into the loadable object.
+				let object = output.with_extension("o.cubin");
+				let linker = Path::new(assembler).with_file_name("nvlink");
+				require(linker.is_file(), format!("the NVIDIA assembler {assembler} has no nvlink beside it"))?;
+				// A kernel whose optimizer constants overflow their bank links only when
+				// the assembler leaves them in the code; every other kernel keeps them.
+				let mut linked = Err(RecipeError::new("NVIDIA link did not run"));
+				for flags in [&["-O3", "-c"][..], &["-O3", "-c", "--disable-optimizer-constants"][..]] {
+					let mut command = Command::new(assembler);
+					command.arg(format!("-arch={architecture}")).args(flags).arg("-o").arg(&object).arg(&ptx);
+					native_command(command, "NVIDIA PTX assembler", key)?;
+					let mut command = Command::new(&linker);
+					command.arg(format!("-arch={architecture}")).arg(&object).arg("-o").arg(output);
+					linked = native_command(command, "NVIDIA linker", key);
+					match &linked {
+						Err(error) if error.to_string().contains("compiler-generated constants") => continue,
+						_ => break,
+					}
+				}
 				fs::remove_file(&ptx).map_err(|error| RecipeError::new(format!("cannot remove native PTX: {error}")))?;
-				assembled?;
+				fs::remove_file(&object).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA object: {error}")))?;
+				linked?;
 				return Ok(Vec::new());
 			}
 			fs::read(output)
@@ -8210,11 +9500,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, epoch: bool, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	let compile_started = Instant::now();
 	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	if tracing() {
+		model.trace_precision_nodes(device)?;
+	}
 	let matrix = resolve_capability(target, ContractFormat::of(model.precision.model, 0)?)?.matrix.map(|(method, _)| method).filter(|_| model.schedule.matrix);
 	let dp4a = matches!(target, BackendTarget::Nvidia { architecture } if nvidia_sm(architecture).is_some_and(|sm| sm >= 61));
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
@@ -8280,6 +9573,13 @@ impl FloatLayout {
 		self.sign + self.exp + self.man
 	}
 	fn pack(self, value: f64) -> u64 {
+		// A finite value rounds to IEEE single or double exactly as the hardware does.
+		if value.abs() <= f64::from(f32::MAX) && (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return u64::from((value as f32).to_bits());
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return value.to_bits();
+		}
 		let sign = value.to_bits() >> (u64::BITS - 1) << (self.exp + self.man);
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -8316,6 +9616,13 @@ impl FloatLayout {
 		}
 	}
 	fn unpack(self, bits: u64) -> f64 {
+		// IEEE single and double decode exactly by the hardware conversion.
+		if (self.exp, self.man) == (8, 23) && self.bias() == 127 {
+			return f64::from(f32::from_bits(bits as u32));
+		}
+		if (self.exp, self.man) == (11, 52) && self.bias() == 1023 {
+			return f64::from_bits(bits);
+		}
 		let negative = bits >> (self.exp + self.man) != 0;
 		let exponent_limit = (1u64 << self.exp) - 1;
 		let mantissa_limit = 1u64 << self.man;
@@ -8954,7 +10261,8 @@ mod tokenizer {
 		Gpt2,
 		Llama3,
 		Qwen2,
-		Gemma4,
+		/// A SentencePiece vocabulary (`tokenizer.ggml.model` of `llama` or `gemma4`): spaces become `▁` and bytes without a piece fall back to `<unk>`.
+		SentencePiece,
 		/// Every digit on its own, then the GPT-2 words.
 		Digits,
 		/// Punctuation runs, the GPT-2 words, then digits in threes.
@@ -9141,7 +10449,7 @@ mod tokenizer {
 		/// The passes llama.cpp applies for this family, in order.
 		fn passes(self) -> &'static [Pass] {
 			match self {
-				Self::Gemma4 => &[],
+				Self::SentencePiece => &[],
 				Self::Gpt2 => &[Pass::Words(Self::Gpt2)],
 				Self::Llama3 => &[Pass::Words(Self::Llama3)],
 				Self::Qwen2 => &[Pass::Words(Self::Qwen2)],
@@ -9203,7 +10511,7 @@ mod tokenizer {
 			run(chars, at, space).max(1)
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
-			if self == Self::Gemma4 {
+			if self == Self::SentencePiece {
 				let mut pieces = Vec::new();
 				let mut start = 0;
 				while start < text.len() {
@@ -9307,7 +10615,7 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			let family = if kind == "gemma4" { Family::Gemma4 } else {
+			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
 			};
@@ -9335,9 +10643,9 @@ mod tokenizer {
 				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
 			};
 			let map = byte_map();
-			let mut bytes = [if family == Family::Gemma4 { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
+			let mut bytes = [if family == Family::SentencePiece { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
 			let mut byte_of = HashMap::new();
-			if family != Family::Gemma4 {
+			if family != Family::SentencePiece {
 				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = ids.get(&symbol.to_string()).copied().unwrap_or(ABSENT); }
 				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
@@ -9427,10 +10735,10 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
-			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
+			let normalized = (self.family == Family::SentencePiece).then(|| text.replace(' ', "▁"));
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
-				let mut symbols = if self.family == Family::Gemma4 {
+				let mut symbols = if self.family == Family::SentencePiece {
 					if word.chars().all(|value| value == '\n') && let Some(id) = self.ids.get(word) {
 						vec![*id]
 					} else {
@@ -9481,7 +10789,7 @@ mod tokenizer {
 				}
 			}
 			let text = String::from_utf8_lossy(&bytes).into_owned();
-			if self.family == Family::Gemma4 { text.replace('▁', " ") } else { text }
+			if self.family == Family::SentencePiece { text.replace('▁', " ") } else { text }
 		}
 		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
 		/// content. `generation` sets `add_generation_prompt`, which the template
@@ -9490,7 +10798,7 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
-			if self.family == Family::Gemma4 {
+			if self.family == Family::SentencePiece {
 				let mut prompt = String::new();
 				for (role, content) in messages {
 					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
@@ -11897,8 +13205,93 @@ impl Drop for ChatInput {
 }
 /// Whether `.log([debug])` asked for the trace of every dispatch in recipe.log.
 static TRACE: AtomicBool = AtomicBool::new(false);
+fn lane_tuning() -> bool {
+	env!("RECIPE_LANE_TUNING") == "1"
+}
+/// The team widths a packed sum can take: zero is the body's own choice.
+const LANE_TEAMS: [i32; 6] = [0, 1, 2, 4, 8, 16];
+/// Chooses each packed sum's team width from its measured node clocks. Nodes of
+/// one operation, shape, and format share a class, so every one of them adds to
+/// the estimate their class steps on. Each step draws a width per class from a
+/// softmax over the candidates' mean clocks in a rolling window, relative to the
+/// best; a width not yet run is drawn as though it matched the best.
+struct LaneTuner {
+	classes: Vec<Option<usize>>,
+	history: Vec<Vec<std::collections::VecDeque<f64>>>,
+	chosen: Vec<usize>,
+	random: u64,
+	window: usize,
+	temperature: f64,
+}
+impl LaneTuner {
+	fn new(graph: &Graph) -> Result<Self> {
+		let mut keys = Vec::<(u32, usize, usize, String)>::new();
+		let mut classes = Vec::with_capacity(graph.nodes.len());
+		for (index, node) in graph.nodes.iter().enumerate() {
+			let packed = matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) && packed_weight(graph, index, true).is_some();
+			classes.push(packed.then(|| {
+				let format = graph.stored.get(index).and_then(Option::as_ref).and_then(|stored| stored.format_segments().first().and_then(|(segment, _)| segment.spec()).map(|spec| spec.codec.quantization().name.to_owned())).unwrap_or_default();
+				let key = (node.op as u32, node.shard.terms.local(node.input.channels), node.shard.rows.local(node.output.channels), format);
+				keys.iter().position(|known| *known == key).unwrap_or_else(|| {
+					keys.push(key);
+					keys.len() - 1
+				})
+			}));
+		}
+		let window = natural("lane tuning window", env!("RECIPE_LANE_TUNING_WINDOW"))?.max(1);
+		let temperature = env!("RECIPE_LANE_TUNING_TEMPERATURE").parse::<f64>().map_err(|_| RecipeError::new("lane tuning temperature is not a number"))?;
+		Ok(Self { history: vec![vec![std::collections::VecDeque::new(); LANE_TEAMS.len()]; keys.len()], chosen: vec![0; keys.len()], classes, random: 0x9e37_79b9_7f4a_7c15, window, temperature })
+	}
+	/// The width each class runs next, and the table of one i32 per node slot.
+	fn choose(&mut self) -> Vec<u8> {
+		for (class, runs) in self.history.iter().enumerate() {
+			let means = runs.iter().map(|window| (!window.is_empty()).then(|| window.iter().sum::<f64>() / window.len() as f64)).collect::<Vec<_>>();
+			let best = means.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+			let weights = means.iter().map(|mean| if best.is_finite() { (-(mean.unwrap_or(best) - best) / (self.temperature * best).max(f64::MIN_POSITIVE)).exp() } else { 1.0 }).collect::<Vec<_>>();
+			let total = weights.iter().sum::<f64>();
+			let mut draw = (next_random(&mut self.random) >> 11) as f64 / (1_u64 << 53) as f64 * total;
+			let mut pick = weights.len() - 1;
+			for (candidate, weight) in weights.iter().enumerate() {
+				if draw < *weight {
+					pick = candidate;
+					break;
+				}
+				draw -= weight;
+			}
+			self.chosen[class] = pick;
+		}
+		// Slot n + 1 holds node n's knob: the kernels number nodes from one.
+		let mut table = vec![0_u8; (self.classes.len() + 2) * 4];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let Some(class) = class {
+				table[(index + 1) * 4..(index + 2) * 4].copy_from_slice(&LANE_TEAMS[self.chosen[*class]].to_le_bytes());
+			}
+		}
+		table
+	}
+	/// Adds a step's node clocks: node n ran from clock n to clock n + 1.
+	fn observe(&mut self, ticks: &[i64]) {
+		let mut sums = vec![(0.0, 0_usize); self.history.len()];
+		for (index, class) in self.classes.iter().enumerate() {
+			if let (Some(class), Some(end)) = (class, ticks.get(index + 1)) {
+				sums[*class].0 += end.wrapping_sub(ticks[index]).max(0) as f64;
+				sums[*class].1 += 1;
+			}
+		}
+		for (class, (sum, count)) in sums.into_iter().enumerate() {
+			if count != 0 {
+				let window = &mut self.history[class][self.chosen[class]];
+				window.push_back(sum / count as f64);
+				if window.len() > self.window {
+					window.pop_front();
+				}
+			}
+		}
+	}
+}
 fn tracing() -> bool {
-	TRACE.load(Ordering::Relaxed)
+	static ENV_TRACE: OnceLock<bool> = OnceLock::new();
+	TRACE.load(Ordering::Relaxed) || *ENV_TRACE.get_or_init(|| std::env::var("RECIPE_TRACE").is_ok_and(|value| value == "1"))
 }
 fn trace(message: &str) -> Result<()> {
 	if !tracing() {
@@ -11953,7 +13346,7 @@ pub struct Data {
 	/// The GGUF model file `recipe.data` opened, which `recipe.infer` runs.
 	file: Option<Gguf>,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FeatureSelection {
 	All,
 	Include(Vec<String>),
@@ -13457,6 +14850,10 @@ const IQ3_S: [u16; 512] = [
 	3159, 3188, 3210, 3228, 3234, 3245, 3250, 3256, 3264, 3276, 3281, 3296, 3349, 3363, 3378, 3392, 3395, 3420, 3440, 3461, 3488, 3529, 3531, 3584, 3588, 3591, 3600, 3602, 3614, 3616, 3628, 3634,
 	3650, 3657, 3668, 3683, 3685, 3713, 3716, 3720, 3726, 3729, 3736, 3753, 3778, 3802, 3805, 3819, 3841, 3845, 3851, 3856, 3880, 3922, 3938, 3970, 3993, 4032,
 ];
+/// ggml's IQ2 grid bytes for levels 0 to 2, IQ3_XXS's for levels 0 to 7, and IQ3_S's.
+const IQ2_LEVELS: [u16; 3] = [8, 25, 43];
+const IQ3_XXS_LEVELS: [u16; 8] = [4, 12, 20, 28, 36, 44, 52, 62];
+const IQ3_S_LEVELS: [u16; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 const IQ2_XXS: [u16; 256] = [
 	0, 2, 5, 8, 10, 17, 20, 32, 34, 40, 42, 65, 68, 80, 88, 97, 100, 128, 130, 138, 162, 257, 260, 272, 277, 320, 388, 408, 512, 514, 546, 642, 1025, 1028, 1040, 1057, 1060, 1088, 1090, 1096, 1120,
 	1153, 1156, 1168, 1188, 1280, 1282, 1288, 1312, 1350, 1385, 1408, 1425, 1545, 1552, 1600, 1668, 1700, 2048, 2053, 2056, 2068, 2088, 2113, 2116, 2128, 2130, 2184, 2308, 2368, 2562, 2580, 4097,
@@ -13945,12 +15342,12 @@ impl NativeDequant {
 		}
 	}
 
-	fn table(self) -> Option<NativeQuantTable> {
+	/// The constant tables the decoder reads: a grid, and for grids of levels, each level's value.
+	fn tables(self) -> Vec<NativeQuantTable> {
 		match self {
-			Self::Iq4(layout) => Some(NativeQuantTable::Signed(layout.table_name, layout.table)),
-			Self::Iq1(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			Self::Iq(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
-			_ => None,
+			Self::Iq4(layout) => vec![NativeQuantTable::Signed(layout.table_name, layout.table)],
+			Self::Iq1(layout) => vec![NativeQuantTable::Unsigned(layout.table_name, layout.table)],
+			_ => Vec::new(),
 		}
 	}
 }
@@ -13971,12 +15368,12 @@ impl NativeQuantTable {
 	fn definition(self) -> String {
 		match self {
 			Self::Unsigned(name, values) => format!(
-				"@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n",
+				"@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i16] [{}]\n",
 				values.len(),
 				values.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")
 			),
 			Self::Signed(name, values) => {
-				format!("@recipe_model_{name} = private unnamed_addr constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
+				format!("@recipe_model_{name} = private unnamed_addr addrspace(1) constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", "))
 			}
 		}
 	}
@@ -14040,13 +15437,13 @@ quantizations! {
 	Q8K { code: (0, 8, [3]), block: 256, stride: 292, name: "q8k", quant: Quantizer::Q8K, native: Some(NativeDequant::Q8K) }
 	IQ4NL { code: (1, 4, [5]), block: 32, stride: 18, name: "iq4nl", quant: Quantizer::Iq4Nl, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 })) }
 	IQ4XS { code: (1, 4, [2]), block: 256, stride: 136, name: "iq4xs", quant: Quantizer::Iq4Xs, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 6, man: 4, xs: true, table_name: "iq4", table: &IQ4 })) }
-	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS })) }
-	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS })) }
-	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS })) }
-	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S })) }
+	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS, levels: &IQ3_XXS_LEVELS })) }
+	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS, levels: &IQ2_LEVELS })) }
+	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS, levels: &IQ2_LEVELS })) }
+	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S, levels: &IQ2_LEVELS })) }
 	IQ1S { code: (1, 1, [3]), block: 256, stride: 50, name: "iq1s", quant: Quantizer::Iq1 { medium: false }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: false, table_name: "iq1", table: &IQ1 })) }
 	IQ1M { code: (1, 1, [4]), block: 256, stride: 56, name: "iq1m", quant: Quantizer::Iq1 { medium: true }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: true, table_name: "iq1", table: &IQ1 })) }
-	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S })) }
+	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S, levels: &IQ3_S_LEVELS })) }
 }
 
 fn nf4_codebook(codebook: &[f64], count: usize, bytes: usize) -> Result<(usize, &[f64], &[f64])> {
@@ -14089,23 +15486,27 @@ enum StoredSegment {
 	/// Bytes the load kernel writes on the device: they take their place in the
 	/// run but exist on no host page.
 	Absent(usize),
+	/// `count` pieces of `length` mapped bytes, `pitch` apart from `at`: one
+	/// die's rows or inputs of every row of a split weight.
+	Strided { mapping: Arc<gguf::Mapping>, at: usize, length: usize, pitch: usize, count: usize },
 }
 impl StoredSegment {
 	fn length(&self) -> usize {
 		match self {
 			Self::Owned(bytes) => bytes.len(),
 			Self::Mapped(_, _, length) | Self::Absent(length) => *length,
+			Self::Strided { length, count, .. } => length * count,
 		}
 	}
-}
-impl std::ops::Deref for StoredSegment {
-	type Target = [u8];
-	fn deref(&self) -> &[u8] {
-		match self {
-			Self::Owned(bytes) => bytes,
-			Self::Mapped(mapping, at, length) => &mapping.bytes()[*at..*at + *length],
-			Self::Absent(_) => &[],
-		}
+	/// The contiguous host pieces of the run, in order.
+	fn pieces(&self) -> impl Iterator<Item = &[u8]> {
+		let (bytes, at, length, pitch, count): (&[u8], usize, usize, usize, usize) = match self {
+			Self::Owned(bytes) => (bytes, 0, bytes.len(), 0, 1),
+			Self::Mapped(mapping, at, length) => (mapping.bytes(), *at, *length, 0, 1),
+			Self::Absent(_) => (&[], 0, 0, 0, 0),
+			Self::Strided { mapping, at, length, pitch, count } => (mapping.bytes(), *at, *length, *pitch, *count),
+		};
+		(0..count).map(move |piece| &bytes[at + piece * pitch..at + piece * pitch + length])
 	}
 }
 /// One node's stored bytes as the ordered runs they are assembled from, each
@@ -14123,9 +15524,70 @@ impl StoredBytes {
 	fn joined(parts: Vec<Self>) -> Self {
 		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
 	}
+	/// Tells the kernel the mapped runs are read at scattered places, so a read
+	/// brings in its own page and not the pages around it.
+	fn scattered(&self) {
+		#[cfg(unix)]
+		self.advise(1);
+	}
+	#[cfg(unix)]
+	fn advise(&self, advice: i32) {
+		for segment in self.0.iter() {
+			let (mapping, at, length) = match segment {
+				StoredSegment::Mapped(mapping, at, length) => (mapping, at, *length),
+				StoredSegment::Strided { mapping, at, length, pitch, count } => (mapping, at, (count - 1) * pitch + length),
+				_ => continue,
+			};
+			{
+				let page = usize::try_from(unsafe { getpagesize() }).unwrap_or(4096).max(1);
+				let start = mapping.bytes().as_ptr() as usize + at;
+				let aligned = start / page * page;
+				unsafe { madvise(aligned as Ptr, length + (start - aligned), advice) };
+			}
+		}
+	}
 	/// A run of `length` bytes the load kernel writes on the device.
 	fn absent(length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Absent(length)]))
+	}
+	/// `count` views of `length` bytes, `pitch` apart from `first`: one
+	/// strided run when the bytes are one mapped run, so splitting a table of
+	/// many rows costs one segment, not one per row.
+	fn strided(&self, first: usize, length: usize, pitch: usize, count: usize) -> Self {
+		match self.0.as_slice() {
+			[StoredSegment::Mapped(mapping, at, total)] if count > 1 && first + (count - 1) * pitch + length <= *total => {
+				Self(Arc::new(vec![StoredSegment::Strided { mapping: mapping.clone(), at: at + first, length, pitch, count }]))
+			}
+			[StoredSegment::Absent(_)] => Self::absent(length * count),
+			_ => Self::joined((0..count).map(|piece| self.view(first + piece * pitch, length)).collect()),
+		}
+	}
+	/// Bytes `from` to `from + length` of the runs, sharing every mapped run.
+	fn view(&self, from: usize, length: usize) -> Self {
+		let (mut at, mut parts) = (0, Vec::new());
+		for run in self.0.iter() {
+			let (start, end) = (at, at + run.length());
+			at = end;
+			let (low, high) = (from.max(start), (from + length).min(end));
+			if low >= high {
+				continue;
+			}
+			let (offset, count) = (low - start, high - low);
+			parts.push(match run {
+				StoredSegment::Owned(bytes) => StoredSegment::Owned(bytes[offset..offset + count].to_vec()),
+				StoredSegment::Mapped(mapping, base, _) => StoredSegment::Mapped(mapping.clone(), base + offset, count),
+				StoredSegment::Absent(_) => StoredSegment::Absent(count),
+				StoredSegment::Strided { mapping, at, length, pitch, .. } => {
+					// Each piece the range touches becomes its own mapped run.
+					for piece in offset / length..(offset + count).div_ceil(*length) {
+						let (low, high) = (offset.max(piece * length), (offset + count).min((piece + 1) * length));
+						parts.push(StoredSegment::Mapped(mapping.clone(), at + piece * pitch + low - piece * length, high - low));
+					}
+					continue;
+				}
+			});
+		}
+		Self(Arc::new(parts))
 	}
 	/// Whether any run is written on the device rather than held on the host.
 	fn absent_runs(&self) -> bool {
@@ -14138,13 +15600,10 @@ impl StoredBytes {
 	/// device writes is skipped.
 	fn runs(&self) -> impl Iterator<Item = (usize, &[u8])> {
 		let mut at = 0;
-		self.0.iter().filter_map(move |run| {
+		self.0.iter().flat_map(|run| run.pieces()).filter_map(move |piece| {
 			let offset = at;
-			at += run.length();
-			match run {
-				StoredSegment::Absent(_) => None,
-				_ => Some((offset, &**run)),
-			}
+			at += piece.len();
+			(!piece.is_empty()).then_some((offset, piece))
 		})
 	}
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
@@ -15128,9 +16587,11 @@ impl LossFunction {
 	}
 }
 impl Recipe {
+	/// Opens a GGUF file for metadata and tensor-shape decisions in a model script.
+	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf { open_script_file(path.as_ref()) }
 	/// The data a model reads: table, image and text sources, or one GGUF model
-	/// file, whose metadata the `gemma3.*` and `tokenizer.*` identifiers then
-	/// read and whose weights `recipe.infer` binds.
+	/// file, whose metadata and tensors named paths then read and whose weights
+	/// `recipe.infer` binds.
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
 		let sources = sources.into_data_sources();
 		let models = sources.iter().filter(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))).collect::<Vec<_>>();
@@ -15206,7 +16667,8 @@ impl Recipe {
 
 fn key_color(name: &str, color: bool) -> String {
 	if !color { return name.to_owned(); }
-	name.split('.').enumerate().map(|(index, part)| format!("\x1b[{}m{part}\x1b[0m", [96, 95, 94, 93, 92, 91][index % 6])).collect::<Vec<_>>().join(".")
+	const COLORS: [&str; 5] = ["242;40;60", "0;174;107", "39;125;255", "255;194;0", "135;90;251"];
+	name.split('.').enumerate().map(|(index, part)| format!("\x1b[38;2;{}m{part}\x1b[0m", COLORS[index % COLORS.len()])).collect::<Vec<_>>().join(".")
 }
 pub fn keys(path: impl AsRef<Path>) -> Result<()> {
 	use GgufValue::*;
@@ -18153,6 +19615,184 @@ pub struct Placed {
 	resident: Vec<usize>,
 	movement: Vec<usize>,
 	moved: usize,
+	/// A tensor split's shared machine RAM: its tapes are dies that each run
+	/// every layer at once rather than ranges run one after another.
+	exchange: Option<ExchangeBuffer>,
+}
+/// The memory a tensor split's exchanges write and read: the first die's own
+/// memory when every other die reaches it peer to peer, else pinned machine
+/// RAM mapped into every die.
+struct ExchangeBuffer {
+	/// The pinned machine RAM, when the dies share that.
+	pointer: Ptr,
+	/// The first die's buffer the others reach directly, or zero.
+	device: u64,
+	gpu: &'static Gpu,
+}
+// The buffer is plain pinned memory; each die reaches it through its own mapping.
+unsafe impl Send for ExchangeBuffer {}
+unsafe impl Sync for ExchangeBuffer {}
+impl Drop for ExchangeBuffer {
+	fn drop(&mut self) {
+		match &self.gpu.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				if self.device != 0 {
+					(driver.set)(driver.context);
+					(driver.free)(self.device);
+				} else {
+					(driver.host_free)(self.pointer);
+				}
+			},
+			_ => {}
+		}
+	}
+}
+impl Gpu {
+	/// Whether every other die of `peers` reaches this die's memory directly,
+	/// enabling that access on the way.
+	fn reaches(&'static self, peers: &[&'static Gpu]) -> bool {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => peers.iter().filter(|peer| !std::ptr::eq(**peer, self)).all(|peer| match &peer.driver {
+				Driver::Cuda(other) => unsafe {
+					(other.set)(other.context);
+					// 704: peer access is already on.
+					matches!((other.enable_peer)(driver.context, 0), 0 | 704)
+				},
+				_ => false,
+			}),
+			_ => false,
+		}
+	}
+	/// `bytes` of zeroed exchange memory for this die and `peers`: this die's
+	/// own memory when every peer reaches it directly, so exchanges never wait on
+	/// the machine's memory controller; else pinned machine RAM every context maps.
+	fn exchange_buffer(&'static self, bytes: usize, peers: &[&'static Gpu]) -> Result<ExchangeBuffer> {
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe {
+				let reach = self.reaches(peers);
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				if reach {
+					let mut device = 0_u64;
+					driver_status(Backend::Nvidia, (driver.allocate)(&mut device, bytes), "exchange allocation")?;
+					driver_status(Backend::Nvidia, (driver.clear)(device, 0, bytes), "exchange clear")?;
+					return Ok(ExchangeBuffer { pointer: ptr::null_mut(), device, gpu: self });
+				}
+				let mut pointer = ptr::null_mut();
+				// Portable to every context, and mapped into each device's addresses.
+				driver_status(Backend::Nvidia, (driver.host_alloc)(&mut pointer, bytes, 0x01 | 0x02), "exchange allocation")?;
+				ptr::write_bytes(pointer.cast::<u8>(), 0, bytes);
+				Ok(ExchangeBuffer { pointer, device: 0, gpu: self })
+			},
+			_ => Err(RecipeError::new(format!("{} cannot hold a tensor split's exchange", self.name))),
+		}
+	}
+}
+/// Every die of a tensor split over `devices` with its tape, and the machine
+/// RAM their exchanges go through. Each die holds its share of the split
+/// nodes' weights and the whole of every other node's.
+fn place_tensor(graph: &Graph, devices: &'static [&'static Gpu], precision: Compute) -> Result<(Vec<NativeTape>, ExchangeBuffer, Vec<usize>)> {
+	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	// A region saves each die the weights it reads a share of and costs an
+	// exchange. One a position reads few bytes of stays whole on every die,
+	// the fewest first, while every die still holds its weights.
+	let mut whole = std::collections::BTreeSet::new();
+	// The plan keeps 1/64 of each die free: setting up the dies takes some of
+	// it before the weights go up.
+	let available = devices.iter().map(|device| device.free_bytes().map(|bytes| { let room = bytes.saturating_sub(reserve); room - room / 64 })).collect::<Result<Vec<_>>>()?;
+	let dies = devices.len();
+	let items = split_items(graph, dies, &whole)?;
+	let shard = |plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>| (0..dies).map(|die| shard_graph(graph, die, dies, plan, whole)).collect::<Result<Vec<_>>>();
+	let sizes = |parts: &[Graph]| parts.iter().map(|part| part_bytes(part, precision).map(|bytes| bytes as u64)).collect::<Result<Vec<_>>>();
+	// The first plan fills each die's free memory; every later one fills the
+	// room past what the die measured holding whole.
+	let mut plan = plan_split(&items, &available.iter().map(|room| *room as f64).collect::<Vec<_>>());
+	let mut split = shard(&plan, &whole)?;
+	let mut used = sizes(&split)?;
+	for _ in 0..8 {
+		if used.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			break;
+		}
+		let rooms = (0..dies).map(|die| {
+			let held = items.iter().map(|(key, units, bytes)| plan[key][die] as f64 * *bytes as f64 / *units as f64).sum::<f64>();
+			available[die] as f64 - (used[die] as f64 - held)
+		}).collect::<Vec<_>>();
+		plan = plan_split(&items, &rooms);
+		drop(split);
+		split = shard(&plan, &whole)?;
+		used = sizes(&split)?;
+	}
+	if used.iter().zip(&available).any(|(bytes, room)| bytes > room) {
+		let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+		let dies = devices.iter().zip(used.iter().zip(&available)).map(|(device, (bytes, room))| format!("{} {:.3} of {:.3} GiB", device.name, gib(*bytes), gib(*room))).collect::<Vec<_>>();
+		return Err(RecipeError::new(format!("no tensor split fits every die: {}", dies.join(", "))));
+	}
+	let threshold = natural("tensor split region bytes", env!("RECIPE_TENSOR_SPLIT_REGION_BYTES"))?;
+	let mut candidates = split_regions(graph, devices.len())?.into_iter().filter(|region| region.read < threshold).collect::<Vec<_>>();
+	candidates.sort_by_key(|region| region.read);
+	let mut kept = Vec::new();
+	for region in candidates {
+		let counts = &plan[&region.end];
+		let grown = used.iter().zip(counts).map(|(bytes, count)| bytes + (region.stored as f64 * (1.0 - *count as f64 * region.unit as f64 / region.period as f64)) as u64).collect::<Vec<_>>();
+		if grown.iter().zip(&available).all(|(bytes, room)| bytes <= room) {
+			whole.insert(region.end);
+			kept.push(region.end);
+			used = grown;
+		}
+	}
+	// The first shards go before the second are cut, so the machine holds one
+	// set. The estimate above can miss a die's real size: while a die does not
+	// fit, the region kept last is split again.
+	let mut graphs = split;
+	while !whole.is_empty() {
+		drop(graphs);
+		graphs = shard(&plan, &whole)?;
+		let fits = graphs.iter().zip(&available).map(|(part, room)| part_bytes(part, precision).map(|bytes| bytes as u64 <= *room)).collect::<Result<Vec<_>>>()?;
+		if fits.iter().all(|fit| *fit) {
+			break;
+		}
+		let Some(last) = kept.pop() else { break };
+		whole.remove(&last);
+		if whole.is_empty() {
+			drop(graphs);
+			graphs = shard(&plan, &whole)?;
+		}
+	}
+	for (part, device) in graphs.iter().zip(devices) {
+		let required = part_bytes(part, precision)? as u64;
+		let available = device.free_bytes()?.saturating_sub(reserve);
+		if required > available {
+			return Err(RecipeError::new(format!("{}: {}", device.name, placement_memory_error(part, precision, available)?)));
+		}
+	}
+	std::thread::scope(|scope| {
+		let compiles = graphs.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None, false))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a die compile panicked"))?)
+	})?;
+	// Every die uploads its weights at once, each from its own thread.
+	let tokens = vec![0.0; graph_positions(graph)];
+	let tapes = std::thread::scope(|scope| {
+		let builds = graphs.iter().zip(devices).map(|(part, device)| {
+			let tokens = &tokens;
+			scope.spawn(move || range_tape(part, &vec![0.0; part.input.elements()], tokens, device, precision, &[], &mut 0, None))
+		}).collect::<Vec<_>>();
+		builds.into_iter().map(|build| build.join().map_err(|_| RecipeError::new("a die's tape build panicked"))?).collect::<Result<Vec<_>>>()
+	})?;
+	// The largest exchange: its planes in the model type, over the window a tape holds.
+	let mut largest = 0;
+	for (part, tape) in graphs.iter().zip(&tapes) {
+		for node in part.nodes.iter().filter(|node| node.op == Primitive::Exchange) {
+			let plane = window_shape(node.output, part.input.length, tape.program.artifact.layout.window_positions).elements();
+			let planes = if node.argument[0] != 0.0 { devices.len() } else { 1 };
+			largest = largest.max(plane * planes * NativePrecision::new(node.precision, node.acc)?.model.bytes());
+		}
+	}
+	let buffer = devices[0].exchange_buffer(EXCHANGE_FLAG_BYTES + 2 * largest, devices)?;
+	tapes.iter().try_for_each(|tape| tape.bind_exchange(&buffer))?;
+	let resident = tapes.iter().map(NativeTape::resident_bytes).collect();
+	Ok((tapes, buffer, resident))
 }
 /// The saved statistics a batch normalization carries into inference, as the
 /// node index and the values it holds, out of what every node declares.
@@ -18331,7 +19971,11 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		.iter()
 		.map(|node| {
 			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+			let mut node = Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() };
+			if let Some(body) = node.body_start() {
+				*body -= start as f64;
+			}
+			Ok(node)
 		})
 		.collect::<Result<Vec<_>>>()?;
 	let last = &graph.nodes[end - 1];
@@ -18369,6 +20013,368 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		bias: graph.bias,
 		epsilon: graph.epsilon,
 	})
+}
+/// A stored weight a split can slice: packed, one format, every byte on the
+/// machine, with its block of values and the bytes the block takes.
+fn sliceable(graph: &Graph, index: usize) -> Option<(&StoredWeight, usize, usize)> {
+	let rows = graph.nodes[index].output.channels;
+	let weight = graph.stored[index]
+		.as_ref()
+		.filter(|weight| graph.nodes[index].packed && !weight.bytes.absent_runs() && (weight.format_segments().len() == 1 || bias_tail(weight).is_some_and(|(_, count, _)| count == rows)))?;
+	let spec = weight.format.spec()?;
+	Some((weight, spec.block, spec.stride))
+}
+/// A sum's bias stored after its matrix as a raw segment of one value per
+/// output row: its format, its values, and its bytes.
+fn bias_tail(weight: &StoredWeight) -> Option<(StorageFormat, usize, usize)> {
+	match weight.format_segments()[..] {
+		[_, (format, count)] => format.spec().filter(|spec| spec.block == 1).map(|spec| (format, count, count * spec.stride)),
+		_ => None,
+	}
+}
+/// Whether node `index` is a plain sum of its inputs onto its outputs, with or
+/// without a bias row, so a split can take shares of its rows or its inputs.
+fn plain_sum(graph: &Graph, index: usize) -> bool {
+	let node = &graph.nodes[index];
+	let offsets = graph.stored[index].as_ref().and_then(bias_tail).map_or(0, |(_, count, _)| count);
+	node.op == Primitive::Contraction && node.argument[0] <= 1.0 && node.parameters == node.input.channels * node.output.channels + offsets
+}
+/// Nodes that keep a split region together: a sum whose outputs a die can take
+/// a share of, ops that read and write only their own channels, and the sum over
+/// a share of its inputs that ends the region. `period` channels repeat the same
+/// pattern of shares and `unit` channels are the least a die takes.
+struct SplitRegion {
+	starts: Vec<usize>,
+	end: usize,
+	period: usize,
+	unit: usize,
+	/// The weight bytes one position reads of the region, and the bytes it stores.
+	read: usize,
+	stored: usize,
+}
+/// Every region of `graph` a split can keep apart: grown back from each sum that
+/// can split its inputs, through ops that keep channels apart, to the sums that
+/// split their outputs. A region whose nodes feed anything outside it, or that
+/// reaches any other op, is not split.
+fn split_regions(graph: &Graph, dies: usize) -> Result<Vec<SplitRegion>> {
+	let mut consumers = vec![Vec::new(); graph.nodes.len()];
+	for (index, node) in graph.nodes.iter().enumerate() {
+		for operand in [node.source, node.second] {
+			if let Ok(operand) = usize::try_from(operand) && operand < index {
+				consumers[operand].push(index);
+			}
+		}
+	}
+	let gcd = |mut a: usize, mut b: usize| {
+		while b != 0 {
+			(a, b) = (b, a % b);
+		}
+		a
+	};
+	let (mut regions, mut claimed) = (Vec::new(), vec![false; graph.nodes.len()]);
+	for (end, node) in graph.nodes.iter().enumerate() {
+		let sums = plain_sum(graph, end) || node.op == Primitive::ExpertOut;
+		let Some((_, block, _)) = sliceable(graph, end).filter(|_| sums) else { continue };
+		let (mut inside, mut starts, mut stack, mut whole) = (Vec::new(), Vec::new(), vec![node.source], true);
+		let (mut head, mut widths) = (None, vec![block]);
+		while let Some(operand) = stack.pop() {
+			let Ok(at) = usize::try_from(operand) else {
+				whole = false;
+				break;
+			};
+			if inside.contains(&at) || claimed[at] {
+				whole &= !claimed[at];
+				continue;
+			}
+			let producer = &graph.nodes[at];
+			let row_split = match producer.op {
+				Primitive::Contraction => plain_sum(graph, at),
+				Primitive::ExpertIn => true,
+				_ => false,
+			} && sliceable(graph, at).is_some();
+			inside.push(at);
+			if row_split {
+				starts.push(at);
+				continue;
+			}
+			match producer.op {
+				Primitive::Elementwise | Primitive::Dconv => {}
+				Primitive::Normalize if normalize_mode(producer.argument[0]).is_ok_and(|mode| mode.per_row()) && normalize_width(producer) < producer.output.channels => widths.push(normalize_width(producer)),
+				Primitive::Delta if producer.argument[5] == 1.0 => {
+					let (key_heads, key_width, _, width) = delta_extent(producer)?;
+					if key_width != width {
+						whole = false;
+						break;
+					}
+					head = Some((key_heads * key_width) as usize);
+					widths.push(width as usize);
+				}
+				_ => {
+					whole = false;
+					break;
+				}
+			}
+			// An elementwise op carries the channels of its operands of its own
+			// shape (others are whole on every die); the rest carry their source's.
+			if producer.op == Primitive::Elementwise {
+				for operand in [producer.source, producer.second] {
+					if usize::try_from(operand).is_ok_and(|operand| graph.nodes[operand].output == producer.output) {
+						stack.push(operand);
+					}
+				}
+			} else {
+				stack.push(producer.source);
+			}
+		}
+		if !whole || starts.is_empty() || inside.iter().any(|at| consumers[*at].iter().any(|consumer| *consumer != end && !inside.contains(consumer))) {
+			continue;
+		}
+		let period = match (head, node.op) {
+			(Some(period), _) => period,
+			(None, Primitive::ExpertOut) => node.argument[2] as usize,
+			(None, _) => node.input.channels,
+		};
+		let unit = widths.iter().fold(1, |unit, width| unit / gcd(unit, *width) * width);
+		let channels_fit = inside.iter().all(|at| graph.nodes[*at].output.channels % period == 0);
+		if period == 0 || period % unit != 0 || period / unit < dies || !channels_fit {
+			continue;
+		}
+		let read = starts.iter().chain(std::iter::once(&end)).map(|at| position_weight_bytes(graph, *at)).sum::<usize>();
+		let stored = starts.iter().chain(std::iter::once(&end)).map(|at| graph.stored.get(*at).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len())).sum::<usize>();
+		for at in &inside {
+			claimed[*at] = true;
+		}
+		claimed[end] = true;
+		regions.push(SplitRegion { starts, end, period, unit, read, stored });
+	}
+	Ok(regions)
+}
+/// The stored weight bytes one position reads of node `index`: all of a sum's,
+/// and of an expert table the share its routed experts hold.
+fn position_weight_bytes(graph: &Graph, index: usize) -> usize {
+	let (node, bytes) = (&graph.nodes[index], graph.stored.get(index).and_then(Option::as_ref).map_or(0, |weight| weight.bytes.len()));
+	match node.op {
+		Primitive::ExpertIn | Primitive::ExpertOut if node.argument[0] >= 1.0 => (bytes as f64 * node.argument[1] / node.argument[0]) as usize,
+		_ => bytes,
+	}
+}
+/// Rows `run` of a row-major weight of `rows` rows repeated `repeats` times
+/// (once per expert), as views of the stored bytes.
+fn weight_rows(weight: &StoredWeight, repeats: usize, rows: usize, run: Run) -> Result<StoredWeight> {
+	let tail = bias_tail(weight);
+	let (tail_count, tail_bytes) = tail.map_or((0, 0), |(_, count, bytes)| (count, bytes));
+	let (matrix_bytes, matrix_count) = (weight.bytes.len() - tail_bytes, weight.count - tail_count);
+	let matrix = weight.bytes.view(0, matrix_bytes);
+	let row_bytes = matrix_bytes / (repeats * rows);
+	let row_count = matrix_count / (repeats * rows);
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { rows / run.period };
+	// Every repeat's periods are the same rows apart, so the share is one strided view.
+	let period_rows = if run.period == 0 { rows } else { run.period };
+	let bytes = matrix.strided(run.first * row_bytes, run.count * row_bytes, period_rows * row_bytes, repeats * periods);
+	let count = row_count * run.count * periods * repeats;
+	let format = weight.format_segments()[0].0;
+	let Some((tail_format, _, _)) = tail else {
+		return Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] });
+	};
+	// The bias keeps the same rows as the matrix, one value each.
+	let value = tail_bytes / (repeats * rows);
+	let offsets = weight.bytes.view(matrix_bytes, tail_bytes).strided(run.first * value, run.count * value, period_rows * value, repeats * periods);
+	let biased = run.count * periods * repeats;
+	Ok(StoredWeight { format, count: count + biased, bytes: StoredBytes::joined(vec![bytes, offsets]), codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count), (tail_format, biased)] })
+}
+/// Inputs `run` of every row of a row-major weight of `rows` rows by `terms`
+/// inputs repeated `repeats` times, whole blocks at a time: each row's share
+/// is its own view of the stored bytes, so a die's share copies nothing.
+fn weight_terms(weight: &StoredWeight, repeats: usize, rows: usize, terms: usize, run: Run, block: usize, stride: usize) -> Result<StoredWeight> {
+	require(run.first % block == 0 && run.count % block == 0 && (run.period == 0 || run.period % block == 0), "a split of a sum's inputs must fall on whole blocks")?;
+	let tail = bias_tail(weight);
+	let matrix_bytes = weight.bytes.len() - tail.map_or(0, |(_, _, bytes)| bytes);
+	let row_bytes = terms / block * stride;
+	require(row_bytes * repeats * rows == matrix_bytes, "a split weight does not divide into its rows")?;
+	let periods = if run.period == 0 { 1 } else { terms / run.period };
+	// Every row's periods are the same bytes apart, so the share is one strided view.
+	let bytes = weight.bytes.view(0, matrix_bytes).strided(run.first / block * stride, run.count / block * stride, row_bytes / periods, repeats * rows * periods);
+	let count = repeats * rows * periods * run.count;
+	let format = weight.format_segments()[0].0;
+	// The dies' partial sums add up to the whole sum, so only the die holding the
+	// first inputs adds the bias; the others carry none.
+	match tail.filter(|_| run.first == 0) {
+		Some((tail_format, biased, tail_bytes)) => Ok(StoredWeight {
+			format,
+			count: count + biased,
+			bytes: StoredBytes::joined(vec![bytes, weight.bytes.view(matrix_bytes, tail_bytes)]),
+			codebook: weight.codebook.clone(),
+			arithmetic: Vec::new(),
+			segments: vec![(format, count), (tail_format, biased)],
+		}),
+		None => Ok(StoredWeight { format, count, bytes, codebook: weight.codebook.clone(), arithmetic: Vec::new(), segments: vec![(format, count)] }),
+	}
+}
+/// How many units of each split item every die takes, keyed by the item's
+/// node: a region by its end, a sum or expert table split alone by itself.
+type SplitPlan = BTreeMap<usize, Vec<usize>>;
+/// The units node `index` outside every region splits into and the period its
+/// rows repeat with, when it is large enough to split alone.
+fn lone_split(graph: &Graph, index: usize, dies: usize) -> Option<(usize, usize)> {
+	let node = &graph.nodes[index];
+	let (weight, _, _) = sliceable(graph, index)?;
+	match node.op {
+		Primitive::Contraction if plain_sum(graph, index) && weight.bytes.len() >= 16 << 20 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		Primitive::ExpertIn if node.argument[0] as usize > 1 && node.argument[2] as usize >= dies => Some((node.argument[2] as usize, node.argument[2] as usize)),
+		Primitive::ExpertOut if node.argument[0] as usize > 1 && node.output.channels >= dies => Some((node.output.channels, 0)),
+		_ => None,
+	}
+}
+/// Every item a split over `dies` cuts, as its key, its units and its stored
+/// bytes: each region not kept `whole`, then each large node outside them.
+fn split_items(graph: &Graph, dies: usize, whole: &std::collections::BTreeSet<usize>) -> Result<Vec<(usize, usize, usize)>> {
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	let inside = regions.iter().flat_map(|region| region.starts.iter().copied().chain([region.end])).collect::<std::collections::BTreeSet<_>>();
+	let mut items = regions.iter().map(|region| (region.end, region.period / region.unit, region.stored)).collect::<Vec<_>>();
+	for index in (0..graph.nodes.len()).filter(|index| !inside.contains(index)) {
+		if let Some((units, _)) = lone_split(graph, index, dies) {
+			items.push((index, units, graph.stored[index].as_ref().map_or(0, |weight| weight.bytes.len())));
+		}
+	}
+	Ok(items)
+}
+/// Each item's units over the dies, largest unit first, in proportion to the
+/// room each die has left: the coarse items go first and the fine ones even
+/// out what their whole units left over.
+fn plan_split(items: &[(usize, usize, usize)], rooms: &[f64]) -> SplitPlan {
+	let mut order = (0..items.len()).collect::<Vec<_>>();
+	let unit = |index: usize| items[index].2 as f64 / items[index].1 as f64;
+	order.sort_by(|a, b| unit(*b).total_cmp(&unit(*a)).then(a.cmp(b)));
+	let mut left = rooms.to_vec();
+	let mut plan = SplitPlan::new();
+	for index in order {
+		let (key, units, _) = items[index];
+		let weights = left.iter().map(|room| room.max(0.0)).collect::<Vec<_>>();
+		let total = weights.iter().sum::<f64>();
+		let exact = weights.iter().map(|weight| if total > 0.0 { units as f64 * weight / total } else { units as f64 / weights.len() as f64 }).collect::<Vec<_>>();
+		let counts = apportion(units, &exact);
+		for (room, count) in left.iter_mut().zip(&counts) {
+			*room -= *count as f64 * unit(index);
+		}
+		plan.insert(key, counts);
+	}
+	plan
+}
+/// Whole units summing to `count` near `exact`: each takes its whole part, at
+/// least one while there are enough to go round, and the units left go to the
+/// largest remainders.
+fn apportion(count: usize, exact: &[f64]) -> Vec<usize> {
+	let floor = usize::from(count >= exact.len());
+	let mut counts = exact.iter().map(|units| (*units as usize).max(floor)).collect::<Vec<_>>();
+	let mut order = (0..exact.len()).collect::<Vec<_>>();
+	order.sort_by(|a, b| (exact[*b] - counts[*b] as f64).total_cmp(&(exact[*a] - counts[*a] as f64)).then(a.cmp(b)));
+	for index in order.iter().cycle().take(count.saturating_sub(counts.iter().sum())) {
+		counts[*index] += 1;
+	}
+	// Units over the count leave the ones furthest past their exact share.
+	while counts.iter().sum::<usize>() > count {
+		let index = (0..exact.len()).filter(|index| counts[*index] > floor).max_by(|a, b| (counts[*a] as f64 - exact[*a]).total_cmp(&(counts[*b] as f64 - exact[*b])).then(b.cmp(a))).unwrap_or(0);
+		counts[index] -= 1;
+	}
+	counts
+}
+/// Die `die`'s graph of a tensor split over `dies` dies, each taking the units
+/// `plan` gives it of every split item. Each split region runs apart: its first sums keep this die's share
+/// of their rows, the ops after them keep channels apart, and the last sum adds
+/// this die's share of its inputs, which one exchange then sums over the dies.
+/// A large sum outside any region keeps a share of its rows, gathered after it;
+/// every other node runs whole on every die.
+fn shard_graph(graph: &Graph, die: usize, dies: usize, plan: &SplitPlan, whole: &std::collections::BTreeSet<usize>) -> Result<Graph> {
+	// Die `die`'s first unit and unit count of the item keyed `key`.
+	let part = |key: usize| {
+		plan.get(&key).map(|counts| (counts[..die].iter().sum::<usize>(), counts[die])).ok_or_else(|| RecipeError::new("a split item has no plan"))
+	};
+	let regions = split_regions(graph, dies)?.into_iter().filter(|region| !whole.contains(&region.end)).collect::<Vec<_>>();
+	if tracing() && die == 0 {
+		for region in &regions {
+			trace(&format!("split region starts {:?} end {} period {} unit {}", region.starts, region.end, region.period, region.unit))?;
+		}
+	}
+	// The rows and inputs each region node splits, and whether a sum follows.
+	let mut plans: Vec<Option<(Shard, Option<f64>)>> = vec![None; graph.nodes.len()];
+	for region in &regions {
+		let (first, count) = part(region.end)?;
+		require(count != 0, "a split region gives a die no channels")?;
+		let run = Run { first: first * region.unit, count: count * region.unit, period: region.period };
+		for start in &region.starts {
+			plans[*start] = Some((Shard { rows: run, terms: Run::default() }, None));
+		}
+		plans[region.end] = Some((Shard { rows: Run::default(), terms: run }, Some(1.0)));
+	}
+	let (mut nodes, mut stored, mut requantize, mut remap) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(graph.nodes.len()));
+	let map = |index: i32, remap: &[i32]| if index >= 0 { remap[index as usize] } else { index };
+	for (index, original) in graph.nodes.iter().enumerate() {
+		let mut node = original.clone();
+		node.source = map(node.source, &remap);
+		node.second = map(node.second, &remap);
+		// A scan is never split, so it lands next and its body right after it.
+		if let Some(body) = node.body_start() {
+			*body = nodes.len() as f64 + 1.0;
+		}
+		let weight = sliceable(graph, index);
+		// Outside a region, a large sum or expert table keeps a share of its rows
+		// and gathers them after itself; a small one runs whole.
+		let alone = match lone_split(graph, index, dies) {
+			_ if plans[index].is_some() || !plan.contains_key(&index) => None,
+			Some((_, period)) => {
+				let (first, count) = part(index)?;
+				Some(Run { first, count, period })
+			}
+			None => None,
+		};
+		let plan = plans[index].or(alone.map(|run| (Shard { rows: run, terms: Run::default() }, Some(0.0))));
+		let Some((shard, exchange)) = plan else {
+			nodes.push(node);
+			stored.push(graph.stored[index].clone());
+			requantize.push(graph.requantize[index].clone());
+			remap.push(nodes.len() as i32 - 1);
+			continue;
+		};
+		let (weight, block, stride) = weight.ok_or_else(|| RecipeError::new("a split node has no stored weight"))?;
+		// An expert table repeats its rows once per expert; a sum is one repeat.
+		let (repeats, rows, terms) = match node.op {
+			Primitive::ExpertIn => (node.argument[0] as usize, node.argument[2] as usize, node.input.channels),
+			Primitive::ExpertOut => (node.argument[0] as usize, node.output.channels, node.argument[2] as usize),
+			_ => (1, node.output.channels, node.input.channels),
+		};
+		let sliced = if shard.terms.count != 0 { weight_terms(weight, repeats, rows, terms, shard.terms, block, stride)? } else { weight_rows(weight, repeats, rows, shard.rows)? };
+		if bias_tail(weight).is_some() && bias_tail(&sliced).is_none() {
+			node.argument[2] = 1.0;
+		}
+		node.parameters = sliced.count;
+		node.shard = shard;
+		stored.push(Some(sliced));
+		requantize.push(None);
+		let (output, template) = (node.output, node.clone());
+		nodes.push(node);
+		if let Some(mode) = exchange {
+			let source = nodes.len() as i32 - 1;
+			nodes.push(Node {
+				op: Primitive::Exchange,
+				source,
+				second: source,
+				input: output,
+				output,
+				parameters: 0,
+				argument: [mode, die as f64, dies as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+				program_offset: 0,
+				program_count: 0,
+				storage: 0,
+				packed: false,
+				..template
+			});
+			stored.push(None);
+			requantize.push(None);
+		}
+		remap.push(nodes.len() as i32 - 1);
+	}
+	Ok(Graph { source: map(graph.source, &remap), nodes, stored, requantize, state: TrainingState::default(), bound: None, bound_values: Vec::new(), ..graph.clone() })
 }
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
@@ -18409,6 +20415,12 @@ fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu]
 			return Err(placement_memory_error(graph, precision, available)?);
 		}
 	}
+	// Every range compiles at once, one thread each, through LLVM and the
+	// driver's own compile; the tapes below then load the cached objects.
+	std::thread::scope(|scope| {
+		let compiles = parts.iter().zip(devices).map(|(part, device)| scope.spawn(move || device.native_prepare(part, 1, precision, None, false))).collect::<Vec<_>>();
+		compiles.into_iter().try_for_each(|compile| compile.join().map_err(|_| RecipeError::new("a range compile panicked"))?)
+	})?;
 	let (mut ranges, mut resident, mut movement, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], vec![0; devices.len()], 0, 0);
 	let tokens = vec![0.0; graph_positions(graph)];
 	for (index, (part, device)) in parts.iter().zip(devices).enumerate() {
@@ -18458,7 +20470,7 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		moved += graph_moved;
 		tapes.push(ranges);
 	}
-	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: chosen, tapes, resident, movement, moved, exchange: None })
 }
 /// Place a GGUF-bound model over the selected devices through the same graph
 /// partition and tape construction used by a saved model.
@@ -18476,9 +20488,21 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 		Some(_) => return Err(RecipeError::new("tokenizer suppress_tokens is not an array")),
 		None => Vec::new(),
 	};
+	// Dies that reach each other peer to peer exchange fast enough that every
+	// layer over every die beats layers one die after another.
+	let tensor = match env!("RECIPE_DEVICE_SPLIT") {
+		"tensor" => true,
+		"auto" => devices[0].reaches(devices),
+		_ => false,
+	};
+	if tensor && devices.len() > 1 && split.is_empty() {
+		let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+		let (dies, exchange, resident) = place_tensor(&graph, devices, Config::load()?.precision)?;
+		return Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split: vec![blocks; devices.len()], tapes: vec![dies], resident, movement: vec![0; devices.len()], moved: 0, exchange: Some(exchange) });
+	}
 	let retained = retained_source(&model.file)?;
 	let (split, ranges, resident, movement, moved) = place_ranges(&graph, split, devices, Config::load()?.precision, &[], retained.as_ref())?;
-	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved })
+	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
 }
 impl Placed {
 	pub fn residency(&self) -> Vec<WeightResidency> {
@@ -18694,7 +20718,7 @@ impl Placed {
 			*state = DecodeState::default();
 		}
 		let result = decode_sequence(&mut samples, prompt, sampler, stop, budget, first.profile, exact, progress, &mut state, emit, |samples, settled, reached| {
-			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None })?;
+			let predictions = self.run_window_observed(samples, settled, reached, if reached as usize == prompt.len() { progress } else { None }, false)?;
 			let mut sample_logits = self.last_logits(&predictions, settled, reached)?;
 			if let PlacedSource::Bound(_, suppressed) = &self.source {
 				for id in suppressed {
@@ -18708,6 +20732,39 @@ impl Placed {
 		if result.is_err() { *state = DecodeState::default(); }
 		result
 	}
+	/// A window through every die of a tensor split at once: each takes the
+	/// whole input and launches its step, and the dies meet at their exchanges.
+	fn forward_dies(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
+		let last = tapes.last().ok_or_else(|| RecipeError::new("placement has no die"))?;
+		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		for tape in tapes {
+			if begin == 0 {
+				tape.reset_sequence()?;
+			}
+			tape.write_tokens(begin as usize, token_window)?;
+			for (start, count) in tape.input_runs(begin, end) {
+				tape.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
+			}
+		}
+		let count = tapes.len();
+		let gate = std::sync::Barrier::new(count);
+		std::thread::scope(|scope| {
+			let runs = tapes
+				.iter()
+				.enumerate()
+				.map(|(index, tape)| {
+					let gate = &gate;
+					scope.spawn(move || {
+						tape.forward_window_gated(tape.samples.pointer, begin, end, ForwardMode::Inference, &mut |reached, _| {
+							if index + 1 == count && let Some(progress) = progress { progress.prefilled(reached as usize); }
+						}, Some(gate))
+					})
+				})
+				.collect::<Vec<_>>();
+			runs.into_iter().try_for_each(|run| run.join().map_err(|_| RecipeError::new("a die's window panicked"))?)
+		})?;
+		if last_only { last.last_column() } else { last.predictions() }
+	}
 	fn output_shape(&self) -> Result<Shape> {
 		let tape = self.tapes.last().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
 		Ok(tape.output)
@@ -18719,22 +20776,24 @@ impl Placed {
 	/// Run a window through either a saved semantic pipeline or one directly
 	/// bound GGUF graph, using the placement's persistent range tapes.
 	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
-		self.run_window_observed(samples, begin, end, None)
+		self.run_window_observed(samples, begin, end, None, false)
 	}
-	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	/// The window's output: every position of it, or with `last_only` a bound
+	/// model's last reached position alone.
+	fn run_window_observed(&self, samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		match &self.source {
 			PlacedSource::Saved(graphs) => {
 				let mut graph = 0;
 				bundle::infer_graphs(graphs, samples, |_, prepared| {
 					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
 					graph += 1;
-					self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None })
+					self.forward_window_with_tokens(ranges, prepared, samples, begin, end, if graph == graphs.len() { progress } else { None }, false)
 				})
 			}
 			PlacedSource::Bound(input, _) => {
 				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
 				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
-				self.forward_window(ranges, samples, begin, end, progress)
+				self.forward_window(ranges, samples, begin, end, progress, last_only)
 			}
 		}
 	}
@@ -18743,13 +20802,28 @@ impl Placed {
 	/// `samples` enter the first range, each range writes the positions the
 	/// window reaches and keeps them as its state, and only the window's rows of
 	/// the stream hop to the next device. Returns the last range's output.
-	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
-		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress)
+	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
+		self.forward_window_with_tokens(tapes, samples, samples, begin, end, progress, last_only)
 	}
 	/// Every part receives the original token IDs, independently of transformed
 	/// numeric inputs produced by earlier graphs. Host lookups share that clock.
-	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>) -> Result<Vec<f64>> {
+	fn forward_window_with_tokens(&self, tapes: &[NativeTape], samples: &[f64], tokens: &[f64], begin: u32, end: u32, progress: Option<&InferenceLive>, last_only: bool) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
+		let capacity = tapes.iter().map(|tape| tape.program.artifact.layout.window_positions.min(tape.input.length)).min().unwrap_or(1).max(1) as u32;
+		if end - begin > capacity {
+			let mut cursor = begin;
+			loop {
+				let stop = cursor.saturating_add(capacity).min(end);
+				let values = self.forward_window_with_tokens(tapes, samples, tokens, cursor, stop, progress, last_only)?;
+				if stop == end {
+					return Ok(values);
+				}
+				cursor = stop;
+			}
+		}
+		if self.exchange.is_some() {
+			return self.forward_dies(tapes, samples, begin, end, progress, last_only);
+		}
 		require(begin <= end, "window begins after its end")?;
 		let token_window = tokens.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
 		for tape in tapes {
@@ -18783,14 +20857,21 @@ impl Placed {
 			};
 			(begin, end) = tape.output_window(begin, end)?;
 			let hop_started = traced.then(Instant::now);
-			for (start, count) in window_runs(tape.output, begin, end) {
-				next.write_samples(start, &tape.output(start, count)?)?;
+			next.window_begin.store(begin, Ordering::Relaxed);
+			let runs = window_runs(tape.output, begin, end);
+			if runs.len() > 1 && next.vocabulary == 0.0 {
+				// Every channel's run of the window moves in one strided copy each way.
+				next.write_window(begin, end, &tape.output_window_values(begin, end)?)?;
+			} else {
+				for (start, count) in runs {
+					next.write_samples(start, &tape.output(start, count)?)?;
+				}
 			}
 			if let (Some(window_seconds), Some(hop_started)) = (window_seconds, hop_started) {
 				trace(&format!("range window range={index} device={} positions={}..{} window_seconds={window_seconds:.6} hop_seconds={:.6}", tape.device_label()?, window.0, window.1, hop_started.elapsed().as_secs_f64()))?;
 			}
 		}
-		last.predictions()
+		if last_only { last.last_column() } else { last.predictions() }
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18835,6 +20916,9 @@ enum Primitive {
 	Fold = 21,
 	/// The final position reached by a forward window, collapsed to length one.
 	Last = 22,
+	/// Values the dies of a tensor split share: each die's rows gathered into
+	/// every die (argument 0 = 0), or every die's partial sums added (= 1).
+	Exchange = 23,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -18877,6 +20961,11 @@ impl Node {
 	fn table(&self) -> bool {
 		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
+	/// The node index a scan's recurrent body starts at, right after the scan. It
+	/// is a node reference like `source`, so it moves wherever the nodes move.
+	fn body_start(&mut self) -> Option<&mut f64> {
+		(self.op == Primitive::Scan && self.argument[5] == 1.0).then_some(&mut self.argument[3])
+	}
 	fn primitive_name(&self) -> &'static str {
 		match self.op {
 			Primitive::Contraction => "Contraction",
@@ -18899,6 +20988,7 @@ impl Node {
 			Primitive::Lookup => "Lookup",
 			Primitive::Fold => "Fold",
 			Primitive::Last => "Last",
+			Primitive::Exchange => "Exchange",
 		}
 	}
 	fn identity(&self, index: usize) -> String {
@@ -18947,6 +21037,32 @@ struct Node {
 	/// The format an attention node keeps its key-value cache in; the node's
 	/// own arithmetic for every other node.
 	kv_precision: Compute,
+	/// The part of a tensor-split node this die computes: its output rows and the
+	/// inputs it sums over. A whole run is the whole axis.
+	shard: Shard,
+}
+/// Channels `first` to `first + count` of every `period` channels, or from
+/// `first` on when `period` is zero; no channels named is the whole axis.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Run {
+	first: usize,
+	count: usize,
+	period: usize,
+}
+impl Run {
+	/// How many of `channels` the run holds.
+	fn local(self, channels: usize) -> usize {
+		match (self.count, self.period) {
+			(0, _) => channels,
+			(count, 0) => count,
+			(count, period) => channels / period * count,
+		}
+	}
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Shard {
+	rows: Run,
+	terms: Run,
 }
 #[derive(Clone, Default)]
 struct TrainingState {
@@ -19239,6 +21355,9 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 	for node in &mut tail.nodes {
 		node.source = rebase(node.source)?;
 		node.second = rebase(node.second)?;
+		if let Some(body) = node.body_start() {
+			*body -= at as f64;
+		}
 	}
 	tail.input = tail.nodes[0].input;
 	tail.source = tail.nodes.len() as i32 - 1;
@@ -19278,6 +21397,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 			node.second = source;
 		} else if node.second >= 0 {
 			node.second += node_base
+		}
+		if let Some(body) = node.body_start() {
+			*body += f64::from(node_base);
 		}
 		node.offset = checked_add(node.offset, weight_base, "model weight offset")?;
 		if node.program_count != 0 {
@@ -19453,9 +21575,10 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 	// first), so a host requantize is kept and handed back to every later compile
 	// of the same file bytes into the same format.
 	let key = (format.0, weight.count, weight.bytes.0.iter().map(|run| match run {
-		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length),
-		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len()),
-		StoredSegment::Absent(length) => (0, 0, *length),
+		StoredSegment::Mapped(mapping, at, length) => (Arc::as_ptr(mapping) as usize, *at, *length, 0, 1),
+		StoredSegment::Owned(bytes) => (bytes.as_ptr() as usize, 0, bytes.len(), 0, 1),
+		StoredSegment::Absent(length) => (0, 0, *length, 0, 1),
+		StoredSegment::Strided { mapping, at, length, pitch, count } => (Arc::as_ptr(mapping) as usize, *at, *length, *pitch, *count),
 	}).collect::<Vec<_>>());
 	let cache = REQUANTIZED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
 	if let Some((_, encoded)) = cache.lock().map_err(|_| RecipeError::new("requantize cache lock is poisoned"))?.get(&key) {
@@ -19489,7 +21612,7 @@ fn requantize_bound(graph: &mut Graph, index: usize, format: StorageFormat, conf
 /// Host requantize results by source runs and target format, kept for the
 /// later compiles of one run.
 #[allow(clippy::type_complexity)]
-static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
+static REQUANTIZED: OnceLock<Mutex<std::collections::HashMap<(u16, usize, Vec<(usize, usize, usize, usize, usize)>), (StoredBytes, StoredWeight)>>> = OnceLock::new();
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
 	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
 	// The block's own suffix for this kind of op, else the run's table.
@@ -19521,6 +21644,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		precision,
 		acc,
 		kv_precision,
+		shard: Shard::default(),
 	};
 	// A graph compiled over mapped tensors fills each parameterized node from
 	// the next plan entry. Block bytes stay packed and the node reserves no
@@ -19532,6 +21656,9 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		Some(None) => return Err(RecipeError::new(format!("{} takes {weights} values but the plan names no tensor for it", node.identity(index)))),
 		Some(Some(bound)) => {
 			require(bound.elements == weights, format!("{} hold {} values; {} takes {weights}", bound.names, bound.elements, node.identity(index)))?;
+			if tracing() {
+				trace(&format!("bind {} {}", node.identity(index), bound.names))?;
+			}
 			match bound.weight {
 				// A bound contraction or expert decodes the mapped source layout;
 				// compute precision does not expand its stored table.
@@ -20999,6 +23126,8 @@ struct NativeSchedule {
 	shared_values: u32,
 	contractions: Vec<Option<NativeContractionTiles>>,
 	attention: Vec<Option<Tile>>,
+	/// The lanes of the device's wave: the rows a stored weight interleaves.
+	lanes: u32,
 }
 #[derive(Clone, Copy, Debug)]
 struct NativeContractionTiles {
@@ -21249,15 +23378,15 @@ mod precision_contract_checks {
 			Box::leak(Box::new(cpu_device().unwrap()))
 		}
 	}
-	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize, gated: bool) -> (Vec<f64>, Vec<f64>) {
+	fn attention_gradient_fixture(gpu: &'static Gpu, format: Compute, inputs: &[f64], heads: usize, width: usize, length: usize) -> (Vec<f64>, Vec<f64>) {
 		let config = Config::load().unwrap();
-		let channels = width * (heads + 2 + if gated { heads } else { 0 });
+		let channels = width * (heads + 2);
 		assert_eq!(inputs.len(), channels * length);
 		let mut graph = Graph::new(Shape { channels, length }, 1e-5);
 		graph.profile = config.profile;
 		graph.profile.attn = format;
 		graph.profile.atvn = Compute::FP32;
-		let args = [heads as f64, 1.0, f64::from(gated), 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
+		let args = [heads as f64, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-5, 1.0];
 		push_node(&mut graph, Primitive::Attention, Shape { channels: width * heads, length }, 0, args, -2).unwrap();
 		lower_scale(&mut graph, 2.0_f64.powi(-24)).unwrap();
 		let targets = vec![0.25; width * heads * length];
@@ -21304,25 +23433,19 @@ mod precision_contract_checks {
 		let scale = 2.0_f64.powi(-24);
 		for format in [Compute::FP32, Compute::FP16, Compute::BF16] {
 			for heads in [1, 2] {
-				for gated in [false, true] {
-					let mut inputs = vec![0.5; (heads + 2) * 4];
-					inputs[(heads + 1) * 4..].fill(0.0625);
-					if gated { inputs.extend(vec![0.0; heads * 4]); }
-					let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1, gated);
-					let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
-					for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
-					for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
-						let expected = delta * heads as f64 * if gated { 0.5 } else { 1.0 };
-						assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
-					}
-					if gated {
-						for value in &derivative[(heads + 2) * 4..] { assert!((value - delta * 0.0625 * 0.25).abs() < 1e-12, "{} gate gradient {value}", format.label()); }
-					}
+				let mut inputs = vec![0.5; (heads + 2) * 4];
+				inputs[(heads + 1) * 4..].fill(0.0625);
+				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, heads, 4, 1);
+				let delta = 2.0 * (output[0] - 0.25) * scale / (heads * 4) as f64;
+				for value in &derivative[..(heads + 1) * 4] { assert!(value.abs() < 1e-12); }
+				for value in &derivative[(heads + 1) * 4..(heads + 2) * 4] {
+					let expected = delta * heads as f64;
+					assert!((value - expected).abs() < 1e-12, "{} value gradient {value} vs {expected}", format.label());
 				}
 			}
 			for (q, k0, k1) in [(0.5, 0.0, 0.0), (0.0, 0.5, -0.5)] {
 				let inputs = [0.0, q, k0, k1, 0.25, 0.5];
-				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2, false);
+				let (output, derivative) = attention_gradient_fixture(gpu, format, &inputs, 1, 1, 2);
 				let d0 = (output[0] - 0.25) * scale;
 				let d1 = (output[1] - 0.25) * scale;
 				let score0 = d1 * 0.5 * (0.25 - 0.375);
@@ -21359,48 +23482,6 @@ mod precision_contract_checks {
 				let gradients = tape.download_gradient().unwrap();
 				let expected_bias = d * factors.iter().sum::<f64>();
 				assert!((gradients[candidate * 3 + 2] - expected_bias).abs() < 1e-12, "{} {gates}-gate bias {} vs {expected_bias}", format.label(), gradients[candidate * 3 + 2]);
-			}
-		}
-	}
-	#[test]
-	fn narrow_delta_rule_carries_small_gradients() {
-		let gpu = gradient_test_gpu();
-		let scale = 2.0_f64.powi(-24);
-		for format in [Compute::FP16, Compute::BF16] {
-			for chunk in [1, 2] {
-				let config = Config::load().unwrap();
-				let shape = Shape { channels: 3, length: 2 };
-				let mut graph = Graph::new(shape, 1e-5);
-				graph.profile = config.profile;
-				graph.profile.sum = format;
-				graph.profile.atvn = format;
-				let gates = constant(&mut graph, -1, Shape { channels: 2, length: 2 }, 0.0).unwrap();
-				reset(&mut graph, -1, shape);
-				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 1, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
-				graph.parameters.fill(0.0);
-				graph.block_precision = Some(Compute::FP32);
-				lower_scale(&mut graph, scale).unwrap();
-				// The existing forward predicts from the prior state before decay:
-				// S_next = a*S + b*k*(v-k*S). With a=b=k=0.5, carry is 0.375.
-				let inputs = [1.0, 1.0, 0.5, 0.5, 0.25, 0.5];
-				let mut tape = NativeTape::new(&graph, TapeInput::Values(&inputs), &inputs, &[0.25, 0.25], gpu, Compute::FP32, Some(mse)).unwrap();
-				tape.advance().unwrap();
-				tape.gradient_launch(0.01, config).unwrap();
-				let predictions = tape.predictions().unwrap();
-				assert!((predictions[0] - 0.0625 * scale).abs() < 1e-12);
-				assert!((predictions[1] - 0.1484375 * scale).abs() < 1e-12);
-				let d0 = (predictions[0] - 0.25) * scale;
-				let d1 = (predictions[1] - 0.25) * scale;
-				let s0 = d0 + 0.375 * d1;
-				let expected = [0.0625 * d0, 0.1484375 * d1, 0.125 * s0, 0.21875 * d1, 0.25 * s0, 0.25 * d1];
-				let adjoints = tape.input_adjoint.download_float(6, Compute::FP32).unwrap();
-				for (i, (got, want)) in adjoints.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} delta input {i}: {got} vs {want}", format.label()); }
-				let gate_values = tape.adjoints.download_float_bytes(tape.program.artifact.layout.adjoints[gates as usize], 4, Compute::FP32).unwrap();
-				for (i, (got, want)) in gate_values.iter().zip([0.0, -0.015625 * d1, 0.03125 * s0, 0.05859375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
-				let softplus = format.unpack(format.pack(2.0_f64.ln()));
-				let expected_decay = -0.03125 * softplus * d1;
-				let decay = tape.download_gradient().unwrap()[0];
-				assert!((decay - expected_decay).abs() < 1e-12, "{} chunk {chunk} decay {decay} vs {expected_decay}", format.label());
 			}
 		}
 	}
@@ -22089,6 +24170,8 @@ struct NativeTape {
 	/// The end of the last forwarded window: the positions a traced dump reads.
 	reached: std::sync::atomic::AtomicU32,
 	window_begin: std::sync::atomic::AtomicU32,
+	/// The lane tuner of an inference tape whose program reads knobs.
+	tuner: Mutex<Option<LaneTuner>>,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
@@ -22337,7 +24420,7 @@ impl NativeTape {
 			(TapeInput::Values(values), true) => Buffer::upload(gpu, &values.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?,
 			(TapeInput::Values(values), false) => Buffer::upload_float(gpu, values, layout.input_precision)?,
 		};
-		let Acquired { mut weights, mut residency, mut load, hold: reused_hold } = acquire_weights(gpu, graph, precision.model, inference, source)?;
+		let Acquired { mut weights, mut residency, mut load, hold: reused_hold } = acquire_weights(gpu, graph, precision.model, inference, rows, source)?;
 		let reused = residency.outcome == "reused";
 		let mut hold = reused_hold;
 		if program.model_load.is_some() && !reused {
@@ -22409,6 +24492,9 @@ impl NativeTape {
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				// A position reads a few scattered rows of a table far larger than the
+				// machine's memory: each read takes only its own page from the disk.
+				table.bytes.scattered();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
@@ -22487,8 +24573,10 @@ impl NativeTape {
 			last_device_seconds: AtomicU64::new(0.0_f64.to_bits()),
 			reached: std::sync::atomic::AtomicU32::new(0),
 			window_begin: std::sync::atomic::AtomicU32::new(0),
+			tuner: Mutex::new(None),
 		};
 		tape.stage_lookups(0, tape.positions)?;
+		tape.bind_knobs(graph)?;
 		Ok(tape)
 	}
 	/// Writes every contraction node's forward, gradient, and previous tiles
@@ -22633,19 +24721,29 @@ impl NativeTape {
 	/// the host and write them into the staging context the device reads.
 	fn stage_lookups(&self, begin: u32, end: u32) -> Result<()> {
 		let (begin, end) = (begin as usize, end as usize);
+		// A buffer that holds one window keeps its first position at slot zero.
+		let origin = if self.program.artifact.layout.window_positions < self.input.length { begin } else { 0 };
 		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
 		for lookup in &self.lookups {
 			let bytes = lookup.precision.bytes();
 			let channels = lookup.hash.heads() * lookup.width;
 			for row in 0..self.rows as usize {
 				let ids = tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
+				// The rows of a window are scattered reads of the machine's disk or
+				// memory: they are read at once, each waiting on its own page.
+				let indices = (begin..end).flat_map(|position| lookup.hash.rows_at(&ids, position)).collect::<Vec<_>>();
+				let readers = indices.len().clamp(1, natural("lookup readers", env!("RECIPE_LOOKUP_READERS"))?);
+				let parts = std::thread::scope(|scope| {
+					let handles = indices.chunks(indices.len().div_ceil(readers).max(1)).map(|part| scope.spawn(move || part.iter().map(|index| ngram::table_row(&lookup.table, lookup.width, *index)).collect::<Result<Vec<_>>>())).collect::<Vec<_>>();
+					handles.into_iter().map(|handle| handle.join().map_err(|_| RecipeError::new("a lookup reader panicked"))?).collect::<Result<Vec<_>>>()
+				})?;
 				let mut staged = Vec::with_capacity((end - begin) * channels);
-				for position in begin..end {
-					for index in lookup.hash.rows_at(&ids, position) {
-						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
+				for rows in parts {
+					for row in rows {
+						staged.extend(row);
 					}
 				}
-				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin, "lookup slot")?, channels, "lookup staging offset")?;
+				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin - origin, "lookup slot")?, channels, "lookup staging offset")?;
 				self.contexts.write_float_bytes(checked_add(lookup.context, checked_mul(slot, bytes, "lookup staging bytes")?, "lookup staging")?, &staged, lookup.precision)?;
 			}
 		}
@@ -22662,13 +24760,19 @@ impl NativeTape {
 		self.forward_window_observed(samples, begin, end, mode, &mut |_, _| {})
 	}
 	fn forward_window_observed(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64)) -> Result<()> {
+		self.forward_window_gated(samples, begin, end, mode, observed, None)
+	}
+	/// A window whose launch waits at `gate` for the other dies of a tensor
+	/// split, so every die starts its step together and none waits at its
+	/// first exchange for another's host work.
+	fn forward_window_gated(&self, samples: u64, begin: u32, end: u32, mode: ForwardMode, observed: &mut dyn FnMut(u32, f64), gate: Option<&std::sync::Barrier>) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
 		let capacity = self.program.artifact.layout.window_positions as u32;
 		if end - begin > capacity {
 			let (mut cursor, mut seconds) = (begin, 0.0);
 			while cursor < end {
 				let stop = cursor.saturating_add(capacity).min(end);
-				self.forward_window_observed(samples, cursor, stop, mode, observed)?;
+				self.forward_window_gated(samples, cursor, stop, mode, observed, gate)?;
 				seconds += f64::from_bits(self.last_device_seconds.load(Ordering::Acquire));
 				cursor = stop;
 			}
@@ -22686,31 +24790,91 @@ impl NativeTape {
 		if single && let NativeBackend::Amd(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
 		#[cfg(nvidia)]
 		if single && let NativeBackend::Nvidia(program) = &self.program.backend && let Some(dispatch) = program.step { thread_count = dispatch.geometry.threads()?; }
+		// A decode step runs with the knobs the lane tuner draws for it.
+		let mut tuner = self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))?;
+		let tuning = single && tuner.is_some();
+		if tuning && let (Some(tuner), Some(offset)) = (tuner.as_mut(), self.program.artifact.layout.knobs) {
+			self.contexts.write_bytes(offset, &tuner.choose())?;
+		}
 		let mode = mode as i32;
 		let mut call = ptrs![samples, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end, mode];
+		if let Some(gate) = gate {
+			gate.wait();
+		}
 		let machine_started = Instant::now();
 		self.program.launch_forward(&mut call, single).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		observed(end, seconds);
 		if mode == ForwardMode::Inference as i32 && self.observations != 0 {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
-		if let Some(clocks) = self.program.artifact.layout.clocks {
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
 			let count = self.program.artifact.layout.precisions.len();
+			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
-			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
-			let mut line = format!("clocks window {begin}..{end} {unit}");
-			for index in 0..count {
-				let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
-				line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
+			if tuning && let Some(tuner) = tuner.as_mut() {
+				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
+				tuner.observe(&stamps);
 			}
-			trace(&line)?;
+			if tracing() {
+				let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
+				let mut line = format!("clocks window {begin}..{end} {unit}");
+				for index in 0..count {
+					let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
+					line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
+				}
+				line.push_str(&format!(" device={}", self.device_label()?));
+				trace(&line)?;
+			}
 		}
 		Ok(())
+	}
+	/// Points the program's knob table at this tape's context arena and starts
+	/// the lane tuner, where the program reads knobs.
+	fn bind_knobs(&self, graph: &Graph) -> Result<()> {
+		let Some(offset) = self.program.artifact.layout.knobs else { return Ok(()) };
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				let (mut address, mut bytes) = (0_u64, 0_usize);
+				if (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, b"recipe_knobs\0".as_ptr()) != 0 {
+					return Ok(());
+				}
+				let table = self.contexts.pointer + offset as u64;
+				driver_status(Backend::Nvidia, (driver.upload)(address, (&table as *const u64).cast(), 8), "knob table write")?;
+			},
+			_ => return Ok(()),
+		}
+		self.contexts.write_bytes(offset, &vec![0; (graph.nodes.len() + 2) * 4])?;
+		*self.tuner.lock().map_err(|_| RecipeError::new("lane tuner lock poisoned"))? = Some(LaneTuner::new(graph)?);
+		Ok(())
+	}
+	/// Points this tape's program at a tensor split's machine RAM and starts
+	/// its exchange count at zero.
+	fn bind_exchange(&self, buffer: &ExchangeBuffer) -> Result<()> {
+		match (&self.program.gpu.driver, &self.program.backend) {
+			#[cfg(nvidia)]
+			(Driver::Cuda(driver), NativeBackend::Nvidia(program)) => unsafe {
+				driver_status(Backend::Nvidia, (driver.set)(driver.context), "native context")?;
+				// The first die's buffer at its unified address, or the address this
+				// device's context maps the machine RAM at.
+				let mut mapped = buffer.device;
+				if mapped == 0 {
+					driver_status(Backend::Nvidia, (driver.host_device_pointer)(&mut mapped, buffer.pointer, 0), "exchange mapping")?;
+				}
+				for (name, value, size) in [(&b"recipe_exchange_host\0"[..], mapped, 8), (&b"recipe_exchange_epoch\0"[..], 0, 4)] {
+					let (mut address, mut bytes) = (0_u64, 0_usize);
+					driver_status(Backend::Nvidia, (driver.module_global)(&mut address, &mut bytes, program.module as Ptr, name.as_ptr()), "exchange symbol")?;
+					driver_status(Backend::Nvidia, (driver.upload)(address, (&value as *const u64).cast(), size), "exchange symbol write")?;
+				}
+				Ok(())
+			},
+			_ => Err(RecipeError::new(format!("{} cannot take part in a tensor split", self.program.gpu.name))),
+		}
 	}
 	/// Evaluate rows after `first` with this trained native program. The input
 	/// buffer is reused in bounded chunks, and `%rows` changes per launch, so a
@@ -22768,8 +24932,20 @@ impl NativeTape {
 			self.samples.write_bytes(checked_mul(first, size_of::<i32>(), "token offset")?, ids.as_flattened())
 		} else {
 			let input_precision = self.program.artifact.layout.input_precision;
-			self.samples.write_float_bytes(checked_mul(first, input_precision.bytes(), "sample offset")?, values, input_precision)
+			self.samples.write_float_bytes(checked_mul(first - self.input_origin(), input_precision.bytes(), "sample offset")?, values, input_precision)
 		}
+	}
+	/// The first position a windowed stream input holds.
+	fn input_origin(&self) -> usize {
+		if self.program.artifact.layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) as usize } else { 0 }
+	}
+	/// Positions `begin..end` of every input channel, channel by channel.
+	fn write_window(&self, begin: u32, end: u32, values: &[f64]) -> Result<()> {
+		let precision = self.program.artifact.layout.input_precision;
+		let bytes = precision.bytes();
+		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
+		let pitch = checked_mul(self.input.length.min(self.program.artifact.layout.window_positions), bytes, "window pitch")?;
+		self.samples.write_strided_bytes(checked_mul(begin as usize - self.input_origin(), bytes, "window offset")?, pitch, checked_mul((end - begin) as usize, bytes, "window width")?, &encoded)
 	}
 	fn write_tokens(&self, first: usize, values: &[f64]) -> Result<()> {
 		let mut tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
@@ -22803,8 +24979,6 @@ impl NativeTape {
 		}
 		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
 	}
-	/// Restore the token, input, and mutable arenas before a new sequence, while
-	/// retaining packed tables and saved evaluation statistics.
 	fn reset_sequence(&self) -> Result<()> {
 		self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.fill(0.0);
 		self.samples.clear()?;
@@ -22839,6 +25013,28 @@ impl NativeTape {
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.rows as usize * self.output.elements())
 	}
+	/// Positions `begin..end` of every output channel, channel by channel.
+	fn output_window_values(&self, begin: u32, end: u32) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let arena = *layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let (precision, bytes) = (layout.output_precision, layout.output_precision.bytes());
+		// A buffer that holds one window keeps its first position at slot zero.
+		let length = window_shape(self.output, self.input.length, layout.window_positions).length;
+		let origin = if layout.window_positions < self.input.length { self.window_begin.load(Ordering::Relaxed) } else { 0 };
+		let offset = checked_add(arena, checked_mul((begin - origin) as usize, bytes, "window offset")?, "window offset")?;
+		let encoded = self.values.download_strided_bytes(offset, checked_mul(length, bytes, "window pitch")?, checked_mul((end - begin) as usize, bytes, "window width")?, self.output.channels)?;
+		let values = encoded.chunks_exact(bytes).map(|chunk| { let mut bits = [0_u8; 8]; bits[..bytes].copy_from_slice(chunk); precision.unpack(u64::from_le_bytes(bits)) }).collect::<Vec<_>>();
+		self.trace_values(&values)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
+	}
+	/// The output channels at the last position the latest forward reached.
+	fn last_column(&self) -> Result<Vec<f64>> {
+		let layout = &self.program.artifact.layout;
+		let column = layout.last_column.ok_or_else(|| RecipeError::new("this tape keeps no last output column"))?;
+		let values = self.contexts.download_float_bytes(column, self.output.channels, layout.output_precision)?;
+		self.trace_values(&values)?;
+		Ok(values)
+	}
 	/// Select the last output position reached by an input window for
 	/// autoregressive sampling. Predictions stay channel-major (`channel,
 	/// position`) so a decode must sample one value from each channel while
@@ -22849,11 +25045,9 @@ impl NativeTape {
 		select_last_logits(predictions, self.output, reached as usize - 1)
 	}
 	/// A run of `count` output values from element `first` of the output arena.
-	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
-		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let output_precision = self.program.artifact.layout.output_precision;
-		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
-		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+	/// Under a trace, the head of every traced node's values, once and again
+	/// whenever the output the host just read went nonfinite.
+	fn trace_values(&self, values: &[f64]) -> Result<()> {
 		// A traced run shows the head of every node's values once, at the first
 		// output, and again if a later output went nonfinite.
 		static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -22927,6 +25121,14 @@ impl NativeTape {
 				trace(&format!("values node {index} {} {channels}x{positions} first {first:?} last {last:?}{at} sum {sum}", self.nodes[index].identity(index)))?;
 			}
 		}
+		Ok(())
+	}
+	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
+		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let output_precision = self.program.artifact.layout.output_precision;
+		let offset = checked_add(arena, checked_mul(first, output_precision.bytes(), "output offset")?, "output arena offset")?;
+		let values = self.values.download_float_bytes(offset, count, output_precision)?;
+		self.trace_values(&values)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn capture_tensors(&self, begin: u32, end: u32) -> Result<Vec<TensorObservation>> {
@@ -23003,11 +25205,16 @@ impl NativeTape {
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
 		trace(&format!("epoch {} {operation:?} submitted", self.step))?;
 		self.program.gpu.synchronize()?;
-		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
-		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9 };
+		let seconds = if self.program.gpu.backend == Backend::Cpu { machine_started.elapsed().as_secs_f64() } else { self.kernel_seconds()? };
 		self.last_device_seconds.store(seconds.to_bits(), Ordering::Release);
 		trace(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
+	}
+	/// The last dispatch on the device's own clock: from the leading worker's
+	/// entry mark to the last worker's exit.
+	fn kernel_seconds(&self) -> Result<f64> {
+		let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
+		Ok(ticks[1].wrapping_sub(ticks[0]).max(0) as f64 / 1e9)
 	}
 	fn epoch_metrics(&self) -> Result<EpochMetrics> {
 		let values = self.metrics.download_float(EpochMetrics::VALUES, self.program.artifact.layout.output_adjoint_precision)?;
@@ -23305,7 +25512,8 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width, config.precision, config.precision), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, TapeInput::Values(&samples), &samples, &targets, gpu, config.precision, Some(mse))?;
-	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
+	// Each dispatch's machine time, then the interval its kernel marked on the device's own clock.
+	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<(f64, f64)> {
 		tape.advance()?;
 		let started = Instant::now();
 		if gradient {
@@ -23314,17 +25522,23 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 			tape.optimizer_launch(config.surrogate_rate, config)?;
 		}
 		gpu.synchronize()?;
-		Ok(started.elapsed().as_secs_f64())
+		Ok((started.elapsed().as_secs_f64(), tape.kernel_seconds()?))
 	};
 	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
 	timed(&mut tape, false)?;
-	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
+	let (mut overhead, mut epoch, mut kernel) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
 	for _ in 0..config.surrogate_epochs {
-		overhead = overhead.min(timed(&mut tape, false)?);
-		epoch = epoch.min(timed(&mut tape, true)?);
+		overhead = overhead.min(timed(&mut tape, false)?.0);
+		let (machine, own) = timed(&mut tape, true)?;
+		(epoch, kernel) = (epoch.min(machine), kernel.min(own));
 	}
-	let gradient = epoch - overhead;
+	// A CPU dispatch starts its worker threads and wakes them at every barrier,
+	// and a loaded scheduler defers each wake by up to a tick, longer than the
+	// whole surrogate gradient. The machine times of two such dispatches then
+	// need not differ by the work between them, so the epoch kernel's own clock
+	// times that work inside one dispatch.
+	let gradient = if gpu.backend == Backend::Cpu { kernel } else { epoch - overhead };
 	require(gradient.is_finite() && gradient > 0.0, "surrogate gradient time must be finite and positive")?;
 	Ok(((gradient_work(&graph, rows)? / gradient).max(1.0), overhead))
 }
@@ -23957,6 +26171,11 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 }
 /// Context sizing and lifetimes are one declaration consumed by allocation.
 /// Regions remain contiguous and in the order the kernel reads them.
+/// The first positions of a decode window whose carried state is kept, so a
+/// rejected draft takes the state back instead of running the window again.
+fn draft_positions() -> Result<usize> {
+	natural("draft positions", env!("RECIPE_DRAFT_POSITIONS"))
+}
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inference: bool, step: usize) -> Result<Vec<(usize, BufferLifetime)>> {
 	use BufferLifetime::{ReadOnly, Retained, Unused};
 	let local = if inference { BufferLifetime::Until(step) } else { Retained };
@@ -23969,6 +26188,14 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 	}
 	let state = carried(node, rows)?.values;
 	let regions = match node.op {
+		// The inputs before a window that its taps still reach, per channel.
+		Primitive::Dconv if inference => {
+			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
+			let tail = checked_mul(checked_mul(rows, node.output.channels, "depthwise history channels")?, checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?, "depthwise history")?;
+			let tail_bytes = checked_mul(tail.max(1), precision.bytes(), "depthwise history bytes")?;
+			// The history after each of a window's first positions, to take back to.
+			vec![(tail_bytes, Retained), (checked_mul(tail_bytes, draft_positions()?, "depthwise kept histories")?, Retained)]
+		}
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
@@ -24023,9 +26250,12 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta state")?;
 			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
+			let live = checked_mul(pair_bytes, state, "delta carried state bytes")?;
 			vec![
-				(checked_mul(pair_bytes, state, "delta carried state bytes")?, Retained),
+				(live, Retained),
 				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+				// The live state after each of a window's first positions, to take back to.
+				(checked_mul(live, draft_positions()?, "delta kept states")?, Retained),
 			]
 		}
 		Primitive::Pool if inference => Vec::new(),
@@ -24121,9 +26351,27 @@ impl Buffer {
 	}
 	/// Writes stored bytes run by run from where they are mapped or held, so a
 	/// weight reaches the device without a host copy of its own size.
+	/// Adjacent runs, such as the per-row views of a die's share, go up
+	/// together through one staging buffer of at most 64 MiB.
 	fn write_runs(&self, offset: usize, stored: &StoredBytes) -> Result<()> {
+		const STAGING: usize = 64 << 20;
+		let (mut staged, mut start) = (Vec::new(), 0);
 		for (at, run) in stored.runs() {
-			self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+			if !staged.is_empty() && (start + staged.len() != at || staged.len() + run.len() > STAGING) {
+				self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
+				staged.clear();
+			}
+			if run.len() >= STAGING {
+				self.write_bytes(checked_add(offset, at, "GPU run write")?, run)?;
+				continue;
+			}
+			if staged.is_empty() {
+				start = at;
+			}
+			staged.extend_from_slice(run);
+		}
+		if !staged.is_empty() {
+			self.write_bytes(checked_add(offset, start, "GPU run write")?, &staged)?;
 		}
 		Ok(())
 	}
@@ -24135,19 +26383,33 @@ impl Buffer {
 	/// The weight arena. A packed weight is written from where it is mapped, a
 	/// stored weight the model-load kernel expands is left to that kernel, and
 	/// every other node's parameters are encoded and written in place.
-	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool) -> Result<(Self, (usize, usize, usize))> {
+	fn upload_weights(runtime: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize) -> Result<(Self, (usize, usize, usize))> {
 		let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
-		let buffer = Self { runtime, pointer: runtime.allocate(bytes.max(1))?, bytes: bytes.max(1), mapped: false, sealed: false };
-		let fill = buffer.fill_weights(graph, &offsets, inference)?;
+		// A run decoder reads the last block of a weight as whole aligned words,
+		// up to three bytes past its end.
+		let bytes = bytes + 4;
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes, mapped: false, sealed: false };
+		let fill = buffer.fill_weights(graph, &offsets, inference, rows)?;
 		Ok((buffer, fill))
 	}
 	/// Writes every weight node into the weight buffer. Returns the bytes read from the
 	/// stored source, the bytes converted on the CPU, and the bytes uploaded.
-	fn fill_weights(&self, graph: &Graph, offsets: &[usize], inference: bool) -> Result<(usize, usize, usize)> {
+	fn fill_weights(&self, graph: &Graph, offsets: &[usize], inference: bool, rows: usize) -> Result<(usize, usize, usize)> {
 		let (mut read, mut converted, mut uploaded) = (0, 0, 0);
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if let Some(weight) = packed_weight(graph, index, inference) {
-				self.write_runs(offsets[index], &weight.bytes)?;
+				match row_interleave(graph, index, inference, rows, self.runtime.lanes()) {
+					Some((lanes, row_bytes, padded_row)) => {
+						let mut bytes = Vec::with_capacity(weight.bytes.len());
+						for (_, run) in weight.bytes.runs() {
+							bytes.extend_from_slice(run);
+						}
+						let stride = weight.format_segments().first().and_then(|(segment, _)| segment.spec()).map_or(row_bytes, |spec| spec.stride);
+						let padded = stride * padded_row / row_bytes;
+						self.write_bytes(offsets[index], &interleave_rows(&bytes, bytes.len() / row_bytes, row_bytes, lanes as usize, stride, padded))?;
+					}
+					None => self.write_runs(offsets[index], &weight.bytes)?,
+				}
 				read += weight.bytes.len();
 				uploaded += weight.bytes.len();
 			} else if !node.table() && runtime_stored_weight(graph, index, inference).is_some() {
@@ -24171,6 +26433,19 @@ impl Buffer {
 		require(!self.sealed, "retained weights are read-only")?;
 		require(checked_add(offset, values.len(), "GPU byte write")? <= self.bytes, "GPU byte write exceeds buffer")?;
 		self.runtime.upload(self.pointer + offset as u64, values.as_ptr().cast(), values.len()).map(|_| ())
+	}
+	/// Runs of `width` bytes from `offset` on, `pitch` apart, one per value of `values.len() / width`.
+	fn write_strided_bytes(&self, offset: usize, pitch: usize, width: usize, values: &[u8]) -> Result<()> {
+		let rows = values.len() / width.max(1);
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided write")?, "GPU strided write")?, width, "GPU strided write")? <= self.bytes, "GPU strided write exceeds buffer")?;
+		self.runtime.upload_strided(self.pointer + offset as u64, values.as_ptr().cast(), pitch, width, rows)
+	}
+	fn download_strided_bytes(&self, offset: usize, pitch: usize, width: usize, rows: usize) -> Result<Vec<u8>> {
+		require(rows == 0 || checked_add(checked_add(offset, checked_mul(rows - 1, pitch, "GPU strided read")?, "GPU strided read")?, width, "GPU strided read")? <= self.bytes, "GPU strided read exceeds buffer")?;
+		let mut values = vec![0_u8; checked_mul(rows, width, "GPU strided read")?];
+		self.runtime.synchronize()?;
+		self.runtime.download_strided(values.as_mut_ptr().cast(), self.pointer + offset as u64, pitch, width, rows)?;
+		Ok(values)
 	}
 	fn clear(&self) -> Result<()> {
 		self.clear_range(0, self.bytes)
@@ -24627,8 +26902,8 @@ struct Acquired {
 	load: Option<RetainedLoad>,
 	hold: Option<RetainedHold>,
 }
-fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, reason: &str) -> Result<Acquired> {
-	let (weights, (read_bytes, converted_bytes, uploaded_bytes)) = Buffer::upload_weights(gpu, graph, precision, inference)?;
+fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, reason: &str) -> Result<Acquired> {
+	let (weights, (read_bytes, converted_bytes, uploaded_bytes)) = Buffer::upload_weights(gpu, graph, precision, inference, rows)?;
 	let residency = WeightResidency {
 		device: gpu.name.clone(),
 		outcome: if reason.is_empty() { "private" } else { "bypassed" },
@@ -24658,26 +26933,27 @@ fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
 	text
 }
 #[cfg(target_os = "linux")]
-fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, source: Option<&RetainedSource>) -> Result<Acquired> {
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, source: Option<&RetainedSource>) -> Result<Acquired> {
 	use std::io::Write as _;
 	use std::os::unix::fs::MetadataExt as _;
-	let Some(source) = source else { return private_weights(gpu, graph, precision, inference, "") };
+	let Some(source) = source else { return private_weights(gpu, graph, precision, inference, rows, "") };
 	if !inference {
-		return private_weights(gpu, graph, precision, inference, "training weights are mutable");
+		return private_weights(gpu, graph, precision, inference, rows, "training weights are mutable");
 	}
 	if !matches!(gpu.driver, Driver::Cpu) {
-		return private_weights(gpu, graph, precision, inference, "device weights are not retained on this device");
+		return private_weights(gpu, graph, precision, inference, rows, "device weights are not retained on this device");
 	}
 	let root = retained_root()?;
 	let owner = fs::metadata(&root).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", root.display())))?.uid();
 	let now = unix_now();
 	let (released, recovered) = sweep_retained(&root, owner, now);
 	let (offsets, weight_total) = native_weight_arena(graph, precision, inference)?;
-	let bytes = weight_total.max(1);
+	// A run decoder reads the last block of a weight as whole aligned words, up to three bytes past its end.
+	let bytes = weight_total + 4;
 	let digest = hex(&source.digest);
 	let interface = weight_interface(graph, &offsets, bytes);
 	let identity = format!(
-		"{RETAINED_ROOT}\nsource {}\nsource_digest {digest}\ninterface {interface}\ndevice {}\ntarget {}\nprecision {}\n",
+		"{RETAINED_ROOT}\nsource {}\nsource_digest {digest}\ninterface {interface}\ndevice {}\ntarget {}\nprecision {}\nrows {rows}\n",
 		source.path,
 		gpu.name,
 		native_target_label(&gpu.native_target),
@@ -24694,7 +26970,7 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 		if current {
 			let mapped = fs::OpenOptions::new().read(true).write(true).open(&weights_path).ok().zip(field_address(&fields, "address")).and_then(|(file, address)| map_retained(&file, bytes, address));
 			let Some(pointer) = mapped else {
-				return private_weights(gpu, graph, precision, inference, "retained address is unavailable");
+				return private_weights(gpu, graph, precision, inference, rows, "retained address is unavailable");
 			};
 			let expires = now + source.ttl;
 			let mut renewed = fields;
@@ -24720,7 +26996,7 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
 				let stale = read_fields(&loading, owner).is_some_and(|fields| !holder_alive(fields.get("holder")));
 				if !stale {
-					return private_weights(gpu, graph, precision, inference, "another process is loading these weights");
+					return private_weights(gpu, graph, precision, inference, rows, "another process is loading these weights");
 				}
 				remove_retained(&lease);
 				residency.recovered += 1;
@@ -24729,7 +27005,7 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 		}
 	}
 	if !claimed {
-		return private_weights(gpu, graph, precision, inference, "another process is loading these weights");
+		return private_weights(gpu, graph, precision, inference, rows, "another process is loading these weights");
 	}
 	let weight_file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&weights_path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", weights_path.display())))?;
 	weight_file.set_len(retained_length(bytes) as u64).map_err(|error| RecipeError::new(format!("cannot size {}: {error}", weights_path.display())))?;
@@ -24740,10 +27016,10 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	});
 	let Some(pointer) = mapped else {
 		remove_retained(&lease);
-		return private_weights(gpu, graph, precision, inference, "no retained address is free");
+		return private_weights(gpu, graph, precision, inference, rows, "no retained address is free");
 	};
 	let weights = Buffer::retained(gpu, pointer, bytes);
-	let (read_bytes, converted_bytes, uploaded_bytes) = weights.fill_weights(graph, &offsets, inference)?;
+	let (read_bytes, converted_bytes, uploaded_bytes) = weights.fill_weights(graph, &offsets, inference, rows)?;
 	residency.address = pointer as usize;
 	residency.read_bytes = read_bytes;
 	residency.converted_bytes = converted_bytes;
@@ -24757,9 +27033,9 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	Ok(Acquired { weights, residency, load: Some(RetainedLoad { lease, loading, owner, ttl: source.ttl, fields }), hold: None })
 }
 #[cfg(not(target_os = "linux"))]
-fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, _source: Option<&RetainedSource>) -> Result<Acquired> {
+fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, rows: usize, _source: Option<&RetainedSource>) -> Result<Acquired> {
 	let reason = format!("retained weights require Linux, not {}", std::env::consts::OS);
-	private_weights(gpu, graph, precision, inference, &reason)
+	private_weights(gpu, graph, precision, inference, rows, &reason)
 }
 #[derive(Clone, Copy)]
 struct Kernel {
@@ -24780,7 +27056,7 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32, i32);
-type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
+type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32, i32);
@@ -24946,6 +27222,27 @@ impl Kernel {
 		}
 	}
 }
+/// `CUDA_MEMCPY2D`: `height` rows of `width` bytes, each side with its own pitch.
+#[cfg(nvidia)]
+#[repr(C)]
+struct CudaCopy2d {
+	src_x: usize,
+	src_y: usize,
+	src_memory: u32,
+	src_host: *const c_void,
+	src_device: u64,
+	src_array: Ptr,
+	src_pitch: usize,
+	dst_x: usize,
+	dst_y: usize,
+	dst_memory: u32,
+	dst_host: Ptr,
+	dst_device: u64,
+	dst_array: Ptr,
+	dst_pitch: usize,
+	width: usize,
+	height: usize,
+}
 #[cfg(nvidia)]
 struct Cuda {
 	_runtime: std::sync::Arc<Library>,
@@ -24955,6 +27252,7 @@ struct Cuda {
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	copy_2d: unsafe extern "C" fn(*const CudaCopy2d) -> i32,
 	clear: unsafe extern "C" fn(u64, u8, usize) -> i32,
 	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
@@ -24965,6 +27263,11 @@ struct Cuda {
 	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
 	function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32>,
 	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
+	host_alloc: unsafe extern "C" fn(*mut Ptr, usize, u32) -> i32,
+	host_free: unsafe extern "C" fn(Ptr) -> i32,
+	host_device_pointer: unsafe extern "C" fn(*mut u64, Ptr, u32) -> i32,
+	enable_peer: unsafe extern "C" fn(Ptr, u32) -> i32,
+	module_global: unsafe extern "C" fn(*mut u64, *mut usize, Ptr, *const u8) -> i32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
@@ -25230,6 +27533,17 @@ fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
 }
 impl Gpu {
+	/// The lanes of one wave on this device: a CPU runs one lane at a time.
+	fn lanes(&self) -> u32 {
+		match &self.driver {
+			Driver::Cpu => 1,
+			#[cfg(amd)]
+			Driver::Hsa(hsa) => hsa.wave,
+			#[cfg(nvidia)]
+			Driver::Cuda(cuda) => cuda.wave,
+			Driver::Remote(remote) => remote.wave,
+		}
+	}
 	#[cfg(any(amd, nvidia))]
 	fn status(&self, status: i32, action: &str) -> Result<()> {
 		driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend)))
@@ -25244,6 +27558,30 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<NativeProgram> {
+		let (artifact, schedule, shapes, register_values, waves, element, shared_values) = self.native_compile(graph, rows, precision, loss, epoch)?;
+		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
+		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
+		let required = fixed
+			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
+			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
+		Ok(program)
+	}
+	/// Compiles a graph for this device and runs the driver's own compile of the
+	/// artifact into its cache, without keeping anything loaded.
+	fn native_prepare(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<()> {
+		let (artifact, ..) = self.native_compile(graph, rows, precision, loss, epoch)?;
+		match &self.driver {
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => unsafe { driver.warm_native(&artifact.artifact) },
+			_ => Ok(()),
+		}
+	}
+	/// The schedule and compiled artifact of a graph on this device, without
+	/// loading it: the artifact lands in the native cache, so ranges compile in
+	/// parallel before each loads on its own device.
+	#[allow(clippy::type_complexity)]
+	fn native_compile(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, epoch: bool) -> Result<(NativeArtifact, NativeSchedule, Vec<Option<NativeContractionShapes>>, u32, u32, Compute, u32)> {
 		validate_capabilities(&self.native_target, graph)?;
 		let cpu = self.backend == Backend::Cpu;
 		let vector_waves = if cpu {
@@ -25303,15 +27641,20 @@ impl Gpu {
 		let matrix_waves =
 			narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")?
 				as u32;
-		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
+		// An inference pass over a window runs as wide as the one-position step:
+		// its packed sums spread their rows over every wave the SM holds.
+		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else if loss.is_none() && !cpu { (512 / wave.max(1)).max(1) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
-		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
+		// A widened inference window keeps the general body's register tile small
+		// enough that its reduction buffer fits beside the packed column.
+		let widened = loss.is_none() && !cpu && !matrix;
+		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m).min(if widened { 2 } else { u32::MAX });
 		let waves = if cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
-		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
+		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min(if widened { 2 } else { u32::MAX }).min((self.shared_limit
 			/ element.bytes() as u32
 			/ block / register_m
 			.checked_add(1)
@@ -25324,7 +27667,9 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		// The margin is the configured width's: widening an inference pass to the
+		// step's width keeps the tiles its schedule sized for that width.
+		let shared_budget = shared_values / if matrix || cpu { waves } else { vector_waves };
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
@@ -25368,7 +27713,17 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// A packed row stages its whole column at once when the tile holds it: the
+		// column, one padding value per 32, and 96 values of row sums, expert ids
+		// and routing weights per wave of the widest (512-lane) workgroup.
+		let packed_shared_values = if inference && !cpu {
+			let scratch = 96 * (512 / wave.max(1)) + 8;
+			let widest = graph.nodes.iter().filter(|node| node.packed).map(|node| node.input.channels as u32).max().unwrap_or(0);
+			(widest + widest / 32 + 1 + scratch).min(shared_values.saturating_sub(256))
+		} else {
+			0
+		};
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(packed_shared_values);
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
@@ -25409,15 +27764,10 @@ impl Gpu {
 			shared_values,
 			contractions,
 			attention,
+			lanes: self.lanes(),
 		};
-		let artifact = compile_model(&self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, shapes, register_values, waves)?;
-		let fixed = [Some(program.forward), program.epoch, program.model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.shared).max().unwrap_or(0);
-		let required = fixed
-			.checked_add(shared_values.max(program.reduction_values).checked_mul(element.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?)
-			.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		require(required <= self.shared_limit, format!("native model needs {required} bytes of shared memory ({fixed} fixed, {} values of {} bytes), the device has {}", shared_values.max(program.reduction_values), element.bytes(), self.shared_limit))?;
-		Ok(program)
+		let artifact = compile_model(&self.name, &self.native_target, graph, precision, loss, epoch, rows, schedule.clone())?;
+		Ok((artifact, schedule, shapes, register_values, waves, element, shared_values))
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
 		let pointer = self.allocate_bytes(bytes)?;
@@ -25555,6 +27905,35 @@ impl Gpu {
 			}
 		}
 	}
+	/// `bytes` from device address `src` to device address `dst` on this device.
+	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
+	/// `rows` runs of `width` bytes, `pitch` apart on the device, packed together
+	/// in machine RAM: one copy where the driver has one, else one per run.
+	fn download_strided(&self, dst: Ptr, src: u64, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 2, src_host: ptr::null(), src_device: src, src_array: ptr::null_mut(), src_pitch: pitch, dst_x: 0, dst_y: 0, dst_memory: 1, dst_host: dst, dst_device: 0, dst_array: ptr::null_mut(), dst_pitch: width, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided download");
+			if result.is_ok() { record_transfer(&self.name, false, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.download(unsafe { dst.cast::<u8>().add(row * width).cast() }, src + (row * pitch) as u64, width))
+	}
+	/// `rows` runs of `width` bytes packed in machine RAM, written `pitch` apart on the device.
+	fn upload_strided(&self, dst: u64, src: *const c_void, pitch: usize, width: usize, rows: usize) -> Result<()> {
+		#[cfg(nvidia)]
+		if let Driver::Cuda(driver) = &self.driver {
+			self.activate()?;
+			let copy = CudaCopy2d { src_x: 0, src_y: 0, src_memory: 1, src_host: src, src_device: 0, src_array: ptr::null_mut(), src_pitch: width, dst_x: 0, dst_y: 0, dst_memory: 2, dst_host: ptr::null_mut(), dst_device: dst, dst_array: ptr::null_mut(), dst_pitch: pitch, width, height: rows };
+			let started = Instant::now();
+			let result = self.status(unsafe { (driver.copy_2d)(&copy) }, "strided upload");
+			if result.is_ok() { record_transfer(&self.name, true, width * rows, started.elapsed().as_secs_f64()); }
+			return result;
+		}
+		(0..rows).try_for_each(|row| self.upload(dst + (row * pitch) as u64, unsafe { src.cast::<u8>().add(row * width).cast() }, width).map(|_| ()))
+	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		self.activate()?;
@@ -25595,7 +27974,9 @@ impl Gpu {
 				Driver::Cuda(driver) => {
 					let (mut free, mut total) = (0, 0);
 					self.status((driver.memory_info)(&mut free, &mut total), "free memory")?;
-					Ok(free as u64)
+					// Memory above a configured bound is unusable, so it is never free.
+					let unusable = device_usable_bytes(&self.name)?.map_or(0, |usable| (total as u64).saturating_sub(usable));
+					Ok((free as u64).saturating_sub(unusable))
 				}
 				#[cfg(amd)]
 				Driver::Hsa(driver) => {
@@ -25794,6 +28175,12 @@ static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Dots chain devices under the most recent host prefix. Commas are invalid.
 /// `cpu` names the available CPU pool, not a physical socket.
 /// The first name is the primary device.
+/// The bytes of this machine's device `name` that may hold data, when the
+/// manifest bounds them (`device-usable-bytes`): memory above it is faulty.
+fn device_usable_bytes(name: &str) -> Result<Option<u64>> {
+	let device = format!("{}:{name}", local_host()?);
+	env!("RECIPE_DEVICE_USABLE_BYTES").split(';').filter_map(|entry| entry.split_once('=')).find(|(entry, _)| *entry == device).map(|(_, bytes)| bytes.parse::<u64>().map_err(|error| RecipeError::new(format!("device-usable-bytes for {device} is invalid: {error}")))).transpose()
+}
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
@@ -26171,6 +28558,17 @@ impl Cuda {
 		}
 	}
 
+	/// Runs the driver's PTX compile for this device into its compute cache, so
+	/// the later load of the same bytes reads the cached object.
+	unsafe fn warm_native(&self, bytes: &[u8]) -> Result<()> {
+		unsafe {
+			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
+			let mut module = ptr::null_mut();
+			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
+			driver_status(Backend::Nvidia, (self.unload)(module), "native module unload")
+		}
+	}
+
 	unsafe fn load_native(
 		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_step: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
 	) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
@@ -26208,6 +28606,12 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
+}
+/// The CPU kernels' `@recipe.clock`: nanoseconds on the machine's monotonic
+/// clock, so a kernel's own start and end marks time its work in seconds.
+extern "C" fn native_cpu_clock() -> i64 {
+	static ORIGIN: OnceLock<Instant> = OnceLock::new();
+	i64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(i64::MAX)
 }
 
 macro_rules! launch_native_cpu_epoch {
@@ -26282,6 +28686,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 	let barrier = std::sync::Barrier::new(threads as usize);
 	let context = ptr::from_ref(&barrier) as usize;
 	let wait = native_cpu_barrier as *const () as usize;
+	let clock = native_cpu_clock as *const () as usize;
 	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
 	std::thread::scope(|scope| {
 		let workers = (0..threads)
@@ -26291,7 +28696,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 					let thread_id = i32::try_from(thread_id).map_err(|_| RecipeError::new("native CPU worker ID exceeds i32"))?;
 					let arguments = slots.iter().map(|slot| *slot as Ptr).collect::<Vec<_>>();
 					unsafe {
-						thread(thread_id, context as Ptr, wait as Ptr);
+						thread(thread_id, context as Ptr, wait as Ptr, clock as Ptr);
 						launch_native_cpu_entry(forward, epoch, model_load, entry, &arguments)
 					}
 				})
@@ -26759,6 +29164,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_2d: runtime.function(b"cuMemcpy2D_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -26769,6 +29175,11 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				function_attribute,
 				function_attribute_set,
 				occupancy,
+				host_alloc: runtime.function(b"cuMemHostAlloc\0")?,
+				host_free: runtime.function(b"cuMemFreeHost\0")?,
+				host_device_pointer: runtime.function(b"cuMemHostGetDevicePointer_v2\0")?,
+				enable_peer: runtime.function(b"cuCtxEnablePeerAccess\0")?,
+				module_global: runtime.function(b"cuModuleGetGlobal_v2\0")?,
 				cus: cus as u32,
 				wave: wave as u32,
 				workgroup: workgroup as u32,
@@ -26979,6 +29390,8 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn madvise(address: Ptr, length: usize, advice: i32) -> i32;
+	fn getpagesize() -> i32;
 }
 #[cfg(unix)]
 unsafe fn native_library(name: &OsStr) -> Ptr {
