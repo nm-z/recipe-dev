@@ -11732,7 +11732,7 @@ use std::{
 	error::Error,
 	ffi::{OsStr, c_void},
 	fmt, fs,
-	io::{IsTerminal, Read, Write},
+	io::{IsTerminal, Read, Seek, SeekFrom, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
@@ -11944,6 +11944,7 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
+	schema_file: Option<String>,
 	normalize: bool,
 	split: f64,
 	/// Whether `.split()` was called: the rolling RAT policy reads its window from it.
@@ -15138,7 +15139,7 @@ impl Recipe {
 			[path] if sources.len() == 1 => Some(open_script_file(Path::new(path))),
 			_ => panic!("a GGUF model file is the only source of its data"),
 		};
-		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
+		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, schema_file: None, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
 	}
 	/// An empty model. Its normalization epsilon is the one the opened GGUF file
 	/// declares, or the Cargo default when no file is open.
@@ -28587,6 +28588,12 @@ impl Data {
 		self.target = target.into_data_sources();
 		self
 	}
+	/// Use one confirmed dataset schema to validate the source layout and select
+	/// the declared feature types while loading its rows.
+	pub fn schema(mut self, path: impl Into<String>) -> Self {
+		self.schema_file = Some(path.into());
+		self
+	}
 	pub fn include(mut self, names: impl IntoDataSources) -> Self {
 		assert!(!matches!(&self.features, FeatureSelection::Exclude(_)), "include and exclude are mutually exclusive");
 		self.features = FeatureSelection::Include(names.into_data_sources());
@@ -28720,6 +28727,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			table.path = path.clone();
 			grouped.push((directory.clone(), table));
 		}
+	}
+	// A confirmed SQLite table selects one table before the tables are aligned.
+	if let Some(name) = confirmed_data_schema(data)?.and_then(|schema| schema.table) {
+		grouped.retain(|(_, table)| table.name == name);
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
 		return Ok((vec![table], paths));
@@ -29003,7 +29014,7 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	if targets.is_empty() {
 		return Ok(None);
 	}
-	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
+	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_audio(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
 		return Ok(None);
@@ -29251,6 +29262,16 @@ fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
 	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
 }
 fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String>)> {
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_audio) {
+		let (encoding, channels, bits, frames, payload) = data_audio_header(bytes)?;
+		require(encoding == 1 && matches!(bits, 8 | 16), "audio samples must use 8-bit or 16-bit PCM WAV")?;
+		let values = match bits {
+			8 => payload.iter().map(|value| ((f64::from(*value) - 128.0) / 128.0).to_string()).collect::<Vec<_>>(),
+			16 => payload.chunks_exact(2).map(|sample| (f64::from(i16::from_le_bytes(sample.try_into().unwrap())) / 32768.0).to_string()).collect::<Vec<_>>(),
+			_ => unreachable!(),
+		};
+		return Ok((Some(Shape { channels, length: frames }), values));
+	}
 	if !path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
 		return Ok((None, vec![sample_text(path, bytes)?]));
 	}
@@ -29261,6 +29282,9 @@ fn sample_values(path: &Path, bytes: &[u8]) -> Result<(Option<Shape>, Vec<String
 }
 fn is_image(extension: &str) -> bool {
 	matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
+}
+fn is_audio(extension: &str) -> bool {
+	extension.eq_ignore_ascii_case("wav")
 }
 /// Document formats that carry sample text but never decode as tables, so they only
 /// count as samples inside a recognized directory layout.
@@ -29693,10 +29717,45 @@ fn name_headerless(data: &Data, tables: &mut [Table]) -> Result<()> {
 	table.declared = true;
 	Ok(())
 }
+/// Checks one column against its confirmed dtype and returns the feature type it loads as.
+fn confirmed_feature(table: &Table, column: usize, declared: &str, rows: usize) -> Result<FeatureType> {
+	let header = &table.headers[column];
+	let values = table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|entry| !entry.is_empty()).collect::<Vec<_>>();
+	match declared {
+		"integer" => {
+			require(values.iter().all(|entry| entry.parse::<i64>().is_ok()), format!("dataset schema column {header:?} is not integer"))?;
+			Ok(FeatureType::Numeric)
+		}
+		"float" => {
+			require(values.iter().all(|entry| entry.parse::<f64>().is_ok_and(f64::is_finite)), format!("dataset schema column {header:?} is not finite float"))?;
+			Ok(FeatureType::Numeric)
+		}
+		"categorical" => Ok(FeatureType::Categorical(categories(table, column, rows))),
+		"text" => Ok(FeatureType::Text(values.iter().map(|entry| entry.len()).max().unwrap_or(0))),
+		_ => Err(RecipeError::new(format!("dataset schema column {header:?} has a non-tabular type {declared:?}"))),
+	}
+}
+
 fn prepare_data(data: &Data) -> Result<Prepared> {
+	let confirmed = confirmed_data_schema(data)?;
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
 	name_headerless(data, &mut tables)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
+	if let Some(schema) = &confirmed {
+		require(source_table_rows == schema.samples, format!("dataset schema expected {} samples, loader found {source_table_rows}", schema.samples))?;
+		if schema.parse == "table" || schema.parse == "sqlite_table" {
+			require(tables.len() == 1, format!("confirmed {} schema requires exactly one loaded table", schema.parse))?;
+			let table = &tables[0];
+			require(table.headers.len() == schema.features && table.headers.len() == schema.columns.len(), "dataset schema table width differs from loaded headers")?;
+			// Every declared column, including the target, must match its header and its values.
+			for (column, (header, (name, declared))) in table.headers.iter().zip(&schema.columns).enumerate() {
+				require(header == name, format!("dataset schema column {name:?} differs from loaded header {header:?}"))?;
+				confirmed_feature(table, column, declared, source_table_rows)?;
+			}
+		} else {
+			require(tables.len() == 1 && !data.target.is_empty(), format!("confirmed {} requires one labeled sample table", schema.parse))?;
+		}
+	}
 	if !data.tests.is_empty() {
 		let (mut tests, test_sources) = load_tables(data, &data.tests)?;
 		name_headerless(data, &mut tests)?;
@@ -29742,7 +29801,11 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	for (table, value) in tables.iter().enumerate() {
 		for (column, header) in value.headers.iter().enumerate() {
 			if !selected.contains(&(table, column)) && data.features.selects(value, header, column) {
-				columns.push((table, column, infer_feature(value, column, source_table_rows)));
+				let kind = match confirmed.as_ref().filter(|schema| schema.parse == "table") {
+					Some(schema) => confirmed_feature(value, column, &schema.columns[column].1, source_table_rows)?,
+					None => infer_feature(value, column, source_table_rows),
+				};
+				columns.push((table, column, kind));
 			}
 		}
 	}
@@ -29750,6 +29813,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		columns.sort_by_key(|(table, column, _)| names.iter().position(|name| column_match(name, &tables[*table], &tables[*table].headers[*column], *column)).unwrap_or(names.len()));
 	}
 	let features = columns.iter().map(|column| column.2.width()).sum();
+	if let Some(schema) = &confirmed && schema.parse != "table" && schema.parse != "sqlite_table" {
+		require(features == schema.features, format!("dataset schema expected {} sample features, loader found {features}", schema.features))?;
+	}
 	let mut sequence_widths = BTreeMap::new();
 	let repeated = columns.iter().all(|column| {
 		tables[column.0].headers[column.1].rsplit_once('.').and_then(|value| value.1.parse::<usize>().ok().map(|row| *sequence_widths.entry(row).or_insert(0) += column.2.width())).is_some()
@@ -29984,6 +30050,988 @@ fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf,
 	files.push((path.to_owned(), bytes));
 	Ok(())
 }
+fn data_json_string(value: &str) -> String {
+	let mut text = String::from("\"");
+	for character in value.chars() {
+		match character {
+			'"' => text.push_str("\\\""),
+			'\\' => text.push_str("\\\\"),
+			'\n' => text.push_str("\\n"),
+			'\r' => text.push_str("\\r"),
+			'\t' => text.push_str("\\t"),
+			control if control.is_control() => text.push_str(&format!("\\u{:04x}", control as u32)),
+			other => text.push(other),
+		}
+	}
+	text.push('"');
+	text
+}
+
+fn data_name_index(path: &Path) -> Option<usize> {
+	let name = path.file_stem()?.to_str()?;
+	name.split(|character: char| !character.is_ascii_digit()).filter(|part| !part.is_empty()).filter_map(|part| part.parse::<usize>().ok()).max()
+}
+
+fn data_image_header(path: &Path, bytes: &[u8]) -> Result<(usize, usize, usize)> {
+	let kind = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
+	if kind == "png" {
+		require(bytes.get(..8) == Some(&b"\x89PNG\r\n\x1a\n"[..]) && bytes.get(12..16) == Some(&b"IHDR"[..]), "PNG header is absent")?;
+		let header = bytes.get(16..29).ok_or_else(|| RecipeError::new("PNG header is truncated"))?;
+		let width = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+		let height = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+		let channels = match header[9] {
+			0 | 3 => 1,
+			2 => 3,
+			4 => 2,
+			6 => 4,
+			_ => 0,
+		};
+		require(width != 0 && height != 0 && channels != 0, "PNG dimensions or channel type are invalid")?;
+		return Ok((width, height, channels));
+	}
+	require(bytes.get(..2) == Some(&[0xff, 0xd8]), "JPEG header is absent")?;
+	let mut at = 2;
+	while at + 4 <= bytes.len() {
+		if bytes[at] != 0xff {
+			return Err(RecipeError::new("JPEG marker is invalid"));
+		}
+		let marker = bytes[at + 1];
+		if marker == 0xd9 || marker == 0xda {
+			break;
+		}
+		let size = u16::from_be_bytes(bytes[at + 2..at + 4].try_into().unwrap()) as usize;
+		require(size >= 2 && at + 2 + size <= bytes.len(), "JPEG segment is truncated")?;
+		if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+			let body = bytes.get(at + 4..at + 2 + size).ok_or_else(|| RecipeError::new("JPEG frame is truncated"))?;
+			require(body.len() >= 6, "JPEG frame is truncated")?;
+			let height = u16::from_be_bytes(body[1..3].try_into().unwrap()) as usize;
+			let width = u16::from_be_bytes(body[3..5].try_into().unwrap()) as usize;
+			let channels = body[5] as usize;
+			require(width != 0 && height != 0 && channels != 0, "JPEG dimensions or channels are invalid")?;
+			return Ok((width, height, channels));
+		}
+		at += size + 2;
+	}
+	Err(RecipeError::new("JPEG frame header is absent"))
+}
+
+fn data_audio_header(bytes: &[u8]) -> Result<(u16, usize, usize, usize, &[u8])> {
+	require(bytes.get(..4) == Some(&b"RIFF"[..]) && bytes.get(8..12) == Some(&b"WAVE"[..]), "WAV header is absent")?;
+	let (mut at, mut format, mut payload) = (12, None, None);
+	while at + 8 <= bytes.len() {
+		let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+		let start = at + 8;
+		let chunk = bytes.get(start..start + size).ok_or_else(|| RecipeError::new("WAV chunk is truncated"))?;
+		match &bytes[at..at + 4] {
+			b"fmt " if chunk.len() >= 16 => {
+				format = Some((
+					u16::from_le_bytes(chunk[..2].try_into().unwrap()),
+					u16::from_le_bytes(chunk[2..4].try_into().unwrap()) as usize,
+					u16::from_le_bytes(chunk[14..16].try_into().unwrap()) as usize,
+				));
+			}
+			b"data" => payload = Some(chunk),
+			_ => {}
+		}
+		at = start + size + size % 2;
+	}
+	let (encoding, channels, bits) = format.ok_or_else(|| RecipeError::new("WAV format is absent"))?;
+	let payload = payload.ok_or_else(|| RecipeError::new("WAV samples are absent"))?;
+	require(channels != 0 && bits != 0, "WAV format is invalid")?;
+	let frame = checked_mul(channels, bits.div_ceil(8), "WAV frame")?;
+	require(frame != 0 && payload.len() % frame == 0, "WAV samples are incomplete")?;
+	Ok((encoding, channels, bits, payload.len() / frame, payload))
+}
+
+/// Bytes read from the start of a sample image; a JPEG frame header lies within this prefix.
+const PROBE_IMAGE_BYTES: u64 = 1 << 20;
+/// Bytes of each delimited field the probe keeps. Longer fields keep their true length.
+const PROBE_FIELD_BYTES: usize = 4096;
+const PROBE_CHUNK_BYTES: usize = 1 << 16;
+/// Most distinct values a categorical feature may have.
+const PROBE_CATEGORY_LIMIT: usize = 16;
+/// Sample-count choices and anchors offered to the answerer.
+const PROBE_CHOICE_LIMIT: usize = 8;
+/// Entries listed per section of the packet. Section totals are always complete.
+const PROBE_ENTRY_LIMIT: usize = 64;
+/// The fixed categories every feature question offers.
+const PROBE_FEATURE_TYPES: &str = "\"categorical\",\"integer\",\"float\",\"text\",\"image\",\"audio\"";
+const PROBE_DOCUMENT_BYTES: u64 = 16 << 20;
+
+/// One file under the dataset source. The walk records sizes and never opens a file.
+struct ProbeFile {
+	path: PathBuf,
+	bytes: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+	Delimited,
+	Image,
+	Audio,
+	Database,
+	Unprobed,
+}
+
+fn probe_kind(path: &Path) -> ProbeKind {
+	let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+	match extension.as_str() {
+		"csv" | "tsv" | "txt" | "data" | "dat" | "all-data" => ProbeKind::Delimited,
+		"sqlite" | "sqlite3" | "db" => ProbeKind::Database,
+		"wav" => ProbeKind::Audio,
+		"png" | "jpg" | "jpeg" => ProbeKind::Image,
+		_ => ProbeKind::Unprobed,
+	}
+}
+
+/// Lists every file under a path in sorted order. Archives and other formats are listed
+/// as unprobed; the probe does not open their members.
+fn probe_walk(path: &Path, files: &mut Vec<ProbeFile>) -> Result<()> {
+	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+	if !metadata.is_dir() {
+		files.push(ProbeFile { path: path.to_owned(), bytes: metadata.len() });
+		return Ok(());
+	}
+	let mut children = fs::read_dir(path)
+		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		.collect::<std::io::Result<Vec<_>>>()
+		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	children.sort_by_key(fs::DirEntry::path);
+	for child in children {
+		probe_walk(&child.path(), files)?;
+	}
+	Ok(())
+}
+
+#[derive(Default)]
+struct ProbeFolder {
+	files: usize,
+	samples: usize,
+	indexed: usize,
+	low: Option<usize>,
+	high: Option<usize>,
+}
+
+impl ProbeFolder {
+	fn add_sample(&mut self, index: Option<usize>) {
+		self.samples += 1;
+		if let Some(index) = index {
+			self.indexed += 1;
+			self.low = Some(self.low.map_or(index, |low| low.min(index)));
+			self.high = Some(self.high.map_or(index, |high| high.max(index)));
+		}
+	}
+
+	/// The numbered span of the samples, present only when every sample carries a number.
+	fn span(&self) -> Option<usize> {
+		match (self.low, self.high) {
+			(Some(low), Some(high)) if self.indexed == self.samples => Some(high - low + 1),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone)]
+struct ProbeCell {
+	text: String,
+	length: usize,
+}
+
+fn probe_push_byte(field: &mut Vec<u8>, length: &mut usize, byte: u8) {
+	if field.len() < PROBE_FIELD_BYTES {
+		field.push(byte);
+	}
+	*length += 1;
+}
+
+fn probe_take_cell(field: &mut Vec<u8>, length: &mut usize) -> ProbeCell {
+	let cell = ProbeCell { text: String::from_utf8_lossy(field).into_owned(), length: *length };
+	field.clear();
+	*length = 0;
+	cell
+}
+
+/// Streams delimited records with the loader's quoting and blank-record rules. It keeps one
+/// record and at most `PROBE_FIELD_BYTES` of each field in memory.
+fn probe_records(path: &Path, delimiter: u8, mut visit: impl FnMut(&[ProbeCell]) -> Result<()>) -> Result<()> {
+	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let mut chunk = vec![0u8; PROBE_CHUNK_BYTES];
+	let (mut row, mut field, mut length, mut quoted, mut pending) = (Vec::new(), Vec::new(), 0usize, false, false);
+	loop {
+		let read = file.read(&mut chunk).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		if read == 0 {
+			break;
+		}
+		for &byte in &chunk[..read] {
+			if pending {
+				pending = false;
+				if byte == b'"' {
+					probe_push_byte(&mut field, &mut length, byte);
+					continue;
+				}
+				quoted = false;
+			}
+			match byte {
+				b'"' if quoted => pending = true,
+				b'"' => quoted = true,
+				b'\n' if !quoted => {
+					if length == field.len() && field.last() == Some(&b'\r') {
+						field.pop();
+						length -= 1;
+					}
+					row.push(probe_take_cell(&mut field, &mut length));
+					if row.iter().any(|cell| !cell.text.trim().is_empty()) {
+						visit(&row)?;
+					}
+					row.clear();
+				}
+				_ if byte == delimiter && !quoted => row.push(probe_take_cell(&mut field, &mut length)),
+				_ => probe_push_byte(&mut field, &mut length, byte),
+			}
+		}
+	}
+	if pending {
+		quoted = false;
+	}
+	require(!quoted, format!("unterminated quoted feature in {}", path.display()))?;
+	if length > 0 || !row.is_empty() {
+		row.push(probe_take_cell(&mut field, &mut length));
+		if row.iter().any(|cell| !cell.text.trim().is_empty()) {
+			visit(&row)?;
+		}
+	}
+	Ok(())
+}
+
+struct ProbeColumn {
+	name: String,
+	values: usize,
+	integer: bool,
+	float: bool,
+	/// Distinct values, counted up to one past the categorical limit so a larger count is visible.
+	distinct: BTreeSet<String>,
+	longest: usize,
+}
+
+impl ProbeColumn {
+	fn new(name: String) -> Self {
+		Self { name, values: 0, integer: true, float: true, distinct: BTreeSet::new(), longest: 0 }
+	}
+
+	fn observe(&mut self, cell: &ProbeCell) {
+		self.longest = self.longest.max(cell.length);
+		if cell.text.is_empty() {
+			return;
+		}
+		self.values += 1;
+		self.integer &= cell.text.parse::<i64>().is_ok();
+		self.float &= cell.text.parse::<f64>().is_ok_and(f64::is_finite);
+		if self.distinct.len() <= PROBE_CATEGORY_LIMIT {
+			self.distinct.insert(cell.text.clone());
+		}
+	}
+
+	/// The fixed category the probe suggests. The answerer may choose another category the evidence allows.
+	fn suggested(&self) -> &'static str {
+		if self.values == 0 {
+			"text"
+		} else if self.integer {
+			"integer"
+		} else if self.float {
+			"float"
+		} else if self.distinct.len() <= PROBE_CATEGORY_LIMIT && self.distinct.len() * 4 <= self.values {
+			"categorical"
+		} else {
+			"text"
+		}
+	}
+}
+
+struct ProbeTable {
+	path: PathBuf,
+	name: String,
+	rows: usize,
+	ragged: bool,
+	columns: Vec<ProbeColumn>,
+}
+
+/// Probes one delimited file. The delimiter and header rules match `parse_table`, but the
+/// probe streams the file and keeps only column statistics.
+fn probe_delimited(path: &Path) -> Result<ProbeTable> {
+	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	// The widest rectangular parse wins; a tie goes to the later delimiter, as in the loader.
+	let mut choice = (0usize, b',', true);
+	for delimiter in [b'\t', b';', b','] {
+		let (mut width, mut rectangular) = (None, true);
+		probe_records(path, delimiter, |row| {
+			match width {
+				None => width = Some(row.len()),
+				Some(expected) => rectangular &= expected == row.len(),
+			}
+			Ok(())
+		})?;
+		let rectangle = if rectangular { width.unwrap_or(0) } else { 0 };
+		if rectangle >= choice.0 {
+			choice = (rectangle, delimiter, rectangular);
+		}
+	}
+	let (_, delimiter, rectangular) = choice;
+	let mut first: Option<Vec<ProbeCell>> = None;
+	let mut columns = Vec::new();
+	let mut data_rows = 0usize;
+	probe_records(path, delimiter, |row| {
+		if first.is_none() {
+			columns = (0..row.len()).map(|_| ProbeColumn::new(String::new())).collect();
+			first = Some(row.to_vec());
+			return Ok(());
+		}
+		data_rows += 1;
+		for (column, cell) in columns.iter_mut().zip(row) {
+			column.observe(cell);
+		}
+		Ok(())
+	})?;
+	let Some(first) = first else {
+		return Ok(ProbeTable { path: path.to_owned(), name, rows: 0, ragged: !rectangular, columns: Vec::new() });
+	};
+	// A first record of only numbers, or a file with one record, is data with positional names.
+	let headerless = first.iter().all(|cell| cell.text.parse::<f64>().is_ok()) || data_rows == 0;
+	let width = first.len();
+	let names = if headerless {
+		(1..=width).map(|column| if column == width { "target".to_owned() } else { format!("col{column}") }).collect::<Vec<_>>()
+	} else {
+		first.iter().map(|cell| cell.text.clone()).collect()
+	};
+	if headerless {
+		for (column, cell) in columns.iter_mut().zip(&first) {
+			column.observe(cell);
+		}
+	}
+	for (column, name) in columns.iter_mut().zip(names) {
+		column.name = name;
+	}
+	Ok(ProbeTable { path: path.to_owned(), name, rows: data_rows + usize::from(headerless), ragged: !rectangular, columns })
+}
+
+struct ProbeAudio {
+	encoding: u16,
+	channels: usize,
+	sample_rate: u32,
+	bits: usize,
+	frames: usize,
+	loadable: bool,
+	/// Ordinal digits of the mean amplitude over time; present only for loadable PCM samples.
+	envelope: Option<String>,
+}
+
+/// Spans of the sample payload that the envelope compares.
+const PROBE_ENVELOPE_BUCKETS: usize = 16;
+
+/// Ranks the mean amplitude of each span of a PCM payload in one streaming pass. Each span
+/// contributes one hexadecimal digit: 0 for the quietest span and f for the loudest. Ties keep
+/// the earlier span first, so the string is deterministic.
+fn probe_envelope(file: &mut fs::File, body: u64, frames: usize, channels: usize, bits: usize, path: &Path) -> Result<String> {
+	let buckets = frames.min(PROBE_ENVELOPE_BUCKETS);
+	if buckets == 0 {
+		return Ok(String::new());
+	}
+	let bytes = bits / 8;
+	let frame = channels * bytes;
+	let mut sums = vec![0u128; buckets];
+	let mut counts = vec![0u64; buckets];
+	file.seek(SeekFrom::Start(body)).map_err(|error| RecipeError::new(format!("cannot seek {}: {error}", path.display())))?;
+	let read = (PROBE_CHUNK_BYTES / frame).max(1) * frame;
+	let mut chunk = vec![0u8; read];
+	let (mut remaining, mut index) = (frames * frame, 0usize);
+	while remaining > 0 {
+		let take = remaining.min(read);
+		file.read_exact(&mut chunk[..take]).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		for frame_bytes in chunk[..take].chunks_exact(frame) {
+			let bucket = index * buckets / frames;
+			let amplitude = frame_bytes
+				.chunks_exact(bytes)
+				.map(|sample| if bytes == 1 { u128::from((i16::from(sample[0]) - 128).unsigned_abs()) } else { u128::from(i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs()) })
+				.sum::<u128>();
+			sums[bucket] += amplitude;
+			counts[bucket] += channels as u64;
+			index += 1;
+		}
+		remaining -= take;
+	}
+	let mut order = (0..buckets).collect::<Vec<_>>();
+	// Cross-multiplication compares the exact means without division.
+	order.sort_by(|left, right| (sums[*left] * u128::from(counts[*right])).cmp(&(sums[*right] * u128::from(counts[*left]))).then(left.cmp(right)));
+	let mut ranks = vec![0u32; buckets];
+	for (rank, bucket) in order.into_iter().enumerate() {
+		ranks[bucket] = rank as u32;
+	}
+	Ok(ranks.iter().map(|rank| char::from_digit(*rank, 16).unwrap_or('0')).collect())
+}
+
+/// Reads a WAV file's chunk headers and format, and seeks past the sample payload.
+fn probe_wav(path: &Path) -> Result<ProbeAudio> {
+	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let length = file.metadata().map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
+	let mut riff = [0u8; 12];
+	let riff_ok = length >= 12 && file.read_exact(&mut riff).is_ok() && &riff[..4] == b"RIFF" && &riff[8..] == b"WAVE";
+	require(riff_ok, format!("WAV header is absent in {}", path.display()))?;
+	let (mut format, mut data, mut at) = (None::<[u8; 16]>, None::<(u64, u64)>, 12u64);
+	while at + 8 <= length {
+		file.seek(SeekFrom::Start(at)).map_err(|error| RecipeError::new(format!("cannot seek {}: {error}", path.display())))?;
+		let mut head = [0u8; 8];
+		file.read_exact(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		let size = u64::from(u32::from_le_bytes(head[4..].try_into().unwrap()));
+		let body = at + 8;
+		match &head[..4] {
+			b"fmt " if size >= 16 => {
+				let mut fields = [0u8; 16];
+				file.read_exact(&mut fields).map_err(|error| RecipeError::new(format!("WAV format is truncated in {}: {error}", path.display())))?;
+				format = Some(fields);
+			}
+			b"data" => data = Some((size, body)),
+			_ => {}
+		}
+		at = body + size + size % 2;
+	}
+	let format = format.ok_or_else(|| RecipeError::new(format!("WAV format is absent in {}", path.display())))?;
+	let (declared, body) = data.ok_or_else(|| RecipeError::new(format!("WAV samples are absent in {}", path.display())))?;
+	let encoding = u16::from_le_bytes([format[0], format[1]]);
+	let channels = u16::from_le_bytes([format[2], format[3]]) as usize;
+	let sample_rate = u32::from_le_bytes(format[4..8].try_into().unwrap());
+	let bits = u16::from_le_bytes([format[14], format[15]]) as usize;
+	let frame = channels * bits.div_ceil(8);
+	let available = length.saturating_sub(body).min(declared);
+	let complete = declared == available && frame != 0 && available % frame as u64 == 0;
+	let frames = if frame == 0 { 0 } else { available as usize / frame };
+	let loadable = complete && channels != 0 && encoding == 1 && matches!(bits, 8 | 16);
+	let envelope = if loadable { Some(probe_envelope(&mut file, body, frames, channels, bits, path)?) } else { None };
+	Ok(ProbeAudio { encoding, channels, sample_rate, bits, frames, loadable, envelope })
+}
+
+/// Reads only the image header prefix that holds the dimensions.
+fn probe_image(path: &Path) -> Result<(usize, usize, usize)> {
+	let mut prefix = Vec::new();
+	fs::File::open(path).and_then(|file| file.take(PROBE_IMAGE_BYTES).read_to_end(&mut prefix)).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	data_image_header(path, &prefix)
+}
+
+/// One SQLite table as the probe saw it: its declared columns and the value statistics of
+/// every column over all of its rows.
+struct ProbeSqliteTable {
+	name: String,
+	rows: usize,
+	declared: Vec<String>,
+	columns: Vec<ProbeColumn>,
+}
+
+struct ProbeDatabase {
+	page_size: usize,
+	pages: usize,
+	tables: Vec<ProbeSqliteTable>,
+}
+
+/// Probes a plaintext SQLite file page by page. It refuses a file with a pending rollback
+/// journal or a WAL sidecar, because those pages are not the database's current content.
+fn probe_database(path: &Path) -> Result<ProbeDatabase> {
+	for suffix in ["-wal", "-journal"] {
+		let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+		require(!fs::metadata(&sidecar).is_ok_and(|metadata| metadata.len() > 0), format!("{} has a non-empty {suffix} file; checkpoint or remove it first", path.display()))?;
+	}
+	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?.len();
+	let mut file = fs::File::open(path).map_err(|error| RecipeError::new(format!("cannot open {}: {error}", path.display())))?;
+	let mut head = [0u8; 100];
+	let read = file.read(&mut head).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+	let layout = sqlite_layout(&head[..read], length).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+	let mut tables = Vec::new();
+	for table in sqlite_catalog(&mut file, layout).map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))? {
+		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
+		let mut columns = table.columns.iter().map(|column| ProbeColumn::new(column.name.clone())).collect::<Vec<_>>();
+		let mut rows = 0usize;
+		sqlite_scan(&mut file, layout, table.root, &aliases, &mut |row: &[String]| {
+			rows += 1;
+			for (column, value) in columns.iter_mut().zip(row) {
+				column.observe(&probe_cell(value));
+			}
+			Ok(())
+		})
+		.map_err(|error| RecipeError::new(format!("{}: {error}", path.display())))?;
+		tables.push(ProbeSqliteTable { name: table.name, rows, declared: table.columns.iter().map(|column| column.declared.clone()).collect(), columns });
+	}
+	Ok(ProbeDatabase { page_size: layout.page_size, pages: layout.pages, tables })
+}
+
+/// Keeps at most `PROBE_FIELD_BYTES` of a stored value, on a character boundary, with its full length.
+fn probe_cell(value: &str) -> ProbeCell {
+	let mut end = value.len().min(PROBE_FIELD_BYTES);
+	while !value.is_char_boundary(end) {
+		end -= 1;
+	}
+	ProbeCell { text: value[..end].to_owned(), length: value.len() }
+}
+
+/// The only value every observation agrees on, or `None` when the values differ or none exist.
+fn probe_uniform(values: &[usize]) -> Option<usize> {
+	let first = *values.first()?;
+	values.iter().all(|value| *value == first).then_some(first)
+}
+
+fn json_optional(value: Option<usize>) -> String {
+	value.map_or("null".to_owned(), |value| value.to_string())
+}
+
+/// One column's evidence in the packet. A declared type is included when the source declares one.
+fn probe_column_json(column: &ProbeColumn, declared: Option<&String>) -> String {
+	let declared = declared.map_or(String::new(), |declared| format!("\"declared\":{},", data_json_string(declared)));
+	format!(
+		"{{\"name\":{},{declared}\"dtype\":{},\"values\":{},\"integer\":{},\"float\":{},\"distinct\":{},\"longest\":{}}}",
+		data_json_string(&column.name),
+		data_json_string(column.suggested()),
+		column.values,
+		column.integer,
+		column.float,
+		column.distinct.len(),
+		column.longest
+	)
+}
+
+/// Builds the bounded metadata packet for one dataset. The packet holds names, counts,
+/// dimensions, and per-column type evidence. It never contains cell values, pixels, or samples.
+/// Output is one JSON object followed by a newline.
+pub fn propose_data_schema(source: impl AsRef<Path>) -> Result<String> {
+	let source = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve dataset: {error}")))?;
+	let mut walked = Vec::new();
+	probe_walk(&source, &mut walked)?;
+	require(!walked.is_empty(), "dataset source contains no files")?;
+	let (mut tables, mut images, mut audio, mut databases) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+	let mut folders = BTreeMap::<PathBuf, ProbeFolder>::new();
+	let mut anchors = BTreeMap::<usize, usize>::new();
+	let mut unprobed = 0usize;
+	for file in &walked {
+		let folder = folders.entry(file.path.parent().unwrap_or(Path::new("")).to_owned()).or_default();
+		folder.files += 1;
+		let index = data_name_index(&file.path);
+		match probe_kind(&file.path) {
+			ProbeKind::Delimited => {
+				let table = probe_delimited(&file.path)?;
+				if table.rows > 0 {
+					*anchors.entry(table.rows).or_default() += 1;
+				}
+				tables.push(table);
+			}
+			ProbeKind::Image => {
+				images.push((file.path.clone(), probe_image(&file.path)?));
+				folder.add_sample(index);
+			}
+			ProbeKind::Audio => {
+				audio.push((file.path.clone(), probe_wav(&file.path)?));
+				folder.add_sample(index);
+			}
+			ProbeKind::Database => {
+				let database = probe_database(&file.path)?;
+				for table in database.tables.iter().filter(|table| table.rows > 0) {
+					*anchors.entry(table.rows).or_default() += 1;
+				}
+				databases.push((file.path.clone(), database));
+			}
+			ProbeKind::Unprobed => unprobed += 1,
+		}
+	}
+	for folder in folders.values().filter(|folder| folder.samples > 0) {
+		*anchors.entry(folder.samples).or_default() += 1;
+		if let Some(span) = folder.span() {
+			*anchors.entry(span).or_default() += 1;
+		}
+	}
+	// Support counts independent observations of each count; ties prefer the larger count.
+	let mut ranked = anchors.iter().map(|(count, support)| (*count, *support)).collect::<Vec<_>>();
+	ranked.sort_by(|left, right| right.1.cmp(&left.1).then(right.0.cmp(&left.0)));
+	let samples = json_optional(ranked.first().map(|(count, _)| *count));
+	let mut choices = ranked.iter().take(PROBE_CHOICE_LIMIT).map(|(count, _)| data_json_string(&count.to_string())).collect::<Vec<_>>();
+	choices.push(data_json_string("unknown"));
+	let anchor_entries = ranked.iter().take(PROBE_CHOICE_LIMIT).map(|(count, support)| format!("{{\"count\":{count},\"support\":{support}}}")).collect::<Vec<_>>();
+	let mut pixels = Vec::new();
+	for (_, (width, height, channels)) in &images {
+		pixels.push(checked_mul(checked_mul(*width, *height, "image pixels")?, *channels, "image channels")?);
+	}
+	let image_features = probe_uniform(&pixels);
+	let mut sizes = Vec::new();
+	for (_, probe) in &audio {
+		sizes.push(checked_mul(probe.channels, probe.frames, "audio samples")?);
+	}
+	let audio_features = probe_uniform(&sizes);
+	let parse = if !tables.is_empty() {
+		"table"
+	} else if !images.is_empty() {
+		"image_folder"
+	} else if !audio.is_empty() {
+		"audio_folder"
+	} else if databases.iter().any(|(_, database)| !database.tables.is_empty()) {
+		"sqlite_table"
+	} else {
+		"unknown"
+	};
+	let sqlite = match databases.as_slice() {
+		[(_, database)] if database.tables.len() == 1 => Some(&database.tables[0]),
+		_ => None,
+	};
+	let features = match parse {
+		"table" if tables.len() == 1 => tables[0].columns.len(),
+		"sqlite_table" => sqlite.map_or(0, |table| table.columns.len()),
+		"image_folder" => image_features.unwrap_or(0),
+		"audio_folder" => audio_features.unwrap_or(0),
+		_ => 0,
+	};
+	let mut questions = vec![
+		"{\"id\":\"parse\",\"prompt\":\"Which parse path reads one sample per source?\",\"choices\":[\"table\",\"image_folder\",\"audio_folder\",\"sqlite_table\",\"unknown\"]}".to_owned(),
+		format!("{{\"id\":\"samples\",\"prompt\":\"Which count is the sample count?\",\"choices\":[{}]}}", choices.join(",")),
+	];
+	if tables.len() == 1 {
+		for (index, column) in tables[0].columns.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+			questions.push(format!(
+				"{{\"id\":{},\"prompt\":{},\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"parse\",\"choice\":\"table\"}}}}",
+				data_json_string(&format!("feature.{index}")),
+				data_json_string(&format!("What type is feature {}?", column.name))
+			));
+		}
+	}
+	if !audio.is_empty() {
+		questions.push(format!("{{\"id\":\"feature.sample\",\"prompt\":\"What type is the audio sample?\",\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"parse\",\"choice\":\"audio_folder\"}}}}"));
+	}
+	if let [(_, database)] = databases.as_slice() {
+		if !database.tables.is_empty() {
+			let names = database.tables.iter().take(PROBE_ENTRY_LIMIT).map(|table| data_json_string(&table.name)).collect::<Vec<_>>();
+			questions.push(format!("{{\"id\":\"sqlite_table\",\"prompt\":\"Which table holds one sample per row?\",\"choices\":[{}],\"after\":{{\"id\":\"parse\",\"choice\":\"sqlite_table\"}}}}", names.join(",")));
+			for (index, table) in database.tables.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+				for (column_index, column) in table.columns.iter().enumerate().take(PROBE_ENTRY_LIMIT) {
+					questions.push(format!(
+						"{{\"id\":{},\"prompt\":{},\"choices\":[{PROBE_FEATURE_TYPES}],\"after\":{{\"id\":\"sqlite_table\",\"choice\":{}}}}}",
+						data_json_string(&format!("table{index}.feature.{column_index}")),
+						data_json_string(&format!("What type is feature {} of table {}?", column.name, table.name)),
+						data_json_string(&table.name)
+					));
+				}
+			}
+		}
+	}
+	let folder_entries = folders
+		.iter()
+		.take(PROBE_ENTRY_LIMIT * 2)
+		.map(|(path, folder)| {
+			format!(
+				"{{\"path\":{},\"files\":{},\"samples\":{},\"low\":{},\"high\":{},\"span\":{}}}",
+				data_json_string(&path.to_string_lossy()),
+				folder.files,
+				folder.samples,
+				json_optional(folder.low),
+				json_optional(folder.high),
+				json_optional(folder.span())
+			)
+		})
+		.collect::<Vec<_>>();
+	let table_entries = tables
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|table| {
+			let columns = table.columns.iter().take(PROBE_ENTRY_LIMIT).map(|column| probe_column_json(column, None)).collect::<Vec<_>>();
+			format!(
+				"{{\"path\":{},\"name\":{},\"rows\":{},\"ragged\":{},\"columns_total\":{},\"columns\":[{}]}}",
+				data_json_string(&table.path.to_string_lossy()),
+				data_json_string(&table.name),
+				table.rows,
+				table.ragged,
+				table.columns.len(),
+				columns.join(",")
+			)
+		})
+		.collect::<Vec<_>>();
+	let image_entries = images
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, (width, height, channels))| format!("{{\"path\":{},\"width\":{width},\"height\":{height},\"channels\":{channels}}}", data_json_string(&path.to_string_lossy())))
+		.collect::<Vec<_>>();
+	let audio_entries = audio
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, probe)| {
+			format!(
+				"{{\"path\":{},\"encoding\":{},\"channels\":{},\"sample_rate\":{},\"bits\":{},\"frames\":{},\"loadable\":{},\"envelope\":{}}}",
+				data_json_string(&path.to_string_lossy()),
+				probe.encoding,
+				probe.channels,
+				probe.sample_rate,
+				probe.bits,
+				probe.frames,
+				probe.loadable,
+				probe.envelope.as_deref().map_or("null".to_owned(), data_json_string)
+			)
+		})
+		.collect::<Vec<_>>();
+	let database_entries = databases
+		.iter()
+		.take(PROBE_ENTRY_LIMIT)
+		.map(|(path, database)| {
+			let tables = database
+				.tables
+				.iter()
+				.take(PROBE_ENTRY_LIMIT)
+				.map(|table| {
+					let columns = table.columns.iter().zip(&table.declared).take(PROBE_ENTRY_LIMIT).map(|(column, declared)| probe_column_json(column, Some(declared))).collect::<Vec<_>>();
+					format!("{{\"name\":{},\"rows\":{},\"columns_total\":{},\"columns\":[{}]}}", data_json_string(&table.name), table.rows, table.columns.len(), columns.join(","))
+				})
+				.collect::<Vec<_>>();
+			format!(
+				"{{\"path\":{},\"page_size\":{},\"pages\":{},\"tables\":{{\"total\":{},\"entries\":[{}]}}}}",
+				data_json_string(&path.to_string_lossy()),
+				database.page_size,
+				database.pages,
+				database.tables.len(),
+				tables.join(",")
+			)
+		})
+		.collect::<Vec<_>>();
+	let bytes = walked.iter().map(|file| file.bytes).sum::<u64>();
+	let loadable = audio.iter().filter(|(_, probe)| probe.loadable).count();
+	Ok(format!(
+		"{{\"schema_version\":1,\"source\":{},\"files\":{},\"bytes\":{bytes},\"unprobed\":{unprobed},\"folders\":{{\"total\":{},\"entries\":[{}]}},\"tables\":{{\"total\":{},\"entries\":[{}]}},\"images\":{{\"total\":{},\"features\":{},\"entries\":[{}]}},\"audio\":{{\"total\":{},\"features\":{},\"loadable\":{loadable},\"entries\":[{}]}},\"databases\":{{\"total\":{},\"entries\":[{}]}},\"proposal\":{{\"samples\":{samples},\"features\":{features},\"parse\":{},\"anchors\":[{}]}},\"questions\":[{}]}}\n",
+		data_json_string(&source.to_string_lossy()),
+		walked.len(),
+		folders.len(),
+		folder_entries.join(","),
+		tables.len(),
+		table_entries.join(","),
+		images.len(),
+		json_optional(image_features),
+		image_entries.join(","),
+		audio.len(),
+		json_optional(audio_features),
+		audio_entries.join(","),
+		databases.len(),
+		database_entries.join(","),
+		data_json_string(parse),
+		anchor_entries.join(","),
+		questions.join(",")
+	))
+}
+
+fn data_document(path: &Path) -> Result<JsonValue> {
+	let length = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect schema document {}: {error}", path.display())))?.len();
+	require(length <= PROBE_DOCUMENT_BYTES, format!("schema document {} exceeds {PROBE_DOCUMENT_BYTES} bytes", path.display()))?;
+	let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read schema document {}: {error}", path.display())))?;
+	let (value, rest) = json_value(&text)?;
+	require(rest.trim().is_empty(), format!("schema document {} has trailing content", path.display()))?;
+	Ok(value)
+}
+
+fn data_field<'a>(value: &'a JsonValue, name: &str) -> Result<&'a JsonValue> {
+	let JsonValue::Object(fields) = value else { return Err(RecipeError::new("schema record is not an object")) };
+	fields.iter().find(|(field, _)| field == name).map(|(_, value)| value).ok_or_else(|| RecipeError::new(format!("schema field {name} is absent")))
+}
+
+fn data_text<'a>(value: &'a JsonValue, name: &str) -> Result<&'a str> {
+	let JsonValue::Text(text) = value else { return Err(RecipeError::new(format!("schema field {name} must be text"))) };
+	Ok(text)
+}
+
+fn data_count(value: &JsonValue, name: &str) -> Result<usize> {
+	let JsonValue::Number(text) = value else { return Err(RecipeError::new(format!("schema field {name} must be an integer"))) };
+	text.parse::<usize>().map_err(|_| RecipeError::new(format!("schema field {name} is not a nonnegative integer")))
+}
+
+fn data_bool(value: &JsonValue, name: &str) -> Result<bool> {
+	match data_field(value, name)? {
+		JsonValue::Bool(flag) => Ok(*flag),
+		_ => Err(RecipeError::new(format!("schema field {name} must be true or false"))),
+	}
+}
+
+fn data_items<'a>(value: &'a JsonValue, name: &str) -> Result<&'a [JsonValue]> {
+	let JsonValue::Array(items) = value else { return Err(RecipeError::new(format!("schema field {name} must be a list"))) };
+	Ok(items)
+}
+
+struct ConfirmedDataset {
+	samples: usize,
+	features: usize,
+	parse: String,
+	/// The SQLite table that holds the samples, present only for the `sqlite_table` parse path.
+	table: Option<String>,
+	columns: Vec<(String, String)>,
+}
+
+/// Reads the loader schema named by `Data::schema`, and checks its source and dimensions.
+fn confirmed_data_schema(data: &Data) -> Result<Option<ConfirmedDataset>> {
+	let Some(path) = &data.schema_file else { return Ok(None) };
+	let path = resolve_path(path)?;
+	let document = data_document(&path)?;
+	require(data_count(data_field(&document, "schema_version")?, "schema_version")? == 1, "dataset schema version is unsupported")?;
+	let source = data_text(data_field(&document, "source")?, "source")?;
+	require(data.sources.len() == 1, "a confirmed dataset schema requires exactly one source")?;
+	let actual = fs::canonicalize(resolve_path(&data.sources[0])?).map_err(|error| RecipeError::new(format!("cannot resolve dataset source: {error}")))?;
+	require(actual == Path::new(source), format!("dataset schema source {source:?} differs from {}", actual.display()))?;
+	let samples = data_count(data_field(&document, "samples")?, "samples")?;
+	let features = data_count(data_field(&document, "features")?, "features")?;
+	require(samples != 0 && features != 0, "dataset schema dimensions must be positive")?;
+	let parse = data_text(data_field(&document, "parse")?, "parse")?.to_owned();
+	require(matches!(parse.as_str(), "table" | "sqlite_table" | "image_folder" | "audio_folder"), format!("dataset schema parse path {parse:?} is unsupported"))?;
+	let table = match data_field(&document, "table") {
+		Ok(JsonValue::Text(name)) => Some(name.clone()),
+		_ => None,
+	};
+	require(table.is_some() == (parse == "sqlite_table"), "dataset schema names a SQLite table only for the sqlite_table parse path")?;
+	let columns = data_items(data_field(&document, "columns")?, "columns")?
+		.iter()
+		.map(|column| {
+			let name = data_text(data_field(column, "name")?, "name")?;
+			let kind = data_text(data_field(column, "dtype")?, "dtype")?;
+			require(matches!(kind, "categorical" | "integer" | "float" | "text" | "image" | "audio"), format!("dataset schema feature {name:?} has unsupported type {kind:?}"))?;
+			Ok((name.to_owned(), kind.to_owned()))
+		})
+		.collect::<Result<Vec<_>>>()?;
+	Ok(Some(ConfirmedDataset { samples, features, parse, table, columns }))
+}
+
+/// Checks one feature answer against the evidence in its column packet entry.
+fn probe_feature_check(name: &str, choice: &str, column: &JsonValue) -> Result<()> {
+	let (supported, reason) = match choice {
+		"integer" => (data_bool(column, "integer")?, "a value that is not an integer"),
+		"float" => (data_bool(column, "float")?, "a value that is not a finite float"),
+		"categorical" => (data_count(data_field(column, "distinct")?, "distinct")? <= PROBE_CATEGORY_LIMIT, "more distinct values than a categorical feature allows"),
+		"text" => (true, ""),
+		_ => (false, "no image or audio samples in this column"),
+	};
+	require(supported, format!("feature {name:?} was answered {choice:?}, but the probe found {reason}"))
+}
+
+/// Checks every column answer of one table and returns the loader column objects. `id` names the
+/// question that answers column `index`.
+fn probe_table_answers(table: &JsonValue, samples: usize, decided: &BTreeMap<String, String>, id: impl Fn(usize) -> String) -> Result<Vec<String>> {
+	let rows = data_count(data_field(table, "rows")?, "rows")?;
+	require(rows == samples, format!("sample answer {samples} differs from the {rows} table rows the probe found"))?;
+	let total = data_count(data_field(table, "columns_total")?, "columns_total")?;
+	let entries = data_items(data_field(table, "columns")?, "columns")?;
+	require(total == entries.len(), format!("the table has {total} columns, and the bounded packet lists {}", entries.len()))?;
+	entries
+		.iter()
+		.enumerate()
+		.map(|(index, column)| {
+			let name = data_text(data_field(column, "name")?, "name")?;
+			let key = id(index);
+			let choice = decided.get(&key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))?;
+			probe_feature_check(name, choice, column)?;
+			Ok(format!("{{\"name\":{},\"dtype\":{}}}", data_json_string(name), data_json_string(choice)))
+		})
+		.collect()
+}
+
+/// Checks the answers against the question tree and the probe's evidence, then returns the
+/// loader schema JSON and one `id choice probability` line per answered question.
+/// A wrong answer fails here and names the question that diverged.
+pub fn finalize_data_schema(proposal: impl AsRef<Path>, answers: impl AsRef<Path>) -> Result<(String, String)> {
+	let proposal = data_document(proposal.as_ref())?;
+	let answers = data_document(answers.as_ref())?;
+	require(data_count(data_field(&proposal, "schema_version")?, "schema_version")? == 1, "proposal schema version is unsupported")?;
+	require(data_count(data_field(&answers, "schema_version")?, "schema_version")? == 1, "answer schema version is unsupported")?;
+	let status = data_text(data_field(&answers, "status")?, "status")?;
+	require(status == "ok", format!("the answerer reported status {status:?}, so no loader schema was written"))?;
+	let mut answered = BTreeMap::<String, (String, f64)>::new();
+	for answer in data_items(data_field(&answers, "answers")?, "answers")? {
+		let id = data_text(data_field(answer, "id")?, "id")?;
+		let choice = data_text(data_field(answer, "choice")?, "choice")?;
+		let probability = match data_field(answer, "probability")? {
+			JsonValue::Number(value) => value.parse::<f64>().map_err(|_| RecipeError::new(format!("answer {id} probability is invalid")))?,
+			_ => return Err(RecipeError::new(format!("answer {id} probability must be numeric"))),
+		};
+		require((0.0..=1.0).contains(&probability), format!("answer {id} probability is outside 0 to 1"))?;
+		require(answered.insert(id.to_owned(), (choice.to_owned(), probability)).is_none(), format!("answer {id} is repeated"))?;
+	}
+	// Questions are ordered parents first. A question is active only when its parent answer selects its branch.
+	let mut decided = BTreeMap::<String, String>::new();
+	let mut decisions = Vec::new();
+	for question in data_items(data_field(&proposal, "questions")?, "questions")? {
+		let id = data_text(data_field(question, "id")?, "id")?;
+		let choices = data_items(data_field(question, "choices")?, "choices")?;
+		let active = match data_field(question, "after") {
+			Ok(JsonValue::Null) | Err(_) => true,
+			Ok(parent) => {
+				let parent_id = data_text(data_field(parent, "id")?, "after.id")?;
+				let parent_choice = data_text(data_field(parent, "choice")?, "after.choice")?;
+				decided.get(parent_id).is_some_and(|choice| choice == parent_choice)
+			}
+		};
+		let answer = answered.remove(id);
+		if !active {
+			require(answer.is_none(), format!("answer {id} is outside the active branch and must be absent"))?;
+			continue;
+		}
+		let (choice, probability) = answer.ok_or_else(|| RecipeError::new(format!("answer {id} is absent")))?;
+		require(choices.iter().any(|value| matches!(value, JsonValue::Text(text) if *text == choice)), format!("answer {id} selected {choice:?}, which the question does not offer"))?;
+		decisions.push(format!("{id} {choice} {probability}"));
+		decided.insert(id.to_owned(), choice);
+	}
+	require(answered.is_empty(), format!("answers name questions not in the proposal: {}", answered.keys().cloned().collect::<Vec<_>>().join(", ")))?;
+	let parse = decided.get("parse").ok_or_else(|| RecipeError::new("parse path was not confirmed"))?.clone();
+	let samples_text = decided.get("samples").ok_or_else(|| RecipeError::new("sample count was not confirmed"))?;
+	let samples = samples_text.parse::<usize>().ok().filter(|count| *count != 0).ok_or_else(|| RecipeError::new(format!("sample count {samples_text:?} is not a positive count")))?;
+	let source = data_text(data_field(&proposal, "source")?, "source")?;
+	let (columns, features, table) = match parse.as_str() {
+		"table" => {
+			let tables = data_field(&proposal, "tables")?;
+			require(data_count(data_field(tables, "total")?, "total")? == 1, "the table parse path requires exactly one table in the source")?;
+			let table = data_items(data_field(tables, "entries")?, "entries")?.first().ok_or_else(|| RecipeError::new("table metadata is absent"))?;
+			require(!data_bool(table, "ragged")?, "the table has rows of differing widths")?;
+			let columns = probe_table_answers(table, samples, &decided, |index| format!("feature.{index}"))?;
+			let features = columns.len();
+			(columns, features, None)
+		}
+		"sqlite_table" => {
+			let databases = data_field(&proposal, "databases")?;
+			require(data_count(data_field(databases, "total")?, "total")? == 1, "the sqlite_table parse path requires exactly one database in the source")?;
+			let database = data_items(data_field(databases, "entries")?, "entries")?.first().ok_or_else(|| RecipeError::new("database metadata is absent"))?;
+			let tables = data_field(database, "tables")?;
+			let total = data_count(data_field(tables, "total")?, "total")?;
+			let entries = data_items(data_field(tables, "entries")?, "entries")?;
+			require(total == entries.len(), format!("the database has {total} tables, and the bounded packet lists {}", entries.len()))?;
+			let name = decided.get("sqlite_table").ok_or_else(|| RecipeError::new("table was not confirmed"))?;
+			let index = entries
+				.iter()
+				.position(|table| matches!(data_field(table, "name"), Ok(JsonValue::Text(text)) if text == name))
+				.ok_or_else(|| RecipeError::new(format!("table {name:?} is not in the bounded packet")))?;
+			let columns = probe_table_answers(&entries[index], samples, &decided, |column| format!("table{index}.feature.{column}"))?;
+			let features = columns.len();
+			(columns, features, Some(name.clone()))
+		}
+		"image_folder" | "audio_folder" => {
+			let image = parse == "image_folder";
+			let section = data_field(&proposal, if image { "images" } else { "audio" })?;
+			let total = data_count(data_field(section, "total")?, "total")?;
+			require(total == samples, format!("sample answer {samples} differs from the {total} files the probe found"))?;
+			let features = match data_field(section, "features")? {
+				JsonValue::Null => return Err(RecipeError::new("the sample files do not share one size, so no feature count exists")),
+				value => data_count(value, "features")?,
+			};
+			let dtype = if image {
+				"image".to_owned()
+			} else {
+				let loadable = data_count(data_field(section, "loadable")?, "loadable")?;
+				require(loadable == total, format!("{} of {total} audio files are not 8-bit or 16-bit PCM WAV", total - loadable))?;
+				let kind = decided.get("feature.sample").ok_or_else(|| RecipeError::new("sample type was not confirmed"))?;
+				require(kind == "audio", format!("feature \"sample\" was answered {kind:?}, but the probe found audio samples"))?;
+				kind.clone()
+			};
+			(vec![format!("{{\"name\":\"sample\",\"dtype\":{}}}", data_json_string(&dtype))], features, None)
+		}
+		_ => return Err(RecipeError::new("the unknown parse path has no loader schema")),
+	};
+	let schema = format!(
+		"{{\"schema_version\":1,\"source\":{},\"samples\":{samples},\"features\":{features},\"parse\":{},\"table\":{},\"columns\":[{}]}}\n",
+		data_json_string(source),
+		data_json_string(&parse),
+		table.as_deref().map_or("null".to_owned(), data_json_string),
+		columns.join(",")
+	);
+	Ok((schema, format!("{}\n", decisions.join("\n"))))
+}
+
 fn target_column(table: &Table, name: &str) -> Option<usize> {
 	table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column))
 }
@@ -30144,69 +31192,220 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
-/// Every user table of a SQLite database, walked from its rowid b-trees.
-fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
-	require(bytes.get(..16) == Some(b"SQLite format 3\0"), "SQLite header is absent")?;
-	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize {
+/// Page geometry of a plaintext SQLite 3 file in rollback-journal mode.
+#[derive(Clone, Copy)]
+struct SqliteLayout {
+	page_size: usize,
+	/// Bytes of each page that hold b-tree content; the rest is reserved.
+	usable: usize,
+	pages: usize,
+}
+
+/// Validates the file header and length. Encrypted, WAL-mode, and truncated files are refused
+/// rather than read as if their pages were plain.
+fn sqlite_layout(head: &[u8], length: u64) -> Result<SqliteLayout> {
+	require(head.len() >= 100 && head.starts_with(b"SQLite format 3\0"), "SQLite header is absent; the file is not plaintext SQLite 3 or is encrypted")?;
+	require(head[18] == 1 && head[19] == 1, "SQLite database is in WAL mode, which is unsupported; checkpoint it to rollback-journal mode first")?;
+	let page_size = match u16::from_be_bytes([head[16], head[17]]) as usize {
 		1 => 65536,
 		size => size,
 	};
+	require(page_size.is_power_of_two() && (512..=65536).contains(&page_size), format!("SQLite page size {page_size} is invalid"))?;
+	let usable = page_size.checked_sub(head[20] as usize).filter(|usable| *usable >= 480).ok_or_else(|| RecipeError::new("SQLite reserved bytes leave no usable page"))?;
+	require(length != 0 && length % page_size as u64 == 0, "SQLite file length is not a whole number of pages; the file is truncated")?;
+	Ok(SqliteLayout { page_size, usable, pages: (length / page_size as u64) as usize })
+}
+
+/// Reads one page into a buffer of one page. The caller keeps only the buffers it needs.
+fn sqlite_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page: usize) -> Result<Vec<u8>> {
+	require(page >= 1 && page <= layout.pages, format!("SQLite page {page} is outside the file"))?;
+	let mut buffer = vec![0u8; layout.page_size];
+	source.seek(SeekFrom::Start(((page - 1) * layout.page_size) as u64)).and_then(|_| source.read_exact(&mut buffer)).map_err(|error| RecipeError::new(format!("SQLite page {page} cannot be read: {error}")))?;
+	Ok(buffer)
+}
+
+/// A rowid table listed in `sqlite_schema`.
+struct SqliteTable {
+	name: String,
+	root: usize,
+	columns: Vec<SqliteColumn>,
+}
+
+struct SqliteColumn {
+	name: String,
+	/// The declared type words, such as `INTEGER` or `VARCHAR(20)`; empty when the column declares none.
+	declared: String,
+	/// An `INTEGER PRIMARY KEY` stores its value as the rowid, so its record holds NULL.
+	alias: bool,
+}
+
+/// Lists the user tables from `sqlite_schema`, which is the b-tree rooted at page 1.
+fn sqlite_catalog(source: &mut (impl Read + Seek), layout: SqliteLayout) -> Result<Vec<SqliteTable>> {
 	let mut schema = Vec::new();
-	sqlite_rows(bytes, page_size, 1, &mut schema)?;
+	sqlite_scan(source, layout, 1, &[], &mut |row: &[String]| {
+		schema.push(row.to_vec());
+		Ok(())
+	})?;
 	let mut tables = Vec::new();
 	for row in schema {
 		let [kind, name, _, root, sql] = row.as_slice() else { return Err(RecipeError::new("SQLite schema row has the wrong width")) };
 		if kind != "table" || name.starts_with("sqlite_") {
 			continue;
 		}
+		require(!sql.trim_start().to_ascii_uppercase().starts_with("CREATE VIRTUAL"), format!("SQLite table {name:?} is a virtual table, which is unsupported"))?;
 		let root = root.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid SQLite root page: {error}")))?;
-		let columns =
-			sql.split_once('(').map(|(_, rest)| rest.rsplit_once(')').map_or(rest, |(inner, _)| inner)).ok_or_else(|| RecipeError::new(format!("SQLite table {name:?} has no column list")))?;
-		let headers = columns.split(',').map(|column| column.trim().split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '`', '[', ']']).to_owned()).collect::<Vec<_>>();
-		require(headers.iter().all(|header| !header.is_empty()), format!("SQLite table {name:?} has an unreadable column list"))?;
-		let mut rows = Vec::new();
-		sqlite_rows(bytes, page_size, root, &mut rows)?;
-		for row in &mut rows {
-			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
-			row.resize_with(headers.len(), String::new);
-		}
-		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None, path: PathBuf::new() });
+		require(root != 0, format!("SQLite table {name:?} has no root page"))?;
+		tables.push(SqliteTable { name: name.clone(), root, columns: sqlite_columns(name, sql)? });
 	}
-	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
 }
-/// In-order rowid b-tree walk appending each leaf record's decoded values.
-fn sqlite_rows(bytes: &[u8], page_size: usize, page: usize, rows: &mut Vec<Vec<String>>) -> Result<()> {
-	let start = checked_mul(page - 1, page_size, "SQLite page offset")?;
-	let header = start + if page == 1 { 100 } else { 0 };
-	let contents = bytes.get(start..start + page_size).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
-	let kind = *bytes.get(header).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
-	let cells = u16::from_be_bytes(bytes[header + 3..header + 5].try_into().unwrap()) as usize;
-	let pointers = header + if kind == 5 { 12 } else { 8 };
-	for cell in 0..cells {
-		let pointer = u16::from_be_bytes(bytes[pointers + cell * 2..pointers + cell * 2 + 2].try_into().unwrap()) as usize;
-		let mut offset = start + pointer;
-		match kind {
-			5 => {
-				let child = u32::from_be_bytes(bytes.get(offset..offset + 4).ok_or_else(|| RecipeError::new("SQLite interior cell is truncated"))?.try_into().unwrap()) as usize;
-				sqlite_rows(bytes, page_size, child, rows)?;
+
+/// Splits the column list of a `CREATE TABLE` statement at its top-level commas. Table
+/// constraints are skipped, and each column keeps its declared type words.
+fn sqlite_columns(table: &str, sql: &str) -> Result<Vec<SqliteColumn>> {
+	let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else { return Err(RecipeError::new(format!("SQLite table {table:?} has no column list"))) };
+	require(close > open, format!("SQLite table {table:?} has no column list"))?;
+	let inner = &sql[open + 1..close];
+	let (mut depth, mut quote, mut start, mut segments) = (0usize, None::<char>, 0usize, Vec::new());
+	for (index, ch) in inner.char_indices() {
+		match quote {
+			Some(end) => {
+				if ch == end {
+					quote = None;
+				}
 			}
-			13 => {
-				let (payload, _) = sqlite_varint(bytes, &mut offset)?;
-				let _ = sqlite_varint(bytes, &mut offset)?;
-				let usable = page_size - 35;
-				require((payload as usize) <= usable, format!("SQLite page {page} overflows; overflow pages are unsupported"))?;
-				rows.push(sqlite_record(bytes.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new("SQLite record is truncated"))?)?);
-			}
-			_ => return Err(RecipeError::new(format!("SQLite page type {kind} is unsupported"))),
+			None => match ch {
+				'"' | '\'' | '`' => quote = Some(ch),
+				'[' => quote = Some(']'),
+				'(' => depth += 1,
+				')' => depth = depth.saturating_sub(1),
+				',' if depth == 0 => {
+					segments.push(&inner[start..index]);
+					start = index + 1;
+				}
+				_ => {}
+			},
 		}
 	}
-	if kind == 5 {
-		let right = u32::from_be_bytes(bytes[header + 8..header + 12].try_into().unwrap()) as usize;
-		sqlite_rows(bytes, page_size, right, rows)?;
+	segments.push(&inner[start..]);
+	const TABLE_CONSTRAINTS: [&str; 5] = ["CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"];
+	const COLUMN_CONSTRAINTS: [&str; 11] = ["CONSTRAINT", "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS"];
+	let mut columns = Vec::new();
+	for segment in segments.into_iter().map(str::trim).filter(|segment| !segment.is_empty()) {
+		let (name, rest, quoted) = sqlite_identifier(segment)?;
+		if !quoted && TABLE_CONSTRAINTS.contains(&name.to_ascii_uppercase().as_str()) {
+			continue;
+		}
+		let words = rest.split_whitespace().take_while(|word| !COLUMN_CONSTRAINTS.contains(&word.to_ascii_uppercase().as_str())).collect::<Vec<_>>();
+		let declared = words.join(" ");
+		let alias = declared.eq_ignore_ascii_case("INTEGER") && segment.to_ascii_uppercase().contains("PRIMARY KEY");
+		columns.push(SqliteColumn { name, declared, alias });
 	}
-	let _ = contents;
-	Ok(())
+	require(!columns.is_empty(), format!("SQLite table {table:?} declares no columns"))?;
+	Ok(columns)
+}
+
+/// Reads a column name, with its quoting removed, and returns the text after it.
+fn sqlite_identifier(segment: &str) -> Result<(String, &str, bool)> {
+	let closer = match segment.chars().next() {
+		Some('"') => Some('"'),
+		Some('\'') => Some('\''),
+		Some('`') => Some('`'),
+		Some('[') => Some(']'),
+		_ => None,
+	};
+	match closer {
+		Some(end) => {
+			let body = &segment[1..];
+			let close = body.find(end).ok_or_else(|| RecipeError::new(format!("SQLite column name is unterminated in {segment:?}")))?;
+			Ok((body[..close].to_owned(), &body[close + 1..], true))
+		}
+		None => {
+			let end = segment.find(char::is_whitespace).unwrap_or(segment.len());
+			Ok((segment[..end].to_owned(), &segment[end..], false))
+		}
+	}
+}
+
+/// Visits the rows of one table b-tree in rowid order, reading one page at a time. A column
+/// flagged in `aliases` takes the row's rowid. Returns the number of rows visited.
+fn sqlite_scan(source: &mut (impl Read + Seek), layout: SqliteLayout, root: usize, aliases: &[bool], visit: &mut impl FnMut(&[String]) -> Result<()>) -> Result<usize> {
+	sqlite_scan_page(source, layout, root, aliases, visit, 0)
+}
+
+fn sqlite_scan_page(source: &mut (impl Read + Seek), layout: SqliteLayout, page: usize, aliases: &[bool], visit: &mut impl FnMut(&[String]) -> Result<()>, depth: usize) -> Result<usize> {
+	require(depth <= 32, "SQLite b-tree is deeper than 32 levels or cyclic")?;
+	let buffer = sqlite_page(source, layout, page)?;
+	let header = if page == 1 { 100 } else { 0 };
+	let kind = buffer[header];
+	let cells = u16::from_be_bytes([buffer[header + 3], buffer[header + 4]]) as usize;
+	let pointer = |at: usize| -> Result<usize> {
+		let entry = buffer.get(at..at + 2).ok_or_else(|| RecipeError::new(format!("SQLite page {page} cell pointers are truncated")))?;
+		let offset = u16::from_be_bytes([entry[0], entry[1]]) as usize;
+		require(offset < layout.page_size, format!("SQLite page {page} has a cell outside the page"))?;
+		Ok(offset)
+	};
+	match kind {
+		// Interior table page: each cell names a left child, and the header names the right child.
+		5 => {
+			let mut children = Vec::with_capacity(cells + 1);
+			for cell in 0..cells {
+				let offset = pointer(header + 12 + cell * 2)?;
+				let child = buffer.get(offset..offset + 4).ok_or_else(|| RecipeError::new(format!("SQLite page {page} interior cell is truncated")))?;
+				children.push(u32::from_be_bytes([child[0], child[1], child[2], child[3]]) as usize);
+			}
+			children.push(u32::from_be_bytes([buffer[header + 8], buffer[header + 9], buffer[header + 10], buffer[header + 11]]) as usize);
+			drop(buffer);
+			let mut rows = 0;
+			for child in children {
+				rows += sqlite_scan_page(source, layout, child, aliases, visit, depth + 1)?;
+			}
+			Ok(rows)
+		}
+		// Leaf table page: each cell holds a payload size, a rowid, and the record.
+		13 => {
+			for cell in 0..cells {
+				let mut offset = pointer(header + 8 + cell * 2)?;
+				let (payload, _) = sqlite_varint(&buffer, &mut offset)?;
+				let (rowid, _) = sqlite_varint(&buffer, &mut offset)?;
+				require((payload as usize) <= layout.usable - 35, format!("SQLite page {page} holds a row that overflows its page; overflow pages are unsupported"))?;
+				let record = buffer.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new(format!("SQLite page {page} record is truncated")))?;
+				let mut values = sqlite_record(record)?;
+				for (column, _) in aliases.iter().enumerate().filter(|(_, alias)| **alias) {
+					if values.len() <= column {
+						values.resize(column + 1, String::new());
+					}
+					values[column] = rowid.to_string();
+				}
+				visit(&values)?;
+			}
+			Ok(cells)
+		}
+		other => Err(RecipeError::new(format!("SQLite page {page} has type {other}; only rowid table pages are read"))),
+	}
+}
+
+/// Every user table of a SQLite database in memory, for the loader.
+fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+	let layout = sqlite_layout(bytes.get(..100).unwrap_or(bytes), bytes.len() as u64)?;
+	let mut source = std::io::Cursor::new(bytes);
+	let catalog = sqlite_catalog(&mut source, layout)?;
+	require(!catalog.is_empty(), "SQLite database has no tables")?;
+	let mut tables = Vec::new();
+	for table in catalog {
+		let headers = table.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+		let aliases = table.columns.iter().map(|column| column.alias).collect::<Vec<_>>();
+		let mut rows = Vec::new();
+		sqlite_scan(&mut source, layout, table.root, &aliases, &mut |row: &[String]| {
+			require(row.len() <= headers.len(), format!("SQLite table {:?} row exceeds {} columns", table.name, headers.len()))?;
+			let mut row = row.to_vec();
+			row.resize_with(headers.len(), String::new);
+			rows.push(row);
+			Ok(())
+		})?;
+		tables.push(Table { name: table.name, headers, declared: true, rows, attention: None, path: PathBuf::new() });
+	}
+	Ok(tables)
 }
 fn sqlite_varint(bytes: &[u8], offset: &mut usize) -> Result<(i64, usize)> {
 	let mut value = 0_i64;
@@ -30262,6 +31461,12 @@ fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
 				let text = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite text is truncated"))?;
 				body += length;
 				String::from_utf8(text.to_vec()).map_err(|error| RecipeError::new(format!("SQLite text is not UTF-8: {error}")))?
+			}
+			serial if serial >= 12 => {
+				let length = (serial as usize - 12) / 2;
+				let blob = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite blob is truncated"))?;
+				body += length;
+				String::from_utf8_lossy(blob).into_owned()
 			}
 			serial => return Err(RecipeError::new(format!("SQLite serial type {serial} is unsupported"))),
 		});
@@ -31024,7 +32229,7 @@ enum JsonValue {
 	Bool(bool),
 	Number(String),
 	Text(String),
-	Array,
+	Array(Vec<JsonValue>),
 	Object(Vec<(String, JsonValue)>),
 }
 impl JsonValue {
@@ -31033,7 +32238,7 @@ impl JsonValue {
 			Self::Null => Some(String::new()),
 			Self::Bool(value) => Some(value.to_string()),
 			Self::Number(value) | Self::Text(value) => Some(value.clone()),
-			Self::Array | Self::Object(_) => None,
+			Self::Array(_) | Self::Object(_) => None,
 		}
 	}
 }
@@ -31051,16 +32256,16 @@ fn json_value(text: &str) -> Result<(JsonValue, &str)> {
 		}
 		Some('[') => {
 			let mut rest = text[1..].trim_start();
-			let mut values = 0;
+			let mut values = Vec::new();
 			loop {
 				if let Some(after) = rest.strip_prefix(']') {
-					return Ok((JsonValue::Array, after));
+					return Ok((JsonValue::Array(values), after));
 				}
-				if values != 0 {
+				if !values.is_empty() {
 					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
 				}
-				let (_, remaining) = json_value(rest)?;
-				values += 1;
+				let (value, remaining) = json_value(rest)?;
+				values.push(value);
 				rest = remaining.trim_start();
 			}
 		}
@@ -32092,6 +33297,7 @@ fn prepare_command_data(data: &Data) -> Result<Prepared> {
 		autoregressive: false,
 		target: Vec::new(),
 		features: data.features.clone(),
+		schema_file: data.schema_file.clone(),
 		normalize: data.normalize,
 		split: 1.0,
 		split_supplied: false,
@@ -32593,6 +33799,7 @@ impl Train {
 				autoregressive: false,
 				target: Vec::new(),
 				features: FeatureSelection::All,
+				schema_file: None,
 				normalize: false,
 				split: 1.0,
 				split_supplied: false,
