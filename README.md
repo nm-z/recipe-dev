@@ -254,6 +254,8 @@ recipe stats model.gguf
 recipe keys model.gguf
 ```
 
+GGUF tensor pairing and delta activations come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`); gated-delta models also name `delta-convolution` and `delta-output`. Unknown names fail instead of taking another architecture's defaults.
+
 ## Precision and reference checks
 
 ```toml

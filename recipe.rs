@@ -15269,19 +15269,54 @@ impl RopeSelector for RopePairs {
 /// `token_embd`, `output_norm` and `output` names, so a row adds no path of
 /// its own.
 struct Architecture {
-	names: &'static [&'static str],
+	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
 }
-const ARCHITECTURES: &[Architecture] = &[
-	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
-	Architecture { names: &["gemma3"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["gemma4"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["lfm2"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
-	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
-	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
-];
+fn architecture_activation(value: &str) -> Result<Activation> {
+	match value {
+		"linear" => Ok(Activation::Linear),
+		"relu" => Ok(Activation::Relu),
+		"silu" => Ok(Activation::Silu),
+		"sigmoid" => Ok(Activation::Sigmoid),
+		"tanh" => Ok(Activation::Tanh),
+		"gelu" => Ok(Activation::Gelu),
+		"elu" => Ok(Activation::Elu),
+		"selu" => Ok(Activation::Selu),
+		_ => Err(RecipeError::new(format!("architecture activation {value:?} is not supported"))),
+	}
+}
+fn architectures() -> Result<Vec<Architecture>> {
+	let (mut rows, mut name, mut rope, mut convolution, mut output) = (Vec::new(), None::<String>, None, None, None);
+	let finish = |name: String, rope: Option<RopePairs>, convolution: Option<Activation>, output: Option<Activation>| -> Result<Architecture> {
+		let rope = rope.ok_or_else(|| RecipeError::new(format!("architecture {name:?} names no rope pairing")))?;
+		require(convolution.is_some() == output.is_some(), format!("architecture {name:?} names only one delta activation"))?;
+		Ok(Architecture { name, rope, delta_activation: convolution.zip(output) })
+	};
+	for raw in include_str!("Cargo.toml").lines() {
+		let line = raw.split('#').next().unwrap_or("").trim();
+		if line.starts_with('[') {
+			if let Some(previous) = name.take() { rows.push(finish(previous, rope.take(), convolution.take(), output.take())?); }
+			name = line.strip_prefix("[architecture.").and_then(|value| value.strip_suffix(']')).map(str::to_owned);
+			continue;
+		}
+		let Some(current) = name.as_ref() else { continue };
+		if line.is_empty() { continue; }
+		let (key, value) = line.split_once('=').ok_or_else(|| RecipeError::new(format!("architecture {current:?} contains an invalid field")))?;
+		let value = value.trim().strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| RecipeError::new(format!("architecture {current:?} field {key:?} is not a string")))?;
+		match key.trim() {
+			"rope-pairs" => rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {current:?} has invalid rope pairing {value:?}"))) }),
+			"delta-convolution" => convolution = Some(architecture_activation(value)?),
+			"delta-output" => output = Some(architecture_activation(value)?),
+			key => return Err(RecipeError::new(format!("architecture {current:?} has unknown field {key:?}"))),
+		}
+	}
+	if let Some(previous) = name { rows.push(finish(previous, rope, convolution, output)?); }
+	require(!rows.is_empty(), "Cargo.toml names no model architectures")?;
+	let mut seen = BTreeSet::new();
+	for row in &rows { require(seen.insert(row.name.clone()), format!("architecture {:?} is duplicated", row.name))?; }
+	Ok(rows)
+}
 /// A model built from a GGUF file: the blocks its architecture metadata declares
 /// and the plan that binds every weighted node to the file's tensors by name.
 pub struct Bound {
@@ -15411,8 +15446,9 @@ struct ExpertDims {
 impl<'a> Builder<'a> {
 	fn build(file: &'a Gguf) -> Result<Bound> {
 		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
-		let row = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).ok_or_else(|| {
-			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
+		let rows = architectures()?;
+		let row = rows.iter().find(|row| row.name == architecture).ok_or_else(|| {
+			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
 		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
@@ -16458,7 +16494,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 /// pushes weighted nodes, so the plan lines up with the graph entry by entry.
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
-	let rope = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).map_or(RopePairs::Halves, |row| row.rope);
+	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
 	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();

@@ -164,3 +164,42 @@ rope-angle = "chain"
 attn-softmax = "online"
 math = "libm"
 step = 256
+
+[architecture.llama]
+rope-pairs = "neighbours"
+
+[architecture.gemma3]
+rope-pairs = "halves"
+
+[architecture.gemma4]
+rope-pairs = "halves"
+
+[architecture.lfm2]
+rope-pairs = "halves"
+
+[architecture.qwen2]
+rope-pairs = "halves"
+
+[architecture.qwen3]
+rope-pairs = "halves"
+
+[architecture.qwen2moe]
+rope-pairs = "halves"
+
+[architecture.qwen3moe]
+rope-pairs = "halves"
+
+[architecture.qwen35]
+rope-pairs = "halves"
+delta-convolution = "silu"
+delta-output = "silu"
+
+[architecture.qwen3next]
+rope-pairs = "halves"
+delta-convolution = "silu"
+delta-output = "silu"
+
+[architecture.qwen4exp]
+rope-pairs = "halves"
+delta-convolution = "silu"
+delta-output = "sigmoid"
