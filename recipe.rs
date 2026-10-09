@@ -23891,6 +23891,16 @@ mod ple_stepper_checks {
 		out.extend(data);
 		std::fs::write(path, out).unwrap();
 	}
+	/// The per-layer embedding math the public control used before the model definition carried it.
+	fn ple_math() -> PleMath {
+		PleMath {
+			key_norm: BlockNormalization::Rms,
+			query_norm: BlockNormalization::Rms,
+			output_norm: BlockNormalization::Rms,
+			gate: PleGate::signed_root_sigmoid(1e-6, true),
+			convolution: Activation::Silu,
+		}
+	}
 	/// The public control's model: an optional per-layer embedding after the
 	/// embedding, then residual attention and gated feed-forward blocks.
 	fn model(table: Option<&Ngram<'_>>) -> Model {
@@ -23898,7 +23908,7 @@ mod ple_stepper_checks {
 		let up = layer(1).fp(64);
 		let model = recipe.model().no(bias).embed(2, 1).fp(64);
 		let model = match table {
-			Some(table) => model.ple(table).fp(64),
+			Some(table) => model.ple(table).ple_math(ple_math()).fp(64),
 			None => model,
 		};
 		model.res([attn(1).fp(64)]).fp(64).res([(gate * up).fp(64), layer(1).fp(64)]).fp(64).layer(2).fp(64)
@@ -23906,7 +23916,7 @@ mod ple_stepper_checks {
 	/// Places the model on the CPU as one range, the same tape a single-device
 	/// `recipe.infer` placement builds.
 	fn place_cpu(file: &Gguf, model: &Model, positions: usize) -> Placed {
-		let bound = explicit_bound(file, model).unwrap();
+		let bound = explicit_bound(file, model, true).unwrap();
 		let devices: &'static [&'static Gpu] = Box::leak(Box::new([shared_cpu_device().unwrap()]));
 		place_bound(&bound, positions, &[], devices).unwrap()
 	}
