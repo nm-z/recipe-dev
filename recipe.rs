@@ -8942,7 +8942,7 @@ mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
 	//! special ids, and the chat template.
-	use super::{Gguf, GgufValue, RecipeError, Result, require};
+	use super::{Gguf, GgufValue, RecipeError, Result, adds_bos_token, require};
 	use std::{cmp::Ordering, collections::HashMap};
 
 	/// The pre-tokenizer `tokenizer.ggml.pre` names: the passes that cut text
@@ -9364,7 +9364,7 @@ mod tokenizer {
 				bytes,
 				family,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
-				add_bos: flag("tokenizer.ggml.add_bos_token"),
+				add_bos: adds_bos_token(model),
 				add_eos: flag("tokenizer.ggml.add_eos_token"),
 				bos: special_id("tokenizer.ggml.bos_token_id"),
 				eos: special_id("tokenizer.ggml.eos_token_id"),
@@ -16566,7 +16566,7 @@ impl std::ops::Deref for TokenizerNamespace {
 					pre: text("tokenizer.ggml.pre"),
 					bos_token_id: id("tokenizer.ggml.bos_token_id"),
 					eos_token_id: id("tokenizer.ggml.eos_token_id"),
-					add_bos_token: matches!(file.value("tokenizer.ggml.add_bos_token"), Some(GgufValue::Bool(true))),
+					add_bos_token: adds_bos_token(file),
 				},
 				chat_template: text("tokenizer.chat_template"),
 			}
@@ -16622,6 +16622,7 @@ pub struct Infer {
 	positions: Option<Vec<u32>>,
 	score: bool,
 	scored_ids: Option<Vec<u32>>,
+	prompt_ids: Option<Vec<u32>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChatMetric(u8);
@@ -16653,7 +16654,7 @@ impl<const N: usize> IntoChatMetrics for [ChatMetric; N] {
 }
 impl Recipe {
 	pub fn infer(&self) -> Infer {
-		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false, scored_ids: None }
+		Infer { log: Vec::new(), tokens: None, chat: None, positions: None, score: false, scored_ids: None, prompt_ids: None }
 	}
 }
 impl Infer {
@@ -16680,6 +16681,13 @@ impl Infer {
 	pub fn score_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
 		self.score = true;
 		self.scored_ids = Some(ids.as_ref().to_vec());
+		self
+	}
+	/// Generates from these prompt token ids in place of the chat prompt. The ids
+	/// reach the model exactly as given: no chat template renders, and no
+	/// beginning-of-sequence id is added or removed.
+	pub fn prompt_ids(mut self, ids: impl AsRef<[u32]>) -> Self {
+		self.prompt_ids = Some(ids.as_ref().to_vec());
 		self
 	}
 	/// Keep the model resident and read successive messages from stdin. A supplied
@@ -16717,7 +16725,12 @@ impl Infer {
 		let coder = file.tokenizer();
 		let supplied = std::env::var("RNJ_PROMPT_FILE").ok().map(|path| fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read prompt file {path}: {error}")))).transpose()?;
 		let message = std::env::var("RECIPE_MESSAGE").ok().or_else(|| std::env::args().nth(1));
-		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none();
+		let interactive = self.chat.is_some() && supplied.is_none() && message.is_none() && self.prompt_ids.is_none();
+		if let Some(ids) = &self.prompt_ids {
+			require(!self.score, "prompt ids cannot be combined with a score")?;
+			require(!ids.is_empty(), "prompt ids are empty")?;
+			require(ids.iter().all(|id| (*id as usize) < coder.vocabulary()), "prompt ids exceed the tokenizer vocabulary")?;
+		}
 		require(!interactive || self.positions.is_none(), "explicit rotary positions require a supplied prompt")?;
 		let stop = stop_ids(&coder)?;
 		let scored = if self.score {
@@ -16758,28 +16771,35 @@ impl Infer {
 			};
 			let progress;
 			let request_started;
-			let text = if interactive {
-				if INTERRUPTED.load(Ordering::Acquire) { break; }
-				if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
-				let Some(line) = input.read()? else { break };
-				if line.trim() == "/exit" { break; }
-				if line.trim() == "/clear" { conversation.clear(); placed.clear(); continue; }
-				if line.trim().is_empty() { continue; }
+			let mut prompt = if let Some(ids) = &self.prompt_ids {
 				request_started = Instant::now();
 				progress = start_progress(request_started);
-				conversation.push(("user".to_owned(), line.trim_end().to_owned()));
-				coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+				ids.clone()
 			} else {
-				request_started = Instant::now();
-				progress = start_progress(request_started);
-				match &supplied {
-					Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
-					Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
-					None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
-				}
+				let text = if interactive {
+					if INTERRUPTED.load(Ordering::Acquire) { break; }
+					if std::io::stdin().is_terminal() { eprint!("> "); std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot print chat prompt: {error}")))?; }
+					let Some(line) = input.read()? else { break };
+					if line.trim() == "/exit" { break; }
+					if line.trim() == "/clear" { conversation.clear(); placed.clear(); continue; }
+					if line.trim().is_empty() { continue; }
+					request_started = Instant::now();
+					progress = start_progress(request_started);
+					conversation.push(("user".to_owned(), line.trim_end().to_owned()));
+					coder.prompt(&conversation.iter().map(|(role, text)| (role.as_str(), text.as_str())).collect::<Vec<_>>(), true)?
+				} else {
+					request_started = Instant::now();
+					progress = start_progress(request_started);
+					match &supplied {
+						Some(prompt) if std::env::var("RNJ_RAW_PROMPT").as_deref() == Ok("1") => prompt.clone(),
+						Some(message) => coder.prompt(&[("user", message.as_str())], true)?,
+						None => coder.prompt(&[("user", message.as_deref().unwrap_or("What is the capital of France?"))], true)?,
+					}
+				};
+				let mut prompt = coder.encode(&text);
+				if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
+				prompt
 			};
-			let mut prompt = coder.encode(&text);
-			if let Some(bos) = coder.bos() && coder.adds_bos() && prompt.len() >= 2 && prompt[0] == bos && prompt[1] == bos { prompt.remove(0); }
 			if let Some(progress) = &progress { progress.prompt(prompt.len()); }
 			if prompt.len() >= sequence && interactive {
 				conversation.pop();
@@ -16848,6 +16868,15 @@ impl Infer {
 			history: request_history,
 			score,
 		})
+	}
+}
+/// The `add_bos` default when `tokenizer.ggml.add_bos_token` is absent. Among
+/// Recipe's BPE vocabularies, only the Llama 3 pre-tokenizer names prepend the
+/// beginning-of-sequence id by default, as llama.cpp does.
+fn adds_bos_token(file: &Gguf) -> bool {
+	match file.value("tokenizer.ggml.add_bos_token") {
+		Some(GgufValue::Bool(value)) => *value,
+		_ => matches!(file.value("tokenizer.ggml.pre").and_then(GgufValue::text), Some("llama3" | "llama-v3" | "llama-bpe")),
 	}
 }
 /// The word groups of `ids`: the tokenizer must reproduce the ids from their
