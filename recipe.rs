@@ -1712,6 +1712,11 @@ pub(crate) struct NativeLayout {
 	/// device clock per node, written by thread 0 as each node begins; a
 	/// traced forward reads them back and logs the time between nodes.
 	pub clocks: Option<usize>,
+	/// Under a traced run on an NVIDIA device, the byte offset in the context
+	/// buffer of two i64 values the kernel writes as a forward ends: how many grid
+	/// barriers it executed and, summed over them, the nanoseconds from the first
+	/// workgroup's arrival to the last's. A traced forward reads them back.
+	pub barriers: Option<usize>,
 	/// At inference, the byte offset in the context arena of the output node's
 	/// values at the last position a forward reached, one per output channel,
 	/// gathered on the device so a decode reads one column and not the tensor.
@@ -2413,6 +2418,8 @@ impl NativeLayout {
 		let clocks = if tracing() || tuned {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
+		// Only the inference forward reads the barrier measurement back.
+		let barriers = if tracing() && inference { Some(context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let last_column = match graph.nodes.last().filter(|_| inference) {
 			Some(last) => Some(context_plan.allocate(&[(checked_mul(last.output.channels, output_precision.bytes(), "last output column")?, BufferLifetime::Retained)], 8, 0, false)?),
@@ -2422,7 +2429,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, barriers, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -8138,6 +8145,14 @@ impl NativeModelIr {
 		} else if nvidia_widen {
 			ir = nvidia_float_dot4_helpers(ir, &self.variants);
 		}
+		// A traced run's grid barrier also measures the spread of its arrivals.
+		let barriers = self.layout.barriers.filter(|_| backend == Backend::Nvidia);
+		if barriers.is_some() {
+			let mapping = option_env!("RECIPE_NV_IR").ok_or_else(|| RecipeError::new("NVIDIA native LLVM templates are unavailable"))?;
+			let traced = fs::read_to_string(template_path(mapping, "barrier-traced")?).map_err(|error| RecipeError::new(format!("cannot read traced grid barrier template: {error}")))?;
+			ir = strip_definition(ir, "grid_barrier");
+			ir.push_str(&traced);
+		}
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let source_decode = self.emit_source_decode(backend)?;
@@ -8176,9 +8191,21 @@ impl NativeModelIr {
 		body.push_str(&blocks.definitions);
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&timing_start("timing.inference.start", self.layout.timing));
+		if barriers.is_some() {
+			// The first thread clears the step's barrier count and total spread; no
+			// barrier releases before it arrives at one.
+			body.push_str("%barriers.start.leader = icmp eq i32 %tid, 0\nbr i1 %barriers.start.leader, label %barriers.start.write, label %barriers.start.done\nbarriers.start.write:\nstore atomic i64 0, ptr addrspace(1) @grid.barriers monotonic, align 8\nstore atomic i64 0, ptr addrspace(1) @grid.spread monotonic, align 8\nbr label %barriers.start.done\nbarriers.start.done:\n");
+		}
 		body.push_str(&prelude);
 		body.push_str(&blocks.calls);
 		body.push_str(&self.emit_last_column(backend)?);
+		if let Some(at) = barriers {
+			// Every barrier has released by the time the first thread leaves the last.
+			body.push_str(&format!(
+				"%barriers.end.leader = icmp eq i32 %tid, 0\nbr i1 %barriers.end.leader, label %barriers.end.write, label %barriers.end.done\nbarriers.end.write:\n%barriers.count = load atomic i64, ptr addrspace(1) @grid.barriers monotonic, align 8\n%barriers.spread = load atomic i64, ptr addrspace(1) @grid.spread monotonic, align 8\n%barriers.count.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %barriers.count, {pointer} %barriers.count.ptr, align 8\n%barriers.spread.ptr = getelementptr i8, {pointer} %contexts, i64 {next}\nstore i64 %barriers.spread, {pointer} %barriers.spread.ptr, align 8\nbr label %barriers.end.done\nbarriers.end.done:\n",
+				next = at + 8
+			));
+		}
 		body.push_str(&timing_end("timing.inference.end", self.layout.timing + 8));
 		body.push_str("ret void\n}\n");
 		if loss.is_some() {
@@ -24825,6 +24852,10 @@ impl NativeTape {
 				for index in 0..count {
 					let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
 					line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
+				}
+				if let Some(barriers) = self.program.artifact.layout.barriers.filter(|_| self.program.gpu.backend == Backend::Nvidia) {
+					let [count, spread] = self.contexts.download_range::<i64>(barriers / 8, 2)?[..] else { return Err(RecipeError::new("barrier measurement is incomplete")) };
+					line.push_str(&format!(" barriers={count} spread_ns={spread}"));
 				}
 				line.push_str(&format!(" device={}", self.device_label()?));
 				trace(&line)?;
