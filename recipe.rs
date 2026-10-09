@@ -2357,7 +2357,7 @@ impl NativeLayout {
 	/// regions only the reverse pass fills. Values, conversions, and workspace
 	/// use the same lifetime-based allocator. Retained regions stay private;
 	/// transient regions share storage after their last reader's barrier.
-	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
+	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool, timed: bool) -> Result<Self> {
 		let window_positions = inference_window(graph, rows, inference);
 		let element = precision.bytes();
 		let unit = 8;
@@ -2469,7 +2469,7 @@ impl NativeLayout {
 		let timing = context_plan.allocate(&[(16, BufferLifetime::Retained)], 8, 0, false)?;
 		// The lane tuner reads the node clocks too.
 		let tuned = inference && lane_tuning();
-		let clocks = if tracing() || tuned {
+		let clocks = if tracing() || tuned || (inference && timed) {
 			Some(context_plan.allocate(&[(checked_mul(graph.nodes.len().max(1) + 1, 8, "node clocks")?, BufferLifetime::Retained)], 8, 0, false)?)
 		} else { None };
 		let knobs = if tuned { Some(context_plan.allocate(&[(checked_mul(graph.nodes.len() + 2, 4, "lane knobs")?, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
@@ -2752,7 +2752,7 @@ pub(crate) struct NativeModelIr {
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool, timed: bool) -> Result<Self> {
 		// Integer inference stages activation codes; training uses the declared
 		// float arithmetic and keeps packed storage for checkpoint output only.
 		let tile_bytes = schedule.shared_values as usize * schedule.element.bytes();
@@ -2771,7 +2771,7 @@ impl NativeModelIr {
 			require(needed <= tile_bytes, format!("{} computes in int{} over {} inputs, whose activation codes take {needed} bytes of the {tile_bytes}-byte tile; increase contraction-cpu-shared-values", node.identity(index), node.int_bits, node.input.channels))?;
 		}
 		require(rows != 0, "native model rows must be positive")?;
-		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
+		let layout = NativeLayout::for_graph(graph, rows, precision, inference, timed)?;
 		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision, graph.profile.acc)?;
 		let mut variants: Vec<NativeVariant> = Vec::new();
@@ -9569,7 +9569,7 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 	let compile_started = Instant::now();
 	require(!epoch || loss.is_some(), "an epoch requires a loss function")?;
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none())?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule, loss.is_none(), target.backend() == Backend::Cpu)?;
 	if tracing() {
 		model.trace_precision_nodes(device)?;
 	}
@@ -18628,6 +18628,7 @@ impl Infer {
 			grids: placed.grid_report()?,
 			load: DurationReport(load_seconds),
 			compile: DurationReport(placed.compile_seconds()),
+			timings: placed.timings(),
 			residency: placed.residency(),
 			context: sequence,
 			requests: request_history.len(),
@@ -19322,6 +19323,8 @@ pub struct InferenceReport {
 	pub grids: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
+	/// Predicted and measured time per node, summed over the run's forward windows.
+	pub timings: Vec<NodeTiming>,
 	/// Each tape's weight buffer: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
 	pub residency: Vec<WeightResidency>,
 	pub context: usize,
@@ -19331,6 +19334,33 @@ pub struct InferenceReport {
 	/// Teacher-forced log probabilities of the scored text, set by `Infer::score`.
 	pub score: Option<TextScore>,
 	last: Arc<InferenceRequest>,
+}
+/// A node whose measured time exceeds its prediction by more than the margin.
+#[derive(Clone, Debug)]
+pub struct NodeGap {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub predicted_seconds: f64,
+	pub measured_seconds: f64,
+	/// Measured time divided by predicted time.
+	pub ratio: f64,
+}
+impl InferenceReport {
+	/// The nodes whose measured time is more than `margin` times their predicted
+	/// time, largest ratio first. `margin` is a ratio, so 2.0 selects nodes that
+	/// ran more than twice as long as predicted. Nodes without a prediction are omitted.
+	pub fn gaps(&self, margin: f64) -> Vec<NodeGap> {
+		let mut gaps = self.timings.iter().filter_map(|timing| {
+			let predicted = timing.predicted_seconds?;
+			let ratio = if predicted > 0.0 { timing.measured_seconds / predicted } else if timing.measured_seconds > 0.0 { f64::INFINITY } else { 0.0 };
+			(ratio > margin).then(|| NodeGap { device: timing.device.clone(), node: timing.node, block: timing.block, kind: timing.kind, op: timing.op, predicted_seconds: predicted, measured_seconds: timing.measured_seconds, ratio })
+		}).collect::<Vec<_>>();
+		gaps.sort_by(|left, right| right.ratio.total_cmp(&left.ratio));
+		gaps
+	}
 }
 impl std::ops::Deref for InferenceReport {
 	type Target = InferenceRequest;
@@ -20191,7 +20221,7 @@ impl DeviceMemory {
 }
 fn part_memory(part: &Graph, precision: Compute) -> Result<DeviceMemory> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
-	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
+	let layout = NativeLayout::for_graph(part, 1, precision, true, false)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { part.nodes.first().map_or(precision, |node| node.precision).bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	Ok(DeviceMemory { device: String::new(), input, weights, values: layout.values_bytes, contexts: layout.contexts_bytes, scratch: storage_scratch_bytes(part), dead: layout.dead_bytes, dead_buffers: layout.dead_buffers })
@@ -20857,6 +20887,10 @@ fn place_bound_observed(model: &Bound, positions: usize, split: &[usize], device
 	Ok(Placed { source: PlacedSource::Bound(input, suppressed), decode: Mutex::new(DecodeState::default()), devices: devices.to_vec(), split, tapes: vec![ranges], resident, movement, moved, exchange: None })
 }
 impl Placed {
+	/// Predicted and measured time for every node that ran, across all tapes.
+	pub fn timings(&self) -> Vec<NodeTiming> {
+		self.tapes.iter().flatten().flat_map(|tape| tape.timing.lock().map(|timing| timing.totals.iter().filter(|total| total.forwards != 0).cloned().collect::<Vec<_>>()).unwrap_or_default()).collect()
+	}
 	pub fn residency(&self) -> Vec<WeightResidency> {
 		self.tapes.iter().flatten().map(|tape| tape.residency.clone()).collect()
 	}
@@ -21271,6 +21305,34 @@ enum Primitive {
 	/// Values the dies of a tensor split share: each die's rows gathered into
 	/// every die (argument 0 = 0), or every die's partial sums added (= 1).
 	Exchange = 23,
+}
+impl Primitive {
+	/// The primitive's name, as node lines print it.
+	const fn name(self) -> &'static str {
+		match self {
+			Primitive::Contraction => "contraction",
+			Primitive::Pool => "pool",
+			Primitive::Attention => "attention",
+			Primitive::Scan => "scan",
+			Primitive::Elementwise => "elementwise",
+			Primitive::Normalize => "normalize",
+			Primitive::Predictor => "predictor",
+			Primitive::Gather => "gather",
+			Primitive::Rope => "rope",
+			Primitive::Expand => "expand",
+			Primitive::Read => "read",
+			Primitive::Outer => "outer",
+			Primitive::TopK => "topk",
+			Primitive::ExpertIn => "expert_in",
+			Primitive::Dconv => "dconv",
+			Primitive::Delta => "delta",
+			Primitive::ExpertOut => "expert_out",
+			Primitive::Lookup => "lookup",
+			Primitive::Fold => "fold",
+			Primitive::Last => "last",
+			Primitive::Exchange => "exchange",
+		}
+	}
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -23995,6 +24057,7 @@ struct NativeTape {
 	targets: Buffer,
 	weights: Buffer,
 	frozen: Buffer,
+	timing: Mutex<TapeTiming>,
 	residency: WeightResidency,
 	#[allow(dead_code)]
 	hold: Option<RetainedHold>,
@@ -24399,6 +24462,7 @@ impl NativeTape {
 			targets: Buffer::upload_float(gpu, &target_buffer, layout.output_precision)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen_mask)?,
+			timing: Mutex::new(TapeTiming::new(graph, gpu)?),
 			residency,
 			hold,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
@@ -24660,10 +24724,13 @@ impl NativeTape {
 			let tensors = self.capture_tensors(begin, end)?;
 			self.tensor_history.lock().map_err(|_| RecipeError::new("tensor observation history is poisoned"))?.extend(tensors);
 		}
-		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing()) {
+		if let Some(clocks) = self.program.artifact.layout.clocks.filter(|_| tuning || tracing() || (mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu)) {
 			let count = self.program.artifact.layout.precisions.len();
 			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			if mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu {
+				record_node_timing(&self.timing, (end - begin) as usize, &node_ticks, ticks[0])?;
+			}
 			if tuning && let Some(tuner) = tuner.as_mut() {
 				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
 				tuner.observe(&stamps);
@@ -25241,6 +25308,256 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
+}
+/// Work and time for one node, summed over every forward window a run executed.
+/// `predicted_seconds` is `None` where no device rates are configured.
+#[derive(Clone, Debug)]
+pub struct NodeTiming {
+	pub device: String,
+	pub node: usize,
+	pub block: usize,
+	pub kind: &'static str,
+	pub op: &'static str,
+	pub operations: f64,
+	pub bytes: f64,
+	pub predicted_seconds: Option<f64>,
+	pub measured_seconds: f64,
+	pub forwards: usize,
+}
+/// What the plan says one node does per position: its primitive, channel
+/// counts, activation width, weight bytes, and the model's context length.
+#[derive(Clone, Copy)]
+struct NodeWork {
+	op: Primitive,
+	input: usize,
+	output: usize,
+	width: f64,
+	weight_bytes: f64,
+	positions: usize,
+}
+struct NodeCost {
+	operations: f64,
+	bytes: f64,
+}
+/// The arithmetic and traffic one node performs over `span` positions. A
+/// contraction costs two operations per weight element and position, attention
+/// costs its score and value products over the context, and every other
+/// primitive costs a fixed count per output element by its class.
+fn node_cost(work: &NodeWork, span: usize) -> NodeCost {
+	let span = span as f64;
+	let (input, output) = (work.input as f64 * span, work.output as f64 * span);
+	let operations = match work.op {
+		Primitive::Contraction => 2.0 * work.input as f64 * work.output as f64 * span,
+		Primitive::Attention => 4.0 * output * work.positions as f64,
+		Primitive::Normalize => 5.0 * output,
+		Primitive::Rope | Primitive::Delta | Primitive::Scan => 6.0 * output,
+		_ => 2.0 * output,
+	};
+	NodeCost { operations, bytes: (input + output) * work.width + work.weight_bytes }
+}
+/// The CPU's peak rates as (FLOP/s over every worker, bytes/s), which node predictions divide by.
+/// `RECIPE_CPU_PEAK_GFLOPS` (per worker thread) and `RECIPE_CPU_PEAK_GBPS` (all workers together)
+/// override a rate. Otherwise the rates are measured on this machine once, in a few hundred
+/// milliseconds on the host before any inference dispatch, and cached in `~/.cache/recipe/cpu-peaks`
+/// under the CPU model and worker count.
+fn cpu_peak_rates(workers: u32) -> Result<(f64, f64)> {
+	static RATES: OnceLock<Result<(f64, f64)>> = OnceLock::new();
+	let rates = RATES.get_or_init(|| {
+		let overridden = |name: &str| -> Result<Option<f64>> {
+			let Ok(text) = std::env::var(name) else { return Ok(None) };
+			let value = text.trim().parse::<f64>().map_err(|error| RecipeError::new(format!("{name} is not a number: {error}")))?;
+			require(value.is_finite() && value > 0.0, format!("{name} must be a positive number"))?;
+			Ok(Some(value))
+		};
+		let (gflops, gbps) = (overridden("RECIPE_CPU_PEAK_GFLOPS")?, overridden("RECIPE_CPU_PEAK_GBPS")?);
+		let (per_worker, bandwidth) = match (gflops, gbps) {
+			(Some(gflops), Some(gbps)) => (gflops, gbps),
+			_ => {
+				let (measured_gflops, measured_gbps) = cached_cpu_peaks(workers as usize);
+				(gflops.unwrap_or(measured_gflops), gbps.unwrap_or(measured_gbps))
+			}
+		};
+		Ok((per_worker * 1e9 * f64::from(workers), bandwidth * 1e9))
+	});
+	match rates {
+		Ok(rates) => Ok(*rates),
+		Err(error) => Err(RecipeError::new(error.to_string())),
+	}
+}
+/// The CPU model the peak cache is keyed by: the processor name where the machine reports one,
+/// else the architecture.
+fn cpu_model() -> String {
+	let named = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| text.lines().find(|line| line.starts_with("model name")).and_then(|line| line.split_once(':')).map(|(_, name)| name.trim().to_owned()));
+	named.or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok()).unwrap_or_else(|| std::env::consts::ARCH.to_owned())
+}
+/// (GFLOP/s per worker, GB/s over all workers) for this CPU model and worker count, from the
+/// cache file or else measured and appended to it.
+fn cached_cpu_peaks(workers: usize) -> (f64, f64) {
+	let model = cpu_model();
+	let path = home_directory().ok().map(|home| home.join(".cache").join("recipe").join("cpu-peaks"));
+	if let Some(text) = path.as_ref().and_then(|path| fs::read_to_string(path).ok()) {
+		for line in text.lines() {
+			let mut fields = line.splitn(4, '\t');
+			if let (Some(count), Some(gflops), Some(gbps), Some(name)) = (fields.next(), fields.next(), fields.next(), fields.next())
+				&& count == workers.to_string()
+				&& name == model
+				&& let (Ok(gflops), Ok(gbps)) = (gflops.parse::<f64>(), gbps.parse::<f64>())
+			{
+				return (gflops, gbps);
+			}
+		}
+	}
+	let (gflops, gbps) = measure_cpu_peaks(workers);
+	if let Some(path) = path {
+		use std::io::Write;
+		if let Some(parent) = path.parent() {
+			let _ = fs::create_dir_all(parent);
+		}
+		if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+			let _ = writeln!(file, "{workers}\t{gflops}\t{gbps}\t{model}");
+		}
+	}
+	(gflops, gbps)
+}
+/// One burst of independent fused multiply-add chains: the value and the FLOPs performed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_burst_avx2(iterations: u64) -> f32 {
+	use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_set1_ps, _mm256_storeu_ps};
+	let mut lanes = [_mm256_set1_ps(0.5); 12];
+	let (a, b) = (_mm256_set1_ps(1.000_000_1), _mm256_set1_ps(1.0e-7));
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			*lane = _mm256_fmadd_ps(*lane, a, b);
+		}
+	}
+	let mut out = [0.0_f32; 8];
+	let mut sum = 0.0_f32;
+	for lane in lanes {
+		_mm256_storeu_ps(out.as_mut_ptr(), lane);
+		sum += out.iter().sum::<f32>();
+	}
+	sum
+}
+fn fma_burst(iterations: u64) -> (f32, f64) {
+	#[cfg(target_arch = "x86_64")]
+	if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+		// 12 accumulators x 8 lanes x 2 operations per FMA.
+		return (unsafe { fma_burst_avx2(iterations) }, iterations as f64 * 12.0 * 8.0 * 2.0);
+	}
+	// Elsewhere: 64 independent lanes the compiler vectorizes to the target's baseline vector unit.
+	let mut lanes = [0.5_f32; 64];
+	for _ in 0..iterations {
+		for lane in lanes.iter_mut() {
+			#[cfg(target_arch = "aarch64")]
+			{ *lane = lane.mul_add(1.000_000_1, 1.0e-7); }
+			#[cfg(not(target_arch = "aarch64"))]
+			{ *lane = *lane * 1.000_000_1 + 1.0e-7; }
+		}
+	}
+	(lanes.iter().sum(), iterations as f64 * 64.0 * 2.0)
+}
+/// Measures (GFLOP/s per worker, GB/s over all workers): every worker runs a fused multiply-add
+/// burst and a streaming triad (`a = b + 3c` over arrays larger than the cache, each worker
+/// touching its own pages first) in lockstep passes. The best pass counts, since load only slows
+/// a pass down.
+fn measure_cpu_peaks(workers: usize) -> (f64, f64) {
+	const PASSES: usize = 5;
+	const FMA_ITERATIONS: u64 = 2_000_000;
+	const TRIAD_FLOATS: usize = 1 << 24;
+	let workers = workers.max(1);
+	let length = TRIAD_FLOATS / workers;
+	let barrier = std::sync::Barrier::new(workers);
+	let times: Vec<([f64; PASSES], [f64; PASSES], f64)> = std::thread::scope(|scope| {
+		let handles: Vec<_> = (0..workers)
+			.map(|_| {
+				scope.spawn(|| {
+					let (mut fma, mut triad, mut flops) = ([0.0; PASSES], [0.0; PASSES], 0.0);
+					for pass in &mut fma {
+						barrier.wait();
+						let started = Instant::now();
+						let (value, performed) = fma_burst(FMA_ITERATIONS);
+						std::hint::black_box(value);
+						flops = performed;
+						*pass = started.elapsed().as_secs_f64();
+					}
+					let mut a = vec![0.0_f32; length];
+					let b = vec![1.5_f32; length];
+					let c = vec![0.25_f32; length];
+					for round in 0..=PASSES {
+						barrier.wait();
+						let started = Instant::now();
+						for ((out, x), y) in a.iter_mut().zip(&b).zip(&c) {
+							*out = *x + 3.0 * *y;
+						}
+						std::hint::black_box(&a);
+						// Round 0 only faults the pages in.
+						if round > 0 {
+							triad[round - 1] = started.elapsed().as_secs_f64();
+						}
+					}
+					(fma, triad, flops)
+				})
+			})
+			.collect();
+		handles.into_iter().map(|handle| handle.join().unwrap_or_default()).collect()
+	});
+	let slowest = |pick: fn(&([f64; PASSES], [f64; PASSES], f64)) -> &[f64; PASSES]| (0..PASSES).map(|pass| times.iter().map(|entry| pick(entry)[pass]).fold(0.0, f64::max)).fold(f64::MAX, f64::min).max(f64::EPSILON);
+	let flops = times.first().map_or(0.0, |entry| entry.2);
+	let fma_seconds = slowest(|entry| &entry.0);
+	let triad_seconds = slowest(|entry| &entry.1);
+	(flops / fma_seconds / 1e9, 12.0 * (length * workers) as f64 / triad_seconds / 1e9)
+}
+/// Per-node work and running totals for one tape. Peak rates come from the
+/// configured CPU rates; other devices have none, so their predictions stay unset.
+struct TapeTiming {
+	work: Vec<NodeWork>,
+	totals: Vec<NodeTiming>,
+	/// Nodes whose clock the kernel writes. Recurrent body nodes run inside their scan.
+	measured: Vec<usize>,
+	peak: Option<(f64, f64)>,
+}
+impl TapeTiming {
+	fn new(graph: &Graph, gpu: &Gpu) -> Result<Self> {
+		let positions = graph_positions(graph);
+		// The peak is per worker times the workers execution uses, so the prediction and the run share one thread count.
+		let peak = if gpu.backend == Backend::Cpu { Some(cpu_peak_rates(cpu_worker_threads()?)?) } else { None };
+		let work = graph.nodes.iter().enumerate().map(|(index, node)| {
+			let width = node.precision.bytes() as f64;
+			let weight_bytes = packed_weight(graph, index, true).map_or(node.parameters as f64 * width, |weight| weight.bytes.len() as f64);
+			NodeWork { op: node.op, input: node.input.channels, output: node.output.channels, width, weight_bytes, positions }
+		}).collect();
+		let totals = graph.nodes.iter().enumerate().map(|(index, node)| NodeTiming {
+			device: gpu.name.clone(), node: index, block: node.block_index, kind: node.block_kind, op: node.op.name(), operations: 0.0, bytes: 0.0, predicted_seconds: peak.map(|_| 0.0), measured_seconds: 0.0, forwards: 0,
+		}).collect();
+		let measured = graph.nodes.iter().enumerate().filter(|(_, node)| node.block_kind != "recur_body").map(|(index, _)| index).collect();
+		Ok(Self { work, totals, measured, peak })
+	}
+}
+/// Adds one forward window to every node's totals. A node's clock is stamped after
+/// its node-ending grid barrier, so a node runs from the previous node's clock (the
+/// forward's entry clock for the first) to its own.
+/// Node clocks count nanoseconds of the CPU kernels' `recipe.clock`.
+fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], start: i64) -> Result<()> {
+	let mut timing = timing.lock().map_err(|_| RecipeError::new("node timing is poisoned"))?;
+	let measured = timing.measured.clone();
+	let peak = timing.peak;
+	let per_tick = 1e-9;
+	let mut prior = start;
+	for &index in &measured {
+		let elapsed = (node_ticks[index] - prior).max(0) as f64 * per_tick;
+		prior = node_ticks[index];
+		let cost = node_cost(&timing.work[index], span);
+		let total = &mut timing.totals[index];
+		total.operations += cost.operations;
+		total.bytes += cost.bytes;
+		total.measured_seconds += elapsed;
+		total.forwards += 1;
+		if let (Some(predicted), Some((flops, bandwidth))) = (total.predicted_seconds.as_mut(), peak) {
+			*predicted += (cost.operations / flops).max(cost.bytes / bandwidth);
+		}
+	}
+	Ok(())
 }
 /// The measured behavior of one device: the two transfer directions between it and the coordinating
 /// machine, the gradient work it retires each second, and the fixed cost of one dispatch on it.
