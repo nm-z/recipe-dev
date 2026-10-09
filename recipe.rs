@@ -10670,6 +10670,8 @@ mod tokenizer {
 		family: Family,
 		template: Option<String>,
 		add_bos: bool,
+		/// Whether `encode` prepends a space to the text at the start and after each added token, as llama.cpp does for a `llama` vocabulary.
+		add_prefix: bool,
 		add_eos: bool,
 		bos: Option<u32>,
 		eos: Option<u32>,
@@ -10680,6 +10682,8 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
+			// `llama` vocabularies prefix by default; a file turns it off with `tokenizer.ggml.add_space_prefix`, and `gemma4` never prefixes.
+			let add_prefix = kind == "llama" && !matches!(model.value("tokenizer.ggml.add_space_prefix"), Some(GgufValue::Bool(false)));
 			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
@@ -10738,6 +10742,7 @@ mod tokenizer {
 				family,
 				template: model.value("tokenizer.chat_template").and_then(GgufValue::text).map(str::to_owned),
 				add_bos: adds_bos_token(model),
+				add_prefix,
 				add_eos: flag("tokenizer.ggml.add_eos_token"),
 				bos: special_id("tokenizer.ggml.bos_token_id"),
 				eos: special_id("tokenizer.ggml.eos_token_id"),
@@ -10800,7 +10805,7 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
-			let normalized = (self.family == Family::SentencePiece).then(|| text.replace(' ', "▁"));
+			let normalized = (self.family == Family::SentencePiece).then(|| if self.add_prefix && !text.is_empty() { format!("▁{}", text.replace(' ', "▁")) } else { text.replace(' ', "▁") });
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
 				let mut symbols = if self.family == Family::SentencePiece {
@@ -10841,12 +10846,18 @@ mod tokenizer {
 		/// keep their own text.
 		pub fn decode(&self, ids: &[u32]) -> String {
 			let mut bytes = Vec::new();
+			// The prefix `encode` adds is not part of the text: the first piece after the start or an added token loses it.
+			let mut after_special = true;
 			for id in ids {
 				if self.is_added[*id as usize] {
 					bytes.extend(self.tokens[*id as usize].as_bytes());
+					after_special = true;
 					continue;
 				}
-				for symbol in self.tokens[*id as usize].chars() {
+				let token = self.tokens[*id as usize].as_str();
+				let token = if after_special && self.add_prefix { token.strip_prefix('▁').unwrap_or(token) } else { token };
+				after_special = false;
+				for symbol in token.chars() {
 					match self.byte_of.get(&symbol) {
 						Some(byte) => bytes.push(*byte),
 						None => bytes.extend(symbol.to_string().as_bytes()),
