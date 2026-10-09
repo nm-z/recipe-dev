@@ -2106,14 +2106,15 @@ fn main() -> BuildResult<()> {
 /// runtime socket, timing, and frame limits for the shared job scheduler.
 fn runtime_configuration(manifest: &str) -> BuildResult<()> {
 	let socket = text(manifest, "runtime-socket")?;
-	let path = std::path::Path::new(socket);
-	if !path.is_absolute() {
+	// Unix socket paths must be absolute. On Windows, the runtime is
+	// unavailable, so the path is recorded but not enforced.
+	let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+	if os != "windows" && !std::path::Path::new(socket).is_absolute() {
 		return Err(io::Error::other("runtime-socket must be an absolute path").into());
 	}
 	println!("cargo:rustc-env=RECIPE_RUNTIME_SOCKET={socket}");
 	let lock = text(manifest, "runtime-lock")?;
-	let lock_path = std::path::Path::new(lock);
-	if !lock_path.is_absolute() {
+	if os != "windows" && !std::path::Path::new(lock).is_absolute() {
 		return Err(io::Error::other("runtime-lock must be an absolute path").into());
 	}
 	println!("cargo:rustc-env=RECIPE_RUNTIME_LOCK={lock}");
