@@ -5587,7 +5587,8 @@ impl NativeModelIr {
 			writeln!(ir, "br label %recur{index}.time.loop")?;
 		}
 		writeln!(ir, "recur{index}.time.loop:")?;
-		writeln!(ir, "%recur{index}.time = phi i32 [ %length.minus.one, %recur{index}.gradient.clear.loop ], [ %recur{index}.time.next, %recur{index}.time.done ]")?;
+		let initial = if layout.temporary_gradient_len == 0 { "owner.entry".to_owned() } else { format!("recur{index}.gradient.clear.loop") };
+		writeln!(ir, "%recur{index}.time = phi i32 [ %length.minus.one, %{initial} ], [ %recur{index}.time.next, %recur{index}.time.done ]")?;
 		writeln!(ir, "%recur{index}.time.more = icmp sge i32 %recur{index}.time, 0")?;
 		writeln!(ir, "br i1 %recur{index}.time.more, label %recur{index}.time.body, label %recur{index}.owner.done")?;
 		writeln!(ir, "recur{index}.time.body:")?;
@@ -7793,14 +7794,16 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> Result<String> {
 	let mut hash = 14695981039346656037_u64;
 	let version = match target {
 		BackendTarget::Cpu { .. } => b"recipe-native-cpu-v6".as_slice(),
-		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => b"recipe-native-v3".as_slice(),
+		BackendTarget::Amd { .. } => b"recipe-native-v3".as_slice(),
+		BackendTarget::Nvidia { .. } => b"recipe-native-nvidia-v4".as_slice(),
 	};
 	let requirement = match target {
 		BackendTarget::Cpu { target } => {
 			let (target, _, cpu, features) = cpu_identity(target)?;
 			format!("target={target};cpu={cpu};features={features}")
 		}
-		BackendTarget::Amd { .. } | BackendTarget::Nvidia { .. } => native_target_label(target).to_owned(),
+		BackendTarget::Amd { .. } => native_target_label(target).to_owned(),
+		BackendTarget::Nvidia { architecture } => format!("{architecture};ptx={}", native_nvidia_ptx_version(architecture)?),
 	};
 	let producer = match target {
 		BackendTarget::Cpu { .. } => native_cpu_compiler_identity()?,
@@ -7991,8 +7994,102 @@ fn native_nvidia_device_library() -> Result<&'static str> {
 	option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))
 }
 
-fn native_nvidia_ptx_version() -> Result<&'static str> {
-	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
+fn native_nvidia_ptx_floor(architecture: &str) -> Result<u32> {
+	// LLVM's NVPTX SM floors include architecture-specific and family-specific targets.
+	Ok(match architecture {
+		"sm_20" | "sm_21" | "sm_30" | "sm_35" => 32,
+		"sm_32" | "sm_50" => 40,
+		"sm_37" | "sm_52" => 41,
+		"sm_53" => 42,
+		"sm_60" | "sm_61" | "sm_62" => 50,
+		"sm_70" => 60,
+		"sm_72" => 61,
+		"sm_75" => 63,
+		"sm_80" => 70,
+		"sm_86" => 71,
+		"sm_87" => 74,
+		"sm_89" | "sm_90" => 78,
+		"sm_90a" => 80,
+		"sm_100" | "sm_100a" | "sm_101" | "sm_101a" => 86,
+		"sm_120" | "sm_120a" => 87,
+		"sm_100f" | "sm_101f" | "sm_103" | "sm_103f" | "sm_103a" | "sm_120f" | "sm_121" | "sm_121f" | "sm_121a" => 88,
+		"sm_88" | "sm_110" | "sm_110f" | "sm_110a" => 90,
+		_ => return Err(RecipeError::new(format!("NVIDIA target {architecture:?} has no known PTX minimum"))),
+	})
+}
+
+fn native_nvidia_ptx_version(architecture: &str) -> Result<u32> {
+	let configured = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
+	let baseline = configured
+		.strip_prefix("+ptx")
+		.and_then(|value| value.parse::<u32>().ok())
+		.filter(|version| matches!(version, 32 | 40..=43 | 50 | 60..=65 | 70..=78 | 80..=88 | 90..=94))
+		.ok_or_else(|| RecipeError::new(format!("NVIDIA PTX configuration {configured:?} is not a supported PTX version")))?;
+	// Compilation can run on a different machine from the opening GPU worker.
+	Ok(baseline.max(native_nvidia_ptx_floor(architecture)?))
+}
+
+fn validate_nvidia_ptx_feature(feature: &str, diagnostic: &str) -> Result<()> {
+	require(!diagnostic.lines().any(|line| line.contains(feature) && line.contains("ignoring feature")), format!("NVIDIA LLVM compiler does not support PTX feature {feature}"))
+}
+
+#[cfg(nvidia)]
+fn validate_nvidia_ptx_driver(architecture: &str, driver: u32) -> Result<()> {
+	// NVIDIA's PTX release history maps CUDA 12.5 and 12.6 to the same PTX 8.5 ceiling.
+	let releases = [
+		(13040, 94),
+		(13030, 93),
+		(13020, 92),
+		(13010, 91),
+		(13000, 90),
+		(12090, 88),
+		(12080, 87),
+		(12070, 86),
+		(12050, 85),
+		(12040, 84),
+		(12030, 83),
+		(12020, 82),
+		(12010, 81),
+		(12000, 80),
+		(11080, 78),
+		(11070, 77),
+		(11060, 76),
+		(11050, 75),
+		(11040, 74),
+		(11030, 73),
+		(11020, 72),
+		(11010, 71),
+		(11000, 70),
+		(10020, 65),
+		(10010, 64),
+		(10000, 63),
+		(9020, 62),
+		(9010, 61),
+		(9000, 60),
+		(8000, 50),
+		(7050, 43),
+		(7000, 42),
+		(6050, 41),
+		(6000, 40),
+		(5050, 32),
+	];
+	let ceiling = releases
+		.into_iter()
+		.find_map(|(release, ptx)| (driver >= release).then_some(ptx))
+		.ok_or_else(|| RecipeError::new(format!("NVIDIA driver CUDA {}.{} has no supported PTX version", driver / 1000, driver % 1000 / 10)))?;
+	let selected = native_nvidia_ptx_version(architecture)?;
+	require(
+		selected <= ceiling,
+		format!(
+			"NVIDIA target {architecture} requires PTX {}.{} with the configured baseline; driver CUDA {}.{} supports PTX at most {}.{}",
+			selected / 10,
+			selected % 10,
+			driver / 1000,
+			driver % 1000 / 10,
+			ceiling / 10,
+			ceiling % 10,
+		),
+	)
 }
 
 fn cpu_unsupported_feature(features: &str, diagnostic: &str) -> Option<String> {
@@ -8066,25 +8163,26 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let compiler = native_nvidia_compiler()?;
 			let codegen = native_nvidia_codegen().ok().filter(|path| Path::new(path).is_file());
 			let device = native_nvidia_device_library()?;
-			let ptx_version = native_nvidia_ptx_version()?;
+			let ptx_feature = format!("+ptx{}", native_nvidia_ptx_version(architecture)?);
 			let bitcode = output.with_extension("bc");
 			let mut command = Command::new(compiler);
 			command
 				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.arg("-Xclang").arg("-target-feature").arg("-Xclang").arg(ptx_version);
+				.arg(format!("--cuda-feature={ptx_feature}"));
 			if codegen.is_some() {
 				command.args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(&bitcode);
 			} else {
 				command.args(["-O2", "-S", "-x", "ir"]).arg(source).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(output);
 			}
-			native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			let diagnostic = native_command(command, "NVIDIA LLVM IR compiler", key)?;
+			validate_nvidia_ptx_feature(&ptx_feature, &diagnostic)?;
 			if let Some(codegen) = codegen {
 				let mut command = Command::new(codegen);
-				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_version}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
+				command.args(["-mtriple=nvptx64-nvidia-cuda"]).arg(format!("-mcpu={architecture}")).arg(format!("-mattr={ptx_feature}")).args(["-O2", "-o"]).arg(output).arg(&bitcode);
 				let generated = native_command(command, "NVIDIA PTX code generator", key);
 				fs::remove_file(&bitcode).map_err(|error| RecipeError::new(format!("cannot remove native NVIDIA bitcode: {error}")))?;
-				generated?;
+				validate_nvidia_ptx_feature(&ptx_feature, &generated?)?;
 			}
 			if let Some(assembler) = native_nvidia_assembler(architecture) {
 				let ptx = output.with_extension("ptx");
@@ -10637,22 +10735,7 @@ mod bundle {
 			exclusions: 0,
 		})
 	}
-	fn residual(value: &str) -> Result<Block> {
-		let text = unescape(value)?;
-		// A fragment step used to be one of three fixed shapes carrying no
-		// fields of its own, written without a block's six. Those records still
-		// read: only the newer form holds the block separator.
-		if !text.contains('|') {
-			let mut fields = text.split(',');
-			return match fields.next().unwrap_or("") {
-				"layer" => Ok(Block::of(Operation::Layer(value_at(fields.next(), "residual layer width")?))),
-				"conv" => Ok(Block::of(Operation::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?))),
-				"activation" => Ok(Block { activation: activation(fields.next().ok_or_else(|| RecipeError::new("residual activation is absent"))?)?, ..Block::of(Operation::Identity) }),
-				_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
-			};
-		}
-		block(&text)
-	}
+	fn residual(value: &str) -> Result<Block> { block(&unescape(value)?) }
 	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
 	where
 		T::Err: fmt::Display,
@@ -10770,7 +10853,6 @@ mod bundle {
 				};
 				format!("ple,{},{},{},{},{},{},{math}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text())
 			},
-			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
@@ -10960,7 +11042,6 @@ mod bundle {
 				require(fields.next().is_none(), "per-layer embedding record has extra fields")?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash, math }))
 			}
-			"norm" => Ok(Operation::Norm),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -10979,45 +11060,38 @@ mod bundle {
 		})
 	}
 	fn block_text(block: &Block) -> String {
-		format!(
-			"{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}||-|{}|{}|{}|{}",
-			operation_text(&block.operation),
-			activation_text(block.activation),
-			normalization_text(block.normalization),
-			block.quantization,
-			u8::from(block.profile),
-			normalization_text(block.qk),
-			u8::from(block.frozen),
-			0,
-			precision_token(block.precision),
-			precision_token(block.kv_precision),
-			precision_token(block.blck_precision),
-			precision_token(block.qk_precision),
-			precision_token(block.rope_precision),
-			precision_token(block.activation_precision),
-			precision_token(block.norm_precision)
-		)
+		let maps = block.maps.iter().map(|step| {
+			let value = match step.map {
+				ActivationMap::Scalar(value) => format!("a:{}", activation_text(value)),
+				ActivationMap::Normalize(value) => format!("n:{}", normalization_text(Some(value))),
+			};
+			format!("{value}:{}", precision_token(step.precision))
+		}).collect::<Vec<_>>().join("/");
+		format!("{}|maps:{maps}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+			operation_text(&block.operation), block.quantization, u8::from(block.profile), normalization_text(block.qk), u8::from(block.frozen),
+			precision_token(block.precision), precision_token(block.kv_precision), precision_token(block.blck_precision), precision_token(block.qk_precision), precision_token(block.rope_precision))
 	}
 	fn block(value: &str) -> Result<Block> {
 		let fields = split_escaped(value, '|');
-		require(matches!(fields.len(), 6 | 8 | 9 | 10 | 11 | 12 | 13 | 15 | 17), "semantic model block has the wrong width")?;
-		require(fields.get(11).is_none_or(|field| field.is_empty()), "saved block accumulator overrides are no longer supported; configure acc in the precision table")?;
+		require(fields.len() == 11, "semantic model block has the wrong width")?;
+		let encoded = fields[1].strip_prefix("maps:").ok_or_else(|| RecipeError::new("semantic model block has no ordered map list"))?;
+		let mut maps = Vec::new();
+		for token in encoded.split('/').filter(|_| !encoded.is_empty()) {
+			let parts = token.split(':').collect::<Vec<_>>();
+			require(parts.len() == 3, "semantic map has the wrong width")?;
+			let map = match parts[0] {
+				"a" => ActivationMap::Scalar(activation(parts[1])?),
+				"n" => ActivationMap::Normalize(normalization(Some(parts[1]), "map normalization")?.ok_or_else(|| RecipeError::new("normalization map has no mode"))?),
+				_ => return Err(RecipeError::new("semantic map has an invalid kind")),
+			};
+			maps.push(ActivationStep { map, precision: precision_from_token(parts[2])? });
+		}
 		Ok(Block {
-			operation: operation(&fields[0])?,
-			activation: activation(&fields[1])?,
-			normalization: normalization(Some(&fields[2]), "block normalization")?,
-			qk: normalization(Some(&fields[5]), "block query and key normalization")?,
-			quantization: value_at(Some(&fields[3]), "block quantization")?,
-			profile: bool_value(&fields[4], "block quantization profile")?,
-			frozen: fields.get(6).map_or(Ok(false), |field| bool_value(field, "block frozen qualifier"))?,
-			precision: fields.get(8).map_or(Ok(None), |field| precision_from_token(field))?,
-			kv_precision: fields.get(9).map_or(Ok(None), |field| precision_from_token(field))?,
-			blck_precision: fields.get(10).map_or(Ok(None), |field| precision_from_token(field))?,
-			qk_precision: fields.get(13).map_or(Ok(None), |field| precision_from_token(field))?,
-			rope_precision: fields.get(14).map_or(Ok(None), |field| precision_from_token(field))?,
-			activation_precision: fields.get(15).map_or(Ok(None), |field| precision_from_token(field))?,
-			norm_precision: fields.get(16).map_or(Ok(None), |field| precision_from_token(field))?,
-			suffix: Suffix::End,
+			operation: operation(&fields[0])?, maps,
+			quantization: value_at(Some(&fields[2]), "block quantization")?, profile: bool_value(&fields[3], "block quantization profile")?,
+			qk: normalization(Some(&fields[4]), "block query and key normalization")?, frozen: bool_value(&fields[5], "block frozen qualifier")?,
+			precision: precision_from_token(&fields[6])?, kv_precision: precision_from_token(&fields[7])?, blck_precision: precision_from_token(&fields[8])?,
+			qk_precision: precision_from_token(&fields[9])?, rope_precision: precision_from_token(&fields[10])?, suffix: Suffix::End,
 		})
 	}
 	/// A block's arithmetic as one token, `family.bits.exp.man.storage`, empty when the block names none.
@@ -11569,18 +11643,11 @@ mod bundle {
 	mod tests {
 		use super::*;
 		#[test]
-		fn operation_precisions_round_trip_without_repurposing_legacy_step() {
+		fn operation_precisions_round_trip() {
 			let original = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32).gelu().fp(16).norm(rms).fp(32);
 			let text = block_text(&original);
-			assert_eq!(split_escaped(&text, '|').len(), 17);
+			assert_eq!(split_escaped(&text, '|').len(), 11);
 			assert_eq!(block(&text).unwrap(), original);
-			let legacy = "layer,1|0|0|0|0|0|0|0|||int.16.0.0.0||-";
-			let legacy = block(legacy).unwrap();
-			assert_eq!(legacy.blck_precision, Some(Compute::INT16));
-			assert_eq!(legacy.qk_precision, None);
-			assert_eq!(legacy.rope_precision, None);
-			assert_eq!(legacy.activation_precision, None);
-			assert_eq!(legacy.norm_precision, None);
 		}
 	}
 }
@@ -11986,7 +12053,7 @@ pub const fn conv(filters: usize, kernel: usize) -> Block {
 }
 /// A normalization on its own, computing nothing before it.
 pub fn norm(normalization: impl NormalizationSelector) -> Block {
-	Block { normalization: Some(normalization.normalization()), suffix: Suffix::Norm, ..Block::of(Operation::Identity) }
+	Block::of(Operation::Identity).norm(normalization)
 }
 pub fn pool(size: usize) -> Block {
 	Block::of(Operation::Pool(size))
@@ -12222,9 +12289,6 @@ enum Operation {
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
-	/// A normalization that leads a model: the block's own normalization is the
-	/// only thing it does, so the model input is normalized before its first block.
-	Norm,
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
 	/// Computes nothing. It carries a step that is only an activation or only
@@ -12339,10 +12403,10 @@ impl<F: Fn(usize) -> Block> NormalizationSelector for F {
 		}
 	}
 }
-macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Block {
-	Block { operation: Operation::Identity, activation: Activation::$value, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Activation } })+}; }
+macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub fn $name() -> Block {
+	Block::of(Operation::Identity).with_activation(Activation::$value) })+}; }
 pub mod atv {
-	use super::{Activation, Block, Operation, Suffix};
+	use super::{Activation, Block, Operation};
 	slots! {
 	fn linear = Linear, fn cos = Cos, fn exp = Exp, fn log = Log, fn ln = Ln, fn sqrt = Sqrt, fn huber = Huber,
 	fn tan = Tan, fn relu = Relu, fn leak = Leak, fn sigmoid = Sigmoid, fn tanh = Tanh,
@@ -12387,18 +12451,37 @@ macro_rules! precision_methods {
 		}
 	};
 }
+/// Output maps retain their written order and their own precision suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationMap {
+	Scalar(Activation),
+	Normalize(BlockNormalization),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivationStep {
+	map: ActivationMap,
+	precision: Option<Compute>,
+}
+impl ActivationStep {
+	fn new(map: ActivationMap) -> Self { Self { map, precision: None } }
+	fn normalization(self) -> Option<BlockNormalization> {
+		match self.map { ActivationMap::Normalize(mode) => Some(mode), ActivationMap::Scalar(_) => None }
+	}
+	fn name(self) -> &'static str {
+		match self.map { ActivationMap::Scalar(activation) => activation.name(), ActivationMap::Normalize(mode) => mode.name() }
+	}
+}
 #[derive(Clone, Debug)]
 pub struct Block {
 	operation: Operation,
-	activation: Activation,
-	normalization: Option<BlockNormalization>,
+	maps: Vec<ActivationStep>,
 	/// The per-head normalization of the attention queries and keys.
 	qk: Option<BlockNormalization>,
 	quantization: u16,
 	profile: bool,
 	frozen: bool,
-	/// The precision of an activation, output normalization, composition, or
-	/// residual add named by a suffix immediately after that operation.
+	/// The precision of the primary operation or residual add. Output maps
+	/// carry their own precision suffix in the ordered list.
 	precision: Option<Compute>,
 	/// The precision of the op that holds the block's numbers (a layer's sum,
 	/// attention, an embedding's lookup), named by a precision right after it.
@@ -12410,8 +12493,7 @@ pub struct Block {
 	qk_precision: Option<Compute>,
 	/// The arithmetic of rotary embedding named after `.rope(...)` or `.yarn(...)`.
 	rope_precision: Option<Compute>,
-	activation_precision: Option<Compute>,
-	norm_precision: Option<Compute>,
+
 	/// The accumulator the block's sums and reductions carry, when named.
 	/// What the next precision suffix names.
 	suffix: Suffix,
@@ -12427,8 +12509,7 @@ enum Suffix {
 	Kv,
 	Qk,
 	Rope,
-	Activation,
-	Norm,
+	Map,
 	End,
 }
 impl Suffix {
@@ -12448,8 +12529,7 @@ impl Suffix {
 impl PartialEq for Block {
 	fn eq(&self, other: &Self) -> bool {
 		self.operation == other.operation
-			&& self.activation == other.activation
-			&& self.normalization == other.normalization
+			&& self.maps == other.maps
 			&& self.qk == other.qk
 			&& self.quantization == other.quantization
 			&& self.profile == other.profile
@@ -12459,8 +12539,6 @@ impl PartialEq for Block {
 			&& self.kv_precision == other.kv_precision
 			&& self.qk_precision == other.qk_precision
 			&& self.rope_precision == other.rope_precision
-			&& self.activation_precision == other.activation_precision
-			&& self.norm_precision == other.norm_precision
 	}
 }
 impl Eq for Block {}
@@ -12484,18 +12562,22 @@ macro_rules! block_activations { ($(fn $method:ident = $activation:ident;)+) => 
 	self.with_activation(Activation::$activation)
 })+}; }
 impl Block {
+	fn has_normalization(&self) -> bool { self.maps.iter().any(|step| step.normalization().is_some()) }
+	fn has_scalar_map(&self) -> bool { self.maps.iter().any(|step| matches!(step.map, ActivationMap::Scalar(value) if value != Activation::Linear)) }
 	const fn of(operation: Operation) -> Self {
-		Self { operation, activation: Activation::Linear, normalization: None, qk: None, quantization: 0, profile: false, frozen: false, precision: None, blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, activation_precision: None, norm_precision: None, suffix: Suffix::Fresh }
+		Self {
+			operation, maps: Vec::new(), qk: None, quantization: 0, profile: false, frozen: false, precision: None,
+			blck_precision: None, kv_precision: None, qk_precision: None, rope_precision: None, suffix: Suffix::Fresh,
+		}
 	}
 	fn with_activation(mut self, activation: Activation) -> Self {
-		self.suffix = Suffix::Activation;
-		assert!(self.normalization.is_none(), "activation must precede normalization");
-		self.activation = activation;
+		self.suffix = Suffix::Map;
+		self.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
 		self
 	}
 	pub fn norm(mut self, normalization: impl NormalizationSelector) -> Self {
-		self.suffix = Suffix::Norm;
-		self.normalization = Some(normalization.normalization());
+		self.suffix = Suffix::Map;
+		self.maps.push(ActivationStep::new(ActivationMap::Normalize(normalization.normalization())));
 		self
 	}
 	pub fn qk(mut self, normalization: impl NormalizationSelector) -> Self {
@@ -12585,8 +12667,7 @@ impl Block {
 			Suffix::Kv => block.kv_precision = Some(format),
 			Suffix::Qk => block.qk_precision = Some(format),
 			Suffix::Rope => block.rope_precision = Some(format),
-			Suffix::Activation => block.activation_precision = Some(format),
-			Suffix::Norm => block.norm_precision = Some(format),
+			Suffix::Map => block.maps.last_mut().expect("precision requires a preceding map").precision = Some(format),
 			Suffix::End => block.precision = Some(format),
 		}
 		block
@@ -12719,8 +12800,7 @@ impl Model {
 			let suffix = Suffix::for_operation(&operation);
 			model.blocks.push(Block {
 				operation,
-				activation: Activation::Linear,
-				normalization: None,
+				maps: Vec::new(),
 				qk: None,
 				quantization: 0,
 				profile: false,
@@ -12730,8 +12810,6 @@ impl Model {
 				kv_precision: None,
 				qk_precision: None,
 				rope_precision: None,
-				activation_precision: None,
-				norm_precision: None,
 				suffix,
 			});
 			model.pending_frozen = false;
@@ -12749,15 +12827,12 @@ impl Model {
 		self.edit(|model| model.exclusions |= mask)
 	}
 	fn with_activation(&self, activation: Activation) -> Self {
-		if self.blocks.last().is_some_and(|block| block.activation != Activation::Linear || block.normalization.is_some()) {
-			return self.push(Operation::Identity).with_activation(activation);
-		}
 		let model = self.suffix();
 		assert!(!model.blocks.is_empty(), "activation requires a preceding block");
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap();
-			block.activation = activation;
-			block.suffix = Suffix::Activation;
+			block.maps.push(ActivationStep::new(ActivationMap::Scalar(activation)));
+			block.suffix = Suffix::Map;
 		})
 	}
 	/// A projection onto `width` outputs: a count, or the vocabulary itself as
@@ -12937,12 +13012,12 @@ impl Model {
 	/// the model input before the first block, which is the pre-normalization
 	/// of a residual branch when the model is one.
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
-		let model = if self.blocks.is_empty() { self.push(Operation::Norm) } else { self.suffix() };
+		let model = if self.blocks.is_empty() { self.push(Operation::Identity) } else { self.suffix() };
 		let normalization = normalization.normalization();
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
-			block.normalization = Some(normalization);
-			block.suffix = Suffix::Norm;
+			block.maps.push(ActivationStep::new(ActivationMap::Normalize(normalization)));
+			block.suffix = Suffix::Map;
 		})
 	}
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
@@ -13002,12 +13077,12 @@ impl Model {
 			let previous = (0..projection).rev().find(|index| !matches!(model.blocks[*index].operation, Operation::Last));
 			if let Some(index) = previous {
 				let block = &mut model.blocks[index];
-				if block.normalization.is_some() && !matches!(block.operation, Operation::Hyper(..)) { return; }
+				if block.has_normalization() && !matches!(block.operation, Operation::Hyper(..)) { return; }
 				// The final scale reads the collapsed stream, not its widened lanes.
-				let normalization = block.normalization.take().unwrap_or(BlockNormalization::Rms);
+				let step = if block.maps.last().is_some_and(|step| step.normalization().is_some()) { block.maps.pop().unwrap() }
+					else { ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms)) };
 				let mut scale = Block::of(Operation::Identity);
-				scale.normalization = Some(normalization);
-				scale.norm_precision = block.norm_precision;
+				scale.maps.push(step);
 				model.blocks.insert(projection, scale);
 			}
 		})
@@ -13056,20 +13131,12 @@ impl Model {
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
-			Operation::Norm | Operation::Identity => String::new(),
+			Operation::Identity => String::new(),
 			Operation::Last => "last()".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
 		};
 		if block.frozen {
 			text.insert_str(0, "frozen.");
-		}
-		if block.activation != Activation::Linear {
-			let activation = match block.activation {
-				Activation::Scale(bits) => format!("scale({})", f64::from_bits(bits)),
-				activation => format!("{}()", activation.name()),
-			};
-			if !text.is_empty() { text.push('.'); }
-			text.push_str(&activation);
 		}
 		let normalization = |value| match value {
 			BlockNormalization::Batch => "batch",
@@ -13081,12 +13148,14 @@ impl Model {
 			if !text.is_empty() { text.push('.'); }
 			text.push_str(&format!("qk({})", normalization(value)));
 		}
-		if let Some(value) = block.normalization {
-			if text.is_empty() {
-				text = format!("norm({})", normalization(value));
-			} else {
-				text.push_str(&format!(".norm({})", normalization(value)));
-			}
+		for step in &block.maps {
+			let map = match step.map {
+				ActivationMap::Scalar(Activation::Scale(bits)) => format!("scale({})", f64::from_bits(bits)),
+				ActivationMap::Scalar(activation) => format!("{}()", activation.name()),
+				ActivationMap::Normalize(mode) => format!("norm({})", normalization(mode)),
+			};
+			if !text.is_empty() { text.push('.'); }
+			text.push_str(&map);
 		}
 		if block.quantization != 0 {
 			text.push_str(&format!(".{}", quantization(block.quantization)));
@@ -14538,7 +14607,6 @@ impl Operation {
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
-			Self::Norm => "norm",
 			Self::Glu(..) => "glu",
 		}
 	}
@@ -16669,14 +16737,14 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 	}
 	let post = if part == "attn" { "post_attention_norm.weight" } else { "post_ffw_norm.weight" };
 	if file.tensor(&name(post)).is_some() {
-		if let Some(block) = parts.last_mut().filter(|block| block.normalization.is_none()) { block.normalization = Some(BlockNormalization::Rms); }
+		if let Some(block) = parts.last_mut().filter(|block| !block.has_normalization()) { block.maps.push(ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms))); }
 	}
 	if plain {
 		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
-		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity | Operation::Norm) && block.normalization.is_some());
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.has_normalization());
 		if !normalized && file.tensor(&name(pre)).is_some() {
 			let mut scale = Block::of(Operation::Identity);
-			scale.normalization = Some(BlockNormalization::Rms);
+			scale.maps.push(ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms)));
 			parts.insert(0, scale);
 		}
 	}
@@ -16729,7 +16797,7 @@ impl Builder<'_> {
 				}
 				Operation::Layer(outputs) => {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
-					require(block.normalization.is_none(), "a normalization after the vocabulary projection has no tensor name")?;
+					require(!block.has_normalization(), "a normalization after the vocabulary projection has no tensor name")?;
 					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
 					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
 					self.mapped(vec![output]);
@@ -16737,7 +16805,7 @@ impl Builder<'_> {
 				Operation::Identity | Operation::Last => {}
 				other => return Err(RecipeError::new(format!("{} has no tensor naming convention", other.name()))),
 			}
-			if block.normalization.is_some() {
+			for _ in block.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
 				let name = if self.file.tensor("output_norm.weight").is_some() { "output_norm.weight" } else { "token_embd_norm.weight" };
 				self.norm_scale(name, width)?;
 			}
@@ -16773,7 +16841,7 @@ impl Builder<'_> {
 		let (mut weighted, mut hidden) = (false, 0);
 		for step in parts {
 			match &step.operation {
-				Operation::Identity | Operation::Norm => {}
+				Operation::Identity => {}
 				Operation::Attention(attention) => {
 					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
 					weighted = true;
@@ -16788,7 +16856,7 @@ impl Builder<'_> {
 				}
 				Operation::Product(left, right) => {
 					// The activated branch is the gate: `down(act(gate(x)) * up(x))`.
-					let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.activation != Activation::Linear);
+					let activated = |branch: &ProductBranch| branch.blocks.iter().any(|block| block.has_scalar_map());
 					let suffixes = if activated(right) && !activated(left) { ["ffn_up.weight", "ffn_gate.weight"] } else { ["ffn_gate.weight", "ffn_up.weight"] };
 					for (branch, suffix) in [(left, suffixes[0]), (right, suffixes[1])] {
 						let widths = branch.blocks.iter().filter_map(|block| match block.operation { Operation::Layer(width) => Some(width), _ => None }).collect::<Vec<_>>();
@@ -16813,7 +16881,7 @@ impl Builder<'_> {
 				}
 				other => return Err(RecipeError::new(format!("{} inside a residual has no tensor naming convention", other.name()))),
 			}
-			if step.normalization.is_some() {
+			for _ in step.maps.iter().filter(|step| step.normalization().is_some_and(|mode| mode != BlockNormalization::L2)) {
 				let suffix = match (part, weighted) {
 					("attn", false) => "attn_norm.weight",
 					("attn", true) => "post_attention_norm.weight",
@@ -17837,8 +17905,6 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		block_kv_precision: None,
 		block_qk_precision: None,
 		block_rope_precision: None,
-		block_activation_precision: None,
-		block_norm_precision: None,
 		profile: graph.profile,
 		bound: None,
 		bound_values: Vec::new(),
@@ -18427,8 +18493,6 @@ struct Graph {
 	block_kv_precision: Option<Compute>,
 	block_qk_precision: Option<Compute>,
 	block_rope_precision: Option<Compute>,
-	block_activation_precision: Option<Compute>,
-	block_norm_precision: Option<Compute>,
 	/// The run's table: the precision of every kind of op a block names none for.
 	profile: Precisions,
 	/// The weights still to bind while a graph compiles over mapped tensors:
@@ -18469,8 +18533,6 @@ impl Graph {
 			block_kv_precision: None,
 			block_qk_precision: None,
 			block_rope_precision: None,
-			block_activation_precision: None,
-			block_norm_precision: None,
 			profile: Precisions::default(),
 			bound: None,
 			bound_values: Vec::new(),
@@ -18573,8 +18635,6 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_kv_precision = None;
 	graph.block_qk_precision = None;
 	graph.block_rope_precision = None;
-	graph.block_activation_precision = None;
-	graph.block_norm_precision = None;
 	if tracing() {
 		for (index, node) in graph.nodes.iter().enumerate() {
 			trace(&format!("precision node {index} {} {} kv {}", node.identity(index), node.precision.label(), node.kv_precision.label()))?;
@@ -18743,15 +18803,13 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A block's qualifiers hold inside it and its parts; its precisions hold for
 	// its own ops only, and a part that names none takes the run's table, never
 	// the enclosing block's. A residual's precision is its add's alone.
-	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision);
+	let outer = (graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision);
 	graph.block_frozen |= block.frozen;
 	graph.block_precision = block.precision.filter(|_| !matches!(block.operation, Operation::Residual(_)));
 	graph.block_blck_precision = block.blck_precision;
 	graph.block_kv_precision = block.kv_precision;
 	graph.block_qk_precision = block.qk_precision;
 	graph.block_rope_precision = block.rope_precision;
-	graph.block_activation_precision = block.activation_precision;
-	graph.block_norm_precision = block.norm_precision;
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -18773,7 +18831,6 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks, gate) => lower_hyper(graph, *lanes, *rank, blocks, gate.as_ref(), total, data, targets, rows, gpu, config)?,
-		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
@@ -18783,17 +18840,19 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
-	if block.activation != Activation::Linear {
+	for step in &block.maps {
 		let precision = graph.block_precision;
-		graph.block_precision = graph.block_activation_precision.or(precision);
-		lower_activation(graph, block.activation, config)?;
-		graph.block_precision = precision;
-	}
-	if let Some(normalization) = block.normalization {
-		let precision = graph.block_precision;
-		graph.block_precision = graph.block_norm_precision.or(precision);
-		let channels = graph.output.channels;
-		lower_normalize(graph, normalization, channels, channels)?;
+		graph.block_precision = step.precision.or(precision);
+		match step.map {
+			ActivationMap::Scalar(Activation::Linear) => {},
+			ActivationMap::Scalar(activation) => {
+				lower_activation(graph, activation, config)?;
+			}
+			ActivationMap::Normalize(normalization) => {
+				let channels = graph.output.channels;
+				lower_normalize(graph, normalization, channels, channels)?;
+			}
+		}
 		graph.block_precision = precision;
 	}
 	// Only a legacy block record can name storage. New models take storage from
@@ -18861,7 +18920,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	}
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?;
-	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision, graph.block_activation_precision, graph.block_norm_precision) = outer;
+	(graph.block_frozen, graph.block_precision, graph.block_blck_precision, graph.block_kv_precision, graph.block_qk_precision, graph.block_rope_precision) = outer;
 	Ok(())
 }
 /// A weight bound from a file arrives in the file's format. When the block names
@@ -19905,14 +19964,17 @@ fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 }
 /// The activation code emitted for a declared recurrent cell. The native scan
 /// ABI keeps these four codes independent from the public activation enum.
-fn recur_activation(activation: Activation) -> Result<usize> {
-	match activation {
-		Activation::Linear => Ok(0),
-		Activation::Relu => Ok(1),
-		Activation::Tanh => Ok(2),
-		Activation::Sigmoid => Ok(3),
-		other => Err(RecipeError::new(format!("a recurrent body's activation must be linear, relu, tanh or sigmoid, not {}", other.name()))),
-	}
+fn recur_activation(maps: &mut Vec<ActivationStep>) -> usize {
+	let Some(step) = maps.first().filter(|step| step.precision.is_none()) else { return 0 };
+	let code = match step.map {
+		ActivationMap::Scalar(Activation::Linear) => 0,
+		ActivationMap::Scalar(Activation::Relu) => 1,
+		ActivationMap::Scalar(Activation::Tanh) => 2,
+		ActivationMap::Scalar(Activation::Sigmoid) => 3,
+		_ => return 0,
+	};
+	maps.remove(0);
+	code
 }
 /// A recurrence over the sequence. The first stage is the recurrent cell, which
 /// reads the position's input and the previous position's output; every further
@@ -19926,13 +19988,21 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		ref other => return Err(RecipeError::new(format!("a recurrent body must open with a layer, not {}", other.name()))),
 	};
 	require(width != 0, "recurrent width must be positive")?;
-	let mut cell_activation = recur_activation(first.activation)?;
-	let mut body_start = 1;
-	if let Some(block) = parts.get(1) && matches!(block.operation, Operation::Identity) {
-		require(cell_activation == 0, "a recurrent cell stage declares one activation")?;
-		cell_activation = recur_activation(block.activation)?;
-		body_start = 2;
+	let mut maps = first.maps.clone();
+	let mut cell_activation = recur_activation(&mut maps);
+	let mut body_parts = Vec::new();
+	if !maps.is_empty() {
+		let mut mapped = Block::of(Operation::Identity);
+		mapped.maps = maps;
+		mapped.frozen = first.frozen;
+		body_parts.push(mapped);
 	}
+	let mut following = parts[1..].to_vec();
+	if first.maps.is_empty() && let Some(block) = following.first_mut().filter(|block| matches!(block.operation, Operation::Identity)) {
+		cell_activation = recur_activation(&mut block.maps);
+		if block.maps.is_empty() { following.remove(0); }
+	}
+	body_parts.extend(following);
 	// The program record carries the cell width and activation. Body operations
 	// are lowered as ordinary graph nodes below the scan and run once per
 	// sequence position by the generated recurrent body emitter.
@@ -19947,13 +20017,13 @@ fn lower_recur(graph: &mut Graph, parts: &[Block], _total: usize, data: &Prepare
 		node.program_offset = program_offset;
 		node.program_count = 1;
 	}
-	if body_start < parts.len() {
+	if !body_parts.is_empty() {
 		let mut body = Graph::new(Shape { channels: width, length: 1 }, graph.epsilon);
 		body.bias = graph.bias;
 		// The body's blocks name their own precisions or take the run's table,
 		// as the outer blocks do.
 		body.profile = graph.profile;
-		for (index, block) in parts[body_start..].iter().enumerate() {
+		for (index, block) in body_parts.iter().enumerate() {
 			body.block_index = index;
 			body.block_kind = "recur_body";
 			lower_block(&mut body, block, parts.len(), data, targets, rows, gpu, config)?;
@@ -20123,26 +20193,29 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], g
 /// Lower one explicit gate step. Its own precision and activation travel with
 /// the block; the leading shared RMS is handled by `lower_gates`.
 fn lower_gate_step(graph: &mut Graph, block: &Block, config: Config) -> Result<()> {
-	let outer = (graph.block_kind, graph.block_precision, graph.block_blck_precision, graph.block_activation_precision, graph.block_norm_precision);
+	let outer = (graph.block_kind, graph.block_precision, graph.block_blck_precision);
 	graph.block_kind = block.operation.name();
 	graph.block_precision = block.precision;
 	graph.block_blck_precision = block.blck_precision;
-	graph.block_activation_precision = block.activation_precision;
-	graph.block_norm_precision = block.norm_precision;
 	match block.operation {
 		Operation::Layer(width) => lower_project(graph, width)?,
 		Operation::Identity => {},
 		_ => return Err(RecipeError::new(format!("{} is not a hyper gate step; use norm, layer, and scalar activations", block.operation.name()))),
 	}
-	match block.activation {
-		Activation::Linear => {},
-		Activation::Scale(factor) => lower_scale(graph, f64::from_bits(factor))?,
-		activation => lower_activation(graph, activation, config)?,
+	for step in &block.maps {
+		let precision = graph.block_precision;
+		graph.block_precision = step.precision.or(precision);
+		match step.map {
+			ActivationMap::Scalar(Activation::Linear) => {},
+			ActivationMap::Scalar(activation) => lower_activation(graph, activation, config)?,
+			ActivationMap::Normalize(normalization) => {
+				let channels = graph.output.channels;
+				lower_normalize(graph, normalization, channels, channels)?;
+			}
+		}
+		graph.block_precision = precision;
 	}
-	if let Some(normalization) = block.normalization {
-		lower_normalize(graph, normalization, graph.output.channels, graph.output.channels)?;
-	}
-	(graph.block_kind, graph.block_precision, graph.block_blck_precision, graph.block_activation_precision, graph.block_norm_precision) = outer;
+	(graph.block_kind, graph.block_precision, graph.block_blck_precision) = outer;
 	Ok(())
 }
 /// The two gate lists share their leading per-lane RMS node and its scale.
@@ -20152,12 +20225,12 @@ fn lower_gates(graph: &mut Graph, lanes: usize, gate: Option<&HyperGateBlocks>, 
 	let (stream, shape) = (graph.source, graph.output);
 	let Some(gate) = gate else { return Ok((stream, -2, -2)); };
 	require(lanes != 0 && shape.channels % lanes == 0, "hyper gate stream does not split into lanes")?;
-	let leading_rms = |blocks: &[Block]| blocks.first().is_some_and(|block| matches!(block.operation, Operation::Norm) && block.normalization == Some(BlockNormalization::Rms) && block.activation == Activation::Linear);
+	let leading_rms = |blocks: &[Block]| blocks.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && matches!(block.maps.as_slice(), [step] if step.normalization() == Some(BlockNormalization::Rms)));
 	require(leading_rms(&gate.read.blocks) && leading_rms(&gate.write.blocks), "hyper read and write gates must begin with per-lane rms")?;
-	let outer = (graph.bias, graph.lanes, graph.block_kind, graph.block_norm_precision);
+	let outer = (graph.bias, graph.lanes, graph.block_kind, graph.block_precision);
 	graph.bias = outer.0 && gate.read.exclusions & bias.mask() == 0;
 	graph.lanes = 0;
-	graph.block_norm_precision = gate.read.blocks[0].norm_precision;
+	graph.block_precision = gate.read.blocks[0].maps[0].precision.or(outer.3);
 	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
 	let normalized = graph.source;
 	for block in &gate.read.blocks[1..] { lower_gate_step(graph, block, config)?; }
@@ -20173,7 +20246,7 @@ fn lower_gates(graph: &mut Graph, lanes: usize, gate: Option<&HyperGateBlocks>, 
 		require(graph.output.channels == lanes && graph.output.length == shape.length, "hyper write gate must produce one value per lane")?;
 	}
 	let written = if write { graph.source } else { -2 };
-	(graph.bias, graph.lanes, graph.block_kind, graph.block_norm_precision) = outer;
+	(graph.bias, graph.lanes, graph.block_kind, graph.block_precision) = outer;
 	Ok((normalized, read, written))
 }
 /// Multiplies the graph output by `factor`.
@@ -20920,8 +20993,8 @@ mod precision_contract_checks {
 	fn precision_suffix_scope_is_local_and_explicit() {
 		let projection = layer(32).int(4).gelu().fp(16).norm(rms).fp(32);
 		assert_eq!(projection.blck_precision, Some(Compute::INT4));
-		assert_eq!(projection.activation_precision, Some(Compute::FP16));
-		assert_eq!(projection.norm_precision, Some(Compute::FP32));
+		assert_eq!(projection.maps[0].precision, Some(Compute::FP16));
+		assert_eq!(projection.maps[1].precision, Some(Compute::FP32));
 		assert_eq!(projection.precision, None);
 		let attention = attn(4).int(8).kv(2).bf(16).qk(rms).fp(16).rope(neox, 4, 10000.0).fp(32);
 		assert_eq!(attention.blck_precision, Some(Compute::INT8));
@@ -23649,11 +23722,13 @@ struct Cuda {
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
 	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
+	function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32>,
 	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
 	cus: u32,
 	wave: u32,
 	workgroup: u32,
 	block_lds: u32,
+	optin_lds: u32,
 	sm_lds: u32,
 	registers: u32,
 	threads: u32,
@@ -24802,7 +24877,11 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
+	const MAX_DYNAMIC_SHARED: i32 = 8;
+
+	fn shared_limit(&self) -> u32 { self.block_lds.max(self.optin_lds).min(self.sm_lds) }
+
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 			let mut object = 0;
@@ -24816,17 +24895,38 @@ impl Cuda {
 			require((self.registers / register_wave).min(self.threads / self.wave) != 0, "NVIDIA native symbol has no resident wave")?;
 			let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
 			// The schedule sized every tile and the reduction buffer for its own workgroup, so the dispatch must use that width and not the wider one the register budget would allow.
-			let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, waves, resources)?;
+			let geometry = nvidia(self.cus, self.wave, self.workgroup, self.shared_limit(), self.sm_lds, waves, resources)?;
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+		}
+	}
+
+	/// Set the loaded function's dynamic limit before asking occupancy about the
+	/// exact buffer every launch uses. The device opt-in budget already describes
+	/// available per-block storage; its fixed function storage shares that budget.
+	unsafe fn native_shared(&self, name: &str, dispatch: Dispatch, values: u32) -> Result<()> {
+		unsafe {
+			let object = dispatch.kernel.object as usize;
+			let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+			let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+			require(shared <= self.shared_limit(), format!("NVIDIA native symbol {name} needs {shared} bytes of shared memory, the device limit is {}", self.shared_limit()))?;
+			if shared > self.block_lds {
+				let set = self.function_attribute_set.ok_or_else(|| RecipeError::new("NVIDIA dynamic shared-memory opt-in is unavailable"))?;
+				require(self.optin_lds > self.block_lds, "NVIDIA dynamic shared-memory opt-in is unavailable")?;
+				let requested = i32::try_from(dynamic).map_err(|_| RecipeError::new("NVIDIA dynamic shared memory exceeds i32"))?;
+				driver_status(Backend::Nvidia, set(object, Self::MAX_DYNAMIC_SHARED, requested), "native dynamic shared-memory opt-in")?;
+				let mut maximum = 0;
+				driver_status(Backend::Nvidia, (self.function_attribute)(&mut maximum, Self::MAX_DYNAMIC_SHARED, object), "native dynamic shared-memory limit query")?;
+				require(maximum >= requested, "NVIDIA native dynamic shared-memory limit is below the requested size")?;
+				trace(&format!("NVIDIA shared-memory symbol={name} fixed={} dynamic={dynamic} maximum={maximum}", dispatch.kernel.shared))?;
+			}
 			let mut active = 0;
 			// The grid is one workgroup per SM and the barrier only completes once every one of them
 			// is resident, so the occupancy question has to be asked about the launch this dispatch
 			// really makes. With no dynamic shared memory it answers a question nobody goes on to ask.
-			let values = shared_values.max(geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
-			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
-			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
+			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, dispatch.geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
 			// One workgroup per SM leaves every block room to reach the grid barrier.
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+			Ok(())
 		}
 	}
 
@@ -24838,16 +24938,21 @@ impl Cuda {
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 			let mut program = NativeCudaProgram { module: module as usize, step: None, unload: self.unload };
-			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
+			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves)).transpose()?;
+			let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
+			let values = shared_values.max(block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
 			// The single-position step fills every SM with as many warps as the
 			// kernel allows, as the AMD step does; the forward keeps the schedule
-			// width. Its launch carries the forward's reduction buffer, so its
+			// width. Its launch carries the forward/epoch reduction buffer, so its
 			// residency is asked with that buffer and not one scaled to its own block.
 			let step_waves = (self.workgroup.min(512) / self.wave).max(1);
-			let step_values = shared_values.max(forward.geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
-			program.step = has_step.then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves, step_values, 0)).transpose()?;
-			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
-			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
+			program.step = has_step.then(|| self.native_dispatch(program.module as Ptr, "recipe_model_step", element, NATIVE_FORWARD_LAYOUT, step_waves)).transpose()?;
+			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves)).transpose()?;
+			self.native_shared(NATIVE_FORWARD_SYMBOL, forward, values)?;
+			if let Some(dispatch) = epoch { self.native_shared(NATIVE_EPOCH_SYMBOL, dispatch, values)?; }
+			if let Some(dispatch) = program.step { self.native_shared("recipe_model_step", dispatch, values)?; }
+			if let Some(dispatch) = model_load { self.native_shared(NATIVE_MODEL_LOAD_SYMBOL, dispatch, 0)?; }
 			Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -25348,6 +25453,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		const CUS: i32 = 16;
 		const THREADS_PER_SM: i32 = 39;
 		const SM_LDS: i32 = 81;
+		const BLOCK_LDS_OPTIN: i32 = 97;
 		const REGISTERS_PER_SM: i32 = 82;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
@@ -25362,6 +25468,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 		let unload: unsafe extern "C" fn(Ptr) -> i32 = runtime.function(b"cuModuleUnload\0")?;
 		let function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32 = runtime.function(b"cuModuleGetFunction\0")?;
 		let function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32 = runtime.function(b"cuFuncGetAttribute\0")?;
+		let function_attribute_set: Option<unsafe extern "C" fn(usize, i32, i32) -> i32> = runtime.function(b"cuFuncSetAttribute\0").ok();
 		let occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32 = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
 		let driver_version: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDriverGetVersion\0")?;
 		let check = |s, a| driver_status(Backend::Nvidia, s, a);
@@ -25391,7 +25498,17 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				check(attribute(output, kind, device), action)?;
 			}
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
-			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
+			require(block_lds > 0 && sm_lds > 0, "Nvidia shared-memory limits are invalid")?;
+			let architecture = format!("sm_{compute_major}{compute_minor}");
+			validate_nvidia_ptx_driver(&architecture, version.max(0) as u32)?;
+			// Older devices and drivers retain their ordinary limit. Attribute 97
+			// advertises the larger budget only when this runtime can opt into it.
+			let mut optin_lds = 0;
+			if compute_major >= 7 && function_attribute_set.is_some() {
+				let mut reported = 0;
+				if attribute(&mut reported, BLOCK_LDS_OPTIN, device) == 0 && reported > block_lds { optin_lds = reported as u32; }
+			}
+			let native_target = BackendTarget::Nvidia { architecture };
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda {
 				_runtime: runtime.clone(),
@@ -25409,22 +25526,25 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				unload,
 				function,
 				function_attribute,
+				function_attribute_set,
 				occupancy,
 				cus: cus as u32,
 				wave: wave as u32,
 				workgroup: workgroup as u32,
 				block_lds: block_lds as u32,
+				optin_lds,
 				sm_lds: sm_lds as u32,
 				registers: registers as u32,
 				threads: threads as u32,
 			};
+			let shared_limit = cuda.shared_limit();
 			Ok(Gpu {
 				name: format!("nv{index}"),
 				backend: Backend::Nvidia,
 				native_target,
 				driver: Driver::Cuda(cuda),
 				memory: memory as u64,
-				shared_limit: (block_lds as u32).min(sm_lds as u32),
+				shared_limit,
 				dispatch: Mutex::new(()),
 			})
 		};
