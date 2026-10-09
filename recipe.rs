@@ -23156,7 +23156,7 @@ struct Buffer {
 	pointer: u64,
 	bytes: usize,
 	/// A retained weight buffer mapped from a shared file rather than allocated by the runtime.
-	#[cfg_attr(not(unix), allow(dead_code))]
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 	mapped: bool,
 	/// A retained weight buffer a tape reads; writes fail once it is sealed.
 	sealed: bool,
@@ -23301,7 +23301,7 @@ impl Buffer {
 }
 impl Drop for Buffer {
 	fn drop(&mut self) {
-		#[cfg(unix)]
+		#[cfg(target_os = "linux")]
 		if self.mapped {
 			return unmap_retained(self.pointer, self.bytes);
 		}
@@ -23311,7 +23311,7 @@ impl Drop for Buffer {
 
 impl Buffer {
 	/// A weight buffer mapped at a retained address, filled and sealed by its tape.
-	#[cfg(unix)]
+	#[cfg(target_os = "linux")]
 	fn retained(runtime: &'static Gpu, pointer: u64, bytes: usize) -> Self {
 		Self { runtime, pointer, bytes, mapped: true, sealed: false }
 	}
@@ -23322,29 +23322,29 @@ impl Buffer {
 /// Weight buffers retained across invocations on the CPU. Each weight buffer is a shared
 /// file mapped at an address recorded in its lease, so a later process maps the
 /// same bytes at the addresses its compiled kernels already name.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const RETAINED_ROOT: &str = "recipe-retained-v1";
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const RETAINED_BASE: usize = 0x1000_0000_0000;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const RETAINED_SLOT: usize = 1 << 30;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const RETAINED_SLOTS: u64 = 1 << 16;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const SHA256_ROUNDS: [u32; 64] = [
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
 	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
 	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
 	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct Sha256 {
 	state: [u32; 8],
 	block: [u8; 64],
 	filled: usize,
 	length: u64,
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl Sha256 {
 	fn new() -> Self {
 		Self { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], block: [0; 64], filled: 0, length: 0 }
@@ -23418,13 +23418,13 @@ impl Sha256 {
 		digest
 	}
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn sha256(data: &[u8]) -> [u8; 32] {
 	let mut hash = Sha256::new();
 	hash.update(data);
 	hash.finish()
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn sha256_file(path: &Path) -> Result<[u8; 32]> {
 	use std::io::Read as _;
 	let unreadable = |error: std::io::Error| RecipeError::new(format!("cannot read {}: {error}", path.display()));
@@ -23439,11 +23439,11 @@ fn sha256_file(path: &Path) -> Result<[u8; 32]> {
 		hash.update(&buffer[..read]);
 	}
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn hex(bytes: &[u8]) -> String {
 	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn unhex(text: &str) -> Option<[u8; 32]> {
 	if text.len() != 64 {
 		return None;
@@ -23457,12 +23457,12 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
 fn unix_now() -> u64 {
 	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn private_directory(path: &Path) -> Result<()> {
 	use std::os::unix::fs::DirBuilderExt as _;
 	fs::DirBuilder::new().recursive(true).mode(0o700).create(path).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", path.display())))
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn retained_root() -> Result<PathBuf> {
 	let root = home_directory()?.join(".cache").join("recipe").join("retained");
 	private_directory(&root)?;
@@ -23470,7 +23470,7 @@ fn retained_root() -> Result<PathBuf> {
 }
 /// The content identity of a GGUF source: the SHA-256 of each shard, cached
 /// beside the stat stamp of that shard. A stamp change rehashes the shard.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn source_digest(paths: &[PathBuf], root: &Path) -> Result<[u8; 32]> {
 	use std::os::unix::fs::MetadataExt as _;
 	let cache = root.join("sources");
@@ -23504,7 +23504,7 @@ fn source_digest(paths: &[PathBuf], root: &Path) -> Result<[u8; 32]> {
 }
 /// Lease and loading records, one `name value` pair per line.
 type Fields = std::collections::BTreeMap<String, String>;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_fields(path: &Path, owner: u32) -> Option<Fields> {
 	use std::os::unix::fs::MetadataExt as _;
 	if fs::metadata(path).ok()?.uid() != owner {
@@ -23518,35 +23518,35 @@ fn write_fields(path: &Path, fields: &Fields) -> Result<()> {
 	let text: String = fields.iter().map(|(name, value)| format!("{name} {value}\n")).collect();
 	fs::write(&temporary, text).and_then(|()| fs::rename(&temporary, path)).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn field_number(fields: &Fields, name: &str) -> Option<u64> {
 	fields.get(name)?.parse().ok()
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn field_address(fields: &Fields, name: &str) -> Option<usize> {
 	usize::from_str_radix(fields.get(name)?.trim_start_matches("0x"), 16).ok()
 }
 /// The start time of a process, used to tell a live holder from a reused pid.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_start(pid: u32) -> Option<u64> {
 	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
 	stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn holder_alive(holder: Option<&String>) -> bool {
 	let Some(holder) = holder else { return false };
 	let mut parts = holder.split_whitespace().map(|part| part.parse::<u64>().ok());
 	let (Some(Some(pid)), Some(Some(start))) = (parts.next(), parts.next()) else { return false };
 	process_start(pid as u32) == Some(start)
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn remove_retained(lease: &Path) {
 	fs::remove_file(lease).ok();
 	fs::remove_file(lease.with_extension("loading")).ok();
 	fs::remove_file(lease.with_extension("weight buffer")).ok();
 }
 /// Releases expired leases and recovers loads whose holder has exited.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
 	let (mut released, mut recovered) = (0, 0);
 	let Ok(entries) = fs::read_dir(root) else { return (0, 0) };
@@ -23568,7 +23568,7 @@ fn sweep_retained(root: &Path, owner: u32, now: u64) -> (usize, usize) {
 	(released, recovered)
 }
 /// Removes retained weight buffers of this source whose content no longer matches.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn invalidate_sources(root: &Path, owner: u32, source: &str, digest: &str) -> usize {
 	let Ok(entries) = fs::read_dir(root) else { return 0 };
 	let mut removed = 0;
@@ -23585,17 +23585,17 @@ fn invalidate_sources(root: &Path, owner: u32, source: &str, digest: &str) -> us
 	}
 	removed
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn renew_retained(lease: &Path, owner: u32, ttl: u64) {
 	let Some(mut fields) = read_fields(lease, owner) else { return };
 	fields.insert("expires".to_owned(), (unix_now() + ttl).to_string());
 	write_fields(lease, &fields).ok();
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn retained_length(bytes: usize) -> usize {
 	bytes.max(1).next_multiple_of(4096)
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
 	#[link_name = "mmap"]
 	fn retained_map(address: *mut std::ffi::c_void, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> *mut std::ffi::c_void;
@@ -23603,7 +23603,7 @@ unsafe extern "C" {
 	fn retained_unmap(address: *mut std::ffi::c_void, length: usize) -> i32;
 }
 /// Maps the weight file at `address` when that range is free.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn map_retained(file: &fs::File, bytes: usize, address: usize) -> Option<u64> {
 	use std::os::fd::AsRawFd as _;
 	const READ_WRITE: i32 = 0x1 | 0x2;
@@ -23620,13 +23620,13 @@ fn map_retained(file: &fs::File, bytes: usize, address: usize) -> Option<u64> {
 	}
 	Some(address as u64)
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn unmap_retained(pointer: u64, bytes: usize) {
 	unsafe { retained_unmap(pointer as *mut _, retained_length(bytes)) };
 }
 /// The source a placement retains weights for: the GGUF shards, their content
 /// digest, the label used for invalidation, and the lease lifetime in seconds.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct RetainedSource {
 	digest: [u8; 32],
 	path: String,
@@ -23638,9 +23638,9 @@ fn retained_source(file: &Gguf) -> Result<Option<RetainedSource>> {
 	};
 	let path = file.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(";");
 	let ttl = minutes.checked_mul(60).ok_or_else(|| RecipeError::new("--ttl is too large"))?;
-	#[cfg(unix)]
+	#[cfg(target_os = "linux")]
 	let digest = source_digest(&file.paths, &retained_root()?)?;
-	#[cfg(not(unix))]
+	#[cfg(not(target_os = "linux"))]
 	let digest = [0_u8; 32];
 	Ok(Some(RetainedSource { digest, path, ttl }))
 }
@@ -23670,13 +23670,13 @@ pub struct WeightResidency {
 	pub recovered: usize,
 }
 /// Keeps a retained weight buffer's lease alive for its TTL after the tape is dropped.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct RetainedHold {
 	lease: PathBuf,
 	ttl: u64,
 	owner: u32,
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl Drop for RetainedHold {
 	fn drop(&mut self) {
 		renew_retained(&self.lease, self.owner, self.ttl);
@@ -23727,7 +23727,7 @@ fn private_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 /// The buffer interface of the weight buffer: offsets, sizes, precisions, and
 /// stored representations of every weighted node. Node operations and indices
 /// are excluded, so a kernel-only change keeps a compatible weight buffer.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
 	let mut text = format!("bytes {bytes}\n");
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -23740,7 +23740,7 @@ fn weight_interface(graph: &Graph, offsets: &[usize], bytes: usize) -> String {
 	}
 	text
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, source: Option<&RetainedSource>) -> Result<Acquired> {
 	use std::io::Write as _;
 	use std::os::unix::fs::MetadataExt as _;
@@ -23839,9 +23839,9 @@ fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inferen
 	]);
 	Ok(Acquired { weights, residency, load: Some(RetainedLoad { lease, loading, owner, ttl: source.ttl, fields }), hold: None })
 }
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn acquire_weights(gpu: &'static Gpu, graph: &Graph, precision: Compute, inference: bool, _source: Option<&RetainedSource>) -> Result<Acquired> {
-	let reason = format!("retained weights require a Unix platform, not {}", std::env::consts::OS);
+	let reason = format!("retained weights require Linux, not {}", std::env::consts::OS);
 	private_weights(gpu, graph, precision, inference, &reason)
 }
 #[derive(Clone, Copy)]
