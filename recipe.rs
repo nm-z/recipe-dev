@@ -3952,13 +3952,6 @@ impl NativeModelIr {
 				continue;
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
-			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
-				let pointer = pointer_type(backend);
-				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
-					at = clocks + index * 8
-				));
-			}
 			let node = &plan.node;
 			let v = self.variant(node);
 			let matrix = matrix && matrix_capable(self.node_precision(node));
@@ -5100,6 +5093,16 @@ impl NativeModelIr {
 						ir.push_str(barrier(backend));
 					}
 				}
+			}
+			// Each forward primitive has completed its node-ending grid barrier.
+			// Stamp that boundary, so neighboring clock slots enclose one node's
+			// work rather than the next node's entry or the prior node's tail.
+			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
+				let pointer = pointer_type(backend);
+				ir.push_str(&format!(
+					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+					at = clocks + index * 8
+				));
 			}
 			if reverse {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
@@ -22059,11 +22062,12 @@ impl NativeTape {
 		}
 		if let Some(clocks) = self.program.artifact.layout.clocks {
 			let count = self.program.artifact.layout.precisions.len();
-			let ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
+			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
 			let unit = match self.program.backend { NativeBackend::Cpu(_) => "cycles", _ => "ticks" };
 			let mut line = format!("clocks window {begin}..{end} {unit}");
-			for index in 1..count {
-				line.push_str(&format!(" n{}:{}", index - 1, ticks[index].wrapping_sub(ticks[index - 1])));
+			for index in 0..count {
+				let prior = if index == 0 { ticks[0] } else { node_ticks[index - 1] };
+				line.push_str(&format!(" n{index}:{}", node_ticks[index].wrapping_sub(prior)));
 			}
 			trace(&line)?;
 		}
