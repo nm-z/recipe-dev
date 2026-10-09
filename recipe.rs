@@ -16008,6 +16008,19 @@ pub(crate) struct StoredWeight {
 	pub(crate) segments: Vec<(StorageFormat, usize)>,
 }
 impl StoredWeight {
+	/// Every element decoded on the host, one source layout at a time.
+	fn decoded(&self) -> Result<Vec<f64>> {
+		let bytes = self.bytes.to_vec()?;
+		let (mut values, mut at) = (Vec::with_capacity(self.count), 0);
+		for (format, count) in self.format_segments() {
+			let spec = format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", format.0)))?;
+			let length = count.div_ceil(spec.block) * spec.stride;
+			let span = bytes.get(at..at + length).ok_or_else(|| RecipeError::new("stored weight is shorter than its layout"))?;
+			values.extend(format.decompress(span, &self.codebook, count)?);
+			at += length;
+		}
+		Ok(values)
+	}
 	/// The formats and element counts in the order their bytes occupy `bytes`.
 	/// Older in-memory callers may leave this empty, so retain the single-span
 	/// representation as a compatibility fallback.
@@ -16946,14 +16959,14 @@ impl Recipe {
 	pub fn gguf(&self, path: impl AsRef<Path>) -> Gguf { open_script_file(path.as_ref()) }
 	/// The data a model reads: table, image and text sources, or one GGUF model
 	/// file, whose metadata and tensors named paths then read and whose weights
-	/// `recipe.infer` binds.
+	/// `recipe.infer` and `recipe.train` bind. A GGUF file may accompany table
+	/// sources, which then supply the rows.
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
-		let sources = sources.into_data_sources();
-		let models = sources.iter().filter(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))).collect::<Vec<_>>();
+		let (models, sources) = sources.into_data_sources().into_iter().partition::<Vec<String>, _>(|source| Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")));
 		let file = match models[..] {
 			[] => None,
-			[path] if sources.len() == 1 => Some(open_script_file(Path::new(path))),
-			_ => panic!("a GGUF model file is the only source of its data"),
+			[ref path] => Some(open_script_file(Path::new(path))),
+			_ => panic!("a data source names at most one GGUF model file"),
 		};
 		Data { sources, tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), features: FeatureSelection::All, schema_file: None, normalize: false, split: 1.0, split_supplied: false, prepared: OnceLock::new(), file }
 	}
@@ -20639,6 +20652,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		config: graph.config,
 		bound: None,
 		bound_values: Vec::new(),
+		host_weights: graph.host_weights,
 		bias: graph.bias,
 		epsilon: graph.epsilon,
 	})
@@ -21775,6 +21789,8 @@ struct Graph {
 	/// Bound values by node, written into their spans once every lowering has
 	/// set its own initial parameters.
 	bound_values: Vec<(usize, Vec<f64>)>,
+	/// Whether a bound weight that trains decodes into its host span rather than staying packed for the device.
+	host_weights: bool,
 	/// Whether a weighted block allocates its bias. Set once from the model, so
 	/// every lowering below sees it without threading a flag through each one.
 	bias: bool,
@@ -21812,6 +21828,7 @@ impl Graph {
 			config: None,
 			bound: None,
 			bound_values: Vec::new(),
+			host_weights: false,
 			bias: true,
 		}
 	}
@@ -21828,7 +21845,8 @@ impl Graph {
 		if !self.nodes.iter().any(|node| node.int_bits != 0) {
 			return Ok(std::borrow::Cow::Borrowed(self));
 		}
-		let float = self.profile.train.ok_or_else(|| RecipeError::new("integer checkpoint blocks require an explicit train = fp16, bf16, fp32, or fp64 in the precision table"))?;
+		// A precision table without `train =` trains integer checkpoints in fp32.
+		let float = self.profile.train.unwrap_or(Compute::FP32);
 		require(matches!(float, Compute::FP16 | Compute::BF16 | Compute::FP32 | Compute::FP64), "integer checkpoint training requires a float compute format")?;
 		let mut graph = self.clone();
 		if float == Compute::FP64 { graph.profile.acc = Compute::FP64; }
@@ -21897,6 +21915,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.profile = config.profile;
 	graph.config = Some(config);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
+	graph.host_weights = initialize;
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
 	graph.bias = model.exclusions & bias.mask() == 0;
@@ -21926,15 +21945,15 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// be the wrong shape for the projection's bias.
 	if data.target_width != 0 && (graph.output.channels != data.target_width || graph.output.length != 1) {
 		let length = graph.output.length;
+		// The projection onto the targets is not in the file, so it takes random weights even when the file binds every model node.
+		eprintln!("target projection {} -> {} takes fresh weights; the file has none for it", graph.output.channels, data.target_width);
+		let plan = graph.bound.take();
 		lower_conv(&mut graph, data.target_width, length)?;
+		graph.bound = plan;
 		output_profile = None;
 	}
 	if let Some(left) = graph.bound.take().filter(|plan| !plan.is_empty()) {
 		return Err(RecipeError::new(format!("the plan names {} more weights than the model has parameterized nodes, starting with {}", left.len(), left[0].names)));
-	}
-	for (index, values) in std::mem::take(&mut graph.bound_values) {
-		let (offset, parameters) = (graph.nodes[index].offset, graph.nodes[index].parameters);
-		graph.parameters[offset..offset + parameters].copy_from_slice(&values);
 	}
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
@@ -21948,6 +21967,11 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 				graph.parameters[offset + channel] = mean;
 			}
 		}
+	}
+	// Bound values land after initialization, so a file's weights are never replaced by random ones.
+	for (index, values) in std::mem::take(&mut graph.bound_values) {
+		let (offset, parameters) = (graph.nodes[index].offset, graph.nodes[index].parameters);
+		graph.parameters[offset..offset + parameters].copy_from_slice(&values);
 	}
 	// A frozen block keeps its initialized weights, so the mask lands after initialization.
 	for (offset, parameters) in graph.nodes.iter().filter(|node| node.frozen).map(|node| (node.offset, node.parameters)).collect::<Vec<_>>() {
@@ -22324,6 +22348,11 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 			match bound.weight {
 				// A bound contraction or expert decodes the mapped source layout;
 				// compute precision does not expand its stored table.
+				// A node that trains owns a host span, so a packed file weight decodes into it; a table is drawn once and stays packed.
+				BoundWeight::Stored(weight) if graph.host_weights && !node.table() => {
+					graph.bound_values.push((index, weight.decoded()?));
+					None
+				}
 				BoundWeight::Stored(weight) => {
 					if node.table() || matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) {
 						node.storage = weight.format.0;
@@ -31406,8 +31435,12 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 }
 impl Data {
 	fn report_path(&self) -> Result<String> {
-		let source = self.sources.first().ok_or_else(|| RecipeError::new("data source path is absent"))?;
-		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?;
+		// A GGUF-only source has no table, so its report names the opened model file.
+		let path = match (self.sources.first(), self.file.as_ref().and_then(|file| file.paths.first())) {
+			(Some(source), _) => fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve report path {source}: {error}")))?,
+			(None, Some(model)) => fs::canonicalize(model).map_err(|error| RecipeError::new(format!("cannot resolve report path {}: {error}", model.display())))?,
+			(None, None) => return Err(RecipeError::new("data source path is absent")),
+		};
 		Ok(format!("{}:{}", local_host()?, path.display()))
 	}
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
@@ -36843,7 +36876,7 @@ impl Train {
 			if let Some(estimator) = model.blocks.iter().find_map(first_estimator) {
 				return Err(RecipeError::new(format!("a RAT proposer cannot contain {}: estimators fit labeled rows, and a proposal has no labels", estimator.name)));
 			}
-			if data.autoregressive && data.sources.is_empty() {
+			if data.autoregressive && data.sources.is_empty() && data.file.is_none() {
 				return self.try_run_stateful_rat(model, data, command, started);
 			}
 			let prepared = prepare_command_data(data)?;
@@ -36853,7 +36886,24 @@ impl Train {
 			}
 			return self.try_run_rat(model, data, &prepared, command, gpu, config, started);
 		}
-		let prepared = prepare(data)?;
+		// A GGUF file in the data binds the model's weights; its rows still come from the table sources.
+		let bound = match &data.file {
+			Some(file) => {
+				let plan = conventional_plan(file, &model.for_file(file))?;
+				let head = plan.nodes.last().map_or_else(String::new, |planes| planes.iter().map(Plane::name).collect::<Vec<_>>().join(", "));
+				eprintln!("bound {} weighted nodes from {} tensors; the output head reads {head}", plan.nodes(), plan.tensors());
+				Some(file.bound(&plan)?)
+			}
+			None => None,
+		};
+		let owned;
+		let prepared = match bound {
+			Some(bound) => {
+				owned = Prepared { bound: Some(bound), ..prepare_data(data)? };
+				&owned
+			}
+			None => prepare(data)?,
+		};
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
 		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
