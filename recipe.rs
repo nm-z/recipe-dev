@@ -10837,7 +10837,6 @@ mod bundle {
 					delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation.code(), delta.output_activation.code()
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
-			Operation::Norm => "norm".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", activation.code()),
 			Operation::Identity => "identity".to_owned(),
 			Operation::Last => "last".to_owned(),
@@ -11004,7 +11003,6 @@ mod bundle {
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
-			"norm" => Ok(Operation::Norm),
 			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(fields.next().ok_or_else(|| RecipeError::new("gated feed-forward activation is absent"))?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -12232,9 +12230,6 @@ enum Operation {
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
-	/// A normalization that leads a model: the block's own normalization is the
-	/// only thing it does, so the model input is normalized before its first block.
-	Norm,
 	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
 	Glu(usize, Activation),
 	/// Computes nothing. It carries a step that is only an activation or only
@@ -12931,7 +12926,7 @@ impl Model {
 	/// the model input before the first block, which is the pre-normalization
 	/// of a residual branch when the model is one.
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
-		let model = if self.blocks.is_empty() { self.push(Operation::Norm) } else { self.suffix() };
+		let model = if self.blocks.is_empty() { self.push(Operation::Identity) } else { self.suffix() };
 		let normalization = normalization.normalization();
 		model.edit(|model| {
 			let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
@@ -13050,7 +13045,7 @@ impl Model {
 			Operation::Dconv(kernel, dilation) => format!("dconv({kernel},{dilation})"),
 			Operation::Delta(delta) => format!("delta({},{})", delta.heads, delta.kernel),
 			Operation::Ple(ple) => format!("ple({},{},{},{},{})", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation),
-			Operation::Norm | Operation::Identity => String::new(),
+			Operation::Identity => String::new(),
 			Operation::Last => "last()".to_owned(),
 			Operation::Glu(hidden, activation) => format!("glu({hidden},{})", activation.name()),
 		};
@@ -14526,7 +14521,6 @@ impl Operation {
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
-			Self::Norm => "norm",
 			Self::Glu(..) => "glu",
 		}
 	}
@@ -16528,7 +16522,7 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 	}
 	if plain {
 		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
-		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity | Operation::Norm) && block.has_normalization());
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.has_normalization());
 		if !normalized && file.tensor(&name(pre)).is_some() {
 			let mut scale = Block::of(Operation::Identity);
 			scale.maps.push(ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms)));
@@ -16626,7 +16620,7 @@ impl Builder<'_> {
 		let (mut weighted, mut hidden) = (false, 0);
 		for step in parts {
 			match &step.operation {
-				Operation::Identity | Operation::Norm => {}
+				Operation::Identity => {}
 				Operation::Attention(attention) => {
 					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
 					weighted = true;
@@ -18613,7 +18607,6 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::MoeBlocks(top_k, experts) => lower_moe_blocks(graph, *top_k, experts, total, data, targets, rows, gpu, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_gguf_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
-		Operation::Norm => require(block.has_normalization(), "a leading normalization block names no normalization")?,
 		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Last => lower_last(graph)?,
 		Operation::Identity => {}
