@@ -50,12 +50,12 @@ fn main() {
 }
 RECIPE
 
-# Prints the loss after each epoch, then the final loss, from one run's output.
+# Prints the loss after each epoch (stderr), then the final loss (stdout), for one run.
 losses() {
-	sed 's/\x1b\[[0-9;]*m//g' "$1" | awk '
-		/ epoch / { value = $NF; keep = 1 }
+	cat "$1.err" "$1.out" | sed 's/\x1b\[[0-9;]*m//g' | awk '
+		/ epoch / { print $NF }
 		/^final loss / { final = $3 }
-		END { if (keep) print value; if (final != "") print final }'
+		END { if (final != "") print final }'
 }
 
 check_run() {
@@ -66,10 +66,14 @@ check_run() {
 		tail -n 20 "$log.err" >&2
 		return 1
 	fi
-	mapfile -t values < <(losses "$log.out")
+	mapfile -t values < <(losses "$log")
 	local count=$(( ${#values[@]} - 1 ))
 	if [ "$count" -ne "$epochs" ]; then
 		echo "$name: expected $epochs epoch losses, found $count" >&2
+		head -c 1500 "$log.out" >&2
+		tail -c 1200 "$log.err" >&2
+		head -c 1500 "$log.out" >&2
+		tail -c 800 "$log.err" >&2
 		return 1
 	fi
 	local first=${values[0]} final=${values[$count]}
