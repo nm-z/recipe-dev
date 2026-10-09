@@ -247,6 +247,23 @@ recipe stats model.gguf
 recipe keys model.gguf
 ```
 
+## Dataset schema
+
+```bash
+recipe schema probe measurements/ > proposal.json
+recipe schema finalize proposal.json answers.json schema.json
+```
+
+The answers file names one choice for each question on the active branch:
+
+```json
+{"schema_version":1,"status":"ok","answers":[{"id":"parse","choice":"table","probability":0.99}]}
+```
+
+```rust
+let data = recipe.data("measurements/").schema("schema.json").target(["temperature"]);
+```
+
 ## Precision and reference checks
 
 ```toml
