@@ -3,8 +3,17 @@ use recipe::infer::{cached, input, out, pp, tg, time};
 
 const GGUF: &str = "/mnt/sentry-nfs/unsloth/Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf";
 
+fn hyper_gate(lanes: usize, rank: usize, width: usize) -> HyperGate {
+	let scale = 1.0 / lanes as f64;
+	HyperGate {
+		read: recipe.model().no(bias).norm(rms).layer(rank).scale(scale).silu().layer(lanes * width).sigmoid(),
+		write: recipe.model().no(bias).norm(rms).layer(lanes).scale(scale).sigmoid().scale(2.0),
+	}
+}
+
 pub fn model() -> Model {
 	let (width, vocabulary) = (qwen4exp.embedding_length, tokenizer.ggml.tokens.len());
+	let (lanes, rank) = (qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank);
 	let mut model = recipe.model().embed(vocabulary, width);
 	for layer in 0..qwen4exp.block_count {
 		if qwen4exp.ple.layers.contains(&layer) { model = model.ple(&ngram); }
@@ -18,11 +27,11 @@ pub fn model() -> Model {
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
 		};
-		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &attention);
+		model = if rank == 0 { model.hyper(lanes, &attention) } else { model.hyper_gate(lanes, &attention, hyper_gate(lanes, rank, width)) };
 		let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
 		let experts = recipe.model().gguf_moe(qwen4exp.expert_count, qwen4exp.expert_used_count, qwen4exp.expert_feed_forward_length,
 			Activation::Silu, scoring, qwen4exp.expert_weights_norm, qwen4exp.expert_shared_feed_forward_length != 0);
-		model = model.hyper(qwen4exp.hyper_connection.count, qwen4exp.hyper_connection.low_rank, &experts);
+		model = if rank == 0 { model.hyper(lanes, &experts) } else { model.hyper_gate(lanes, &experts, hyper_gate(lanes, rank, width)) };
 	}
 	model.layer(vocabulary)
 }
