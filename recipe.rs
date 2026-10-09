@@ -16552,7 +16552,7 @@ impl Builder<'_> {
 		let (mut weighted, mut hidden) = (false, 0);
 		for step in parts {
 			match &step.operation {
-				Operation::Identity => {}
+				Operation::Identity | Operation::Norm => {}
 				Operation::Attention(attention) => {
 					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
 					weighted = true;
