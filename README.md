@@ -190,6 +190,7 @@ train()
 	.save(path)|.resume(path)
 	.rat(history|rolling|online|learned|full, command)
 	.target(value)
+	.repeat(penalty, window)
 	.log([run, time, epoch, r2, loss, blck, tile, score, choices, window]|all|dev)
 	.run(&model, &data)
 all:
