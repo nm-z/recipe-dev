@@ -68,7 +68,7 @@ let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
 	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
-	.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
+	.delta_gates(Activation::Softplus, Activation::Sigmoid)
 	.norm(rms);
 let gate = HyperGate {
 	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),

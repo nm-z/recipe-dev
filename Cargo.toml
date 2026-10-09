@@ -145,7 +145,7 @@ tolerance = 0.05
 step = 32
 
 [precision.check64]
-sum = "int8"
+sum = "fp64"
 embed = "fp16"
 attn = "fp16"
 rope = "fp16"

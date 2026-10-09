@@ -4269,12 +4269,10 @@ impl NativeModelIr {
 					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_runtime_window_loop(&mut ir, index, "delta", pairs, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries}, i32 {decode} )\n",
+							"call void @delta_forward_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries} )\n",
 							pointer = pointer_type(backend),
-							decode = plan.decode(index),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							value = pointers.value,
 							context = pointers.context,
 							arguments = shape.arguments
@@ -4696,35 +4694,21 @@ impl NativeModelIr {
 				(true, Primitive::Delta) => {
 					let shape = delta_shape(node, self.rows)?;
 					let keys = Shape { channels: shape.key_heads as usize, length: 1 };
-					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// One row and key head per element, so the value heads sharing a key head
 					// walk in one thread and own the query and key adjoint elements they share.
 					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
+							"call void @delta_reverse_body{v}( {pointer} {source}, {pointer} {second}, {pointer} {context}, {pointer} {backward}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
-							weights = pointers.weights,
 							context = pointers.context,
 							backward = pointers.backward_context,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							gate = pointers.second_adjoint,
 							arguments = shape.arguments
-						));
-					})?;
-					ir.push_str(barrier(backend));
-					// Then one decay scale per value head, folding that head's row partials.
-					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, _p, wide| {
-						ir.push_str(&format!(
-							"call void @delta_reverse_decay_body{v}( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
-							pointer = pointer_type(backend),
-							context = pointers.backward_context,
-							heads = shape.heads,
-							partials = shape.partials,
-							offset = gradient_base
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -7783,13 +7767,11 @@ fn emit_row_loop(ir: &mut String, index: usize, name: &str, per_row: usize, mut 
 	Ok(())
 }
 
-/// The delta rule arguments both directions share, and the context offset of the
-/// per-pair decay partials that follow every other region.
+/// The delta rule arguments both directions share.
 struct DeltaShape {
 	heads: i32,
 	key_heads: i32,
 	chunks: i32,
-	partials: i32,
 	arguments: String,
 }
 
@@ -7806,18 +7788,13 @@ fn delta_extent(node: &Node) -> Result<(i32, i32, i32, i32)> {
 fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 	let (key_heads, key_width, heads, width) = delta_extent(node)?;
 	let chunk = integer_argument(node.argument[2], "delta chunk")?;
-	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?);
+	let pairs = checked_mul(rows, heads as usize, "delta pairs")?;
 	let chunks = node.output.length.div_ceil(chunk as usize);
-	let partials = narrow(
-		checked_mul(pairs, checked_add(state, checked_mul(2, width as usize, "delta vectors")?, "delta backward pair span")?, "delta partials")?,
-		"delta partials",
-	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
 	Ok(DeltaShape {
 		heads,
 		key_heads,
 		chunks: blocks,
-		partials,
 		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}"),
 	})
 }
@@ -10951,6 +10928,7 @@ mod bundle {
 			14 => Ok(Activation::Elu),
 			15 => Ok(Activation::Prelu),
 			17 => Ok(Activation::Sqrt),
+			18 => Ok(Activation::Softplus),
 			_ => Err(RecipeError::new(format!("invalid activation {value}"))),
 			}?
 		};
@@ -11004,7 +10982,7 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,v3,{},{},{},{},{},{},{},{},{},{},{},{}",
+				"delta,v4,{},{},{},{},{},{},{},{},{},{},{},{}",
 				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
 				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
 				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
@@ -11181,14 +11159,14 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
-				require(fields.next() == Some("v3"), "saved delta record is not current format")?;
+				require(fields.next() == Some("v4"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
 				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
 				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
 				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
-				let decay_gate = fields.next().filter(|value| *value != "-").map(delta_decay_code).transpose()?;
-				let write_gate = fields.next().filter(|value| *value != "-").map(delta_write_code).transpose()?;
+				let decay_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
+				let write_gate = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
 				let value_norm = normalization(fields.next(), "delta value normalization")?;
 				require(fields.next().is_none(), "delta record has extra fields")?;
@@ -12377,26 +12355,6 @@ impl AttentionBlock {
 
 
 }
-/// The decay of a delta block: each step scales the state by exp(-softplus(a) * rate), with rate from the block's ssm_a.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeltaDecay {
-	Softplus,
-}
-impl DeltaDecay {
-	const fn code(self) -> u8 {
-		match self { Self::Softplus => 1 }
-	}
-}
-/// The write strength of a delta block: sigmoid of the beta projection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeltaWrite {
-	Sigmoid,
-}
-impl DeltaWrite {
-	const fn code(self) -> u8 {
-		match self { Self::Sigmoid => 1 }
-	}
-}
 /// One gated delta rule block: value heads, the convolution kernel, and the key
 /// and value extents. A zero extent takes it from the stream, so the value heads
 /// exactly partition the block input and the keys match the values.
@@ -12413,9 +12371,9 @@ struct DeltaBlock {
 	/// Activation applied to the output gate, named by the model.
 	output_activation: Option<Activation>,
 	/// Decay gate of the recurrence, named by the model.
-	decay_gate: Option<DeltaDecay>,
+	decay_gate: Option<Activation>,
 	/// Write gate of the recurrence, named by the model.
-	write_gate: Option<DeltaWrite>,
+	write_gate: Option<Activation>,
 	qk_norm: Option<BlockNormalization>,
 	value_norm: Option<BlockNormalization>,
 }
@@ -12540,6 +12498,7 @@ pub enum Activation {
 	/// activation stays comparable. Owns no weights and preserves shape.
 	Scale(u64),
 	Sqrt,
+	Softplus,
 }
 impl Activation {
 	/// The saved code of the activation. A parameterized activation writes its
@@ -12564,6 +12523,7 @@ impl Activation {
 			Self::Prelu => 15,
 			Self::Scale(_) => 16,
 			Self::Sqrt => 17,
+			Self::Softplus => 18,
 		}
 	}
 }
@@ -13183,7 +13143,7 @@ impl Model {
 		self.delta_block("delta_norms", |delta| (delta.qk_norm, delta.value_norm) = (Some(query_key.normalization()), Some(value.normalization())))
 	}
 	/// Decay and write gates of the preceding delta block, named by the model.
-	pub fn delta_gates(&self, decay: DeltaDecay, write: DeltaWrite) -> Self {
+	pub fn delta_gates(&self, decay: Activation, write: Activation) -> Self {
 		self.delta_block("delta_gates", |delta| (delta.decay_gate, delta.write_gate) = (Some(decay), Some(write)))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
@@ -14889,6 +14849,7 @@ impl Activation {
 			Self::Prelu => "prelu",
 			Self::Scale(_) => "scale",
 			Self::Sqrt => "sqrt",
+			Self::Softplus => "softplus",
 		}
 	}
 }
@@ -15649,7 +15610,7 @@ struct Architecture {
 	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
-	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_gates: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
@@ -15666,8 +15627,8 @@ struct ArchitectureDraft {
 	rope: Option<RopePairs>,
 	convolution: Option<Activation>,
 	output: Option<Activation>,
-	delta_decay: Option<DeltaDecay>,
-	delta_write: Option<DeltaWrite>,
+	delta_decay: Option<Activation>,
+	delta_write: Option<Activation>,
 	qk_norm: Option<BlockNormalization>,
 	value_norm: Option<BlockNormalization>,
 	ple_key_norm: Option<BlockNormalization>,
@@ -15703,23 +15664,12 @@ impl ArchitectureDraft {
 		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale })
 	}
 }
-fn delta_decay_code(value: &str) -> Result<DeltaDecay> {
-	match value {
-		"1" => Ok(DeltaDecay::Softplus),
-		_ => Err(RecipeError::new(format!("saved delta decay gate {value:?} is not known"))),
-	}
-}
-fn delta_write_code(value: &str) -> Result<DeltaWrite> {
-	match value {
-		"1" => Ok(DeltaWrite::Sigmoid),
-		_ => Err(RecipeError::new(format!("saved delta write gate {value:?} is not known"))),
-	}
-}
 fn architecture_activation(value: &str) -> Result<Activation> {
 	match value {
 		"linear" => Ok(Activation::Linear),
 		"relu" => Ok(Activation::Relu),
 		"silu" => Ok(Activation::Silu),
+		"softplus" => Ok(Activation::Softplus),
 		"sigmoid" => Ok(Activation::Sigmoid),
 		"tanh" => Ok(Activation::Tanh),
 		"gelu" => Ok(Activation::Gelu),
@@ -15754,8 +15704,8 @@ fn architectures() -> Result<Vec<Architecture>> {
 			"rope-pairs" => current.rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid rope pairing {value:?}", current.name))) }),
 			"delta-convolution" => current.convolution = Some(architecture_activation(value)?),
 			"delta-output" => current.output = Some(architecture_activation(value)?),
-			"delta-decay" => current.delta_decay = Some(match value { "softplus" => DeltaDecay::Softplus, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta decay {value:?}", current.name))) }),
-			"delta-write" => current.delta_write = Some(match value { "sigmoid" => DeltaWrite::Sigmoid, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid delta write {value:?}", current.name))) }),
+			"delta-decay" => current.delta_decay = Some(architecture_activation(value)?),
+			"delta-write" => current.delta_write = Some(architecture_activation(value)?),
 			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
 			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
 			"feed-forward-activation" => current.feed_forward_activation = Some(architecture_activation(value)?),
@@ -15874,7 +15824,7 @@ struct Builder<'a> {
 	architecture: &'a str,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
-	delta_gates: Option<(DeltaDecay, DeltaWrite)>,
+	delta_gates: Option<(Activation, Activation)>,
 	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	ple_math: Option<PleMath>,
 	feed_forward_activation: Option<Activation>,
@@ -16295,6 +16245,11 @@ impl<'a> Builder<'a> {
 			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
 		}
 		self.slot(gates);
+		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
+		let decay = self.tensor(&name("ssm_a"), &role)?;
+		let values = self.file.values(&decay)?;
+		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
+		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let conv_width = 2 * key_heads * key_width + inner;
 		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
 		self.mapped(vec![qkv]);
@@ -16304,11 +16259,6 @@ impl<'a> Builder<'a> {
 			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
 		)?;
 		self.mapped(vec![taps]);
-		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
-		let decay = self.tensor(&name("ssm_a"), &role)?;
-		let values = self.file.values(&decay)?;
-		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
-		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
 		let order = (0..value_width).collect::<Vec<_>>();
 		let scales = self.scale(&name("ssm_norm.weight"), &role, value_width, heads, &order)?;
 		self.slot(scales);
@@ -19744,6 +19694,16 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		}
 	}
 	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
+	activation_program(&mut program, x, activation, config, graph.profile.gelu_table)?;
+	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
+	push_program(graph, -2, initial, program)
+}
+/// Appends the program of one activation applied to `x` and returns the index of its result. A
+/// linear activation returns `x` itself, so the caller's program names the source.
+fn activation_program(program: &mut ScalarProgram, x: f64, activation: Activation, config: Config, gelu_table: bool) -> Result<f64> {
+	if activation == Activation::Linear {
+		return Ok(x);
+	}
 	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let positive = program.op(ScalarOpcode::Greater, x, zero);
 	let constant = |program: &mut ScalarProgram, value| program.constant(value);
@@ -19751,6 +19711,17 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Cos => program.unary(ScalarOpcode::Cos, x),
 		Activation::Exp => program.unary(ScalarOpcode::Exp, x),
 		Activation::Sqrt => program.unary(ScalarOpcode::SquareRoot, x),
+		Activation::Softplus => {
+			// log(1 + exp(-|x|)) plus the positive part of x.
+			let magnitude = program.unary(ScalarOpcode::Absolute, x);
+			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
+			let exponential = program.unary(ScalarOpcode::Exp, negative);
+			let shifted = program.op(ScalarOpcode::Add, one, exponential);
+			let tail = program.unary(ScalarOpcode::Log, shifted);
+			let positive = program.op(ScalarOpcode::Greater, x, zero);
+			let linear = program.op(ScalarOpcode::Select, positive, x);
+			program.op(ScalarOpcode::Add, linear, tail)
+		}
 		Activation::Log | Activation::Ln => {
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let shifted = program.op(ScalarOpcode::Add, one, absolute);
@@ -19758,18 +19729,18 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let negative = program.op(ScalarOpcode::Subtract, zero, magnitude);
 			let signed = program.choose(positive, magnitude, negative);
 			if activation == Activation::Log {
-				let base = constant(&mut program, std::f64::consts::LN_10);
+				let base = constant(program, std::f64::consts::LN_10);
 				program.op(ScalarOpcode::Divide, signed, base)
 			} else {
 				signed
 			}
 		}
 		Activation::Huber => {
-			let threshold = constant(&mut program, config.activation[7]);
+			let threshold = constant(program, config.activation[7]);
 			let absolute = program.unary(ScalarOpcode::Absolute, x);
 			let large = program.op(ScalarOpcode::Greater, absolute, threshold);
 			let square = program.op(ScalarOpcode::Multiply, x, x);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let small = program.op(ScalarOpcode::Multiply, half, square);
 			let half_threshold = program.op(ScalarOpcode::Multiply, half, threshold);
 			let excess = program.op(ScalarOpcode::Subtract, absolute, half_threshold);
@@ -19785,7 +19756,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 		Activation::Leak | Activation::Elu | Activation::Selu | Activation::Prelu => {
 			let negative = match activation {
 				Activation::Leak => {
-					let slope = constant(&mut program, config.activation[0]);
+					let slope = constant(program, config.activation[0]);
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				Activation::Prelu => {
@@ -19800,20 +19771,20 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					let masked = program.select(inverse, x);
 					let exponential = program.unary(ScalarOpcode::Exp, masked);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
-					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
+					let alpha = constant(program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
 				}
 			};
 			let selected = program.choose(positive, x, negative);
 			if activation == Activation::Selu {
-				let scale = constant(&mut program, config.activation[4]);
+				let scale = constant(program, config.activation[4]);
 				program.op(ScalarOpcode::Multiply, scale, selected)
 			} else {
 				selected
 			}
 		}
 		Activation::Sigmoid | Activation::Silu => {
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			let curved = program.unary(ScalarOpcode::Tanh, half_x);
 			let shifted = program.op(ScalarOpcode::Add, curved, one);
@@ -19821,24 +19792,24 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			if activation == Activation::Silu { program.op(ScalarOpcode::Multiply, x, sigmoid) } else { sigmoid }
 		}
 		Activation::Tanh => program.unary(ScalarOpcode::Tanh, x),
-		Activation::Gelu if graph.profile.gelu_table => {
+		Activation::Gelu if gelu_table => {
 			// llama.cpp's fp16 gelu table: between -10 and 10 the input rounds to
 			// fp16, the tanh form above runs in fp32 on it, and the result rounds
 			// to fp16; at 10 and above the input passes as it is, at -10 and below
 			// the result is zero.
-			let ten = constant(&mut program, 10.0);
-			let minus_ten = constant(&mut program, -10.0);
+			let ten = constant(program, 10.0);
+			let minus_ten = constant(program, -10.0);
 			let rounded = program.unary(ScalarOpcode::Half, x);
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, rounded);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, rounded);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, rounded);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, rounded);
 			let value = program.op(ScalarOpcode::Multiply, half_x, shifted);
 			let tabled = program.unary(ScalarOpcode::Half, value);
@@ -19854,30 +19825,29 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			// The tanh form in ggml's order: 0.5x * (1 + tanh((s*x) * fma(a*x, x, 1))),
 			// one fused step where its compiler fuses one, so an fp32 gelu prints
 			// the bits llama.cpp's does.
-			let cubic = constant(&mut program, config.activation[6]);
+			let cubic = constant(program, config.activation[6]);
 			let cubic_x = program.op(ScalarOpcode::Multiply, cubic, x);
 			let inner_product = program.op(ScalarOpcode::Multiply, cubic_x, x);
 			let inner = program.op(ScalarOpcode::FusedAdd, inner_product, one);
-			let scale = constant(&mut program, config.activation[5]);
+			let scale = constant(program, config.activation[5]);
 			let scale_x = program.op(ScalarOpcode::Multiply, scale, x);
 			let argument = program.op(ScalarOpcode::Multiply, scale_x, inner);
 			let tanh = program.unary(ScalarOpcode::Tanh, argument);
 			let shifted = program.op(ScalarOpcode::Add, one, tanh);
-			let half = constant(&mut program, 0.5);
+			let half = constant(program, 0.5);
 			let half_x = program.op(ScalarOpcode::Multiply, half, x);
 			program.op(ScalarOpcode::Multiply, half_x, shifted)
 		}
 		Activation::Scale(factor) => {
 			let factor = f64::from_bits(factor);
 			require(factor.is_finite(), "scale factor must be finite")?;
-			let factor = constant(&mut program, factor);
+			let factor = constant(program, factor);
 			program.op(ScalarOpcode::Multiply, factor, x)
 		}
 		Activation::Linear => unreachable!(),
 	};
-	let initial = if activation == Activation::Prelu { &config.activation[1..2] } else { &[] };
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3);
-	push_program(graph, -2, initial, program)
+	Ok(result)
 }
 /// Whether the contraction the graph is about to push carries a bias row. A
 /// trained contraction does when its lowering owns one (`bias`); a gate that
@@ -20131,6 +20101,31 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 	require(mscale.is_finite(), "yarn attention scale is nonfinite")?;
 	Ok((f64::from(mscale), f64::from(low), f64::from(high)))
 }
+/// Lowers the delta gates as one elementwise program over the gate projection.
+/// Channels below `heads` take `-exp(rate) * decay(alpha + dt)`, the decay
+/// exponent of the state, and the rest take `write(beta)`. The rate is one
+/// trainable value per head, read through the channel parameter operand.
+fn lower_delta_gates(graph: &mut Graph, heads: usize, decay: Activation, write: Activation, config: Config) -> Result<()> {
+	require(decay != Activation::Prelu && write != Activation::Prelu, "delta gate activations take no parameters")?;
+	let mut program = ScalarProgram(Vec::new());
+	let x = -1.0;
+	let zero = program.constant(0.0);
+	let channel = program.op(ScalarOpcode::Channel, 0.0, 0.0);
+	let boundary = program.constant(heads as f64 - 0.5);
+	let beta = program.op(ScalarOpcode::Greater, channel, boundary);
+	let rate = program.op(ScalarOpcode::ChannelParameter, 0.0, heads as f64);
+	let scale = program.unary(ScalarOpcode::Exp, rate);
+	let decayed = activation_program(&mut program, x, decay, config, graph.profile.gelu_table)?;
+	let exponent = program.op(ScalarOpcode::Multiply, decayed, scale);
+	let negated = program.op(ScalarOpcode::Subtract, zero, exponent);
+	let written = activation_program(&mut program, x, write, config, graph.profile.gelu_table)?;
+	program.choose(beta, written, negated);
+	// The planes hold the decay exponent and the write in double, as the recurrence reads them.
+	let block = graph.block_precision.replace(Compute::FP64);
+	let pushed = push_program(graph, -2, &vec![0.0; heads], program);
+	graph.block_precision = block;
+	pushed
+}
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
 /// stream, a second carries the decay and write gate pre-activations, and the
@@ -20154,6 +20149,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
+	lower_delta_gates(graph, heads, decay, write, config)?;
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
@@ -20165,8 +20161,8 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, qk_norm, key_width, checked_mul(2, keys, "delta query and key span")?)?;
-	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, decay.code() as f64, write.code() as f64, 0.0, 0.0];
-	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	push_node(graph, Primitive::Delta, recurrent, 0, argument, gates)?;
 	// The recurrent read uses the same inverse-root key-width scale as attention.
 	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
 	lower_normalize(graph, value_norm, value_width, inner)?;
@@ -21515,10 +21511,17 @@ mod precision_contract_checks {
 				graph.profile = config.profile;
 				graph.profile.sum = format;
 				graph.profile.atvn = format;
-				let gates = constant(&mut graph, -1, Shape { channels: 2, length: 2 }, 0.0).unwrap();
+				// The gate planes are the decay exponent, log(1/2), then the write, 1/2.
+				let mut gate_program = ScalarProgram(Vec::new());
+				let channel = gate_program.op(ScalarOpcode::Channel, 0.0, 0.0);
+				let boundary = gate_program.constant(0.5);
+				let beta = gate_program.op(ScalarOpcode::Greater, channel, boundary);
+				let exponent = gate_program.constant(-2.0_f64.ln());
+				let write = gate_program.constant(0.5);
+				gate_program.choose(beta, write, exponent);
+				let gates = program(&mut graph, -1, -2, Shape { channels: 2, length: 2 }, &[], gate_program).unwrap();
 				reset(&mut graph, -1, shape);
-				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 1, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
-				graph.parameters.fill(0.0);
+				push_node(&mut graph, Primitive::Delta, Shape { channels: 1, length: 2 }, 0, [1.0, 1.0, chunk as f64, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], gates).unwrap();
 				graph.block_precision = Some(Compute::FP32);
 				lower_scale(&mut graph, scale).unwrap();
 				// The existing forward predicts from the prior state before decay:
@@ -21537,11 +21540,7 @@ mod precision_contract_checks {
 				let adjoints = tape.input_adjoint.download_float(6, Compute::FP32).unwrap();
 				for (i, (got, want)) in adjoints.iter().zip(expected).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} delta input {i}: {got} vs {want}", format.label()); }
 				let gate_values = tape.adjoints.download_float_bytes(tape.program.artifact.layout.adjoints[gates as usize], 4, Compute::FP32).unwrap();
-				for (i, (got, want)) in gate_values.iter().zip([0.0, -0.015625 * d1, 0.03125 * s0, 0.05859375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
-				let softplus = format.unpack(format.pack(2.0_f64.ln()));
-				let expected_decay = -0.03125 * softplus * d1;
-				let decay = tape.download_gradient().unwrap()[0];
-				assert!((decay - expected_decay).abs() < 1e-12, "{} chunk {chunk} decay {decay} vs {expected_decay}", format.label());
+				for (i, (got, want)) in gate_values.iter().zip([0.0, 0.03125 * d1, 0.125 * s0, 0.234375 * d1]).enumerate() { assert!((got - want).abs() < 1e-12, "{} chunk {chunk} gate {i}: {got} vs {want}", format.label()); }
 			}
 		}
 	}
@@ -24089,7 +24088,7 @@ fn backward_context_bytes(node: &Node, rows: usize) -> Result<usize> {
 		Primitive::Delta => {
 			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
 			let state = checked_mul(key_width, width, "delta adjoint state")?;
-			let vectors = checked_add(checked_mul(2, width, "delta adjoint vectors")?, 1, "delta decay partial")?;
+			let vectors = checked_mul(2, width, "delta adjoint vectors")?;
 			checked_mul(checked_mul(rows, heads, "delta backward pairs")?, checked_add(state, vectors, "delta backward pair")?, "delta backward context")?
 		}
 		_ => return Err(RecipeError::new("this op has no separate backward context")),
@@ -24166,7 +24165,7 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute, inf
 			let pair_bytes = checked_mul(checked_mul(rows, heads, "delta pairs")?, precision.bytes(), "delta pair bytes")?;
 			vec![
 				(checked_mul(pair_bytes, state, "delta carried state bytes")?, Retained),
-				(checked_mul(pair_bytes, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta reserved bytes")?, Unused),
+				(checked_mul(pair_bytes, checked_mul(2, width, "delta vectors")?, "delta reserved bytes")?, Unused),
 			]
 		}
 		Primitive::Pool if inference => Vec::new(),

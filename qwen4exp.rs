@@ -37,7 +37,7 @@ pub fn model() -> Model {
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
 				.delta_norms(l2, rms)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
-				.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
+				.delta_gates(Activation::Softplus, Activation::Sigmoid)
 		};
 		model = if rank == 0 { model.hyper(lanes, &attention, 1.0 / lanes as f64) } else { model.hyper_gate(lanes, &attention, hyper_gate(lanes, rank, width)) };
 		let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
