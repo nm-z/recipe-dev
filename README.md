@@ -260,6 +260,14 @@ The answers file names one choice for each question on the active branch:
 {"schema_version":1,"status":"ok","answers":[{"id":"parse","choice":"table","probability":0.99}]}
 ```
 
+A SQLite file uses the `sqlite_table` parse path. The answers name one table and its feature types:
+
+```json
+{"id":"sqlite_table","choice":"samples"}
+```
+
+The probe records each WAV file's sample rate and frame count, and an `envelope`: 16 hexadecimal digits, one per span of the samples, ranked by mean amplitude from `0` (quietest) to `f` (loudest).
+
 ```rust
 let data = recipe.data("measurements/").schema("schema.json").target(["temperature"]);
 ```
