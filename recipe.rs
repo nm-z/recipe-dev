@@ -16431,7 +16431,7 @@ fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &s
 	}
 	if plain {
 		let pre = if part == "attn" { "attn_norm.weight" } else if file.tensor(&name("ffn_norm.weight")).is_some() { "ffn_norm.weight" } else { "post_attention_norm.weight" };
-		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity) && block.has_normalization());
+		let normalized = parts.first().is_some_and(|block| matches!(block.operation, Operation::Identity | Operation::Norm) && block.has_normalization());
 		if !normalized && file.tensor(&name(pre)).is_some() {
 			let mut scale = Block::of(Operation::Identity);
 			scale.maps.push(ActivationStep::new(ActivationMap::Normalize(BlockNormalization::Rms)));
@@ -16529,7 +16529,7 @@ impl Builder<'_> {
 		let (mut weighted, mut hidden) = (false, 0);
 		for step in parts {
 			match &step.operation {
-				Operation::Identity => {}
+				Operation::Identity | Operation::Norm => {}
 				Operation::Attention(attention) => {
 					self.attention_planes(layer, attention, step.qk.is_some(), width)?;
 					weighted = true;
@@ -17141,55 +17141,71 @@ fn request_ids(query: &str, name: &str) -> Result<Vec<u32>> {
 }
 fn try_serve(placed: &Placed, address: &str, requests: usize) -> Result<()> {
 	let listener = std::net::TcpListener::bind(address).map_err(|error| RecipeError::new(format!("cannot serve decode on {address}: {error}")))?;
-	listener.set_nonblocking(true).map_err(|error| RecipeError::new(format!("cannot make the decode listener nonblocking: {error}")))?;
+	if requests == 0 { return Ok(()); }
+	let local = listener.local_addr().map_err(|error| RecipeError::new(format!("cannot read the decode listener address: {error}")))?;
+	let wake = match local.ip() {
+		std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local.port()),
+		std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), local.port()),
+		_ => local,
+	};
 	let (sender, receiver) = std::sync::mpsc::channel::<(std::net::TcpStream, String)>();
-	let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let stopping = Arc::new(AtomicBool::new(false));
 	let accepting = std::thread::spawn({
-		let pending = pending.clone();
+		let admitted = admitted.clone();
+		let stopping = stopping.clone();
 		move || -> Result<()> {
-			let mut admitted = 0;
-			while admitted < requests || pending.load(Ordering::SeqCst) != 0 {
-				let (mut stream, _) = match listener.accept() {
-					Ok(client) => client,
-					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-						std::thread::sleep(Duration::from_millis(5));
-						continue;
-					}
-					Err(error) => return Err(RecipeError::new(format!("cannot accept a decode request: {error}"))),
-				};
-				let target = match request_target(&mut stream) {
-					Ok(target) => target,
-					Err(error) => {
-						let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
-						continue;
-					}
-				};
-				match target.split('?').next().unwrap_or("") {
-					"/" => { let _ = write_http(&mut stream, "200 OK", "text/plain", "Recipe ready\n"); }
-					"/health" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"status\":\"ok\"}"); }
-					"/v1/models" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"recipe\",\"object\":\"model\"}]}"); }
-					"/decode" if admitted < requests => {
-						pending.fetch_add(1, Ordering::SeqCst);
-						if sender.send((stream, target)).is_err() {
-							pending.fetch_sub(1, Ordering::SeqCst);
-							return Err(RecipeError::new("decode worker stopped before accepting the request"));
-						}
-						admitted += 1;
-					}
-					"/decode" => { let _ = write_http(&mut stream, "503 Service Unavailable", "text/plain", "decode request limit reached\n"); }
-					_ => { let _ = write_http(&mut stream, "404 Not Found", "text/plain", "not found\n"); }
-				}
+			let mut handlers = Vec::new();
+			loop {
+				let (stream, _) = listener.accept().map_err(|error| RecipeError::new(format!("cannot accept a decode request: {error}")))?;
+				if stopping.load(Ordering::SeqCst) { break; }
+				let sender = sender.clone();
+				let admitted = admitted.clone();
+				handlers.push(std::thread::spawn(move || serve_request_head(stream, sender, admitted, requests)));
+			}
+			for handler in handlers {
+				handler.join().map_err(|_| RecipeError::new("decode request reader panicked"))?;
 			}
 			Ok(())
 		}
 	});
-	for (mut stream, target) in receiver {
-		if let Err(error) = serve_decode(placed, &mut stream, &target) {
-			let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
+	let decoded = (|| -> Result<()> {
+		for _ in 0..requests {
+			let (mut stream, target) = receiver.recv().map_err(|_| RecipeError::new("decode listener stopped before all requested completions"))?;
+			if let Err(error) = serve_decode(placed, &mut stream, &target) {
+				let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
+			}
 		}
-		pending.fetch_sub(1, Ordering::SeqCst);
+		Ok(())
+	})();
+	stopping.store(true, Ordering::SeqCst);
+	let _ = std::net::TcpStream::connect(wake);
+	let accepted = accepting.join().map_err(|_| RecipeError::new("decode listener panicked"))?;
+	decoded?;
+	accepted
+}
+fn serve_request_head(mut stream: std::net::TcpStream, sender: std::sync::mpsc::Sender<(std::net::TcpStream, String)>, admitted: Arc<std::sync::atomic::AtomicUsize>, requests: usize) {
+	let target = match request_target(&mut stream) {
+		Ok(target) => target,
+		Err(error) => {
+			let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
+			return;
+		}
+	};
+	match target.split('?').next().unwrap_or("") {
+		"/" => { let _ = write_http(&mut stream, "200 OK", "text/plain", "Recipe ready\n"); }
+		"/health" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"status\":\"ok\"}"); }
+		"/v1/models" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"recipe\",\"object\":\"model\"}]}"); }
+		"/decode" if admitted.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| (count < requests).then_some(count + 1)).is_ok() => {
+			if let Err(error) = sender.send((stream, target)) {
+				admitted.fetch_sub(1, Ordering::SeqCst);
+				let (mut stream, _) = error.0;
+				let _ = write_http(&mut stream, "503 Service Unavailable", "text/plain", "decode worker unavailable\n");
+			}
+		}
+		"/decode" => { let _ = write_http(&mut stream, "503 Service Unavailable", "text/plain", "decode request limit reached\n"); }
+		_ => { let _ = write_http(&mut stream, "404 Not Found", "text/plain", "not found\n"); }
 	}
-	accepting.join().map_err(|_| RecipeError::new("decode listener panicked"))?
 }
 fn write_http(stream: &mut std::net::TcpStream, status: &str, content_type: &str, body: &str) -> Result<()> {
 	use std::io::Write as _;
@@ -17198,11 +17214,14 @@ fn write_http(stream: &mut std::net::TcpStream, status: &str, content_type: &str
 }
 fn request_target(stream: &mut std::net::TcpStream) -> Result<String> {
 	use std::io::Read as _;
-	stream.set_read_timeout(Some(Duration::from_millis(250))).map_err(|error| RecipeError::new(format!("cannot set request timeout: {error}")))?;
+	let deadline = Instant::now() + Duration::from_secs(1);
 	let mut head = Vec::new();
 	let mut byte = [0_u8; 1];
 	while !head.ends_with(b"\r\n\r\n") {
 		require(head.len() < 8192, "decode request head is longer than 8192 bytes")?;
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		require(!remaining.is_zero(), "decode request head exceeded its one-second deadline")?;
+		stream.set_read_timeout(Some(remaining)).map_err(|error| RecipeError::new(format!("cannot set request timeout: {error}")))?;
 		let read = stream.read(&mut byte).map_err(|error| RecipeError::new(format!("cannot read a decode request: {error}")))?;
 		require(read == 1, "decode request ended before its head")?;
 		head.push(byte[0]);
