@@ -25,6 +25,7 @@ pub fn model() -> Model {
 		} else {
 			recipe.model().delta(qwen4exp.ssm.time_step_rank, qwen4exp.ssm.conv_kernel)
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
+				.delta_norms(l2, rms)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
 		};
 		model = if rank == 0 { model.hyper(lanes, &attention) } else { model.hyper_gate(lanes, &attention, hyper_gate(lanes, rank, width)) };

@@ -10754,10 +10754,11 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
 			Operation::Delta(delta) => format!(
-				"delta,{},{},{},{},{},{},{},{}",
+				"delta,v3,{},{},{},{},{},{},{},{},{},{}",
 				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output,
 				delta.conv_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
-				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string())
+				delta.output_activation.map_or("-".to_owned(), |activation| activation.code().to_string()),
+				normalization_text(delta.qk_norm), normalization_text(delta.value_norm)
 			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 			Operation::Norm => "norm".to_owned(),
@@ -10915,15 +10916,16 @@ mod bundle {
 				fields.next().map(|field| value_at(Some(field), "depthwise convolution dilation")).transpose()?.unwrap_or(1),
 			)),
 			"delta" => {
+				require(fields.next() == Some("v3"), "saved delta record is not current format")?;
 				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
-				// A bundle written before the extents were separable names neither, so
-				// an absent field takes the extent from the stream, as the builder does.
-				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
-				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
-				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
+				let (key_heads, key_width) = (value_at(fields.next(), "delta key heads")?, value_at(fields.next(), "delta key width")?);
+				let (value_width, output) = (value_at(fields.next(), "delta value width")?, value_at(fields.next(), "delta output width")?);
 				let conv_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
 				let output_activation = fields.next().filter(|value| *value != "-").map(activation).transpose()?;
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
+				let qk_norm = normalization(fields.next(), "delta query/key normalization")?;
+				let value_norm = normalization(fields.next(), "delta value normalization")?;
+				require(fields.next().is_none(), "delta record has extra fields")?;
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation, qk_norm, value_norm }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -12107,10 +12109,12 @@ struct DeltaBlock {
 	conv_activation: Option<Activation>,
 	/// Activation applied to the output gate, named by the model.
 	output_activation: Option<Activation>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: None, output_activation: None, qk_norm: None, value_norm: None }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -12818,6 +12822,9 @@ impl Model {
 	/// Activations of the preceding delta block's convolution and output gate.
 	pub fn delta_activations(&self, convolution: Activation, output: Activation) -> Self {
 		self.delta_block("delta_activations", |delta| (delta.conv_activation, delta.output_activation) = (Some(convolution), Some(output)))
+	}
+	pub fn delta_norms(&self, query_key: impl NormalizationSelector, value: impl NormalizationSelector) -> Self {
+		self.delta_block("delta_norms", |delta| (delta.qk_norm, delta.value_norm) = (Some(query_key.normalization()), Some(value.normalization())))
 	}
 	/// Output width of the preceding `delta` block's closing projection.
 	pub fn out(&self, width: usize) -> Self {
@@ -15269,6 +15276,25 @@ struct Architecture {
 	name: String,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
+}
+#[derive(Default)]
+struct ArchitectureDraft {
+	name: String,
+	rope: Option<RopePairs>,
+	convolution: Option<Activation>,
+	output: Option<Activation>,
+	qk_norm: Option<BlockNormalization>,
+	value_norm: Option<BlockNormalization>,
+}
+impl ArchitectureDraft {
+	fn finish(self) -> Result<Architecture> {
+		let rope = self.rope.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no rope pairing", self.name)))?;
+		require(self.convolution.is_some() == self.output.is_some(), format!("architecture {:?} names only one delta activation", self.name))?;
+		require(self.qk_norm.is_some() == self.value_norm.is_some(), format!("architecture {:?} names only one delta normalization", self.name))?;
+		require(self.convolution.is_some() == self.qk_norm.is_some(), format!("architecture {:?} has an incomplete delta profile", self.name))?;
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_norms: self.qk_norm.zip(self.value_norm) })
+	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
 	match value {
@@ -15283,32 +15309,38 @@ fn architecture_activation(value: &str) -> Result<Activation> {
 		_ => Err(RecipeError::new(format!("architecture activation {value:?} is not supported"))),
 	}
 }
+fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
+	match value {
+		"rms" => Ok(BlockNormalization::Rms),
+		"l2" => Ok(BlockNormalization::L2),
+		"layer" => Ok(BlockNormalization::Layer),
+		"batch" => Ok(BlockNormalization::Batch),
+		_ => Err(RecipeError::new(format!("architecture normalization {value:?} is not supported"))),
+	}
+}
 fn architectures() -> Result<Vec<Architecture>> {
-	let (mut rows, mut name, mut rope, mut convolution, mut output) = (Vec::new(), None::<String>, None, None, None);
-	let finish = |name: String, rope: Option<RopePairs>, convolution: Option<Activation>, output: Option<Activation>| -> Result<Architecture> {
-		let rope = rope.ok_or_else(|| RecipeError::new(format!("architecture {name:?} names no rope pairing")))?;
-		require(convolution.is_some() == output.is_some(), format!("architecture {name:?} names only one delta activation"))?;
-		Ok(Architecture { name, rope, delta_activation: convolution.zip(output) })
-	};
+	let (mut rows, mut current) = (Vec::new(), None::<ArchitectureDraft>);
 	for raw in include_str!("Cargo.toml").lines() {
 		let line = raw.split('#').next().unwrap_or("").trim();
 		if line.starts_with('[') {
-			if let Some(previous) = name.take() { rows.push(finish(previous, rope.take(), convolution.take(), output.take())?); }
-			name = line.strip_prefix("[architecture.").and_then(|value| value.strip_suffix(']')).map(str::to_owned);
+			if let Some(previous) = current.take() { rows.push(previous.finish()?); }
+			current = line.strip_prefix("[architecture.").and_then(|value| value.strip_suffix(']')).map(|name| ArchitectureDraft { name: name.to_owned(), ..Default::default() });
 			continue;
 		}
-		let Some(current) = name.as_ref() else { continue };
+		let Some(current) = current.as_mut() else { continue };
 		if line.is_empty() { continue; }
-		let (key, value) = line.split_once('=').ok_or_else(|| RecipeError::new(format!("architecture {current:?} contains an invalid field")))?;
-		let value = value.trim().strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| RecipeError::new(format!("architecture {current:?} field {key:?} is not a string")))?;
+		let (key, value) = line.split_once('=').ok_or_else(|| RecipeError::new(format!("architecture {:?} contains an invalid field", current.name)))?;
+		let value = value.trim().strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| RecipeError::new(format!("architecture {:?} field {key:?} is not a string", current.name)))?;
 		match key.trim() {
-			"rope-pairs" => rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {current:?} has invalid rope pairing {value:?}"))) }),
-			"delta-convolution" => convolution = Some(architecture_activation(value)?),
-			"delta-output" => output = Some(architecture_activation(value)?),
-			key => return Err(RecipeError::new(format!("architecture {current:?} has unknown field {key:?}"))),
+			"rope-pairs" => current.rope = Some(match value { "halves" => RopePairs::Halves, "neighbours" => RopePairs::Neighbours, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid rope pairing {value:?}", current.name))) }),
+			"delta-convolution" => current.convolution = Some(architecture_activation(value)?),
+			"delta-output" => current.output = Some(architecture_activation(value)?),
+			"delta-qk-norm" => current.qk_norm = Some(architecture_normalization(value)?),
+			"delta-value-norm" => current.value_norm = Some(architecture_normalization(value)?),
+			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
 		}
 	}
-	if let Some(previous) = name { rows.push(finish(previous, rope, convolution, output)?); }
+	if let Some(previous) = current { rows.push(previous.finish()?); }
 	require(!rows.is_empty(), "Cargo.toml names no model architectures")?;
 	let mut seen = BTreeSet::new();
 	for row in &rows { require(seen.insert(row.name.clone()), format!("architecture {:?} is duplicated", row.name))?; }
@@ -15403,6 +15435,7 @@ struct Builder<'a> {
 	architecture: &'a str,
 	rope: RopePairs,
 	delta_activation: Option<(Activation, Activation)>,
+	delta_norms: Option<(BlockNormalization, BlockNormalization)>,
 	plan: Binding,
 }
 /// The dimensions every row reads from the `<architecture>.*` namespace.
@@ -15448,7 +15481,7 @@ impl<'a> Builder<'a> {
 			let known = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>().join(", ");
 			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
 		})?;
-		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default() };
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, delta_norms: row.delta_norms, plan: Binding::default() };
 		let dimensions = builder.dimensions()?;
 		let blocks = builder.integer("block_count")?;
 		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
@@ -15761,7 +15794,8 @@ impl<'a> Builder<'a> {
 		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
 		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
 		let (conv_activation, output_activation) = self.delta_activation.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta activations", self.architecture)))?;
-		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation) };
+		let (qk_norm, value_norm) = self.delta_norms.ok_or_else(|| RecipeError::new(format!("architecture {:?} names no delta normalizations", self.architecture)))?;
+		let delta = DeltaBlock { heads, kernel, key_heads, key_width: state, value_width: state, output: dimensions.width, conv_activation: Some(conv_activation), output_activation: Some(output_activation), qk_norm: Some(qk_norm), value_norm: Some(value_norm) };
 		self.delta_planes(layer, &delta, dimensions.width)?;
 		Ok(branch.push(Operation::Delta(delta)))
 	}
@@ -16492,7 +16526,7 @@ fn fitting_context(file: &Gguf, model: &Model, plan: &Binding, device: &'static 
 fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 	let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
 	let rope = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?.rope;
-	let mut builder = Builder { file, architecture, rope, delta_activation: None, plan: Binding::default() };
+	let mut builder = Builder { file, architecture, rope, delta_activation: None, delta_norms: None, plan: Binding::default() };
 	builder.plan_model(model)?;
 	let unread = file.tensors().iter().filter(|tensor| !builder.plan.tensors.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 	require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
@@ -19281,6 +19315,8 @@ fn yarn_parameters_chain(factor: f64, context: usize, dims: usize, base: f64, fa
 fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
 	let conv_activation = delta.conv_activation.ok_or_else(|| RecipeError::new("delta names no convolution activation; call delta_activations"))?;
 	let output_activation = delta.output_activation.ok_or_else(|| RecipeError::new("delta names no output activation; call delta_activations"))?;
+	let qk_norm = delta.qk_norm.ok_or_else(|| RecipeError::new("delta names no query/key normalization; call delta_norms"))?;
+	let value_norm = delta.value_norm.ok_or_else(|| RecipeError::new("delta names no value normalization; call delta_norms"))?;
 	let (source, input) = (graph.source, graph.output);
 	let (heads, kernel) = (delta.heads, delta.kernel);
 	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
@@ -19302,12 +19338,12 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	lower_normalize(graph, qk_norm, key_width, checked_mul(2, keys, "delta query and key span")?)?;
 	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
 	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
 	// The recurrent read uses the same inverse-root key-width scale as attention.
 	lower_scale(graph, 1.0 / (key_width as f64).sqrt())?;
-	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
+	lower_normalize(graph, value_norm, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;

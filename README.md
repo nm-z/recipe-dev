@@ -67,6 +67,7 @@ attn(heads).int(8)
 ```rust
 let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
+	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
 	.norm(rms);
 let gate = HyperGate {
@@ -89,6 +90,7 @@ let model = recipe.model()
 	delta(heads, kernel)
 		.keys(count, width)
 		.values(width)
+		.delta_norms(l2, rms)
 		.delta_activations(Activation::Silu, Activation::Sigmoid)
 		.out(width)
 		.delta_activations(convolution, output)
@@ -255,7 +257,7 @@ recipe stats model.gguf
 recipe keys model.gguf
 ```
 
-GGUF tensor pairing and delta activations come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`); gated-delta models also name `delta-convolution` and `delta-output`. Unknown names fail instead of taking another architecture's defaults.
+GGUF tensor pairing, delta activations, and delta normalizations come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`); gated-delta models also name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`. Unknown names fail instead of taking another architecture's defaults.
 
 ## Precision and reference checks
 
