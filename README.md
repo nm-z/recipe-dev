@@ -351,8 +351,9 @@ report.*
 		(name|device|block|node|row_start|shape|input_window|dtype|bytes)
 	(load|compile).seconds()
 	path
-	(formats|memory|links|aot|tiles|grids)[]
+	(formats|memory|links|aot|tiles|grids|barriers)[]
 	llvm.(instructions|intrinsics)[]
+	llvm.(fused_nodes|barriers)
 train().run().*
 	(itl|fnl).*
 		(loss|r2)

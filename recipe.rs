@@ -1687,10 +1687,61 @@ fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, b
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
+/// Byte ranges of the value buffer that one node's kernel reads and writes.
+/// The planner chose these slots from the same lifetimes it reuses storage
+/// by, so two kernels that share no range need no grid barrier between them.
+#[derive(Clone, Default)]
+pub(crate) struct ValueAccess {
+	reads: Vec<(usize, usize)>,
+	writes: Vec<(usize, usize)>,
+}
+
+impl ValueAccess {
+	fn range(begin: usize, bytes: usize) -> Option<(usize, usize)> {
+		(bytes != 0).then_some((begin, begin + bytes))
+	}
+	fn overlap(left: &[(usize, usize)], right: &[(usize, usize)]) -> bool {
+		left.iter().any(|(begin, end)| right.iter().any(|(other_begin, other_end)| begin < other_end && other_begin < end))
+	}
+	/// The hazard that stops a kernel with access `next` from running before every
+	/// outstanding access in `self` is ordered, if any: it must not write what an
+	/// outstanding kernel reads or writes, and must not read what one writes.
+	fn hazard(&self, next: &Self) -> Option<&'static str> {
+		if Self::overlap(&next.reads, &self.writes) {
+			Some("read after write")
+		} else if Self::overlap(&next.writes, &self.reads) {
+			Some("write after read")
+		} else if Self::overlap(&next.writes, &self.writes) {
+			Some("write after write")
+		} else {
+			None
+		}
+	}
+	fn join(&mut self, next: &Self) {
+		self.reads.extend_from_slice(&next.reads);
+		self.writes.extend_from_slice(&next.writes);
+	}
+	fn is_empty(&self) -> bool {
+		self.reads.is_empty() && self.writes.is_empty()
+	}
+}
+
+/// Grid barrier call sites in one lowered inference forward: those emitted, and
+/// those dropped between nodes whose accesses do not conflict.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ForwardBarriers {
+	pub emitted: usize,
+	pub elided: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
 	pub window_positions: usize,
 	pub values: Vec<usize>,
+	/// At inference, the value buffer ranges that each contraction or elementwise
+	/// node reads and writes, including the converted copies it makes. Every other
+	/// node is `None` and keeps its barrier.
+	pub barrier_access: Vec<Option<ValueAccess>>,
 	pub contexts: Vec<usize>,
 	pub contexts_in_values: Vec<bool>,
 	pub context_resets: Vec<(usize, usize)>,
@@ -1875,12 +1926,17 @@ pub(crate) struct NativeArtifact {
 	step: bool,
 	llvm: LlvmNames,
 	compile_seconds: f64,
+	barriers: ForwardBarriers,
 }
 
 #[derive(Clone, Default)]
 struct LlvmNames {
 	instructions: Vec<String>,
 	intrinsics: Vec<String>,
+	/// Consumers whose loop a producer's loop computes, as the emitter marked them.
+	fused: usize,
+	/// Barrier call sites in the model's block functions.
+	barriers: usize,
 }
 
 fn llvm_names(ir: &str) -> LlvmNames {
@@ -1902,7 +1958,17 @@ fn llvm_names(ir: &str) -> LlvmNames {
 		intrinsics.insert(rest[..end].to_owned());
 		rest = &rest[end..];
 	}
-	LlvmNames { instructions: instructions.into_iter().collect(), intrinsics: intrinsics.into_iter().collect() }
+	let (mut fused, mut barriers, mut in_block) = (0, 0, false);
+	for line in ir.lines() {
+		if line.starts_with("define ") {
+			in_block = line.starts_with("define internal void @recipe_model_block");
+		} else if line.starts_with("; recipe.fused ") {
+			fused += 1;
+		} else if in_block && matches!(line, "call void @grid_barrier(i32 %threads)" | "call void @recipe.cpu.barrier()") {
+			barriers += 1;
+		}
+	}
+	LlvmNames { instructions: instructions.into_iter().collect(), intrinsics: intrinsics.into_iter().collect(), fused, barriers }
 }
 
 /// The model-load storage arena as stored bytes at their arena offsets, so the
@@ -2308,6 +2374,8 @@ impl NativeLayout {
 		let mut attention_kv = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let mut casts = Vec::with_capacity(graph.nodes.len());
+		let mut value_bytes = Vec::with_capacity(graph.nodes.len());
+		let mut barrier_access = Vec::with_capacity(graph.nodes.len());
 		let mut kept = Vec::new();
 		let mut cast_adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_plan, mut context_plan, mut adjoint_plan) = (BufferPlan::default(), BufferPlan::default(), BufferPlan::default());
@@ -2336,10 +2404,12 @@ impl NativeLayout {
 				trace(&format!("layout node {index} slot {slot} bytes {bytes} last {} retained {} source {} second {}", last.get(index).copied().unwrap_or(0), retained.get(index).copied().unwrap_or(false), node.source, node.second))?;
 			}
 			values.push(slot);
+			value_bytes.push(bytes);
 			// An operand computed in another arithmetic is converted into this
 			// node's type first; the converted copy and, in training, the adjoint
 			// contribution on its way back each take a slot of their own.
 			let mut node_casts = [None, None];
+			let mut converted_writes = Vec::new();
 			let mut node_cast_adjoints = [None, None];
 			for (position, operand) in [node.source, node.second].into_iter().enumerate() {
 				let (source, shape) = if let Ok(operand) = usize::try_from(operand) {
@@ -2353,6 +2423,7 @@ impl NativeLayout {
 					let lifetime = if inference && !retained_operand(graph, index, position, &signatures) { BufferLifetime::Until(step) } else { BufferLifetime::Retained };
 					let slot = value_plan.allocate(&[(converted, lifetime)], unit, cast_step, inference)?;
 					node_casts[position] = Some(slot);
+					converted_writes.extend(ValueAccess::range(slot, converted));
 				}
 				if !inference && NativePrecision::new(source.precision, source.acc)?.state != state {
 					let converted = graph_rows_buffer(shape, rows, state.bytes())?;
@@ -2361,6 +2432,16 @@ impl NativeLayout {
 				}
 			}
 			casts.push(node_casts);
+			// A contraction or an elementwise node touches only its operands' values,
+			// the converted copies it makes of them, its weights, which nothing
+			// writes, and its own value.
+			barrier_access.push((inference && matches!(node.op, Primitive::Contraction | Primitive::Elementwise)).then(|| {
+				let operands = [node.source, node.second].into_iter().filter_map(|operand| usize::try_from(operand).ok());
+				ValueAccess {
+					reads: operands.filter_map(|operand| ValueAccess::range(values[operand], value_bytes[operand])).collect(),
+					writes: ValueAccess::range(slot, bytes).into_iter().chain(converted_writes).collect(),
+				}
+			}));
 			cast_adjoints.push(node_cast_adjoints);
 			let mut context_node = node.clone();
 			if node.op != Primitive::Attention {
@@ -2422,7 +2503,7 @@ impl NativeLayout {
 		let split_bytes = graph.nodes.iter().filter(|node| matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut)).map(|node| node.output.channels.saturating_mul(node.input.channels.div_ceil(32)).saturating_mul(8)).max().unwrap_or(0);
 		let split_scratch = if inference && split_bytes != 0 { Some(context_plan.allocate(&[(split_bytes, BufferLifetime::Retained)], 8, 0, false)?) } else { None };
 		let (dead_bytes, dead_buffers) = if inference { BufferPlan::unreused_dead_storage(&[&value_plan, &context_plan])? } else { (0, 0) };
-		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
+		Ok(Self { window_positions, precisions, input_precision, input_adjoint_precision, output_precision, output_adjoint_precision, weights, gradients, gradient_precisions, gradient_bytes, spans, casts, cast_adjoints, values, barrier_access, contexts, contexts_in_values, context_resets: context_plan.reset_ranges(), attention_kv, adjoints, schedule, values_bytes: value_plan.bytes.max(element), dead_bytes, dead_buffers, contexts_bytes: context_plan.bytes.max(element), adjoints_bytes: adjoint_plan.bytes.max(element), timing, clocks, last_column, split_scratch, knobs, kept })
 	}
 }
 
@@ -2690,6 +2771,8 @@ pub(crate) struct NativeModelIr {
 	/// The layout is the inference layout: no adjoints, forward-only contexts,
 	/// and shared value slots.
 	inference: bool,
+	/// What the last lowered inference forward emitted and elided.
+	barriers: std::cell::Cell<ForwardBarriers>,
 }
 
 impl NativeModelIr {
@@ -2772,7 +2855,7 @@ impl NativeModelIr {
 				packed: kept,
 			});
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, variants, rows, schedule, plans, storage_bytes, inference })
+		Ok(Self { graph: graph.clone(), layout, precision, variants, rows, schedule, plans, storage_bytes, inference, barriers: Default::default() })
 	}
 	/// The suffix on every template symbol a node calls: empty for the run's own
 	/// arithmetic, the variant's suffix for any other.
@@ -3293,6 +3376,17 @@ fn barrier(backend: Backend) -> &'static str {
 	match backend {
 		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)\n",
+	}
+}
+
+/// The synchronization that stays when a grid barrier is elided: one workgroup
+/// finishes the shared tile of a kernel before the next kernel reuses it. A CPU
+/// workgroup is one thread and has no shared tile.
+fn workgroup_barrier(backend: Backend) -> &'static str {
+	match backend {
+		Backend::Cpu => "",
+		Backend::Amd => "call void @recipe.workgroup.barrier()\n",
+		Backend::Nvidia => "call void @llvm.nvvm.barrier0()\n",
 	}
 }
 
@@ -4429,11 +4523,16 @@ impl NativeModelIr {
 		let blocked = !reverse && !training;
 		let mut windows = String::new();
 		let mut block = None;
+		// What the contractions emitted since the last grid barrier read and write,
+		// and the barriers dropped between contractions that do not conflict.
+		let mut outstanding = ValueAccess::default();
+		let mut elided = 0usize;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
 			self.plans.iter().enumerate().collect::<Vec<_>>()
 		};
+		let fusion = self.plan_fusion(reverse, training)?;
 		for (index, plan) in order {
 			// Recurrent body nodes are emitted by the scan's uniform position loop.
 			// They are still plans so their parameters, storage, and adjoints remain
@@ -4442,9 +4541,52 @@ impl NativeModelIr {
 			if plan.node.block_kind == "recur_body" {
 				continue;
 			}
+			// The barrier after a contraction or an elementwise node is deferred to the
+			// next node: it stays when that node is of another kind, starts another
+			// block, or conflicts with an outstanding read or write. A node that makes
+			// converted copies barriers after each copy, which orders what came before
+			// it too. Every other node keeps the barrier after it.
+			let access = self.layout.barrier_access[index].as_ref().filter(|_| blocked);
+			let converts = self.layout.casts[index] != [None, None];
+			// A producer's loop also reads and writes what its absorbed consumers do.
+			let combined = access.map(|own| {
+				let mut combined = own.clone();
+				for tail in &fusion.tails[index] {
+					if let Some(tail) = &self.layout.barrier_access[*tail] {
+						combined.join(tail);
+					}
+				}
+				combined
+			});
+			if !outstanding.is_empty() && !fusion.absorbed[index] {
+				let hazard = combined.as_ref().and_then(|next| outstanding.hazard(next));
+				if let Some(hazard) = hazard {
+					trace(&format!("barrier kept before node {index}: {hazard}"))?;
+				}
+				if access.is_some() && hazard.is_none() && block == Some(plan.node.block_index) {
+					elided += 1;
+					if !converts {
+						ir.push_str(workgroup_barrier(backend));
+					}
+				} else {
+					ir.push_str(barrier(backend));
+					outstanding = ValueAccess::default();
+				}
+			}
 			if blocked && block != Some(plan.node.block_index) {
 				block = Some(plan.node.block_index);
 				ir.push_str(&format!("{BLOCK_MARK}{}\n", plan.node.block_index));
+			}
+			// An absorbed consumer runs inside its producer's loop. Its window still
+			// defines the names later nodes read, and its clock still marks its place.
+			if fusion.absorbed[index] {
+				// Its producer's loop now does its reads and writes, so they stay outstanding with the producer's.
+				if let Some(access) = access.filter(|_| !outstanding.is_empty()) {
+					outstanding.join(access);
+				}
+				self.emit_node_window(index, &plan.node, &mut windows)?;
+				self.emit_node_clock(backend, index, reverse, &mut ir);
+				continue;
 			}
 			let mut pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
 			let node = &plan.node;
@@ -4456,6 +4598,9 @@ impl NativeModelIr {
 			// The reverse pass differentiates the whole sequence at once.
 			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, if blocked { &mut windows } else { &mut ir })? };
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
+			if converts && access.is_some() {
+				outstanding = ValueAccess::default();
+			}
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				// A float sum over a stored format, one row at a time: the packed body.
@@ -4528,7 +4673,9 @@ impl NativeModelIr {
 						));
 						ir.push_str(&format!("br label %{p}.rows.done\n{p}.rows.done:\n"));
 					}
-					ir.push_str(barrier(backend));
+					if access.is_none() {
+						ir.push_str(barrier(backend));
+					}
 				}
 				(false, Primitive::Contraction) => {
 					if self.inference && tracing() {
@@ -4556,7 +4703,9 @@ impl NativeModelIr {
 						tile_k = tiles[2]
 					);
 					ir.push_str(&call);
-					ir.push_str(barrier(backend));
+					if access.is_none() {
+						ir.push_str(barrier(backend));
+					}
 				}
 				(false, Primitive::Gather) => {
 					let (layout, _) = embedding_row(node)?;
@@ -5117,13 +5266,19 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
+					let tail = self.emit_fused_pointers(backend, index, &fusion.tails[index], &mut ir)?;
+					let mut fused = Ok(());
 					emit_runtime_window_loop(&mut ir, index, "scalar", node.output, &window, |ir, _p, wide| {
-						let output_pointer = format!("%{prefix}.output.ptr");
 						self.emit_operand_load(backend, index, 0, &pointers.source, wide, &first, ir);
 						if pointers.second != pointers.source {
 							self.emit_operand_load(backend, index, 1, &pointers.second, wide, &second, ir);
 						}
 						ir.push_str(&forward.code);
+						if !tail.is_empty() {
+							fused = self.emit_fused_tail(backend, index, &fusion.tails[index], &tail, &forward.value, wide, ir);
+							return;
+						}
+						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
 							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
 							value = pointers.value,
@@ -5132,7 +5287,10 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					fused?;
+					if access.is_none() {
+						ir.push_str(barrier(backend));
+					}
 				}
 				(false, Primitive::Predictor) => {
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
@@ -5751,6 +5909,8 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode, &window)?);
 						ir.push_str(barrier(backend));
 					}
+					let tail = self.emit_fused_pointers(backend, index, &fusion.tails[index], &mut ir)?;
+					let mut fused = Ok(());
 							emit_runtime_window_loop(&mut ir, index, "normalize", node.output, &window, |ir, _p, wide| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
@@ -5781,6 +5941,10 @@ impl NativeModelIr {
 							wide,
 						);
 						ir.push_str(&fragment.code);
+						if !tail.is_empty() {
+							fused = self.emit_fused_tail(backend, index, &fusion.tails[index], &tail, &fragment.value, wide, ir);
+							return;
+						}
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
 							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
@@ -5790,6 +5954,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
+					fused?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Normalize) => {
@@ -5940,16 +6105,19 @@ impl NativeModelIr {
 			// Each forward primitive has completed its node-ending grid barrier.
 			// Stamp that boundary, so neighboring clock slots enclose one node's
 			// work rather than the next node's entry or the prior node's tail.
-			if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
-				let pointer = pointer_type(backend);
-				ir.push_str(&format!(
-					"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
-					at = clocks + index * 8
-				));
-			}
+			self.emit_node_clock(backend, index, reverse, &mut ir);
 			if reverse {
 				self.emit_cast_adjoints(backend, index, &mut ir)?;
 			}
+			if let Some(access) = access {
+				outstanding.join(access);
+			}
+		}
+		if !outstanding.is_empty() {
+			ir.push_str(barrier(backend));
+		}
+		if blocked {
+			self.barriers.set(ForwardBarriers { emitted: (windows.matches(barrier(backend)).count() + ir.matches(barrier(backend)).count()), elided });
 		}
 		Ok(if blocked { windows + &ir } else { ir })
 	}
@@ -7070,11 +7238,7 @@ impl NativeModelIr {
 		} else { ("%begin".to_owned(), "%end".to_owned()) };
 		let length = node.output.length;
 		let kernel = if node.op == Primitive::Contraction { integer_argument(node.argument[0], "contraction kernel")? } else { 0 };
-		let source_length = match usize::try_from(node.source) {
-			Ok(source) => self.plans.get(source).map(|source| source.node.output.length),
-			Err(_) => Some(self.layout.window_positions),
-		};
-		let reinterpreted = source_length.is_some_and(|source_length| source_length != node.input.length);
+		let reinterpreted = self.window_reinterpreted(node);
 		match node.op {
 			Primitive::Predictor => ir.push_str(&format!("%{prefix}.begin = add i32 0, 0\n%{prefix}.end = add i32 0, {length}\n")),
 			_ if reinterpreted && !matches!(node.op, Primitive::Pool | Primitive::Last | Primitive::Gather) => {
@@ -8717,6 +8881,238 @@ struct NodeWindow {
 	span: String,
 }
 
+/// The consumers each node's loop also computes, so their shared values stay in
+/// registers instead of crossing a store, a barrier, and a load.
+struct Fusion {
+	/// Per node, the elementwise consumers its loop computes after it, each reading the one before.
+	tails: Vec<Vec<usize>>,
+	absorbed: Vec<bool>,
+}
+
+/// What the graph says about every node's uses: the facts a fusion must respect.
+struct FusionFacts {
+	consumers: Vec<usize>,
+	last: Vec<usize>,
+	retained: Vec<bool>,
+	signatures: Vec<String>,
+}
+
+/// The pointers one absorbed consumer needs inside its producer's loop.
+struct FusedPointers {
+	operands: [Option<String>; 2],
+	weights: String,
+	value: String,
+}
+
+impl NativeModelIr {
+	/// Lengths as this tape holds them: whether the node's source holds a window
+	/// of positions its input does not read as written.
+	fn window_reinterpreted(&self, node: &Node) -> bool {
+		let source_length = match usize::try_from(node.source) {
+			Ok(source) => self.plans.get(source).map(|source| source.node.output.length),
+			Err(_) => Some(self.layout.window_positions),
+		};
+		source_length.is_some_and(|source_length| source_length != node.input.length)
+	}
+
+	/// Stamps the node's end in the clock slots, when the machine keeps clocks.
+	fn emit_node_clock(&self, backend: Backend, index: usize, reverse: bool, ir: &mut String) {
+		if let Some(clocks) = self.layout.clocks.filter(|_| !reverse) {
+			let pointer = pointer_type(backend);
+			ir.push_str(&format!(
+				"%clk.n{index}.zero = icmp eq i32 %tid, 0\nbr i1 %clk.n{index}.zero, label %clk.n{index}.mark, label %clk.n{index}.done\nclk.n{index}.mark:\n%clk.n{index}.value = call i64 @recipe.clock()\n%clk.n{index}.ptr = getelementptr i8, {pointer} %contexts, i64 {at}\nstore i64 %clk.n{index}.value, {pointer} %clk.n{index}.ptr, align 8\nbr label %clk.n{index}.done\nclk.n{index}.done:\n",
+				at = clocks + index * 8
+			));
+		}
+	}
+
+	/// Chooses the elementwise nodes an inference forward computes inside the loop
+	/// of the elementwise or normalize node before them.
+	fn plan_fusion(&self, reverse: bool, training: bool) -> Result<Fusion> {
+		let count = self.plans.len();
+		let mut fusion = Fusion { tails: vec![Vec::new(); count], absorbed: vec![false; count] };
+		if reverse || training || !self.inference {
+			return Ok(fusion);
+		}
+		let mut consumers = vec![0; count];
+		for node in &self.graph.nodes {
+			let first = usize::try_from(node.source).ok();
+			for operand in first.into_iter().chain(usize::try_from(node.second).ok().filter(|second| Some(*second) != first)) {
+				consumers[operand] += 1;
+			}
+		}
+		let facts = FusionFacts { consumers, last: last_uses(&self.graph), retained: retained_outputs(&self.graph), signatures: window_signatures(&self.graph) };
+		let mut head = None;
+		for index in 0..count {
+			if let Some(first) = head.filter(|first| self.fusible(&facts, *first, &fusion.tails[*first], index)) {
+				fusion.tails[first].push(index);
+				fusion.absorbed[index] = true;
+				continue;
+			}
+			let node = &self.plans[index].node;
+			head = (matches!(node.op, Primitive::Elementwise | Primitive::Normalize) && node.block_kind != "recur_body").then_some(index);
+		}
+		Ok(fusion)
+	}
+
+	/// Whether elementwise node `consumer` can join the chain that starts at `head`
+	/// and ends at the last of `tail`: it is the end's only reader, nothing else
+	/// needs the end's value, both compute the same positions in one arithmetic,
+	/// and the value it writes cannot land on anything the fused loop still reads.
+	fn fusible(&self, facts: &FusionFacts, head: usize, tail: &[usize], consumer: usize) -> bool {
+		let end = tail.last().copied().unwrap_or(head);
+		let (producer, node) = (&self.plans[end].node, &self.plans[consumer].node);
+		let Ok(name) = i32::try_from(end) else { return false };
+		if consumer != end + 1 || node.op != Primitive::Elementwise || node.block_index != producer.block_index || node.block_kind == "recur_body" {
+			return false;
+		}
+		if node.source < 0 || !(node.second >= 0 || node.second == -2) || (node.source != name && node.second != name) || self.layout.casts[consumer] != [None, None] {
+			return false;
+		}
+		let observed = tracing() && traced_node(end, self.graph.nodes.len());
+		if facts.consumers[end] != 1 || facts.last[end] != consumer || facts.retained[end] || observed {
+			return false;
+		}
+		if node.output != producer.output || node.precision != producer.precision || node.acc != producer.acc {
+			return false;
+		}
+		if facts.signatures[end] != facts.signatures[consumer] || self.window_reinterpreted(producer) || self.window_reinterpreted(node) {
+			return false;
+		}
+		let outside = [node.source, node.second].into_iter().filter_map(|operand| usize::try_from(operand).ok().filter(|operand| *operand < head)).collect::<Vec<_>>();
+		if [node.source, node.second].into_iter().any(|operand| usize::try_from(operand).is_ok_and(|operand| operand >= head && operand != end)) {
+			return false;
+		}
+		if outside.iter().any(|operand| facts.signatures[*operand] != facts.signatures[consumer] || self.plans[*operand].node.output != node.output) {
+			return false;
+		}
+		self.fused_storage_is_clear(head, tail, consumer)
+	}
+
+	/// Whether the value the chain's last node writes shares no byte with a value
+	/// or context the chain reads, except element for element in the same type,
+	/// where each lane reads its position before it writes it.
+	fn fused_storage_is_clear(&self, head: usize, tail: &[usize], consumer: usize) -> bool {
+		let window = |shape: Shape| window_shape(shape, self.graph.input.length, self.layout.window_positions);
+		let range = |index: usize| {
+			let node = &self.plans[index].node;
+			let element = node.precision.bytes();
+			graph_rows_buffer(window(node.output), self.rows, element).map(|bytes| (self.layout.values[index], bytes, element))
+		};
+		let Ok(write) = range(consumer) else { return false };
+		let overlaps = |begin: usize, bytes: usize| begin < write.0 + write.1 && write.0 < begin + bytes;
+		let members = std::iter::once(head).chain(tail.iter().copied()).chain(std::iter::once(consumer));
+		for member in members {
+			let node = &self.plans[member].node;
+			for (position, operand) in [node.source, node.second].into_iter().enumerate() {
+				let Some(operand) = usize::try_from(operand).ok().filter(|operand| *operand < head) else { continue };
+				// A node that reads a converted copy reads that copy, not the operand.
+				let read = match self.layout.casts[member][position] {
+					Some(slot) => {
+						let element = node.precision.bytes();
+						graph_rows_buffer(window(self.plans[operand].node.output), self.rows, element).map(|bytes| (slot, bytes, element))
+					}
+					None => range(operand),
+				};
+				let Ok(read) = read else { return false };
+				if overlaps(read.0, read.1) && (read.0 != write.0 || read.2 != write.2) {
+					return false;
+				}
+			}
+		}
+		let node = &self.plans[head].node;
+		if node.op != Primitive::Normalize || !self.layout.contexts_in_values[head] {
+			return true;
+		}
+		let mut context = node.clone();
+		context.input = window(node.input);
+		context.output = window(node.output);
+		let Ok(regions) = node_context(&self.graph, &context, self.rows, node.precision, self.inference, 0) else { return false };
+		!overlaps(self.layout.contexts[head], regions.iter().map(|(bytes, _)| bytes).sum())
+	}
+
+	/// Names what each absorbed consumer reads beside the value it takes from the
+	/// node before it, and marks the fusion for the report.
+	fn emit_fused_pointers(&self, backend: Backend, head: usize, tail: &[usize], ir: &mut String) -> Result<Vec<FusedPointers>> {
+		let mut pointers = Vec::with_capacity(tail.len());
+		let mut previous = head;
+		for &member in tail {
+			let plan = &self.plans[member];
+			ir.push_str(&format!("; recipe.fused n{member} into n{head}\n"));
+			let mut operands = [None, None];
+			for (position, operand) in [plan.node.source, plan.node.second].into_iter().enumerate() {
+				let Some(operand) = usize::try_from(operand).ok().filter(|operand| *operand != previous) else { continue };
+				let name = format!("n{member}.fused.operand{position}");
+				ir.push_str(&ptr_gep(backend, "values", self.layout.values[operand], &name));
+				operands[position] = Some(format!("%{name}"));
+			}
+			ir.push_str(&ptr_gep(backend, "weights", plan.weight_offset, &format!("n{member}.fused.weights")));
+			ir.push_str(&ptr_gep(backend, "values", plan.value, &format!("n{member}.fused.value")));
+			pointers.push(FusedPointers { operands, weights: format!("%n{member}.fused.weights"), value: format!("%n{member}.fused.value") });
+			previous = member;
+		}
+		Ok(pointers)
+	}
+
+	/// Computes each absorbed consumer from the value before it, in registers, and
+	/// stores only the last result where its own node keeps its value.
+	fn emit_fused_tail(&self, backend: Backend, head: usize, tail: &[usize], pointers: &[FusedPointers], head_value: &str, wide: &str, ir: &mut String) -> Result<()> {
+		let pointer = pointer_type(backend);
+		let mut previous = (head, head_value.to_owned());
+		for (&member, fused) in tail.iter().zip(pointers) {
+			let plan = &self.plans[member];
+			let node = &plan.node;
+			let (ty, state) = (self.node_precision(node).model_type, self.node_precision(node).state_type);
+			let prefix = format!("n{member}.scalar");
+			// An operand that is the node before comes from its register, not memory.
+			let operand = |position: usize, name: &str, ir: &mut String| match &fused.operands[position] {
+				Some(base) => {
+					self.emit_operand_load(backend, member, position, base, wide, name, ir);
+					name.to_owned()
+				}
+				None => previous.1.clone(),
+			};
+			let first = operand(0, &format!("%{prefix}.first"), ir);
+			let second = if node.second == -2 { first.clone() } else { operand(1, &format!("%{prefix}.second"), ir) };
+			let literal = |value: f64, ty: &str| native_literal(self.node_precision(node).model, ty, value);
+			let code_end = node
+				.program_offset
+				.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("scalar program length overflows"))?)
+				.ok_or_else(|| RecipeError::new("scalar program range overflows"))?;
+			let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {member} scalar program range is invalid")))?;
+			let forward = program_ir::emit_scalar_forward(
+				code,
+				program_ir::ScalarContext {
+					value_type: ty,
+					state_type: state,
+					libm: self.graph.profile.libm,
+					suffix: self.variant(node),
+					pointer_type: pointer,
+					alignment: alignment(ty),
+					first: &first,
+					second: &second,
+					weights: &fused.weights,
+					decode: plan.decode(member),
+					prefix: &prefix,
+					literal: &literal,
+				},
+			)
+			.map_err(|error| RecipeError::new(error.to_string()))?;
+			ir.push_str(&forward.code);
+			if member == tail[tail.len() - 1] {
+				ir.push_str(&format!(
+					"%{prefix}.output.ptr = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} %{prefix}.output.ptr, align {align}\n",
+					value = fused.value,
+					result = forward.value,
+					align = alignment(ty)
+				));
+			}
+			previous = (member, forward.value);
+		}
+		Ok(())
+	}
+}
+
 fn integer_argument(value: f64, role: &str) -> Result<i32> {
 	require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), format!("native {role} is not an integer"))?;
 	Ok(value as i32)
@@ -9513,6 +9909,7 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 	let widen = matches!(target, BackendTarget::Nvidia { .. }) && !dp4a;
 	let ir = model.emit(target.backend(), matrix, loss, epoch, dp4a, widen)?;
 	let step = ir.lines().any(|line| line.starts_with("define ") && line.contains("@recipe_model_step("));
+	let barriers = model.barriers.get();
 	let llvm = llvm_names(&ir);
 	let key = native_artifact_key(target, &ir)?;
 	let directory = native_artifact_directory(&key)?;
@@ -9520,10 +9917,12 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 	let path = directory.join(format!("artifact.{}", target.artifact_extension()));
 	let cached = path.is_file();
 	trace(&format!(
-		"native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}",
+		"native artifact key={key} target={} arithmetic={} loss={} rows={rows} fused={} barriers={} cache={} path={}",
 		native_target_label(target).split(";features=").next().unwrap_or("unknown"),
 		model.precision.model.label(),
 		loss.map_or("none", |loss| loss.name()),
+		llvm.fused,
+		llvm.barriers,
 		if cached { "hit" } else { "miss" },
 		path.display()
 	))?;
@@ -9553,7 +9952,7 @@ pub(crate) fn compile_model(device: &str, target: &BackendTarget, graph: &Graph,
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: epoch, step, llvm, compile_seconds: compile_started.elapsed().as_secs_f64() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: epoch, step, llvm, compile_seconds: compile_started.elapsed().as_secs_f64(), barriers })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16353,7 +16752,7 @@ impl std::ops::Deref for NameList {
 }
 
 #[derive(Clone, Default)]
-pub struct LlvmReport { pub instructions: NameList, pub intrinsics: NameList }
+pub struct LlvmReport { pub instructions: NameList, pub intrinsics: NameList, pub fused_nodes: usize, pub barriers: usize }
 
 #[derive(Clone, Copy, Default)]
 pub struct DurationReport(f64);
@@ -18322,6 +18721,7 @@ impl Infer {
 			aot: placed.aot_report()?,
 			tiles: placed.tile_report()?,
 			grids: placed.grid_report()?,
+			barriers: placed.barrier_report()?,
 			load: DurationReport(load_seconds),
 			compile: DurationReport(placed.compile_seconds()),
 			residency: placed.residency(),
@@ -18968,6 +19368,7 @@ pub struct InferenceReport {
 	pub aot: ReportLines,
 	pub tiles: ReportLines,
 	pub grids: ReportLines,
+	pub barriers: ReportLines,
 	pub load: DurationReport,
 	pub compile: DurationReport,
 	/// Each tape's weight buffer: whether it was reused, created, or private, and what this invocation read, converted, and uploaded.
@@ -20592,6 +20993,8 @@ impl Placed {
 		for tape in self.tapes.iter().flatten() {
 			report.instructions.extend(tape.program.artifact.llvm.instructions.clone());
 			report.intrinsics.extend(tape.program.artifact.llvm.intrinsics.clone());
+			report.fused_nodes += tape.program.artifact.llvm.fused;
+			report.barriers += tape.program.artifact.llvm.barriers;
 		}
 		report
 	}
@@ -20644,6 +21047,9 @@ impl Placed {
 	}
 	fn grid_report(&self) -> Result<ReportLines> {
 		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::grid_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
+	}
+	fn barrier_report(&self) -> Result<ReportLines> {
+		Ok(ReportLines::new(self.tapes.iter().flatten().map(NativeTape::barrier_lines).collect::<Result<Vec<_>>>()?.into_iter().flatten()))
 	}
 	fn compile_seconds(&self) -> f64 { self.tapes.iter().flatten().map(|tape| tape.compile_seconds).sum() }
 	/// Actual resident arena sizes, available directly to model scripts.
@@ -24285,6 +24691,8 @@ impl NativeTape {
 		LlvmReport {
 			instructions: NameList::new(self.program.artifact.llvm.instructions.clone()),
 			intrinsics: NameList::new(self.program.artifact.llvm.intrinsics.clone()),
+			fused_nodes: self.program.artifact.llvm.fused,
+			barriers: self.program.artifact.llvm.barriers,
 		}
 	}
 	fn format_lines(&self) -> Result<Vec<String>> {
@@ -24343,6 +24751,12 @@ impl NativeTape {
 		}
 		if let Some(load) = self.program.model_load { lines.push(format!("{device}  grid: load {}x1x1 workgroup {}x1x1", load.geometry.groups, load.geometry.block)); }
 		Ok(lines)
+	}
+	/// Grid barrier call sites in the lowered inference forward. They are counted
+	/// where the model is lowered, so a barrier inside a loop counts once.
+	fn barrier_lines(&self) -> Result<Vec<String>> {
+		let barriers = self.program.artifact.barriers;
+		Ok(if self.program.epoch.is_some() { Vec::new() } else { vec![format!("{}  barriers: forward {} emitted {} elided", self.device_label()?, barriers.emitted, barriers.elided)] })
 	}
 	/// `tokens` are the model's ids, one per position of every row, which the
 	/// lookups of this graph gather rows for; a whole graph reads its own
@@ -25664,6 +26078,8 @@ impl DeviceTape {
 		for shard in &self.shards {
 			report.instructions.extend(shard.program.artifact.llvm.instructions.clone());
 			report.intrinsics.extend(shard.program.artifact.llvm.intrinsics.clone());
+			report.fused_nodes += shard.program.artifact.llvm.fused;
+			report.barriers += shard.program.artifact.llvm.barriers;
 		}
 		report
 	}
