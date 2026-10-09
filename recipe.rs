@@ -1687,16 +1687,16 @@ fn tune_contraction_schedule(tape: &mut NativeTape, rate: f64, config: Config, b
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
-/// Byte ranges of the value arena that one node's kernel reads and writes.
+/// Byte ranges of the value buffer that one node's kernel reads and writes.
 /// The planner chose these slots from the same lifetimes it reuses storage
 /// by, so two kernels that share no range need no grid barrier between them.
 #[derive(Clone, Default)]
-pub(crate) struct ArenaAccess {
+pub(crate) struct ValueAccess {
 	reads: Vec<(usize, usize)>,
 	writes: Vec<(usize, usize)>,
 }
 
-impl ArenaAccess {
+impl ValueAccess {
 	fn range(begin: usize, bytes: usize) -> Option<(usize, usize)> {
 		(bytes != 0).then_some((begin, begin + bytes))
 	}
@@ -1738,10 +1738,10 @@ pub(crate) struct ForwardBarriers {
 pub(crate) struct NativeLayout {
 	pub window_positions: usize,
 	pub values: Vec<usize>,
-	/// At inference, the value-arena ranges that each contraction or elementwise
+	/// At inference, the value buffer ranges that each contraction or elementwise
 	/// node reads and writes, including the converted copies it makes. Every other
 	/// node is `None` and keeps its barrier.
-	pub barrier_access: Vec<Option<ArenaAccess>>,
+	pub barrier_access: Vec<Option<ValueAccess>>,
 	pub contexts: Vec<usize>,
 	pub contexts_in_values: Vec<bool>,
 	pub context_resets: Vec<(usize, usize)>,
@@ -2409,7 +2409,7 @@ impl NativeLayout {
 					let lifetime = if inference && !retained_operand(graph, index, position, &signatures) { BufferLifetime::Until(step) } else { BufferLifetime::Retained };
 					let slot = value_plan.allocate(&[(converted, lifetime)], unit, cast_step, inference)?;
 					node_casts[position] = Some(slot);
-					converted_writes.extend(ArenaAccess::range(slot, converted));
+					converted_writes.extend(ValueAccess::range(slot, converted));
 				}
 				if !inference && NativePrecision::new(source.precision, source.acc)?.state != state {
 					let converted = graph_rows_buffer(shape, rows, state.bytes())?;
@@ -2423,9 +2423,9 @@ impl NativeLayout {
 			// writes, and its own value.
 			barrier_access.push((inference && matches!(node.op, Primitive::Contraction | Primitive::Elementwise)).then(|| {
 				let operands = [node.source, node.second].into_iter().filter_map(|operand| usize::try_from(operand).ok());
-				ArenaAccess {
-					reads: operands.filter_map(|operand| ArenaAccess::range(values[operand], value_bytes[operand])).collect(),
-					writes: ArenaAccess::range(slot, bytes).into_iter().chain(converted_writes).collect(),
+				ValueAccess {
+					reads: operands.filter_map(|operand| ValueAccess::range(values[operand], value_bytes[operand])).collect(),
+					writes: ValueAccess::range(slot, bytes).into_iter().chain(converted_writes).collect(),
 				}
 			}));
 			cast_adjoints.push(node_cast_adjoints);
@@ -4511,7 +4511,7 @@ impl NativeModelIr {
 		let mut block = None;
 		// What the contractions emitted since the last grid barrier read and write,
 		// and the barriers dropped between contractions that do not conflict.
-		let mut outstanding = ArenaAccess::default();
+		let mut outstanding = ValueAccess::default();
 		let mut elided = 0usize;
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
@@ -4545,7 +4545,7 @@ impl NativeModelIr {
 					}
 				} else {
 					ir.push_str(barrier(backend));
-					outstanding = ArenaAccess::default();
+					outstanding = ValueAccess::default();
 				}
 			}
 			if blocked && block != Some(plan.node.block_index) {
@@ -4563,7 +4563,7 @@ impl NativeModelIr {
 			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, if blocked { &mut windows } else { &mut ir })? };
 			self.emit_casts(backend, index, reverse, &window, &mut pointers, &mut ir)?;
 			if converts && access.is_some() {
-				outstanding = ArenaAccess::default();
+				outstanding = ValueAccess::default();
 			}
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
