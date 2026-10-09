@@ -69,10 +69,14 @@ let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
 	.norm(rms);
+let gate = HyperGate {
+	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),
+	write: recipe.model().no(bias).norm(rms).layer(4).scale(0.25).sigmoid().scale(2.0),
+};
 let model = recipe.model()
 	.e(qwen35.attention.layer_norm_rms_epsilon)
 	.embed(tokenizer.ggml.tokens, qwen35.embedding_length)
-	.hyper(4, 320, &attention);
+	.hyper_gate(4, &attention, gate);
 ```
 
 ```rust
@@ -152,7 +156,8 @@ prec:
 	.recur([blocks]])
 	.ensemble([blocks])
 	.moe(topk, [blocks])
-	.hyper(lanes, rank, [blocks])
+	.hyper(lanes, &branch)
+	.hyper_gate(lanes, &branch, HyperGate { read, write })
 ```
 
 ```rust
@@ -364,8 +369,8 @@ delta(heads, kernel)
 attn(heads)
 	.gate(sigmoid|silu|tanh)                                    // .gate()
 
-hyper(lanes, [blocks])                                          // hyper(lanes, rank, &branch)
-hyper(lanes, [blocks], [blocks])
+hyper(lanes, &branch)
+hyper_gate(lanes, &branch, HyperGate { read, write })
 
 moe(topk, [experts])                                            // moe(topk, [blocks])
 	.route(softmax|sigmoid)
