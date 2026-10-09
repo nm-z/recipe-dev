@@ -17372,6 +17372,8 @@ struct Architecture {
 	expert_scale: Option<f64>,
 	expert_shared: Option<SharedChoice>,
 	expert_shared_gate: Option<Activation>,
+	/// The tensor conventions the row declares, by key of `CONVENTIONS`.
+	conventions: BTreeMap<String, String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedChoice { None, Ungated, Gated }
@@ -17401,6 +17403,7 @@ struct ArchitectureDraft {
 	expert_scale: Option<f64>,
 	expert_shared: Option<SharedChoice>,
 	expert_shared_gate: Option<Activation>,
+	conventions: BTreeMap<String, String>,
 }
 impl ArchitectureDraft {
 	fn finish(self) -> Result<Architecture> {
@@ -17425,7 +17428,7 @@ impl ArchitectureDraft {
 				gate: match self.ple_gate.unwrap() { PleGateChoice::SignedRootSigmoid => PleGate::SignedRootSigmoid { floor_bits: self.ple_floor.unwrap(), width_scaled: self.ple_width_scaled.unwrap() } },
 			})
 		} else { None };
-		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate })
+		Ok(Architecture { name: self.name, rope, delta_activation: self.convolution.zip(self.output), delta_gates: self.delta_decay.zip(self.delta_write), delta_norms: self.qk_norm.zip(self.value_norm), ple_math, feed_forward_activation: self.feed_forward_activation, expert_activation: self.expert_activation, expert_scoring: self.expert_scoring, expert_renormalize: self.expert_renormalize, expert_scale: self.expert_scale, expert_shared: self.expert_shared, expert_shared_gate: self.expert_shared_gate, conventions: self.conventions })
 	}
 }
 fn architecture_activation(value: &str) -> Result<Activation> {
@@ -17450,6 +17453,95 @@ fn architecture_normalization(value: &str) -> Result<BlockNormalization> {
 		"batch" => Ok(BlockNormalization::Batch),
 		_ => Err(RecipeError::new(format!("architecture normalization {value:?} is not supported"))),
 	}
+}
+/// The tensor conventions an architecture row declares and a file's tensors can be read for, each
+/// with the values it takes. `-` means the architecture has no such block. A row states them so a
+/// definition builds from the row, not from which tensors a file happens to hold.
+const CONVENTIONS: [(&str, &[&str]); 14] = [
+	("attention-gate", &["-", "none", "interleaved"]),
+	("qk-norm", &["-", "none", "rms"]),
+	("rope-factors", &["-", "none", "tensor", "optional"]),
+	("attention-bias", &["-", "none", "qkv"]),
+	("values-from-keys", &["-", "false", "true"]),
+	("attn-pre-norm", &["-", "false", "true"]),
+	("attn-post-norm", &["-", "false", "true"]),
+	("ffn-pre-norm", &["-", "none", "ffn_norm", "post_attention_norm"]),
+	("ffn-post-norm", &["-", "false", "true"]),
+	("output", &["tied", "untied", "optional"]),
+	("output-norm", &["none", "output_norm", "token_embd_norm"]),
+	("selection-bias", &["-", "false", "true"]),
+	("decay-bias", &["-", "false", "true"]),
+	("indexer-score-norm", &["-", "none", "rms"]),
+];
+/// What a file's tensors say each convention is, by the rules `Gguf::model` guesses with. A
+/// convention that differs between layers reads `mixed(a, b)`.
+fn guessed_conventions(file: &Gguf) -> Result<BTreeMap<&'static str, String>> {
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let key = |suffix: &str| format!("{architecture}.{suffix}");
+	let layers = file.integer_at(&key("block_count"))?;
+	let width = file.integer_at(&key("embedding_length"))?;
+	let heads = file.integer_at(&key("attention.head_count")).unwrap_or(1).max(1);
+	let head = if file.value(&key("attention.key_length")).is_some() { file.integer_at(&key("attention.key_length"))? } else { width / heads };
+	let has = |name: &str| file.tensor(name).is_some();
+	let mut seen: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+	let mut note = |name: &'static str, value: String| { seen.entry(name).or_default().insert(value); };
+	let flag = |value: bool| if value { "true" } else { "false" }.to_owned();
+	for layer in 0..layers {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let (attention, delta) = (has(&name("attn_q.weight")), has(&name("ssm_a")));
+		if attention {
+			let gated = file.tensor(&name("attn_q.weight")).and_then(|query| query.shape.get(1)).is_some_and(|outputs| *outputs as usize == 2 * heads * head);
+			note("attention-gate", if gated { "interleaved" } else { "none" }.to_owned());
+			note("qk-norm", if has(&name("attn_q_norm.weight")) { "rms" } else { "none" }.to_owned());
+			note("rope-factors", if has("rope_freqs.weight") { "tensor" } else { "none" }.to_owned());
+			note("attention-bias", if has(&name("attn_q.bias")) || has(&name("attn_k.bias")) || has(&name("attn_v.bias")) { "qkv" } else { "none" }.to_owned());
+			note("values-from-keys", flag(!has(&name("attn_v.weight"))));
+			if has(&name("indexer.q_proj.weight")) {
+				note("indexer-score-norm", if has(&name("indexer.q_norm.weight")) || has(&name("indexer.k_norm.weight")) { "rms" } else { "none" }.to_owned());
+			}
+		}
+		if delta {
+			note("decay-bias", flag(has(&name("ssm_dt.bias"))));
+		}
+		if attention || delta {
+			note("attn-pre-norm", flag(has(&name("attn_norm.weight"))));
+			note("attn-post-norm", flag(has(&name("post_attention_norm.weight"))));
+		}
+		if has(&name("ffn_gate.weight")) || has(&name("ffn_gate_inp.weight")) || has(&name("ffn_gate_exps.weight")) {
+			note("ffn-pre-norm", if has(&name("ffn_norm.weight")) { "ffn_norm" } else if has(&name("post_attention_norm.weight")) { "post_attention_norm" } else { "none" }.to_owned());
+			note("ffn-post-norm", flag(has(&name("post_ffw_norm.weight"))));
+		}
+		if has(&name("ffn_gate_inp.weight")) {
+			note("selection-bias", flag(has(&name("exp_probs_b.bias"))));
+		}
+	}
+	note("output", if has("output.weight") { "untied" } else { "tied" }.to_owned());
+	note("output-norm", if has("output_norm.weight") { "output_norm" } else if has("token_embd_norm.weight") { "token_embd_norm" } else { "none" }.to_owned());
+	Ok(CONVENTIONS.iter().map(|(name, _)| {
+		let value = match seen.get(name) {
+			None => "-".to_owned(),
+			Some(values) if values.len() == 1 => values.iter().next().unwrap().clone(),
+			Some(values) => format!("mixed({})", values.iter().cloned().collect::<Vec<_>>().join(", ")),
+		};
+		(*name, value)
+	}).collect())
+}
+/// Compares the conventions a file's architecture row declares with what the file's tensors say,
+/// one line per convention, and counts the disagreements. Reads only the header.
+pub fn conventions(path: impl AsRef<Path>) -> Result<(String, usize)> {
+	let file = Gguf::open(&resolve_path(path)?)?;
+	let architecture = file.value("general.architecture").and_then(GgufValue::text).ok_or_else(|| RecipeError::new("the file names no general.architecture"))?.to_owned();
+	let row = architectures()?.into_iter().find(|row| row.name == architecture).ok_or_else(|| RecipeError::new(format!("architecture {architecture:?} is absent from Cargo.toml")))?;
+	let guessed = guessed_conventions(&file)?;
+	let (mut text, mut mismatches) = (format!("architecture {architecture}\n"), 0);
+	for (name, _) in CONVENTIONS {
+		let declared = row.conventions.get(name).map_or("(undeclared)", String::as_str);
+		let found = guessed[name].as_str();
+		let agree = declared == found || declared == "optional" && matches!(found, "none" | "tensor" | "tied" | "untied");
+		mismatches += usize::from(!agree);
+		text.push_str(&format!("{} {name}: declared {declared}, file {found}\n", if agree { "ok      " } else { "MISMATCH" }));
+	}
+	Ok((text, mismatches))
 }
 fn architectures() -> Result<Vec<Architecture>> {
 	let (mut rows, mut current) = (Vec::new(), None::<ArchitectureDraft>);
@@ -17490,6 +17582,11 @@ fn architectures() -> Result<Vec<Architecture>> {
 				current.ple_floor = Some(floor.to_bits());
 			},
 			"ple-width-scaled" => current.ple_width_scaled = Some(match value { "true" => true, "false" => false, _ => return Err(RecipeError::new(format!("architecture {:?} has invalid per-layer embedding width scaling {value:?}", current.name))) }),
+			key if CONVENTIONS.iter().any(|(name, _)| *name == key) => {
+				let (name, values) = CONVENTIONS.iter().find(|(name, _)| *name == key).unwrap();
+				require(values.contains(&value), format!("architecture {:?} has invalid {name} {value:?}; it takes {}", current.name, values.join(", ")))?;
+				current.conventions.insert(key.to_owned(), value.to_owned());
+			}
 			key => return Err(RecipeError::new(format!("architecture {:?} has unknown field {key:?}", current.name))),
 		}
 	}

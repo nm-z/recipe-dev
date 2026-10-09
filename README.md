@@ -313,9 +313,12 @@ recipe run rnj-1.rs --device archy:nv6.nv7 --ctx 128 "Hello"
 ```bash
 recipe stats model.gguf
 recipe keys model.gguf
+recipe conventions model.gguf
 ```
 
 GGUF tensor pairing, feed-forward and expert activations, expert routing, delta math, and per-layer embedding math come from the named `[architecture.<name>]` section in `Cargo.toml`. A new architecture needs an explicit `rope-pairs` value (`halves` or `neighbours`). Models with feed-forward or expert blocks name `feed-forward-activation` or `expert-activation`. An expert model also names `expert-scoring` (`softmax` or `sigmoid`) and `expert-renormalize`; declared GGUF metadata overrides those two manifest choices. Gated-delta models name `delta-convolution`, `delta-output`, `delta-qk-norm`, and `delta-value-norm`; per-layer embedding models name their three `ple-*-norm` fields, convolution activation, gate, floor, and width scaling. Unknown names fail instead of taking another architecture's defaults.
+
+A row also declares the tensor conventions of its blocks: `attention-gate`, `qk-norm`, `rope-factors`, `attention-bias`, `values-from-keys`, `attn-pre-norm`, `attn-post-norm`, `ffn-pre-norm`, `ffn-post-norm`, `output`, `output-norm`, `selection-bias`, `decay-bias` and `indexer-score-norm`. `-` means the architecture has no such block, and `optional` (for `rope-factors` and `output`) means files of the architecture differ, as llama.cpp's optional tensors do. `recipe conventions model.gguf` prints each declaration beside what the file's tensors say, and exits 1 when any differ.
 
 ## Dataset schema
 

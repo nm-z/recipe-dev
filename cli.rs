@@ -178,6 +178,13 @@ fn main() {
 			(if argument == "stats" { recipe::stats(&path) } else { recipe::keys(&path) }).unwrap_or_else(|error| invalid(&error.to_string()));
 			return;
 		}
+		if source.is_none() && argument == "conventions" {
+			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			if arguments.next().is_some() { invalid(USAGE); }
+			let (report, mismatches) = recipe::conventions(&path).unwrap_or_else(|error| invalid(&error.to_string()));
+			print!("{report}");
+			std::process::exit(i32::from(mismatches != 0));
+		}
 		if source.is_none() && argument == "schema" {
 			let action = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			let path = arguments.next().unwrap_or_else(|| invalid(USAGE));
