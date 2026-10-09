@@ -255,7 +255,7 @@ place(path, &[blocks])
 
 ## GGUF tensors
 
-A script names the file tensors a block reads. A delta block names its nine; a normalization names its scale.
+A script names the file tensors a block reads. A delta block names its nine, an attention block its projections, biases, scales, rotary factors and indexer, and a normalization its scale.
 
 ```rust
 let delta = recipe.model().delta(heads, kernel).keys(key_heads, state).values(state).out(width)
@@ -268,6 +268,17 @@ model = model.res([norm(rms).scale_from("blk.0.attn_norm.weight"), Block::from(d
 DeltaTensors { alpha, beta, decay_bias, decay, qkv, conv, norm, gate, out }
 DeltaTensors::block(layer)
 binding.listing()
+```
+
+```rust
+let attention = recipe.model().attn_heads(heads).kv(kv).head(width).qk(rms).rope(neox, dims, base)
+	.attention_from(AttentionTensors::block(layer));
+model = model.res([norm(rms).scale_from("blk.3.attn_norm.weight"), Block::from(attention * gate), layer(width)]);
+```
+
+```rust
+AttentionTensors { q, k, v, q_bias, k_bias, v_bias, q_norm, k_norm, factors, out, indexer }
+IndexerTensors { q_proj, k_proj, q_norm, k_norm }
 ```
 
 ## Terminal chat and remote execution
