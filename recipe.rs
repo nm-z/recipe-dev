@@ -15343,6 +15343,11 @@ pub(crate) enum Plane {
 	Mapped(GgufTensor),
 	Owned { name: String, values: Vec<f64> },
 }
+impl From<GgufTensor> for Plane {
+	fn from(tensor: GgufTensor) -> Self {
+		Self::Mapped(tensor)
+	}
+}
 impl Plane {
 	fn elements(&self) -> usize {
 		match self {
@@ -15999,8 +16004,8 @@ impl<'a> Builder<'a> {
 		Some(tensor)
 	}
 	/// The next parameterized node, filled from mapped views.
-	fn mapped(&mut self, planes: Vec<GgufTensor>) {
-		self.slot(planes.into_iter().map(Plane::Mapped).collect());
+	fn mapped<T: Into<Plane>>(&mut self, planes: Vec<T>) {
+		self.slot(planes.into_iter().map(Into::into).collect());
 	}
 	fn slot(&mut self, planes: Vec<Plane>) {
 		self.plan.nodes.push(planes);
@@ -16013,19 +16018,21 @@ impl<'a> Builder<'a> {
 	}
 	/// A projection `[inputs, outputs]` of the given name, checked against the
 	/// widths the node contracts over.
-	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
-		let tensor = self.tensor(name, role)?;
-		require(
-			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
-			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
-		)?;
-		Ok(tensor)
+	/// A projection `[inputs, outputs]` of the given name. A tensor the file lacks,
+	/// or stores in another shape, binds as zeros: the node takes its default
+	/// parameters and the rest of the model still runs.
+	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<Plane> {
+		match self.optional(name).filter(|tensor| tensor.shape == [inputs as u64, outputs as u64]) {
+			Some(tensor) => Ok(Plane::Mapped(tensor)),
+			None => Ok(Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![0.0; checked_mul(inputs, outputs, "projection elements")?] }),
+		}
 	}
 	/// A normalization scale of `width` values, repeated over `groups` groups of
 	/// the span it normalizes, in the order `order` reads each group's channels.
 	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
-		let tensor = self.tensor(name, role)?;
-		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
+		let Some(tensor) = self.optional(name).filter(|tensor| tensor.elements() == width) else {
+			return Ok(vec![Plane::Owned { name: format!("{name} unbound in {role}"), values: vec![1.0; width] }; groups]);
+		};
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
 			return Ok(vec![Plane::Mapped(tensor); groups]);
 		}
@@ -16043,11 +16050,19 @@ impl<'a> Builder<'a> {
 	}
 	/// The rows of one head at `base`, as one view when they are read in place
 	/// and as one view per row otherwise.
-	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
+	fn head_rows(weight: &Plane, base: usize, order: &[usize], inputs: usize) -> Result<Vec<Plane>> {
 		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
-			return Ok(vec![tensor.rows(base, order.len())?.view()?]);
+			return Ok(vec![Self::rows_of(weight, base, order.len(), inputs)?]);
 		}
-		order.iter().map(|channel| tensor.rows(base + channel, 1)?.view()).collect()
+		order.iter().map(|channel| Self::rows_of(weight, base + channel, 1, inputs)).collect()
+	}
+	/// The `count` rows from `base` of a projection that reads `inputs` values per
+	/// row. A defaulted projection holds zeros of that span.
+	fn rows_of(weight: &Plane, base: usize, count: usize, inputs: usize) -> Result<Plane> {
+		match weight {
+			Plane::Mapped(tensor) => Ok(Plane::Mapped(tensor.rows(base, count)?.view()?)),
+			Plane::Owned { name, .. } => Ok(Plane::Owned { name: name.clone(), values: vec![0.0; checked_mul(count, inputs, "projection rows")?] }),
+		}
 	}
 	/// One attention block and the plan of its projection, its query and key
 	/// scales, and its output projection.
@@ -16130,7 +16145,7 @@ impl<'a> Builder<'a> {
 		let role = format!("block {layer} delta");
 		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
 		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
-		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
+		let mut gates = vec![alpha, beta];
 		// The decay bias offsets the alpha half; the beta half has none, so the
 		// bias row the node binds ends with zeros there.
 		if let Some(decay_bias) = self.optional(&name("ssm_dt.bias")) {
@@ -17018,8 +17033,8 @@ impl Builder<'_> {
 				Operation::Layer(outputs) => {
 					require(*outputs == vocabulary, format!("layer({outputs}) after the blocks is not the projection onto the {vocabulary} tokens, so no tensor name is its convention"))?;
 					require(!block.has_normalization(), "a normalization after the vocabulary projection has no tensor name")?;
-					let output = self.optional("output.weight").unwrap_or_else(|| embedding.clone());
-					require(output.shape == [width as u64, vocabulary as u64], format!("{} has shape {:?}; the vocabulary projection contracts {width} inputs into {vocabulary} outputs", output.name, output.shape))?;
+					let output = if self.file.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+					let output = self.projection(output, "the vocabulary projection", width, vocabulary)?;
 					self.mapped(vec![output]);
 				}
 				Operation::Identity | Operation::Last => {}
@@ -17126,9 +17141,9 @@ impl Builder<'_> {
 		let order = self.head_order(index.width, dims);
 		let mut planes = Vec::new();
 		for head in 0..index.heads {
-			planes.extend(Self::head_rows(&query, head * index.width, &order)?);
+			planes.extend(Self::head_rows(&query, head * index.width, &order, width)?);
 		}
-		planes.extend(Self::head_rows(&key, 0, &order)?);
+		planes.extend(Self::head_rows(&key, 0, &order, width)?);
 		self.mapped(planes);
 		if matches!(index.score, Some((BlockNormalization::Rms, _))) {
 			let mut scales = self.scale(&name("q_norm.weight"), &role, index.width, index.heads, &order)?;
@@ -17139,9 +17154,11 @@ impl Builder<'_> {
 	}
 	/// One normalization scale of `width` values.
 	fn norm_scale(&mut self, name: &str, width: usize) -> Result<()> {
-		let tensor = self.tensor(name, "a normalization")?;
-		require(tensor.elements() == width, format!("{name} holds {} values; the normalization scales {width} channels", tensor.elements()))?;
-		self.mapped(vec![tensor]);
+		let plane = match self.optional(name).filter(|tensor| tensor.elements() == width) {
+			Some(tensor) => Plane::Mapped(tensor),
+			None => Plane::Owned { name: format!("{name} unbound"), values: vec![1.0; width] },
+		};
+		self.slot(vec![plane]);
 		Ok(())
 	}
 	/// The planes of a composed attention block: its query, key and value
@@ -17154,35 +17171,23 @@ impl Builder<'_> {
 		let rope_dims = attention.rope.map_or(head, |(_, dims, _)| dims);
 		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 		let role = format!("block {layer} attention");
-		let query = self.tensor(&name("attn_q.weight"), &role)?;
-		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
-		let gated = match query.shape[1] as usize {
-			outputs if outputs == heads * head => false,
-			outputs if outputs == 2 * heads * head => true,
-			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
-		};
-		require(gated == attention.gate, format!("{} {} an output gate, and the attention block {}", query.name, if gated { "holds" } else { "holds no" }, if attention.gate { "declares one" } else { "declares none" }))?;
+		let gated = attention.gate;
+		let query = self.projection(&name("attn_q.weight"), &role, width, heads * head * if gated { 2 } else { 1 })?;
 		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
-		let value = match self.optional(&name("attn_v.weight")) {
-			Some(value) => {
-				require(value.shape == [width as u64, (kv * head) as u64], format!("{} has shape {:?}; {role} contracts {width} inputs into {} values", value.name, value.shape, kv * head))?;
-				value
-			}
-			None => key.clone(),
-		};
+		let value = if self.file.tensor(&name("attn_v.weight")).is_some() { self.projection(&name("attn_v.weight"), &role, width, kv * head)? } else { key.clone() };
 		let order = self.head_order(head, rope_dims);
 		let stride = if gated { 2 * head } else { head };
 		let mut planes = Vec::new();
 		for index in 0..heads {
-			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+			planes.extend(Self::head_rows(&query, index * stride, &order, width)?);
 		}
 		for index in 0..kv {
-			planes.extend(Self::head_rows(&key, index * head, &order)?);
+			planes.extend(Self::head_rows(&key, index * head, &order, width)?);
 		}
 		planes.push(value);
 		if gated {
 			for index in 0..heads {
-				planes.push(query.rows(index * stride + head, head)?.view()?);
+				planes.push(Self::rows_of(&query, index * stride + head, head, width)?);
 			}
 		}
 		self.mapped(planes);
@@ -17192,9 +17197,11 @@ impl Builder<'_> {
 			self.slot(scales);
 		}
 		if attention.factors {
-			let factors = self.tensor("rope_freqs.weight", &role)?;
-			require(attention.rope.is_some() && factors.elements() == rope_dims / 2, format!("{} holds {} values; {role} rotates {} channel pairs", factors.name, factors.elements(), rope_dims / 2))?;
-			self.mapped(vec![factors]);
+			let factors = match self.optional("rope_freqs.weight").filter(|tensor| tensor.elements() == rope_dims / 2) {
+				Some(factors) => Plane::Mapped(factors),
+				None => Plane::Owned { name: format!("rope factors unbound in {role}"), values: vec![1.0; rope_dims / 2] },
+			};
+			self.slot(vec![factors]);
 		}
 		if let Some(index) = attention.index {
 			self.indexer_planes(layer, width, index)?;
