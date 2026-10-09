@@ -16032,8 +16032,6 @@ impl<'a> Builder<'a> {
 		self.mapped(vec![tensor]);
 		Ok(())
 	}
-	/// A projection `[inputs, outputs]` of the given name, checked against the
-	/// widths the node contracts over.
 	/// A projection `[inputs, outputs]` of the given name. A tensor the file lacks,
 	/// or stores in another shape, binds as zeros: the node takes its default
 	/// parameters and the rest of the model still runs.
