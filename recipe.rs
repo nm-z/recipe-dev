@@ -9694,13 +9694,15 @@ mod gguf {
 		pub fn blocked(&self) -> bool {
 			layout(self.kind).is_ok_and(|(_, _, _, format)| format.is_some())
 		}
-		/// A contiguous mapped view of `count` output rows from `start`.
-		pub fn rows(&self, start: usize, count: usize) -> Result<Self> {
+		/// Select `count` consecutive output rows from `start`. `RowRun::every` repeats
+		/// the selection through the tensor.
+		pub fn rows(&self, start: usize, count: usize) -> Result<RowRun> {
 			require(self.shape.len() >= 2, format!("tensor {} has {} dimensions; a row slice takes at least [k, n]", self.name, self.shape.len()))?;
 			let rows = self.elements() / self.shape[0] as usize;
 			let end = start.checked_add(count).ok_or_else(|| RecipeError::new(format!("tensor {} row slice overflows", self.name)))?;
 			require(count != 0 && end <= rows, format!("tensor {} holds {rows} rows, so rows {start}..{end} are absent", self.name))?;
-			self.slice(vec![self.shape[0], count as u64], start, count)
+			let view = self.slice(vec![self.shape[0], count as u64], start, count)?;
+			Ok(RowRun { source: self.clone(), start, count, view })
 		}
 		/// A view of `count` rows of `self.shape[0]` elements each, `before` rows in.
 		fn slice(&self, shape: Vec<u64>, before: usize, count: usize) -> Result<Self> {
@@ -9709,6 +9711,28 @@ mod gguf {
 			let (skipped, elements) = (before * width, count * width);
 			require(skipped % block == 0 && elements % block == 0, format!("tensor {} rows of {width} do not divide its {block}-element block, so a slice would cut one", self.name))?;
 			Ok(Self { name: self.name.clone(), shape, kind: self.kind, offset: self.offset + skipped / block * stride, bytes: elements / block * stride, shard: self.shard })
+		}
+	}
+
+	/// Consecutive output rows selected from a tensor by `GgufTensor::rows`.
+	#[derive(Clone)]
+	pub struct RowRun {
+		source: GgufTensor,
+		start: usize,
+		count: usize,
+		view: GgufTensor,
+	}
+	impl RowRun {
+		/// The selected rows as one mapped view.
+		pub fn tensor(self) -> GgufTensor {
+			self.view
+		}
+		/// The selected rows repeated every `period` rows through the tensor, one view
+		/// per repeat in row order. The period must hold the run and divide the rows.
+		pub fn every(self, period: usize) -> Result<Vec<GgufTensor>> {
+			let rows = self.source.elements() / self.source.shape[0] as usize;
+			require(period != 0 && self.start + self.count <= period && rows % period == 0, format!("tensor {} holds {rows} rows, which a {period}-row period over rows {}..{} does not divide", self.source.name, self.start, self.start + self.count))?;
+			(0..rows / period).map(|repeat| self.source.rows(repeat * period + self.start, self.count).map(RowRun::tensor)).collect()
 		}
 	}
 
@@ -10133,7 +10157,7 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue};
+pub use gguf::{Gguf, GgufTensor, GgufValue, RowRun};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
@@ -17431,7 +17455,7 @@ impl<'a> Builder<'a> {
 						tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && count == outputs,
 						format!("{} has shape {:?}; {role} selects {count} rows for a {inputs} by {outputs} projection", tensor.name, tensor.shape),
 					)?;
-					tensor = tensor.rows(start, count)?;
+					tensor = tensor.rows(start, count)?.tensor();
 				}
 				require(
 					tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
@@ -18355,7 +18379,7 @@ impl Builder<'_> {
 							require(branch.blocks.len() == 1 && widths.len() == 1, format!("block {layer} feed-forward product branches are one layer each"))?;
 							hidden = widths[0];
 							let planes = match &pair {
-								Some(pair) => vec![pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?],
+								Some(pair) => vec![pair.rows(if suffix == "ffn_gate.weight" { 0 } else { hidden }, hidden)?.tensor()],
 								None => {
 									let tensor = self.layer_projection(&branch.blocks[0], &name(suffix), &role, width, hidden)?;
 									if branch.blocks[0].weight_rows.is_some() { vec![tensor] } else { self.with_bias(tensor)? }
@@ -18543,8 +18567,8 @@ impl Builder<'_> {
 		// One fused tensor holds the query, key and value rows in that order.
 		if attention.query.is_none() && self.file.tensor(&name("attn_q.weight")).is_none() && self.file.tensor(&name("attn_qkv.weight")).is_some() {
 			let fused = self.projection(&name("attn_qkv.weight"), &role, width, (heads + 2 * kv) * head)?;
-			let mut planes = (0..heads + kv).map(|index| fused.rows(index * head, head)).collect::<Result<Vec<_>>>()?;
-			planes.push(fused.rows((heads + kv) * head, kv * head)?);
+			let mut planes = (0..heads + kv).map(|index| fused.rows(index * head, head).map(RowRun::tensor)).collect::<Result<Vec<_>>>()?;
+			planes.push(fused.rows((heads + kv) * head, kv * head)?.tensor());
 			// The projection's bias rows follow its matrix, in the same order.
 			planes.extend(self.optional(&name("attn_qkv.bias")));
 			self.mapped(planes);
@@ -18573,12 +18597,8 @@ impl Builder<'_> {
 		};
 		let stride = if query_gated { 2 * head } else { head };
 		let mut planes = Vec::new();
-		for index in 0..heads {
-			planes.push(query.rows(index * stride, head)?);
-		}
-		for index in 0..kv {
-			planes.push(key.rows(index * head, head)?);
-		}
+		planes.extend(query.rows(0, head)?.every(stride)?);
+		planes.extend(key.rows(0, head)?.every(head)?);
 		planes.push(value);
 		// Query, key and value biases follow the matrix, in its row order.
 		if !query_gated && let Some(query_bias) = self.optional(&name("attn_q.bias")) {
@@ -18601,8 +18621,8 @@ impl Builder<'_> {
 		if let Some(index) = attention.index.filter(|index| index.heads != 0) {
 			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index.heads * index.width)?;
 			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index.width)?;
-			let mut planes = (0..index.heads).map(|head| query.rows(head * index.width, index.width)).collect::<Result<Vec<_>>>()?;
-			planes.push(key.rows(0, index.width)?);
+			let mut planes = query.rows(0, index.width)?.every(index.width)?;
+			planes.push(key.rows(0, index.width)?.tensor());
 			self.mapped(planes);
 			if index.score.is_some() {
 				let mut scales = self.scale(&name("indexer.q_norm.weight"), &role, index.width, index.heads)?;
@@ -18615,11 +18635,7 @@ impl Builder<'_> {
 				let gate = self.projection_path(path, &role, width, heads * head)?;
 				self.mapped(vec![gate]);
 			} else {
-				let mut gate_planes = Vec::new();
-				for index in 0..heads {
-					gate_planes.push(query.rows(index * stride + head, head)?);
-				}
-				self.mapped(gate_planes);
+				self.mapped(query.rows(head, head)?.every(stride)?);
 			}
 		}
 		Ok(heads * head)
