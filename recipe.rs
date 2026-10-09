@@ -24880,7 +24880,7 @@ impl NativeTape {
 			let ticks = self.contexts.download_range::<i64>(self.program.artifact.layout.timing / 8, 2)?;
 			let node_ticks = self.contexts.download_range::<i64>(clocks / 8, count)?;
 			if mode == ForwardMode::Inference as i32 && self.program.gpu.backend == Backend::Cpu {
-				record_node_timing(&self.timing, (end - begin) as usize, &node_ticks, ticks[1])?;
+				record_node_timing(&self.timing, (end - begin) as usize, &node_ticks, ticks[0])?;
 			}
 			if tuning && let Some(tuner) = tuner.as_mut() {
 				let stamps = std::iter::once(ticks[0]).chain(node_ticks.iter().copied()).collect::<Vec<_>>();
@@ -25685,17 +25685,19 @@ impl TapeTiming {
 		Ok(Self { work, totals, measured, peak })
 	}
 }
-/// Adds one forward window to every node's totals. A node's measured time runs
-/// from its clock to the next node's clock, and the last node runs to completion.
+/// Adds one forward window to every node's totals. A node's clock is stamped after
+/// its node-ending grid barrier, so a node runs from the previous node's clock (the
+/// forward's entry clock for the first) to its own.
 /// Node clocks count nanoseconds of the CPU kernels' `recipe.clock`.
-fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], stop: i64) -> Result<()> {
+fn record_node_timing(timing: &Mutex<TapeTiming>, span: usize, node_ticks: &[i64], start: i64) -> Result<()> {
 	let mut timing = timing.lock().map_err(|_| RecipeError::new("node timing is poisoned"))?;
 	let measured = timing.measured.clone();
 	let peak = timing.peak;
 	let per_tick = 1e-9;
-	for (position, &index) in measured.iter().enumerate() {
-		let next = measured.get(position + 1).map_or(stop, |&next| node_ticks[next]);
-		let elapsed = (next - node_ticks[index]).max(0) as f64 * per_tick;
+	let mut prior = start;
+	for &index in &measured {
+		let elapsed = (node_ticks[index] - prior).max(0) as f64 * per_tick;
+		prior = node_ticks[index];
 		let cost = node_cost(&timing.work[index], span);
 		let total = &mut timing.totals[index];
 		total.operations += cost.operations;
