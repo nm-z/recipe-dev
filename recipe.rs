@@ -17113,7 +17113,8 @@ impl Recipe {
 		self.place_primary(path).try_decode(prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Answer `requests` decodes over HTTP on the primary device, as
-	/// [`Placed::serve`] does over a placement.
+	/// [`Placed::serve`] does over a placement. Health and model reads remain
+	/// available while a queued decode uses that device.
 	pub fn serve(&self, path: impl AsRef<Path>, address: &str, requests: usize) {
 		self.place_primary(path).serve(address, requests);
 	}
@@ -17139,20 +17140,65 @@ fn request_ids(query: &str, name: &str) -> Result<Vec<u32>> {
 		.map_or_else(|| Ok(Vec::new()), |value| value.split(',').map(|id| id.parse().map_err(|_| RecipeError::new(format!("request {name} holds {id:?}, which is not an id")))).collect())
 }
 fn try_serve(placed: &Placed, address: &str, requests: usize) -> Result<()> {
-	use std::io::Write as _;
 	let listener = std::net::TcpListener::bind(address).map_err(|error| RecipeError::new(format!("cannot serve decode on {address}: {error}")))?;
-	for _ in 0..requests {
-		let mut stream = listener.accept().map_err(|error| RecipeError::new(format!("cannot accept a decode request: {error}")))?.0;
-		if let Err(error) = serve_decode(placed, &mut stream) {
-			let body = error.to_string();
-			let answer = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-			stream.write_all(answer.as_bytes()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))?;
+	listener.set_nonblocking(true).map_err(|error| RecipeError::new(format!("cannot make the decode listener nonblocking: {error}")))?;
+	let (sender, receiver) = std::sync::mpsc::channel::<(std::net::TcpStream, String)>();
+	let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let accepting = std::thread::spawn({
+		let pending = pending.clone();
+		move || -> Result<()> {
+			let mut admitted = 0;
+			while admitted < requests || pending.load(Ordering::SeqCst) != 0 {
+				let (mut stream, _) = match listener.accept() {
+					Ok(client) => client,
+					Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+						std::thread::sleep(Duration::from_millis(5));
+						continue;
+					}
+					Err(error) => return Err(RecipeError::new(format!("cannot accept a decode request: {error}"))),
+				};
+				let target = match request_target(&mut stream) {
+					Ok(target) => target,
+					Err(error) => {
+						let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
+						continue;
+					}
+				};
+				match target.split('?').next().unwrap_or("") {
+					"/" => { let _ = write_http(&mut stream, "200 OK", "text/plain", "Recipe ready\n"); }
+					"/health" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"status\":\"ok\"}"); }
+					"/v1/models" => { let _ = write_http(&mut stream, "200 OK", "application/json", "{\"object\":\"list\",\"data\":[{\"id\":\"recipe\",\"object\":\"model\"}]}"); }
+					"/decode" if admitted < requests => {
+						pending.fetch_add(1, Ordering::SeqCst);
+						if sender.send((stream, target)).is_err() {
+							pending.fetch_sub(1, Ordering::SeqCst);
+							return Err(RecipeError::new("decode worker stopped before accepting the request"));
+						}
+						admitted += 1;
+					}
+					"/decode" => { let _ = write_http(&mut stream, "503 Service Unavailable", "text/plain", "decode request limit reached\n"); }
+					_ => { let _ = write_http(&mut stream, "404 Not Found", "text/plain", "not found\n"); }
+				}
+			}
+			Ok(())
 		}
+	});
+	for (mut stream, target) in receiver {
+		if let Err(error) = serve_decode(placed, &mut stream, &target) {
+			let _ = write_http(&mut stream, "400 Bad Request", "text/plain", &error.to_string());
+		}
+		pending.fetch_sub(1, Ordering::SeqCst);
 	}
-	Ok(())
+	accepting.join().map_err(|_| RecipeError::new("decode listener panicked"))?
 }
-fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()> {
-	use std::io::{Read as _, Write as _};
+fn write_http(stream: &mut std::net::TcpStream, status: &str, content_type: &str, body: &str) -> Result<()> {
+	use std::io::Write as _;
+	let answer = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+	stream.write_all(answer.as_bytes()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
+}
+fn request_target(stream: &mut std::net::TcpStream) -> Result<String> {
+	use std::io::Read as _;
+	stream.set_read_timeout(Some(Duration::from_millis(250))).map_err(|error| RecipeError::new(format!("cannot set request timeout: {error}")))?;
 	let mut head = Vec::new();
 	let mut byte = [0_u8; 1];
 	while !head.ends_with(b"\r\n\r\n") {
@@ -17161,8 +17207,11 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 		require(read == 1, "decode request ended before its head")?;
 		head.push(byte[0]);
 	}
-	let head = String::from_utf8_lossy(&head).into_owned();
-	let target = head.split_whitespace().nth(1).ok_or_else(|| RecipeError::new("decode request names no target"))?;
+	stream.set_read_timeout(None).map_err(|error| RecipeError::new(format!("cannot clear request timeout: {error}")))?;
+	String::from_utf8_lossy(&head).split_whitespace().nth(1).map(str::to_owned).ok_or_else(|| RecipeError::new("decode request names no target"))
+}
+fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream, target: &str) -> Result<()> {
+	use std::io::Write as _;
 	let query = target.split_once('?').map_or("", |(_, query)| query);
 	let prompt = request_ids(query, "ids")?;
 	let stop = request_ids(query, "stop")?;
@@ -17190,12 +17239,27 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 	let write = |stream: &mut std::net::TcpStream, bytes: &[u8]| {
 		stream.write_all(bytes).and_then(|()| stream.flush()).map_err(|error| RecipeError::new(format!("cannot answer a decode request: {error}")))
 	};
-	write(stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-	placed.try_decode(&prompt, &mut sampler, &stop, budget, |id| {
+	let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+	let mut started = false;
+	let decoded = placed.try_decode(&prompt, &mut sampler, &stop, budget, |id| {
+		if !started {
+			write(stream, header)?;
+			started = true;
+		}
 		let chunk = format!("{id}\n");
 		write(stream, format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
-	})?;
-	write(stream, b"0\r\n\r\n")
+	});
+	match decoded {
+		Ok(_) => {
+			if !started { write(stream, header)?; }
+			write(stream, b"0\r\n\r\n")
+		}
+		Err(error) if started => {
+			eprintln!("decode response ended after streaming began: {error}");
+			Ok(())
+		}
+		Err(error) => Err(error),
+	}
 }
 /// One id at a time over a tape whose input is a sequence of ids. The prefill
 /// runs the prompt, every step adds one id and forwards the positions it reaches
@@ -17777,8 +17841,9 @@ impl Placed {
 	pub fn decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
 		self.try_decode(prompt, sampler, stop, budget, |_| Ok(())).unwrap_or_else(|error| panic!("{error}"))
 	}
-	/// Answer `requests` decodes over HTTP and return. A request names its prompt
-	/// in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&seed=7`,
+	/// Answer `requests` decodes over HTTP and return. Control reads at `/`,
+	/// `/health`, and `/v1/models` do not consume the decode request count. A
+	/// completion names its prompt as `GET /decode?ids=3,1,4&budget=16&stop=2`,
 	/// and the answer sends each id as its own chunk as the decode reaches it.
 	pub fn serve(&self, address: &str, requests: usize) {
 		try_serve(self, address, requests).unwrap_or_else(|error| panic!("{error}"));
