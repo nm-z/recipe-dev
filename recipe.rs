@@ -14049,6 +14049,19 @@ pub(crate) struct StoredWeight {
 	pub(crate) segments: Vec<(StorageFormat, usize)>,
 }
 impl StoredWeight {
+	/// Every element decoded on the host, one source layout at a time.
+	fn decoded(&self) -> Result<Vec<f64>> {
+		let bytes = self.bytes.to_vec()?;
+		let (mut values, mut at) = (Vec::with_capacity(self.count), 0);
+		for (format, count) in self.format_segments() {
+			let spec = format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", format.0)))?;
+			let length = count.div_ceil(spec.block) * spec.stride;
+			let span = bytes.get(at..at + length).ok_or_else(|| RecipeError::new("stored weight is shorter than its layout"))?;
+			values.extend(format.decompress(span, &self.codebook, count)?);
+			at += length;
+		}
+		Ok(values)
+	}
 	/// The formats and element counts in the order their bytes occupy `bytes`.
 	/// Older in-memory callers may leave this empty, so retain the single-span
 	/// representation as a compatibility fallback.
@@ -17963,6 +17976,7 @@ fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
 		config: graph.config,
 		bound: None,
 		bound_values: Vec::new(),
+		host_weights: graph.host_weights,
 		bias: graph.bias,
 		epsilon: graph.epsilon,
 	})
@@ -18565,6 +18579,8 @@ struct Graph {
 	/// Bound values by node, written into their spans once every lowering has
 	/// set its own initial parameters.
 	bound_values: Vec<(usize, Vec<f64>)>,
+	/// Whether a bound weight that trains decodes into its host span rather than staying packed for the device.
+	host_weights: bool,
 	/// Whether a weighted block allocates its bias. Set once from the model, so
 	/// every lowering below sees it without threading a flag through each one.
 	bias: bool,
@@ -18600,6 +18616,7 @@ impl Graph {
 			config: None,
 			bound: None,
 			bound_values: Vec::new(),
+			host_weights: false,
 			bias: true,
 		}
 	}
@@ -18686,6 +18703,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.profile = config.profile;
 	graph.config = Some(config);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
+	graph.host_weights = initialize;
 	// Set once. Every lowering below reads it from the graph, so a nested branch
 	// inside a residual, an ensemble, a mixture, or a product excludes the bias too.
 	graph.bias = model.exclusions & bias.mask() == 0;
@@ -19105,6 +19123,11 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 			match bound.weight {
 				// A bound contraction or expert decodes the mapped source layout;
 				// compute precision does not expand its stored table.
+				// A node that trains owns a host span, so a packed file weight decodes into it; a table is drawn once and stays packed.
+				BoundWeight::Stored(weight) if graph.host_weights && !node.table() => {
+					graph.bound_values.push((index, weight.decoded()?));
+					None
+				}
 				BoundWeight::Stored(weight) => {
 					if node.table() || matches!(node.op, Primitive::Contraction | Primitive::ExpertIn | Primitive::ExpertOut) {
 						node.storage = weight.format.0;
