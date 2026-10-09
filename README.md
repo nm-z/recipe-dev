@@ -8,7 +8,7 @@ GPU/CPU ML training and inference in Rust.
 recipe run train.rs --cfg recipe --device amd0.cpu.archy:nv7.nv8 --ctx 4096 -p "text"
 ```
 
-The AMD backend supports discrete GPUs only. AMD APUs and integrated GPUs are unsupported.
+The AMD backend supports discrete GPUs only and requires gfx8 or newer. AMD APUs and integrated GPUs are unsupported.
 
 ## **Data**
 
