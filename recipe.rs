@@ -12985,7 +12985,7 @@ impl Model {
 	}
 	fn for_file(&self, file: &Gguf) -> Self {
 		let model = if self.epsilon_explicit { self.clone() } else { self.edit(|model| model.epsilon = file.rms_epsilon().unwrap_or(model.epsilon)) };
-		let Some((vocabulary, width)) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, width) => Some((rows, width)), _ => None }) else { return model };
+		let Some(vocabulary) = model.blocks.iter().find_map(|block| match block.operation { Operation::Embed(rows, _) => Some(rows), _ => None }) else { return model };
 		model.edit(|model| {
 			let mut layers = 0;
 			for block in &mut model.blocks {
@@ -12998,7 +12998,7 @@ impl Model {
 				if attends { layers += 1; }
 				if layers == 0 { continue; }
 				let part = if attends { "attn" } else { "ffn" };
-				adapt_file_branch(file, parts, layers - 1, part, width, plain);
+				adapt_file_branch(file, parts, layers - 1, part, plain);
 			}
 			let output_scale = file.tensor("output_norm.weight").or_else(|| file.tensor("token_embd_norm.weight"));
 			if output_scale.is_none() { return; }
@@ -16527,8 +16527,8 @@ fn conventional_plan(file: &Gguf, model: &Model) -> Result<Binding> {
 }
 /// Resolve optional source planes inside the model builder. The user declares
 /// each branch's operation and dimensions; the file determines its trained
-/// gates and normalization scales.
-fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, width: usize, plain: bool) {
+/// normalization scales and rotary factors.
+fn adapt_file_branch(file: &Gguf, parts: &mut Vec<Block>, layer: usize, part: &str, plain: bool) {
 	let name = |suffix: &str| format!("blk.{layer}.{suffix}");
 	for block in parts.iter_mut() {
 		if let Operation::Attention(attention) = &mut block.operation {
