@@ -8,6 +8,7 @@ fn hyper_gate(lanes: usize, rank: usize, width: usize) -> HyperGate {
 	HyperGate {
 		read: recipe.model().no(bias).norm(rms).layer(rank).scale(scale).silu().layer(lanes * width).sigmoid(),
 		write: recipe.model().no(bias).norm(rms).layer(lanes).scale(scale).sigmoid().scale(2.0),
+		mean: scale,
 	}
 }
 
@@ -34,12 +35,13 @@ pub fn model() -> Model {
 				.keys(qwen4exp.ssm.group_count, qwen4exp.ssm.state_size).values(qwen4exp.ssm.state_size).out(width)
 				.delta_norms(l2, rms)
 				.delta_activations(Activation::Silu, Activation::Sigmoid)
+				.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
 		};
-		model = if rank == 0 { model.hyper(lanes, &attention) } else { model.hyper_gate(lanes, &attention, hyper_gate(lanes, rank, width)) };
+		model = if rank == 0 { model.hyper(lanes, &attention, 1.0 / lanes as f64) } else { model.hyper_gate(lanes, &attention, hyper_gate(lanes, rank, width)) };
 		let scoring = match qwen4exp.expert_gating_func { 1 => Scoring::Softmax, 2 => Scoring::Sigmoid, value => panic!("unknown expert gating function {value}") };
 		let experts = recipe.model().gguf_moe(qwen4exp.expert_count, qwen4exp.expert_used_count, qwen4exp.expert_feed_forward_length,
 			Activation::Silu, scoring, qwen4exp.expert_weights_norm, qwen4exp.expert_shared_feed_forward_length != 0);
-		model = if rank == 0 { model.hyper(lanes, &experts) } else { model.hyper_gate(lanes, &experts, hyper_gate(lanes, rank, width)) };
+		model = if rank == 0 { model.hyper(lanes, &experts, 1.0 / lanes as f64) } else { model.hyper_gate(lanes, &experts, hyper_gate(lanes, rank, width)) };
 	}
 	model.layer(vocabulary)
 }

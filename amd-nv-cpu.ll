@@ -2684,7 +2684,6 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narro
 define internal void @read_forward_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %output, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %narrow %within = urem i64 %p, %narrow
-%lanes.value = call double @recipe.from.u32(i32 %lanes) %scale = call double @recipe.div(double 1.0, double %lanes.value)
 %row.base = mul i64 %row, %per.row %base = add i64 %row.base, %within br label %loop loop:
 %lane = phi i64 [ 0, %entry ], [ %lane.next, %step ] %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ] %more = icmp ult i64 %lane, %lanes.wide
 br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narrow %index = add i64 %base, %lane.offset
@@ -2692,17 +2691,14 @@ br i1 %more, label %step, label %done step: %lane.offset = mul i64 %lane, %narro
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %index %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8
 %weight = select i1 %gated, double %gate.loaded, double 1.0 %product = call double @recipe.mul(double %weight, double %value)
 %sum.next = call double @recipe.add(double %sum, double %product) %lane.next = add i64 %lane, 1 br label %loop done:
-%mean = call double @recipe.mul(double %sum, double %scale)
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %mean, ptr addrspace(1) %output.ptr, align 8 ret void }
-; Stream element %p receives gate * dh / lanes, and its gate receives stream * dh / lanes.
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p store double %sum, ptr addrspace(1) %output.ptr, align 8 ret void }
+; Stream element %p receives gate * dh, and its gate receives stream * dh. The lane mean is an explicit scale step, so dh arrives already divided by the lane count.
 define internal void @read_reverse_body( ptr addrspace(1) %stream, ptr addrspace(1) %gate, ptr addrspace(1) %delta, ptr addrspace(1) %stream.adjoint, ptr addrspace(1) %gate.adjoint, i64 %p, i32 %channels, i32 %length, i32 %lanes, i1 %gated ) #1 { entry:
 %channels.wide = zext i32 %channels to i64 %length.wide = zext i32 %length to i64 %lanes.wide = zext i32 %lanes to i64
 %narrow = mul i64 %channels.wide, %length.wide %per.row = mul i64 %narrow, %lanes.wide %row = udiv i64 %p, %per.row %within = urem i64 %p, %per.row
 %lane.channel = udiv i64 %within, %length.wide %position = urem i64 %within, %length.wide %channel = urem i64 %lane.channel, %channels.wide
 %row.base = mul i64 %row, %narrow %channel.base = mul i64 %channel, %length.wide %h.row = add i64 %row.base, %channel.base %h = add i64 %h.row, %position
-%state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true) %lanes.value = call RECIPE_STATE @recipe.state.from.u32(i32 %lanes) %scale = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %state.one, RECIPE_STATE %lanes.value)
-%delta.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %delta, i64 %h %dh.loaded = load RECIPE_STATE, ptr addrspace(1) %delta.ptr, align RECIPE_STATE_ALIGN
-%dh = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %dh.loaded, RECIPE_STATE %scale)
+%state.one = call RECIPE_STATE @recipe.state.from.u1(i1 true) %delta.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %delta, i64 %h %dh = load RECIPE_STATE, ptr addrspace(1) %delta.ptr, align RECIPE_STATE_ALIGN
 %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %gate, i64 %p %gate.loaded = load double, ptr addrspace(1) %gate.ptr, align 8 %gate.wide = call RECIPE_STATE @recipe.decode(double %gate.loaded)
 %weight = select i1 %gated, RECIPE_STATE %gate.wide, RECIPE_STATE %state.one %stream.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %weight, RECIPE_STATE %dh)
 %stream.adjoint.ptr = getelementptr inbounds RECIPE_STATE, ptr addrspace(1) %stream.adjoint, i64 %p %stream.prior = load RECIPE_STATE, ptr addrspace(1) %stream.adjoint.ptr, align RECIPE_STATE_ALIGN

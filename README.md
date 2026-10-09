@@ -68,10 +68,12 @@ let attention = recipe.model()
 	.delta(48, 4).keys(16, 128).values(128).out(qwen35.embedding_length)
 	.delta_norms(l2, rms)
 	.delta_activations(Activation::Silu, Activation::Sigmoid)
+	.delta_gates(DeltaDecay::Softplus, DeltaWrite::Sigmoid)
 	.norm(rms);
 let gate = HyperGate {
 	read: recipe.model().no(bias).norm(rms).layer(320).scale(0.25).silu().layer(4 * qwen35.embedding_length).sigmoid(),
 	write: recipe.model().no(bias).norm(rms).layer(4).scale(0.25).sigmoid().scale(2.0),
+	mean: 0.25,
 };
 let model = recipe.model()
 	.e(qwen35.attention.layer_norm_rms_epsilon)
@@ -92,6 +94,7 @@ let model = recipe.model()
 		.delta_norms(l2, rms)
 		.out(width)
 		.delta_activations(convolution, output)
+		.delta_gates(decay, write)
 	perc(width)
 	glu(hidden, activation)
 	ple(&ngram).ple_math(PleMath {
@@ -160,8 +163,8 @@ prec:
 	.recur([blocks]])
 	.ensemble([blocks])
 	.moe(topk, [blocks])
-	.hyper(lanes, &branch)
-	.hyper_gate(lanes, &branch, HyperGate { read, write })
+	.hyper(lanes, &branch, mean)
+	.hyper_gate(lanes, &branch, HyperGate { read, write, mean })
 ```
 
 ```rust
@@ -370,13 +373,13 @@ model.memory(&data, positions).*|place().memory()[].*
 delta(heads, kernel)
 	.keys(count, width, tiled)                                  // .keys(count, width)
 	.qk(l2|rms)
-	.decay(softplus|sigmoid)
+	.delta_gates(softplus, sigmoid)
 
 attn(heads)
 	.gate(sigmoid|silu|tanh)                                    // .gate()
 
-hyper(lanes, &branch)
-hyper_gate(lanes, &branch, HyperGate { read, write })
+hyper(lanes, &branch, mean)
+hyper_gate(lanes, &branch, HyperGate { read, write, mean })
 
 moe(topk, [experts])                                            // moe(topk, [blocks])
 	.route(softmax|sigmoid)
