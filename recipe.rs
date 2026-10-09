@@ -10261,7 +10261,8 @@ mod tokenizer {
 		Gpt2,
 		Llama3,
 		Qwen2,
-		Gemma4,
+		/// A SentencePiece vocabulary (`tokenizer.ggml.model` of `llama` or `gemma4`): spaces become `▁` and bytes without a piece fall back to `<unk>`.
+		SentencePiece,
 		/// Every digit on its own, then the GPT-2 words.
 		Digits,
 		/// Punctuation runs, the GPT-2 words, then digits in threes.
@@ -10448,7 +10449,7 @@ mod tokenizer {
 		/// The passes llama.cpp applies for this family, in order.
 		fn passes(self) -> &'static [Pass] {
 			match self {
-				Self::Gemma4 => &[],
+				Self::SentencePiece => &[],
 				Self::Gpt2 => &[Pass::Words(Self::Gpt2)],
 				Self::Llama3 => &[Pass::Words(Self::Llama3)],
 				Self::Qwen2 => &[Pass::Words(Self::Qwen2)],
@@ -10510,7 +10511,7 @@ mod tokenizer {
 			run(chars, at, space).max(1)
 		}
 		fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
-			if self == Self::Gemma4 {
+			if self == Self::SentencePiece {
 				let mut pieces = Vec::new();
 				let mut start = 0;
 				while start < text.len() {
@@ -10614,7 +10615,7 @@ mod tokenizer {
 		pub(super) fn from_gguf(model: &Gguf) -> Result<Self> {
 			let text = |key: &str| model.value(key).and_then(GgufValue::text).ok_or_else(|| RecipeError::new(format!("{key} is absent")));
 			let kind = text("tokenizer.ggml.model")?;
-			let family = if kind == "gemma4" || kind == "llama" { Family::Gemma4 } else {
+			let family = if kind == "gemma4" || kind == "llama" { Family::SentencePiece } else {
 				require(kind == "gpt2", format!("tokenizer model {kind:?} is unsupported"))?;
 				Family::named(text("tokenizer.ggml.pre")?)?
 			};
@@ -10642,9 +10643,9 @@ mod tokenizer {
 				_ => return Err(RecipeError::new("the vocabulary ranks its pieces by neither tokenizer.ggml.merges nor tokenizer.ggml.scores")),
 			};
 			let map = byte_map();
-			let mut bytes = [if family == Family::Gemma4 { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
+			let mut bytes = [if family == Family::SentencePiece { *ids.get("<unk>").unwrap_or(&0) } else { ABSENT }; 256];
 			let mut byte_of = HashMap::new();
-			if family != Family::Gemma4 {
+			if family != Family::SentencePiece {
 				for (byte, symbol) in map.iter().enumerate() { bytes[byte] = ids.get(&symbol.to_string()).copied().unwrap_or(ABSENT); }
 				byte_of = map.iter().enumerate().map(|(byte, symbol)| (*symbol, byte as u8)).collect();
 			}
@@ -10734,10 +10735,10 @@ mod tokenizer {
 			(!self.is_added[merged as usize]).then_some((rank, merged))
 		}
 		fn encode_plain(&self, text: &str, output: &mut Vec<Vec<u32>>) {
-			let normalized = (self.family == Family::Gemma4).then(|| text.replace(' ', "▁"));
+			let normalized = (self.family == Family::SentencePiece).then(|| text.replace(' ', "▁"));
 			let text = normalized.as_deref().unwrap_or(text);
 			for word in self.family.split(text) {
-				let mut symbols = if self.family == Family::Gemma4 {
+				let mut symbols = if self.family == Family::SentencePiece {
 					if word.chars().all(|value| value == '\n') && let Some(id) = self.ids.get(word) {
 						vec![*id]
 					} else {
@@ -10788,7 +10789,7 @@ mod tokenizer {
 				}
 			}
 			let text = String::from_utf8_lossy(&bytes).into_owned();
-			if self.family == Family::Gemma4 { text.replace('▁', " ") } else { text }
+			if self.family == Family::SentencePiece { text.replace('▁', " ") } else { text }
 		}
 		/// `tokenizer.chat_template` rendered for `messages`, each a role and its
 		/// content. `generation` sets `add_generation_prompt`, which the template
@@ -10797,7 +10798,7 @@ mod tokenizer {
 			self.prompt(messages, generation).unwrap_or_else(|error| panic!("{error}"))
 		}
 		pub fn prompt(&self, messages: &[(&str, &str)], generation: bool) -> Result<String> {
-			if self.family == Family::Gemma4 {
+			if self.family == Family::SentencePiece {
 				let mut prompt = String::new();
 				for (role, content) in messages {
 					let role = if *role == "assistant" { "model" } else if *role == "developer" { "system" } else { role };
