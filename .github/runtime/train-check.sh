@@ -37,7 +37,6 @@ fn main() {
 				norm(rms),
 				attn(qwen3.attention.head_count).kv(qwen3.attention.head_count_kv).width(qwen3.attention.key_length)
 					.qk(rms).rope(neox, qwen3.attention.key_length, qwen3.rope.freq_base),
-				layer(qwen3.embedding_length),
 			])
 			.res([
 				norm(rms),
