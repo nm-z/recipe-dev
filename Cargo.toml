@@ -164,3 +164,105 @@ rope-angle = "chain"
 attn-softmax = "online"
 math = "libm"
 step = 256
+
+[architecture.llama]
+rope-pairs = "neighbours"
+feed-forward-activation = "silu"
+
+[architecture.gemma3]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.gemma4]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.lfm2]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
+[architecture.qwen2]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+
+[architecture.qwen3]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
+
+[architecture.qwen2moe]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+
+[architecture.qwen3moe]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+
+[architecture.qwen35]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+delta-convolution = "silu"
+delta-output = "silu"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+
+[architecture.qwen3next]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+delta-convolution = "silu"
+delta-output = "silu"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+
+[architecture.qwen4exp]
+rope-pairs = "halves"
+feed-forward-activation = "silu"
+expert-activation = "silu"
+expert-scoring = "softmax"
+expert-renormalize = "true"
+expert-scale = "1.0"
+delta-convolution = "silu"
+delta-output = "sigmoid"
+delta-decay = "softplus"
+delta-write = "sigmoid"
+delta-qk-norm = "l2"
+delta-value-norm = "rms"
+ple-key-norm = "rms"
+ple-query-norm = "rms"
+ple-output-norm = "rms"
+ple-convolution = "silu"
+ple-gate = "signed-root-sigmoid"
+ple-floor = "0.000001"
+ple-width-scaled = "true"
