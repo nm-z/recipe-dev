@@ -10431,6 +10431,13 @@ mod ngram {
 
 	impl<'a> Ngram<'a> {
 		pub(super) fn new(model: &'a Gguf) -> Result<Self> {
+			let mut table = Self::layout(model)?;
+			let name = model.value("ngram.conv").and_then(GgufValue::text).unwrap_or("ngram.conv");
+			table.taps = model.tensor(name).map(|tensor| model.values(tensor)).transpose()?.unwrap_or_default();
+			Ok(table)
+		}
+		/// Read the table and hash description without decoding any tensor values.
+		fn layout(model: &'a Gguf) -> Result<Self> {
 			let integer = |key: &str| model.value(key).and_then(GgufValue::integer);
 			let named = |key: &str, fallback| model.value(key).and_then(GgufValue::text).unwrap_or(fallback);
 			let architecture = model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
@@ -10492,11 +10499,16 @@ mod ngram {
 			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
 			require(width != 0 && hash.rows() <= rows, format!("n-gram table {name:?} holds {rows} rows of {width}, the hash reaches row {}", hash.rows()))?;
 			require(kernel != 0, "n-gram convolution kernel must be positive")?;
-			let taps = match model.tensor(named("ngram.conv", "ngram.conv")) {
-				Some(tensor) => model.values(tensor)?,
-				None => Vec::new(),
-			};
-			Ok(Self { model, table, taps, hash, layer, kernel, width, rows })
+			Ok(Self { model, table, taps: Vec::new(), hash, layer, kernel, width, rows })
+		}
+		pub(super) fn report(model: &'a Gguf) -> Result<Option<NgramReport>> {
+			let architecture = model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+			if model.value("ngram.heads").is_none() && model.value(&format!("{architecture}.ple.ngram_size")).is_none() { return Ok(None); }
+			let table = Self::layout(model)?;
+			Ok(Some(NgramReport {
+				table: table.table, ngram_size: table.hash.ngram, heads_per_ngram: table.hash.per_order,
+				layer: table.layer, kernel: table.kernel, head_offsets: table.hash.offsets, head_vocab_sizes: table.hash.vocabularies,
+			}))
 		}
 		/// Heads per n-gram order.
 		pub fn heads(&self) -> usize {
@@ -14824,6 +14836,9 @@ pub const all: Metric = Metric(16);
 pub const dev: Metric = Metric(17);
 /// Capture actual Hyper mixer value buffers in `report.tensors`.
 pub const hc_values: Metric = Metric(18);
+const GGUF_METADATA: u8 = 19;
+const GGUF_TENSORS: u8 = 20;
+const GGUF_NGRAM: u8 = 21;
 const TENSOR_HYPER: u8 = 1;
 /// Lowercase field selectors for `.log(...)`; groups and the uncommon `blck`
 /// and `tile` selectors remain available from the crate root.
@@ -14837,6 +14852,12 @@ pub mod log {
 	pub const score: Metric = super::Score;
 	pub const choices: Metric = super::Choices;
 	pub const window: Metric = super::Window;
+	/// Metadata from the GGUF opened by this inference run.
+	pub const metadata: Metric = Metric(super::GGUF_METADATA);
+	/// GGUF tensor names, shapes, and storage types.
+	pub const tensors: Metric = Metric(super::GGUF_TENSORS);
+	/// The GGUF n-gram table and head ranges.
+	pub const ngram: Metric = Metric(super::GGUF_NGRAM);
 }
 /// One metric or a set of them, so `.log(tile)` and `.log(all)` are the same call.
 pub trait IntoMetrics {
@@ -14855,7 +14876,7 @@ impl<const N: usize> IntoMetrics for [Metric; N] {
 fn normalize_metrics(metrics: impl IntoIterator<Item = Metric>) -> Vec<Metric> {
 	const ALL: [Metric; 6] = [Run, Time, Epoch, R2, Loss, blck];
 	const DEV: [Metric; 4] = [tile, Score, Choices, Window];
-	const ORDER: [Metric; 13] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values];
+	const ORDER: [Metric; 16] = [Run, Time, Epoch, R2, Loss, blck, tile, Score, Choices, Window, chat, debug, hc_values, log::metadata, log::tensors, log::ngram];
 	let mut selected = Vec::new();
 	for metric in metrics {
 		match metric {
@@ -16220,6 +16241,9 @@ pub mod infer {
 	pub const out: ChatMetric = ChatMetric(4);
 	pub const cached: ChatMetric = ChatMetric(5);
 	pub const time: ChatMetric = ChatMetric(6);
+	pub const metadata: ChatMetric = ChatMetric(super::GGUF_METADATA);
+	pub const tensors: ChatMetric = ChatMetric(super::GGUF_TENSORS);
+	pub const ngram: ChatMetric = ChatMetric(super::GGUF_NGRAM);
 }
 pub trait IntoChatMetrics { fn into_chat_metrics(self) -> Vec<ChatMetric>; }
 impl IntoChatMetrics for ChatMetric {
@@ -16273,9 +16297,11 @@ impl Infer {
 		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPTED.store(false, Ordering::Release);
 		let load_started = Instant::now();
-		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| metric.0 != infer::text.0).collect::<Vec<_>>();
-		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
+		let metrics = self.chat.clone().unwrap_or_default().into_iter().filter(|metric| (infer::pp.0..=infer::time.0).contains(&metric.0)).collect::<Vec<_>>();
 		let file = data.file.clone().ok_or_else(|| RecipeError::new("recipe.infer runs the model a GGUF file describes; open one with recipe.data(\"<model>.gguf\")"))?;
+		let gguf = GgufReport::collect(&file)?;
+		gguf.print(self.log.iter().map(|metric| metric.0).chain(self.chat.iter().flatten().map(|metric| metric.0)))?;
+		let loading = metrics.contains(&infer::time).then(|| InferenceLive::new(InferenceProgress { phase: "load", started: Some(load_started), ..Default::default() }, metrics.clone()));
 		let bound = explicit_bound(&file, model)?;
 		let devices = selected_gpus()?;
 		let architecture = file.value("general.architecture").and_then(GgufValue::text).unwrap_or("model").to_owned();
@@ -16377,6 +16403,7 @@ impl Infer {
 			conversation.push(("assistant".to_owned(), reply));
 		}
 		Ok(InferenceReport {
+			gguf,
 			llvm: placed.llvm_report(),
 			path: data.report_path()?,
 			formats: placed.format_report()?,
@@ -16889,7 +16916,80 @@ fn print_tensor_observations(tensors: &[TensorObservation]) -> Result<()> {
 	}
 	Ok(())
 }
+/// GGUF contents observed by an inference run. Values retain their declared
+/// types; live selections summarize large arrays and cap the displayed rows.
+#[derive(Clone, Debug)]
+pub struct GgufReport {
+	pub metadata: Vec<(String, GgufValue)>,
+	pub tensors: Vec<GgufTensor>,
+	pub ngram: Option<NgramReport>,
+}
+/// The parsed table layout, without gathering or decoding embedding values.
+#[derive(Clone, Debug)]
+pub struct NgramReport {
+	pub table: GgufTensor,
+	pub ngram_size: usize,
+	pub heads_per_ngram: usize,
+	pub layer: usize,
+	pub kernel: usize,
+	pub head_offsets: Vec<u64>,
+	pub head_vocab_sizes: Vec<u64>,
+}
+impl GgufReport {
+	fn collect(file: &Gguf) -> Result<Self> {
+		Ok(Self { metadata: file.metadata().to_vec(), tensors: file.tensors().to_vec(), ngram: Ngram::report(file)? })
+	}
+	fn print(&self, metrics: impl IntoIterator<Item = u8>) -> Result<()> {
+		const ROWS: usize = 32;
+		const CHARS: usize = 160;
+		let selected = metrics.into_iter().collect::<Vec<_>>();
+		if !selected.iter().any(|metric| matches!(*metric, GGUF_METADATA | GGUF_TENSORS | GGUF_NGRAM)) { return Ok(()); }
+		let text = |value: &str| {
+			let mut chars = value.chars().flat_map(char::escape_debug);
+			let mut text = chars.by_ref().take(CHARS).collect::<String>();
+			if chars.next().is_some() { text.push_str("..."); }
+			text
+		};
+		let printed = (|| -> std::io::Result<()> {
+			let mut output = std::io::stdout().lock();
+			if selected.contains(&GGUF_METADATA) {
+				writeln!(output, "gguf metadata {} entries, {} shown", self.metadata.len(), self.metadata.len().min(ROWS))?;
+				for (key, value) in self.metadata.iter().take(ROWS) {
+					let value = match value {
+						GgufValue::String(value) => format!("\"{}\"", text(value)),
+						GgufValue::Array(values) => format!("array[{}]", values.len()),
+						value => format!("{value:?}"),
+					};
+					writeln!(output, "{} {}", text(key), value)?;
+				}
+			}
+			if selected.contains(&GGUF_TENSORS) {
+				writeln!(output, "gguf tensors {} entries, {} shown", self.tensors.len(), self.tensors.len().min(ROWS))?;
+				for tensor in self.tensors.iter().take(ROWS) {
+					writeln!(output, "{} shape {:?} kind {} bytes {}", text(&tensor.name), &tensor.shape[..tensor.shape.len().min(8)], tensor.kind, tensor.bytes)?;
+				}
+			}
+			if selected.contains(&GGUF_NGRAM) {
+				match &self.ngram {
+					Some(table) => {
+						writeln!(output, "gguf ngram {} shape {:?} kind {} size {} heads-per-ngram {} layer {} kernel {}", text(&table.table.name), table.table.shape, table.table.kind,
+							table.ngram_size, table.heads_per_ngram, table.layer, table.kernel)?;
+						writeln!(output, "head offsets {:?} vocab sizes {:?} of {} heads", &table.head_offsets[..table.head_offsets.len().min(8)],
+							&table.head_vocab_sizes[..table.head_vocab_sizes.len().min(8)], table.head_offsets.len())?;
+					}
+					None => writeln!(output, "gguf ngram absent")?,
+				}
+			}
+			output.flush()?;
+			Ok(())
+		})();
+		printed.map_err(|error| RecipeError::new(format!("cannot print GGUF observations: {error}")))
+	}
+}
+
 pub struct InferenceReport {
+	/// File observations from this run, distinct from captured execution buffers.
+	pub gguf: GgufReport,
 	pub llvm: LlvmReport,
 	pub path: String,
 	pub formats: ReportLines,
@@ -30717,6 +30817,7 @@ impl Train {
 	}
 	pub fn log(mut self, metrics: impl IntoMetrics) -> Self {
 		self.log_metrics = metrics.into_metrics();
+		assert!(!self.log_metrics.iter().any(|metric| matches!(metric.0, GGUF_METADATA | GGUF_TENSORS | GGUF_NGRAM)), "GGUF file observations require recipe.infer()");
 		arm_trace(&self.log_metrics);
 		self
 	}
