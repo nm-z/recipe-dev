@@ -1,0 +1,12 @@
+case accept drafts 0 accepted 0 rejected 0 steps 15 tokens_per_step 1.000 weights 31108
+case accept drafts 1 accepted 8 rejected 0 steps 8 tokens_per_step 2.000 weights 31108
+case accept drafts 2 accepted 10 rejected 0 steps 5 tokens_per_step 3.000 weights 31108
+case accept drafts 3 accepted 12 rejected 0 steps 4 tokens_per_step 4.000 weights 31108
+case accept drafts 4 accepted 12 rejected 0 steps 3 tokens_per_step 5.000 weights 31108
+case accept lookup drafted 17 accepted 11 partial_rejected 6 cached 21 weights 31108
+case reject drafts 0 accepted 0 rejected 0 steps 15 tokens_per_step 1.000 weights 31108
+case reject drafts 1 accepted 0 rejected 15 steps 15 tokens_per_step 1.000 weights 31108
+case reject drafts 2 accepted 0 rejected 29 steps 15 tokens_per_step 1.000 weights 31108
+case reject drafts 3 accepted 0 rejected 42 steps 15 tokens_per_step 1.000 weights 31108
+case reject drafts 4 accepted 0 rejected 54 steps 15 tokens_per_step 1.000 weights 31108
+case reject lookup drafted 17 accepted 11 partial_rejected 6 cached 21 weights 31108

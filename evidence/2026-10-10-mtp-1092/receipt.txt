@@ -1,0 +1,41 @@
+Issue: nm-z/recipe-dev#1092
+Parent source: PR #942, 97ce58cedce085b2258706f422245a2870bfc00b
+Runtime/grouping source: 8a1957360008a1cf2d1174b5f0b402f66dab3d85
+MoE head precision source: 154b9ea195873fbe5326f2ca947af0dcc933acd2
+Machine: archy
+GPU: physical die 1, GPU-ccb8b3a3-f45d-8962-215b-c2b140e4bb28
+Serialization: flock /home/nate/codex/flash-1092-die1.lock
+Toolkit: owned PTX 7.4, /opt/cuda-11.4/bin/ptxas, sm_52, driver 470
+GPU fixture commands use CUDA_VISIBLE_DEVICES with the UUID above and logical nv0.
+No hardware setting or service changes from this track.
+
+Build: make all; release library/CLI and owned PTX object, exit 0.
+Public CPU/GPU state checks:
+recipe run /home/nate/codex/cx-fl-mtp-edit/resident-run.rs --device cpu --ctx 64 --cfg llamacpp
+recipe run /home/nate/codex/cx-fl-mtp-edit/resident-indexed.rs --device cpu --ctx 66 --cfg recipe
+recipe run /home/nate/codex/cx-fl-mtp-edit/resident-run.rs --device nv0 --ctx 64 --cfg llamacpp
+recipe run /home/nate/codex/cx-fl-mtp-edit/resident-indexed.rs --device nv0 --ctx 66 --cfg recipe
+CPU MoE head check:
+recipe run /home/nate/codex/cx-fl-mtp-edit/resident-moe.rs --device cpu --ctx 64 --cfg recipe
+
+Fixtures are generated Qwen35 GGUFs with width 32 and vocabulary 9.
+The indexed fixture uses one attention block, compressed blocks of 3, and context 66.
+The MoE fixture uses four experts and top-k 2.
+Each source has accepting/rejecting heads, caps 0..4, lookup partial rejection, and a cached second request.
+The target and head stay in one MtpPlaced across each cap/request sweep.
+Reported weight bytes remain unchanged: plain 31108, indexed 60036, MoE 123396.
+Scratch fixture/probe sources stay outside the repository under /home/nate/codex/cx-fl-mtp-edit on archy.
+All public checks use Recipe's normal CLI/API; there are no inline tests or new test-only runtime APIs.
+
+GPU primitive checks:
+Compact position/selected-slot routing, absent selections, padding, weighted scatter, and combine pass for 1..5 positions.
+Routing/load benchmark: 16 CTAs, all 16 SMs and all 128 warps checked, top-k 10, k=2560 pair/float2 strides.
+20 warmups and 200 measured launches per row.
+GPU globaltimer endpoints bound routing and direct activation/scales loads; checksum writes follow those endpoints.
+Final linked entry: 32 registers, 8 shared bytes, 128 constant bytes, zero stack/spills.
+Table excludes expert-weight arithmetic and complete model verification.
+
+The GPU source/hash packet covers 8a19573; the later MoE-only source line is separately covered by the CPU MoE receipt.
+Actual Flash-Next code/chat acceptance, verification cost, 60/80 tok/s, and 10% reference logits remain pending the integrated holder run.
+The existing chained/Yarn/weighted cached-indexer limitation remains with forward integration.
+The real MTP shared-expert branch also needs the shared routine repair from cx-flash.

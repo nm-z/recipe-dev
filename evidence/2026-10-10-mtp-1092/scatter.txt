@@ -1,0 +1,5 @@
+positions 1 compact routing/scatter/combine PASS
+positions 2 compact routing/scatter/combine PASS
+positions 3 compact routing/scatter/combine PASS
+positions 4 compact routing/scatter/combine PASS
+positions 5 compact routing/scatter/combine PASS
