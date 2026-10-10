@@ -1717,7 +1717,8 @@ wait_return:
 publish_scan:
 	mov.u32 value, seq;
 	setp.lt.u32 p, tid, count;
-	@p ld.volatile.global.u32 value, [pointer];
+	// Local CTA stores share coherent L2; bypass L1 without discarding L2.
+	@p ld.global.cg.u32 value, [pointer];
 	setp.eq.u32 lane_ready, value, seq;
 	vote.sync.all.pred all_ready, lane_ready, 0xffffffff;
 	@all_ready bra publish_success;
@@ -2577,9 +2578,10 @@ multi_finish:
 	mov.u32 tid, %tid.x;
 	mov.u32 cta, %ctaid.x;
 	mov.u32 grid, %nctaid.x;
-	mad.lo.u32 linear, cta, 256, tid;
+	// CTA 0 transfers the packet; every CTA participates in local completion.
+	mad.lo.u32 linear, cta, 4096, tid;
 	shl.b32 linear, linear, 2;
-	mul.lo.u32 stride, grid, 1024;
+	mov.u32 stride, 1024;
 	mov.u64 started, %globaltimer;
 	add.u64 limit, started, 1000000000;
 	mad.lo.u32 tmp, cta, 256, tid;

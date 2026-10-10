@@ -341,6 +341,7 @@ fn grid_relay(d: &[Die; 2], p: &mut [recipe::PeerPacket; 2], functions: &[Handle
 	samples.sort_by(f64::total_cmp);
 	println!("grid_relay ctas_per_die=16 active_sms=16 bytes=16384 hops=100 trials={trials} delay_cta7_ns={delay} machine_total_us={total:.3} token_us={:.3} hop_us={:.3} p99_token_us={:.3} errors=0 timeouts=0 launches_per_token=2",
 		total / trials as f64, total / trials as f64 / 100., samples[(samples.len()*99/100).min(samples.len()-1)]);
+	if delay == 0 { assert!(total / trials as f64 / 100. < 10., "All-SM transport hop_us={} exceeds 10", total / trials as f64 / 100.); }
 }
 fn multi_demo() {
 	let owned = std::fs::read_to_string("../../barrier.ptx").unwrap();

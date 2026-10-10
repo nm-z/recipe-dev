@@ -1,0 +1,36 @@
+Atomic instruction count: 0
+
+line 3: Function : p2p_grid_relay
+
+line 515: /*0ff0*/                   MOV R10, R21 ;                                                /* 0x5c9807800157000a */
+line 516: /*0ff8*/                   SSY 0x1020 ;                                                  /* 0xe290000002000000 */
+line 517: /* 0x001ff40016200ffd */
+line 518: /*1008*/               @P1 SYNC ;                                                        /* 0xf0f800000001000f */
+line 519: /*1010*/                   LDG.E.CG R10, [R12] ;                                         /* 0xeed4600000070c0a */
+line 520: /*1018*/                   SYNC ;                                                        /* 0xf0f800000007000f */
+line 521: /* 0x001fd800fd8107f1 */
+line 522: /*1028*/                   ISETP.NE.U32.AND P0, PT, R10, R21, PT ;                       /* 0x5b6a038001570a07 */
+line 523: /*1030*/                   VOTE.ANY R11, PT, PT ;                                        /* 0x50d9e3800007000b */
+line 524: /*1038*/                   VOTE.ANY R10, PT, !P0 ;                                       /* 0x50d9e4000007000a */
+line 525: /* 0x001ff400fda407f6 */
+line 526: /*1048*/                   LOP.AND R10, R10, R11.reuse ;                                 /* 0x5c47000000b70a0a */
+line 527: /*1050*/                   ISETP.NE.U32.AND P0, PT, R10, R11, PT ;                       /* 0x5b6a038000b70a07 */
+
+line 592: Function : p2p_layers
+
+line 1671: /*21a8*/                   MOV R8, R11 ;                                                 /* 0x5c98078000b70008 */
+line 1672: /*21b0*/                   SSY 0x21d8 ;                                                  /* 0xe290000002000000 */
+line 1673: /*21b8*/               @P0 SYNC ;                                                        /* 0xf0f800000000000f */
+line 1674: /* 0x041fc400ffa000b1 */
+line 1675: /*21c8*/                   LDG.E.CG R8, [R14] ;                                          /* 0xeed4600000070e08 */
+line 1676: /*21d0*/                   SYNC ;                                                        /* 0xf0f800000007000f */
+line 1677: /*21d8*/                   ISETP.NE.U32.AND P1, PT, R8, R11, PT ;                        /* 0x5b6a038000b7080f */
+line 1678: /* 0x101fd800fec007ec */
+line 1679: /*21e8*/                   VOTE.ANY R9, PT, PT ;                                         /* 0x50d9e38000070009 */
+line 1680: /*21f0*/                   VOTE.ANY R8, PT, !P1 ;                                        /* 0x50d9e48000070008 */
+line 1681: /*21f8*/                   LOP.AND R8, R8, R9.reuse ;                                    /* 0x5c47000000970808 */
+line 1682: /* 0x001fd800ffa007ed */
+line 1683: /*2208*/                   ISETP.NE.U32.AND P1, PT, R8, R9, PT ;                         /* 0x5b6a03800097080f */
+
+System fence instruction count: 12
+Volatile load instruction count: 26
