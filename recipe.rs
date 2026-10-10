@@ -19820,7 +19820,11 @@ impl ExpertSplitWeights {
 		}
 		let buffers = devices.iter().enumerate().map(|(die, gpu)| gpu.map(|gpu| Buffer::reserve(gpu, expert_bytes[die])).transpose()).collect::<Result<Vec<_>>>()?;
 		let spill=if plan.spill_bytes>0 {Some(ExpertPinned::new(main,plan.spill_bytes,&devices)?)} else {None};
-		for item in plan.placements.iter().filter(|item| item.expert.is_some() || item.row_start.is_some()) {
+		// Read each shard in file order while preserving every assigned destination.
+		let mut uploads=plan.placements.iter().filter(|item|item.expert.is_some() || item.row_start.is_some()).collect::<Vec<_>>();
+		uploads.sort_by_key(|item|(item.mtp,item.tensor.shard,item.tensor.offset,item.die));
+		let upload_started=Instant::now(); let mut upload_reported=upload_started; let mut uploaded=0usize;
+		for item in uploads {
 			let model = if item.mtp { head.ok_or_else(|| RecipeError::new("MTP tensor placement requires its complete GGUF"))? } else { target };
 			let original = model.tensor(&item.tensor.name).ok_or_else(|| RecipeError::new(format!("packed tensor {} is absent", item.tensor.name)))?;
 			let tensor = if let Some(expert) = item.expert { original.expert(expert as usize)? } else if let Some(first)=item.row_start {original.rows(first,item.tensor.shape[1] as usize)?} else {original.clone()};
@@ -19829,7 +19833,14 @@ impl ExpertSplitWeights {
 				let spill=spill.as_ref().expect("spill allocation is present");
 				unsafe {ptr::copy_nonoverlapping(model.data(&tensor).as_ptr(),(spill.pointer as *mut u8).add(item.offset),tensor.bytes);}
 			} else {buffers[item.die].as_ref().expect("assigned die is permitted").write_bytes(item.offset, model.data(&tensor))?;}
+			uploaded=checked_add(uploaded,tensor.bytes,"uploaded packed weight bytes")?;
+			let now=Instant::now();
+			if now.duration_since(upload_reported).as_secs_f64()>=1.0 {
+				println!("resident weights {} bytes  rate {:.4} GB/s",uploaded,uploaded as f64/now.duration_since(upload_started).as_secs_f64()/1e9);
+				upload_reported=now;
+			}
 		}
+		println!("resident weights {} bytes  average rate {:.4} GB/s",uploaded,uploaded as f64/upload_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)/1e9);
 		let response_table = Buffer::reserve(main, 6 * 16)?;
 		let mut bindings=std::collections::HashMap::new();
 		for item in plan.placements.iter().filter(|item|item.expert.is_some()) {
