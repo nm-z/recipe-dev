@@ -27,7 +27,7 @@ $(BUILD)/probes.ptx: $(PACKED_EVIDENCE)/packed.cu $(BUILD)/codebooks.inc | $(BUI
 	mkdir -p $(BUILD)/tmp
 	TMPDIR=$(BUILD)/tmp $(NVCC) -Wno-deprecated-gpu-targets -arch=sm_52 -I$(LLAMA)/ggml/src -I$(BUILD) -ptx $< -o $@
 	sed -i 's/^\.version .*/.version 7.4/' $@
-$(BUILD)/selected.cu: $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $(PACKED_EVIDENCE)/fixed-cta.tsv $(PACKED_EVIDENCE)/cta-256.tsv $(PACKED_EVIDENCE)/select-source.sh | $(BUILD)
+$(BUILD)/selected.cu: $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $(PACKED_EVIDENCE)/fixed-cta.tsv $(PACKED_EVIDENCE)/cta-256.tsv $(PACKED_EVIDENCE)/fused-winners.tsv $(PACKED_EVIDENCE)/select-source.sh | $(BUILD)
 	bash $(PACKED_EVIDENCE)/select-source.sh $(PACKED_EVIDENCE)/packed.cu $(PACKED_EVIDENCE)/winners.tsv $@ $(BUILD)/selected-configs.txt
 $(BUILD)/selected.ptx: $(BUILD)/selected.cu $(BUILD)/codebooks.inc
 	mkdir -p $(BUILD)/tmp
@@ -37,6 +37,8 @@ packed.ptx: $(BUILD)/selected.ptx $(PACKED_EVIDENCE)/extract-helpers.awk $(PACKE
 	awk -f $(PACKED_EVIDENCE)/prune-globals.awk $< $< > $(BUILD)/selected-pruned.ptx
 	awk -f $(PACKED_EVIDENCE)/extract-helpers.awk $(BUILD)/selected-pruned.ptx > $@
 $(BUILD)/packed.cubin: $(BUILD)/probes.ptx
+	$(PTXAS) -arch=sm_52 -v $< -o $@
+$(BUILD)/selected-probes.cubin: $(BUILD)/selected.ptx
 	$(PTXAS) -arch=sm_52 -v $< -o $@
 $(BUILD)/helpers.cubin: packed.ptx | $(BUILD)
 	$(PTXAS) -arch=sm_52 -v $< -o $@
@@ -56,3 +58,21 @@ benchmark: packed.ptx $(BUILD)/packed.cubin $(BUILD)/bench
 clean:
 	rm -f barrier.cubin $(PEER_EVIDENCE)/bench
 .PHONY: all run inventory samples benchmark clean
+$(BUILD)/layer:
+	mkdir -p $@
+$(BUILD)/layer/codebooks: $(PACKED_EVIDENCE)/layer-codebooks.c $(LLAMA)/ggml/src/ggml-common.h | $(BUILD)/layer
+	$(CC) -O2 -Wall -Wextra -I$(LLAMA)/ggml/src $< -o $@
+$(BUILD)/layer/codebooks.inc: $(BUILD)/layer/codebooks
+	$< > $@.partial && mv $@.partial $@
+$(BUILD)/layer/layer.ptx: $(PACKED_EVIDENCE)/layer.cu $(BUILD)/layer/codebooks.inc
+	TMPDIR=$(BUILD)/tmp $(NVCC) -Wno-deprecated-gpu-targets -arch=sm_52 -I$(LLAMA)/ggml/src -I$(BUILD)/layer -ptx $< -o $@
+	sed -i 's/^\.version .*/.version 7.4/' $@
+$(BUILD)/layer/layer.cubin: $(BUILD)/layer/layer.ptx
+	$(PTXAS) -arch=sm_52 -v $< -o $@
+$(BUILD)/bench-layer: $(PACKED_EVIDENCE)/bench-layer.c | $(BUILD)
+	$(CC) -O2 -Wall -Wextra -std=gnu11 $< -o $@ -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src -I/opt/cuda/include -L$(LIBS) -lggml -lggml-base -lggml-cpu -lggml-cuda -lcuda -lm -Wl,-rpath,$(LIBS) -Wl,--disable-new-dtags
+$(BUILD)/bench-fused-mask: $(PACKED_EVIDENCE)/bench-fused-mask.c | $(BUILD)
+	$(CC) -O2 -Wall -Wextra -std=gnu11 $< -o $@ -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src -I/opt/cuda/include -L$(LIBS) -lggml -lggml-base -lggml-cpu -lggml-cuda -lcuda -lm -Wl,-rpath,$(LIBS) -Wl,--disable-new-dtags
+layer-build: $(BUILD)/layer/layer.cubin $(BUILD)/bench-layer
+fused-mask-build: $(BUILD)/selected-probes.cubin $(BUILD)/bench-fused-mask
+.PHONY: layer-build fused-mask-build

@@ -51,3 +51,21 @@ Stock IQ2_XS/IQ3_XXS differs from the independently decoded algebra beyond the o
 The shipped winners use the referenced canonical and signed format tables; unreferenced codebooks are removed. Tensor weights remain in their original GGUF layout. Follow-up codebook and spill reductions remain outside this snapshot until their measured configurations are selected.
 
 The shipped library contains the measured winner functions and the fastest measured 512-thread configuration for every shape and capacity. Unlisted kind/CTA/row-lane configurations return 0. Use winners.tsv for the unrestricted AOT choice, or fixed-cta.tsv for a 512-thread persistent launch and cta-256.tsv for a 256-thread launch; the full candidate generator and benchmark source remain in the evidence directory. The selected library replaces the 1.1-million-line artifact.
+
+## Fused expert gate/up
+
+The measured fused helpers cover IQ2_XS and IQ3_XXS gate/up matrices with k=2560 and m=640, capacities 1/2, and CTA sizes 256/512. Select the measured tuple from `fused-winners.tsv`.
+
+```text
+packed_gate_up_T_N_W_L(gate:u64, up:u64, packed_x:u64, scales:u64,
+	product_f32:u64, active_columns:u32, position_mask:u32,
+	cta_index:u32, cta_count:u32) -> u32
+```
+
+`T` is the GGML type, `N` is capacity, `W` is the number of warps, and `L` is row lanes. The helper reads a shared input tile once for both matrices and produces SiLU(gate) * up in compact columns, each with 640 floats. It uses the same mask and logical-group conventions as matvec and leaves inactive outputs untouched. All CTA threads call together, with 40960 dynamic shared bytes.
+
+The helper copies canonical packed-byte grids and sign masks to shared memory once per CTA. XOR/add applies byte signs without carry because every grid magnitude is nonzero; the checked IQ2 and IQ3 ranges are 8..43 and 4..62. PRMT expands signed bytes to int16 pairs; XMAD.S16.S16 accumulates integers. IQ2 applies its two 16-value scale factors after integer sums; IQ3 applies the 32-value factor after its integer sum.
+
+After the group's product writes finish, the caller supplies its completion barrier, prepares the compact product with k=640, supplies another completion barrier, and calls IQ4_NL down. Router coefficients belong to combine. The helper has no grid or peer protocol.
+
+The composed full-active 1/2-column probe passes on real gate/up/down weights, with product error at most 3.38e-7 and checked down error at most 9.24e-8. Current selected-source masked, zero-active, and invalid-mask GPU checks wait for the resident model's lock; those cases are not declared GPU-validated. Whole-model rate and final logits remain integration gates.

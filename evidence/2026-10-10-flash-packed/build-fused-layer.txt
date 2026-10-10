@@ -1,0 +1,2056 @@
+selected.cu(232): warning #177-D: function "decode_scales" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) void decode_scales(u32 S0, u32 S1, u32 S2, int g, int& scA, int& scB, int& mA, int& mB) {
+                                                                                ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+selected.cu(241): warning #177-D: function "finish_unit" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float finish_unit(u32 dd, int dotA, int dotB, int scA, int scB, int mA, int mB, float2 dA, float2 dB) {
+                                                                                 ^
+
+selected.cu(249): warning #177-D: function "warp_sum" was declared but never referenced
+  static __attribute__((device)) __inline__ __attribute__((always_inline)) float warp_sum(float v) {
+                                                                                 ^
+
+ptxas info    : 321704 bytes gmem
+ptxas info    : Compiling entry function 'pair_probe_18_2_16_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_2_16_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_2_8_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 136 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_2_8_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 134 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_1_16_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 114 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_1_16_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 112 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_1_8_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 114 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_18_1_8_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_18_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 112 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_18_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_2_16_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_2_16_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_2_8_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 123 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_2_8_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 122 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_1_16_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 102 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_1_16_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 100 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_1_8_16' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 102 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pair_probe_17_1_8_8' for 'sm_52'
+ptxas info    : Function properties for pair_probe_17_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 100 registers, 384 bytes cmem[0], 24 bytes cmem[2]
+ptxas info    : Function properties for packed_gate_up_17_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_2_16_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_2_16_16
+    48 bytes stack frame, 24 bytes spill stores, 24 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_2_16_16
+    0 bytes stack frame, 24 bytes spill stores, 28 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_2_16_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_2_16_16
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_2_16_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_2_16_8
+    40 bytes stack frame, 24 bytes spill stores, 24 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_2_16_8
+    0 bytes stack frame, 12 bytes spill stores, 16 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 4 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_2_16_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_2_16_8
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_2_8_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 155 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_2_8_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_2_8_16
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_2_8_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 154 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_2_8_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_2_8_8
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_1_16_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_1_16_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_1_16_16
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_1_16_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 126 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_1_16_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_1_16_8
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_1_8_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 131 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_1_8_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_1_8_16
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_18_1_8_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_18_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_18_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_18_1_8_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_18_1_8_8
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_2_16_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_2_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_2_16_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_2_16_16
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_2_16_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_2_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_2_16_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_2_16_8
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_2_8_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 142 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_2_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_2_8_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_2_8_16
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_2_8_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 140 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_2_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_2_8_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_2_8_8
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_1_16_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 123 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_1_16_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_1_16_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_1_16_16
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_1_16_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 123 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_1_16_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_1_16_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_1_16_8
+    1152 bytes stack frame, 68 bytes spill stores, 148 bytes spill loads
+ptxas info    : Used 128 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 208 bytes spill stores, 252 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 80 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 108 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 84 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 44 bytes spill stores, 60 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 152 bytes spill stores, 172 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_1_8_16' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 123 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_1_8_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_1_8_16' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_1_8_16
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'fused_layer_17_1_8_8' for 'sm_52'
+ptxas info    : Function properties for fused_layer_17_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 123 registers, 448 bytes cmem[0], 32 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_gate_up_17_1_8_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'plain_layer_17_1_8_8' for 'sm_52'
+ptxas info    : Function properties for plain_layer_17_1_8_8
+    632 bytes stack frame, 68 bytes spill stores, 152 bytes spill loads
+ptxas info    : Used 255 registers, 448 bytes cmem[0], 36 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 92 bytes spill stores, 108 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 116 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 100 bytes spill stores, 116 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 8 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 72 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 44 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 144 bytes spill stores, 164 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 8 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'packed_probe_wide' for 'sm_52'
+ptxas info    : Function properties for packed_probe_wide
+    144 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 64 registers, 396 bytes cmem[0], 8 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 124 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 124 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 124 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 124 bytes spill stores, 132 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 28 bytes spill stores, 36 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 116 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 116 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 116 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 116 bytes spill stores, 124 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 16 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 16 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 16 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 16 bytes spill stores, 24 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 120 bytes spill stores, 128 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 120 bytes spill stores, 128 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 120 bytes spill stores, 128 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 120 bytes spill stores, 128 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 4 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec_wide
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'packed_probe' for 'sm_52'
+ptxas info    : Function properties for packed_probe
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 115 registers, 396 bytes cmem[0], 8 bytes cmem[2]
+ptxas info    : Function properties for packed_g_17_1_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_1_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_16_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_17_2_8_0_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_18_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_1_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_16_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_g_20_2_8_2_8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Function properties for packed_matvec
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'packed_prepare_probe' for 'sm_52'
+ptxas info    : Function properties for packed_prepare_probe
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 23 registers, 352 bytes cmem[0], 16 bytes cmem[2]
+ptxas info    : Function properties for packed_prepare
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Compiling entry function 'pack_x' for 'sm_52'
+ptxas info    : Function properties for pack_x
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 18 registers, 352 bytes cmem[0], 16 bytes cmem[2]
+done 2026-10-10T09:16:18-07:00
